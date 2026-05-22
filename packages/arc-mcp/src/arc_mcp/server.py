@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Callable
+from uuid import uuid4
 
 from arc_paper_query import service
 from arc_paper_query.batch.db import BatchDB
 from arc_paper_query.batch.runner import export_batch, prefetch_batch, run_batch
 from arc_paper_query.host import detect_host, select_llm_provider
+from arc_paper_query.ids import normalize_paper_id
 from pydantic import Field
 
 
 ToolHandler = Callable[[dict[str, Any]], Any]
+SUMMARY_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="arc-summary")
+SUMMARY_JOBS: dict[str, dict[str, Any]] = {}
+SUMMARY_LOCK = Lock()
 
 SERVER_INSTRUCTIONS = (
     "Use ARC when a user asks about theoretical-physics papers or arXiv papers: "
@@ -69,13 +77,14 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         str(args["query"]),
         refresh=bool(args.get("refresh", False)),
     ),
-    "get_LLM_summary": lambda args: service.get_llm_summary(_paper_ids(args), refresh=bool(args.get("refresh", False))),
-    "generate_LLM_summary": lambda args: service.generate_llm_summary(
+    "get_LLM_summary": lambda args: _cached_or_start_summary_job(args),
+    "generate_LLM_summary": lambda args: _start_summary_job_response(
         _paper_ids(args),
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
         refresh=bool(args.get("refresh", False)),
     ),
+    "get_LLM_summary_status": lambda args: get_summary_job_status(str(args["job_id"])),
     "store_LLM_summary": lambda args: service.store_llm_summary(str(args["paper_id"]), args["summary"]),
     "doctor_host": lambda args: {
         "ok": True,
@@ -93,7 +102,164 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         "errors": [],
         "meta": {},
     },
+    "doctor_cache": lambda args: service.doctor_cache(args.get("paper_id")),
 }
+
+
+def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
+    paper_ids = _paper_ids(args)
+    if not bool(args.get("refresh", False)):
+        cached = service.get_cached_llm_summary(paper_ids)
+        if _all_ok(cached):
+            return cached
+    return _start_summary_job_response(
+        paper_ids,
+        provider=str(args.get("provider", "auto")),
+        model=args.get("model"),
+        refresh=bool(args.get("refresh", False)),
+    )
+
+
+def _start_summary_job_response(
+    paper_ids: Any,
+    *,
+    provider: str,
+    model: str | None,
+    refresh: bool,
+) -> dict[str, Any]:
+    job_id = uuid4().hex
+    normalized = _normalize_ids(paper_ids)
+    with SUMMARY_LOCK:
+        SUMMARY_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "phase": "queued",
+            "paper_ids": normalized,
+            "provider": provider,
+            "model": model,
+            "refresh": refresh,
+            "sections_total": None,
+            "sections_completed": 0,
+            "current_section": None,
+            "events": [],
+            "started_at": _now_iso(),
+            "updated_at": _now_iso(),
+            "result": None,
+            "error": None,
+        }
+    future = SUMMARY_EXECUTOR.submit(_run_summary_job, job_id, normalized, provider, model, refresh)
+    future.add_done_callback(_capture_unhandled_job_error(job_id))
+    return {
+        "ok": False,
+        "status": "summary_job_started",
+        "job_id": job_id,
+        "paper_ids": normalized,
+        "message": "No cached LLM summary was returned immediately; background generation has started.",
+        "next": {
+            "tool": "get_LLM_summary_status",
+            "arguments": {"job_id": job_id},
+            "poll_after_seconds": 5,
+        },
+    }
+
+
+def get_summary_job_status(job_id: str) -> dict[str, Any]:
+    with SUMMARY_LOCK:
+        job = SUMMARY_JOBS.get(job_id)
+        if not job:
+            return {
+                "ok": False,
+                "status": "summary_job_unknown",
+                "error": {"code": "summary_job_unknown", "message": f"Unknown summary job: {job_id}"},
+                "errors": [],
+                "meta": {},
+            }
+        return {key: value for key, value in job.items() if key != "future"}
+
+
+def _run_summary_job(job_id: str, paper_ids: Any, provider: str, model: str | None, refresh: bool) -> None:
+    _record_summary_progress(job_id, {"event": "job_started"})
+    result = service.generate_llm_summary(
+        paper_ids,
+        provider=provider,
+        model=model,
+        refresh=refresh,
+        progress_callback=lambda event: _record_summary_progress(job_id, event),
+    )
+    if _all_ok(result):
+        status = "done"
+    elif isinstance(result, dict) and result.get("status") == "needs_llm":
+        status = "needs_llm"
+    else:
+        status = "failed"
+    with SUMMARY_LOCK:
+        if job_id in SUMMARY_JOBS:
+            SUMMARY_JOBS[job_id]["status"] = status
+            SUMMARY_JOBS[job_id]["phase"] = status
+            SUMMARY_JOBS[job_id]["updated_at"] = _now_iso()
+            SUMMARY_JOBS[job_id]["result"] = result
+
+
+def _capture_unhandled_job_error(job_id: str) -> Callable[[Future], None]:
+    def callback(future: Future) -> None:
+        exc = future.exception()
+        if not exc:
+            return
+        with SUMMARY_LOCK:
+            if job_id in SUMMARY_JOBS:
+                SUMMARY_JOBS[job_id]["status"] = "failed"
+                SUMMARY_JOBS[job_id]["phase"] = "failed"
+                SUMMARY_JOBS[job_id]["updated_at"] = _now_iso()
+                SUMMARY_JOBS[job_id]["error"] = str(exc)
+
+    return callback
+
+
+def _record_summary_progress(job_id: str, event: dict[str, Any]) -> None:
+    timestamped = {"at": _now_iso(), **event}
+    with SUMMARY_LOCK:
+        job = SUMMARY_JOBS.get(job_id)
+        if not job:
+            return
+        event_name = str(timestamped.get("event") or "")
+        job["phase"] = event_name or job.get("phase")
+        job["updated_at"] = timestamped["at"]
+        if "sections_total" in timestamped:
+            job["sections_total"] = timestamped["sections_total"]
+        if "sections_completed" in timestamped:
+            job["sections_completed"] = timestamped["sections_completed"]
+        if event_name in {"section_started", "section_cached", "section_completed"}:
+            job["current_section"] = {
+                "paper_id": timestamped.get("paper_id"),
+                "section_index": timestamped.get("section_index"),
+                "sections_total": timestamped.get("sections_total"),
+                "section_id": timestamped.get("section_id"),
+                "title": timestamped.get("title"),
+            }
+        elif event_name.startswith("final_") or event_name in {"done", "failed"}:
+            job["current_section"] = None
+        events = job.setdefault("events", [])
+        events.append(timestamped)
+        if len(events) > 100:
+            del events[:-100]
+
+
+def _all_ok(result: Any) -> bool:
+    if isinstance(result, dict) and "ok" in result:
+        return result.get("ok") is True
+    if isinstance(result, dict):
+        return bool(result) and all(isinstance(item, dict) and item.get("ok") is True for item in result.values())
+    return False
+
+
+def _normalize_ids(paper_ids: Any) -> Any:
+    if isinstance(paper_ids, str):
+        return normalize_paper_id(paper_ids)
+    return [normalize_paper_id(str(item)) for item in paper_ids or []]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def main() -> None:
@@ -207,18 +373,32 @@ def _register_tools(app: Any) -> None:
     @app.tool(
         name="get_LLM_summary",
         description=(
-            "Read a cached high-quality LLM summary for one or more arXiv papers, or return "
-            "a needs_llm task describing the summary to generate."
+            "Get a cached high-quality LLM summary for one or more arXiv papers. "
+            "If no cached summary is immediately available, start a background summary job and return a job id."
         ),
     )
-    def get_llm_summary(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_llm_summary(_one_or_many(paper_id, paper_ids), refresh=refresh)
+    def get_llm_summary(
+        paper_id: PaperId = None,
+        paper_ids: PaperIds = None,
+        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
+        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        refresh: Refresh = False,
+    ) -> Any:
+        return _cached_or_start_summary_job(
+            {
+                "paper_id": paper_id,
+                "paper_ids": paper_ids,
+                "provider": provider,
+                "model": model,
+                "refresh": refresh,
+            }
+        )
 
     @app.tool(
         name="generate_LLM_summary",
         description=(
-            "Generate and cache a high-quality LLM summary for one or more arXiv papers. "
-            "Provider auto-selects Codex CLI, Claude CLI, or manual fallback from the host."
+            "Start a background job to generate and cache a high-quality LLM summary for one or more arXiv papers. "
+            "Returns immediately with a job id to avoid MCP client tool-call timeouts."
         ),
     )
     def generate_llm_summary(
@@ -228,12 +408,24 @@ def _register_tools(app: Any) -> None:
         model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
         refresh: Refresh = False,
     ) -> Any:
-        return service.generate_llm_summary(
+        return _start_summary_job_response(
             _one_or_many(paper_id, paper_ids),
             provider=provider,
             model=model,
             refresh=refresh,
         )
+
+    @app.tool(
+        name="get_LLM_summary_status",
+        description=(
+            "Check a background LLM summary job started by get_LLM_summary or generate_LLM_summary. "
+            "When status is done, the result contains the generated summary."
+        ),
+    )
+    def get_llm_summary_status(
+        job_id: Annotated[str, Field(description="Background summary job id returned by get_LLM_summary.")],
+    ) -> Any:
+        return get_summary_job_status(job_id)
 
     @app.tool(
         name="store_LLM_summary",
@@ -333,3 +525,7 @@ def _register_tools(app: Any) -> None:
             "errors": [],
             "meta": {},
         }
+
+    @app.tool(description="Diagnose ARC's local cache directory and whether a paper summary is cached.")
+    def doctor_cache(paper_id: PaperId = None) -> Any:
+        return service.doctor_cache(paper_id)

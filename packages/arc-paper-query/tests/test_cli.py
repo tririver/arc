@@ -50,3 +50,16 @@ def test_cli_doctor_provider(monkeypatch, capsys):
 
     output = json.loads(capsys.readouterr().out)
     assert output["data"]["provider"] == "codex-cli"
+
+
+def test_cli_doctor_cache(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.service,
+        "doctor_cache",
+        lambda paper_id=None: {"ok": True, "data": {"paper": {"paper_id": paper_id}}},
+    )
+
+    assert cli.main(["doctor", "cache", "0911.3380", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["paper"]["paper_id"] == "0911.3380"

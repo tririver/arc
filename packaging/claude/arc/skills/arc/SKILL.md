@@ -30,8 +30,13 @@ arc-paper-query get-llm-summary arXiv:0911.3380 --json
 arc-paper-query generate-llm-summary arXiv:0911.3380 --provider auto --json
 ```
 
+`get-llm-summary` reads the cache first, then automatically generates and caches
+the summary when a host LLM provider is available. Use
+`generate-llm-summary` only when an explicit generation step or provider
+override is needed.
+
 If `get-llm-summary` returns `status: "needs_llm"`, use the returned
-`llm_task` to generate schema-valid JSON, then store it with:
+`llm_task` to generate schema-valid JSON manually, then store it with:
 
 ```bash
 arc-paper-query store-llm-summary arXiv:0911.3380 --summary-json - --json

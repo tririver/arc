@@ -15,7 +15,15 @@ def valid_summary():
             {
                 "section_id": "S1",
                 "title": "1 Introduction",
-                "one_sentence_summary": "Introduces the problem.",
+                "level": 2,
+            }
+        ],
+        "section_summaries": [
+            {
+                "section_id": "S1",
+                "title": "1 Introduction",
+                "summary": "Introduces the problem.",
+                "warnings": [],
             }
         ],
         "reading_guide": [

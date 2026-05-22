@@ -14,7 +14,7 @@ class FakeInspire:
         }
 
     def get_references(self, paper_id, *, refresh=False):
-        return [{"paper_id": "arXiv:0801.0001", "title": "Reference"}]
+        raise AssertionError("summary input packs should not fetch references")
 
 
 class FakeAr5iv:
@@ -37,7 +37,15 @@ def valid_summary():
             {
                 "section_id": "S1",
                 "title": "1 Introduction",
-                "one_sentence_summary": "Introduces the problem.",
+                "level": 2,
+            }
+        ],
+        "section_summaries": [
+            {
+                "section_id": "S1",
+                "title": "1 Introduction",
+                "summary": "Introduces the problem.",
+                "warnings": [],
             }
         ],
         "reading_guide": [
@@ -61,23 +69,43 @@ def valid_summary():
 class FakeSummaryProvider:
     name = "fake"
 
-    def generate_summary(self, task, *, model=None):
+    def generate_summary(self, task, *, model=None, progress_callback=None):
         summary = valid_summary()
         summary["provenance"]["source_hash"] = task["input_pack"]["source_hash"]
         return summary
 
 
-def test_get_llm_summary_returns_needs_llm(monkeypatch, tmp_path):
+class ManualSummaryProvider:
+    name = "manual"
+
+
+def test_get_llm_summary_returns_needs_llm_when_provider_is_manual(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
     monkeypatch.setattr(service, "_inspire", FakeInspire())
     monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    monkeypatch.setattr(service, "select_summary_provider", lambda provider: ManualSummaryProvider())
 
     result = service.get_llm_summary("0911.3380")
 
     assert result["ok"] is False
     assert result["status"] == "needs_llm"
     assert result["llm_task"]["input_pack"]["paper_id"] == "arXiv:0911.3380"
+    assert "references" not in result["llm_task"]["input_pack"]
     assert result["llm_task"]["output_schema"]["$id"] == "arc.paper-summary-v1"
+
+
+def test_get_llm_summary_autogenerates_and_caches(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    monkeypatch.setattr(service, "select_summary_provider", lambda provider: FakeSummaryProvider())
+
+    result = service.get_llm_summary("0911.3380")
+
+    assert result["ok"] is True
+    assert result["data"]["title"] == "A Test Paper"
+    assert result["meta"]["cache"] == "write"
+    assert service.get_llm_summary("0911.3380")["meta"]["cache"] == "hit"
 
 
 def test_generate_llm_summary_uses_provider_and_caches(monkeypatch, tmp_path):
@@ -91,6 +119,19 @@ def test_generate_llm_summary_uses_provider_and_caches(monkeypatch, tmp_path):
     assert result["ok"] is True
     assert result["data"]["title"] == "A Test Paper"
     assert service.get_llm_summary("0911.3380")["meta"]["cache"] == "hit"
+    assert service.get_cached_llm_summary("0911.3380")["meta"]["cache"] == "hit"
+
+
+def test_cli_get_llm_summary_can_force_manual_provider(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    monkeypatch.setattr(service, "select_summary_provider", lambda provider: ManualSummaryProvider())
+
+    assert cli.main(["get-llm-summary", "0911.3380", "--provider", "manual", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "needs_llm"
 
 
 def test_cli_store_llm_summary(monkeypatch, tmp_path, capsys):

@@ -49,6 +49,8 @@ def cache_root() -> Path:
         return Path(value).expanduser()
     if value := os.environ.get("XDG_CACHE_HOME"):
         return Path(value).expanduser() / "arc" / "paper-query"
+    if project_root := _project_root():
+        return project_root / "cache" / "paper-query"
     return Path.home() / ".cache" / "arc" / "paper-query"
 
 
@@ -100,3 +102,14 @@ def _is_fresh(path: Path, *, ttl_seconds: int | None) -> bool:
 
 def _unique_tmp_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{os.getpid()}.{get_ident()}.{time.time_ns()}.tmp")
+
+
+def _project_root() -> Path | None:
+    for parent in Path(__file__).resolve().parents:
+        if (
+            (parent / "packages" / "arc-paper-query").is_dir()
+            and (parent / "schemas").is_dir()
+            and (parent / "prompts").is_dir()
+        ):
+            return parent
+    return None

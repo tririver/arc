@@ -14,15 +14,28 @@ envelope plus `toc`. Use the returned `toc` to choose a valid section.
 
 ## LLM Summary
 
-First check cache:
+Get or build the summary:
 
 ```bash
 arc-paper-query get-llm-summary arXiv:0911.3380 --json
 ```
 
-If the result is a cache hit, use it directly.
+This command first checks the cache. If the summary is missing and a host LLM
+provider is available, it generates and caches the summary automatically.
+ARC uses fast summary defaults unless overridden: `gpt-5.4-mini` for Codex and
+`haiku` for Claude Code. Summary generation first creates short section
+summaries sequentially, then synthesizes the paper-level summary from title,
+abstract, TOC, and section summaries. The final JSON keeps `toc` as navigation
+metadata and stores the canonical per-section content under
+`section_summaries`. References are intentionally omitted from the summary input
+pack.
 
-If the result has `status: "needs_llm"`:
+When using MCP, `get_LLM_summary` and `generate_LLM_summary` return quickly. If
+no cached summary is available, they start a background job and return a
+`job_id`; poll `get_LLM_summary_status` with that `job_id`.
+
+If the result has `status: "needs_llm"`, no runnable provider was available.
+Use the manual fallback:
 
 1. Use `llm_task.system_prompt`, `llm_task.user_prompt`, `llm_task.input_pack`,
    and `llm_task.output_schema`.
@@ -33,7 +46,7 @@ If the result has `status: "needs_llm"`:
 arc-paper-query store-llm-summary arXiv:0911.3380 --summary-json - --json
 ```
 
-For automatic generation through the host CLI:
+For explicit generation through the host CLI or provider override:
 
 ```bash
 arc-paper-query generate-llm-summary arXiv:0911.3380 --provider auto --json

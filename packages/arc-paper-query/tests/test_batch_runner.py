@@ -10,7 +10,7 @@ def test_prefetch_marks_ready(monkeypatch, tmp_path):
     db.create_batch("qft", ["0911.3380"], "paper-summary-v1")
 
     monkeypatch.setattr(runner.service, "get_title", lambda paper_id, refresh=False: {"ok": True})
-    monkeypatch.setattr(runner.service, "get_references", lambda paper_id, refresh=False: {"ok": True})
+    monkeypatch.setattr(runner.service, "get_abstract", lambda paper_id, refresh=False: {"ok": True})
     monkeypatch.setattr(runner.service, "get_toc", lambda paper_id, refresh=False: {"ok": True})
 
     result = runner.prefetch_batch("qft", workers=1, db=db)

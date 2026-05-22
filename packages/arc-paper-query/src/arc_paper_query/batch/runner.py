@@ -62,7 +62,7 @@ def _prefetch_one(item: BatchItem, db: BatchDB) -> None:
     db.mark_status(item.batch_name, item.paper_id, "prefetching")
     results = [
         service.get_title(item.paper_id),
-        service.get_references(item.paper_id),
+        service.get_abstract(item.paper_id),
         service.get_toc(item.paper_id),
     ]
     failed = [result for result in results if not result.get("ok")]

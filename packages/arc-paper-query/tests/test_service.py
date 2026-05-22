@@ -1,4 +1,5 @@
 from arc_paper_query import service
+from arc_paper_query.providers.base import ProviderError
 
 
 class FakeInspire:
@@ -32,6 +33,11 @@ class FakeAr5iv:
           </section>
         </body></html>
         """
+
+
+class FailingAr5iv:
+    def get_html(self, paper_id, *, refresh=False):
+        raise ProviderError("ar5iv_not_found", "missing")
 
 
 def test_get_title_single(monkeypatch):
@@ -70,3 +76,16 @@ def test_missing_section_keeps_error_and_toc(monkeypatch, tmp_path):
     assert result["ok"] is False
     assert result["error"]["code"] == "section_not_found"
     assert len(result["toc"]) == 2
+
+
+def test_section_and_equation_provider_errors_are_result_envelopes(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_ar5iv", FailingAr5iv())
+
+    section = service.get_section("0911.3380", "intro")
+    equation = service.get_equation_context("0911.3380", "x = y")
+
+    assert section["ok"] is False
+    assert section["error"]["code"] == "ar5iv_not_found"
+    assert equation["ok"] is False
+    assert equation["error"]["code"] == "ar5iv_not_found"

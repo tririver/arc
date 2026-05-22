@@ -24,7 +24,9 @@ def main(argv: list[str] | None = None) -> int:
     _paper_command(sub, "get-citers")
     _paper_command(sub, "get-citer-count")
     _paper_command(sub, "get-toc")
-    _paper_command(sub, "get-llm-summary")
+    llm_summary = _paper_command(sub, "get-llm-summary")
+    llm_summary.add_argument("--provider", default="auto")
+    llm_summary.add_argument("--model", default=None)
 
     generate = sub.add_parser("generate-llm-summary")
     generate.add_argument("paper_ids", nargs="+")
@@ -55,6 +57,9 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("host", "provider"):
         p = doctor_sub.add_parser(name)
         p.add_argument("--json", action="store_true")
+    cache = doctor_sub.add_parser("cache")
+    cache.add_argument("paper_id", nargs="?")
+    cache.add_argument("--json", action="store_true")
 
     batch = sub.add_parser("summary-batch")
     batch_sub = batch.add_subparsers(dest="batch_command", required=True)
@@ -91,11 +96,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _paper_command(sub, name: str) -> None:
+def _paper_command(sub, name: str) -> argparse.ArgumentParser:
     parser = sub.add_parser(name)
     parser.add_argument("paper_ids", nargs="+")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--json", action="store_true")
+    return parser
 
 
 def _dispatch(args: argparse.Namespace) -> Any:
@@ -110,6 +116,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
                     "signals": detected.signals,
                 }
             )
+        if args.doctor_command == "cache":
+            return service.doctor_cache(args.paper_id)
         selected = select_llm_provider()
         return ok(
             {
@@ -168,7 +176,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if command == "get-equation-context":
         return service.get_equation_context(paper_ids, args.query, refresh=args.refresh)
     if command == "get-llm-summary":
-        return service.get_llm_summary(paper_ids, refresh=args.refresh)
+        return service.get_llm_summary(paper_ids, provider=args.provider, model=args.model, refresh=args.refresh)
     if command == "generate-llm-summary":
         return service.generate_llm_summary(
             paper_ids,

@@ -31,6 +31,29 @@ arc-paper-query get-llm-summary arXiv:0911.3380 --json
 arc-paper-query generate-llm-summary arXiv:0911.3380 --provider auto --json
 ```
 
+`get-llm-summary` first reads the local summary cache. If the summary is
+missing and a host LLM provider is available, it generates and caches the
+summary automatically. `generate-llm-summary` remains available when you want an
+explicit generation command or provider override.
+
+Summary generation uses fast host defaults unless overridden: Codex uses
+`gpt-5.4-mini`, and Claude Code uses `haiku`. The LLM pipeline summarizes paper
+sections sequentially first, then synthesizes the final paper summary from the
+title, abstract, table of contents, and compact section summaries. The final
+JSON keeps `toc` as navigation metadata and stores the richer per-section text
+under `section_summaries`; it does not rewrite those into one-sentence TOC
+entries. References are intentionally not included in the summary input pack.
+
+When called through MCP, `get_LLM_summary` and `generate_LLM_summary` avoid long
+tool calls: if no cached summary is available, they start a background job and
+return a `job_id`. Poll `get_LLM_summary_status` with that `job_id` for
+completion and progress fields such as `phase`, `sections_completed`,
+`sections_total`, `current_section`, and recent `events`. Completed section
+summaries are cached as they finish, so a failed or interrupted job can resume
+without paying again for sections that already completed. MCP background jobs do
+not stream or push a completion notification; clients should poll the status
+tool.
+
 Batch workflow:
 
 ```bash
@@ -64,6 +87,14 @@ Debug:
 ```bash
 arc-paper-query doctor host --json
 arc-paper-query doctor provider --json
+arc-paper-query doctor cache 0911.3380 --json
+```
+
+When ARC is run from this checkout without `ARC_PAPER_QUERY_CACHE` or
+`XDG_CACHE_HOME`, paper-query data is cached under:
+
+```text
+/arc-dev/cache/paper-query/
 ```
 
 ## Reference Code

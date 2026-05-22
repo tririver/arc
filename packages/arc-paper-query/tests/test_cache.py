@@ -15,6 +15,17 @@ def test_cache_root_uses_xdg_when_arc_env_missing(monkeypatch, tmp_path):
     assert cache_root() == tmp_path / "xdg" / "arc" / "paper-query"
 
 
+def test_cache_root_uses_project_cache_in_arc_checkout(monkeypatch):
+    monkeypatch.delenv("ARC_PAPER_QUERY_CACHE", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    repo_root = next(
+        parent
+        for parent in Path(__file__).resolve().parents
+        if (parent / "packages" / "arc-paper-query").is_dir()
+    )
+    assert cache_root() == repo_root / "cache" / "paper-query"
+
+
 def test_cache_paths_quote_paper_id(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
     paths = CachePaths.for_paper("arXiv:hep-th/0601001")

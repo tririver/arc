@@ -10,12 +10,14 @@
     "authors_short",
     "high_value_summary",
     "toc",
+    "section_summaries",
     "reading_guide",
     "warnings",
     "provenance"
   ],
   "properties": {
     "schema_version": {
+      "type": "string",
       "const": "arc.paper_llm_summary.v1"
     },
     "paper_id": {
@@ -43,11 +45,28 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["section_id", "title", "one_sentence_summary"],
+        "required": ["section_id", "title"],
         "properties": {
           "section_id": {"type": "string"},
           "title": {"type": "string"},
-          "one_sentence_summary": {"type": "string"}
+          "level": {"type": "integer"}
+        }
+      }
+    },
+    "section_summaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section_id", "title", "summary", "warnings"],
+        "properties": {
+          "section_id": {"type": "string"},
+          "title": {"type": "string"},
+          "summary": {"type": "string", "minLength": 1},
+          "warnings": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
         }
       }
     },
@@ -82,7 +101,7 @@
           "enum": ["manual", "codex-cli", "claude-cli", "openai", "anthropic"]
         },
         "model": {"type": "string"},
-        "prompt_version": {"const": "paper-summary-v1"},
+        "prompt_version": {"type": "string", "const": "paper-summary-v1"},
         "source_hash": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"

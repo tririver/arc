@@ -45,6 +45,7 @@ def test_inspire_metadata_and_references_are_cached(monkeypatch, tmp_path):
         {
             "paper_id": "arXiv:0801.0001",
             "title": "A Reference",
+            "arxiv_id": "0801.0001",
             "inspire_recid": "456",
         }
     ]
@@ -56,6 +57,7 @@ def test_inspire_metadata_and_references_are_cached(monkeypatch, tmp_path):
         )
     )
     assert cached_provider.get_metadata("arXiv:0911.3380")["title"] == "A Test Paper"
+    assert cached_provider.get_references("arXiv:0911.3380")[0]["title"] == "A Reference"
 
 
 def test_inspire_citers_use_recid_query_and_month_cache(monkeypatch, tmp_path):
@@ -69,6 +71,8 @@ def test_inspire_citers_use_recid_query_and_month_cache(monkeypatch, tmp_path):
         query = urllib.parse.parse_qs(request.url.query.decode())
         assert query["q"] == ["refersto:recid:123"]
         assert query["size"] == ["1000"]
+        assert "abstracts" in query["fields"][0]
+        assert "arxiv_eprints" in query["fields"][0]
         return httpx.Response(
             200,
             json={
@@ -80,6 +84,7 @@ def test_inspire_citers_use_recid_query_and_month_cache(monkeypatch, tmp_path):
                                 "titles": [{"title": "A Citer"}],
                                 "arxiv_eprints": [{"value": "2210.00001"}],
                                 "authors": [{"full_name": "Carol C."}],
+                                "abstracts": [{"value": "Citer abstract."}],
                                 "citation_count": 3,
                             },
                         }
@@ -92,6 +97,7 @@ def test_inspire_citers_use_recid_query_and_month_cache(monkeypatch, tmp_path):
     citers = provider.get_citers("arXiv:0911.3380")
     assert citers[0]["paper_id"] == "arXiv:2210.00001"
     assert citers[0]["title"] == "A Citer"
+    assert citers[0]["abstract"] == "Citer abstract."
     assert len(calls) == 2
 
     cached_provider = InspireProvider(

@@ -11,6 +11,19 @@ from .base import ProviderError
 
 BASE_URL = "https://inspirehep.net/api"
 MAX_PAGE_SIZE = 1000
+SUMMARY_FIELDS = ",".join(
+    [
+        "titles",
+        "authors",
+        "arxiv_eprints",
+        "dois",
+        "citation_count",
+        "earliest_date",
+        "preprint_date",
+        "publication_info",
+        "abstracts",
+    ]
+)
 
 
 class InspireProvider:
@@ -24,7 +37,7 @@ class InspireProvider:
 
     def get_references(self, paper_id: str, *, refresh: bool = False) -> list[dict[str, Any]]:
         paths = CachePaths.for_paper(paper_id)
-        if not refresh and (cached := read_json(paths.inspire_references)):
+        if not refresh and (cached := read_json(paths.inspire_references)) and _references_cache_is_current(cached):
             return cached
 
         raw = self.get_raw_record(paper_id, refresh=refresh)
@@ -48,7 +61,12 @@ class InspireProvider:
 
         response = self.client.get(
             f"{BASE_URL}/literature",
-            params={"q": f"refersto:recid:{recid}", "size": str(MAX_PAGE_SIZE), "format": "json"},
+            params={
+                "q": f"refersto:recid:{recid}",
+                "size": str(MAX_PAGE_SIZE),
+                "fields": SUMMARY_FIELDS,
+                "format": "json",
+            },
             timeout=self.timeout,
         )
         try:
@@ -89,7 +107,7 @@ class InspireProvider:
 def _normalize_record(payload: dict[str, Any]) -> dict[str, Any]:
     metadata = payload.get("metadata", payload) or {}
     arxiv_id = _first_arxiv_id(metadata)
-    recid = str(payload.get("id") or metadata.get("control_number") or "")
+    recid = str(metadata.get("control_number") or payload.get("id") or "")
     return {
         "paper_id": f"arXiv:{arxiv_id}" if arxiv_id else (f"inspire:{recid}" if recid else ""),
         "title": _first_title(metadata),
@@ -97,23 +115,58 @@ def _normalize_record(payload: dict[str, Any]) -> dict[str, Any]:
         "authors": _authors(metadata),
         "arxiv_id": arxiv_id,
         "inspire_recid": recid,
+        "doi": _first_doi(metadata),
+        "year": _year(metadata),
+        "published": str(metadata.get("earliest_date") or metadata.get("preprint_date") or ""),
         "citation_count": int(metadata.get("citation_count") or 0),
     }
 
 
 def _normalize_reference(item: dict[str, Any]) -> dict[str, Any]:
     raw = item.get("reference") or item
-    record = item.get("record") or {}
-    recid = str(record.get("$ref", "").rstrip("/").split("/")[-1] or item.get("recid") or "")
-    arxiv_id = str(raw.get("arxiv_eprint") or raw.get("arxiv_id") or raw.get("eprint") or "")
+    recid = _reference_recid(item)
+    arxiv_id = _reference_arxiv_id(item)
     title = raw.get("title") or raw.get("titles") or ""
     paper_id = normalize_paper_id(arxiv_id) if arxiv_id else (f"inspire:{recid}" if recid else "")
     if not paper_id and not title:
         return {}
     out = {"paper_id": paper_id, "title": _string_or_first(title)}
+    if abstract := _first_abstract(raw):
+        out["abstract"] = abstract
+    if authors := _authors(raw):
+        out["authors"] = authors
+    if arxiv_id:
+        out["arxiv_id"] = arxiv_id
     if recid:
         out["inspire_recid"] = recid
+    if doi := _first_doi(raw):
+        out["doi"] = doi
+    if year := _year(raw):
+        out["year"] = year
+    published = str(raw.get("earliest_date") or raw.get("preprint_date") or "")
+    if published:
+        out["published"] = published
+    if raw.get("citation_count") is not None:
+        out["citation_count"] = int(raw.get("citation_count") or 0)
     return out
+
+
+def _reference_recid(item: dict[str, Any]) -> str:
+    record = item.get("record") or {}
+    return str(record.get("$ref", "").rstrip("/").split("/")[-1] or item.get("recid") or "")
+
+
+def _reference_arxiv_id(item: dict[str, Any]) -> str:
+    raw = item.get("reference") or item
+    return str(raw.get("arxiv_eprint") or raw.get("arxiv_id") or raw.get("eprint") or "")
+
+
+def _references_cache_is_current(cached: Any) -> bool:
+    if not isinstance(cached, list):
+        return False
+    if not cached:
+        return True
+    return all(isinstance(item, dict) and "paper_id" in item and "title" in item for item in cached)
 
 
 def _first_title(metadata: dict[str, Any]) -> str:
@@ -139,6 +192,26 @@ def _first_arxiv_id(metadata: dict[str, Any]) -> str:
         if value:
             return str(value)
     return ""
+
+
+def _first_doi(metadata: dict[str, Any]) -> str:
+    for item in metadata.get("dois") or []:
+        if isinstance(item, dict) and item.get("value"):
+            return str(item["value"])
+        if isinstance(item, str):
+            return item
+    return ""
+
+
+def _year(metadata: dict[str, Any]) -> int | None:
+    for key in ("earliest_date", "preprint_date"):
+        value = str(metadata.get(key) or "")
+        if len(value) >= 4 and value[:4].isdigit():
+            return int(value[:4])
+    for item in metadata.get("publication_info") or []:
+        if isinstance(item, dict) and item.get("year"):
+            return int(item["year"])
+    return None
 
 
 def _authors(metadata: dict[str, Any]) -> list[str]:
