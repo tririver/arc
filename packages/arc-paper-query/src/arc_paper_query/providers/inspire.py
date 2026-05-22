@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 
 from ..cache import CachePaths, ONE_MONTH_SECONDS, read_json, write_json
-from ..ids import arxiv_path_id, normalize_paper_id
+from ..ids import arxiv_path_id, inspire_recid, normalize_paper_id
 from .base import ProviderError
 
 
@@ -35,19 +35,48 @@ class InspireProvider:
         raw = self.get_raw_record(paper_id, refresh=refresh)
         return _normalize_record(raw)
 
-    def get_references(self, paper_id: str, *, refresh: bool = False) -> list[dict[str, Any]]:
+    def get_references(self, paper_id: str, *, refresh: bool = False, enrich: bool = False) -> list[dict[str, Any]]:
         paths = CachePaths.for_paper(paper_id)
+        references: list[dict[str, Any]]
         if not refresh and (cached := read_json(paths.inspire_references)) and _references_cache_is_current(cached):
-            return cached
+            if not enrich or _references_cache_is_enriched(cached):
+                return cached
+            references = cached
+        else:
+            raw = self.get_raw_record(paper_id, refresh=refresh)
+            references = [
+                normalized
+                for item in raw.get("metadata", {}).get("references", [])
+                if (normalized := _normalize_reference(item))
+            ]
 
-        raw = self.get_raw_record(paper_id, refresh=refresh)
-        references = [
-            normalized
-            for item in raw.get("metadata", {}).get("references", [])
-            if (normalized := _normalize_reference(item))
-        ]
+        if enrich:
+            references = self.enrich_reference_metadata(references, refresh=refresh)
         write_json(paths.inspire_references, references)
         return references
+
+    def enrich_reference_metadata(
+        self,
+        references: list[dict[str, Any]],
+        *,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        for reference in references:
+            lookup_id = _reference_lookup_id(reference)
+            if not lookup_id:
+                enriched.append(reference)
+                continue
+            try:
+                metadata = self.get_metadata(lookup_id, refresh=refresh)
+            except ProviderError as exc:
+                failed = dict(reference)
+                failed["metadata_enriched"] = False
+                failed["metadata_enrichment_error"] = {"code": exc.code, "message": exc.message}
+                enriched.append(failed)
+                continue
+            enriched.append(_merge_reference_metadata(reference, metadata))
+        return enriched
 
     def get_citers(self, paper_id: str, *, refresh: bool = False) -> list[dict[str, Any]]:
         paths = CachePaths.for_paper(paper_id)
@@ -83,15 +112,21 @@ class InspireProvider:
         return int(self.get_metadata(paper_id, refresh=refresh).get("citation_count") or 0)
 
     def get_raw_record(self, paper_id: str, *, refresh: bool = False) -> dict[str, Any]:
-        paths = CachePaths.for_paper(paper_id)
+        normalized_id = normalize_paper_id(paper_id)
+        paths = CachePaths.for_paper(normalized_id)
         if not refresh and (cached := read_json(paths.inspire_metadata)):
             return cached
 
-        aid = arxiv_path_id(paper_id)
-        if not aid:
-            raise ProviderError("not_arxiv_id", f"INSPIRE arXiv endpoint requires an arXiv ID: {paper_id}")
+        recid = inspire_recid(normalized_id)
+        aid = arxiv_path_id(normalized_id)
+        if recid:
+            url = f"{BASE_URL}/literature/{recid}"
+        elif aid:
+            url = f"{BASE_URL}/arxiv/{aid}"
+        else:
+            raise ProviderError("unsupported_paper_id", f"INSPIRE requires an arXiv ID or INSPIRE recid: {paper_id}")
 
-        response = self.client.get(f"{BASE_URL}/arxiv/{aid}", timeout=self.timeout)
+        response = self.client.get(url, timeout=self.timeout)
         if response.status_code == 404:
             raise ProviderError("inspire_not_found", f"INSPIRE record not found for {paper_id}")
         try:
@@ -100,7 +135,7 @@ class InspireProvider:
             raise ProviderError("inspire_fetch_failed", str(exc)) from exc
 
         raw = response.json()
-        write_json(paths.inspire_metadata, raw)
+        _cache_raw_record(raw, requested_id=normalized_id)
         return raw
 
 
@@ -108,14 +143,17 @@ def _normalize_record(payload: dict[str, Any]) -> dict[str, Any]:
     metadata = payload.get("metadata", payload) or {}
     arxiv_id = _first_arxiv_id(metadata)
     recid = str(metadata.get("control_number") or payload.get("id") or "")
+    paper_id = f"arXiv:{arxiv_id}" if arxiv_id else (f"inspire:{recid}" if recid else "")
+    doi = _first_doi(metadata)
     return {
-        "paper_id": f"arXiv:{arxiv_id}" if arxiv_id else (f"inspire:{recid}" if recid else ""),
+        "paper_id": paper_id,
         "title": _first_title(metadata),
         "abstract": _first_abstract(metadata),
         "authors": _authors(metadata),
         "arxiv_id": arxiv_id,
         "inspire_recid": recid,
-        "doi": _first_doi(metadata),
+        "doi": doi,
+        "identifiers": _identifiers(paper_id=paper_id, arxiv_id=arxiv_id, inspire_recid=recid, doi=doi),
         "year": _year(metadata),
         "published": str(metadata.get("earliest_date") or metadata.get("preprint_date") or ""),
         "citation_count": int(metadata.get("citation_count") or 0),
@@ -128,9 +166,19 @@ def _normalize_reference(item: dict[str, Any]) -> dict[str, Any]:
     arxiv_id = _reference_arxiv_id(item)
     title = raw.get("title") or raw.get("titles") or ""
     paper_id = normalize_paper_id(arxiv_id) if arxiv_id else (f"inspire:{recid}" if recid else "")
-    if not paper_id and not title:
+    doi = _first_doi(raw)
+    if not paper_id and not title and not raw:
         return {}
-    out = {"paper_id": paper_id, "title": _string_or_first(title)}
+    out = {
+        "paper_id": paper_id,
+        "title": _string_or_first(title),
+        "raw_inspire_reference": item,
+    }
+    record_ref = (item.get("record") or {}).get("$ref")
+    if record_ref:
+        out["record_ref"] = str(record_ref)
+    if publication_info := raw.get("publication_info"):
+        out["publication_info"] = publication_info
     if abstract := _first_abstract(raw):
         out["abstract"] = abstract
     if authors := _authors(raw):
@@ -139,8 +187,10 @@ def _normalize_reference(item: dict[str, Any]) -> dict[str, Any]:
         out["arxiv_id"] = arxiv_id
     if recid:
         out["inspire_recid"] = recid
-    if doi := _first_doi(raw):
+    if doi:
         out["doi"] = doi
+    if identifiers := _identifiers(paper_id=paper_id, arxiv_id=arxiv_id, inspire_recid=recid, doi=doi):
+        out["identifiers"] = identifiers
     if year := _year(raw):
         out["year"] = year
     published = str(raw.get("earliest_date") or raw.get("preprint_date") or "")
@@ -149,6 +199,65 @@ def _normalize_reference(item: dict[str, Any]) -> dict[str, Any]:
     if raw.get("citation_count") is not None:
         out["citation_count"] = int(raw.get("citation_count") or 0)
     return out
+
+
+def _cache_raw_record(raw: dict[str, Any], *, requested_id: str) -> None:
+    keys = {requested_id}
+    metadata = _normalize_record(raw)
+    if paper_id := metadata.get("paper_id"):
+        keys.add(str(paper_id))
+    if recid := metadata.get("inspire_recid"):
+        keys.add(f"inspire:{recid}")
+    if arxiv_id := metadata.get("arxiv_id"):
+        keys.add(f"arXiv:{arxiv_id}")
+    for key in {normalize_paper_id(item) for item in keys if item}:
+        write_json(CachePaths.for_paper(key).inspire_metadata, raw)
+
+
+def _reference_lookup_id(reference: dict[str, Any]) -> str:
+    if recid := reference.get("inspire_recid"):
+        return f"inspire:{recid}"
+    if paper_id := reference.get("paper_id"):
+        return normalize_paper_id(str(paper_id))
+    return ""
+
+
+def _merge_reference_metadata(reference: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(reference)
+    merged["paper_id"] = metadata.get("paper_id") or merged.get("paper_id", "")
+    merged["title"] = metadata.get("title") or merged.get("title", "")
+    merged["abstract"] = metadata.get("abstract") or merged.get("abstract", "")
+    merged["authors"] = metadata.get("authors") or merged.get("authors", [])
+    for key in ("arxiv_id", "inspire_recid", "doi", "year", "published", "citation_count"):
+        value = metadata.get(key)
+        if value not in (None, "", []):
+            merged[key] = value
+        elif key not in merged:
+            merged[key] = "" if key not in {"year", "citation_count"} else None
+    merged["identifiers"] = metadata.get("identifiers") or _identifiers(
+        paper_id=str(merged.get("paper_id") or ""),
+        arxiv_id=str(merged.get("arxiv_id") or ""),
+        inspire_recid=str(merged.get("inspire_recid") or ""),
+        doi=str(merged.get("doi") or ""),
+    )
+    merged["metadata_enriched"] = True
+    merged.pop("metadata_enrichment_error", None)
+    return merged
+
+
+def _identifiers(*, paper_id: str, arxiv_id: str, inspire_recid: str, doi: str) -> dict[str, str]:
+    identifiers: dict[str, str] = {}
+    if paper_id:
+        identifiers["paper_id"] = paper_id
+    if arxiv_id:
+        identifiers["arxiv"] = f"arXiv:{arxiv_id}"
+        identifiers["arxiv_id"] = arxiv_id
+    if inspire_recid:
+        identifiers["inspire"] = f"inspire:{inspire_recid}"
+        identifiers["inspire_recid"] = inspire_recid
+    if doi:
+        identifiers["doi"] = doi
+    return identifiers
 
 
 def _reference_recid(item: dict[str, Any]) -> str:
@@ -167,6 +276,20 @@ def _references_cache_is_current(cached: Any) -> bool:
     if not cached:
         return True
     return all(isinstance(item, dict) and "paper_id" in item and "title" in item for item in cached)
+
+
+def _references_cache_is_enriched(cached: Any) -> bool:
+    if not _references_cache_is_current(cached):
+        return False
+    for item in cached:
+        if not _reference_lookup_id(item):
+            continue
+        if item.get("metadata_enriched") is not True:
+            return False
+        for key in ("title", "abstract", "authors", "arxiv_id", "inspire_recid"):
+            if key not in item:
+                return False
+    return True
 
 
 def _first_title(metadata: dict[str, Any]) -> str:

@@ -20,7 +20,8 @@ def main(argv: list[str] | None = None) -> int:
     _paper_command(sub, "get-title")
     _paper_command(sub, "get-abstract")
     _paper_command(sub, "get-authors")
-    _paper_command(sub, "get-references")
+    references = _paper_command(sub, "get-references")
+    references.add_argument("--enrich", action="store_true")
     _paper_command(sub, "get-citers")
     _paper_command(sub, "get-citer-count")
     _paper_command(sub, "get-toc")
@@ -164,7 +165,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if command == "get-authors":
         return service.get_authors(paper_ids, refresh=args.refresh)
     if command == "get-references":
-        return service.get_references(paper_ids, refresh=args.refresh)
+        return service.get_references(paper_ids, refresh=args.refresh, enrich=args.enrich)
     if command == "get-citers":
         return service.get_citers(paper_ids, refresh=args.refresh)
     if command == "get-citer-count":

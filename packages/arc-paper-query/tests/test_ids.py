@@ -1,4 +1,4 @@
-from arc_paper_query.ids import arxiv_path_id, normalize_paper_id
+from arc_paper_query.ids import arxiv_path_id, inspire_recid, normalize_paper_id
 
 
 def test_normalize_new_arxiv_id():
@@ -14,3 +14,9 @@ def test_normalize_old_arxiv_id():
 
 def test_arxiv_path_id_rejects_non_arxiv():
     assert arxiv_path_id("doi:10.1000/example") == ""
+
+
+def test_normalize_inspire_recid():
+    assert normalize_paper_id("recid:154280") == "inspire:154280"
+    assert normalize_paper_id("inspire:154280") == "inspire:154280"
+    assert inspire_recid("recid:154280") == "154280"

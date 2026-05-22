@@ -15,6 +15,7 @@ ARXIV_URL_RE = re.compile(
     r"arxiv\.org/(?:abs|pdf)/((?:\d{4}\.\d{4,5})|(?:[a-z-]+/\d{7}))(?:v\d+)?",
     re.IGNORECASE,
 )
+INSPIRE_RECID_RE = re.compile(r"^(?:inspire:|recid:)(\d+)$", re.IGNORECASE)
 
 
 def normalize_paper_id(identifier: str) -> str:
@@ -30,12 +31,21 @@ def normalize_paper_id(identifier: str) -> str:
         return f"arXiv:{match.group(1)}"
     if text.lower().startswith("arxiv:"):
         return "arXiv:" + _strip_version(text.split(":", 1)[1])
+    if match := INSPIRE_RECID_RE.match(text):
+        return f"inspire:{match.group(1)}"
     return text
 
 
 def arxiv_path_id(identifier: str) -> str:
     normalized = normalize_paper_id(identifier)
     if not normalized.startswith("arXiv:"):
+        return ""
+    return normalized.split(":", 1)[1]
+
+
+def inspire_recid(identifier: str) -> str:
+    normalized = normalize_paper_id(identifier)
+    if not normalized.startswith("inspire:"):
         return ""
     return normalized.split(":", 1)[1]
 

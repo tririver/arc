@@ -12,6 +12,19 @@ def test_cli_get_title(monkeypatch, capsys):
     assert output["data"] == "Title"
 
 
+def test_cli_get_references_enrich(monkeypatch, capsys):
+    def get_references(ids, refresh=False, enrich=False):
+        return {"ok": True, "data": {"ids": ids, "refresh": refresh, "enrich": enrich}}
+
+    monkeypatch.setattr(cli.service, "get_references", get_references)
+
+    assert cli.main(["get-references", "0911.3380", "--enrich", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["ids"] == "0911.3380"
+    assert output["data"]["enrich"] is True
+
+
 def test_cli_get_section(monkeypatch, capsys):
     monkeypatch.setattr(
         cli.service,

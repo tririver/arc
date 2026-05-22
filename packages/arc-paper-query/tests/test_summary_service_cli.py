@@ -13,7 +13,7 @@ class FakeInspire:
             "citation_count": 5,
         }
 
-    def get_references(self, paper_id, *, refresh=False):
+    def get_references(self, paper_id, *, refresh=False, enrich=False):
         raise AssertionError("summary input packs should not fetch references")
 
 

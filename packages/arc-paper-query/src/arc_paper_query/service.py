@@ -35,8 +35,14 @@ def get_authors(ids: str | Iterable[str], *, refresh: bool = False):
     return _map(ids, lambda paper_id: _metadata_field(paper_id, "authors", refresh=refresh))
 
 
-def get_references(ids: str | Iterable[str], *, refresh: bool = False):
-    return _map(ids, lambda paper_id: _call(lambda: _inspire.get_references(paper_id, refresh=refresh), "inspire"))
+def get_references(ids: str | Iterable[str], *, refresh: bool = False, enrich: bool = False):
+    return _map(
+        ids,
+        lambda paper_id: _call(
+            lambda: _inspire.get_references(paper_id, refresh=refresh, enrich=enrich),
+            "inspire",
+        ),
+    )
 
 
 def get_citers(ids: str | Iterable[str], *, refresh: bool = False):

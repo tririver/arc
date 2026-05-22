@@ -35,6 +35,10 @@ PAPER_ID_DESCRIPTION = (
 )
 PAPER_IDS_DESCRIPTION = "Multiple paper identifiers. Use this instead of paper_id for batch queries."
 REFRESH_DESCRIPTION = "Bypass cached data and refetch source metadata or full text when possible."
+ENRICH_REFERENCES_DESCRIPTION = (
+    "When true, fetch and cache each referenced paper's INSPIRE metadata through paper-query, "
+    "including title, abstract, authors, and identifiers when available."
+)
 SECTION_DESCRIPTION = "Section heading, section number, or section id to retrieve from the ar5iv full text."
 QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
 BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
@@ -42,6 +46,7 @@ BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite b
 PaperId = Annotated[str | None, Field(description=PAPER_ID_DESCRIPTION)]
 PaperIds = Annotated[list[str] | None, Field(description=PAPER_IDS_DESCRIPTION)]
 Refresh = Annotated[bool, Field(description=REFRESH_DESCRIPTION)]
+EnrichReferences = Annotated[bool, Field(description=ENRICH_REFERENCES_DESCRIPTION)]
 Section = Annotated[str, Field(description=SECTION_DESCRIPTION)]
 EquationQuery = Annotated[str, Field(description=QUERY_DESCRIPTION)]
 BatchName = Annotated[str, Field(description=BATCH_NAME_DESCRIPTION)]
@@ -65,7 +70,11 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "get_authors": lambda args: service.get_authors(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_citers": lambda args: service.get_citers(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_citer_count": lambda args: service.get_citer_count(_paper_ids(args), refresh=bool(args.get("refresh", False))),
-    "get_references": lambda args: service.get_references(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_references": lambda args: service.get_references(
+        _paper_ids(args),
+        refresh=bool(args.get("refresh", False)),
+        enrich=bool(args.get("enrich", False)),
+    ),
     "get_toc": lambda args: service.get_toc(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_section": lambda args: service.get_section(
         _paper_ids(args),
@@ -327,11 +336,17 @@ def _register_tools(app: Any) -> None:
     @app.tool(
         description=(
             "Get the bibliography or reference list for one or more arXiv papers from INSPIRE. "
-            "Use this when the user asks what a paper cites."
+            "Use this when the user asks what a paper cites. Set enrich=true when titles, abstracts, "
+            "authors, and identifiers are needed for referenced papers."
         )
     )
-    def get_references(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_references(_one_or_many(paper_id, paper_ids), refresh=refresh)
+    def get_references(
+        paper_id: PaperId = None,
+        paper_ids: PaperIds = None,
+        refresh: Refresh = False,
+        enrich: EnrichReferences = False,
+    ) -> Any:
+        return service.get_references(_one_or_many(paper_id, paper_ids), refresh=refresh, enrich=enrich)
 
     @app.tool(
         description=(

@@ -12,6 +12,18 @@ def test_call_tool_dispatches_to_service(monkeypatch):
     assert result == {"ok": True, "data": "arXiv:0911.3380"}
 
 
+def test_call_tool_passes_reference_enrichment(monkeypatch):
+    def get_references(paper_ids, refresh=False, enrich=False):
+        return {"ok": True, "data": {"paper_ids": paper_ids, "refresh": refresh, "enrich": enrich}}
+
+    monkeypatch.setattr(server.service, "get_references", get_references)
+
+    result = server.call_tool("get_references", {"paper_id": "0911.3380", "enrich": True})
+
+    assert result["data"]["paper_ids"] == "0911.3380"
+    assert result["data"]["enrich"] is True
+
+
 def test_call_tool_rejects_unknown_tool():
     try:
         server.call_tool("missing", {})
@@ -33,6 +45,7 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "arXiv papers" in by_name["get_title"].description
     assert "LLM summary" in by_name["generate_LLM_summary"].description
     assert by_name["get_title"].inputSchema["properties"]["paper_id"]["description"].startswith("Single paper")
+    assert "enrich" in by_name["get_references"].inputSchema["properties"]
     assert by_name["get_section"].inputSchema["properties"]["section"]["description"].startswith("Section")
     assert "get_LLM_summary_status" in by_name
     assert "doctor_cache" in by_name
