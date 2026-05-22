@@ -1,0 +1,335 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Annotated, Any, Callable
+
+from arc_paper_query import service
+from arc_paper_query.batch.db import BatchDB
+from arc_paper_query.batch.runner import export_batch, prefetch_batch, run_batch
+from arc_paper_query.host import detect_host, select_llm_provider
+from pydantic import Field
+
+
+ToolHandler = Callable[[dict[str, Any]], Any]
+
+SERVER_INSTRUCTIONS = (
+    "Use ARC when a user asks about theoretical-physics papers or arXiv papers: "
+    "titles, abstracts, authors, references, citing papers, citation counts, "
+    "ar5iv table of contents, sections, equation context, or LLM paper summaries. "
+    "Paper IDs may be passed with or without the arXiv: prefix, for example "
+    "0911.3380, arXiv:0911.3380, or hep-th/0601001. For one paper use paper_id; "
+    "for multiple papers use paper_ids."
+)
+
+PAPER_ID_DESCRIPTION = (
+    "Single paper identifier. arXiv IDs may be written as 0911.3380, "
+    "arXiv:0911.3380, or hep-th/0601001."
+)
+PAPER_IDS_DESCRIPTION = "Multiple paper identifiers. Use this instead of paper_id for batch queries."
+REFRESH_DESCRIPTION = "Bypass cached data and refetch source metadata or full text when possible."
+SECTION_DESCRIPTION = "Section heading, section number, or section id to retrieve from the ar5iv full text."
+QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
+BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
+
+PaperId = Annotated[str | None, Field(description=PAPER_ID_DESCRIPTION)]
+PaperIds = Annotated[list[str] | None, Field(description=PAPER_IDS_DESCRIPTION)]
+Refresh = Annotated[bool, Field(description=REFRESH_DESCRIPTION)]
+Section = Annotated[str, Field(description=SECTION_DESCRIPTION)]
+EquationQuery = Annotated[str, Field(description=QUERY_DESCRIPTION)]
+BatchName = Annotated[str, Field(description=BATCH_NAME_DESCRIPTION)]
+
+
+def call_tool(name: str, arguments: dict[str, Any]) -> Any:
+    try:
+        handler = TOOL_HANDLERS[name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown ARC MCP tool: {name}") from exc
+    return handler(arguments)
+
+
+def _paper_ids(args: dict[str, Any]):
+    return args.get("paper_ids") or args.get("paper_id")
+
+
+TOOL_HANDLERS: dict[str, ToolHandler] = {
+    "get_title": lambda args: service.get_title(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_abstract": lambda args: service.get_abstract(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_authors": lambda args: service.get_authors(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_citers": lambda args: service.get_citers(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_citer_count": lambda args: service.get_citer_count(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_references": lambda args: service.get_references(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_toc": lambda args: service.get_toc(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_section": lambda args: service.get_section(
+        _paper_ids(args),
+        str(args["section"]),
+        refresh=bool(args.get("refresh", False)),
+    ),
+    "get_equation_context": lambda args: service.get_equation_context(
+        _paper_ids(args),
+        str(args["query"]),
+        refresh=bool(args.get("refresh", False)),
+    ),
+    "get_LLM_summary": lambda args: service.get_llm_summary(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "generate_LLM_summary": lambda args: service.generate_llm_summary(
+        _paper_ids(args),
+        provider=str(args.get("provider", "auto")),
+        model=args.get("model"),
+        refresh=bool(args.get("refresh", False)),
+    ),
+    "store_LLM_summary": lambda args: service.store_llm_summary(str(args["paper_id"]), args["summary"]),
+    "doctor_host": lambda args: {
+        "ok": True,
+        "data": detect_host().__dict__,
+        "errors": [],
+        "meta": {},
+    },
+    "doctor_provider": lambda args: {
+        "ok": True,
+        "data": {
+            "provider": select_llm_provider().provider,
+            "host": select_llm_provider().host.host,
+            "signals": select_llm_provider().signals,
+        },
+        "errors": [],
+        "meta": {},
+    },
+}
+
+
+def main() -> None:
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError as exc:
+        raise SystemExit("The 'mcp' package is required to run arc-mcp.") from exc
+
+    app = FastMCP("arc", instructions=SERVER_INSTRUCTIONS)
+    _register_tools(app)
+
+    app.run()
+
+
+def _one_or_many(paper_id: str | None = None, paper_ids: list[str] | None = None):
+    return paper_ids if paper_ids is not None else paper_id
+
+
+def _register_tools(app: Any) -> None:
+    @app.tool(
+        description=(
+            "Get the title of one or more arXiv papers from INSPIRE. "
+            "Use this when the user asks for a paper title or to identify a paper."
+        )
+    )
+    def get_title(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_title(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Get the abstract of one or more arXiv papers from INSPIRE. "
+            "Use this for paper overview, motivation, or abstract lookup."
+        )
+    )
+    def get_abstract(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_abstract(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Get authors for one or more arXiv papers from INSPIRE. "
+            "Use this when the user asks who wrote a paper."
+        )
+    )
+    def get_authors(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_authors(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Get papers that cite one or more arXiv papers using INSPIRE. "
+            "Citer data is cached with a time limit because it changes over time."
+        )
+    )
+    def get_citers(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_citers(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Get the INSPIRE citation count for one or more arXiv papers. "
+            "Use this when only the number of citing papers is needed."
+        )
+    )
+    def get_citer_count(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_citer_count(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Get the bibliography or reference list for one or more arXiv papers from INSPIRE. "
+            "Use this when the user asks what a paper cites."
+        )
+    )
+    def get_references(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_references(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Get the table of contents from ar5iv full text for one or more arXiv papers. "
+            "Use this before selecting sections to read."
+        )
+    )
+    def get_toc(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_toc(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Get a specific section from ar5iv full text for one or more arXiv papers. "
+            "If the section is not found, the response includes the table of contents."
+        )
+    )
+    def get_section(
+        section: Section,
+        paper_id: PaperId = None,
+        paper_ids: PaperIds = None,
+        refresh: Refresh = False,
+    ) -> Any:
+        return service.get_section(_one_or_many(paper_id, paper_ids), section, refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Find equation context in ar5iv full text for one or more arXiv papers. "
+            "Use this for equation labels, symbols, or nearby explanatory text."
+        )
+    )
+    def get_equation_context(
+        query: EquationQuery,
+        paper_id: PaperId = None,
+        paper_ids: PaperIds = None,
+        refresh: Refresh = False,
+    ) -> Any:
+        return service.get_equation_context(_one_or_many(paper_id, paper_ids), query, refresh=refresh)
+
+    @app.tool(
+        name="get_LLM_summary",
+        description=(
+            "Read a cached high-quality LLM summary for one or more arXiv papers, or return "
+            "a needs_llm task describing the summary to generate."
+        ),
+    )
+    def get_llm_summary(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_llm_summary(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        name="generate_LLM_summary",
+        description=(
+            "Generate and cache a high-quality LLM summary for one or more arXiv papers. "
+            "Provider auto-selects Codex CLI, Claude CLI, or manual fallback from the host."
+        ),
+    )
+    def generate_llm_summary(
+        paper_id: PaperId = None,
+        paper_ids: PaperIds = None,
+        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
+        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        refresh: Refresh = False,
+    ) -> Any:
+        return service.generate_llm_summary(
+            _one_or_many(paper_id, paper_ids),
+            provider=provider,
+            model=model,
+            refresh=refresh,
+        )
+
+    @app.tool(
+        name="store_LLM_summary",
+        description=(
+            "Validate and cache a schema-valid LLM paper summary for an arXiv paper. "
+            "Use after an agent generated summary JSON from a needs_llm task."
+        ),
+    )
+    def store_llm_summary(
+        paper_id: Annotated[str, Field(description=PAPER_ID_DESCRIPTION)],
+        summary: Annotated[dict[str, Any], Field(description="Schema-valid paper-summary-v1 JSON object.")],
+    ) -> Any:
+        return service.store_llm_summary(paper_id, summary)
+
+    @app.tool(
+        description=(
+            "Create a resumable batch for many paper summaries from a text file of paper IDs. "
+            "Use this for large jobs such as tens or hundreds of arXiv papers."
+        )
+    )
+    def summary_batch_create(
+        papers_file: Annotated[str, Field(description="Path to a text file containing one paper ID per line.")],
+        name: BatchName,
+        prompt_version: Annotated[str, Field(description="Summary prompt/schema version to use.")] = "paper-summary-v1",
+    ) -> Any:
+        db = BatchDB.default()
+        with open(papers_file, encoding="utf-8") as handle:
+            paper_ids = [line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")]
+        db.create_batch(name, paper_ids, prompt_version)
+        return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+
+    @app.tool(
+        description=(
+            "Prefetch deterministic paper data for a summary batch using local cache, ar5iv, and INSPIRE. "
+            "Run this before LLM generation for large batches."
+        )
+    )
+    def summary_batch_prefetch(
+        name: BatchName,
+        workers: Annotated[int, Field(description="Number of parallel prefetch worker threads.")] = 4,
+    ) -> Any:
+        return {"ok": True, "data": prefetch_batch(name, workers=workers), "errors": [], "meta": {}}
+
+    @app.tool(
+        description=(
+            "Run LLM summary generation for queued or ready items in a summary batch. "
+            "Use max_items for calibration before processing a large batch."
+        )
+    )
+    def summary_batch_run(
+        name: BatchName,
+        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
+        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        concurrency: Annotated[int, Field(description="Number of concurrent LLM summary generation workers.")] = 1,
+        max_items: Annotated[int | None, Field(description="Optional cap on items to process in this run.")] = None,
+    ) -> Any:
+        return {
+            "ok": True,
+            "data": run_batch(name, provider=provider, model=model, concurrency=concurrency, max_items=max_items),
+            "errors": [],
+            "meta": {},
+        }
+
+    @app.tool(description="Get status counts for a resumable paper-summary batch.")
+    def summary_batch_status(name: BatchName) -> Any:
+        db = BatchDB.default()
+        return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+
+    @app.tool(description="Export completed paper summaries from a batch to a JSONL file.")
+    def summary_batch_export(
+        name: BatchName,
+        output: Annotated[str, Field(description="Output path for exported JSONL summaries.")],
+    ) -> Any:
+        return {"ok": True, "data": export_batch(name, output=Path(output)), "errors": [], "meta": {}}
+
+    @app.tool(description="Move failed items in a paper-summary batch back to queued status for retry.")
+    def summary_batch_retry_failed(name: BatchName) -> Any:
+        db = BatchDB.default()
+        db.retry_failed(name)
+        return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+
+    @app.tool(description="Diagnose which coding-agent host ARC detected, such as Codex or Claude Code.")
+    def doctor_host() -> Any:
+        detected = detect_host()
+        return {"ok": True, "data": detected.__dict__, "errors": [], "meta": {}}
+
+    @app.tool(description="Diagnose which LLM provider ARC will use for summary generation.")
+    def doctor_provider() -> Any:
+        selected = select_llm_provider()
+        return {
+            "ok": True,
+            "data": {
+                "provider": selected.provider,
+                "host": selected.host.host,
+                "signals": selected.signals,
+            },
+            "errors": [],
+            "meta": {},
+        }

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "arc.paper-summary-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "paper_id",
+    "title",
+    "authors_short",
+    "high_value_summary",
+    "toc",
+    "reading_guide",
+    "warnings",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "arc.paper_llm_summary.v1"
+    },
+    "paper_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "authors_short": {
+      "type": "string",
+      "minLength": 1
+    },
+    "high_value_summary": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "toc": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section_id", "title", "one_sentence_summary"],
+        "properties": {
+          "section_id": {"type": "string"},
+          "title": {"type": "string"},
+          "one_sentence_summary": {"type": "string"}
+        }
+      }
+    },
+    "reading_guide": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["purpose", "sections", "reason"],
+        "properties": {
+          "purpose": {"type": "string"},
+          "sections": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["created_at", "method", "model", "prompt_version", "source_hash"],
+      "properties": {
+        "created_at": {"type": "string"},
+        "method": {
+          "type": "string",
+          "enum": ["manual", "codex-cli", "claude-cli", "openai", "anthropic"]
+        },
+        "model": {"type": "string"},
+        "prompt_version": {"const": "paper-summary-v1"},
+        "source_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

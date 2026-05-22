@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ARC_AGENT_HOST=claude-code
+export ARC_LLM_PROVIDER="${ARC_LLM_PROVIDER:-claude-cli}"
+
+exec arc-mcp "$@"

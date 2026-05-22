@@ -1,0 +1,46 @@
+# Reference snapshots
+0_ref/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging/build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Tool/runtime caches
+.cache/
+cache/
+.uv-cache/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo

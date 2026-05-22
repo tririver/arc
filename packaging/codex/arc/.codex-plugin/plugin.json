@@ -1,0 +1,25 @@
+{
+  "name": "arc",
+  "version": "0.1.0",
+  "description": "ARC paper-query and research workflow tools.",
+  "author": {
+    "name": "ARC"
+  },
+  "license": "MIT",
+  "keywords": ["arc", "papers", "arxiv", "inspire", "research"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ARC",
+    "shortDescription": "Paper query and research workflows",
+    "longDescription": "Cache-first ar5iv and INSPIRE paper tools with LLM summary workflows.",
+    "developerName": "ARC",
+    "category": "Productivity",
+    "capabilities": ["Research", "MCP"],
+    "defaultPrompt": [
+      "Summarize arXiv:0911.3380",
+      "Get references for a paper",
+      "Create a paper summary batch"
+    ]
+  }
+}
