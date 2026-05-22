@@ -1,78 +1,96 @@
-# Domain Info Reference
+# Arc Domain Package
 
-`arc-domain` builds cached research-domain artifacts from one seed paper
-and an optional user intent. Use it when the user asks for a research field,
-subfield map, foundation paper, domain network, or field briefing.
+`arc-domain` builds cached research-domain artifacts from a seed paper and an
+optional user intent. Use it for foundation-paper identification, domain paper
+selection, citation-network graphs, evidence packs, and compact field
+briefings.
 
-## CLI
+Intent affects the domain cache. A different intent string should be treated as
+a different domain selection.
 
-Full build:
+## Full Build CLI
+
+Phase 1: Start from a seed paper.
+Step 1: If the user gives an intent, pass it exactly after trimming outer
+whitespace.
+Step 2: Run:
 
 ```bash
 arc-domain llm-build 0911.3380 --intent "quasi-single-field inflation observables" --json
 ```
 
-Incremental steps:
+Phase 2: Inspect cached artifacts.
+Step 1: Check status and read outputs.
+
+```bash
+arc-domain status 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain get-summary 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain get-graph 0911.3380 --intent "quasi-single-field inflation observables" --json
+```
+
+Step 2: Report `network.html` when the user wants the graph visualization.
+
+## Incremental CLI
+
+Use incremental commands when debugging or when the user asks for an
+intermediate artifact.
+
+Phase 1: Identify the foundation paper.
+Step 1: Run:
 
 ```bash
 arc-domain llm-identify-foundation 0911.3380 --intent "..." --json
+```
+
+Phase 2: Build the network and evidence.
+Step 1: Run:
+
+```bash
 arc-domain llm-build-network 0911.3380 --intent "..." --json
 arc-domain build-evidence 0911.3380 --intent "..." --json
+```
+
+Phase 3: Summarize the domain.
+Step 1: Run:
+
+```bash
 arc-domain llm-summarize 0911.3380 --intent "..." --json
 ```
 
-Read cached artifacts:
+## MCP Tools
 
-```bash
-arc-domain status 0911.3380 --intent "..." --json
-arc-domain get-summary 0911.3380 --intent "..." --json
-arc-domain get-graph 0911.3380 --intent "..." --json
+Read `arc-mcp.md` before using MCP.
+
+Domain MCP tools:
+
+```text
+domain_status
+domain_get_summary
+domain_get_graph
+llm_domain_build
+llm_domain_get_summary
+llm_domain_get_graph
 ```
 
-## MCP
-
-Use `llm_domain_build` for long builds. It may call the host LLM provider, so
-it waits only until the MCP deadline margin. If the result is not ready, it
-returns a `job_id`. Pass `background=true` to schedule the build and return the
-`job_id` immediately.
-
-Phase 1: Check cached artifacts.
+Phase 1: Check cache-only artifacts.
 Step 1: Call `domain_get_summary` or `domain_get_graph`.
-Step 2: These tools are cache-only and do not call an LLM.
+Step 2: If artifacts are missing and the user wants them built, continue.
 
 Phase 2: Build missing artifacts.
 Step 1: Call `llm_domain_build`, `llm_domain_get_summary`, or
 `llm_domain_get_graph`.
 Step 2: Use `background=true` for slow builds or large job launches.
-Step 3: If MCP returns `status: "job_running"` with a `job_id`, run:
-
-```bash
-arc-mcp jobs watch <job_id> --json
-```
-
-Step 4: If the CLI watcher is unavailable, poll `job_status` or `domain_status`
-until status is `done`.
-Step 5: Do not call `cancel_job` unless the user explicitly asks.
-
-ARC stores MCP job state under `cache/arc-mcp/jobs/`. The CLI watcher and MCP
-tools read the same persisted job files.
-
-After completion:
-
-```text
-domain_get_summary(seed_paper="0911.3380", intent="...")
-domain_get_graph(seed_paper="0911.3380", intent="...")
-```
+Step 3: Follow the background-job procedure in `arc-mcp.md`.
 
 ## Artifacts
 
-The cache contains:
+The domain cache contains:
 
 - `foundation_pool.json`: seed, newest citers, seed references, and witness set.
 - `foundation_candidates.json`: top candidate foundation papers.
 - `foundation_selection.json`: LLM or deterministic foundation choice.
 - `citer_pool.json`: merged most-recent and most-cited foundation citers.
-- `selected_papers.json`: up to 50 papers selected for domain construction.
+- `selected_papers.json`: papers selected for domain construction.
 - `reference_overlap.json`: common references added to the network.
 - `domain_graph.json`: node/edge graph.
 - `network.html`: static visualization.
@@ -85,7 +103,8 @@ Default checkout cache:
 /arc-dev/cache/arc-domain/
 ```
 
-## Notes
+## Package Boundary
 
-All single-paper data access should go through `arc-paper`. Domain Info
-should not fetch INSPIRE or ar5iv directly except through that package.
+All single-paper metadata, references, citers, full text, and sections should
+come through `arc-paper`. Do not fetch INSPIRE or ar5iv directly inside domain
+workflows.

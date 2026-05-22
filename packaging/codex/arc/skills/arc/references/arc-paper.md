@@ -1,130 +1,164 @@
-# Arc Paper Reference
+# Arc Paper Package
 
-## Single Paper
+`arc-paper` is the single-paper information package. Use it for metadata,
+INSPIRE references/citers, ar5iv full text, table of contents, section lookup,
+equation context, LLM paper summaries, and paper-summary batches.
 
-Use the CLI with `--json`; outputs are result envelopes suitable for MCP:
+All single-paper operations in higher-level tools should go through
+`arc-paper`.
 
-```bash
-arc-paper get-title arXiv:0911.3380 --json
-arc-paper get-metadata arXiv:0911.3380 --json
-arc-paper get-section arXiv:0911.3380 --section S2 --json
-```
+## Deterministic CLI
 
-If `get-section` cannot find the requested section, it returns an error
-envelope plus `toc`. Use the returned `toc` to choose a valid section.
-
-For citing-paper lists:
+Phase 1: Fetch or read cached paper data.
+Step 1: Use `--json` for agent-readable result envelopes.
+Step 2: Prefer non-refreshing reads unless the user asks to refetch.
 
 ```bash
-arc-paper get-citers arXiv:0911.3380 --limit 1000 --sort mostrecent --json
-arc-paper get-citers arXiv:0911.3380 --limit 1000 --sort mostcited --json
+arc-paper get-title 0911.3380 --json
+arc-paper get-abstract 0911.3380 --json
+arc-paper get-authors 0911.3380 --json
+arc-paper get-metadata 0911.3380 --json
+arc-paper get-references 0911.3380 --json
+arc-paper get-citers 0911.3380 --limit 1000 --sort mostrecent --json
+arc-paper get-citers 0911.3380 --limit 1000 --sort mostcited --json
+arc-paper get-citer-count 0911.3380 --json
+arc-paper get-toc 0911.3380 --json
+arc-paper get-section 0911.3380 --section S2 --json
+arc-paper get-equation-context 0911.3380 --query "dot theta" --json
 ```
 
-INSPIRE citer responses are cached for one month and include title, abstract,
-authors, identifiers, year, and citation count when INSPIRE returns those
-fields.
+Phase 2: Resolve missing sections.
+Step 1: If `get-section` cannot find the requested section, read the returned
+`toc`.
+Step 2: Retry with a valid section id, number, or heading from that `toc`.
 
-## LLM Summary
+## LLM Summary CLI
 
-Get or build the summary:
+Phase 1: Try the cached-or-generate command.
+Step 1: Run:
 
 ```bash
-arc-paper llm-summary arXiv:0911.3380 --json
+arc-paper llm-summary 0911.3380 --json
 ```
 
-This command first checks the cache. If the summary is missing and a host LLM
-provider is available, it generates and caches the summary automatically.
-ARC uses fast summary defaults unless overridden: `gpt-5.4-mini` for Codex and
-`haiku` for Claude Code. Summary generation first creates short section
-summaries sequentially, then synthesizes the paper-level summary from title,
-abstract, TOC, and section summaries. The final JSON keeps `toc` as navigation
-metadata and stores the canonical per-section content under
-`section_summaries`. References are intentionally omitted from the summary input
-pack.
+Step 2: If it returns a summary, use it.
+Step 3: If it returns `status: "needs_llm"`, use the manual fallback below.
 
-When using MCP, use `llm_get_summary` or `llm_generate_summary`. These tools may
-call the host LLM provider, so they wait only until the MCP deadline margin. If
-the result is not ready, they return a `job_id`. Pass `background=true` to
-schedule the job and return the `job_id` immediately.
-
-Phase 1: Start or reuse the result.
-Step 1: Call `llm_get_summary`.
-Step 2: If it returns a result, use it.
-Step 3: For massive or slow launches, call `llm_get_summary` or
-`llm_generate_summary` with `background=true`.
-Step 4: If it returns `status: "job_running"` with a `job_id`, run:
+Phase 2: Explicitly generate or refresh when needed.
+Step 1: Use this when the user asks to regenerate, choose a provider, or bypass
+an old cache:
 
 ```bash
-arc-mcp jobs watch <job_id> --json
+arc-paper llm-generate-summary 0911.3380 --provider auto --json
+arc-paper llm-generate-summary 0911.3380 --provider codex-cli --model gpt-5.4-mini --json
 ```
 
-Phase 2: Read the result.
-Step 1: Use the CLI watcher output as the final result.
-Step 2: If the CLI watcher is unavailable, poll `job_status` and call
-`job_result` when status is `done`.
-Step 3: If status is `needs_llm`, use the manual fallback below.
-Step 4: Do not call `cancel_job` unless the user explicitly asks.
+Step 2: Use `--refresh` only when the user wants fresh source data or a forced
+new summary.
 
-ARC stores MCP job state under `cache/arc-mcp/jobs/`. The CLI watcher and MCP
-tools read the same persisted job files.
+Summary generation first writes section summaries, then synthesizes the final
+paper summary from title, abstract, TOC, and section summaries. References are
+intentionally omitted from the summary input pack.
 
-If the result has `status: "needs_llm"`, no runnable provider was available.
-Use the manual fallback:
+## Manual Summary Fallback
 
-1. Use `llm_task.system_prompt`, `llm_task.user_prompt`, `llm_task.input_pack`,
-   and `llm_task.output_schema`.
-2. Generate JSON only, conforming to `output_schema`.
-3. Call:
+Use this only when no runnable host LLM provider is available and the command
+returns `status: "needs_llm"`.
+
+Phase 1: Generate schema-valid JSON.
+Step 1: Use `llm_task.system_prompt`, `llm_task.user_prompt`,
+`llm_task.input_pack`, and `llm_task.output_schema`.
+Step 2: Return JSON only, conforming to `output_schema`.
+
+Phase 2: Store the summary.
+Step 1: Pipe the generated JSON into:
 
 ```bash
-arc-paper store-llm-summary arXiv:0911.3380 --summary-json - --json
+arc-paper store-llm-summary 0911.3380 --summary-json - --json
 ```
 
-For explicit generation through the host CLI or provider override:
+## Batch Summary CLI
 
-```bash
-arc-paper llm-generate-summary arXiv:0911.3380 --provider auto --json
-```
+Use summary batches for more than 10 papers. Do not run one interactive LLM
+step per paper.
 
-`--provider auto` uses `ARC_LLM_PROVIDER` first, then `ARC_AGENT_HOST`, then
-parent-process detection. Plugin wrappers set these env vars automatically.
-
-## Batch Summary
-
-For more than 10 papers:
+Phase 1: Create and prefetch.
+Step 1: Put one paper id per line in a text file.
+Step 2: Run:
 
 ```bash
 arc-paper summary-batch create papers.txt --name qft-ideas --json
 arc-paper summary-batch prefetch qft-ideas --workers 8 --json
-arc-paper summary-batch run qft-ideas --provider auto --concurrency 2 --max-items 10 --json
 arc-paper summary-batch status qft-ideas --json
 ```
 
-Review the first 10 summaries before running the full batch:
+Phase 2: Generate in controlled chunks.
+Step 1: Review the first chunk before launching the full batch.
 
 ```bash
+arc-paper summary-batch run qft-ideas --provider auto --concurrency 2 --max-items 10 --json
 arc-paper summary-batch run qft-ideas --provider auto --concurrency 2 --json
+```
+
+Step 2: Export completed summaries.
+
+```bash
 arc-paper summary-batch export qft-ideas --format jsonl --output summaries.jsonl --json
 ```
 
-Retry failures:
+Step 3: Retry failures only after checking the error cause.
 
 ```bash
 arc-paper summary-batch retry-failed qft-ideas --json
 ```
 
-## Troubleshooting
+## MCP Tools
 
-Check host and provider detection:
+Read `arc-mcp.md` before using MCP.
 
-```bash
-arc-paper doctor host --json
-arc-paper doctor provider --json
-```
-
-Expected plugin env:
+Paper MCP tools:
 
 ```text
-Codex: ARC_AGENT_HOST=codex, ARC_LLM_PROVIDER=codex-cli
-Claude Code: ARC_AGENT_HOST=claude-code, ARC_LLM_PROVIDER=claude-cli
+get_title
+get_abstract
+get_authors
+get_metadata
+get_references
+get_citers
+get_citer_count
+get_toc
+get_section
+get_equation_context
+llm_get_summary
+llm_generate_summary
+store_llm_summary
+summary_batch_create
+summary_batch_prefetch
+llm_summary_batch_run
+summary_batch_status
+summary_batch_export
+summary_batch_retry_failed
+```
+
+For LLM paper summaries through MCP, use `background=true` for slow or massive
+launches and then follow `arc-mcp.md`.
+
+## Cache Notes
+
+Default checkout cache:
+
+```text
+/arc-dev/cache/arc-paper/
+```
+
+INSPIRE citer lists are cached for one month. Cached citer records include
+title, abstract, authors, identifiers, year, and citation count when INSPIRE
+returns those fields.
+
+Check cache/provider state:
+
+```bash
+arc-paper doctor cache 0911.3380 --json
+arc-paper doctor host --json
+arc-paper doctor provider --json
 ```
