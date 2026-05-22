@@ -59,7 +59,7 @@ arc-domain llm-summarize 0911.3380 --intent "..." --json
 
 ## MCP Tools
 
-Read `arc-mcp.md` before using MCP.
+Read `references/package-manuals/arc-mcp.md` before using MCP.
 
 Domain MCP tools:
 
@@ -80,7 +80,8 @@ Phase 2: Build missing artifacts.
 Step 1: Call `llm_domain_build`, `llm_domain_get_summary`, or
 `llm_domain_get_graph`.
 Step 2: Use `background=true` for slow builds or large job launches.
-Step 3: Follow the background-job procedure in `arc-mcp.md`.
+Step 3: Follow the background-job procedure in
+`references/package-manuals/arc-mcp.md`.
 
 ## Artifacts
 

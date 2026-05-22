@@ -114,7 +114,7 @@ arc-paper summary-batch retry-failed qft-ideas --json
 
 ## MCP Tools
 
-Read `arc-mcp.md` before using MCP.
+Read `references/package-manuals/arc-mcp.md` before using MCP.
 
 Paper MCP tools:
 
@@ -141,7 +141,7 @@ summary_batch_retry_failed
 ```
 
 For LLM paper summaries through MCP, use `background=true` for slow or massive
-launches and then follow `arc-mcp.md`.
+launches and then follow `references/package-manuals/arc-mcp.md`.
 
 ## Cache Notes
 
