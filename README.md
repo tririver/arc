@@ -43,14 +43,15 @@ arc-paper get-section arXiv:0911.3380 --section S2 --json
 LLM summaries:
 
 ```bash
-arc-paper get-llm-summary arXiv:0911.3380 --json
-arc-paper generate-llm-summary arXiv:0911.3380 --provider auto --json
+arc-paper llm-summary arXiv:0911.3380 --json
+arc-paper llm-generate-summary arXiv:0911.3380 --provider auto --json
 ```
 
-`get-llm-summary` first reads the local summary cache. If the summary is
-missing and a host LLM provider is available, it generates and caches the
-summary automatically. `generate-llm-summary` remains available when you want an
-explicit generation command or provider override.
+`llm-summary` first reads the local summary cache. If the summary is missing
+and a host LLM provider is available, it generates and caches the summary
+automatically. `llm-generate-summary` remains available when you want an
+explicit generation command or provider override. Legacy aliases
+`get-llm-summary` and `generate-llm-summary` still work.
 
 Summary generation uses fast host defaults unless overridden: Codex uses
 `gpt-5.4-mini`, and Claude Code uses `haiku`. The LLM pipeline summarizes paper
@@ -60,15 +61,30 @@ JSON keeps `toc` as navigation metadata and stores the richer per-section text
 under `section_summaries`; it does not rewrite those into one-sentence TOC
 entries. References are intentionally not included in the summary input pack.
 
-When called through MCP, `get_LLM_summary` and `generate_LLM_summary` avoid long
-tool calls: if no cached summary is available, they start a background job and
-return a `job_id`. Poll `get_LLM_summary_status` with that `job_id` for
-completion and progress fields such as `phase`, `sections_completed`,
-`sections_total`, `current_section`, and recent `events`. Completed section
-summaries are cached as they finish, so a failed or interrupted job can resume
-without paying again for sections that already completed. MCP background jobs do
-not stream or push a completion notification; clients should poll the status
-tool.
+When called through MCP, tools that may invoke the host LLM are prefixed
+`llm_`. They start the work, wait briefly, and return before the MCP client
+timeout. If the result is not ready, they return a `job_id`. Poll
+`job_status` and read with `job_result`, or use the blocking CLI watcher:
+
+```bash
+arc-mcp jobs watch <job_id> --json
+```
+
+MCP jobs are persisted under `cache/arc-mcp/jobs/`, so MCP tools and CLI tools
+read the same job state. Completed section summaries are cached as they finish,
+so a failed or interrupted paper-summary job can resume without paying again for
+sections that already completed. MCP background jobs do not stream or push a
+completion notification; clients should poll or use the CLI watcher. Do not call
+`cancel_job` unless the user explicitly asks.
+
+MCP LLM tools use this deadline rule: `ARC_MCP_INLINE_WAIT_SEC` if set;
+otherwise `ARC_MCP_TOOL_TIMEOUT_SEC - ARC_MCP_BACKGROUND_MARGIN_SEC`; otherwise
+a best-effort Codex `tool_timeout_sec` read from `~/.codex/config.toml`;
+otherwise 90 seconds.
+
+Job status includes ETA information after enough matching jobs have completed.
+ARC stores runtime history in `cache/arc-mcp/stats/jobs.sqlite`; before three
+similar samples exist, ETA is marked as unavailable.
 
 Batch workflow:
 
@@ -119,7 +135,7 @@ Build a cached research-domain package from one seed paper plus an optional
 intent:
 
 ```bash
-arc-domain build 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain llm-build 0911.3380 --intent "quasi-single-field inflation observables" --json
 arc-domain status 0911.3380 --intent "quasi-single-field inflation observables" --json
 arc-domain get-summary 0911.3380 --intent "quasi-single-field inflation observables" --json
 arc-domain get-graph 0911.3380 --intent "quasi-single-field inflation observables" --json
@@ -130,7 +146,8 @@ identifies a likely foundation paper, builds a citation-domain graph of up to
 about 60 nodes, renders `network.html`, builds an evidence pack from titles,
 abstracts, and conclusion/outlook sections, then asks `arc-llm` for a
 compact field briefing. If the host LLM is unavailable, deterministic fallback
-artifacts are still written so the cache is inspectable.
+artifacts are still written so the cache is inspectable. Legacy aliases such as
+`arc-domain build` still work.
 
 When ARC is run from this checkout without `ARC_DOMAIN_CACHE` or
 `XDG_CACHE_HOME`, domain data is cached under:
@@ -139,25 +156,41 @@ When ARC is run from this checkout without `ARC_DOMAIN_CACHE` or
 /arc-dev/cache/arc-domain/
 ```
 
+ARC MCP job state is cached under:
+
+```text
+/arc-dev/cache/arc-mcp/
+```
+
 ## MCP
 
 Install the packages above, then configure the MCP server command as
 `arc-mcp`. The ARC MCP server exposes paper tools such as `get_metadata`,
-`get_references`, `get_citers`, `get_section`, `get_LLM_summary`, and domain
-tools:
+`get_references`, `get_citers`, `get_section`, and cache-only domain tools.
+Anything that can invoke the host LLM has an `llm_` prefix:
 
 ```text
-domain_build(seed_paper, intent="", provider="auto")
+llm_get_summary(paper_id, provider="auto")
+llm_generate_summary(paper_id, provider="auto")
+llm_domain_build(seed_paper, intent="", provider="auto")
 domain_status(job_id) or domain_status(seed_paper, intent="")
 domain_get_summary(seed_paper, intent="")
 domain_get_graph(seed_paper, intent="")
+job_status(job_id)
+job_result(job_id)
+cancel_job(job_id)
 ```
 
-`domain_build` returns immediately with a `job_id`; poll `domain_status` until
-the job is `done`, then read the cached summary or graph. `domain_get_summary`
-and `domain_get_graph` are also cache-first: if the artifact is missing and a
-`seed_paper` is supplied, they start the same background build and return a
-`job_id`.
+`llm_domain_build` may return a completed result if it finishes before the MCP
+deadline margin, otherwise it returns a `job_id`. In skill workflows, prefer:
+
+```bash
+arc-mcp jobs watch <job_id> --json
+```
+
+Then read the cached summary or graph. `domain_get_summary` and
+`domain_get_graph` are cache-only. Use `llm_domain_get_summary` or
+`llm_domain_get_graph` when a missing artifact should trigger a domain build.
 
 ## Reference Code
 

@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
 from typing import Annotated, Any, Callable
-from uuid import uuid4
 
 from arc_domain import service as domain_service
 from arc_paper import service
@@ -15,20 +11,18 @@ from arc_paper.host import detect_host, select_llm_provider
 from arc_paper.ids import normalize_paper_id
 from pydantic import Field
 
+from .jobs import MCPJobCancelled, MCPJobManager, resolve_inline_wait_seconds
+
 
 ToolHandler = Callable[[dict[str, Any]], Any]
-SUMMARY_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="arc-summary")
-DOMAIN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="arc-domain")
-SUMMARY_JOBS: dict[str, dict[str, Any]] = {}
-DOMAIN_JOBS: dict[str, dict[str, Any]] = {}
-SUMMARY_LOCK = Lock()
-DOMAIN_LOCK = Lock()
+MCP_JOBS = MCPJobManager(max_workers=1)
 
 SERVER_INSTRUCTIONS = (
     "Use ARC when a user asks about theoretical-physics papers or arXiv papers: "
     "titles, abstracts, authors, references, citing papers, citation counts, "
-    "ar5iv table of contents, sections, equation context, LLM paper summaries, "
-    "or research-domain construction from a seed paper. "
+    "ar5iv table of contents, sections, equation context, cached LLM paper summaries, "
+    "or cached research-domain artifacts from a seed paper. "
+    "Tools that may call an LLM provider are prefixed with llm_. "
     "Paper IDs may be passed with or without the arXiv: prefix, for example "
     "0911.3380, arXiv:0911.3380, or hep-th/0601001. For one paper use paper_id; "
     "for multiple papers use paper_ids."
@@ -48,9 +42,15 @@ SECTION_DESCRIPTION = "Section heading, section number, or section id to retriev
 QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
 BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
 DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific interest or desired subfield scope."
-DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by domain_build or arc-domain init."
+DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by llm_domain_build or arc-domain init."
 CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIRE, clamped to 1..1000."
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
+LLM_PROVIDER_DESCRIPTION = "LLM provider: auto, codex-cli, claude-cli, or manual."
+LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
+JOB_CANCEL_DESCRIPTION = (
+    "Cancel an MCP job. Do not use this unless the user explicitly asks; cancelling may waste work "
+    "and leave a requested cached artifact unfinished."
+)
 
 PaperId = Annotated[str | None, Field(description=PAPER_ID_DESCRIPTION)]
 PaperIds = Annotated[list[str] | None, Field(description=PAPER_IDS_DESCRIPTION)]
@@ -63,6 +63,8 @@ DomainIntent = Annotated[str, Field(description=DOMAIN_INTENT_DESCRIPTION)]
 DomainId = Annotated[str | None, Field(description=DOMAIN_ID_DESCRIPTION)]
 CiterLimit = Annotated[int, Field(description=CITER_LIMIT_DESCRIPTION)]
 CiterSort = Annotated[str, Field(description=CITER_SORT_DESCRIPTION)]
+LLMProvider = Annotated[str, Field(description=LLM_PROVIDER_DESCRIPTION)]
+LLMModel = Annotated[str | None, Field(description=LLM_MODEL_DESCRIPTION)]
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -105,15 +107,18 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         str(args["query"]),
         refresh=bool(args.get("refresh", False)),
     ),
-    "get_LLM_summary": lambda args: _cached_or_start_summary_job(args),
-    "generate_LLM_summary": lambda args: _start_summary_job_response(
+    "llm_get_summary": lambda args: _cached_or_start_summary_job(args),
+    "llm_generate_summary": lambda args: _start_summary_job_response(
         _paper_ids(args),
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
         refresh=bool(args.get("refresh", False)),
     ),
-    "get_LLM_summary_status": lambda args: get_summary_job_status(str(args["job_id"])),
-    "store_LLM_summary": lambda args: service.store_llm_summary(str(args["paper_id"]), args["summary"]),
+    "job_status": lambda args: job_status(str(args["job_id"])),
+    "job_result": lambda args: job_result(str(args["job_id"])),
+    "cancel_job": lambda args: cancel_job(str(args["job_id"])),
+    "list_jobs": lambda args: list_jobs(),
+    "store_llm_summary": lambda args: service.store_llm_summary(str(args["paper_id"]), args["summary"]),
     "doctor_host": lambda args: {
         "ok": True,
         "data": detect_host().__dict__,
@@ -131,10 +136,13 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         "meta": {},
     },
     "doctor_cache": lambda args: service.doctor_cache(args.get("paper_id")),
-    "domain_build": lambda args: _start_domain_job_response(args),
+    "llm_domain_build": lambda args: _start_domain_job_response(args),
     "domain_status": lambda args: _domain_status_response(args),
-    "domain_get_summary": lambda args: _domain_artifact_or_start(args, artifact="summary"),
-    "domain_get_graph": lambda args: _domain_artifact_or_start(args, artifact="graph"),
+    "domain_get_summary": lambda args: _domain_artifact(args, artifact="summary"),
+    "domain_get_graph": lambda args: _domain_artifact(args, artifact="graph"),
+    "llm_domain_get_summary": lambda args: _domain_artifact_or_start(args, artifact="summary"),
+    "llm_domain_get_graph": lambda args: _domain_artifact_or_start(args, artifact="graph"),
+    "llm_summary_batch_run": lambda args: _run_summary_batch_inline(args),
 }
 
 
@@ -159,13 +167,10 @@ def _start_summary_job_response(
     model: str | None,
     refresh: bool,
 ) -> dict[str, Any]:
-    job_id = uuid4().hex
     normalized = _normalize_ids(paper_ids)
-    with SUMMARY_LOCK:
-        SUMMARY_JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "running",
-            "phase": "queued",
+    job_id = MCP_JOBS.start(
+        job_type="paper_summary",
+        payload={
             "paper_ids": normalized,
             "provider": provider,
             "model": model,
@@ -173,40 +178,19 @@ def _start_summary_job_response(
             "sections_total": None,
             "sections_completed": 0,
             "current_section": None,
-            "events": [],
-            "started_at": _now_iso(),
-            "updated_at": _now_iso(),
-            "result": None,
-            "error": None,
-        }
-    future = SUMMARY_EXECUTOR.submit(_run_summary_job, job_id, normalized, provider, model, refresh)
-    future.add_done_callback(_capture_unhandled_job_error(job_id))
-    return {
-        "ok": False,
-        "status": "summary_job_started",
-        "job_id": job_id,
-        "paper_ids": normalized,
-        "message": "No cached LLM summary was returned immediately; background generation has started.",
-        "next": {
-            "tool": "get_LLM_summary_status",
-            "arguments": {"job_id": job_id},
-            "poll_after_seconds": 5,
         },
-    }
+        runner=lambda progress, cancel: _run_summary_job(normalized, provider, model, refresh, progress, cancel),
+        status_resolver=_arc_result_status,
+    )
+    return _wait_or_background(
+        job_id,
+        message="LLM summary is still running in the background.",
+        poll_after_seconds=5,
+    )
 
 
 def get_summary_job_status(job_id: str) -> dict[str, Any]:
-    with SUMMARY_LOCK:
-        job = SUMMARY_JOBS.get(job_id)
-        if not job:
-            return {
-                "ok": False,
-                "status": "summary_job_unknown",
-                "error": {"code": "summary_job_unknown", "message": f"Unknown summary job: {job_id}"},
-                "errors": [],
-                "meta": {},
-            }
-        return {key: value for key, value in job.items() if key != "future"}
+    return job_status(job_id)
 
 
 def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
@@ -217,12 +201,9 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
     model = args.get("model")
     refresh = bool(args.get("refresh", False))
     workers = int(args.get("workers", 8))
-    job_id = uuid4().hex
-    with DOMAIN_LOCK:
-        DOMAIN_JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "running",
-            "phase": "queued",
+    job_id = MCP_JOBS.start(
+        job_type="domain_build",
+        payload={
             "seed_paper": normalize_paper_id(seed_paper),
             "intent": intent,
             "domain_id": domain_id,
@@ -230,34 +211,25 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
             "model": model,
             "refresh": refresh,
             "workers": workers,
-            "started_at": _now_iso(),
-            "updated_at": _now_iso(),
-            "result": None,
-            "error": None,
-        }
-    future = DOMAIN_EXECUTOR.submit(
-        _run_domain_job,
-        job_id,
-        seed_paper,
-        intent,
-        domain_id,
-        provider,
-        model,
-        refresh,
-        workers,
-    )
-    future.add_done_callback(_capture_unhandled_domain_job_error(job_id))
-    return {
-        "ok": False,
-        "status": "domain_job_started",
-        "job_id": job_id,
-        "message": "Domain build has started in the background.",
-        "next": {
-            "tool": "domain_status",
-            "arguments": {"job_id": job_id},
-            "poll_after_seconds": 10,
         },
-    }
+        runner=lambda progress, cancel: _run_domain_job(
+            seed_paper,
+            intent,
+            domain_id,
+            provider,
+            model,
+            refresh,
+            workers,
+            progress,
+            cancel,
+        ),
+        status_resolver=_arc_result_status,
+    )
+    return _wait_or_background(
+        job_id,
+        message="Domain build is still running in the background.",
+        poll_after_seconds=10,
+    )
 
 
 def _domain_status_response(args: dict[str, Any]) -> dict[str, Any]:
@@ -270,43 +242,38 @@ def _domain_status_response(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _domain_artifact_or_start(args: dict[str, Any], *, artifact: str) -> dict[str, Any]:
+def _domain_artifact(args: dict[str, Any], *, artifact: str) -> dict[str, Any]:
     if artifact == "summary":
-        result = domain_service.get_domain_summary(
+        return domain_service.get_domain_summary(
             args.get("seed_paper"),
             intent=str(args.get("intent", "")),
             domain_id=args.get("domain_id"),
         )
     elif artifact == "graph":
-        result = domain_service.get_domain_graph(
+        return domain_service.get_domain_graph(
             args.get("seed_paper"),
             intent=str(args.get("intent", "")),
             domain_id=args.get("domain_id"),
         )
-    else:
-        raise ValueError(f"Unsupported domain artifact: {artifact}")
+    raise ValueError(f"Unsupported domain artifact: {artifact}")
+
+
+def _domain_artifact_or_start(args: dict[str, Any], *, artifact: str) -> dict[str, Any]:
+    result = _domain_artifact(args, artifact=artifact)
     if result.get("ok") or not args.get("seed_paper"):
         return result
     error_code = (result.get("error") or {}).get("code")
     if error_code not in {"domain_summary_not_available", "domain_graph_not_available"}:
         return result
-    started = _start_domain_job_response(args)
-    started["message"] = f"No cached domain {artifact} was returned immediately; background domain build has started."
-    return started
+    return _start_domain_job_response(args)
 
 
 def get_domain_job_status(job_id: str) -> dict[str, Any]:
-    with DOMAIN_LOCK:
-        job = DOMAIN_JOBS.get(job_id)
-        if not job:
-            return {
-                "ok": False,
-                "status": "domain_job_unknown",
-                "error": {"code": "domain_job_unknown", "message": f"Unknown domain job: {job_id}"},
-                "errors": [],
-                "meta": {},
-            }
-        snapshot = dict(job)
+    snapshot = job_status(job_id)
+    if snapshot.get("status") == "job_unknown":
+        return snapshot
+    if snapshot.get("job_type") != "domain_build":
+        return snapshot
     try:
         snapshot["domain_status"] = domain_service.status(
             snapshot.get("seed_paper"),
@@ -319,7 +286,6 @@ def get_domain_job_status(job_id: str) -> dict[str, Any]:
 
 
 def _run_domain_job(
-    job_id: str,
     seed_paper: str,
     intent: str,
     domain_id: str | None,
@@ -327,8 +293,12 @@ def _run_domain_job(
     model: str | None,
     refresh: bool,
     workers: int,
-) -> None:
-    _record_domain_phase(job_id, "running")
+    progress: Callable[[dict[str, Any]], None],
+    cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    if cancel():
+        raise MCPJobCancelled("MCP job cancellation was requested.")
+    progress({"event": "domain_started", "seed_paper": normalize_paper_id(seed_paper), "intent": intent})
     result = domain_service.build_domain(
         seed_paper,
         intent=intent,
@@ -338,102 +308,159 @@ def _run_domain_job(
         refresh=refresh,
         workers=workers,
     )
-    status = "done" if isinstance(result, dict) and result.get("ok") else "failed"
-    with DOMAIN_LOCK:
-        if job_id in DOMAIN_JOBS:
-            DOMAIN_JOBS[job_id]["status"] = status
-            DOMAIN_JOBS[job_id]["phase"] = status
-            DOMAIN_JOBS[job_id]["updated_at"] = _now_iso()
-            DOMAIN_JOBS[job_id]["result"] = result
+    progress({"event": "domain_completed" if _all_ok(result) else "domain_failed"})
+    return result
 
 
-def _capture_unhandled_domain_job_error(job_id: str) -> Callable[[Future], None]:
-    def callback(future: Future) -> None:
-        exc = future.exception()
-        if not exc:
-            return
-        with DOMAIN_LOCK:
-            if job_id in DOMAIN_JOBS:
-                DOMAIN_JOBS[job_id]["status"] = "failed"
-                DOMAIN_JOBS[job_id]["phase"] = "failed"
-                DOMAIN_JOBS[job_id]["updated_at"] = _now_iso()
-                DOMAIN_JOBS[job_id]["error"] = str(exc)
-
-    return callback
-
-
-def _record_domain_phase(job_id: str, phase: str) -> None:
-    with DOMAIN_LOCK:
-        if job_id in DOMAIN_JOBS:
-            DOMAIN_JOBS[job_id]["phase"] = phase
-            DOMAIN_JOBS[job_id]["updated_at"] = _now_iso()
-
-
-def _run_summary_job(job_id: str, paper_ids: Any, provider: str, model: str | None, refresh: bool) -> None:
-    _record_summary_progress(job_id, {"event": "job_started"})
-    result = service.generate_llm_summary(
+def _run_summary_job(
+    paper_ids: Any,
+    provider: str,
+    model: str | None,
+    refresh: bool,
+    progress: Callable[[dict[str, Any]], None],
+    cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    if cancel():
+        raise MCPJobCancelled("MCP job cancellation was requested.")
+    progress({"event": "job_started"})
+    return service.generate_llm_summary(
         paper_ids,
         provider=provider,
         model=model,
         refresh=refresh,
-        progress_callback=lambda event: _record_summary_progress(job_id, event),
+        progress_callback=progress,
     )
+
+
+def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args["name"])
+    provider = str(args.get("provider", "auto"))
+    model = args.get("model")
+    concurrency = int(args.get("concurrency", 1))
+    max_items = args.get("max_items")
+    max_items_int = int(max_items) if max_items is not None else None
+    job_id = MCP_JOBS.start(
+        job_type="summary_batch_run",
+        payload={
+            "name": name,
+            "provider": provider,
+            "model": model,
+            "concurrency": concurrency,
+            "max_items": max_items_int,
+        },
+        runner=lambda progress, cancel: _run_summary_batch_job(
+            name, provider, model, concurrency, max_items_int, progress, cancel
+        ),
+        status_resolver=_arc_result_status,
+    )
+    return _wait_or_background(
+        job_id,
+        message="LLM summary batch is still running in the background.",
+        poll_after_seconds=10,
+    )
+
+
+def _run_summary_batch_job(
+    name: str,
+    provider: str,
+    model: str | None,
+    concurrency: int,
+    max_items: int | None,
+    progress: Callable[[dict[str, Any]], None],
+    cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    if cancel():
+        raise MCPJobCancelled("MCP job cancellation was requested.")
+    progress({"event": "summary_batch_started", "name": name})
+    result = run_batch(name, provider=provider, model=model, concurrency=concurrency, max_items=max_items)
+    progress({"event": "summary_batch_completed", "name": name})
+    return {"ok": True, "data": result, "errors": [], "meta": {}}
+
+
+def _wait_or_background(job_id: str, *, message: str, poll_after_seconds: int) -> dict[str, Any]:
+    inline_wait = resolve_inline_wait_seconds(server_name="arc")
+    if MCP_JOBS.wait(job_id, timeout=inline_wait):
+        status = job_status(job_id)
+        wrapped = MCP_JOBS.result(job_id)
+        result = wrapped.get("result") if isinstance(wrapped, dict) else None
+        if isinstance(result, dict):
+            return _attach_job_meta(result, status)
+        return wrapped
+    status = job_status(job_id)
+    return {
+        "ok": False,
+        "status": "job_running",
+        "job_id": job_id,
+        "job_type": status.get("job_type"),
+        "message": message,
+        "inline_wait_seconds": inline_wait,
+        "next": {
+            "cli_command": f"arc-mcp jobs watch {job_id} --json",
+            "tool": "job_status",
+            "arguments": {"job_id": job_id},
+            "poll_after_seconds": poll_after_seconds,
+        },
+        "job": status,
+        "errors": [],
+        "meta": {},
+    }
+
+
+def job_status(job_id: str) -> dict[str, Any]:
+    status = MCP_JOBS.status(job_id)
+    if status.get("job_type") == "paper_summary":
+        _normalize_summary_status(status)
+    return status
+
+
+def job_result(job_id: str) -> dict[str, Any]:
+    return MCP_JOBS.result(job_id)
+
+
+def cancel_job(job_id: str) -> dict[str, Any]:
+    return MCP_JOBS.cancel(job_id)
+
+
+def list_jobs() -> dict[str, Any]:
+    return MCP_JOBS.list_jobs()
+
+
+def _normalize_summary_status(status: dict[str, Any]) -> None:
+    event_name = str(status.get("phase") or "")
+    if event_name in {"section_started", "section_cached", "section_completed"}:
+        status["current_section"] = {
+            "paper_id": status.get("paper_id"),
+            "section_index": status.get("section_index"),
+            "sections_total": status.get("sections_total"),
+            "section_id": status.get("section_id"),
+            "title": status.get("title"),
+        }
+    elif event_name.startswith("final_") or event_name in {"done", "failed", "needs_llm", "cancelled"}:
+        status["current_section"] = None
+
+
+def _attach_job_meta(result: dict[str, Any], status: dict[str, Any]) -> dict[str, Any]:
+    output = dict(result)
+    meta = dict(output.get("meta") or {})
+    meta["job"] = {
+        "job_id": status.get("job_id"),
+        "job_type": status.get("job_type"),
+        "status": status.get("status"),
+        "phase": status.get("phase"),
+        "started_at": status.get("started_at"),
+        "updated_at": status.get("updated_at"),
+        "finished_at": status.get("finished_at"),
+    }
+    output["meta"] = meta
+    return output
+
+
+def _arc_result_status(result: Any) -> str:
     if _all_ok(result):
-        status = "done"
-    elif isinstance(result, dict) and result.get("status") == "needs_llm":
-        status = "needs_llm"
-    else:
-        status = "failed"
-    with SUMMARY_LOCK:
-        if job_id in SUMMARY_JOBS:
-            SUMMARY_JOBS[job_id]["status"] = status
-            SUMMARY_JOBS[job_id]["phase"] = status
-            SUMMARY_JOBS[job_id]["updated_at"] = _now_iso()
-            SUMMARY_JOBS[job_id]["result"] = result
-
-
-def _capture_unhandled_job_error(job_id: str) -> Callable[[Future], None]:
-    def callback(future: Future) -> None:
-        exc = future.exception()
-        if not exc:
-            return
-        with SUMMARY_LOCK:
-            if job_id in SUMMARY_JOBS:
-                SUMMARY_JOBS[job_id]["status"] = "failed"
-                SUMMARY_JOBS[job_id]["phase"] = "failed"
-                SUMMARY_JOBS[job_id]["updated_at"] = _now_iso()
-                SUMMARY_JOBS[job_id]["error"] = str(exc)
-
-    return callback
-
-
-def _record_summary_progress(job_id: str, event: dict[str, Any]) -> None:
-    timestamped = {"at": _now_iso(), **event}
-    with SUMMARY_LOCK:
-        job = SUMMARY_JOBS.get(job_id)
-        if not job:
-            return
-        event_name = str(timestamped.get("event") or "")
-        job["phase"] = event_name or job.get("phase")
-        job["updated_at"] = timestamped["at"]
-        if "sections_total" in timestamped:
-            job["sections_total"] = timestamped["sections_total"]
-        if "sections_completed" in timestamped:
-            job["sections_completed"] = timestamped["sections_completed"]
-        if event_name in {"section_started", "section_cached", "section_completed"}:
-            job["current_section"] = {
-                "paper_id": timestamped.get("paper_id"),
-                "section_index": timestamped.get("section_index"),
-                "sections_total": timestamped.get("sections_total"),
-                "section_id": timestamped.get("section_id"),
-                "title": timestamped.get("title"),
-            }
-        elif event_name.startswith("final_") or event_name in {"done", "failed"}:
-            job["current_section"] = None
-        events = job.setdefault("events", [])
-        events.append(timestamped)
-        if len(events) > 100:
-            del events[:-100]
+        return "done"
+    if isinstance(result, dict) and result.get("status") == "needs_llm":
+        return "needs_llm"
+    return "failed"
 
 
 def _all_ok(result: Any) -> bool:
@@ -450,11 +477,7 @@ def _normalize_ids(paper_ids: Any) -> Any:
     return [normalize_paper_id(str(item)) for item in paper_ids or []]
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def main() -> None:
+def run_mcp_server() -> int:
     try:
         from mcp.server.fastmcp import FastMCP
     except ImportError as exc:
@@ -464,6 +487,11 @@ def main() -> None:
     _register_tools(app)
 
     app.run()
+    return 0
+
+
+def main() -> None:
+    raise SystemExit(run_mcp_server())
 
 
 def _one_or_many(paper_id: str | None = None, paper_ids: list[str] | None = None):
@@ -584,17 +612,18 @@ def _register_tools(app: Any) -> None:
         return service.get_equation_context(_one_or_many(paper_id, paper_ids), query, refresh=refresh)
 
     @app.tool(
-        name="get_LLM_summary",
+        name="llm_get_summary",
         description=(
             "Get a cached high-quality LLM summary for one or more arXiv papers. "
-            "If no cached summary is immediately available, start a background summary job and return a job id."
+            "If no cached summary is available, this may call the host LLM provider. "
+            "The tool waits only until the MCP deadline margin, then returns a background job id."
         ),
     )
-    def get_llm_summary(
+    def llm_get_summary(
         paper_id: PaperId = None,
         paper_ids: PaperIds = None,
-        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
-        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
         refresh: Refresh = False,
     ) -> Any:
         return _cached_or_start_summary_job(
@@ -608,17 +637,18 @@ def _register_tools(app: Any) -> None:
         )
 
     @app.tool(
-        name="generate_LLM_summary",
+        name="llm_generate_summary",
         description=(
-            "Start a background job to generate and cache a high-quality LLM summary for one or more arXiv papers. "
-            "Returns immediately with a job id to avoid MCP client tool-call timeouts."
+            "Generate and cache a high-quality LLM summary for one or more arXiv papers. "
+            "This calls the host LLM provider. The tool waits only until the MCP deadline margin, "
+            "then returns a background job id."
         ),
     )
-    def generate_llm_summary(
+    def llm_generate_summary(
         paper_id: PaperId = None,
         paper_ids: PaperIds = None,
-        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
-        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
         refresh: Refresh = False,
     ) -> Any:
         return _start_summary_job_response(
@@ -629,19 +659,32 @@ def _register_tools(app: Any) -> None:
         )
 
     @app.tool(
-        name="get_LLM_summary_status",
-        description=(
-            "Check a background LLM summary job started by get_LLM_summary or generate_LLM_summary. "
-            "When status is done, the result contains the generated summary."
-        ),
+        name="job_status",
+        description="Check an ARC MCP background job. Poll this tool; ARC does not push completion notifications.",
     )
-    def get_llm_summary_status(
-        job_id: Annotated[str, Field(description="Background summary job id returned by get_LLM_summary.")],
-    ) -> Any:
-        return get_summary_job_status(job_id)
+    def job_status_tool(job_id: Annotated[str, Field(description="MCP job id returned by a long-running tool.")]) -> Any:
+        return job_status(job_id)
 
     @app.tool(
-        name="store_LLM_summary",
+        name="job_result",
+        description="Read the result of an ARC MCP background job when complete, or get a not-ready status.",
+    )
+    def job_result_tool(job_id: Annotated[str, Field(description="MCP job id returned by a long-running tool.")]) -> Any:
+        return job_result(job_id)
+
+    @app.tool(
+        name="cancel_job",
+        description=JOB_CANCEL_DESCRIPTION,
+    )
+    def cancel_job_tool(job_id: Annotated[str, Field(description="MCP job id to cancel.")]) -> Any:
+        return cancel_job(job_id)
+
+    @app.tool(name="list_jobs", description="List in-process jobs known to the current ARC MCP server.")
+    def list_jobs_tool() -> Any:
+        return list_jobs()
+
+    @app.tool(
+        name="store_llm_summary",
         description=(
             "Validate and cache a schema-valid LLM paper summary for an arXiv paper. "
             "Use after an agent generated summary JSON from a needs_llm task."
@@ -683,24 +726,28 @@ def _register_tools(app: Any) -> None:
         return {"ok": True, "data": prefetch_batch(name, workers=workers), "errors": [], "meta": {}}
 
     @app.tool(
+        name="llm_summary_batch_run",
         description=(
             "Run LLM summary generation for queued or ready items in a summary batch. "
-            "Use max_items for calibration before processing a large batch."
-        )
+            "This calls the host LLM provider and may return a background job id."
+        ),
     )
-    def summary_batch_run(
+    def llm_summary_batch_run(
         name: BatchName,
-        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
-        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
         concurrency: Annotated[int, Field(description="Number of concurrent LLM summary generation workers.")] = 1,
         max_items: Annotated[int | None, Field(description="Optional cap on items to process in this run.")] = None,
     ) -> Any:
-        return {
-            "ok": True,
-            "data": run_batch(name, provider=provider, model=model, concurrency=concurrency, max_items=max_items),
-            "errors": [],
-            "meta": {},
-        }
+        return _run_summary_batch_inline(
+            {
+                "name": name,
+                "provider": provider,
+                "model": model,
+                "concurrency": concurrency,
+                "max_items": max_items,
+            }
+        )
 
     @app.tool(description="Get status counts for a resumable paper-summary batch.")
     def summary_batch_status(name: BatchName) -> Any:
@@ -744,18 +791,19 @@ def _register_tools(app: Any) -> None:
         return service.doctor_cache(paper_id)
 
     @app.tool(
+        name="llm_domain_build",
         description=(
             "Build a cached ARC research-domain package from a seed arXiv paper and optional user intent. "
-            "This starts a background job because foundation discovery, network construction, full-text fetches, "
-            "and LLM summary generation can be slow."
-        )
+            "This calls the host LLM provider during foundation selection and domain summarization. "
+            "The tool waits only until the MCP deadline margin, then returns a background job id."
+        ),
     )
-    def domain_build(
+    def llm_domain_build(
         seed_paper: Annotated[str, Field(description=PAPER_ID_DESCRIPTION)],
         intent: DomainIntent = "",
         domain_id: DomainId = None,
-        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
-        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
         refresh: Refresh = False,
         workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
     ) -> Any:
@@ -777,7 +825,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def domain_status(
-        job_id: Annotated[str | None, Field(description="Background job id returned by domain_build.")] = None,
+        job_id: Annotated[str | None, Field(description="Background job id returned by llm_domain_build.")] = None,
         seed_paper: PaperId = None,
         intent: DomainIntent = "",
         domain_id: DomainId = None,
@@ -793,16 +841,54 @@ def _register_tools(app: Any) -> None:
 
     @app.tool(
         description=(
-            "Get a cached ARC domain summary by seed paper or domain id. If no cached summary exists and "
-            "seed_paper is supplied, start a background domain build and return a job id."
+            "Get a cached ARC domain summary by seed paper or domain id. This is cache-only and does not call an LLM."
         )
     )
     def domain_get_summary(
         seed_paper: PaperId = None,
         intent: DomainIntent = "",
         domain_id: DomainId = None,
-        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
-        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+    ) -> Any:
+        return _domain_artifact(
+            {
+                "seed_paper": seed_paper,
+                "intent": intent,
+                "domain_id": domain_id,
+            },
+            artifact="summary",
+        )
+
+    @app.tool(
+        description=(
+            "Get a cached ARC domain graph JSON by seed paper or domain id. This is cache-only and does not call an LLM."
+        )
+    )
+    def domain_get_graph(
+        seed_paper: PaperId = None,
+        intent: DomainIntent = "",
+        domain_id: DomainId = None,
+    ) -> Any:
+        return _domain_artifact(
+            {
+                "seed_paper": seed_paper,
+                "intent": intent,
+                "domain_id": domain_id,
+            },
+            artifact="graph",
+        )
+
+    @app.tool(
+        name="llm_domain_get_summary",
+        description=(
+            "Get a cached ARC domain summary, or call the host LLM provider by starting a domain build when missing."
+        ),
+    )
+    def llm_domain_get_summary(
+        seed_paper: PaperId = None,
+        intent: DomainIntent = "",
+        domain_id: DomainId = None,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
         refresh: Refresh = False,
         workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
     ) -> Any:
@@ -820,17 +906,17 @@ def _register_tools(app: Any) -> None:
         )
 
     @app.tool(
+        name="llm_domain_get_graph",
         description=(
-            "Get a cached ARC domain graph JSON by seed paper or domain id. If no cached graph exists and "
-            "seed_paper is supplied, start a background domain build and return a job id."
-        )
+            "Get a cached ARC domain graph, or call the host LLM provider by starting a domain build when missing."
+        ),
     )
-    def domain_get_graph(
+    def llm_domain_get_graph(
         seed_paper: PaperId = None,
         intent: DomainIntent = "",
         domain_id: DomainId = None,
-        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
-        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
         refresh: Refresh = False,
         workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
     ) -> Any:

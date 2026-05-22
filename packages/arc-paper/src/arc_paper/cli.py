@@ -31,6 +31,9 @@ def main(argv: list[str] | None = None) -> int:
     llm_summary = _paper_command(sub, "get-llm-summary")
     llm_summary.add_argument("--provider", default="auto")
     llm_summary.add_argument("--model", default=None)
+    llm_summary_prefixed = _paper_command(sub, "llm-summary")
+    llm_summary_prefixed.add_argument("--provider", default="auto")
+    llm_summary_prefixed.add_argument("--model", default=None)
 
     generate = sub.add_parser("generate-llm-summary")
     generate.add_argument("paper_ids", nargs="+")
@@ -38,6 +41,12 @@ def main(argv: list[str] | None = None) -> int:
     generate.add_argument("--model", default=None)
     generate.add_argument("--refresh", action="store_true")
     generate.add_argument("--json", action="store_true")
+    llm_generate = sub.add_parser("llm-generate-summary")
+    llm_generate.add_argument("paper_ids", nargs="+")
+    llm_generate.add_argument("--provider", default="auto")
+    llm_generate.add_argument("--model", default=None)
+    llm_generate.add_argument("--refresh", action="store_true")
+    llm_generate.add_argument("--json", action="store_true")
 
     store = sub.add_parser("store-llm-summary")
     store.add_argument("paper_id")
@@ -181,9 +190,9 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.get_section(paper_ids, args.section, refresh=args.refresh)
     if command == "get-equation-context":
         return service.get_equation_context(paper_ids, args.query, refresh=args.refresh)
-    if command == "get-llm-summary":
+    if command in {"get-llm-summary", "llm-summary"}:
         return service.get_llm_summary(paper_ids, provider=args.provider, model=args.model, refresh=args.refresh)
-    if command == "generate-llm-summary":
+    if command in {"generate-llm-summary", "llm-generate-summary"}:
         return service.generate_llm_summary(
             paper_ids,
             provider=args.provider,

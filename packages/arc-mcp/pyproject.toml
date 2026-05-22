@@ -18,7 +18,7 @@ dependencies = [
 test = ["pytest>=8.0"]
 
 [project.scripts]
-arc-mcp = "arc_mcp.server:main"
+arc-mcp = "arc_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/arc_mcp"]

@@ -1,7 +1,15 @@
 import asyncio
 import time
 
+import pytest
+
 from arc_mcp import server
+
+
+@pytest.fixture(autouse=True)
+def _mcp_job_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_MCP_CACHE", str(tmp_path / "arc-mcp"))
+    monkeypatch.setenv("ARC_MCP_WORKER_MODE", "thread")
 
 
 def test_call_tool_dispatches_to_service(monkeypatch):
@@ -63,24 +71,29 @@ def test_fastmcp_tools_have_discovery_metadata():
     by_name = {tool.name: tool for tool in tools}
 
     assert "arXiv papers" in by_name["get_title"].description
-    assert "LLM summary" in by_name["generate_LLM_summary"].description
+    assert "LLM summary" in by_name["llm_generate_summary"].description
     assert "INSPIRE metadata" in by_name["get_metadata"].description
     assert by_name["get_title"].inputSchema["properties"]["paper_id"]["description"].startswith("Single paper")
     assert "limit" in by_name["get_citers"].inputSchema["properties"]
     assert "sort" in by_name["get_citers"].inputSchema["properties"]
     assert "enrich" in by_name["get_references"].inputSchema["properties"]
     assert by_name["get_section"].inputSchema["properties"]["section"]["description"].startswith("Section")
-    assert "get_LLM_summary_status" in by_name
+    assert "job_status" in by_name
+    assert "cancel_job" in by_name
     assert "doctor_cache" in by_name
-    assert "domain_build" in by_name
+    assert "llm_domain_build" in by_name
     assert "domain_status" in by_name
     assert "domain_get_summary" in by_name
-    assert "provider" in by_name["domain_get_summary"].inputSchema["properties"]
-    assert by_name["domain_build"].inputSchema["properties"]["seed_paper"]["description"].startswith("Single paper")
+    assert "provider" not in by_name["domain_get_summary"].inputSchema["properties"]
+    assert "llm_summary_batch_run" in by_name
+    assert by_name["llm_domain_build"].inputSchema["properties"]["seed_paper"]["description"].startswith("Single paper")
 
 
 def test_get_llm_summary_starts_background_job_when_uncached(monkeypatch):
+    monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0.001")
+
     def generate_summary(paper_ids, provider="auto", model=None, refresh=False, progress_callback=None):
+        time.sleep(0.02)
         if progress_callback:
             progress_callback(
                 {
@@ -118,17 +131,17 @@ def test_get_llm_summary_starts_background_job_when_uncached(monkeypatch):
     )
     monkeypatch.setattr(server.service, "generate_llm_summary", generate_summary)
 
-    started = server.call_tool("get_LLM_summary", {"paper_id": "0911.3380"})
+    started = server.call_tool("llm_get_summary", {"paper_id": "0911.3380"})
 
-    assert started["status"] == "summary_job_started"
-    assert started["paper_ids"] == "arXiv:0911.3380"
+    assert started["status"] == "job_running"
+    assert started["job"]["paper_ids"] == "arXiv:0911.3380"
     status = _wait_for_job(started["job_id"])
     assert status["status"] == "done"
     assert status["sections_total"] == 1
     assert status["sections_completed"] == 1
     assert status["phase"] == "done"
     assert [event["event"] for event in status["events"]][-2:] == ["section_started", "section_completed"]
-    assert status["result"]["data"]["paper_id"] == "arXiv:0911.3380"
+    assert server.job_result(started["job_id"])["result"]["data"]["paper_id"] == "arXiv:0911.3380"
 
 
 def test_get_llm_summary_returns_cached_without_background_job(monkeypatch):
@@ -138,14 +151,37 @@ def test_get_llm_summary_returns_cached_without_background_job(monkeypatch):
         lambda paper_ids: {"ok": True, "data": {"title": "Cached"}, "errors": [], "meta": {"cache": "hit"}},
     )
 
-    result = server.call_tool("get_LLM_summary", {"paper_id": "0911.3380"})
+    result = server.call_tool("llm_get_summary", {"paper_id": "0911.3380"})
 
     assert result["ok"] is True
     assert result["data"]["title"] == "Cached"
 
 
+def test_llm_generate_summary_returns_inline_result_when_fast(monkeypatch):
+    monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "1")
+    monkeypatch.setattr(
+        server.service,
+        "generate_llm_summary",
+        lambda paper_ids, provider="auto", model=None, refresh=False, progress_callback=None: {
+            "ok": True,
+            "data": {"paper_id": paper_ids},
+            "errors": [],
+            "meta": {},
+        },
+    )
+
+    result = server.call_tool("llm_generate_summary", {"paper_id": "0911.3380"})
+
+    assert result["ok"] is True
+    assert result["data"]["paper_id"] == "arXiv:0911.3380"
+    assert result["meta"]["job"]["status"] == "done"
+
+
 def test_domain_build_starts_background_job(monkeypatch):
+    monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0.001")
+
     def build_domain(seed_paper, intent="", domain_id=None, provider="auto", model=None, refresh=False, workers=8):
+        time.sleep(0.02)
         return {
             "ok": True,
             "data": {
@@ -161,15 +197,16 @@ def test_domain_build_starts_background_job(monkeypatch):
 
     monkeypatch.setattr(server.domain_service, "build_domain", build_domain)
 
-    started = server.call_tool("domain_build", {"seed_paper": "0911.3380", "intent": "inflation", "workers": 2})
+    started = server.call_tool("llm_domain_build", {"seed_paper": "0911.3380", "intent": "inflation", "workers": 2})
 
-    assert started["status"] == "domain_job_started"
+    assert started["status"] == "job_running"
     status = _wait_for_domain_job(started["job_id"])
     assert status["status"] == "done"
     assert status["seed_paper"] == "arXiv:0911.3380"
     assert "domain_status" in status
-    assert status["result"]["data"]["intent"] == "inflation"
-    assert status["result"]["data"]["workers"] == 2
+    result = server.job_result(started["job_id"])["result"]
+    assert result["data"]["intent"] == "inflation"
+    assert result["data"]["workers"] == 2
 
 
 def test_domain_status_without_job_delegates_to_domain_service(monkeypatch):
@@ -211,21 +248,58 @@ def test_domain_get_summary_starts_build_when_missing(monkeypatch):
     monkeypatch.setattr(server.domain_service, "build_domain", build_domain)
 
     started = server.call_tool(
-        "domain_get_summary",
+        "llm_domain_get_summary",
         {"seed_paper": "0911.3380", "intent": "inflation", "provider": "manual"},
     )
 
-    assert started["status"] == "domain_job_started"
-    status = _wait_for_domain_job(started["job_id"])
-    assert status["status"] == "done"
-    assert status["result"]["data"]["provider"] == "manual"
+    assert started["ok"] is True
+    assert started["meta"]["job"]["status"] == "done"
+    assert started["data"]["provider"] == "manual"
+
+
+def test_domain_get_summary_is_cache_only(monkeypatch):
+    monkeypatch.setattr(
+        server.domain_service,
+        "get_domain_summary",
+        lambda seed_paper=None, intent="", domain_id=None: {
+            "ok": False,
+            "error": {"code": "domain_summary_not_available", "message": "missing"},
+            "errors": [],
+            "meta": {},
+        },
+    )
+
+    result = server.call_tool("domain_get_summary", {"seed_paper": "0911.3380", "intent": "inflation"})
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "domain_summary_not_available"
+
+
+def test_cancel_job_requires_explicit_tool_call(monkeypatch):
+    monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0.001")
+
+    def generate_summary(paper_ids, provider="auto", model=None, refresh=False, progress_callback=None):
+        time.sleep(0.05)
+        return {"ok": True, "data": {}, "errors": [], "meta": {}}
+
+    monkeypatch.setattr(
+        server.service,
+        "get_cached_llm_summary",
+        lambda paper_ids: {"ok": False, "error": {"code": "summary_not_available"}},
+    )
+    monkeypatch.setattr(server.service, "generate_llm_summary", generate_summary)
+
+    started = server.call_tool("llm_get_summary", {"paper_id": "0911.3380"})
+    cancelled = server.call_tool("cancel_job", {"job_id": started["job_id"]})
+
+    assert cancelled["status"] in {"cancel_requested", "cancelled"}
 
 
 def _wait_for_job(job_id):
     deadline = time.time() + 2
     while time.time() < deadline:
         status = server.get_summary_job_status(job_id)
-        if status["status"] != "running":
+        if status["status"] in {"done", "failed", "needs_llm", "cancelled"}:
             return status
         time.sleep(0.01)
     raise AssertionError("summary job did not finish")
@@ -235,7 +309,7 @@ def _wait_for_domain_job(job_id):
     deadline = time.time() + 2
     while time.time() < deadline:
         status = server.get_domain_job_status(job_id)
-        if status["status"] != "running":
+        if status["status"] in {"done", "failed", "needs_llm", "cancelled"}:
             return status
         time.sleep(0.01)
     raise AssertionError("domain job did not finish")

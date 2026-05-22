@@ -14,13 +14,21 @@ def main(argv: list[str] | None = None) -> int:
     init = _seed_command(sub, "init")
     foundation = _seed_command(sub, "identify-foundation")
     _llm_args(foundation)
+    llm_foundation = _seed_command(sub, "llm-identify-foundation")
+    _llm_args(llm_foundation)
     network = _seed_command(sub, "build-network")
     _llm_args(network)
+    llm_network = _seed_command(sub, "llm-build-network")
+    _llm_args(llm_network)
     evidence = _seed_command(sub, "build-evidence")
     summary = _seed_command(sub, "summarize")
     _llm_args(summary)
+    llm_summary = _seed_command(sub, "llm-summarize")
+    _llm_args(llm_summary)
     build = _seed_command(sub, "build")
     _llm_args(build)
+    llm_build = _seed_command(sub, "llm-build")
+    _llm_args(llm_build)
     status = sub.add_parser("status")
     status.add_argument("seed_paper", nargs="?")
     status.add_argument("--intent", default="")
@@ -62,7 +70,7 @@ def _llm_args(parser: argparse.ArgumentParser) -> None:
 def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "init":
         return service.init_domain(args.seed_paper, intent=args.intent, domain_id=args.domain_id)
-    if args.command == "identify-foundation":
+    if args.command in {"identify-foundation", "llm-identify-foundation"}:
         return service.identify_foundation(
             args.seed_paper,
             intent=args.intent,
@@ -72,7 +80,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             refresh=args.refresh,
             workers=args.workers,
         )
-    if args.command == "build-network":
+    if args.command in {"build-network", "llm-build-network"}:
         return service.build_network(
             args.seed_paper,
             intent=args.intent,
@@ -90,7 +98,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             refresh=args.refresh,
             workers=args.workers,
         )
-    if args.command == "summarize":
+    if args.command in {"summarize", "llm-summarize"}:
         return service.summarize_domain(
             args.seed_paper,
             intent=args.intent,
@@ -98,7 +106,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             provider=args.provider,
             model=args.model,
         )
-    if args.command == "build":
+    if args.command in {"build", "llm-build"}:
         return service.build_domain(
             args.seed_paper,
             intent=args.intent,

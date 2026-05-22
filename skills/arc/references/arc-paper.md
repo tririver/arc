@@ -29,7 +29,7 @@ fields.
 Get or build the summary:
 
 ```bash
-arc-paper get-llm-summary arXiv:0911.3380 --json
+arc-paper llm-summary arXiv:0911.3380 --json
 ```
 
 This command first checks the cache. If the summary is missing and a host LLM
@@ -42,9 +42,28 @@ metadata and stores the canonical per-section content under
 `section_summaries`. References are intentionally omitted from the summary input
 pack.
 
-When using MCP, `get_LLM_summary` and `generate_LLM_summary` return quickly. If
-no cached summary is available, they start a background job and return a
-`job_id`; poll `get_LLM_summary_status` with that `job_id`.
+When using MCP, use `llm_get_summary` or `llm_generate_summary`. These tools may
+call the host LLM provider, so they wait only until the MCP deadline margin. If
+the result is not ready, they return a `job_id`.
+
+Phase 1: Start or reuse the result.
+Step 1: Call `llm_get_summary`.
+Step 2: If it returns a result, use it.
+Step 3: If it returns `status: "job_running"` with a `job_id`, run:
+
+```bash
+arc-mcp jobs watch <job_id> --json
+```
+
+Phase 2: Read the result.
+Step 1: Use the CLI watcher output as the final result.
+Step 2: If the CLI watcher is unavailable, poll `job_status` and call
+`job_result` when status is `done`.
+Step 3: If status is `needs_llm`, use the manual fallback below.
+Step 4: Do not call `cancel_job` unless the user explicitly asks.
+
+ARC stores MCP job state under `cache/arc-mcp/jobs/`. The CLI watcher and MCP
+tools read the same persisted job files.
 
 If the result has `status: "needs_llm"`, no runnable provider was available.
 Use the manual fallback:
@@ -61,7 +80,7 @@ arc-paper store-llm-summary arXiv:0911.3380 --summary-json - --json
 For explicit generation through the host CLI or provider override:
 
 ```bash
-arc-paper generate-llm-summary arXiv:0911.3380 --provider auto --json
+arc-paper llm-generate-summary arXiv:0911.3380 --provider auto --json
 ```
 
 `--provider auto` uses `ARC_LLM_PROVIDER` first, then `ARC_AGENT_HOST`, then
