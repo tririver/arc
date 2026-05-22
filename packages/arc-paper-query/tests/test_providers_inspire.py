@@ -136,6 +136,7 @@ def test_inspire_citers_use_recid_query_and_month_cache(monkeypatch, tmp_path):
         query = urllib.parse.parse_qs(request.url.query.decode())
         assert query["q"] == ["refersto:recid:123"]
         assert query["size"] == ["1000"]
+        assert query["sort"] == ["mostrecent"]
         assert "abstracts" in query["fields"][0]
         assert "arxiv_eprints" in query["fields"][0]
         return httpx.Response(
@@ -171,3 +172,47 @@ def test_inspire_citers_use_recid_query_and_month_cache(monkeypatch, tmp_path):
         )
     )
     assert cached_provider.get_citers("arXiv:0911.3380")[0]["title"] == "A Citer"
+
+
+def test_inspire_citers_support_limit_sort_and_separate_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if str(request.url) == "https://inspirehep.net/api/arxiv/0911.3380":
+            return httpx.Response(200, json=INSPIRE_RECORD)
+        query = urllib.parse.parse_qs(request.url.query.decode())
+        assert query["q"] == ["refersto:recid:123"]
+        assert query["size"] == ["3"]
+        assert query["sort"] == ["mostcited"]
+        return httpx.Response(
+            200,
+            json={
+                "hits": {
+                    "hits": [
+                        {
+                            "id": str(index),
+                            "metadata": {
+                                "titles": [{"title": f"Citer {index}"}],
+                                "citation_count": 10 - index,
+                            },
+                        }
+                        for index in range(3)
+                    ]
+                }
+            },
+        )
+
+    provider = InspireProvider(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    citers = provider.get_citers("arXiv:0911.3380", limit=3, sort="mostcited")
+
+    assert [item["title"] for item in citers] == ["Citer 0", "Citer 1", "Citer 2"]
+    assert len(calls) == 2
+
+    cached_provider = InspireProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError()))
+        )
+    )
+    assert cached_provider.get_citers("arXiv:0911.3380", limit=3, sort="mostcited")[1]["title"] == "Citer 1"

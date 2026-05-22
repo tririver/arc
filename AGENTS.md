@@ -48,8 +48,13 @@ must not be modified.
 - `packages/arc-paper-query` owns deterministic paper data access, ID
   normalization, caching, parsing, paper-summary contracts, paper-summary
   orchestration, and batch execution.
-- `packages/arc-mcp` should stay a thin MCP adapter over `arc_paper_query`
-  service functions and batch helpers.
+- `packages/arc-domain-info` owns research-domain construction from seed
+  papers: foundation selection, domain paper selection, network artifacts,
+  evidence packs, HTML rendering, and domain summaries. It should call
+  `arc-paper-query` for single-paper operations and `arc-llm-worker` for host
+  LLM work.
+- `packages/arc-mcp` should stay a thin MCP adapter over `arc_paper_query`,
+  `arc_domain_info`, and batch service functions.
 - `skills/arc`, `prompts/`, `schemas/`, and `packaging/` should describe or
   wrap package behavior rather than reimplementing it.
 - Keep `0_ref/` as reference-only material. Do not preserve old compatibility
@@ -61,7 +66,11 @@ must not be modified.
   first, then the combined local suite when practical:
 
   ```bash
-  packages/arc-paper-query/.venv/bin/python -m pytest packages/arc-paper-query/tests packages/arc-mcp/tests
+  packages/arc-paper-query/.venv/bin/python -m pytest \
+    packages/arc-llm-worker/tests \
+    packages/arc-paper-query/tests \
+    packages/arc-domain-info/tests \
+    packages/arc-mcp/tests
   ```
 
 - Unit tests must not require network access. Network integration tests should

@@ -11,6 +11,7 @@ python3 -m venv packages/arc-paper-query/.venv
 . packages/arc-paper-query/.venv/bin/activate
 python -m pip install -e packages/arc-llm-worker[test]
 python -m pip install -e packages/arc-paper-query[test]
+python -m pip install -e packages/arc-domain-info[test]
 python -m pip install -e packages/arc-mcp
 ```
 
@@ -111,6 +112,52 @@ When ARC is run from this checkout without `ARC_PAPER_QUERY_CACHE` or
 ```text
 /arc-dev/cache/paper-query/
 ```
+
+## Domain Info
+
+Build a cached research-domain package from one seed paper plus an optional
+intent:
+
+```bash
+arc-domain-info build 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain-info status 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain-info get-summary 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain-info get-graph 0911.3380 --intent "quasi-single-field inflation observables" --json
+```
+
+`arc-domain-info` uses `arc-paper-query` for all single-paper operations. It
+identifies a likely foundation paper, builds a citation-domain graph of up to
+about 60 nodes, renders `network.html`, builds an evidence pack from titles,
+abstracts, and conclusion/outlook sections, then asks `arc-llm-worker` for a
+compact field briefing. If the host LLM is unavailable, deterministic fallback
+artifacts are still written so the cache is inspectable.
+
+When ARC is run from this checkout without `ARC_DOMAIN_INFO_CACHE` or
+`XDG_CACHE_HOME`, domain data is cached under:
+
+```text
+/arc-dev/cache/domain-info/
+```
+
+## MCP
+
+Install the packages above, then configure the MCP server command as
+`arc-mcp`. The ARC MCP server exposes paper tools such as `get_metadata`,
+`get_references`, `get_citers`, `get_section`, `get_LLM_summary`, and domain
+tools:
+
+```text
+domain_build(seed_paper, intent="", provider="auto")
+domain_status(job_id) or domain_status(seed_paper, intent="")
+domain_get_summary(seed_paper, intent="")
+domain_get_graph(seed_paper, intent="")
+```
+
+`domain_build` returns immediately with a `job_id`; poll `domain_status` until
+the job is `done`, then read the cached summary or graph. `domain_get_summary`
+and `domain_get_graph` are also cache-first: if the artifact is missing and a
+`seed_paper` is supplied, they start the same background build and return a
+`job_id`.
 
 ## Reference Code
 

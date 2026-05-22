@@ -18,8 +18,8 @@ class FakeInspire:
             reference["abstract"] = "Reference abstract."
         return [reference]
 
-    def get_citers(self, paper_id, *, refresh=False):
-        return [{"paper_id": "arXiv:2210.00001", "title": "Citer"}]
+    def get_citers(self, paper_id, *, refresh=False, limit=1000, sort="mostrecent"):
+        return [{"paper_id": "arXiv:2210.00001", "title": f"Citer {limit} {sort}"}]
 
     def get_citer_count(self, paper_id, *, refresh=False):
         return 5
@@ -59,9 +59,10 @@ def test_list_input_returns_id_result_dict(monkeypatch):
 
 def test_references_citers_and_counts(monkeypatch):
     monkeypatch.setattr(service, "_inspire", FakeInspire())
+    assert service.get_metadata("0911.3380")["data"]["title"] == "A Test Paper"
     assert service.get_references("0911.3380")["data"][0]["title"] == "Reference"
     assert service.get_references("0911.3380", enrich=True)["data"][0]["abstract"] == "Reference abstract."
-    assert service.get_citers("0911.3380")["data"][0]["title"] == "Citer"
+    assert service.get_citers("0911.3380", limit=5, sort="mostcited")["data"][0]["title"] == "Citer 5 mostcited"
     assert service.get_citer_count("0911.3380")["data"] == 5
 
 

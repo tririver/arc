@@ -25,6 +25,28 @@ def test_cli_get_references_enrich(monkeypatch, capsys):
     assert output["data"]["enrich"] is True
 
 
+def test_cli_get_citers_limit_sort(monkeypatch, capsys):
+    def get_citers(ids, refresh=False, limit=1000, sort="mostrecent"):
+        return {"ok": True, "data": {"ids": ids, "limit": limit, "sort": sort}}
+
+    monkeypatch.setattr(cli.service, "get_citers", get_citers)
+
+    assert cli.main(["get-citers", "0911.3380", "--limit", "7", "--sort", "mostcited", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["limit"] == 7
+    assert output["data"]["sort"] == "mostcited"
+
+
+def test_cli_get_metadata(monkeypatch, capsys):
+    monkeypatch.setattr(cli.service, "get_metadata", lambda ids, refresh=False: {"ok": True, "data": {"title": ids}})
+
+    assert cli.main(["get-metadata", "0911.3380", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["title"] == "0911.3380"
+
+
 def test_cli_get_section(monkeypatch, capsys):
     monkeypatch.setattr(
         cli.service,

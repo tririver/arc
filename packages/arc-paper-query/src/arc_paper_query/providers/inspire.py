@@ -78,10 +78,20 @@ class InspireProvider:
             enriched.append(_merge_reference_metadata(reference, metadata))
         return enriched
 
-    def get_citers(self, paper_id: str, *, refresh: bool = False) -> list[dict[str, Any]]:
-        paths = CachePaths.for_paper(paper_id)
-        if not refresh and (cached := read_json(paths.inspire_citers, ttl_seconds=ONE_MONTH_SECONDS)):
-            return cached
+    def get_citers(
+        self,
+        paper_id: str,
+        *,
+        refresh: bool = False,
+        limit: int = MAX_PAGE_SIZE,
+        sort: str = "mostrecent",
+    ) -> list[dict[str, Any]]:
+        limit = _clamp_limit(limit)
+        sort = _normalize_sort(sort)
+        cache_path = _citers_cache_path(paper_id, sort, limit)
+        if not refresh and (cached := read_json(cache_path, ttl_seconds=ONE_MONTH_SECONDS)):
+            if isinstance(cached, list):
+                return cached[:limit]
 
         metadata = self.get_metadata(paper_id, refresh=refresh)
         recid = metadata.get("inspire_recid")
@@ -92,7 +102,8 @@ class InspireProvider:
             f"{BASE_URL}/literature",
             params={
                 "q": f"refersto:recid:{recid}",
-                "size": str(MAX_PAGE_SIZE),
+                "size": str(limit),
+                "sort": sort,
                 "fields": SUMMARY_FIELDS,
                 "format": "json",
             },
@@ -105,7 +116,7 @@ class InspireProvider:
 
         data = response.json()
         citers = [_normalize_record(hit) for hit in data.get("hits", {}).get("hits", [])]
-        write_json(paths.inspire_citers, citers)
+        write_json(cache_path, citers)
         return citers
 
     def get_citer_count(self, paper_id: str, *, refresh: bool = False) -> int:
@@ -158,6 +169,29 @@ def _normalize_record(payload: dict[str, Any]) -> dict[str, Any]:
         "published": str(metadata.get("earliest_date") or metadata.get("preprint_date") or ""),
         "citation_count": int(metadata.get("citation_count") or 0),
     }
+
+
+def _clamp_limit(limit: int) -> int:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        value = MAX_PAGE_SIZE
+    return max(1, min(value, MAX_PAGE_SIZE))
+
+
+def _normalize_sort(sort: str) -> str:
+    normalized = (sort or "mostrecent").strip().lower()
+    if normalized not in {"mostrecent", "mostcited"}:
+        raise ProviderError("unsupported_citer_sort", f"Unsupported INSPIRE citer sort: {sort}")
+    return normalized
+
+
+def _citers_cache_path(paper_id: str, sort: str, limit: int):
+    paths = CachePaths.for_paper(paper_id)
+    if sort == "mostrecent" and limit == MAX_PAGE_SIZE:
+        return paths.inspire_citers
+    suffix = sort if limit == MAX_PAGE_SIZE else f"{sort}_{limit}"
+    return paths.inspire_citers.with_name(f"citers_{suffix}.json")
 
 
 def _normalize_reference(item: dict[str, Any]) -> dict[str, Any]:

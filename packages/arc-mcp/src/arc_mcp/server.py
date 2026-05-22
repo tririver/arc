@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Annotated, Any, Callable
 from uuid import uuid4
 
+from arc_domain_info import service as domain_service
 from arc_paper_query import service
 from arc_paper_query.batch.db import BatchDB
 from arc_paper_query.batch.runner import export_batch, prefetch_batch, run_batch
@@ -17,13 +18,17 @@ from pydantic import Field
 
 ToolHandler = Callable[[dict[str, Any]], Any]
 SUMMARY_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="arc-summary")
+DOMAIN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="arc-domain")
 SUMMARY_JOBS: dict[str, dict[str, Any]] = {}
+DOMAIN_JOBS: dict[str, dict[str, Any]] = {}
 SUMMARY_LOCK = Lock()
+DOMAIN_LOCK = Lock()
 
 SERVER_INSTRUCTIONS = (
     "Use ARC when a user asks about theoretical-physics papers or arXiv papers: "
     "titles, abstracts, authors, references, citing papers, citation counts, "
-    "ar5iv table of contents, sections, equation context, or LLM paper summaries. "
+    "ar5iv table of contents, sections, equation context, LLM paper summaries, "
+    "or research-domain construction from a seed paper. "
     "Paper IDs may be passed with or without the arXiv: prefix, for example "
     "0911.3380, arXiv:0911.3380, or hep-th/0601001. For one paper use paper_id; "
     "for multiple papers use paper_ids."
@@ -42,6 +47,10 @@ ENRICH_REFERENCES_DESCRIPTION = (
 SECTION_DESCRIPTION = "Section heading, section number, or section id to retrieve from the ar5iv full text."
 QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
 BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
+DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific interest or desired subfield scope."
+DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by domain_build or arc-domain-info init."
+CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIRE, clamped to 1..1000."
+CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
 
 PaperId = Annotated[str | None, Field(description=PAPER_ID_DESCRIPTION)]
 PaperIds = Annotated[list[str] | None, Field(description=PAPER_IDS_DESCRIPTION)]
@@ -50,6 +59,10 @@ EnrichReferences = Annotated[bool, Field(description=ENRICH_REFERENCES_DESCRIPTI
 Section = Annotated[str, Field(description=SECTION_DESCRIPTION)]
 EquationQuery = Annotated[str, Field(description=QUERY_DESCRIPTION)]
 BatchName = Annotated[str, Field(description=BATCH_NAME_DESCRIPTION)]
+DomainIntent = Annotated[str, Field(description=DOMAIN_INTENT_DESCRIPTION)]
+DomainId = Annotated[str | None, Field(description=DOMAIN_ID_DESCRIPTION)]
+CiterLimit = Annotated[int, Field(description=CITER_LIMIT_DESCRIPTION)]
+CiterSort = Annotated[str, Field(description=CITER_SORT_DESCRIPTION)]
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -68,7 +81,13 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "get_title": lambda args: service.get_title(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_abstract": lambda args: service.get_abstract(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_authors": lambda args: service.get_authors(_paper_ids(args), refresh=bool(args.get("refresh", False))),
-    "get_citers": lambda args: service.get_citers(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_metadata": lambda args: service.get_metadata(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_citers": lambda args: service.get_citers(
+        _paper_ids(args),
+        refresh=bool(args.get("refresh", False)),
+        limit=int(args.get("limit", 1000)),
+        sort=str(args.get("sort", "mostrecent")),
+    ),
     "get_citer_count": lambda args: service.get_citer_count(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_references": lambda args: service.get_references(
         _paper_ids(args),
@@ -112,6 +131,10 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         "meta": {},
     },
     "doctor_cache": lambda args: service.doctor_cache(args.get("paper_id")),
+    "domain_build": lambda args: _start_domain_job_response(args),
+    "domain_status": lambda args: _domain_status_response(args),
+    "domain_get_summary": lambda args: _domain_artifact_or_start(args, artifact="summary"),
+    "domain_get_graph": lambda args: _domain_artifact_or_start(args, artifact="graph"),
 }
 
 
@@ -184,6 +207,166 @@ def get_summary_job_status(job_id: str) -> dict[str, Any]:
                 "meta": {},
             }
         return {key: value for key, value in job.items() if key != "future"}
+
+
+def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
+    seed_paper = str(args["seed_paper"])
+    intent = str(args.get("intent", ""))
+    domain_id = args.get("domain_id")
+    provider = str(args.get("provider", "auto"))
+    model = args.get("model")
+    refresh = bool(args.get("refresh", False))
+    workers = int(args.get("workers", 8))
+    job_id = uuid4().hex
+    with DOMAIN_LOCK:
+        DOMAIN_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "phase": "queued",
+            "seed_paper": normalize_paper_id(seed_paper),
+            "intent": intent,
+            "domain_id": domain_id,
+            "provider": provider,
+            "model": model,
+            "refresh": refresh,
+            "workers": workers,
+            "started_at": _now_iso(),
+            "updated_at": _now_iso(),
+            "result": None,
+            "error": None,
+        }
+    future = DOMAIN_EXECUTOR.submit(
+        _run_domain_job,
+        job_id,
+        seed_paper,
+        intent,
+        domain_id,
+        provider,
+        model,
+        refresh,
+        workers,
+    )
+    future.add_done_callback(_capture_unhandled_domain_job_error(job_id))
+    return {
+        "ok": False,
+        "status": "domain_job_started",
+        "job_id": job_id,
+        "message": "Domain build has started in the background.",
+        "next": {
+            "tool": "domain_status",
+            "arguments": {"job_id": job_id},
+            "poll_after_seconds": 10,
+        },
+    }
+
+
+def _domain_status_response(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("job_id"):
+        return get_domain_job_status(str(args["job_id"]))
+    return domain_service.status(
+        args.get("seed_paper"),
+        intent=str(args.get("intent", "")),
+        domain_id=args.get("domain_id"),
+    )
+
+
+def _domain_artifact_or_start(args: dict[str, Any], *, artifact: str) -> dict[str, Any]:
+    if artifact == "summary":
+        result = domain_service.get_domain_summary(
+            args.get("seed_paper"),
+            intent=str(args.get("intent", "")),
+            domain_id=args.get("domain_id"),
+        )
+    elif artifact == "graph":
+        result = domain_service.get_domain_graph(
+            args.get("seed_paper"),
+            intent=str(args.get("intent", "")),
+            domain_id=args.get("domain_id"),
+        )
+    else:
+        raise ValueError(f"Unsupported domain artifact: {artifact}")
+    if result.get("ok") or not args.get("seed_paper"):
+        return result
+    error_code = (result.get("error") or {}).get("code")
+    if error_code not in {"domain_summary_not_available", "domain_graph_not_available"}:
+        return result
+    started = _start_domain_job_response(args)
+    started["message"] = f"No cached domain {artifact} was returned immediately; background domain build has started."
+    return started
+
+
+def get_domain_job_status(job_id: str) -> dict[str, Any]:
+    with DOMAIN_LOCK:
+        job = DOMAIN_JOBS.get(job_id)
+        if not job:
+            return {
+                "ok": False,
+                "status": "domain_job_unknown",
+                "error": {"code": "domain_job_unknown", "message": f"Unknown domain job: {job_id}"},
+                "errors": [],
+                "meta": {},
+            }
+        snapshot = dict(job)
+    try:
+        snapshot["domain_status"] = domain_service.status(
+            snapshot.get("seed_paper"),
+            intent=str(snapshot.get("intent", "")),
+            domain_id=snapshot.get("domain_id"),
+        )
+    except Exception as exc:
+        snapshot["domain_status_error"] = str(exc)
+    return snapshot
+
+
+def _run_domain_job(
+    job_id: str,
+    seed_paper: str,
+    intent: str,
+    domain_id: str | None,
+    provider: str,
+    model: str | None,
+    refresh: bool,
+    workers: int,
+) -> None:
+    _record_domain_phase(job_id, "running")
+    result = domain_service.build_domain(
+        seed_paper,
+        intent=intent,
+        domain_id=domain_id,
+        provider=provider,
+        model=model,
+        refresh=refresh,
+        workers=workers,
+    )
+    status = "done" if isinstance(result, dict) and result.get("ok") else "failed"
+    with DOMAIN_LOCK:
+        if job_id in DOMAIN_JOBS:
+            DOMAIN_JOBS[job_id]["status"] = status
+            DOMAIN_JOBS[job_id]["phase"] = status
+            DOMAIN_JOBS[job_id]["updated_at"] = _now_iso()
+            DOMAIN_JOBS[job_id]["result"] = result
+
+
+def _capture_unhandled_domain_job_error(job_id: str) -> Callable[[Future], None]:
+    def callback(future: Future) -> None:
+        exc = future.exception()
+        if not exc:
+            return
+        with DOMAIN_LOCK:
+            if job_id in DOMAIN_JOBS:
+                DOMAIN_JOBS[job_id]["status"] = "failed"
+                DOMAIN_JOBS[job_id]["phase"] = "failed"
+                DOMAIN_JOBS[job_id]["updated_at"] = _now_iso()
+                DOMAIN_JOBS[job_id]["error"] = str(exc)
+
+    return callback
+
+
+def _record_domain_phase(job_id: str, phase: str) -> None:
+    with DOMAIN_LOCK:
+        if job_id in DOMAIN_JOBS:
+            DOMAIN_JOBS[job_id]["phase"] = phase
+            DOMAIN_JOBS[job_id]["updated_at"] = _now_iso()
 
 
 def _run_summary_job(job_id: str, paper_ids: Any, provider: str, model: str | None, refresh: bool) -> None:
@@ -317,12 +500,27 @@ def _register_tools(app: Any) -> None:
 
     @app.tool(
         description=(
+            "Get normalized INSPIRE metadata for one or more arXiv papers, including title, abstract, "
+            "authors, identifiers, year, DOI, INSPIRE record id, and citation count."
+        )
+    )
+    def get_metadata(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
+        return service.get_metadata(_one_or_many(paper_id, paper_ids), refresh=refresh)
+
+    @app.tool(
+        description=(
             "Get papers that cite one or more arXiv papers using INSPIRE. "
             "Citer data is cached with a time limit because it changes over time."
         )
     )
-    def get_citers(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_citers(_one_or_many(paper_id, paper_ids), refresh=refresh)
+    def get_citers(
+        paper_id: PaperId = None,
+        paper_ids: PaperIds = None,
+        refresh: Refresh = False,
+        limit: CiterLimit = 1000,
+        sort: CiterSort = "mostrecent",
+    ) -> Any:
+        return service.get_citers(_one_or_many(paper_id, paper_ids), refresh=refresh, limit=limit, sort=sort)
 
     @app.tool(
         description=(
@@ -544,3 +742,107 @@ def _register_tools(app: Any) -> None:
     @app.tool(description="Diagnose ARC's local cache directory and whether a paper summary is cached.")
     def doctor_cache(paper_id: PaperId = None) -> Any:
         return service.doctor_cache(paper_id)
+
+    @app.tool(
+        description=(
+            "Build a cached ARC research-domain package from a seed arXiv paper and optional user intent. "
+            "This starts a background job because foundation discovery, network construction, full-text fetches, "
+            "and LLM summary generation can be slow."
+        )
+    )
+    def domain_build(
+        seed_paper: Annotated[str, Field(description=PAPER_ID_DESCRIPTION)],
+        intent: DomainIntent = "",
+        domain_id: DomainId = None,
+        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
+        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        refresh: Refresh = False,
+        workers: Annotated[int, Field(description="Number of parallel paper-query workers.")] = 8,
+    ) -> Any:
+        return _start_domain_job_response(
+            {
+                "seed_paper": seed_paper,
+                "intent": intent,
+                "domain_id": domain_id,
+                "provider": provider,
+                "model": model,
+                "refresh": refresh,
+                "workers": workers,
+            }
+        )
+
+    @app.tool(
+        description=(
+            "Check a domain build background job by job_id, or inspect cached domain artifacts by seed_paper/domain_id."
+        )
+    )
+    def domain_status(
+        job_id: Annotated[str | None, Field(description="Background job id returned by domain_build.")] = None,
+        seed_paper: PaperId = None,
+        intent: DomainIntent = "",
+        domain_id: DomainId = None,
+    ) -> Any:
+        return _domain_status_response(
+            {
+                "job_id": job_id,
+                "seed_paper": seed_paper,
+                "intent": intent,
+                "domain_id": domain_id,
+            }
+        )
+
+    @app.tool(
+        description=(
+            "Get a cached ARC domain summary by seed paper or domain id. If no cached summary exists and "
+            "seed_paper is supplied, start a background domain build and return a job id."
+        )
+    )
+    def domain_get_summary(
+        seed_paper: PaperId = None,
+        intent: DomainIntent = "",
+        domain_id: DomainId = None,
+        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
+        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        refresh: Refresh = False,
+        workers: Annotated[int, Field(description="Number of parallel paper-query workers.")] = 8,
+    ) -> Any:
+        return _domain_artifact_or_start(
+            {
+                "seed_paper": seed_paper,
+                "intent": intent,
+                "domain_id": domain_id,
+                "provider": provider,
+                "model": model,
+                "refresh": refresh,
+                "workers": workers,
+            },
+            artifact="summary",
+        )
+
+    @app.tool(
+        description=(
+            "Get a cached ARC domain graph JSON by seed paper or domain id. If no cached graph exists and "
+            "seed_paper is supplied, start a background domain build and return a job id."
+        )
+    )
+    def domain_get_graph(
+        seed_paper: PaperId = None,
+        intent: DomainIntent = "",
+        domain_id: DomainId = None,
+        provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
+        model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
+        refresh: Refresh = False,
+        workers: Annotated[int, Field(description="Number of parallel paper-query workers.")] = 8,
+    ) -> Any:
+        return _domain_artifact_or_start(
+            {
+                "seed_paper": seed_paper,
+                "intent": intent,
+                "domain_id": domain_id,
+                "provider": provider,
+                "model": model,
+                "refresh": refresh,
+                "workers": workers,
+            },
+            artifact="graph",
+        )

@@ -20,9 +20,12 @@ def main(argv: list[str] | None = None) -> int:
     _paper_command(sub, "get-title")
     _paper_command(sub, "get-abstract")
     _paper_command(sub, "get-authors")
+    _paper_command(sub, "get-metadata")
     references = _paper_command(sub, "get-references")
     references.add_argument("--enrich", action="store_true")
-    _paper_command(sub, "get-citers")
+    citers = _paper_command(sub, "get-citers")
+    citers.add_argument("--limit", type=int, default=1000)
+    citers.add_argument("--sort", default="mostrecent", choices=["mostrecent", "mostcited"])
     _paper_command(sub, "get-citer-count")
     _paper_command(sub, "get-toc")
     llm_summary = _paper_command(sub, "get-llm-summary")
@@ -164,10 +167,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.get_abstract(paper_ids, refresh=args.refresh)
     if command == "get-authors":
         return service.get_authors(paper_ids, refresh=args.refresh)
+    if command == "get-metadata":
+        return service.get_metadata(paper_ids, refresh=args.refresh)
     if command == "get-references":
         return service.get_references(paper_ids, refresh=args.refresh, enrich=args.enrich)
     if command == "get-citers":
-        return service.get_citers(paper_ids, refresh=args.refresh)
+        return service.get_citers(paper_ids, refresh=args.refresh, limit=args.limit, sort=args.sort)
     if command == "get-citer-count":
         return service.get_citer_count(paper_ids, refresh=args.refresh)
     if command == "get-toc":

@@ -1,6 +1,6 @@
 ---
 name: arc
-description: Use for ARC research workflows involving paper metadata, ar5iv full text, INSPIRE references/citers, paper section lookup, equation context, and LLM paper summaries.
+description: Use for ARC research workflows involving paper metadata, ar5iv full text, INSPIRE references/citers, paper section lookup, equation context, LLM paper summaries, and research-domain construction from seed papers.
 ---
 
 # ARC
@@ -44,3 +44,17 @@ arc-paper-query store-llm-summary arXiv:0911.3380 --summary-json - --json
 
 For more than 10 papers, use `summary-batch`; do not run one interactive LLM
 step per paper. Read `references/paper-query.md` for the batch workflow.
+
+## Domain Info
+
+For a research-field/domain package from a seed paper:
+
+```bash
+arc-domain-info build arXiv:0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain-info status arXiv:0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain-info get-summary arXiv:0911.3380 --intent "quasi-single-field inflation observables" --json
+```
+
+Use `arc-domain-info` or ARC MCP domain tools instead of reimplementing domain
+construction in the skill. Read `references/domain-info.md` before starting a
+domain build.

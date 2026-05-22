@@ -6,11 +6,23 @@ Use the CLI with `--json`; outputs are result envelopes suitable for MCP:
 
 ```bash
 arc-paper-query get-title arXiv:0911.3380 --json
+arc-paper-query get-metadata arXiv:0911.3380 --json
 arc-paper-query get-section arXiv:0911.3380 --section S2 --json
 ```
 
 If `get-section` cannot find the requested section, it returns an error
 envelope plus `toc`. Use the returned `toc` to choose a valid section.
+
+For citing-paper lists:
+
+```bash
+arc-paper-query get-citers arXiv:0911.3380 --limit 1000 --sort mostrecent --json
+arc-paper-query get-citers arXiv:0911.3380 --limit 1000 --sort mostcited --json
+```
+
+INSPIRE citer responses are cached for one month and include title, abstract,
+authors, identifiers, year, and citation count when INSPIRE returns those
+fields.
 
 ## LLM Summary
 
