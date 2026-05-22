@@ -43,9 +43,11 @@ must not be modified.
 
 ## Package Boundaries
 
+- `packages/arc-llm-worker` owns reusable host LLM execution: host detection,
+  provider selection, model defaults, and Codex/Claude prompt calls.
 - `packages/arc-paper-query` owns deterministic paper data access, ID
-  normalization, caching, parsing, summary contracts, provider selection, and
-  batch execution.
+  normalization, caching, parsing, paper-summary contracts, paper-summary
+  orchestration, and batch execution.
 - `packages/arc-mcp` should stay a thin MCP adapter over `arc_paper_query`
   service functions and batch helpers.
 - `skills/arc`, `prompts/`, `schemas/`, and `packaging/` should describe or

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Protocol
 
-
-class LLMProviderError(RuntimeError):
-    pass
+from arc_llm_worker.providers.base import LLMWorkerError as LLMProviderError
 
 
 class LLMProvider(Protocol):

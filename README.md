@@ -9,9 +9,24 @@ Install the current development packages:
 ```bash
 python3 -m venv packages/arc-paper-query/.venv
 . packages/arc-paper-query/.venv/bin/activate
+python -m pip install -e packages/arc-llm-worker[test]
 python -m pip install -e packages/arc-paper-query[test]
 python -m pip install -e packages/arc-mcp
 ```
+
+## LLM Worker
+
+Reusable host LLM execution:
+
+```bash
+arc-llm-worker doctor config
+echo '{"task":"say ok"}' | arc-llm-worker run-json --provider auto
+echo 'Say ok.' | arc-llm-worker run-text --provider auto
+```
+
+`arc-llm-worker` owns host detection, provider selection, model defaults, and
+Codex/Claude CLI prompt execution. Other packages should use it instead of
+shelling out to host LLMs directly.
 
 ## Paper Query
 
