@@ -18,9 +18,9 @@ def select_provider(
     if provider == "auto":
         name = select_llm_provider(env=env, process_chain=process_chain).provider
     if name == "codex-cli":
-        return CodexCliProvider()
+        return CodexCliProvider(env=env)
     if name == "claude-cli":
-        return ClaudeCliProvider()
+        return ClaudeCliProvider(env=env)
     if name == "manual":
         return ManualProvider()
     raise ValueError(f"Unknown LLM provider: {name}")

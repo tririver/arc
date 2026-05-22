@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,17 @@ from .runner import resolve_llm_config, run_json, run_text
 
 
 def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    result = _dispatch(args)
+    if isinstance(result, str):
+        print(result, end="" if result.endswith("\n") else "\n")
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Reusable ARC host LLM worker")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -20,25 +32,22 @@ def main(argv: list[str] | None = None) -> int:
     run_json_parser.add_argument("--provider", default="auto")
     run_json_parser.add_argument("--model", default=None)
     run_json_parser.add_argument("--json", action="store_true")
+    _shared_runtime_args(run_json_parser)
+    _llm_runtime_args(run_json_parser)
 
     run_text_parser = sub.add_parser("run-text")
     run_text_parser.add_argument("--prompt", default="-")
     run_text_parser.add_argument("--provider", default="auto")
     run_text_parser.add_argument("--model", default=None)
+    _shared_runtime_args(run_text_parser)
+    _llm_runtime_args(run_text_parser)
 
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
     doctor_sub.add_parser("host")
     doctor_sub.add_parser("provider")
     doctor_sub.add_parser("config")
-
-    args = parser.parse_args(argv)
-    result = _dispatch(args)
-    if isinstance(result, str):
-        print(result, end="" if result.endswith("\n") else "\n")
-    else:
-        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-    return 0
+    return parser
 
 
 def _dispatch(args: argparse.Namespace) -> Any:
@@ -65,10 +74,104 @@ def _dispatch(args: argparse.Namespace) -> Any:
             schema=_read_schema(args.schema),
             provider=args.provider,
             model=args.model,
+            env=_runtime_env(args),
         )
     if args.command == "run-text":
-        return run_text(_read_prompt(args.prompt), provider=args.provider, model=args.model)
+        return run_text(
+            _read_prompt(args.prompt),
+            provider=args.provider,
+            model=args.model,
+            env=_runtime_env(args),
+        )
     raise AssertionError(f"Unhandled command: {args.command}")
+
+
+def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--allow-internet", action="store_true")
+    parser.add_argument("--allow-mcp", action="store_true")
+
+
+def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--codex-sandbox", default=None)
+    parser.add_argument("--codex-profile", default=None)
+    parser.add_argument("--codex-profile-v2", default=None)
+    parser.add_argument("--codex-config", action="append", default=[])
+    parser.add_argument("--codex-reasoning-effort", default=None)
+    parser.add_argument("--codex-reasoning-summary", default=None)
+    parser.add_argument("--codex-model-verbosity", default=None)
+    parser.add_argument("--codex-web-search", default=None)
+    parser.add_argument("--codex-network-access", choices=["true", "false"], default=None)
+    parser.add_argument("--no-codex-ephemeral", action="store_true")
+    parser.add_argument("--codex-use-user-config", action="store_true")
+    parser.add_argument("--codex-ignore-user-config", action="store_true")
+    parser.add_argument("--codex-use-rules", action="store_true")
+    parser.add_argument("--codex-ignore-rules", action="store_true")
+    parser.add_argument("--claude-effort", default=None)
+    parser.add_argument("--claude-tools", default=None)
+    parser.add_argument("--claude-mcp-config", action="append", default=[])
+    parser.add_argument("--claude-strict-mcp-config", action="store_true")
+    parser.add_argument("--no-claude-strict-mcp-config", action="store_true")
+    parser.add_argument("--no-claude-bare", action="store_true")
+    parser.add_argument("--no-claude-session-persistence", action="store_true")
+    parser.add_argument("--no-claude-exclude-dynamic-system-prompt-sections", action="store_true")
+    parser.add_argument("--claude-max-budget-usd", default=None)
+    parser.add_argument("--claude-fallback-model", default=None)
+
+
+def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
+    overrides: dict[str, str] = {}
+    if args.allow_internet:
+        overrides["ARC_CODEX_ALLOW_INTERNET"] = "true"
+        overrides["ARC_CLAUDE_ALLOW_INTERNET"] = "true"
+    if args.allow_mcp:
+        overrides["ARC_CODEX_ENABLE_MCP"] = "true"
+        overrides["ARC_CLAUDE_ALLOW_MCP"] = "true"
+    _put(overrides, "ARC_CODEX_SANDBOX", args.codex_sandbox)
+    _put(overrides, "ARC_CODEX_PROFILE", args.codex_profile)
+    _put(overrides, "ARC_CODEX_PROFILE_V2", args.codex_profile_v2)
+    if args.codex_config:
+        overrides["ARC_CODEX_CONFIG"] = "\n".join(args.codex_config)
+    _put(overrides, "ARC_CODEX_REASONING_EFFORT", args.codex_reasoning_effort)
+    _put(overrides, "ARC_CODEX_REASONING_SUMMARY", args.codex_reasoning_summary)
+    _put(overrides, "ARC_CODEX_MODEL_VERBOSITY", args.codex_model_verbosity)
+    _put(overrides, "ARC_CODEX_WEB_SEARCH", args.codex_web_search)
+    _put(overrides, "ARC_CODEX_NETWORK_ACCESS", args.codex_network_access)
+    if args.no_codex_ephemeral:
+        overrides["ARC_CODEX_EPHEMERAL"] = "false"
+    if args.codex_use_user_config:
+        overrides["ARC_CODEX_IGNORE_USER_CONFIG"] = "false"
+    if args.codex_ignore_user_config:
+        overrides["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
+    if args.codex_use_rules:
+        overrides["ARC_CODEX_IGNORE_RULES"] = "false"
+    if args.codex_ignore_rules:
+        overrides["ARC_CODEX_IGNORE_RULES"] = "true"
+    _put(overrides, "ARC_CLAUDE_EFFORT", args.claude_effort)
+    _put(overrides, "ARC_CLAUDE_TOOLS", args.claude_tools)
+    if args.claude_mcp_config:
+        overrides["ARC_CLAUDE_MCP_CONFIG"] = "\n".join(args.claude_mcp_config)
+    if args.claude_strict_mcp_config:
+        overrides["ARC_CLAUDE_STRICT_MCP_CONFIG"] = "true"
+    if args.no_claude_strict_mcp_config:
+        overrides["ARC_CLAUDE_STRICT_MCP_CONFIG"] = "false"
+    if args.no_claude_bare:
+        overrides["ARC_CLAUDE_BARE"] = "false"
+    if args.no_claude_session_persistence:
+        overrides["ARC_CLAUDE_NO_SESSION_PERSISTENCE"] = "false"
+    if args.no_claude_exclude_dynamic_system_prompt_sections:
+        overrides["ARC_CLAUDE_EXCLUDE_DYNAMIC_SYSTEM_PROMPT_SECTIONS"] = "false"
+    _put(overrides, "ARC_CLAUDE_MAX_BUDGET_USD", args.claude_max_budget_usd)
+    _put(overrides, "ARC_CLAUDE_FALLBACK_MODEL", args.claude_fallback_model)
+    if not overrides:
+        return None
+    env = dict(os.environ)
+    env.update(overrides)
+    return env
+
+
+def _put(env: dict[str, str], key: str, value: str | None) -> None:
+    if value is not None:
+        env[key] = value
 
 
 def _read_prompt(value: str) -> str:
