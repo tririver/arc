@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from arc_domain_info import service
 from arc_domain_info.cache import DomainPaths, domain_id_for, read_json
 from arc_domain_info import paper
@@ -26,8 +28,37 @@ def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     assert data["foundation"]["selected_foundation"]["paper_id"] == FOUNDATION
     graph = read_json(paths.domain_graph)
     assert graph["foundation_paper"] == FOUNDATION
+    assert any(node["paper_id"] == FOUNDATION and node["role"] == "selected_foundation" for node in graph["nodes"])
+    parent = next(node for node in graph["nodes"] if node["paper_id"] == "arXiv:2301.00002")
+    assert parent["role"] == "parent_foundation"
+    assert parent["abstract"] == "Abstract for Parent Paper."
+    assert parent["authors"] == ["Alice A.", "Bob B."]
+    assert parent["citation_count"] == 1500
+    domain = next(node for node in graph["nodes"] if node["paper_id"] == "arXiv:2402.00001")
+    assert domain["in_graph_citer_count"] == 1
+    assert domain["in_graph_citer_score"] == 1.0
+    assert "citation_rate_score" in domain
+    assert domain["reference_edge_count"] == 2
+    assert domain["reference_edge_score"] == 1.0
     assert any(node["role"] == "common_reference" for node in graph["nodes"])
     assert read_json(paths.domain_summary)["summary_method"] == "deterministic_fallback"
+    html = paths.network_html.read_text(encoding="utf-8")
+    graph_data = re.search(r'<script id="graph-data" type="application/json">(.*?)</script>', html, re.S)
+    assert graph_data
+    assert "&quot;" not in graph_data.group(1)
+    assert '"nodes"' in graph_data.group(1)
+    assert "highlightConnectedEdges" in html
+    assert "Authors:" in html
+    assert "MathJax" in html
+    assert "typesetMath(details)" in html
+    assert "Ref edges:" in html
+    assert "network.focus" not in html
+    assert "navigationButtons: false" in html
+    assert 'id="fit-network"' in html
+    table_body = re.search(r"<tbody>(.*?)</tbody>", html, re.S).group(1)
+    assert table_body.index(">Parent<") < table_body.index(">Common<") < table_body.index(">Domain<")
+    assert re.search(r'<tr data-id="arXiv:2201.00001">.*?<td></td>.*?</tr>', table_body, re.S)
+    assert re.search(r'<tr data-id="arXiv:2402.00001">.*?<td>[0-9.]+</td>.*?</tr>', table_body, re.S)
 
 
 def test_status_and_cached_summary(monkeypatch, tmp_path):
@@ -78,9 +109,13 @@ def _metadata(paper_id, *, refresh=False):
 def _references(paper_id, *, refresh=False, enrich=False):
     if paper_id == SEED:
         return [_metadata(FOUNDATION), _metadata("arXiv:2301.00002")]
-    if paper_id in {"arXiv:2501.00001", "arXiv:2501.00002"}:
+    if paper_id == "arXiv:2501.00001":
+        return [_metadata(FOUNDATION), _metadata("arXiv:2301.00002"), _metadata("arXiv:2201.00001")]
+    if paper_id == "arXiv:2501.00002":
         return [_metadata(FOUNDATION), _metadata("arXiv:2201.00001")]
     if paper_id in {"arXiv:2402.00001", "arXiv:2402.00002", "arXiv:2402.00003"}:
+        if paper_id == "arXiv:2402.00002":
+            return [_metadata(FOUNDATION), _metadata("arXiv:2201.00001"), _metadata("arXiv:2402.00001")]
         return [_metadata(FOUNDATION), _metadata("arXiv:2201.00001")]
     return []
 

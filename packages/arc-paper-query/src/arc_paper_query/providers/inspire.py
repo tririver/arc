@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import html
+import re
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import httpx
@@ -11,6 +14,9 @@ from .base import ProviderError
 
 BASE_URL = "https://inspirehep.net/api"
 MAX_PAGE_SIZE = 1000
+MATHML_RE = re.compile(r"<math\b[^>]*>.*?</math>", re.IGNORECASE | re.DOTALL)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+WHITESPACE_RE = re.compile(r"\s+")
 SUMMARY_FIELDS = ",".join(
     [
         "titles",
@@ -39,6 +45,9 @@ class InspireProvider:
         paths = CachePaths.for_paper(paper_id)
         references: list[dict[str, Any]]
         if not refresh and (cached := read_json(paths.inspire_references)) and _references_cache_is_current(cached):
+            cached, changed = _clean_cached_paper_items(cached)
+            if changed:
+                write_json(paths.inspire_references, cached)
             if not enrich or _references_cache_is_enriched(cached):
                 return cached
             references = cached
@@ -91,6 +100,9 @@ class InspireProvider:
         cache_path = _citers_cache_path(paper_id, sort, limit)
         if not refresh and (cached := read_json(cache_path, ttl_seconds=ONE_MONTH_SECONDS)):
             if isinstance(cached, list):
+                cached, changed = _clean_cached_paper_items(cached)
+                if changed:
+                    write_json(cache_path, cached)
                 return cached[:limit]
 
         metadata = self.get_metadata(paper_id, refresh=refresh)
@@ -205,7 +217,7 @@ def _normalize_reference(item: dict[str, Any]) -> dict[str, Any]:
         return {}
     out = {
         "paper_id": paper_id,
-        "title": _string_or_first(title),
+        "title": _clean_inspire_text(_string_or_first(title)),
         "raw_inspire_reference": item,
     }
     record_ref = (item.get("record") or {}).get("$ref")
@@ -329,8 +341,8 @@ def _references_cache_is_enriched(cached: Any) -> bool:
 def _first_title(metadata: dict[str, Any]) -> str:
     titles = metadata.get("titles") or []
     if titles and isinstance(titles[0], dict):
-        return str(titles[0].get("title") or "").strip()
-    return str(metadata.get("title") or "").strip()
+        return _clean_inspire_text(titles[0].get("title"))
+    return _clean_inspire_text(metadata.get("title"))
 
 
 def _first_abstract(metadata: dict[str, Any]) -> str:
@@ -338,9 +350,9 @@ def _first_abstract(metadata: dict[str, Any]) -> str:
     if abstracts:
         first = abstracts[0]
         if isinstance(first, dict):
-            return str(first.get("value") or first.get("summary") or "").strip()
-        return str(first).strip()
-    return str(metadata.get("abstract") or "").strip()
+            return _clean_inspire_text(first.get("value") or first.get("summary"))
+        return _clean_inspire_text(first)
+    return _clean_inspire_text(metadata.get("abstract"))
 
 
 def _first_arxiv_id(metadata: dict[str, Any]) -> str:
@@ -382,5 +394,109 @@ def _authors(metadata: dict[str, Any]) -> list[str]:
 
 def _string_or_first(value: Any) -> str:
     if isinstance(value, list):
-        return str(value[0] if value else "").strip()
+        if not value:
+            return ""
+        first = value[0]
+        if isinstance(first, dict):
+            return str(first.get("title") or first.get("value") or first.get("summary") or "").strip()
+        return str(first).strip()
     return str(value or "").strip()
+
+
+def _clean_cached_paper_items(items: list[Any]) -> tuple[list[Any], bool]:
+    changed = False
+    cleaned: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        record = dict(item)
+        for key in ("title", "abstract"):
+            if key not in record:
+                continue
+            value = _clean_inspire_text(record.get(key))
+            if value != record.get(key):
+                record[key] = value
+                changed = True
+        cleaned.append(record)
+    return cleaned, changed
+
+
+def _clean_inspire_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = MATHML_RE.sub(lambda match: _mathml_to_text(match.group(0)), text)
+    text = HTML_TAG_RE.sub("", text)
+    text = html.unescape(text)
+    text = WHITESPACE_RE.sub(" ", text).strip()
+    text = re.sub(r"\s+([,.;:)\]\}])", r"\1", text)
+    text = re.sub(r"([(\[\{])\s+", r"\1", text)
+    return text
+
+
+def _mathml_to_text(markup: str) -> str:
+    try:
+        root = ET.fromstring(markup)
+    except ET.ParseError:
+        return _clean_inspire_text(HTML_TAG_RE.sub("", markup))
+    return _normalize_math_text(_math_node_text(root))
+
+
+def _math_node_text(node: ET.Element) -> str:
+    tag = _local_name(node.tag)
+    children = list(node)
+    if tag in {"math", "mrow", "mstyle", "mpadded", "mphantom"}:
+        return _math_children_text(node)
+    if tag in {"mi", "mn", "mo", "mtext"}:
+        return _math_token_text((node.text or "") + _math_child_elements_text(node))
+    if tag == "msub" and len(children) >= 2:
+        return f"{_math_node_text(children[0])}_{_math_node_text(children[1])}"
+    if tag == "msup" and len(children) >= 2:
+        return f"{_math_node_text(children[0])}^{_math_node_text(children[1])}"
+    if tag == "msubsup" and len(children) >= 3:
+        return f"{_math_node_text(children[0])}_{_math_node_text(children[1])}^{_math_node_text(children[2])}"
+    if tag == "mfrac" and len(children) >= 2:
+        return f"({_math_node_text(children[0])})/({_math_node_text(children[1])})"
+    if tag == "msqrt" and children:
+        return f"sqrt({_math_children_text(node)})"
+    if tag == "mroot" and len(children) >= 2:
+        return f"root({_math_node_text(children[0])},{_math_node_text(children[1])})"
+    if tag in {"semantics", "menclose"} and children:
+        return _math_node_text(children[0])
+    if tag in {"annotation", "annotation-xml"}:
+        return ""
+    return _math_children_text(node) or _math_token_text(node.text or "")
+
+
+def _math_children_text(node: ET.Element) -> str:
+    parts = []
+    if node.text and node.text.strip():
+        parts.append(node.text)
+    parts.append(_math_child_elements_text(node))
+    return "".join(parts)
+
+
+def _math_child_elements_text(node: ET.Element) -> str:
+    parts = []
+    for child in list(node):
+        if _local_name(child.tag) not in {"annotation", "annotation-xml"}:
+            parts.append(_math_node_text(child))
+        if child.tail and child.tail.strip():
+            parts.append(child.tail)
+    return "".join(parts)
+
+
+def _math_token_text(text: str) -> str:
+    return html.unescape(text).replace("\u2062", "").replace("\xa0", " ").strip()
+
+
+def _normalize_math_text(text: str) -> str:
+    text = WHITESPACE_RE.sub(" ", text).strip()
+    text = re.sub(r"\s+([,.;:)\]\}])", r"\1", text)
+    text = re.sub(r"([(\[\{])\s+", r"\1", text)
+    return text
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]

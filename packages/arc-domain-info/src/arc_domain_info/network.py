@@ -23,6 +23,11 @@ INTENT_RANKING_SCHEMA: dict[str, Any] = {
         "reasoning": {"type": "string"},
     },
 }
+CITATION_RATE_WEIGHT = 0.1
+RECENCY_WEIGHT = 0.5
+INTENT_OVERLAP_WEIGHT = 1.0
+GRAPH_CITER_WEIGHT = 2.0
+REFERENCE_EDGE_WEIGHT = 0.5
 
 
 def build_network(
@@ -65,15 +70,6 @@ def build_network(
         intent=intent,
         selected_count=selected_count,
     )
-    write_json(
-        paths.selected_papers,
-        {
-            "schema_version": "arc.domain_selected_papers.v1",
-            "foundation_paper": foundation_id,
-            "papers": selected,
-            "created_at": now_iso(),
-        },
-    )
 
     selected_ids = [item["paper_id"] for item in selected]
     refs_by_selected = paper.fetch_many(
@@ -81,7 +77,10 @@ def build_network(
         lambda paper_id: paper.references(paper_id, refresh=refresh, enrich=False),
         workers=workers,
     )
+    selected = _add_in_graph_citer_scores(selected, refs_by_selected=refs_by_selected)
+    selected_ids = [item["paper_id"] for item in selected]
     common_refs = _common_references(
+        foundation_id=foundation_id,
         selected_ids=selected_ids,
         refs_by_selected=refs_by_selected,
         max_extra=max(0, max_nodes - 1 - len(selected)),
@@ -98,9 +97,31 @@ def build_network(
         },
     )
 
+    parent_foundations = _enrich_parent_foundations(
+        selection.get("parent_foundations") or [],
+        refresh=refresh,
+        workers=workers,
+    )
+    selected = _add_reference_edge_scores(
+        selected,
+        foundation_id=foundation_id,
+        parent_foundations=parent_foundations,
+        common_references=common_refs,
+        refs_by_selected=refs_by_selected,
+    )
+    selected_ids = [item["paper_id"] for item in selected]
+    write_json(
+        paths.selected_papers,
+        {
+            "schema_version": "arc.domain_selected_papers.v1",
+            "foundation_paper": foundation_id,
+            "papers": selected,
+            "created_at": now_iso(),
+        },
+    )
     graph = _build_graph(
         foundation=foundation_meta,
-        parent_foundations=selection.get("parent_foundations") or [],
+        parent_foundations=parent_foundations,
         selected_papers=selected,
         common_references=common_refs,
         refs_by_selected=refs_by_selected,
@@ -232,18 +253,171 @@ def _select_domain_papers(
         intent_boost = 0.0
         if paper_id in intent_rank:
             intent_boost = 2.0 - 0.12 * (intent_rank[paper_id] - 1)
-        score = log_score(cpy) + 0.35 * recency + 1.25 * intent_overlap + intent_boost
+        score = _domain_score(
+            citation_per_year=cpy,
+            recency=recency,
+            intent_overlap=intent_overlap,
+            intent_boost=intent_boost,
+            in_graph_citer_score=0.0,
+            reference_edge_count=0,
+        )
         record["domain_score"] = round(score, 4)
         record["citation_per_year"] = round(cpy, 4)
+        record["citation_rate_score"] = round(CITATION_RATE_WEIGHT * log_score(cpy), 4)
+        record["recency"] = round(recency, 4)
+        record["recency_score"] = round(RECENCY_WEIGHT * recency, 4)
         record["intent_overlap"] = round(intent_overlap, 4)
+        record["intent_overlap_score"] = round(INTENT_OVERLAP_WEIGHT * intent_overlap, 4)
+        record["intent_boost"] = round(intent_boost, 4)
+        record["in_graph_citer_count"] = 0
+        record["in_graph_citer_score"] = 0.0
+        record["reference_edge_count"] = 0
+        record["reference_edge_score"] = 0.0
         record["selection_reason"] = _selection_reason(record, paper_id in intent_rank)
         scored.append(record)
     scored.sort(key=lambda item: (item["domain_score"], item.get("citation_count") or 0, item.get("year") or 0), reverse=True)
     return scored[:selected_count]
 
 
+def _add_in_graph_citer_scores(
+    selected_papers: list[dict[str, Any]],
+    *,
+    refs_by_selected: dict[str, Any],
+) -> list[dict[str, Any]]:
+    selected_ids = [normalize_paper_id(item.get("paper_id") or paper_key(item)) for item in selected_papers]
+    selected_set = set(selected_ids)
+    counts = Counter()
+    for source_id, refs in refs_by_selected.items():
+        source_id = normalize_paper_id(source_id)
+        if source_id not in selected_set or not isinstance(refs, list):
+            continue
+        seen = set()
+        for ref in refs:
+            target_id = normalize_paper_id(paper_key(ref))
+            if not target_id or target_id == source_id or target_id not in selected_set or target_id in seen:
+                continue
+            seen.add(target_id)
+            counts[target_id] += 1
+
+    max_count = max(counts.values(), default=0)
+    scored = []
+    for item in selected_papers:
+        record = dict(item)
+        paper_id = normalize_paper_id(record.get("paper_id") or paper_key(record))
+        count = int(counts.get(paper_id, 0))
+        normalized = count / max_count if max_count else 0.0
+        record["in_graph_citer_count"] = count
+        record["in_graph_citer_score"] = round(normalized, 4)
+        score = _domain_score(
+            citation_per_year=float(record.get("citation_per_year") or 0),
+            recency=float(record.get("recency") or 0),
+            intent_overlap=float(record.get("intent_overlap") or 0),
+            intent_boost=float(record.get("intent_boost") or 0),
+            in_graph_citer_score=normalized,
+            reference_edge_count=int(record.get("reference_edge_count") or 0),
+        )
+        record["domain_score"] = round(score, 4)
+        record["selection_reason"] = _selection_reason(record, bool(record.get("intent_boost")))
+        scored.append(record)
+    scored.sort(
+        key=lambda item: (
+            item["domain_score"],
+            item.get("in_graph_citer_count") or 0,
+            item.get("citation_count") or 0,
+            item.get("year") or 0,
+        ),
+        reverse=True,
+    )
+    return scored
+
+
+def _add_reference_edge_scores(
+    selected_papers: list[dict[str, Any]],
+    *,
+    foundation_id: str,
+    parent_foundations: list[dict[str, Any]],
+    common_references: list[dict[str, Any]],
+    refs_by_selected: dict[str, Any],
+) -> list[dict[str, Any]]:
+    selected_ids = [normalize_paper_id(item.get("paper_id") or paper_key(item)) for item in selected_papers]
+    node_ids = set(selected_ids)
+    if foundation_id:
+        node_ids.add(normalize_paper_id(foundation_id))
+    for item in parent_foundations:
+        parent_id = normalize_paper_id(item.get("paper_id") or paper_key(item))
+        if parent_id:
+            node_ids.add(parent_id)
+    for item in common_references:
+        common_id = normalize_paper_id(item.get("paper_id") or paper_key(item))
+        if common_id:
+            node_ids.add(common_id)
+
+    counts: Counter[str] = Counter()
+    for source_id, refs in refs_by_selected.items():
+        source_id = normalize_paper_id(source_id)
+        if source_id not in node_ids or not isinstance(refs, list):
+            continue
+        seen = set()
+        for ref in refs:
+            target_id = normalize_paper_id(paper_key(ref))
+            if not target_id or target_id == source_id or target_id not in node_ids or target_id in seen:
+                continue
+            seen.add(target_id)
+            counts[source_id] += 1
+
+    scored = []
+    for item in selected_papers:
+        record = dict(item)
+        paper_id = normalize_paper_id(record.get("paper_id") or paper_key(record))
+        count = int(counts.get(paper_id, 0))
+        record["reference_edge_count"] = count
+        record["reference_edge_score"] = round(REFERENCE_EDGE_WEIGHT * count, 4)
+        score = _domain_score(
+            citation_per_year=float(record.get("citation_per_year") or 0),
+            recency=float(record.get("recency") or 0),
+            intent_overlap=float(record.get("intent_overlap") or 0),
+            intent_boost=float(record.get("intent_boost") or 0),
+            in_graph_citer_score=float(record.get("in_graph_citer_score") or 0),
+            reference_edge_count=count,
+        )
+        record["domain_score"] = round(score, 4)
+        record["selection_reason"] = _selection_reason(record, bool(record.get("intent_boost")))
+        scored.append(record)
+    scored.sort(
+        key=lambda item: (
+            item["domain_score"],
+            item.get("reference_edge_count") or 0,
+            item.get("in_graph_citer_count") or 0,
+            item.get("citation_count") or 0,
+            item.get("year") or 0,
+        ),
+        reverse=True,
+    )
+    return scored
+
+
+def _domain_score(
+    *,
+    citation_per_year: float,
+    recency: float,
+    intent_overlap: float,
+    intent_boost: float,
+    in_graph_citer_score: float,
+    reference_edge_count: int,
+) -> float:
+    return (
+        CITATION_RATE_WEIGHT * log_score(citation_per_year)
+        + RECENCY_WEIGHT * recency
+        + INTENT_OVERLAP_WEIGHT * intent_overlap
+        + intent_boost
+        + GRAPH_CITER_WEIGHT * in_graph_citer_score
+        + REFERENCE_EDGE_WEIGHT * reference_edge_count
+    )
+
+
 def _common_references(
     *,
+    foundation_id: str,
     selected_ids: list[str],
     refs_by_selected: dict[str, Any],
     max_extra: int,
@@ -251,6 +425,7 @@ def _common_references(
     workers: int,
 ) -> list[dict[str, Any]]:
     selected_set = {normalize_paper_id(item) for item in selected_ids}
+    selected_set.add(normalize_paper_id(foundation_id))
     counts = Counter()
     support: dict[str, list[str]] = defaultdict(list)
     embedded: dict[str, dict[str, Any]] = {}
@@ -297,6 +472,36 @@ def _common_references(
     return common
 
 
+def _enrich_parent_foundations(
+    parent_foundations: list[dict[str, Any]],
+    *,
+    refresh: bool,
+    workers: int,
+) -> list[dict[str, Any]]:
+    ids = [normalize_paper_id(paper_key(item)) for item in parent_foundations if paper_key(item)]
+    metadata_by_id = paper.fetch_many(
+        ids,
+        lambda paper_id: paper.metadata(paper_id, refresh=refresh),
+        workers=workers,
+    )
+    enriched = []
+    for item in parent_foundations:
+        parent_id = normalize_paper_id(paper_key(item))
+        meta = metadata_by_id.get(parent_id)
+        if not isinstance(meta, dict) or meta.get("error"):
+            meta = {}
+        record = dict(meta)
+        record["paper_id"] = normalize_paper_id(record.get("paper_id") or parent_id)
+        record["title"] = record.get("title") or item.get("title", "")
+        record["reason"] = item.get("reason", "")
+        record["selection_reason"] = item.get("reason", "")
+        for key in ("abstract", "authors", "year", "citation_count", "identifiers"):
+            if key not in record and key in item:
+                record[key] = item[key]
+        enriched.append(record)
+    return enriched
+
+
 def _build_graph(
     *,
     foundation: dict[str, Any],
@@ -316,7 +521,8 @@ def _build_graph(
     for item in selected_papers:
         nodes[item["paper_id"]] = _node(item, role="domain_paper")
     for item in common_references:
-        nodes[item["paper_id"]] = _node(item, role="common_reference")
+        if item["paper_id"] not in nodes:
+            nodes[item["paper_id"]] = _node(item, role="common_reference")
 
     edges = []
     seen_edges = set()
@@ -356,6 +562,16 @@ def _node(paper_record: dict[str, Any], *, role: str) -> dict[str, Any]:
         "citation_count": int(paper_record.get("citation_count") or paper_record.get("cited_by_count") or 0),
         "citation_per_year": paper_record.get("citation_per_year"),
         "domain_score": paper_record.get("domain_score"),
+        "citation_rate_score": paper_record.get("citation_rate_score"),
+        "recency": paper_record.get("recency"),
+        "recency_score": paper_record.get("recency_score"),
+        "intent_overlap": paper_record.get("intent_overlap"),
+        "intent_overlap_score": paper_record.get("intent_overlap_score"),
+        "intent_boost": paper_record.get("intent_boost"),
+        "in_graph_citer_count": paper_record.get("in_graph_citer_count"),
+        "in_graph_citer_score": paper_record.get("in_graph_citer_score"),
+        "reference_edge_count": paper_record.get("reference_edge_count"),
+        "reference_edge_score": paper_record.get("reference_edge_score"),
         "selection_reason": paper_record.get("selection_reason") or paper_record.get("reason", ""),
         "support_count": paper_record.get("support_count"),
         "identifiers": paper_record.get("identifiers") or {},
@@ -376,6 +592,10 @@ def _selection_reason(record: dict[str, Any], intent_ranked: bool) -> str:
         parts.append("LLM intent-ranked")
     if record.get("citation_per_year", 0) > 0:
         parts.append("citation-per-year")
+    if record.get("in_graph_citer_count", 0) > 0:
+        parts.append("cited-within-graph")
+    if record.get("reference_edge_count", 0) > 0:
+        parts.append("reference-connected")
     if record.get("year"):
         parts.append("recency")
     return ", ".join(parts) or "representative foundation citer"

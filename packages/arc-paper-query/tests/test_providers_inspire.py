@@ -37,6 +37,54 @@ FULL_REFERENCE_RECORD = {
 }
 
 
+def test_inspire_mathml_text_is_normalized(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
+    planck = '<math display="inline"><mi>P</mi><mi>l</mi><mi>a</mi><mi>n</mi><mi>c</mi><mi>k</mi></math>'
+    record = {
+        "id": "2878726",
+        "metadata": {
+            "control_number": 2878726,
+            "titles": [{"title": f"Searching for inflationary physics. Constraints from {planck}"}],
+            "abstracts": [
+                {
+                    "value": (
+                        'We analyze <math display="inline"><mo>ℓ</mo><mo>∈</mo>'
+                        '<mo stretchy="false">[</mo><mn>2</mn><mo>,</mo><mn>2048</mn>'
+                        '<mo stretchy="false">]</mo></math> and '
+                        '<math display="inline"><msubsup><mi>g</mi><mrow><mi>NL</mi></mrow>'
+                        '<mrow><mi>loc</mi></mrow></msubsup></math>.'
+                    )
+                }
+            ],
+            "arxiv_eprints": [{"value": "2502.06931"}],
+            "references": [
+                {
+                    "record": {"$ref": "https://inspirehep.net/api/literature/1"},
+                    "reference": {"title": f"Reference to {planck}", "arxiv_eprint": "2501.00001"},
+                }
+            ],
+        },
+    }
+
+    provider = InspireProvider(client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=record))))
+
+    metadata = provider.get_metadata("2502.06931")
+    references = provider.get_references("2502.06931")
+
+    assert metadata["title"] == "Searching for inflationary physics. Constraints from Planck"
+    assert "<math" not in metadata["abstract"]
+    assert "ℓ∈[2,2048]" in metadata["abstract"]
+    assert "g_NL^loc" in metadata["abstract"]
+    assert references[0]["title"] == "Reference to Planck"
+
+    cached_provider = InspireProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError()))
+        )
+    )
+    assert cached_provider.get_metadata("arXiv:2502.06931")["title"].endswith("Planck")
+
+
 def test_inspire_metadata_and_references_are_cached(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_QUERY_CACHE", str(tmp_path))
     calls = []
