@@ -205,7 +205,7 @@ class MCPJobManager:
                 "meta": {},
             }
         paths.cancel_request.write_text(now_iso(), encoding="utf-8")
-        update_status(
+        requested = update_status(
             job_id,
             status="cancel_requested",
             phase="cancel_requested",
@@ -219,7 +219,10 @@ class MCPJobManager:
             future = self._futures.get(job_id)
         if future is not None and future.cancel():
             set_error(job_id, "job_cancelled", "MCP job was cancelled before it started running.", cancelled=True)
-        return self.status(job_id)
+            return self.status(job_id)
+        requested["events"] = tail_events(paths.events, limit=self._event_limit)
+        requested["eta"] = estimate_eta(requested)
+        return requested
 
     def _use_thread_worker(self) -> bool:
         mode = self._worker_mode or os.environ.get("ARC_MCP_WORKER_MODE", "process")

@@ -37,15 +37,16 @@ Step 2: If a cached result is returned, use it.
 Phase 2: Generate only when needed.
 Step 1: Use `arc-paper llm-generate-summary ... --provider auto --json` for an
 explicit generation step or provider override.
-Step 2: If MCP returns `status: "job_running"` with a `job_id`, immediately run:
+Step 2: For MCP, pass `background=true` when launching many or slow summaries.
+Step 3: If MCP returns `status: "job_running"` with a `job_id`, immediately run:
 
 ```bash
 arc-mcp jobs watch <job_id> --json
 ```
 
-Step 3: Use MCP `job_status` and `job_result` only when a CLI watcher is not
+Step 4: Use MCP `job_status` and `job_result` only when a CLI watcher is not
 available.
-Step 4: Do not call `cancel_job` unless the user explicitly asks.
+Step 5: Do not call `cancel_job` unless the user explicitly asks.
 
 If `llm-summary` returns `status: "needs_llm"`, use the returned
 `llm_task` to generate schema-valid JSON manually, then store it with:
@@ -78,12 +79,14 @@ Step 2: If artifacts are missing, move to Phase 2.
 
 Phase 2: Build the domain.
 Step 1: Use `arc-domain llm-build` or MCP `llm_domain_build`.
-Step 2: If MCP returns `status: "job_running"` with a `job_id`, immediately run:
+Step 2: For MCP, pass `background=true` when the build should be scheduled
+immediately instead of waiting inline.
+Step 3: If MCP returns `status: "job_running"` with a `job_id`, immediately run:
 
 ```bash
 arc-mcp jobs watch <job_id> --json
 ```
 
-Step 3: If the CLI watcher is unavailable, poll `job_status` or `domain_status`
+Step 4: If the CLI watcher is unavailable, poll `job_status` or `domain_status`
 until complete.
-Step 4: Read cached artifacts with `domain_get_summary` or `domain_get_graph`.
+Step 5: Read cached artifacts with `domain_get_summary` or `domain_get_graph`.

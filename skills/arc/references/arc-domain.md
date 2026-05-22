@@ -33,7 +33,8 @@ arc-domain get-graph 0911.3380 --intent "..." --json
 
 Use `llm_domain_build` for long builds. It may call the host LLM provider, so
 it waits only until the MCP deadline margin. If the result is not ready, it
-returns a `job_id`.
+returns a `job_id`. Pass `background=true` to schedule the build and return the
+`job_id` immediately.
 
 Phase 1: Check cached artifacts.
 Step 1: Call `domain_get_summary` or `domain_get_graph`.
@@ -42,15 +43,16 @@ Step 2: These tools are cache-only and do not call an LLM.
 Phase 2: Build missing artifacts.
 Step 1: Call `llm_domain_build`, `llm_domain_get_summary`, or
 `llm_domain_get_graph`.
-Step 2: If MCP returns `status: "job_running"` with a `job_id`, run:
+Step 2: Use `background=true` for slow builds or large job launches.
+Step 3: If MCP returns `status: "job_running"` with a `job_id`, run:
 
 ```bash
 arc-mcp jobs watch <job_id> --json
 ```
 
-Step 3: If the CLI watcher is unavailable, poll `job_status` or `domain_status`
+Step 4: If the CLI watcher is unavailable, poll `job_status` or `domain_status`
 until status is `done`.
-Step 4: Do not call `cancel_job` unless the user explicitly asks.
+Step 5: Do not call `cancel_job` unless the user explicitly asks.
 
 ARC stores MCP job state under `cache/arc-mcp/jobs/`. The CLI watcher and MCP
 tools read the same persisted job files.

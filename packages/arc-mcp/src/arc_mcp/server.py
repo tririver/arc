@@ -47,6 +47,9 @@ CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIR
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
 LLM_PROVIDER_DESCRIPTION = "LLM provider: auto, codex-cli, claude-cli, or manual."
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
+BACKGROUND_DESCRIPTION = (
+    "When true, start the job and return a background job id immediately instead of waiting inline."
+)
 JOB_CANCEL_DESCRIPTION = (
     "Cancel an MCP job. Do not use this unless the user explicitly asks; cancelling may waste work "
     "and leave a requested cached artifact unfinished."
@@ -65,6 +68,7 @@ CiterLimit = Annotated[int, Field(description=CITER_LIMIT_DESCRIPTION)]
 CiterSort = Annotated[str, Field(description=CITER_SORT_DESCRIPTION)]
 LLMProvider = Annotated[str, Field(description=LLM_PROVIDER_DESCRIPTION)]
 LLMModel = Annotated[str | None, Field(description=LLM_MODEL_DESCRIPTION)]
+Background = Annotated[bool, Field(description=BACKGROUND_DESCRIPTION)]
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -113,6 +117,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
         refresh=bool(args.get("refresh", False)),
+        background=bool(args.get("background", False)),
     ),
     "job_status": lambda args: job_status(str(args["job_id"])),
     "job_result": lambda args: job_result(str(args["job_id"])),
@@ -157,6 +162,7 @@ def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
         refresh=bool(args.get("refresh", False)),
+        background=bool(args.get("background", False)),
     )
 
 
@@ -166,6 +172,7 @@ def _start_summary_job_response(
     provider: str,
     model: str | None,
     refresh: bool,
+    background: bool,
 ) -> dict[str, Any]:
     normalized = _normalize_ids(paper_ids)
     job_id = MCP_JOBS.start(
@@ -178,6 +185,7 @@ def _start_summary_job_response(
             "sections_total": None,
             "sections_completed": 0,
             "current_section": None,
+            "background": background,
         },
         runner=lambda progress, cancel: _run_summary_job(normalized, provider, model, refresh, progress, cancel),
         status_resolver=_arc_result_status,
@@ -186,6 +194,7 @@ def _start_summary_job_response(
         job_id,
         message="LLM summary is still running in the background.",
         poll_after_seconds=5,
+        background=background,
     )
 
 
@@ -201,6 +210,7 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
     model = args.get("model")
     refresh = bool(args.get("refresh", False))
     workers = int(args.get("workers", 8))
+    background = bool(args.get("background", False))
     job_id = MCP_JOBS.start(
         job_type="domain_build",
         payload={
@@ -211,6 +221,7 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
             "model": model,
             "refresh": refresh,
             "workers": workers,
+            "background": background,
         },
         runner=lambda progress, cancel: _run_domain_job(
             seed_paper,
@@ -229,6 +240,7 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
         job_id,
         message="Domain build is still running in the background.",
         poll_after_seconds=10,
+        background=background,
     )
 
 
@@ -339,6 +351,7 @@ def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
     concurrency = int(args.get("concurrency", 1))
     max_items = args.get("max_items")
     max_items_int = int(max_items) if max_items is not None else None
+    background = bool(args.get("background", False))
     job_id = MCP_JOBS.start(
         job_type="summary_batch_run",
         payload={
@@ -347,6 +360,7 @@ def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
             "model": model,
             "concurrency": concurrency,
             "max_items": max_items_int,
+            "background": background,
         },
         runner=lambda progress, cancel: _run_summary_batch_job(
             name, provider, model, concurrency, max_items_int, progress, cancel
@@ -357,6 +371,7 @@ def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
         job_id,
         message="LLM summary batch is still running in the background.",
         poll_after_seconds=10,
+        background=background,
     )
 
 
@@ -377,9 +392,15 @@ def _run_summary_batch_job(
     return {"ok": True, "data": result, "errors": [], "meta": {}}
 
 
-def _wait_or_background(job_id: str, *, message: str, poll_after_seconds: int) -> dict[str, Any]:
-    inline_wait = resolve_inline_wait_seconds(server_name="arc")
-    if MCP_JOBS.wait(job_id, timeout=inline_wait):
+def _wait_or_background(
+    job_id: str,
+    *,
+    message: str,
+    poll_after_seconds: int,
+    background: bool,
+) -> dict[str, Any]:
+    inline_wait = 0.0 if background else resolve_inline_wait_seconds(server_name="arc")
+    if not background and MCP_JOBS.wait(job_id, timeout=inline_wait):
         status = job_status(job_id)
         wrapped = MCP_JOBS.result(job_id)
         result = wrapped.get("result") if isinstance(wrapped, dict) else None
@@ -394,6 +415,7 @@ def _wait_or_background(job_id: str, *, message: str, poll_after_seconds: int) -
         "job_type": status.get("job_type"),
         "message": message,
         "inline_wait_seconds": inline_wait,
+        "background_requested": background,
         "next": {
             "cli_command": f"arc-mcp jobs watch {job_id} --json",
             "tool": "job_status",
@@ -625,6 +647,7 @@ def _register_tools(app: Any) -> None:
         provider: LLMProvider = "auto",
         model: LLMModel = None,
         refresh: Refresh = False,
+        background: Background = False,
     ) -> Any:
         return _cached_or_start_summary_job(
             {
@@ -633,6 +656,7 @@ def _register_tools(app: Any) -> None:
                 "provider": provider,
                 "model": model,
                 "refresh": refresh,
+                "background": background,
             }
         )
 
@@ -650,12 +674,14 @@ def _register_tools(app: Any) -> None:
         provider: LLMProvider = "auto",
         model: LLMModel = None,
         refresh: Refresh = False,
+        background: Background = False,
     ) -> Any:
         return _start_summary_job_response(
             _one_or_many(paper_id, paper_ids),
             provider=provider,
             model=model,
             refresh=refresh,
+            background=background,
         )
 
     @app.tool(
@@ -679,7 +705,7 @@ def _register_tools(app: Any) -> None:
     def cancel_job_tool(job_id: Annotated[str, Field(description="MCP job id to cancel.")]) -> Any:
         return cancel_job(job_id)
 
-    @app.tool(name="list_jobs", description="List in-process jobs known to the current ARC MCP server.")
+    @app.tool(name="list_jobs", description="List persisted ARC MCP jobs known to the local job store.")
     def list_jobs_tool() -> Any:
         return list_jobs()
 
@@ -738,6 +764,7 @@ def _register_tools(app: Any) -> None:
         model: LLMModel = None,
         concurrency: Annotated[int, Field(description="Number of concurrent LLM summary generation workers.")] = 1,
         max_items: Annotated[int | None, Field(description="Optional cap on items to process in this run.")] = None,
+        background: Background = False,
     ) -> Any:
         return _run_summary_batch_inline(
             {
@@ -746,6 +773,7 @@ def _register_tools(app: Any) -> None:
                 "model": model,
                 "concurrency": concurrency,
                 "max_items": max_items,
+                "background": background,
             }
         )
 
@@ -806,6 +834,7 @@ def _register_tools(app: Any) -> None:
         model: LLMModel = None,
         refresh: Refresh = False,
         workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
+        background: Background = False,
     ) -> Any:
         return _start_domain_job_response(
             {
@@ -816,6 +845,7 @@ def _register_tools(app: Any) -> None:
                 "model": model,
                 "refresh": refresh,
                 "workers": workers,
+                "background": background,
             }
         )
 
@@ -891,6 +921,7 @@ def _register_tools(app: Any) -> None:
         model: LLMModel = None,
         refresh: Refresh = False,
         workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
+        background: Background = False,
     ) -> Any:
         return _domain_artifact_or_start(
             {
@@ -901,6 +932,7 @@ def _register_tools(app: Any) -> None:
                 "model": model,
                 "refresh": refresh,
                 "workers": workers,
+                "background": background,
             },
             artifact="summary",
         )
@@ -919,6 +951,7 @@ def _register_tools(app: Any) -> None:
         model: LLMModel = None,
         refresh: Refresh = False,
         workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
+        background: Background = False,
     ) -> Any:
         return _domain_artifact_or_start(
             {
@@ -929,6 +962,7 @@ def _register_tools(app: Any) -> None:
                 "model": model,
                 "refresh": refresh,
                 "workers": workers,
+                "background": background,
             },
             artifact="graph",
         )

@@ -63,8 +63,9 @@ entries. References are intentionally not included in the summary input pack.
 
 When called through MCP, tools that may invoke the host LLM are prefixed
 `llm_`. They start the work, wait briefly, and return before the MCP client
-timeout. If the result is not ready, they return a `job_id`. Poll
-`job_status` and read with `job_result`, or use the blocking CLI watcher:
+timeout. If the result is not ready, they return a `job_id`. Set
+`background=true` to skip the inline wait and get a `job_id` immediately.
+Poll `job_status` and read with `job_result`, or use the blocking CLI watcher:
 
 ```bash
 arc-mcp jobs watch <job_id> --json
@@ -172,7 +173,8 @@ Anything that can invoke the host LLM has an `llm_` prefix:
 ```text
 llm_get_summary(paper_id, provider="auto")
 llm_generate_summary(paper_id, provider="auto")
-llm_domain_build(seed_paper, intent="", provider="auto")
+llm_generate_summary(paper_id, provider="auto", background=true)
+llm_domain_build(seed_paper, intent="", provider="auto", background=true)
 domain_status(job_id) or domain_status(seed_paper, intent="")
 domain_get_summary(seed_paper, intent="")
 domain_get_graph(seed_paper, intent="")
@@ -182,7 +184,9 @@ cancel_job(job_id)
 ```
 
 `llm_domain_build` may return a completed result if it finishes before the MCP
-deadline margin, otherwise it returns a `job_id`. In skill workflows, prefer:
+deadline margin, otherwise it returns a `job_id`. For massive launches, pass
+`background=true` so ARC returns immediately after scheduling the job. In skill
+workflows, prefer:
 
 ```bash
 arc-mcp jobs watch <job_id> --json

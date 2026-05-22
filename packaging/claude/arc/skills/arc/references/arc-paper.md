@@ -44,12 +44,15 @@ pack.
 
 When using MCP, use `llm_get_summary` or `llm_generate_summary`. These tools may
 call the host LLM provider, so they wait only until the MCP deadline margin. If
-the result is not ready, they return a `job_id`.
+the result is not ready, they return a `job_id`. Pass `background=true` to
+schedule the job and return the `job_id` immediately.
 
 Phase 1: Start or reuse the result.
 Step 1: Call `llm_get_summary`.
 Step 2: If it returns a result, use it.
-Step 3: If it returns `status: "job_running"` with a `job_id`, run:
+Step 3: For massive or slow launches, call `llm_get_summary` or
+`llm_generate_summary` with `background=true`.
+Step 4: If it returns `status: "job_running"` with a `job_id`, run:
 
 ```bash
 arc-mcp jobs watch <job_id> --json
