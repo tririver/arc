@@ -3,22 +3,21 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "arc-mcp"
+name = "arc-domain"
 version = "0.1.0"
-description = "MCP tools for ARC paper query workflows."
+description = "Build cached research-field domain artifacts from a seed paper."
 requires-python = ">=3.11"
 dependencies = [
-  "arc-domain",
+  "arc-llm",
   "arc-paper",
-  "mcp>=1.0",
-  "pydantic>=2"
+  "jsonschema>=4.22"
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 
 [project.scripts]
-arc-mcp = "arc_mcp.server:main"
+arc-domain = "arc_domain.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/arc_mcp"]
+packages = ["src/arc_domain"]

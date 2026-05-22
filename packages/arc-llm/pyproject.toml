@@ -3,22 +3,17 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "arc-mcp"
+name = "arc-llm"
 version = "0.1.0"
-description = "MCP tools for ARC paper query workflows."
+description = "Reusable host LLM execution helpers for ARC tools."
 requires-python = ">=3.11"
-dependencies = [
-  "arc-domain",
-  "arc-paper",
-  "mcp>=1.0",
-  "pydantic>=2"
-]
+dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 
 [project.scripts]
-arc-mcp = "arc_mcp.server:main"
+arc-llm = "arc_llm.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/arc_mcp"]
+packages = ["src/arc_llm"]

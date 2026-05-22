@@ -4,7 +4,7 @@ set -euo pipefail
 export ARC_AGENT_HOST=codex
 export ARC_LLM_PROVIDER="${ARC_LLM_PROVIDER:-codex-cli}"
 export ARC_CODEX_MODEL="${ARC_CODEX_MODEL:-gpt-5.4-mini}"
-export ARC_PAPER_QUERY_CACHE="${ARC_PAPER_QUERY_CACHE:-/arc-dev/cache/paper-query}"
-export ARC_DOMAIN_INFO_CACHE="${ARC_DOMAIN_INFO_CACHE:-/arc-dev/cache/domain-info}"
+export ARC_PAPER_CACHE="${ARC_PAPER_CACHE:-/arc-dev/cache/arc-paper}"
+export ARC_DOMAIN_CACHE="${ARC_DOMAIN_CACHE:-/arc-dev/cache/arc-domain}"
 
 exec arc-mcp "$@"

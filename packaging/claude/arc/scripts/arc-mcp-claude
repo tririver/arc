@@ -4,7 +4,7 @@ set -euo pipefail
 export ARC_AGENT_HOST=claude-code
 export ARC_LLM_PROVIDER="${ARC_LLM_PROVIDER:-claude-cli}"
 export ARC_CLAUDE_MODEL="${ARC_CLAUDE_MODEL:-haiku}"
-export ARC_PAPER_QUERY_CACHE="${ARC_PAPER_QUERY_CACHE:-/arc-dev/cache/paper-query}"
-export ARC_DOMAIN_INFO_CACHE="${ARC_DOMAIN_INFO_CACHE:-/arc-dev/cache/domain-info}"
+export ARC_PAPER_CACHE="${ARC_PAPER_CACHE:-/arc-dev/cache/arc-paper}"
+export ARC_DOMAIN_CACHE="${ARC_DOMAIN_CACHE:-/arc-dev/cache/arc-domain}"
 
 exec arc-mcp "$@"

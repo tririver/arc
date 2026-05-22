@@ -9,7 +9,7 @@ must not be modified.
 - Build ARC tools as general theoretical-physics research infrastructure, not
   as optimizations for one seed paper, one subfield, or one generated wiki.
 - Avoid hard-coded paper IDs, author names, subfield labels, or field-specific
-  keyword lists in discovery, paper-query, summary, batch, or workflow logic.
+  keyword lists in discovery, paper access, summary, batch, or workflow logic.
 - Prefer configurable, documented heuristics that transfer across theoretical
   physics domains. When a heuristic is motivated by a concrete failure case,
   encode the general failure mode and add tests or diagnostics that would catch
@@ -41,20 +41,34 @@ must not be modified.
 - Prefer generic terms such as "agent", "host", "skill directory", "MCP
   server", and "workflow" in reusable documentation.
 
+## Skill Layer
+
+- Keep skill files simple, concise, and easy for a human to scan: clear
+  headings, short bullets, and obvious commands.
+- Use the skill layer to explain when and how to use ARC tools. Do not encode
+  complex control flow, long decision trees, or package internals in skills.
+- When a skill needs a step-by-step workflow, label it with explicit phases and
+  steps: `Phase 1`, `Step 1`, `Step 2`, then `Phase 2`, and so on.
+- Put detailed examples, troubleshooting, and longer workflows in focused
+  reference files. Keep `SKILL.md` as the readable entry point.
+- Prefer commands, MCP tool names, and expected outputs over prose-heavy
+  instructions. Avoid repeating implementation details already owned by
+  `arc-paper`, `arc-domain`, `arc-llm`, or `arc-mcp`.
+
 ## Package Boundaries
 
-- `packages/arc-llm-worker` owns reusable host LLM execution: host detection,
+- `packages/arc-llm` owns reusable host LLM execution: host detection,
   provider selection, model defaults, and Codex/Claude prompt calls.
-- `packages/arc-paper-query` owns deterministic paper data access, ID
+- `packages/arc-paper` owns deterministic paper data access, ID
   normalization, caching, parsing, paper-summary contracts, paper-summary
   orchestration, and batch execution.
-- `packages/arc-domain-info` owns research-domain construction from seed
+- `packages/arc-domain` owns research-domain construction from seed
   papers: foundation selection, domain paper selection, network artifacts,
   evidence packs, HTML rendering, and domain summaries. It should call
-  `arc-paper-query` for single-paper operations and `arc-llm-worker` for host
+  `arc-paper` for single-paper operations and `arc-llm` for host
   LLM work.
-- `packages/arc-mcp` should stay a thin MCP adapter over `arc_paper_query`,
-  `arc_domain_info`, and batch service functions.
+- `packages/arc-mcp` should stay a thin MCP adapter over `arc_paper`,
+  `arc_domain`, and batch service functions.
 - `skills/arc`, `prompts/`, `schemas/`, and `packaging/` should describe or
   wrap package behavior rather than reimplementing it.
 - Keep `0_ref/` as reference-only material. Do not preserve old compatibility
@@ -66,10 +80,10 @@ must not be modified.
   first, then the combined local suite when practical:
 
   ```bash
-  packages/arc-paper-query/.venv/bin/python -m pytest \
-    packages/arc-llm-worker/tests \
-    packages/arc-paper-query/tests \
-    packages/arc-domain-info/tests \
+  packages/arc-paper/.venv/bin/python -m pytest \
+    packages/arc-llm/tests \
+    packages/arc-paper/tests \
+    packages/arc-domain/tests \
     packages/arc-mcp/tests
   ```
 

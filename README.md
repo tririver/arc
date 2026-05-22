@@ -7,11 +7,11 @@ ARC research tooling is organized as Python packages plus thin agent adapters.
 Install the current development packages:
 
 ```bash
-python3 -m venv packages/arc-paper-query/.venv
-. packages/arc-paper-query/.venv/bin/activate
-python -m pip install -e packages/arc-llm-worker[test]
-python -m pip install -e packages/arc-paper-query[test]
-python -m pip install -e packages/arc-domain-info[test]
+python3 -m venv packages/arc-paper/.venv
+. packages/arc-paper/.venv/bin/activate
+python -m pip install -e packages/arc-llm[test]
+python -m pip install -e packages/arc-paper[test]
+python -m pip install -e packages/arc-domain[test]
 python -m pip install -e packages/arc-mcp
 ```
 
@@ -20,31 +20,31 @@ python -m pip install -e packages/arc-mcp
 Reusable host LLM execution:
 
 ```bash
-arc-llm-worker doctor config
-echo '{"task":"say ok"}' | arc-llm-worker run-json --provider auto
-echo 'Say ok.' | arc-llm-worker run-text --provider auto
+arc-llm doctor config
+echo '{"task":"say ok"}' | arc-llm run-json --provider auto
+echo 'Say ok.' | arc-llm run-text --provider auto
 ```
 
-`arc-llm-worker` owns host detection, provider selection, model defaults, and
+`arc-llm` owns host detection, provider selection, model defaults, and
 Codex/Claude CLI prompt execution. Other packages should use it instead of
 shelling out to host LLMs directly.
 
-## Paper Query
+## Paper
 
 Deterministic paper data:
 
 ```bash
-arc-paper-query get-title arXiv:0911.3380 --json
-arc-paper-query get-references arXiv:0911.3380 --json
-arc-paper-query get-toc arXiv:0911.3380 --json
-arc-paper-query get-section arXiv:0911.3380 --section S2 --json
+arc-paper get-title arXiv:0911.3380 --json
+arc-paper get-references arXiv:0911.3380 --json
+arc-paper get-toc arXiv:0911.3380 --json
+arc-paper get-section arXiv:0911.3380 --section S2 --json
 ```
 
 LLM summaries:
 
 ```bash
-arc-paper-query get-llm-summary arXiv:0911.3380 --json
-arc-paper-query generate-llm-summary arXiv:0911.3380 --provider auto --json
+arc-paper get-llm-summary arXiv:0911.3380 --json
+arc-paper generate-llm-summary arXiv:0911.3380 --provider auto --json
 ```
 
 `get-llm-summary` first reads the local summary cache. If the summary is
@@ -73,11 +73,11 @@ tool.
 Batch workflow:
 
 ```bash
-arc-paper-query summary-batch create papers.txt --name qft-ideas --json
-arc-paper-query summary-batch prefetch qft-ideas --workers 8 --json
-arc-paper-query summary-batch run qft-ideas --provider auto --concurrency 2 --max-items 10 --json
-arc-paper-query summary-batch status qft-ideas --json
-arc-paper-query summary-batch export qft-ideas --format jsonl --output summaries.jsonl --json
+arc-paper summary-batch create papers.txt --name qft-ideas --json
+arc-paper summary-batch prefetch qft-ideas --workers 8 --json
+arc-paper summary-batch run qft-ideas --provider auto --concurrency 2 --max-items 10 --json
+arc-paper summary-batch status qft-ideas --json
+arc-paper summary-batch export qft-ideas --format jsonl --output summaries.jsonl --json
 ```
 
 ## Host Detection
@@ -96,21 +96,21 @@ ARC_AGENT_HOST=claude-code
 ARC_LLM_PROVIDER=claude-cli
 ```
 
-Without plugin env, `arc-paper-query` falls back to parent-process detection.
+Without plugin env, `arc-paper` falls back to parent-process detection.
 
 Debug:
 
 ```bash
-arc-paper-query doctor host --json
-arc-paper-query doctor provider --json
-arc-paper-query doctor cache 0911.3380 --json
+arc-paper doctor host --json
+arc-paper doctor provider --json
+arc-paper doctor cache 0911.3380 --json
 ```
 
-When ARC is run from this checkout without `ARC_PAPER_QUERY_CACHE` or
-`XDG_CACHE_HOME`, paper-query data is cached under:
+When ARC is run from this checkout without `ARC_PAPER_CACHE` or
+`XDG_CACHE_HOME`, arc-paper data is cached under:
 
 ```text
-/arc-dev/cache/paper-query/
+/arc-dev/cache/arc-paper/
 ```
 
 ## Domain Info
@@ -119,24 +119,24 @@ Build a cached research-domain package from one seed paper plus an optional
 intent:
 
 ```bash
-arc-domain-info build 0911.3380 --intent "quasi-single-field inflation observables" --json
-arc-domain-info status 0911.3380 --intent "quasi-single-field inflation observables" --json
-arc-domain-info get-summary 0911.3380 --intent "quasi-single-field inflation observables" --json
-arc-domain-info get-graph 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain build 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain status 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain get-summary 0911.3380 --intent "quasi-single-field inflation observables" --json
+arc-domain get-graph 0911.3380 --intent "quasi-single-field inflation observables" --json
 ```
 
-`arc-domain-info` uses `arc-paper-query` for all single-paper operations. It
+`arc-domain` uses `arc-paper` for all single-paper operations. It
 identifies a likely foundation paper, builds a citation-domain graph of up to
 about 60 nodes, renders `network.html`, builds an evidence pack from titles,
-abstracts, and conclusion/outlook sections, then asks `arc-llm-worker` for a
+abstracts, and conclusion/outlook sections, then asks `arc-llm` for a
 compact field briefing. If the host LLM is unavailable, deterministic fallback
 artifacts are still written so the cache is inspectable.
 
-When ARC is run from this checkout without `ARC_DOMAIN_INFO_CACHE` or
+When ARC is run from this checkout without `ARC_DOMAIN_CACHE` or
 `XDG_CACHE_HOME`, domain data is cached under:
 
 ```text
-/arc-dev/cache/domain-info/
+/arc-dev/cache/arc-domain/
 ```
 
 ## MCP

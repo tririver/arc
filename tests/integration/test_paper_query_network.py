@@ -2,8 +2,8 @@ import os
 
 import pytest
 
-from arc_paper_query.providers.ar5iv import Ar5ivProvider
-from arc_paper_query.providers.inspire import InspireProvider
+from arc_paper.providers.ar5iv import Ar5ivProvider
+from arc_paper.providers.inspire import InspireProvider
 
 
 pytestmark = pytest.mark.skipif(

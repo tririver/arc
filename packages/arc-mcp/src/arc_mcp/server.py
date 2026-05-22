@@ -7,12 +7,12 @@ from threading import Lock
 from typing import Annotated, Any, Callable
 from uuid import uuid4
 
-from arc_domain_info import service as domain_service
-from arc_paper_query import service
-from arc_paper_query.batch.db import BatchDB
-from arc_paper_query.batch.runner import export_batch, prefetch_batch, run_batch
-from arc_paper_query.host import detect_host, select_llm_provider
-from arc_paper_query.ids import normalize_paper_id
+from arc_domain import service as domain_service
+from arc_paper import service
+from arc_paper.batch.db import BatchDB
+from arc_paper.batch.runner import export_batch, prefetch_batch, run_batch
+from arc_paper.host import detect_host, select_llm_provider
+from arc_paper.ids import normalize_paper_id
 from pydantic import Field
 
 
@@ -41,14 +41,14 @@ PAPER_ID_DESCRIPTION = (
 PAPER_IDS_DESCRIPTION = "Multiple paper identifiers. Use this instead of paper_id for batch queries."
 REFRESH_DESCRIPTION = "Bypass cached data and refetch source metadata or full text when possible."
 ENRICH_REFERENCES_DESCRIPTION = (
-    "When true, fetch and cache each referenced paper's INSPIRE metadata through paper-query, "
+    "When true, fetch and cache each referenced paper's INSPIRE metadata through arc-paper, "
     "including title, abstract, authors, and identifiers when available."
 )
 SECTION_DESCRIPTION = "Section heading, section number, or section id to retrieve from the ar5iv full text."
 QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
 BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
 DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific interest or desired subfield scope."
-DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by domain_build or arc-domain-info init."
+DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by domain_build or arc-domain init."
 CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIRE, clamped to 1..1000."
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
 
@@ -757,7 +757,7 @@ def _register_tools(app: Any) -> None:
         provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
         model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
         refresh: Refresh = False,
-        workers: Annotated[int, Field(description="Number of parallel paper-query workers.")] = 8,
+        workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
     ) -> Any:
         return _start_domain_job_response(
             {
@@ -804,7 +804,7 @@ def _register_tools(app: Any) -> None:
         provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
         model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
         refresh: Refresh = False,
-        workers: Annotated[int, Field(description="Number of parallel paper-query workers.")] = 8,
+        workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
     ) -> Any:
         return _domain_artifact_or_start(
             {
@@ -832,7 +832,7 @@ def _register_tools(app: Any) -> None:
         provider: Annotated[str, Field(description="LLM provider: auto, codex-cli, claude-cli, or manual.")] = "auto",
         model: Annotated[str | None, Field(description="Optional model name passed to the selected LLM provider.")] = None,
         refresh: Refresh = False,
-        workers: Annotated[int, Field(description="Number of parallel paper-query workers.")] = 8,
+        workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
     ) -> Any:
         return _domain_artifact_or_start(
             {
