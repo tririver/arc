@@ -34,6 +34,20 @@ def test_run_json_uses_selected_provider_and_model(monkeypatch):
     assert result["model"] == "fast"
 
 
+def test_run_json_uses_model_tier_when_exact_model_is_not_set(monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeProvider())
+
+    result = run_json(
+        "prompt",
+        schema={"type": "object"},
+        model_tier="high",
+        env={"ARC_AGENT_HOST": "codex"},
+        process_chain=[],
+    )
+
+    assert result["model"] == "gpt-5.5"
+
+
 def test_run_text_uses_selected_provider_and_model(monkeypatch):
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeProvider())
 

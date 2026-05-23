@@ -169,11 +169,10 @@ The config is one run containing one or more independent loops.
   "max_concurrent_loops": 2,
   "defaults": {
     "provider": "auto",
-    "model": "gpt-5.5",
+    "model_tier": "high",
     "runtime": {
       "allow_internet": false,
-      "allow_mcp": false,
-      "codex_reasoning_effort": "xhigh"
+      "allow_mcp": false
     }
   },
   "loops": [
@@ -472,24 +471,26 @@ paper tools, internet access, or other context improves idea quality.
 ## Security And Permission Model
 
 Runtime permissions are explicit per worker and are merged from defaults.
+Reusable workflows should select `model_tier` instead of provider-specific
+model names.
 
-Recommended runtime fields:
+Recommended worker fields:
 
 ```json
 {
-  "allow_internet": true,
-  "allow_mcp": false,
   "provider": "auto",
-  "model": "gpt-5.5",
-  "codex_reasoning_effort": "xhigh",
-  "codex_sandbox": "read-only",
-  "claude_effort": "high"
+  "model_tier": "high",
+  "runtime": {
+    "allow_internet": true,
+    "allow_mcp": false,
+    "codex_sandbox": "read-only"
+  }
 }
 ```
 
-The package maps these runtime fields to provider environment variables already
-used by `arc_llm.cli` and `arc_llm.runner`. Provider-specific options remain
-optional and must not be required for non-Codex hosts.
+The package maps these fields to provider models and environment variables
+already used by `arc_llm.cli` and `arc_llm.runner`. Provider-specific options
+remain optional and must not be required for non-Codex hosts.
 
 ## Testing Requirements
 

@@ -16,8 +16,9 @@ Read these before executing:
 ## Inputs
 
 Read `<project-dir>/context.json`. Use the exact `user_intent`, `provider`,
-`model`, and existing domain artifact paths from the project. Do not substitute
-a paraphrased research goal into idea prompts.
+configured `model_tier` when present, and existing domain artifact paths from
+the project. Do not substitute a paraphrased research goal into idea prompts.
+Use exact model names only when the project context explicitly provides one.
 
 ### Phase 1: Ensure Domain Context
 
@@ -55,19 +56,16 @@ Use this package-level structure:
   "max_concurrent_loops": 2,
   "defaults": {
     "provider": "<provider>",
-    "model": "<strong-model>",
-    "runtime": {
-      "codex_reasoning_effort": "xhigh"
-    }
+    "model_tier": "high"
   },
   "loops": []
 }
 ```
 
-For Codex, use `model="gpt-5.5"` and
-`runtime.codex_reasoning_effort="xhigh"` unless the project context explicitly
-sets a different model. For other hosts, use the strongest configured model
-available through the host provider.
+Use `model_tier` values `high`, `medium`, or `low`. The idea workflow should
+normally use `high`; `arc-llm` owns the host-specific model and reasoning
+mapping. Set `model` only when the project context explicitly requires an exact
+provider model.
 
 Step 4: Add the requested number of independent loops. For the initial test,
 use two loops and keep `max_concurrent_loops=2`. Future runs may increase the

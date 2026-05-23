@@ -32,6 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_json_parser.add_argument("--schema", default=None)
     run_json_parser.add_argument("--provider", default="auto")
     run_json_parser.add_argument("--model", default=None)
+    run_json_parser.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
     run_json_parser.add_argument("--json", action="store_true")
     _shared_runtime_args(run_json_parser)
     _llm_runtime_args(run_json_parser)
@@ -40,6 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_text_parser.add_argument("--prompt", default="-")
     run_text_parser.add_argument("--provider", default="auto")
     run_text_parser.add_argument("--model", default=None)
+    run_text_parser.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
     _shared_runtime_args(run_text_parser)
     _llm_runtime_args(run_text_parser)
 
@@ -81,6 +83,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             schema=_read_schema(args.schema),
             provider=args.provider,
             model=args.model,
+            model_tier=args.model_tier,
             env=_runtime_env(args),
         )
     if args.command == "run-text":
@@ -88,6 +91,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             _read_prompt(args.prompt),
             provider=args.provider,
             model=args.model,
+            model_tier=args.model_tier,
             env=_runtime_env(args),
         )
     if args.command == "proposers-reviewer-loop":

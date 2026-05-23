@@ -96,6 +96,20 @@ ARC_RUN_LLM_TESTS=1 ARC_RUN_NET_TESTS=1 \
 Set `ARC_LLM_TEST_PROVIDER` or `ARC_LLM_TEST_MODEL` to override the provider or
 model for that opt-in run.
 
+## Model Tiers
+
+Prefer `model_tier` for reusable workflows and package configs:
+
+```text
+low
+medium
+high
+```
+
+`arc-llm` maps these tiers to provider-specific model and reasoning defaults.
+Exact model names are advanced overrides for project contexts that intentionally
+pin a provider model.
+
 ## Runtime Options
 
 By default ARC keeps provider calls lightweight. Enable extra capability only
@@ -105,6 +119,7 @@ Common options:
 
 ```text
 --provider auto
+--model-tier high
 --model <model>
 --allow-internet
 --allow-mcp

@@ -15,11 +15,10 @@ def minimal_config() -> dict:
         "max_concurrent_loops": 2,
         "defaults": {
             "provider": "auto",
-            "model": "gpt-5.5",
+            "model_tier": "high",
             "runtime": {
                 "allow_internet": False,
                 "allow_mcp": False,
-                "codex_reasoning_effort": "xhigh",
             },
         },
         "loops": [
@@ -67,10 +66,10 @@ def test_valid_config_parses_and_merges_defaults():
     proposer = loop.proposers[0]
     reviewer = loop.reviewers[0]
     assert proposer.provider == "auto"
-    assert proposer.model == "gpt-5.5"
+    assert proposer.model is None
+    assert proposer.model_tier == "high"
     assert proposer.runtime["allow_internet"] is True
     assert proposer.runtime["allow_mcp"] is False
-    assert proposer.runtime["codex_reasoning_effort"] == "xhigh"
     assert reviewer.runtime["allow_mcp"] is True
     assert reviewer.runtime["claude_effort"] == "high"
 
@@ -128,6 +127,7 @@ def test_worker_env_maps_runtime_without_mutating_base_env():
     assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
     assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
     assert "ARC_CODEX_ENABLE_MCP" not in env
+    assert env["ARC_LLM_MODEL_TIER"] == "high"
     assert env["ARC_CODEX_REASONING_EFFORT"] == "xhigh"
 
 
@@ -139,5 +139,23 @@ def test_worker_env_maps_mcp_model_and_provider_options():
 
     assert env["ARC_CODEX_ENABLE_MCP"] == "true"
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "true"
+    assert env["ARC_LLM_MODEL_TIER"] == "high"
     assert env["ARC_CODEX_REASONING_EFFORT"] == "xhigh"
     assert env["ARC_CLAUDE_EFFORT"] == "high"
+
+
+def test_worker_specific_model_tier_overrides_default_model_tier():
+    payload = minimal_config()
+    payload["loops"][0]["proposers"][0]["model_tier"] = "low"
+
+    config = load_batch_config(payload)
+
+    assert config.loops[0].proposers[0].model_tier == "low"
+
+
+def test_invalid_model_tier_fails():
+    payload = minimal_config()
+    payload["defaults"]["model_tier"] = "strong"
+
+    with pytest.raises(ConfigError, match="model_tier must be one of"):
+        load_batch_config(payload)

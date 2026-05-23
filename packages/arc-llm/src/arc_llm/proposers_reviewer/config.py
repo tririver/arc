@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from arc_llm.model import VALID_MODEL_TIERS
+
 
 BATCH_CONFIG_SCHEMA = "arc.llm.proposers_reviewer_batch.config.v1"
 REVIEW_ENVELOPE_SCHEMA = "arc.llm.review_envelope.v1"
@@ -30,6 +32,7 @@ class WorkerConfig:
     output_schema: dict[str, Any] | None
     provider: str
     model: str | None
+    model_tier: str | None
     runtime: dict[str, Any]
 
 
@@ -74,6 +77,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     default_model = defaults.get("model")
     if default_model is not None:
         default_model = str(default_model)
+    default_model_tier = _model_tier(defaults.get("model_tier"), "defaults.model_tier")
 
     raw_loops = data.get("loops")
     if not isinstance(raw_loops, list) or not raw_loops:
@@ -86,6 +90,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
             raw_loop,
             default_provider=default_provider,
             default_model=default_model,
+            default_model_tier=default_model_tier,
             default_runtime=default_runtime,
         )
         if loop.loop_id in seen_loop_ids:
@@ -113,6 +118,10 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
     if runtime.get("allow_mcp"):
         env["ARC_CODEX_ENABLE_MCP"] = "true"
         env["ARC_CLAUDE_ALLOW_MCP"] = "true"
+    if worker.model_tier:
+        env["ARC_LLM_MODEL_TIER"] = worker.model_tier
+        env.setdefault("ARC_CODEX_REASONING_EFFORT", _codex_effort_for_model_tier(worker.model_tier))
+        env.setdefault("ARC_CLAUDE_EFFORT", _claude_effort_for_model_tier(worker.model_tier))
 
     _put(env, "ARC_CODEX_SANDBOX", runtime.get("codex_sandbox"))
     _put(env, "ARC_CODEX_PROFILE", runtime.get("codex_profile"))
@@ -134,6 +143,7 @@ def _parse_loop(
     *,
     default_provider: str,
     default_model: str | None,
+    default_model_tier: str | None,
     default_runtime: Mapping[str, Any],
 ) -> LoopConfig:
     loop_data = _dict(raw_loop, "loop")
@@ -146,6 +156,7 @@ def _parse_loop(
         field_name=f"{loop_id}.proposers",
         default_provider=default_provider,
         default_model=default_model,
+        default_model_tier=default_model_tier,
         default_runtime=default_runtime,
         duplicate_label="proposer",
     )
@@ -154,6 +165,7 @@ def _parse_loop(
         field_name=f"{loop_id}.reviewers",
         default_provider=default_provider,
         default_model=default_model,
+        default_model_tier=default_model_tier,
         default_runtime=default_runtime,
         duplicate_label="reviewer",
     )
@@ -175,6 +187,7 @@ def _parse_workers(
     field_name: str,
     default_provider: str,
     default_model: str | None,
+    default_model_tier: str | None,
     default_runtime: Mapping[str, Any],
     duplicate_label: str,
 ) -> list[WorkerConfig]:
@@ -188,6 +201,7 @@ def _parse_workers(
             field_name=field_name,
             default_provider=default_provider,
             default_model=default_model,
+            default_model_tier=default_model_tier,
             default_runtime=default_runtime,
         )
         if worker.id in seen_ids:
@@ -203,6 +217,7 @@ def _parse_worker(
     field_name: str,
     default_provider: str,
     default_model: str | None,
+    default_model_tier: str | None,
     default_runtime: Mapping[str, Any],
 ) -> WorkerConfig:
     worker_data = _dict(raw_worker, field_name)
@@ -225,12 +240,14 @@ def _parse_worker(
     model = worker_data.get("model", default_model)
     if model is not None:
         model = str(model)
+    model_tier = _model_tier(worker_data.get("model_tier", default_model_tier), f"{field_name}.{worker_id}.model_tier")
     return WorkerConfig(
         id=worker_id,
         prompt=prompt,
         output_schema=copy.deepcopy(output_schema),
         provider=provider,
         model=model,
+        model_tier=model_tier,
         runtime=runtime,
     )
 
@@ -272,3 +289,22 @@ def _safe_id(value: str, field_name: str) -> str:
 def _put(env: dict[str, str], key: str, value: Any) -> None:
     if value is not None:
         env[key] = str(value)
+
+
+def _model_tier(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text not in VALID_MODEL_TIERS:
+        raise ConfigError("model_tier must be one of: high, medium, low")
+    return text
+
+
+def _codex_effort_for_model_tier(tier: str) -> str:
+    return {"low": "low", "medium": "medium", "high": "xhigh"}[tier]
+
+
+def _claude_effort_for_model_tier(tier: str) -> str:
+    return {"low": "low", "medium": "medium", "high": "high"}[tier]

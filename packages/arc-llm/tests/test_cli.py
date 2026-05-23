@@ -34,3 +34,26 @@ def test_runtime_env_merges_cli_llm_options(monkeypatch):
     assert env["ARC_CODEX_CONFIG"] == 'mcp_servers.arc.command="arc-mcp"'
     assert env["ARC_CLAUDE_EFFORT"] == "medium"
     assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/arc-mcp.json"
+
+
+def test_run_text_cli_passes_model_tier(monkeypatch):
+    captured = {}
+
+    def fake_run_text(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(cli, "_read_prompt", lambda value: "prompt text")
+    monkeypatch.setattr(cli, "run_text", fake_run_text)
+
+    args = cli._build_parser().parse_args(
+        ["run-text", "--prompt", "-", "--provider", "auto", "--model-tier", "high"]
+    )
+
+    result = cli._dispatch(args)
+
+    assert result == "ok"
+    assert captured["prompt"] == "prompt text"
+    assert captured["model_tier"] == "high"
+    assert captured["model"] is None

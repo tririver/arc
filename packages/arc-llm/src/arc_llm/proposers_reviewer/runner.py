@@ -269,12 +269,19 @@ def _call_json_runner(
 ) -> dict[str, Any]:
     env = worker_env(worker, base_env=base_env)
     if json_runner is not None:
-        return json_runner(prompt, schema=worker.output_schema, provider=worker.provider, model=worker.model, env=env)
+        return json_runner(
+            prompt,
+            schema=worker.output_schema,
+            provider=worker.provider,
+            model=worker.model,
+            env=env,
+        )
     return run_json(
         prompt,
         schema=worker.output_schema,
         provider=worker.provider,
         model=worker.model,
+        model_tier=worker.model_tier,
         env=env,
         process_chain=process_chain,
     )

@@ -20,6 +20,7 @@ def resolve_llm_config(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
 ) -> LLMConfig:
@@ -30,7 +31,7 @@ def resolve_llm_config(
     )
     return LLMConfig(
         provider=selected.provider,
-        model=resolve_model(selected.provider, model, env=env),
+        model=resolve_model(selected.provider, model, model_tier=model_tier, env=env),
         host=selected.host,
         signals=selected.signals,
     )
@@ -42,10 +43,17 @@ def run_json(
     schema: dict[str, Any] | None = None,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    config = resolve_llm_config(provider=provider, model=model, env=env, process_chain=process_chain)
+    config = resolve_llm_config(
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        env=env,
+        process_chain=process_chain,
+    )
     runner = select_provider(config.provider, env=env, process_chain=process_chain)
     return runner.generate_json(prompt, schema=schema, model=config.model)
 
@@ -55,9 +63,16 @@ def run_text(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
 ) -> str:
-    config = resolve_llm_config(provider=provider, model=model, env=env, process_chain=process_chain)
+    config = resolve_llm_config(
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        env=env,
+        process_chain=process_chain,
+    )
     runner = select_provider(config.provider, env=env, process_chain=process_chain)
     return runner.generate_text(prompt, model=config.model)
