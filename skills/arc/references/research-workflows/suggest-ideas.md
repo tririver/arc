@@ -4,15 +4,6 @@ Use this workflow to run ARC idea-generation loops from project-local domain
 context. The loop execution is owned by `arc-llm`; this skill prepares
 caller-specific prompts, permissions, and artifacts.
 
-## Required References
-
-Read these before executing:
-
-- `references/rules/interaction.md`
-- `references/rules/integrity.md`
-- `references/package-manuals/arc-llm.md`
-- `references/research-workflows/build-domain.md`
-
 ## Inputs
 
 Read `<project-dir>/context.json`. Use the exact `user_intent`, `provider`,

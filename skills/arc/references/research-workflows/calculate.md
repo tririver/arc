@@ -3,13 +3,6 @@
 This workflow is a placeholder. It must not perform unsupported calculations or
 claim results before the calculation procedure is implemented.
 
-## Required References
-
-Read these before executing:
-
-- `references/rules/interaction.md`
-- `references/rules/integrity.md`
-
 ### Phase 1: Check Explicitness
 
 Step 1: Read `<project-dir>/context.json`.

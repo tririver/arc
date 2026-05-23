@@ -3,16 +3,6 @@
 Use this workflow to build project-local research-domain references from one or
 more seed papers.
 
-## Required References
-
-Read these before executing:
-
-- `references/rules/interaction.md`
-- `references/rules/integrity.md`
-- `references/package-manuals/arc-paper.md`
-- `references/package-manuals/arc-domain.md`
-- `references/package-manuals/arc-mcp.md`
-
 ## Inputs
 
 Read `<project-dir>/context.json`. Use the exact values from that file for all
