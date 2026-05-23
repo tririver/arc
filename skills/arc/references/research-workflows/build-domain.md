@@ -53,15 +53,6 @@ success. Continue only when the job result is successful. If the job failed,
 was cancelled, or returned `needs_llm`, print `WARNING:` with the reason and
 stop.
 
-Step 4: If MCP is unavailable, use the blocking CLI fallback:
-
-```bash
-arc-domain llm-build <seed-paper> --intent "<user-intent>" --provider <provider> --model <model> --workers <workers> --json
-```
-
-Add `--refresh` only when `refresh` is true. Omit `--model` when `model` is not
-set. Inspect the returned JSON before continuing.
-
 ### Phase 3: Copy Domain Artifacts
 
 Step 1: Derive a safe file prefix:

@@ -10,6 +10,8 @@ commands and MCP tool names live in the package-specific references.
 - Paper IDs may omit the `arXiv:` prefix.
 - For slow or large MCP work, use the background-job procedure in
   `references/package-manuals/arc-mcp.md`.
+- If MCP is unavailable, check the relevant package manual and use the
+  corresponding CLI command with structured output.
 - For user choices and confirmations, use
   `references/rules/interaction.md`.
 - Do not cancel a job unless the user explicitly asks.
