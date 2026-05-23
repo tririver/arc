@@ -42,6 +42,8 @@ prompt context, runtime permissions, or output files.
 - Provide a reusable `arc-llm` proposers-reviewer loop for idea generation,
   calculation comparison, and later ARC workflows.
 - Accept a JSON configuration file rather than complex CLI strings.
+- Let callers configure the runs directory in JSON so different ARC workflows
+  can keep independent run roots.
 - Support multiple proposers per loop.
 - Support exactly one reviewer per loop in v1 while preserving a config shape
   that can later support multiple reviewers.
@@ -163,7 +165,7 @@ The config is one run containing one or more independent loops.
 {
   "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
   "run_id": "idea-test-2026-05-23",
-  "output_dir": "project/ideas/proposers-reviewer",
+  "runs_dir": "project/suggest-ideas/runs",
   "max_concurrent_loops": 2,
   "defaults": {
     "provider": "auto",
@@ -224,6 +226,8 @@ The config is one run containing one or more independent loops.
 ### Validation Rules
 
 - `schema_version` must be recognized.
+- `runs_dir` is required and points to the directory that contains run
+  subdirectories.
 - `run_id` must be filesystem-safe after normalization.
 - `loop_id` values must be unique within the run.
 - v1 requires exactly one reviewer in `reviewers`.
@@ -301,39 +305,51 @@ The reviewer prompt includes all current-round proposer outputs.
 
 ## Directory Structure
 
-Use one shared run directory with isolated loop subdirectories.
+Use one caller-configured runs directory with isolated run and loop
+subdirectories. The `runs_dir` field points directly at the directory that
+contains `<run_id>` directories; `arc-llm` must not append another hard-coded
+`runs/` component.
 
 ```text
-<output_dir>/
-  runs/
-    <run_id>/
-      config.json
-      manifest.json
-      state.json
-      run.lock
-      loops/
-        <loop_id>/
-          lock.json
-          loop_config.json
-          state.json
-          transcript.jsonl
-          rounds/
-            round_001/
-              context/
-                proposer_001.json
-                proposer_002.json
-                reviewer_001.json
-              prompts/
-                proposer_001.md
-                proposer_002.md
-                reviewer_001.md
-              proposer_outputs/
-                proposer_001.json
-                proposer_002.json
-              reviews/
-                reviewer_001.json
-            round_002/
-              ...
+<runs_dir>/
+  <run_id>/
+    config.json
+    manifest.json
+    state.json
+    run.lock
+    loops/
+      <loop_id>/
+        lock.json
+        loop_config.json
+        state.json
+        transcript.jsonl
+        rounds/
+          round_001/
+            context/
+              proposer_001.json
+              proposer_002.json
+              reviewer_001.json
+            prompts/
+              proposer_001.md
+              proposer_002.md
+              reviewer_001.md
+            proposer_outputs/
+              proposer_001.json
+              proposer_002.json
+            reviews/
+              reviewer_001.json
+          round_002/
+            ...
+```
+
+Example workflow-specific run roots:
+
+```json
+{ "runs_dir": "project/suggest-ideas/runs" }
+```
+
+```json
+{ "runs_dir": "project/calculate/runs" }
 ```
 
 `manifest.json` records the run-level plan and loop paths. `state.json` records
@@ -436,7 +452,8 @@ thin orchestration workflow:
 
 1. Read `<project-dir>/context.json`.
 2. Ensure `build-domain.md` has produced domain artifacts.
-3. Build an `arc-llm` loop config under `<project-dir>/ideas/`.
+3. Build an `arc-llm` loop config with
+   `runs_dir=<project-dir>/suggest-ideas/runs`.
 4. Launch two independent idea loops for the initial test.
 5. Set `max_concurrent_loops=2`.
 6. Set `max_rounds=5`.
@@ -505,6 +522,8 @@ loop artifacts through the package writer.
 - `arc-llm proposers-reviewer-loop --config <config.json> --json` runs a fake
   provider test config with two loops concurrently and produces isolated loop
   directories.
+- The runner writes under the configured `runs_dir/<run_id>/` path without
+  appending an extra implicit `runs/` component.
 - Each loop records all prompts, contexts, outputs, reviews, state, and
   transcript entries for every completed round.
 - `max_rounds` controls the maximum number of rounds.
