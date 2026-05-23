@@ -1,4 +1,4 @@
-from arc_paper.ids import arxiv_path_id, inspire_recid, normalize_paper_id
+from arc_paper.ids import arxiv_path_id, doi_value, extract_paper_ids, inspire_recid, normalize_paper_id
 
 
 def test_normalize_new_arxiv_id():
@@ -20,3 +20,36 @@ def test_normalize_inspire_recid():
     assert normalize_paper_id("recid:154280") == "inspire:154280"
     assert normalize_paper_id("inspire:154280") == "inspire:154280"
     assert inspire_recid("recid:154280") == "154280"
+
+
+def test_normalize_doi():
+    assert normalize_paper_id("doi:10.1088/1475-7516/2010/04/027") == "doi:10.1088/1475-7516/2010/04/027"
+    assert normalize_paper_id("https://doi.org/10.1007/JHEP01(2010)117.") == "doi:10.1007/jhep01(2010)117"
+    assert doi_value("doi:10.1088/1475-7516/2010/04/027") == "10.1088/1475-7516/2010/04/027"
+
+
+def test_extract_paper_ids_from_natural_language():
+    text = (
+        "Use arXiv:0911.3380v2, inspire:837197, and "
+        "https://doi.org/10.1088/1475-7516/2010/04/027. "
+        "Also compare 2512.06790 and astro-ph/0610514. "
+        "Do not extract the arXiv-like suffix inside doi:10.1234/2512.06790."
+    )
+
+    assert extract_paper_ids(text) == [
+        "arXiv:0911.3380",
+        "inspire:837197",
+        "doi:10.1088/1475-7516/2010/04/027",
+        "arXiv:2512.06790",
+        "arXiv:astro-ph/0610514",
+        "doi:10.1234/2512.06790",
+    ]
+
+
+def test_extract_paper_ids_deduplicates_and_accepts_urls():
+    text = (
+        "https://arxiv.org/abs/hep-th/0601001v3, arXiv:hep-th/0601001, "
+        "https://inspirehep.net/literature/12345 and recid:12345"
+    )
+
+    assert extract_paper_ids(text) == ["arXiv:hep-th/0601001", "inspire:12345"]

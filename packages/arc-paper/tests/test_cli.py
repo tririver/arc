@@ -12,6 +12,49 @@ def test_cli_get_title(monkeypatch, capsys):
     assert output["data"] == "Title"
 
 
+def test_cli_extract_paper_ids(capsys):
+    assert cli.main(["extract-paper-ids", "See", "0911.3380", "and", "doi:10.1234/2512.06790", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"] == ["arXiv:0911.3380", "doi:10.1234/2512.06790"]
+
+
+def test_cli_llm_infer_main_references(monkeypatch, capsys):
+    def infer(text, provider="auto", model=None, refresh=False):
+        return {
+            "ok": True,
+            "data": ["arXiv:0911.3380"],
+            "errors": [],
+            "meta": {"text": text, "provider": provider, "model": model, "refresh": refresh},
+        }
+
+    monkeypatch.setattr(cli.service, "llm_infer_main_references", infer)
+
+    assert (
+        cli.main(
+            [
+                "llm-infer-main-references",
+                "CMB",
+                "trispectrum",
+                "--provider",
+                "manual",
+                "--model",
+                "test-model",
+                "--refresh",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"] == ["arXiv:0911.3380"]
+    assert output["meta"]["text"] == "CMB trispectrum"
+    assert output["meta"]["provider"] == "manual"
+    assert output["meta"]["model"] == "test-model"
+    assert output["meta"]["refresh"] is True
+
+
 def test_cli_get_references_enrich(monkeypatch, capsys):
     def get_references(ids, refresh=False, enrich=False):
         return {"ok": True, "data": {"ids": ids, "refresh": refresh, "enrich": enrich}}

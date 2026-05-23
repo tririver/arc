@@ -23,14 +23,16 @@ SERVER_INSTRUCTIONS = (
     "ar5iv table of contents, sections, equation context, cached LLM paper summaries, "
     "or cached research-domain artifacts from a seed paper. "
     "Tools that may call an LLM provider are prefixed with llm_. "
-    "Paper IDs may be passed with or without the arXiv: prefix, for example "
-    "0911.3380, arXiv:0911.3380, or hep-th/0601001. For one paper use paper_id; "
-    "for multiple papers use paper_ids."
+    "Paper IDs may be passed with or without the arXiv: prefix, as INSPIRE recids, "
+    "or as DOI identifiers, for example 0911.3380, arXiv:0911.3380, "
+    "hep-th/0601001, inspire:837197, or doi:10.1088/1475-7516/2010/04/027. "
+    "For one paper use paper_id; for multiple papers use paper_ids."
 )
 
 PAPER_ID_DESCRIPTION = (
     "Single paper identifier. arXiv IDs may be written as 0911.3380, "
-    "arXiv:0911.3380, or hep-th/0601001."
+    "arXiv:0911.3380, or hep-th/0601001. DOI and INSPIRE IDs may be written "
+    "as doi:10.1088/1475-7516/2010/04/027 or inspire:837197."
 )
 PAPER_IDS_DESCRIPTION = "Multiple paper identifiers. Use this instead of paper_id for batch queries."
 REFRESH_DESCRIPTION = "Bypass cached data and refetch source metadata or full text when possible."
@@ -40,6 +42,7 @@ ENRICH_REFERENCES_DESCRIPTION = (
 )
 SECTION_DESCRIPTION = "Section heading, section number, or section id to retrieve from the ar5iv full text."
 QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
+TEXT_DESCRIPTION = "Natural-language text that may contain arXiv, INSPIRE, or DOI paper identifiers."
 BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
 DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific interest or desired subfield scope."
 DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by llm_domain_build or arc-domain init."
@@ -61,6 +64,7 @@ Refresh = Annotated[bool, Field(description=REFRESH_DESCRIPTION)]
 EnrichReferences = Annotated[bool, Field(description=ENRICH_REFERENCES_DESCRIPTION)]
 Section = Annotated[str, Field(description=SECTION_DESCRIPTION)]
 EquationQuery = Annotated[str, Field(description=QUERY_DESCRIPTION)]
+NaturalText = Annotated[str, Field(description=TEXT_DESCRIPTION)]
 BatchName = Annotated[str, Field(description=BATCH_NAME_DESCRIPTION)]
 DomainIntent = Annotated[str, Field(description=DOMAIN_INTENT_DESCRIPTION)]
 DomainId = Annotated[str | None, Field(description=DOMAIN_ID_DESCRIPTION)]
@@ -84,6 +88,7 @@ def _paper_ids(args: dict[str, Any]):
 
 
 TOOL_HANDLERS: dict[str, ToolHandler] = {
+    "extract_paper_ids": lambda args: service.extract_paper_ids(str(args.get("text", ""))),
     "get_title": lambda args: service.get_title(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_abstract": lambda args: service.get_abstract(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_authors": lambda args: service.get_authors(_paper_ids(args), refresh=bool(args.get("refresh", False))),
@@ -119,6 +124,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         refresh=bool(args.get("refresh", False)),
         background=bool(args.get("background", False)),
     ),
+    "llm_infer_main_references": lambda args: _start_reference_inference_job_response(args),
     "job_status": lambda args: job_status(str(args["job_id"])),
     "job_result": lambda args: job_result(str(args["job_id"])),
     "cancel_job": lambda args: cancel_job(str(args["job_id"])),
@@ -193,6 +199,48 @@ def _start_summary_job_response(
     return _wait_or_background(
         job_id,
         message="LLM summary is still running in the background.",
+        poll_after_seconds=5,
+        background=background,
+    )
+
+
+def _start_reference_inference_job_response(args: dict[str, Any]) -> dict[str, Any]:
+    text = str(args.get("text") or "")
+    extracted = service.extract_paper_ids(text)
+    if extracted.get("ok") and extracted.get("data"):
+        return {
+            "ok": True,
+            "data": extracted["data"],
+            "errors": [],
+            "meta": {"provider": "local-parser", "llm_used": False},
+        }
+
+    provider = str(args.get("provider", "auto"))
+    model = args.get("model")
+    refresh = bool(args.get("refresh", False))
+    background = bool(args.get("background", False))
+    job_id = MCP_JOBS.start(
+        job_type="main_reference_inference",
+        payload={
+            "text": text,
+            "provider": provider,
+            "model": model,
+            "refresh": refresh,
+            "background": background,
+        },
+        runner=lambda progress, cancel: _run_reference_inference_job(
+            text,
+            provider,
+            model,
+            refresh,
+            progress,
+            cancel,
+        ),
+        status_resolver=_arc_result_status,
+    )
+    return _wait_or_background(
+        job_id,
+        message="Main reference inference is still running in the background.",
         poll_after_seconds=5,
         background=background,
     )
@@ -342,6 +390,23 @@ def _run_summary_job(
         refresh=refresh,
         progress_callback=progress,
     )
+
+
+def _run_reference_inference_job(
+    text: str,
+    provider: str,
+    model: str | None,
+    refresh: bool,
+    progress: Callable[[dict[str, Any]], None],
+    cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    if cancel():
+        raise MCPJobCancelled("MCP job cancellation was requested.")
+    progress({"event": "reference_inference_started"})
+    result = service.llm_infer_main_references(text, provider=provider, model=model, refresh=refresh)
+    event = "reference_inference_completed" if _all_ok(result) else "reference_inference_failed"
+    progress({"event": event})
+    return result
 
 
 def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
@@ -523,6 +588,15 @@ def _one_or_many(paper_id: str | None = None, paper_ids: list[str] | None = None
 def _register_tools(app: Any) -> None:
     @app.tool(
         description=(
+            "Extract normalized paper identifiers from natural-language text. "
+            "Finds explicit arXiv, INSPIRE, DOI, and bare arXiv-like identifiers."
+        )
+    )
+    def extract_paper_ids(text: NaturalText) -> Any:
+        return service.extract_paper_ids(text)
+
+    @app.tool(
+        description=(
             "Get the title of one or more arXiv papers from INSPIRE. "
             "Use this when the user asks for a paper title or to identify a paper."
         )
@@ -682,6 +756,33 @@ def _register_tools(app: Any) -> None:
             model=model,
             refresh=refresh,
             background=background,
+        )
+
+    @app.tool(
+        name="llm_infer_main_references",
+        description=(
+            "Infer the main reference paper IDs from natural-language text. "
+            "If explicit arXiv, INSPIRE, DOI, or bare arXiv-like IDs are present, "
+            "this returns them immediately without calling an LLM. Otherwise it calls "
+            "the host LLM provider with web search enabled, verifies candidates through INSPIRE, "
+            "and may return a background job id."
+        ),
+    )
+    def llm_infer_main_references(
+        text: NaturalText,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
+        refresh: Refresh = False,
+        background: Background = False,
+    ) -> Any:
+        return _start_reference_inference_job_response(
+            {
+                "text": text,
+                "provider": provider,
+                "model": model,
+                "refresh": refresh,
+                "background": background,
+            }
         )
 
     @app.tool(

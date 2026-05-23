@@ -20,6 +20,65 @@ def test_call_tool_dispatches_to_service(monkeypatch):
     assert result == {"ok": True, "data": "arXiv:0911.3380"}
 
 
+def test_call_tool_extracts_paper_ids(monkeypatch):
+    monkeypatch.setattr(server.service, "extract_paper_ids", lambda text: {"ok": True, "data": [text]})
+
+    result = server.call_tool("extract_paper_ids", {"text": "0911.3380"})
+
+    assert result == {"ok": True, "data": ["0911.3380"]}
+
+
+def test_call_tool_llm_infer_main_references_short_circuits_ids(monkeypatch):
+    monkeypatch.setattr(
+        server.service,
+        "extract_paper_ids",
+        lambda text: {"ok": True, "data": ["arXiv:0911.3380"], "errors": [], "meta": {}},
+    )
+    monkeypatch.setattr(
+        server.service,
+        "llm_infer_main_references",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("job should not start")),
+    )
+
+    result = server.call_tool("llm_infer_main_references", {"text": "0911.3380"})
+
+    assert result["ok"] is True
+    assert result["data"] == ["arXiv:0911.3380"]
+    assert result["meta"]["llm_used"] is False
+
+
+def test_call_tool_llm_infer_main_references_uses_background_manager(monkeypatch):
+    monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "1")
+    monkeypatch.setattr(
+        server.service,
+        "extract_paper_ids",
+        lambda text: {"ok": True, "data": [], "errors": [], "meta": {}},
+    )
+
+    def infer(text, provider="auto", model=None, refresh=False):
+        return {
+            "ok": True,
+            "data": ["arXiv:0911.3380"],
+            "errors": [],
+            "meta": {"text": text, "provider": provider, "model": model, "refresh": refresh},
+        }
+
+    monkeypatch.setattr(server.service, "llm_infer_main_references", infer)
+
+    result = server.call_tool(
+        "llm_infer_main_references",
+        {"text": "CMB trispectrum", "provider": "manual", "model": "test-model", "refresh": True},
+    )
+
+    assert result["ok"] is True
+    assert result["data"] == ["arXiv:0911.3380"]
+    assert result["meta"]["job"]["job_type"] == "main_reference_inference"
+    assert result["meta"]["text"] == "CMB trispectrum"
+    assert result["meta"]["provider"] == "manual"
+    assert result["meta"]["model"] == "test-model"
+    assert result["meta"]["refresh"] is True
+
+
 def test_call_tool_passes_reference_enrichment(monkeypatch):
     def get_references(paper_ids, refresh=False, enrich=False):
         return {"ok": True, "data": {"paper_ids": paper_ids, "refresh": refresh, "enrich": enrich}}
@@ -70,6 +129,8 @@ def test_fastmcp_tools_have_discovery_metadata():
     tools = asyncio.run(app.list_tools())
     by_name = {tool.name: tool for tool in tools}
 
+    assert "natural-language text" in by_name["extract_paper_ids"].description
+    assert "web search" in by_name["llm_infer_main_references"].description
     assert "arXiv papers" in by_name["get_title"].description
     assert "LLM summary" in by_name["llm_generate_summary"].description
     assert "INSPIRE metadata" in by_name["get_metadata"].description
@@ -88,6 +149,7 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "llm_summary_batch_run" in by_name
     assert by_name["llm_domain_build"].inputSchema["properties"]["seed_paper"]["description"].startswith("Single paper")
     assert "background" in by_name["llm_generate_summary"].inputSchema["properties"]
+    assert "background" in by_name["llm_infer_main_references"].inputSchema["properties"]
     assert "background" in by_name["llm_get_summary"].inputSchema["properties"]
     assert "background" in by_name["llm_domain_build"].inputSchema["properties"]
     assert "background" in by_name["llm_domain_get_summary"].inputSchema["properties"]

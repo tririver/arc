@@ -50,6 +50,8 @@ def run_job(job_id: str) -> int:
 def _dispatch(job_type: str, payload: dict[str, Any], *, job_id: str) -> Any:
     if job_type == "paper_summary":
         return _paper_summary(payload, job_id=job_id)
+    if job_type == "main_reference_inference":
+        return _main_reference_inference(payload, job_id=job_id)
     if job_type == "domain_build":
         return _domain_build(payload, job_id=job_id)
     if job_type == "summary_batch_run":
@@ -67,6 +69,20 @@ def _paper_summary(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
         refresh=bool(payload.get("refresh", False)),
         progress_callback=lambda event: record_progress(job_id, event),
     )
+
+
+def _main_reference_inference(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    _check_cancel(job_id)
+    record_progress(job_id, {"event": "reference_inference_started"})
+    result = paper_service.llm_infer_main_references(
+        str(payload.get("text") or ""),
+        provider=str(payload.get("provider") or "auto"),
+        model=payload.get("model"),
+        refresh=bool(payload.get("refresh", False)),
+    )
+    event = "reference_inference_completed" if _result_ok(result) else "reference_inference_failed"
+    record_progress(job_id, {"event": event})
+    return result
 
 
 def _domain_build(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:

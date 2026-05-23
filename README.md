@@ -167,10 +167,14 @@ ARC MCP job state is cached under:
 
 Install the packages above, then configure the MCP server command as
 `arc-mcp`. The ARC MCP server exposes paper tools such as `get_metadata`,
-`get_references`, `get_citers`, `get_section`, and cache-only domain tools.
-Anything that can invoke the host LLM has an `llm_` prefix:
+`get_references`, `get_citers`, `get_section`, `extract_paper_ids`, and
+cache-only domain tools. `llm_infer_main_references` first extracts explicit
+paper ids without an LLM; if none are present, it uses web search and verifies
+the result through INSPIRE. Anything that can invoke the host LLM has an
+`llm_` prefix:
 
 ```text
+llm_infer_main_references(text, provider="auto", background=true)
 llm_get_summary(paper_id, provider="auto")
 llm_generate_summary(paper_id, provider="auto")
 llm_generate_summary(paper_id, provider="auto", background=true)

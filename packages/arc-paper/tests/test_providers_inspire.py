@@ -134,6 +134,35 @@ def test_inspire_metadata_and_references_are_cached(monkeypatch, tmp_path):
     assert cached_provider.get_references("arXiv:0911.3380")[0]["title"] == "A Reference"
 
 
+def test_inspire_metadata_supports_doi_lookup(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    record = {
+        **INSPIRE_RECORD,
+        "metadata": {
+            **INSPIRE_RECORD["metadata"],
+            "dois": [{"value": "10.1088/1475-7516/2010/04/027"}],
+        },
+    }
+
+    def handler(request):
+        assert str(request.url.copy_with(query=None)) == "https://inspirehep.net/api/literature"
+        assert request.url.params["q"] == "doi:10.1088/1475-7516/2010/04/027"
+        return httpx.Response(200, json={"hits": {"total": 1, "hits": [record]}})
+
+    provider = InspireProvider(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    metadata = provider.get_metadata("doi:10.1088/1475-7516/2010/04/027")
+
+    assert metadata["paper_id"] == "arXiv:0911.3380"
+    assert metadata["identifiers"]["doi"] == "10.1088/1475-7516/2010/04/027"
+
+    cached_provider = InspireProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError()))
+        )
+    )
+    assert cached_provider.get_metadata("doi:10.1088/1475-7516/2010/04/027")["title"] == "A Test Paper"
+
+
 def test_inspire_references_can_be_enriched_through_single_paper_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     calls = []

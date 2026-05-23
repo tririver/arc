@@ -9,6 +9,29 @@ All single-paper operations in higher-level tools should go through
 
 ## Deterministic CLI
 
+Use `extract-paper-ids` when the input is natural-language text that may
+mention papers in mixed formats.
+
+```bash
+arc-paper extract-paper-ids "Compare arXiv:0911.3380, 2512.06790, and doi:10.1234/2512.06790" --json
+```
+
+It returns normalized identifiers such as `arXiv:0911.3380`,
+`inspire:837197`, and `doi:10.1088/1475-7516/2010/04/027`. DOI identifiers are
+usable for INSPIRE-backed metadata lookups. DOI spans are removed before bare
+arXiv-like IDs are scanned, so DOI suffixes do not create false arXiv IDs.
+
+Use `llm-infer-main-references` when the input has no explicit paper id and the
+task is to infer the main reference paper from a natural-language research
+description. It first runs `extract-paper-ids`; if any ids are found, it returns
+them directly without calling an LLM. Otherwise it calls the host LLM with
+internet search enabled, then verifies returned candidates through INSPIRE
+before returning ids.
+
+```bash
+arc-paper llm-infer-main-references "main reference for CMB trispectrum constraints" --json
+```
+
 Phase 1: Fetch or read cached paper data.
 Step 1: Use `--json` for agent-readable result envelopes.
 Step 2: Prefer non-refreshing reads unless the user asks to refetch.
@@ -119,6 +142,8 @@ Read `references/package-manuals/arc-mcp.md` before using MCP.
 Paper MCP tools:
 
 ```text
+extract_paper_ids
+llm_infer_main_references
 get_title
 get_abstract
 get_authors

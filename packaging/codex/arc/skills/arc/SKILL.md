@@ -9,11 +9,14 @@ ARC is a cache-first research toolkit for theoretical-physics papers and
 research-domain construction. Use ARC tools instead of scraping arXiv/INSPIRE
 or reimplementing paper/domain workflows.
 
-## Read the Tool-Call References First
+## Read the Integrity and Tool-Call References First
 
 Read the relevant reference before calling ARC tools. These reads are required,
 not optional.
 
+- Scientific claims, gap scoring, automated workflow decisions, warning
+  behavior, or robustness-sensitive execution: read
+  `references/rules/integrity.md`.
 - General ARC operating rules: read `references/rules/operating.md`.
 - Single-paper metadata, full text, sections, equations, citers, references,
   paper summaries, or summary batches: read
@@ -25,8 +28,3 @@ not optional.
   behavior: read `references/package-manuals/arc-mcp.md`.
 - Host LLM/provider detection, model choice, direct prompt tests, or provider
   troubleshooting: read `references/package-manuals/arc-llm.md`.
-- Research workflows: read the relevant file under
-  `references/research-workflows/` when present.
-- Scientific claims, gap scoring, automated workflow decisions, warning
-  behavior, or robustness-sensitive execution: read
-  `references/rules/integrity.md`.

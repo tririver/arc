@@ -5,12 +5,15 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from .cache import CachePaths, cache_root, read_json, write_json
+from .ids import arxiv_path_id
+from .ids import extract_paper_ids as _extract_paper_ids
 from .ids import normalize_paper_id
 from .parse.ar5iv_html import get_section as parsed_get_section
 from .parse.ar5iv_html import parse_html
 from .parse.equations import find_equation_context
 from .providers import Ar5ivProvider, InspireProvider
 from .providers.base import ProviderError
+from .reference_inference import ReferenceInferenceError, infer_main_references
 from .results import err, ok
 from .summary.input_pack import build_input_pack
 from .summary.providers.select import select_summary_provider
@@ -21,6 +24,47 @@ from .summary.store import read_latest_summary, read_summary, store_summary
 _inspire = InspireProvider()
 _ar5iv = Ar5ivProvider()
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def extract_paper_ids(text: str) -> dict[str, Any]:
+    return ok(_extract_paper_ids(text))
+
+
+def llm_infer_main_references(
+    text: str,
+    *,
+    provider: str = "auto",
+    model: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    explicit_ids = _extract_paper_ids(text)
+    if explicit_ids:
+        return ok(explicit_ids, provider="local-parser", llm_used=False)
+    try:
+        result = infer_main_references(
+            text,
+            provider=provider,
+            model=model,
+            refresh=refresh,
+            metadata_lookup=_inspire.get_metadata,
+        )
+    except ReferenceInferenceError as exc:
+        return err(exc.code, exc.message)
+    except ProviderError as exc:
+        return err(exc.code, exc.message)
+    except Exception as exc:
+        return err("reference_inference_failed", str(exc))
+    return ok(
+        result["paper_ids"],
+        provider=result.get("provider"),
+        model=result.get("model"),
+        llm_used=True,
+        focus_scope=result.get("focus_scope"),
+        warnings=result.get("warnings", []),
+        verified_references=result.get("verified_references", []),
+        rejected_candidates=result.get("rejected_candidates", []),
+        raw_llm_response=result.get("raw_llm_response"),
+    )
 
 
 def get_title(ids: str | Iterable[str], *, refresh: bool = False):
@@ -187,7 +231,8 @@ def _section_one(paper_id: str, section: str, *, refresh: bool) -> dict[str, Any
 
 def _equation_one(paper_id: str, query: str, *, refresh: bool) -> dict[str, Any]:
     try:
-        html = _ar5iv.get_html(paper_id, refresh=refresh)
+        full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
+        html = _ar5iv.get_html(full_text_id, refresh=refresh)
         return ok(find_equation_context(html, query), provider="ar5iv")
     except ProviderError as exc:
         return err(exc.code, exc.message)
@@ -196,13 +241,24 @@ def _equation_one(paper_id: str, query: str, *, refresh: bool) -> dict[str, Any]
 
 
 def _parsed(paper_id: str, *, refresh: bool) -> dict[str, Any]:
-    paths = CachePaths.for_paper(paper_id)
+    full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
+    paths = CachePaths.for_paper(full_text_id)
     if not refresh and (cached := read_json(paths.ar5iv_parsed)):
         return cached
-    html = _ar5iv.get_html(paper_id, refresh=refresh)
-    parsed = parse_html(html, paper_id=normalize_paper_id(paper_id))
+    html = _ar5iv.get_html(full_text_id, refresh=refresh)
+    parsed = parse_html(html, paper_id=normalize_paper_id(full_text_id))
     write_json(paths.ar5iv_parsed, parsed)
     return parsed
+
+
+def _full_text_paper_id(paper_id: str, *, refresh: bool) -> str:
+    normalized = normalize_paper_id(paper_id)
+    if arxiv_path_id(normalized):
+        return normalized
+    metadata = _inspire.get_metadata(normalized, refresh=refresh)
+    if arxiv_id := metadata.get("arxiv_id"):
+        return normalize_paper_id(f"arXiv:{arxiv_id}")
+    return normalized
 
 
 def _summary_status(paper_id: str, *, refresh: bool) -> dict[str, Any]:

@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from ..cache import CachePaths, ONE_MONTH_SECONDS, read_json, write_json
-from ..ids import arxiv_path_id, inspire_recid, normalize_paper_id
+from ..ids import arxiv_path_id, doi_value, inspire_recid, normalize_paper_id
 from .base import ProviderError
 
 
@@ -142,12 +142,20 @@ class InspireProvider:
 
         recid = inspire_recid(normalized_id)
         aid = arxiv_path_id(normalized_id)
+        doi = doi_value(normalized_id)
         if recid:
             url = f"{BASE_URL}/literature/{recid}"
         elif aid:
             url = f"{BASE_URL}/arxiv/{aid}"
+        elif doi:
+            raw = self._get_raw_record_by_doi(doi, requested_id=normalized_id)
+            _cache_raw_record(raw, requested_id=normalized_id)
+            return raw
         else:
-            raise ProviderError("unsupported_paper_id", f"INSPIRE requires an arXiv ID or INSPIRE recid: {paper_id}")
+            raise ProviderError(
+                "unsupported_paper_id",
+                f"INSPIRE requires an arXiv ID, DOI, or INSPIRE recid: {paper_id}",
+            )
 
         response = self.client.get(url, timeout=self.timeout)
         if response.status_code == 404:
@@ -160,6 +168,22 @@ class InspireProvider:
         raw = response.json()
         _cache_raw_record(raw, requested_id=normalized_id)
         return raw
+
+    def _get_raw_record_by_doi(self, doi: str, *, requested_id: str) -> dict[str, Any]:
+        response = self.client.get(
+            f"{BASE_URL}/literature",
+            params={"q": f"doi:{doi}", "size": "1", "format": "json"},
+            timeout=self.timeout,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError("inspire_fetch_failed", str(exc)) from exc
+
+        hits = response.json().get("hits", {}).get("hits", [])
+        if not hits:
+            raise ProviderError("inspire_not_found", f"INSPIRE record not found for {requested_id}")
+        return hits[0]
 
 
 def _normalize_record(payload: dict[str, Any]) -> dict[str, Any]:
@@ -256,6 +280,8 @@ def _cache_raw_record(raw: dict[str, Any], *, requested_id: str) -> None:
         keys.add(f"inspire:{recid}")
     if arxiv_id := metadata.get("arxiv_id"):
         keys.add(f"arXiv:{arxiv_id}")
+    if doi := metadata.get("doi"):
+        keys.add(f"doi:{doi}")
     for key in {normalize_paper_id(item) for item in keys if item}:
         write_json(CachePaths.for_paper(key).inspire_metadata, raw)
 
@@ -265,6 +291,8 @@ def _reference_lookup_id(reference: dict[str, Any]) -> str:
         return f"inspire:{recid}"
     if paper_id := reference.get("paper_id"):
         return normalize_paper_id(str(paper_id))
+    if doi := reference.get("doi"):
+        return normalize_paper_id(f"doi:{doi}")
     return ""
 
 

@@ -17,6 +17,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Cache-first ar5iv and INSPIRE paper query tools")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    extract = sub.add_parser("extract-paper-ids", aliases=["extract-ids"])
+    extract.add_argument("text", nargs="*")
+    extract.add_argument("--file", default=None)
+    extract.add_argument("--json", action="store_true")
+
+    infer_refs = sub.add_parser("llm-infer-main-references", aliases=["infer-main-references"])
+    infer_refs.add_argument("text", nargs="*")
+    infer_refs.add_argument("--file", default=None)
+    infer_refs.add_argument("--provider", default="auto")
+    infer_refs.add_argument("--model", default=None)
+    infer_refs.add_argument("--refresh", action="store_true")
+    infer_refs.add_argument("--json", action="store_true")
+
     _paper_command(sub, "get-title")
     _paper_command(sub, "get-abstract")
     _paper_command(sub, "get-authors")
@@ -168,6 +181,15 @@ def _dispatch(args: argparse.Namespace) -> Any:
             return ok(export_batch(args.name, output=Path(args.output), db=db))
     if command == "store-llm-summary":
         return service.store_llm_summary(args.paper_id, _read_summary_arg(args.summary_json))
+    if command in {"extract-paper-ids", "extract-ids"}:
+        return service.extract_paper_ids(_read_text_arg(args))
+    if command in {"llm-infer-main-references", "infer-main-references"}:
+        return service.llm_infer_main_references(
+            _read_text_arg(args),
+            provider=args.provider,
+            model=args.model,
+            refresh=args.refresh,
+        )
 
     paper_ids = args.paper_ids[0] if len(args.paper_ids) == 1 else args.paper_ids
     if command == "get-title":
@@ -207,6 +229,18 @@ def _read_summary_arg(value: str) -> dict[str, Any]:
         return json.loads(sys.stdin.read())
     with open(value, encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _read_text_arg(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    if args.file:
+        with open(args.file, encoding="utf-8") as handle:
+            parts.append(handle.read())
+    if args.text:
+        parts.append(" ".join(args.text))
+    if not parts and not sys.stdin.isatty():
+        parts.append(sys.stdin.read())
+    return "\n".join(parts)
 
 
 def _read_papers_file(path: str) -> list[str]:

@@ -1,5 +1,91 @@
-from arc_paper import service
+from arc_paper import reference_inference, service
 from arc_paper.providers.base import ProviderError
+
+
+def test_extract_paper_ids_service():
+    result = service.extract_paper_ids("See arXiv:0911.3380 and doi:10.1234/2512.06790.")
+
+    assert result["ok"] is True
+    assert result["data"] == ["arXiv:0911.3380", "doi:10.1234/2512.06790"]
+
+
+def test_llm_infer_main_references_short_circuits_explicit_ids(monkeypatch):
+    monkeypatch.setattr(
+        reference_inference,
+        "run_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LLM should not be called")),
+    )
+
+    result = service.llm_infer_main_references("Compare 0911.3380 and doi:10.1234/abc.")
+
+    assert result["ok"] is True
+    assert result["data"] == ["arXiv:0911.3380", "doi:10.1234/abc"]
+    assert result["meta"]["llm_used"] is False
+
+
+def test_llm_infer_main_references_enables_web_and_verifies_candidates(monkeypatch):
+    def run_json(prompt, *, schema=None, provider="auto", model=None, env=None, process_chain=None):
+        assert "Use live web search" in prompt
+        assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
+        assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
+        return {
+            "focus_scope": "one_domain",
+            "candidates": [
+                {
+                    "domain": "CMB non-Gaussianity",
+                    "paper_id": "doi:10.1088/1475-7516/2010/04/027",
+                    "title": "A Test Paper",
+                    "evidence_urls": ["https://inspirehep.net/literature/837197"],
+                    "reasoning": "Verified by search.",
+                }
+            ],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(reference_inference, "run_json", run_json)
+    monkeypatch.setenv("ARC_LLM_PROVIDER", "codex-cli")
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+
+    result = service.llm_infer_main_references("Find the key paper on CMB trispectrum.")
+
+    assert result["ok"] is True
+    assert result["data"] == ["arXiv:0911.3380"]
+    assert result["meta"]["llm_used"] is True
+    assert result["meta"]["provider"] == "codex-cli"
+    assert result["meta"]["focus_scope"] == "one_domain"
+    assert result["meta"]["verified_references"][0]["input_paper_id"].startswith("doi:")
+
+
+def test_llm_infer_main_references_rejects_unverified_candidates(monkeypatch):
+    monkeypatch.setattr(
+        reference_inference,
+        "run_json",
+        lambda *args, **kwargs: {
+            "focus_scope": "one_domain",
+            "candidates": [
+                {
+                    "domain": "Fake domain",
+                    "paper_id": "arXiv:9999.99999",
+                    "title": "Fake",
+                    "evidence_urls": [],
+                    "reasoning": "None.",
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    class MissingInspire(FakeInspire):
+        def get_metadata(self, paper_id, *, refresh=False):
+            raise ProviderError("inspire_not_found", "missing")
+
+    monkeypatch.setenv("ARC_LLM_PROVIDER", "codex-cli")
+    monkeypatch.setattr(service, "_inspire", MissingInspire())
+
+    result = service.llm_infer_main_references("Find the key paper.")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "reference_inference_unverified"
 
 
 class FakeInspire:
@@ -9,6 +95,7 @@ class FakeInspire:
             "title": "A Test Paper",
             "abstract": "A useful abstract.",
             "authors": ["Alice", "Bob"],
+            "arxiv_id": "0911.3380",
             "citation_count": 5,
         }
 
@@ -72,6 +159,23 @@ def test_toc_section_and_equation_context(monkeypatch, tmp_path):
     assert service.get_toc("0911.3380")["data"][0]["title"] == "1 Introduction"
     assert service.get_section("0911.3380", "model")["data"]["section_id"] == "S2"
     assert service.get_equation_context("0911.3380", "x = y")["data"][0]["after"] == "After."
+
+
+def test_full_text_resolves_doi_to_arxiv(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+
+    class AssertingAr5iv(FakeAr5iv):
+        def get_html(self, paper_id, *, refresh=False):
+            assert paper_id == "arXiv:0911.3380"
+            return super().get_html(paper_id, refresh=refresh)
+
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", AssertingAr5iv())
+
+    result = service.get_toc("doi:10.1088/1475-7516/2010/04/027")
+
+    assert result["ok"] is True
+    assert result["data"][0]["title"] == "1 Introduction"
 
 
 def test_missing_section_keeps_error_and_toc(monkeypatch, tmp_path):

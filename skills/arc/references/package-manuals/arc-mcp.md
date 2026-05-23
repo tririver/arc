@@ -9,6 +9,8 @@ background jobs, job status, and CLI job watching.
 Paper tools:
 
 ```text
+extract_paper_ids
+llm_infer_main_references
 get_title
 get_abstract
 get_authors
@@ -67,6 +69,7 @@ Step 2: Capture the returned `job_id`.
 Examples:
 
 ```text
+llm_infer_main_references(text="main reference for CMB trispectrum constraints", background=true)
 llm_generate_summary(paper_id="0911.3380", provider="auto", background=true)
 llm_domain_build(seed_paper="0911.3380", intent="...", background=true)
 llm_summary_batch_run(name="qft-ideas", provider="auto", concurrency=2, background=true)
