@@ -10,6 +10,7 @@ from .ids import arxiv_path_id
 from .ids import extract_paper_ids as _extract_paper_ids
 from .ids import normalize_paper_id
 from .ids import paper_ids_safe_dir_name as _paper_ids_safe_dir_name
+from .parse.ar5iv_html import PARSER_VERSION
 from .parse.ar5iv_html import get_section as parsed_get_section
 from .parse.ar5iv_html import parse_html
 from .parse.equations import find_equation_context
@@ -306,7 +307,8 @@ def _parsed(paper_id: str, *, refresh: bool) -> dict[str, Any]:
     full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
     paths = CachePaths.for_paper(full_text_id)
     if not refresh and (cached := read_json(paths.ar5iv_parsed)):
-        return cached
+        if cached.get("parser_version") == PARSER_VERSION:
+            return cached
     html = _ar5iv.get_html(full_text_id, refresh=refresh)
     parsed = parse_html(html, paper_id=normalize_paper_id(full_text_id))
     write_json(paths.ar5iv_parsed, parsed)

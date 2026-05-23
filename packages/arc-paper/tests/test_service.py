@@ -1,5 +1,5 @@
 from arc_paper import reference_inference, service
-from arc_paper.cache import text_query_cache_path, write_json
+from arc_paper.cache import CachePaths, read_json, text_query_cache_path, write_json, write_text
 from arc_paper.providers.base import ProviderError
 
 
@@ -214,6 +214,26 @@ def test_toc_section_and_equation_context(monkeypatch, tmp_path):
     assert service.get_toc("0911.3380")["data"][0]["title"] == "1 Introduction"
     assert service.get_section("0911.3380", "model")["data"]["section_id"] == "S2"
     assert service.get_equation_context("0911.3380", "x = y")["data"][0]["after"] == "After."
+
+
+def test_stale_parsed_cache_is_reparsed_from_cached_html(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    paths = CachePaths.for_paper("arXiv:0911.3380")
+    write_json(paths.ar5iv_parsed, {"paper_id": "arXiv:0911.3380", "toc": [], "sections": []})
+    write_text(
+        paths.ar5iv_html,
+        """
+        <html><body>
+          <p><span class="ltx_text ltx_font_bold">Discussion</span>— Main result.</p>
+        </body></html>
+        """,
+    )
+
+    result = service.get_section("0911.3380", "discussion")
+
+    assert result["ok"] is True
+    assert result["data"]["section_id"] == "inline-discussion"
+    assert read_json(paths.ar5iv_parsed).get("parser_version")
 
 
 def test_full_text_resolves_doi_to_arxiv(monkeypatch, tmp_path):
