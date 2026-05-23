@@ -106,12 +106,17 @@ def _dispatch(args: argparse.Namespace) -> Any:
 def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-internet", action="store_true")
     parser.add_argument("--allow-mcp", action="store_true")
+    parser.add_argument("--mcp-mode", choices=["user-config", "arc-only"], default=None)
 
 
 def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-sandbox", default=None)
     parser.add_argument("--codex-profile", default=None)
     parser.add_argument("--codex-profile-v2", default=None)
+    parser.add_argument("--codex-work-dir", default=None)
+    parser.add_argument("--codex-add-dir", action="append", default=[])
+    parser.add_argument("--arc-mcp-command", default=None)
+    parser.add_argument("--arc-mcp-env", action="append", default=[])
     parser.add_argument("--codex-config", action="append", default=[])
     parser.add_argument("--codex-reasoning-effort", default=None)
     parser.add_argument("--codex-reasoning-summary", default=None)
@@ -143,9 +148,17 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
     if args.allow_mcp:
         overrides["ARC_CODEX_ENABLE_MCP"] = "true"
         overrides["ARC_CLAUDE_ALLOW_MCP"] = "true"
+    _put(overrides, "ARC_CODEX_MCP_MODE", args.mcp_mode)
+    _put(overrides, "ARC_CLAUDE_MCP_MODE", args.mcp_mode)
     _put(overrides, "ARC_CODEX_SANDBOX", args.codex_sandbox)
     _put(overrides, "ARC_CODEX_PROFILE", args.codex_profile)
     _put(overrides, "ARC_CODEX_PROFILE_V2", args.codex_profile_v2)
+    _put(overrides, "ARC_CODEX_WORK_DIR", args.codex_work_dir)
+    if args.codex_add_dir:
+        overrides["ARC_CODEX_ADD_DIRS"] = json.dumps(args.codex_add_dir, ensure_ascii=False)
+    _put(overrides, "ARC_CODEX_ARC_MCP_COMMAND", args.arc_mcp_command)
+    if args.arc_mcp_env:
+        overrides["ARC_CODEX_ARC_MCP_ENV_JSON"] = json.dumps(_parse_key_value_items(args.arc_mcp_env), ensure_ascii=False)
     if args.codex_config:
         overrides["ARC_CODEX_CONFIG"] = "\n".join(args.codex_config)
     _put(overrides, "ARC_CODEX_REASONING_EFFORT", args.codex_reasoning_effort)
@@ -189,6 +202,19 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
 def _put(env: dict[str, str], key: str, value: str | None) -> None:
     if value is not None:
         env[key] = value
+
+
+def _parse_key_value_items(items: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"Expected KEY=VALUE for --arc-mcp-env, got: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit("Expected non-empty KEY for --arc-mcp-env")
+        parsed[key] = value
+    return parsed
 
 
 def _read_prompt(value: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -55,6 +56,7 @@ def test_valid_config_parses_and_merges_defaults():
     assert str(config.run_dir) == "project/suggest-ideas"
     assert config.run_id == "idea-test"
     assert config.max_concurrent_loops == 2
+    assert config.artifact_options.save_prompts is True
     assert len(config.loops) == 1
 
     loop = config.loops[0]
@@ -144,6 +146,39 @@ def test_worker_env_maps_mcp_model_and_provider_options():
     assert env["ARC_CLAUDE_EFFORT"] == "high"
 
 
+def test_worker_env_maps_arc_only_mcp_and_codex_filesystem_options():
+    payload = minimal_config()
+    runtime = payload["loops"][0]["reviewers"][0]["runtime"]
+    runtime.update(
+        {
+            "mcp_mode": "arc-only",
+            "arc_mcp_command": "/tmp/arc-mcp",
+            "arc_mcp_env": {"ARC_PAPER_CACHE": "/tmp/arc-paper"},
+            "codex_work_dir": "/tmp/project",
+            "codex_add_dirs": ["/tmp/project/skills", "/tmp/arc-skills"],
+        }
+    )
+    config = load_batch_config(payload)
+
+    env = worker_env(config.loops[0].reviewers[0], base_env={})
+
+    assert env["ARC_CODEX_ENABLE_MCP"] == "true"
+    assert env["ARC_CODEX_MCP_MODE"] == "arc-only"
+    assert env["ARC_CODEX_ARC_MCP_COMMAND"] == "/tmp/arc-mcp"
+    assert json.loads(env["ARC_CODEX_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
+    assert env["ARC_CODEX_WORK_DIR"] == "/tmp/project"
+    assert json.loads(env["ARC_CODEX_ADD_DIRS"]) == ["/tmp/project/skills", "/tmp/arc-skills"]
+
+
+def test_worker_env_rejects_invalid_mcp_mode():
+    payload = minimal_config()
+    payload["loops"][0]["reviewers"][0]["runtime"]["mcp_mode"] = "broad"
+    config = load_batch_config(payload)
+
+    with pytest.raises(ConfigError, match="mcp_mode"):
+        worker_env(config.loops[0].reviewers[0], base_env={})
+
+
 def test_worker_specific_model_tier_overrides_default_model_tier():
     payload = minimal_config()
     payload["loops"][0]["proposers"][0]["model_tier"] = "low"
@@ -151,6 +186,15 @@ def test_worker_specific_model_tier_overrides_default_model_tier():
     config = load_batch_config(payload)
 
     assert config.loops[0].proposers[0].model_tier == "low"
+
+
+def test_artifact_options_can_disable_prompt_saving():
+    payload = minimal_config()
+    payload["artifact_options"] = {"save_prompts": False}
+
+    config = load_batch_config(payload)
+
+    assert config.artifact_options.save_prompts is False
 
 
 def test_invalid_model_tier_fails():

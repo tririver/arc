@@ -76,13 +76,23 @@ For example, the idea workflow uses:
 ```json
 {
   "run_dir": "<project-dir>/suggest-ideas",
-  "run_id": "<run-id>"
+  "run_id": "<run-id>",
+  "artifact_options": {
+    "save_prompts": true
+  }
 }
 ```
 
 The loop runner owns all artifact writes. Worker prompts and outputs are stored
 under per-loop and per-round directories, so distinct loops can run
 concurrently without sharing mutable context.
+
+`artifact_options.save_prompts` defaults to `true`. When enabled, full rendered
+worker prompts are stored under each round's `prompts/` directory for
+debugging. These prompt artifacts are not included in later worker context or
+`transcript.jsonl`; worker context receives only proposer outputs, reviewer
+reviews, controller messages, and reviewer-to-proposer messages. Worker-call
+errors are written under each round's `errors/` directory.
 
 Optional true-LLM integration tests are skipped by default. To run them
 explicitly:
@@ -123,10 +133,33 @@ Common options:
 --model <model>
 --allow-internet
 --allow-mcp
+--mcp-mode arc-only
+--arc-mcp-command arc-mcp
 --codex-reasoning-effort low
 --codex-sandbox read-only
+--codex-work-dir <project-dir>
+--codex-add-dir <extra-dir>
 --claude-effort low
 ```
 
 Use `--allow-mcp` for LLM tasks that need ARC tools or other configured MCP
 servers. Use `--allow-internet` only when fresh web access is required.
+
+For proposers-reviewer JSON configs, prefer ARC-only MCP access when workers
+need ARC paper/domain tools:
+
+```json
+{
+  "runtime": {
+    "allow_mcp": true,
+    "mcp_mode": "arc-only",
+    "codex_sandbox": "read-only"
+  }
+}
+```
+
+With Codex, `mcp_mode: "arc-only"` keeps the user host config ignored, injects
+only the ARC MCP server, and approves that server's tools for the noninteractive
+worker. If a worker also needs bounded filesystem access, use
+`codex_sandbox: "workspace-write"` with `codex_work_dir` and `codex_add_dirs`;
+do not use `danger-full-access` for normal research workflows.

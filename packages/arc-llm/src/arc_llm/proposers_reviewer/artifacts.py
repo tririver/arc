@@ -99,6 +99,10 @@ class RoundPaths:
     def review_dir(self) -> Path:
         return self.round_root / "reviews"
 
+    @property
+    def error_dir(self) -> Path:
+        return self.round_root / "errors"
+
     def proposer_context(self, worker_id: str) -> Path:
         return self.context_dir / f"{worker_id}.json"
 
@@ -113,6 +117,9 @@ class RoundPaths:
 
     def review(self, worker_id: str) -> Path:
         return self.review_dir / f"{worker_id}.json"
+
+    def worker_error(self, worker_id: str) -> Path:
+        return self.error_dir / f"{worker_id}.json"
 
 
 def atomic_write_json(path: Path, data: Any) -> None:

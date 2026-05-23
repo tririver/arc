@@ -165,14 +165,15 @@ class AddOneReviewRunner:
         }
 
 
-def test_runner_records_full_past_correspondence_without_current_round_cross_talk(tmp_path):
+def test_runner_sends_only_reply_correspondence_while_saving_prompt_artifacts(tmp_path):
     fake = FakeJsonRunner()
 
     result = run_proposers_reviewer_batch(base_config(tmp_path), json_runner=fake, base_env={})
 
     assert result["status"] == "completed"
     run_root = tmp_path / "suggest-ideas" / "run_001"
-    round1_p1_prompt = (run_root / "loops/loop_001/rounds/round_001/prompts/proposer_001.md").read_text(
+    round1_p1_prompt_path = run_root / "loops/loop_001/rounds/round_001/prompts/proposer_001.md"
+    round1_p1_prompt = round1_p1_prompt_path.read_text(
         encoding="utf-8"
     )
     round2_p1_prompt = (run_root / "loops/loop_001/rounds/round_002/prompts/proposer_001.md").read_text(
@@ -182,13 +183,54 @@ def test_runner_records_full_past_correspondence_without_current_round_cross_tal
         encoding="utf-8"
     )
 
+    round2_p1_context = json.loads(
+        (run_root / "loops/loop_001/rounds/round_002/context/proposer_001.json").read_text(encoding="utf-8")
+    )
+    correspondence_types = {event["type"] for event in round2_p1_context["correspondence"]}
+
+    assert round1_p1_prompt_path.exists()
     assert "output-from-proposer_002-round-1" not in round1_p1_prompt
     assert "output-from-proposer_001-round-1" in round2_p1_prompt
     assert "output-from-proposer_002-round-1" in round2_p1_prompt
-    assert "propose proposer_001 round 1" in round2_p1_prompt
+    assert "propose proposer_001 round 1" not in round2_p1_prompt
     assert "review-to-proposer_001-round-1" in round2_p1_prompt
     assert "output-from-proposer_001-round-1" in round1_review_prompt
     assert "output-from-proposer_002-round-1" in round1_review_prompt
+    assert correspondence_types == {"controller_message", "proposer_message", "proposer_output", "review"}
+    assert all(event["type"] not in {"proposer_prompt", "reviewer_prompt"} for event in round2_p1_context["correspondence"])
+
+    transcript_events = [
+        json.loads(line)
+        for line in (run_root / "loops/loop_001/transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert all(event["type"] not in {"proposer_prompt", "reviewer_prompt"} for event in transcript_events)
+
+
+def test_prompt_artifacts_can_be_disabled(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["artifact_options"] = {"save_prompts": False}
+
+    result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(), base_env={})
+
+    run_root = tmp_path / "suggest-ideas" / "run_001"
+    assert result["status"] == "completed"
+    assert not (run_root / "loops/loop_001/rounds/round_001/prompts/proposer_001.md").exists()
+    assert not (run_root / "loops/loop_001/rounds/round_001/prompts/reviewer_001.md").exists()
+    assert (run_root / "loops/loop_001/rounds/round_001/proposer_outputs/proposer_001.json").exists()
+
+
+def test_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+
+    result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(fail_loop="loop_001"), base_env={})
+
+    error_path = tmp_path / "suggest-ideas/run_001/loops/loop_001/rounds/round_001/errors/proposer_001.json"
+    error = json.loads(error_path.read_text(encoding="utf-8"))
+
+    assert result["status"] == "failed"
+    assert error["worker_id"] == "proposer_001"
+    assert error["error_type"] == "RuntimeError"
+    assert error["message"] == "simulated provider failure"
 
 
 def test_two_proposers_follow_add_one_reviewer_request_for_three_rounds(tmp_path):

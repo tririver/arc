@@ -1,6 +1,7 @@
 import json
 import subprocess
 
+from arc_llm.providers.base import LLMWorkerError
 from arc_llm.providers.claude_cli import ClaudeCliProvider
 from arc_llm.providers.codex_cli import CodexCliProvider
 
@@ -109,6 +110,59 @@ def test_codex_can_opt_into_internet_and_selected_config(monkeypatch):
     assert "sandbox_workspace_write.network_access=true" in captured["cmd"]
     assert 'mcp_servers.arc.command="arc-mcp"' in captured["cmd"]
     assert 'mcp_servers.arc.args=["stdio"]' in captured["cmd"]
+
+
+def test_codex_arc_only_mcp_keeps_user_config_ignored_and_injects_arc_server(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        output_path = cmd[cmd.index("--output-last-message") + 1]
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("plain text")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    provider = CodexCliProvider(
+        env={
+            "ARC_CODEX_ENABLE_MCP": "true",
+            "ARC_CODEX_MCP_MODE": "arc-only",
+            "ARC_CODEX_ARC_MCP_COMMAND": "/tmp/arc-mcp",
+            "ARC_CODEX_WORK_DIR": "/tmp/project",
+            "ARC_CODEX_ADD_DIRS": json.dumps(["/tmp/project/skills", "/tmp/arc-skills"]),
+            "ARC_PAPER_CACHE": "/tmp/cache/arc-paper",
+            "ARC_CODEX_ARC_MCP_ENV_JSON": json.dumps({"ARC_MCP_CACHE": "/tmp/cache/arc-mcp"}),
+        }
+    )
+
+    assert provider.generate_text("prompt") == "plain text"
+    assert "--ignore-user-config" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--cd") + 1] == "/tmp/project"
+    assert captured["cmd"].count("--add-dir") == 2
+    assert "/tmp/project/skills" in captured["cmd"]
+    assert "/tmp/arc-skills" in captured["cmd"]
+    assert 'mcp_servers.arc.command="/tmp/arc-mcp"' in captured["cmd"]
+    assert 'mcp_servers.arc.default_tools_approval_mode="approve"' in captured["cmd"]
+    assert 'mcp_servers.arc.env.ARC_AGENT_HOST="codex"' in captured["cmd"]
+    assert 'mcp_servers.arc.env.ARC_LLM_PROVIDER="codex-cli"' in captured["cmd"]
+    assert 'mcp_servers.arc.env.ARC_PAPER_CACHE="/tmp/cache/arc-paper"' in captured["cmd"]
+    assert 'mcp_servers.arc.env.ARC_MCP_CACHE="/tmp/cache/arc-mcp"' in captured["cmd"]
+
+
+def test_codex_invalid_mcp_mode_fails_closed(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise AssertionError("subprocess should not run for invalid MCP mode")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    provider = CodexCliProvider(env={"ARC_CODEX_ENABLE_MCP": "true", "ARC_CODEX_MCP_MODE": "broad"})
+
+    try:
+        provider.generate_text("prompt")
+    except LLMWorkerError as exc:
+        assert "ARC_CODEX_MCP_MODE" in str(exc)
+    else:
+        raise AssertionError("expected LLMWorkerError")
 
 
 def test_codex_profile_loads_user_config(monkeypatch):

@@ -1,5 +1,7 @@
-# Reference snapshots
+# Reference snapshots, caches and local tests
 0_ref/
+cache/
+arc-tests/
 
 # Python bytecode and caches
 __pycache__/
@@ -30,7 +32,6 @@ pip-wheel-metadata/
 
 # Tool/runtime caches
 .cache/
-cache/
 .uv-cache/
 
 # Editor and OS files

@@ -1,6 +1,6 @@
 # ARC Dev
 
-ARC research tooling is organized as Python packages plus thin agent adapters.
+Advanced Research Compass (ARC) research tooling is organized as Python packages plus thin agent adapters.
 
 ## Packages
 

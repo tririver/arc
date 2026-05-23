@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -77,6 +79,9 @@ def _base_cmd(env: Mapping[str, str]) -> list[str]:
     profile = _env_text(env, "ARC_CODEX_PROFILE", "")
     profile_v2 = _env_text(env, "ARC_CODEX_PROFILE_V2", "")
     enable_mcp = _env_bool(env, "ARC_CODEX_ENABLE_MCP", False)
+    mcp_mode = _env_text(env, "ARC_CODEX_MCP_MODE", "user-config" if enable_mcp else "")
+    if enable_mcp and mcp_mode not in {"user-config", "arc-only"}:
+        raise LLMWorkerError("ARC_CODEX_MCP_MODE must be one of: user-config, arc-only")
     cmd = [
         "codex",
         "exec",
@@ -86,18 +91,27 @@ def _base_cmd(env: Mapping[str, str]) -> list[str]:
         "--sandbox",
         _env_text(env, "ARC_CODEX_SANDBOX", "read-only"),
     ]
+    if work_dir := _env_text(env, "ARC_CODEX_WORK_DIR", ""):
+        cmd.extend(["--cd", work_dir])
+    for add_dir in _env_list(env, "ARC_CODEX_ADD_DIRS"):
+        cmd.extend(["--add-dir", add_dir])
     if profile:
         cmd.extend(["--profile", profile])
     if profile_v2:
         cmd.extend(["--profile-v2", profile_v2])
     if _env_bool(env, "ARC_CODEX_EPHEMERAL", True):
         cmd.append("--ephemeral")
-    if _env_bool(env, "ARC_CODEX_IGNORE_USER_CONFIG", not (enable_mcp or profile or profile_v2)):
+    ignore_user_config_default = not (enable_mcp or profile or profile_v2)
+    if enable_mcp and mcp_mode == "arc-only":
+        ignore_user_config_default = True
+    if _env_bool(env, "ARC_CODEX_IGNORE_USER_CONFIG", ignore_user_config_default):
         cmd.append("--ignore-user-config")
     if _env_bool(env, "ARC_CODEX_IGNORE_RULES", True):
         cmd.append("--ignore-rules")
 
     for key, value in _codex_config_overrides(env):
+        cmd.extend(["-c", f"{key}={value}"])
+    for key, value in _arc_only_mcp_config_overrides(env):
         cmd.extend(["-c", f"{key}={value}"])
     for override in _extra_config_overrides(env):
         cmd.extend(["-c", override])
@@ -122,6 +136,47 @@ def _codex_config_overrides(env: Mapping[str, str]) -> list[tuple[str, str]]:
             )
         )
     return [(key, value) for key, value in overrides if value]
+
+
+def _arc_only_mcp_config_overrides(env: Mapping[str, str]) -> list[tuple[str, str]]:
+    if not _env_bool(env, "ARC_CODEX_ENABLE_MCP", False):
+        return []
+    if _env_text(env, "ARC_CODEX_MCP_MODE", "user-config") != "arc-only":
+        return []
+
+    mcp_env = {
+        "ARC_AGENT_HOST": "codex",
+        "ARC_LLM_PROVIDER": env.get("ARC_LLM_PROVIDER", "codex-cli"),
+    }
+    for key in ("ARC_PAPER_CACHE", "ARC_DOMAIN_CACHE", "ARC_MCP_CACHE"):
+        if value := env.get(key):
+            mcp_env[key] = value
+    if raw := env.get("ARC_CODEX_ARC_MCP_ENV_JSON"):
+        try:
+            extra_env = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise LLMWorkerError(f"ARC_CODEX_ARC_MCP_ENV_JSON was not valid JSON: {exc}") from exc
+        if not isinstance(extra_env, dict) or not all(isinstance(key, str) for key in extra_env):
+            raise LLMWorkerError("ARC_CODEX_ARC_MCP_ENV_JSON must be a JSON object with string keys")
+        mcp_env.update({key: str(value) for key, value in extra_env.items()})
+
+    overrides = [
+        ("mcp_servers.arc.command", _toml_string(_arc_mcp_command(env))),
+        ("mcp_servers.arc.default_tools_approval_mode", _toml_string("approve")),
+    ]
+    overrides.extend((f"mcp_servers.arc.env.{key}", _toml_string(value)) for key, value in sorted(mcp_env.items()))
+    return overrides
+
+
+def _arc_mcp_command(env: Mapping[str, str]) -> str:
+    if command := _env_text(env, "ARC_CODEX_ARC_MCP_COMMAND", ""):
+        return command
+    if command := shutil.which("arc-mcp"):
+        return command
+    sibling = Path(sys.executable).with_name("arc-mcp")
+    if sibling.exists():
+        return str(sibling)
+    return "arc-mcp"
 
 
 def _extra_config_overrides(env: Mapping[str, str]) -> list[str]:
@@ -151,6 +206,21 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _env_list(env: Mapping[str, str], key: str) -> list[str]:
+    value = env.get(key)
+    if value is None or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return [line.strip() for line in value.splitlines() if line.strip()]
+    if isinstance(parsed, str):
+        return [parsed]
+    if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+        return parsed
+    raise LLMWorkerError(f"{key} must be a JSON string, JSON array of strings, or newline-separated strings")
 
 
 def _toml_bool(value: bool) -> str:

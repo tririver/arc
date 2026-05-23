@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from arc_llm import cli
 
 
@@ -9,10 +11,21 @@ def test_runtime_env_merges_cli_llm_options(monkeypatch):
         [
             "run-text",
             "--allow-internet",
+            "--allow-mcp",
+            "--mcp-mode",
+            "arc-only",
             "--codex-reasoning-effort",
             "minimal",
             "--codex-model-verbosity",
             "low",
+            "--codex-work-dir",
+            "/tmp/project",
+            "--codex-add-dir",
+            "/tmp/project/skills",
+            "--arc-mcp-command",
+            "/tmp/arc-mcp",
+            "--arc-mcp-env",
+            "ARC_PAPER_CACHE=/tmp/arc-paper",
             "--codex-config",
             'mcp_servers.arc.command="arc-mcp"',
             "--claude-effort",
@@ -29,8 +42,14 @@ def test_runtime_env_merges_cli_llm_options(monkeypatch):
     assert env is not None
     assert env["ARC_AGENT_HOST"] == "codex"
     assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
+    assert env["ARC_CODEX_ENABLE_MCP"] == "true"
+    assert env["ARC_CODEX_MCP_MODE"] == "arc-only"
     assert env["ARC_CODEX_REASONING_EFFORT"] == "minimal"
     assert env["ARC_CODEX_MODEL_VERBOSITY"] == "low"
+    assert env["ARC_CODEX_WORK_DIR"] == "/tmp/project"
+    assert json.loads(env["ARC_CODEX_ADD_DIRS"]) == ["/tmp/project/skills"]
+    assert env["ARC_CODEX_ARC_MCP_COMMAND"] == "/tmp/arc-mcp"
+    assert json.loads(env["ARC_CODEX_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
     assert env["ARC_CODEX_CONFIG"] == 'mcp_servers.arc.command="arc-mcp"'
     assert env["ARC_CLAUDE_EFFORT"] == "medium"
     assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/arc-mcp.json"

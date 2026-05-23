@@ -46,6 +46,9 @@ Use this package-level structure:
   "run_id": "<run-id>",
   "run_dir": "<project-dir>/suggest-ideas",
   "max_concurrent_loops": 2,
+  "artifact_options": {
+    "save_prompts": true
+  },
   "defaults": {
     "provider": "<provider>",
     "model_tier": "high"
@@ -59,6 +62,8 @@ Choose `model_tier: "high"` if available.
 Step 4: Add the requested number of independent loops. For the initial test,
 use two loops and keep `max_concurrent_loops=2`. Future runs may increase the
 loop count by adding more loop objects and raising `max_concurrent_loops`.
+Keep `artifact_options.save_prompts=true` for debugging unless the project
+context explicitly disables prompt artifacts.
 
 Attach all Markdown files under `<project-dir>/domain/` to `caller_context`,
 including all reports and summaries from multiple built domains. Sort them by
@@ -91,7 +96,8 @@ Each loop must set:
 
 Step 5: Configure one proposer per idea loop for the current idea workflow.
 The proposer must receive the user's exact intent, attached domain Markdown
-files, ARC paper-tool guidance, MCP permission, and internet permission:
+files, ARC paper-tool guidance, ARC-only MCP permission, and internet
+permission:
 
 ```json
 {
@@ -105,7 +111,9 @@ files, ARC paper-tool guidance, MCP permission, and internet permission:
   },
   "runtime": {
     "allow_internet": true,
-    "allow_mcp": true
+    "allow_mcp": true,
+    "mcp_mode": "arc-only",
+    "codex_sandbox": "read-only"
   }
 }
 ```
@@ -115,7 +123,7 @@ JSON object in
 `references/research-workflows/suggest-ideas-reviewer-output.schema.json`. The
 written config must contain the schema object, not the placeholder string below.
 If the proposer id changes, update the schema's `proposer_messages` keys to
-match. The reviewer has all available permissions:
+match. The reviewer has ARC-only MCP and internet permission:
 
 ```json
 {
@@ -127,7 +135,9 @@ match. The reviewer has all available permissions:
   "output_schema": "<copy suggest-ideas-reviewer-output.schema.json here>",
   "runtime": {
     "allow_internet": true,
-    "allow_mcp": true
+    "allow_mcp": true,
+    "mcp_mode": "arc-only",
+    "codex_sandbox": "read-only"
   }
 }
 ```
@@ -161,7 +171,8 @@ Step 1: Report the idea loop artifact root:
 ```
 
 Step 2: Report each loop's `state.json`, `transcript.jsonl`, per-round
-proposer outputs, and per-round reviews.
+proposer outputs, per-round reviews, per-round prompt artifacts, and any
+per-round worker error artifacts.
 
 Step 3: Do not invent final idea rankings, novelty claims, or gap scores from
 memory. Any later idea selection or report must read the recorded loop
@@ -178,5 +189,7 @@ per loop and round, with columns for `loop_id`, `round`, idea title or short
 label, `evidence_of_novelty`, `feasibility`, `scientific_value`,
 `user_intent_fit`, `first_calculation_clarity`, and `total_score`. After the
 table, append the detailed correspondence history grouped by loop and round:
-proposer prompt, proposer output, reviewer message to the controller, reviewer
-message to the proposer, and full `review_payload`.
+proposer output, reviewer message to the controller, reviewer message to the
+proposer, and full `review_payload`. Full rendered prompts are debug artifacts
+under each round's `prompts/` directory; mention their paths when useful, but do
+not paste them into the correspondence appendix by default.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -47,6 +48,11 @@ class LoopConfig:
 
 
 @dataclass(frozen=True)
+class ArtifactOptions:
+    save_prompts: bool
+
+
+@dataclass(frozen=True)
 class BatchConfig:
     schema_version: str
     run_id: str
@@ -54,6 +60,7 @@ class BatchConfig:
     max_concurrent_loops: int
     existing_run_policy: str
     fail_fast: bool
+    artifact_options: ArtifactOptions
     loops: list[LoopConfig]
 
 
@@ -70,6 +77,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     if existing_run_policy not in {"fail", "append_new_loops"}:
         raise ConfigError("existing_run_policy must be fail or append_new_loops")
     fail_fast = bool(data.get("fail_fast", False))
+    artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
 
     defaults = _dict(data.get("defaults", {}), "defaults")
     default_runtime = _dict(defaults.get("runtime", {}), "defaults.runtime")
@@ -105,6 +113,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
         max_concurrent_loops=max_concurrent_loops,
         existing_run_policy=existing_run_policy,
         fail_fast=fail_fast,
+        artifact_options=artifact_options,
         loops=loops,
     )
 
@@ -116,8 +125,11 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
         env["ARC_CODEX_ALLOW_INTERNET"] = "true"
         env["ARC_CLAUDE_ALLOW_INTERNET"] = "true"
     if runtime.get("allow_mcp"):
+        mcp_mode = _mcp_mode(runtime.get("mcp_mode"), "runtime.mcp_mode")
         env["ARC_CODEX_ENABLE_MCP"] = "true"
         env["ARC_CLAUDE_ALLOW_MCP"] = "true"
+        _put(env, "ARC_CODEX_MCP_MODE", mcp_mode)
+        _put(env, "ARC_CLAUDE_MCP_MODE", mcp_mode)
     if worker.model_tier:
         env["ARC_LLM_MODEL_TIER"] = worker.model_tier
         env.setdefault("ARC_CODEX_REASONING_EFFORT", _codex_effort_for_model_tier(worker.model_tier))
@@ -126,6 +138,10 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
     _put(env, "ARC_CODEX_SANDBOX", runtime.get("codex_sandbox"))
     _put(env, "ARC_CODEX_PROFILE", runtime.get("codex_profile"))
     _put(env, "ARC_CODEX_PROFILE_V2", runtime.get("codex_profile_v2"))
+    _put(env, "ARC_CODEX_WORK_DIR", runtime.get("codex_work_dir"))
+    _put_path_list(env, "ARC_CODEX_ADD_DIRS", runtime.get("codex_add_dirs"))
+    _put(env, "ARC_CODEX_ARC_MCP_COMMAND", runtime.get("arc_mcp_command"))
+    _put_json_object(env, "ARC_CODEX_ARC_MCP_ENV_JSON", runtime.get("arc_mcp_env"))
     _put(env, "ARC_CODEX_REASONING_EFFORT", runtime.get("codex_reasoning_effort"))
     _put(env, "ARC_CODEX_REASONING_SUMMARY", runtime.get("codex_reasoning_summary"))
     _put(env, "ARC_CODEX_MODEL_VERBOSITY", runtime.get("codex_model_verbosity"))
@@ -252,6 +268,11 @@ def _parse_worker(
     )
 
 
+def _parse_artifact_options(raw_options: Any) -> ArtifactOptions:
+    options = _dict(raw_options, "artifact_options")
+    return ArtifactOptions(save_prompts=_bool(options.get("save_prompts", True), "artifact_options.save_prompts"))
+
+
 def _required_text(data: Mapping[str, Any], key: str) -> str:
     value = data.get(key)
     if value is None:
@@ -280,6 +301,18 @@ def _positive_int(value: Any, field_name: str) -> int:
     return parsed
 
 
+def _bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    raise ConfigError(f"{field_name} must be a boolean")
+
+
 def _safe_id(value: str, field_name: str) -> str:
     if not SAFE_ID_RE.fullmatch(value):
         raise ConfigError(f"{field_name} must contain only letters, numbers, dot, underscore, or dash")
@@ -291,6 +324,26 @@ def _put(env: dict[str, str], key: str, value: Any) -> None:
         env[key] = str(value)
 
 
+def _put_path_list(env: dict[str, str], key: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        items = value
+    else:
+        raise ConfigError(f"{key} must be a string or a list of strings")
+    env[key] = json.dumps(items, ensure_ascii=False)
+
+
+def _put_json_object(env: dict[str, str], key: str, value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or not all(isinstance(k, str) for k in value):
+        raise ConfigError(f"{key} must be an object with string keys")
+    env[key] = json.dumps(value, ensure_ascii=False)
+
+
 def _model_tier(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
@@ -299,6 +352,17 @@ def _model_tier(value: Any, field_name: str) -> str | None:
         return None
     if text not in VALID_MODEL_TIERS:
         raise ConfigError("model_tier must be one of: high, medium, low")
+    return text
+
+
+def _mcp_mode(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text not in {"user-config", "arc-only"}:
+        raise ConfigError(f"{field_name} must be one of: user-config, arc-only")
     return text
 
 

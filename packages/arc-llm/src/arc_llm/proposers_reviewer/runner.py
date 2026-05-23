@@ -12,6 +12,7 @@ from arc_llm.runner import run_json
 
 from .artifacts import RunPaths, acquire_lock, append_jsonl, atomic_write_json, atomic_write_text
 from .config import (
+    ArtifactOptions,
     REVIEW_ENVELOPE_SCHEMA,
     BatchConfig,
     ConfigError,
@@ -52,6 +53,7 @@ def run_proposers_reviewer_batch(
                 copy.deepcopy(loop),
                 paths.loop(loop.loop_id),
                 batch.run_id,
+                batch.artifact_options,
                 json_runner,
                 base_env,
                 process_chain,
@@ -120,6 +122,7 @@ def _run_loop(
     loop: LoopConfig,
     paths,
     run_id: str,
+    artifact_options: ArtifactOptions,
     json_runner: JsonRunner | None,
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
@@ -130,7 +133,7 @@ def _run_loop(
         with acquire_lock(paths.lock, run_id=run_id, loop_id=loop.loop_id):
             atomic_write_json(paths.config, _jsonable(loop))
             atomic_write_json(paths.state, {"status": "running", "loop_id": loop.loop_id, "rounds_completed": 0})
-            result = _run_loop_rounds(loop, paths, json_runner, base_env, process_chain)
+            result = _run_loop_rounds(loop, paths, artifact_options, json_runner, base_env, process_chain)
             atomic_write_json(paths.state, result)
             return result
     except Exception as exc:
@@ -142,6 +145,7 @@ def _run_loop(
 def _run_loop_rounds(
     loop: LoopConfig,
     paths,
+    artifact_options: ArtifactOptions,
     json_runner: JsonRunner | None,
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
@@ -151,11 +155,12 @@ def _run_loop_rounds(
     stop_reason = ""
     for round_number in range(1, loop.max_rounds + 1):
         round_paths = paths.round(round_number)
-        proposer_outputs, proposer_prompts = _run_proposers(
+        proposer_outputs = _run_proposers(
             loop,
             round_paths,
             round_number,
             correspondence,
+            artifact_options,
             json_runner,
             base_env,
             process_chain,
@@ -170,11 +175,16 @@ def _run_loop_rounds(
         )
         review_prompt = render_prompt(reviewer, review_context)
         atomic_write_json(round_paths.reviewer_context(reviewer.id), review_context)
-        atomic_write_text(round_paths.prompt(reviewer.id), review_prompt)
-        review_output = _call_json_runner(
+        review_prompt_path = round_paths.prompt(reviewer.id)
+        if artifact_options.save_prompts:
+            atomic_write_text(review_prompt_path, review_prompt)
+        review_output = _call_json_runner_with_error_artifact(
             json_runner,
             review_prompt,
             worker=reviewer,
+            round_number=round_number,
+            error_path=round_paths.worker_error(reviewer.id),
+            prompt_path=review_prompt_path if artifact_options.save_prompts else None,
             base_env=base_env,
             process_chain=process_chain,
         )
@@ -183,11 +193,9 @@ def _run_loop_rounds(
 
         round_events = _round_events(
             round_number=round_number,
-            proposer_prompts=proposer_prompts,
             proposer_outputs=proposer_outputs,
             review_output=review_output,
             reviewer_id=reviewer.id,
-            review_prompt=review_prompt,
         )
         for event in round_events:
             correspondence.append(event)
@@ -219,13 +227,14 @@ def _run_proposers(
     round_paths,
     round_number: int,
     correspondence: list[dict[str, Any]],
+    artifact_options: ArtifactOptions,
     json_runner: JsonRunner | None,
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> dict[str, Any]:
     outputs: dict[str, Any] = {}
     prompts: dict[str, str] = {}
-    contexts: dict[str, dict[str, Any]] = {}
+    prompt_paths: dict[str, Path | None] = {}
     for proposer in loop.proposers:
         context = proposer_context(
             loop=loop,
@@ -234,18 +243,23 @@ def _run_proposers(
             correspondence=copy.deepcopy(correspondence),
         )
         prompt = render_prompt(proposer, context)
-        contexts[proposer.id] = context
         prompts[proposer.id] = prompt
+        prompt_path = round_paths.prompt(proposer.id)
+        prompt_paths[proposer.id] = prompt_path if artifact_options.save_prompts else None
         atomic_write_json(round_paths.proposer_context(proposer.id), context)
-        atomic_write_text(round_paths.prompt(proposer.id), prompt)
+        if artifact_options.save_prompts:
+            atomic_write_text(prompt_path, prompt)
 
     with ThreadPoolExecutor(max_workers=len(loop.proposers)) as executor:
         future_by_proposer = {
             executor.submit(
-                _call_json_runner,
+                _call_json_runner_with_error_artifact,
                 json_runner,
                 prompts[proposer.id],
                 worker=proposer,
+                round_number=round_number,
+                error_path=round_paths.worker_error(proposer.id),
+                prompt_path=prompt_paths[proposer.id],
                 base_env=base_env,
                 process_chain=process_chain,
             ): proposer
@@ -256,7 +270,41 @@ def _run_proposers(
             output = future.result()
             outputs[proposer.id] = output
             atomic_write_json(round_paths.proposer_output(proposer.id), output)
-    return dict(sorted(outputs.items())), dict(sorted(prompts.items()))
+    return dict(sorted(outputs.items()))
+
+
+def _call_json_runner_with_error_artifact(
+    json_runner: JsonRunner | None,
+    prompt: str,
+    *,
+    worker: WorkerConfig,
+    round_number: int,
+    error_path: Path,
+    prompt_path: Path | None,
+    base_env: Mapping[str, str] | None,
+    process_chain: list[str] | None,
+) -> dict[str, Any]:
+    try:
+        return _call_json_runner(
+            json_runner,
+            prompt,
+            worker=worker,
+            base_env=base_env,
+            process_chain=process_chain,
+        )
+    except Exception as exc:
+        atomic_write_json(
+            error_path,
+            {
+                "worker_id": worker.id,
+                "round_number": round_number,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "prompt_path": str(prompt_path) if prompt_path is not None else "",
+                "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            },
+        )
+        raise
 
 
 def _call_json_runner(
@@ -308,22 +356,11 @@ def _validate_review_envelope(review: dict[str, Any], loop: LoopConfig) -> None:
 def _round_events(
     *,
     round_number: int,
-    proposer_prompts: dict[str, str],
     proposer_outputs: dict[str, Any],
     review_output: dict[str, Any],
     reviewer_id: str,
-    review_prompt: str,
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    for proposer_id, prompt in proposer_prompts.items():
-        events.append(
-            {
-                "type": "proposer_prompt",
-                "round_number": round_number,
-                "worker_id": proposer_id,
-                "prompt": prompt,
-            }
-        )
     for proposer_id, output in proposer_outputs.items():
         events.append(
             {
@@ -333,14 +370,6 @@ def _round_events(
                 "output": output,
             }
         )
-    events.append(
-        {
-            "type": "reviewer_prompt",
-            "round_number": round_number,
-            "worker_id": reviewer_id,
-            "prompt": review_prompt,
-        }
-    )
     events.append(
         {
             "type": "review",
