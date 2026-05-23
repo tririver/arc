@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from arc_domain import foundation
 from arc_domain import service
 from arc_domain.cache import DomainPaths, domain_id_for, read_json
 from arc_domain import paper
@@ -77,6 +78,84 @@ def test_status_and_cached_summary(monkeypatch, tmp_path):
     assert graph["ok"] is True
 
 
+def test_foundation_prompt_marks_low_citation_candidates_as_low_priority():
+    prompt = foundation._foundation_prompt(
+        seed_metadata={"paper_id": SEED, "title": "Seed Paper"},
+        candidates=[
+            {
+                "paper_id": "arXiv:2401.00001",
+                "title": "Young Exact Paper",
+                "citation_count": 41,
+            }
+        ],
+        intent="exact topic",
+    )
+
+    assert "fewer than 100 citations" in prompt
+    assert "low priority" in prompt
+
+
+def test_deterministic_foundation_selection_deprioritizes_low_citation_candidates():
+    selection = foundation._deterministic_selection(
+        [
+            {
+                "paper_id": "arXiv:2401.00001",
+                "title": "Young Exact Paper",
+                "citation_count": 41,
+                "witness_citation_overlap": 5,
+                "intent_overlap": 1.0,
+            },
+            {
+                "paper_id": "arXiv:2301.00001",
+                "title": "Established Foundation",
+                "citation_count": 150,
+                "witness_citation_overlap": 5,
+                "intent_overlap": 0.5,
+            },
+        ],
+        intent="exact topic",
+    )
+
+    assert selection["selected_foundation"]["paper_id"] == "arXiv:2301.00001"
+
+
+def test_foundation_repair_rejects_later_parent_foundations():
+    selection = foundation._repair_selection(
+        {
+            "selected_foundation": {
+                "paper_id": "arXiv:0911.3380",
+                "title": "Selected Foundation",
+                "reason": "selected",
+            },
+            "parent_foundations": [
+                {
+                    "paper_id": "arXiv:1503.08043",
+                    "title": "Later Parent",
+                    "reason": "broad but later",
+                },
+                {
+                    "paper_id": "arXiv:0901.00001",
+                    "title": "Earlier Parent",
+                    "reason": "earlier",
+                },
+            ],
+            "rejected_candidates": [],
+            "warnings": [],
+        },
+        [
+            {"paper_id": "arXiv:0911.3380", "title": "Selected Foundation", "year": 2009},
+            {"paper_id": "arXiv:1503.08043", "title": "Later Parent", "year": 2015},
+            {"paper_id": "arXiv:0901.00001", "title": "Earlier Parent", "year": 2009},
+        ],
+        method="llm",
+    )
+
+    assert [item["paper_id"] for item in selection["parent_foundations"]] == ["arXiv:0901.00001"]
+    rejected_ids = [item["paper_id"] for item in selection["rejected_candidates"]]
+    assert "arXiv:1503.08043" in rejected_ids
+    assert "later than the selected foundation year" in selection["rejected_candidates"][0]["reason"]
+
+
 def _install_fake_paper_query(monkeypatch):
     monkeypatch.setattr(paper, "metadata", _metadata)
     monkeypatch.setattr(paper, "references", _references)
@@ -87,7 +166,7 @@ def _install_fake_paper_query(monkeypatch):
 def _metadata(paper_id, *, refresh=False):
     records = {
         SEED: ("Seed Paper", 2024, 12),
-        FOUNDATION: ("Foundation Paper", 2023, 80),
+        FOUNDATION: ("Foundation Paper", 2023, 180),
         "arXiv:2301.00002": ("Parent Paper", 2020, 1500),
         "arXiv:2402.00001": ("Domain Paper 1", 2024, 8),
         "arXiv:2402.00002": ("Domain Paper 2", 2024, 7),

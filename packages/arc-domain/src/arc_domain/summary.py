@@ -27,11 +27,64 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
         "schema_version": {"type": "string", "const": "arc.domain_summary.v1"},
         "domain_title": {"type": "string"},
         "brief_introduction": {"type": "string"},
-        "foundation_paper": {"type": "object"},
-        "methodology": {"type": "array", "items": {"type": "object"}},
-        "mainstream_directions": {"type": "array", "items": {"type": "object"}},
-        "open_questions": {"type": "array", "items": {"type": "object"}},
-        "reading_guide": {"type": "array", "items": {"type": "object"}},
+        "foundation_paper": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["paper_id", "title", "reason"],
+            "properties": {
+                "paper_id": {"type": "string"},
+                "title": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+        },
+        "methodology": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim", "papers"],
+                "properties": {
+                    "claim": {"type": "string"},
+                    "papers": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "mainstream_directions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["direction", "papers"],
+                "properties": {
+                    "direction": {"type": "string"},
+                    "papers": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "open_questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["question", "papers"],
+                "properties": {
+                    "question": {"type": "string"},
+                    "papers": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "reading_guide": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["purpose", "papers"],
+                "properties": {
+                    "purpose": {"type": "string"},
+                    "papers": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
         "warnings": {"type": "array", "items": {"type": "string"}},
     },
 }

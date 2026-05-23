@@ -11,6 +11,9 @@ from .cache import DomainPaths, now_iso, update_status, write_json
 from .text import deterministic_sample, normalize_authors, paper_key, token_overlap_score
 
 
+MIN_FOUNDATION_CITATION_COUNT = 100
+
+
 FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "arc.domain-foundation-selection-v1",
@@ -28,7 +31,7 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
         "schema_version": {"type": "string", "const": "arc.domain_foundation_selection.v1"},
         "selected_foundation": {
             "type": "object",
-            "additionalProperties": True,
+            "additionalProperties": False,
             "required": ["paper_id", "title", "reason"],
             "properties": {
                 "paper_id": {"type": "string"},
@@ -36,8 +39,32 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
                 "reason": {"type": "string"},
             },
         },
-        "parent_foundations": {"type": "array", "items": {"type": "object"}},
-        "rejected_candidates": {"type": "array", "items": {"type": "object"}},
+        "parent_foundations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["paper_id", "title", "reason"],
+                "properties": {
+                    "paper_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+        "rejected_candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["paper_id", "title", "reason"],
+                "properties": {
+                    "paper_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
         "reasoning": {"type": "string"},
         "warnings": {"type": "array", "items": {"type": "string"}},
     },
@@ -213,6 +240,8 @@ def _candidate_records(
             record["source_role"] = "seed_reference"
         else:
             record["source_role"] = "common_reference"
+        if citation_count < MIN_FOUNDATION_CITATION_COUNT:
+            record["warnings"].append("low_citation_foundation_priority")
         if citation_count >= 1000:
             record["warnings"].append("high_citation_parent_domain_risk")
         records.append(record)
@@ -242,6 +271,8 @@ def _foundation_prompt(*, seed_metadata: dict[str, Any], candidates: list[dict[s
         [
             "You are selecting the foundation paper for a theoretical-physics research domain.",
             "Choose exactly one same-scope foundation paper. If an older high-citation candidate is broader than the user's intent, keep it as a parent foundation rather than the selected foundation.",
+            "A parent foundation must be earlier than, or at the latest from the same year as, the selected foundation. A later paper can be a child, extension, or successful descendant, but never a parent foundation.",
+            f"Citation support rule: candidates with fewer than {MIN_FOUNDATION_CITATION_COUNT} citations should normally have low priority as the selected foundation, because there is usually not enough literature built on top of them to define a research field. Select such a candidate only if the supplied candidates contain no better-supported same-scope foundation.",
             "Use only the supplied candidates. Prefer a candidate that defines the domain represented by the seed paper and its newest citers.",
             f"User intent:\n{intent or '(none)'}",
             f"Seed paper:\n{seed_metadata}",
@@ -258,6 +289,7 @@ def _deterministic_selection(candidates: list[dict[str, Any]], *, intent: str) -
         ranked = sorted(
             candidates,
             key=lambda item: (
+                int(item.get("citation_count") or 0) >= MIN_FOUNDATION_CITATION_COUNT,
                 item.get("witness_citation_overlap", 0),
                 item.get("intent_overlap", 0),
                 item.get("citation_count", 0),
@@ -307,12 +339,64 @@ def _repair_selection(selection: dict[str, Any], candidates: list[dict[str, Any]
         if selected_id in candidate_by_id:
             selected.setdefault("title", candidate_by_id[selected_id].get("title", ""))
     selection["selected_foundation"] = selected
-    selection.setdefault("parent_foundations", [])
-    selection.setdefault("rejected_candidates", [])
+    selection["parent_foundations"], moved = _valid_parent_foundations(
+        selection.get("parent_foundations") or [],
+        selected_id=selected_id,
+        candidate_by_id=candidate_by_id,
+    )
+    selection["rejected_candidates"] = [*(selection.get("rejected_candidates") or []), *moved]
     selection.setdefault("warnings", [])
     selection["selection_method"] = method
     selection["schema_version"] = "arc.domain_foundation_selection.v1"
     return selection
+
+
+def _valid_parent_foundations(
+    parent_foundations: list[dict[str, Any]],
+    *,
+    selected_id: str,
+    candidate_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    selected_year = _candidate_year(candidate_by_id.get(selected_id, {}))
+    valid: list[dict[str, Any]] = []
+    moved: list[dict[str, Any]] = []
+    seen_valid: set[str] = set()
+    seen_moved: set[str] = set()
+    for item in parent_foundations:
+        parent = dict(item)
+        parent_id = normalize_paper_id(str(parent.get("paper_id") or ""))
+        parent["paper_id"] = parent_id
+        candidate = candidate_by_id.get(parent_id, {})
+        parent_year = _candidate_year(candidate)
+        if (
+            selected_year is not None
+            and parent_year is not None
+            and parent_year > selected_year
+        ):
+            if parent_id not in seen_moved:
+                moved.append(
+                    {
+                        "paper_id": parent_id,
+                        "title": parent.get("title") or candidate.get("title", ""),
+                        "reason": (
+                            f"Cannot be a parent foundation because it is from {parent_year}, "
+                            f"later than the selected foundation year {selected_year}."
+                        ),
+                    }
+                )
+                seen_moved.add(parent_id)
+            continue
+        if parent_id and parent_id not in seen_valid:
+            valid.append(parent)
+            seen_valid.add(parent_id)
+    return valid, moved
+
+
+def _candidate_year(candidate: dict[str, Any]) -> int | None:
+    try:
+        return int(candidate.get("year"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _embedded_citation_count(item: dict[str, Any]) -> int:
