@@ -34,6 +34,8 @@ shelling out to host LLMs directly.
 Deterministic paper data:
 
 ```bash
+arc-paper extract-paper-ids "Compare 0911.3380 and doi:10.1234/2512.06790" --json
+arc-paper safe-dir-name 0911.3380 astro-ph/0610514 --json
 arc-paper get-title arXiv:0911.3380 --json
 arc-paper get-references arXiv:0911.3380 --json
 arc-paper get-toc arXiv:0911.3380 --json
@@ -52,6 +54,9 @@ and a host LLM provider is available, it generates and caches the summary
 automatically. `llm-generate-summary` remains available when you want an
 explicit generation command or provider override. Legacy aliases
 `get-llm-summary` and `generate-llm-summary` still work.
+`llm-infer-main-references` also caches inferred paper ids by stripped input
+text; if explicit ids are found, it returns them directly without calling an
+LLM.
 
 Summary generation uses fast host defaults unless overridden: Codex uses
 `gpt-5.4-mini`, and Claude Code uses `haiku`. The LLM pipeline summarizes paper
@@ -168,13 +173,14 @@ ARC MCP job state is cached under:
 Install the packages above, then configure the MCP server command as
 `arc-mcp`. The ARC MCP server exposes paper tools such as `get_metadata`,
 `get_references`, `get_citers`, `get_section`, `extract_paper_ids`, and
-cache-only domain tools. `llm_infer_main_references` first extracts explicit
-paper ids without an LLM; if none are present, it uses web search and verifies
-the result through INSPIRE. Anything that can invoke the host LLM has an
-`llm_` prefix:
+`paper_ids_safe_dir_name`, and cache-only domain tools.
+`llm_infer_main_references` first extracts explicit paper ids without an LLM;
+if none are present, it uses web search and verifies the result through INSPIRE.
+Anything that can invoke the host LLM has an `llm_` prefix:
 
 ```text
 llm_infer_main_references(text, provider="auto", background=true)
+paper_ids_safe_dir_name(paper_ids=["0911.3380", "astro-ph/0610514"])
 llm_get_summary(paper_id, provider="auto")
 llm_generate_summary(paper_id, provider="auto")
 llm_generate_summary(paper_id, provider="auto", background=true)

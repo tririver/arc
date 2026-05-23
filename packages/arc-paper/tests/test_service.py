@@ -1,4 +1,5 @@
 from arc_paper import reference_inference, service
+from arc_paper.cache import text_query_cache_path, write_json
 from arc_paper.providers.base import ProviderError
 
 
@@ -9,7 +10,15 @@ def test_extract_paper_ids_service():
     assert result["data"] == ["arXiv:0911.3380", "doi:10.1234/2512.06790"]
 
 
-def test_llm_infer_main_references_short_circuits_explicit_ids(monkeypatch):
+def test_paper_ids_safe_dir_name_service():
+    result = service.paper_ids_safe_dir_name(["0911.3380", "astro-ph/0610514"])
+
+    assert result["ok"] is True
+    assert result["data"] == "0911.3380_x_astro-ph_0610514"
+
+
+def test_llm_infer_main_references_short_circuits_explicit_ids(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     monkeypatch.setattr(
         reference_inference,
         "run_json",
@@ -21,9 +30,53 @@ def test_llm_infer_main_references_short_circuits_explicit_ids(monkeypatch):
     assert result["ok"] is True
     assert result["data"] == ["arXiv:0911.3380", "doi:10.1234/abc"]
     assert result["meta"]["llm_used"] is False
+    assert result["meta"]["cache"] == "write"
 
 
-def test_llm_infer_main_references_enables_web_and_verifies_candidates(monkeypatch):
+def test_llm_infer_main_references_uses_cached_query(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+
+    first = service.llm_infer_main_references("Compare 0911.3380.")
+    assert first["meta"]["cache"] == "write"
+
+    monkeypatch.setattr(
+        reference_inference,
+        "run_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LLM should not be called")),
+    )
+    second = service.llm_infer_main_references("Compare 0911.3380.")
+
+    assert second["ok"] is True
+    assert second["data"] == ["arXiv:0911.3380"]
+    assert second["meta"]["cache"] == "hit"
+    assert second["meta"]["llm_used"] is False
+
+
+def test_llm_infer_main_references_explicit_ids_override_stale_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    cache_path = text_query_cache_path("main-references", "Compare 0911.3380.")
+    write_json(
+        cache_path,
+        {
+            "schema_version": "arc.paper.main_reference_query.v1",
+            "query_text": "Compare 0911.3380.",
+            "paper_ids": ["arXiv:9999.99999"],
+            "meta": {"provider": "codex-cli", "llm_used": True},
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+    )
+
+    result = service.llm_infer_main_references("Compare 0911.3380.")
+
+    assert result["ok"] is True
+    assert result["data"] == ["arXiv:0911.3380"]
+    assert result["meta"]["cache"] == "write"
+    assert result["meta"]["llm_used"] is False
+
+
+def test_llm_infer_main_references_enables_web_and_verifies_candidates(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+
     def run_json(prompt, *, schema=None, provider="auto", model=None, env=None, process_chain=None):
         assert "Use live web search" in prompt
         assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
@@ -50,13 +103,15 @@ def test_llm_infer_main_references_enables_web_and_verifies_candidates(monkeypat
 
     assert result["ok"] is True
     assert result["data"] == ["arXiv:0911.3380"]
+    assert result["meta"]["cache"] == "write"
     assert result["meta"]["llm_used"] is True
     assert result["meta"]["provider"] == "codex-cli"
     assert result["meta"]["focus_scope"] == "one_domain"
     assert result["meta"]["verified_references"][0]["input_paper_id"].startswith("doi:")
 
 
-def test_llm_infer_main_references_rejects_unverified_candidates(monkeypatch):
+def test_llm_infer_main_references_rejects_unverified_candidates(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     monkeypatch.setattr(
         reference_inference,
         "run_json",

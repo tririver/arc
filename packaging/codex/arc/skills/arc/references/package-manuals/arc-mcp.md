@@ -10,6 +10,7 @@ Paper tools:
 
 ```text
 extract_paper_ids
+paper_ids_safe_dir_name
 llm_infer_main_references
 get_title
 get_abstract
@@ -62,20 +63,20 @@ Tools that may invoke a host LLM provider use the `llm_` prefix.
 Use `background=true` for slow tools, large launches, and anything likely to
 exceed the MCP client timeout.
 
-Phase 1: Launch the MCP job.
+### Phase 1: Launch the MCP job.
 Step 1: Call the relevant `llm_` tool with `background=true`.
 Step 2: Capture the returned `job_id`.
 
 Examples:
 
 ```text
-llm_infer_main_references(text="main reference for CMB trispectrum constraints", background=true)
-llm_generate_summary(paper_id="0911.3380", provider="auto", background=true)
-llm_domain_build(seed_paper="0911.3380", intent="...", background=true)
-llm_summary_batch_run(name="qft-ideas", provider="auto", concurrency=2, background=true)
+llm_infer_main_references(text="<user-intent>", background=true)
+llm_generate_summary(paper_id="<seed-paper>", provider="auto", background=true)
+llm_domain_build(seed_paper="<seed-paper>", intent="<user-intent>", background=true)
+llm_summary_batch_run(name="<batch-name>", provider="auto", concurrency=2, background=true)
 ```
 
-Phase 2: Watch with CLI.
+### Phase 2: Watch with CLI.
 Step 1: Immediately run:
 
 ```bash
@@ -84,7 +85,7 @@ arc-mcp jobs watch <job_id> --json
 
 Step 2: Use the watcher output as the final result when it completes.
 
-Phase 3: Fallback if CLI is unavailable.
+### Phase 3: Fallback if CLI is unavailable.
 Step 1: Poll `job_status(job_id)`.
 Step 2: When status is `done`, call `job_result(job_id)`.
 Step 3: If status is `needs_llm`, follow the package-specific manual fallback.

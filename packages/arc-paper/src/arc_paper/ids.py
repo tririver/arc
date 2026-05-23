@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 import re
 
 
@@ -25,7 +26,7 @@ ARXIV_PREFIX_EXTRACT_RE = re.compile(
     rf"\barxiv\s*:\s*((?:\d{{4}}\.\d{{4,5}})|(?:{ARXIV_ARCHIVE_PATTERN}/\d{{7}}))(?:v\d+)?",
     re.IGNORECASE,
 )
-BARE_NEW_STYLE_ARXIV_RE = re.compile(r"(?<![\w./-])(\d{4}\.\d{4,5})(?:v\d+)?(?![\w./-])", re.IGNORECASE)
+BARE_NEW_STYLE_ARXIV_RE = re.compile(r"(?<![\w./-])(\d{4}\.\d{4,5})(?:v\d+)?(?![\w/-])", re.IGNORECASE)
 BARE_OLD_STYLE_ARXIV_RE = re.compile(
     rf"(?<![\w/-])({ARXIV_ARCHIVE_PATTERN}/\d{{7}})(?:v\d+)?(?![\w/-])",
     re.IGNORECASE,
@@ -87,6 +88,12 @@ def doi_value(identifier: str) -> str:
     if not normalized.startswith("doi:"):
         return ""
     return normalized.split(":", 1)[1]
+
+
+def paper_ids_safe_dir_name(identifiers: Iterable[str] | str) -> str:
+    values = [identifiers] if isinstance(identifiers, str) else identifiers
+    normalized_ids = _dedupe_ids([normalize_paper_id(str(identifier)) for identifier in values if str(identifier)])
+    return "_x_".join(_safe_dir_component(identifier) for identifier in normalized_ids)
 
 
 def extract_paper_ids(text: str) -> list[str]:
@@ -172,3 +179,18 @@ def _dedupe_ids(identifiers: list[str]) -> list[str]:
             seen.add(key)
             out.append(identifier)
     return out
+
+
+def _safe_dir_component(identifier: str) -> str:
+    normalized = normalize_paper_id(identifier)
+    if arxiv_id := arxiv_path_id(normalized):
+        source = arxiv_id
+    elif normalized.startswith("doi:"):
+        source = normalized
+    elif normalized.startswith("inspire:"):
+        source = normalized
+    else:
+        source = normalized
+    safe = re.sub(r"[^A-Za-z0-9.-]+", "_", source.strip())
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    return safe or "paper"

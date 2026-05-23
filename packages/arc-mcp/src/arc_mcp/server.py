@@ -89,6 +89,7 @@ def _paper_ids(args: dict[str, Any]):
 
 TOOL_HANDLERS: dict[str, ToolHandler] = {
     "extract_paper_ids": lambda args: service.extract_paper_ids(str(args.get("text", ""))),
+    "paper_ids_safe_dir_name": lambda args: service.paper_ids_safe_dir_name(_paper_ids(args)),
     "get_title": lambda args: service.get_title(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_abstract": lambda args: service.get_abstract(_paper_ids(args), refresh=bool(args.get("refresh", False))),
     "get_authors": lambda args: service.get_authors(_paper_ids(args), refresh=bool(args.get("refresh", False))),
@@ -206,18 +207,13 @@ def _start_summary_job_response(
 
 def _start_reference_inference_job_response(args: dict[str, Any]) -> dict[str, Any]:
     text = str(args.get("text") or "")
-    extracted = service.extract_paper_ids(text)
-    if extracted.get("ok") and extracted.get("data"):
-        return {
-            "ok": True,
-            "data": extracted["data"],
-            "errors": [],
-            "meta": {"provider": "local-parser", "llm_used": False},
-        }
-
     provider = str(args.get("provider", "auto"))
     model = args.get("model")
     refresh = bool(args.get("refresh", False))
+    extracted = service.extract_paper_ids(text)
+    if extracted.get("ok") and extracted.get("data"):
+        return service.llm_infer_main_references(text, provider=provider, model=model, refresh=refresh)
+
     background = bool(args.get("background", False))
     job_id = MCP_JOBS.start(
         job_type="main_reference_inference",
@@ -594,6 +590,15 @@ def _register_tools(app: Any) -> None:
     )
     def extract_paper_ids(text: NaturalText) -> Any:
         return service.extract_paper_ids(text)
+
+    @app.tool(
+        description=(
+            "Create a filesystem-safe directory-name stem from one or more paper identifiers. "
+            "Examples: arXiv:0911.3380 -> 0911.3380; multiple ids are joined with _x_."
+        )
+    )
+    def paper_ids_safe_dir_name(paper_id: PaperId = None, paper_ids: PaperIds = None) -> Any:
+        return service.paper_ids_safe_dir_name(_one_or_many(paper_id, paper_ids))
 
     @app.tool(
         description=(

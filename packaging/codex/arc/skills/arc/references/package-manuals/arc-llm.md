@@ -7,7 +7,7 @@ tests, and advanced LLM runtime options.
 
 ## Provider Diagnosis
 
-Phase 1: Check host detection.
+### Phase 1: Check host detection.
 Step 1: Run:
 
 ```bash
@@ -16,7 +16,7 @@ arc-llm doctor provider
 arc-llm doctor config
 ```
 
-Phase 2: Check package-level provider detection if paper summaries fail.
+### Phase 2: Check package-level provider detection if paper summaries fail.
 Step 1: Run:
 
 ```bash

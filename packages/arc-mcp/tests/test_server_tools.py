@@ -28,6 +28,13 @@ def test_call_tool_extracts_paper_ids(monkeypatch):
     assert result == {"ok": True, "data": ["0911.3380"]}
 
 
+def test_call_tool_paper_ids_safe_dir_name():
+    result = server.call_tool("paper_ids_safe_dir_name", {"paper_ids": ["0911.3380", "astro-ph/0610514"]})
+
+    assert result["ok"] is True
+    assert result["data"] == "0911.3380_x_astro-ph_0610514"
+
+
 def test_call_tool_llm_infer_main_references_short_circuits_ids(monkeypatch):
     monkeypatch.setattr(
         server.service,
@@ -37,7 +44,17 @@ def test_call_tool_llm_infer_main_references_short_circuits_ids(monkeypatch):
     monkeypatch.setattr(
         server.service,
         "llm_infer_main_references",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("job should not start")),
+        lambda text, provider="auto", model=None, refresh=False: {
+            "ok": True,
+            "data": ["arXiv:0911.3380"],
+            "errors": [],
+            "meta": {
+                "provider": "local-parser",
+                "llm_used": False,
+                "text": text,
+                "refresh": refresh,
+            },
+        },
     )
 
     result = server.call_tool("llm_infer_main_references", {"text": "0911.3380"})
@@ -45,6 +62,7 @@ def test_call_tool_llm_infer_main_references_short_circuits_ids(monkeypatch):
     assert result["ok"] is True
     assert result["data"] == ["arXiv:0911.3380"]
     assert result["meta"]["llm_used"] is False
+    assert result["meta"]["text"] == "0911.3380"
 
 
 def test_call_tool_llm_infer_main_references_uses_background_manager(monkeypatch):
@@ -130,6 +148,7 @@ def test_fastmcp_tools_have_discovery_metadata():
     by_name = {tool.name: tool for tool in tools}
 
     assert "natural-language text" in by_name["extract_paper_ids"].description
+    assert "0911.3380" in by_name["paper_ids_safe_dir_name"].description
     assert "web search" in by_name["llm_infer_main_references"].description
     assert "arXiv papers" in by_name["get_title"].description
     assert "LLM summary" in by_name["llm_generate_summary"].description

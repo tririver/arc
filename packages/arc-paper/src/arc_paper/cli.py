@@ -22,6 +22,10 @@ def main(argv: list[str] | None = None) -> int:
     extract.add_argument("--file", default=None)
     extract.add_argument("--json", action="store_true")
 
+    safe_dir = sub.add_parser("safe-dir-name", aliases=["paper-ids-safe-dir-name"])
+    safe_dir.add_argument("paper_ids", nargs="+")
+    safe_dir.add_argument("--json", action="store_true")
+
     infer_refs = sub.add_parser("llm-infer-main-references", aliases=["infer-main-references"])
     infer_refs.add_argument("text", nargs="*")
     infer_refs.add_argument("--file", default=None)
@@ -183,6 +187,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.store_llm_summary(args.paper_id, _read_summary_arg(args.summary_json))
     if command in {"extract-paper-ids", "extract-ids"}:
         return service.extract_paper_ids(_read_text_arg(args))
+    if command in {"safe-dir-name", "paper-ids-safe-dir-name"}:
+        return service.paper_ids_safe_dir_name(args.paper_ids)
     if command in {"llm-infer-main-references", "infer-main-references"}:
         return service.llm_infer_main_references(
             _read_text_arg(args),

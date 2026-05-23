@@ -19,6 +19,13 @@ def test_cli_extract_paper_ids(capsys):
     assert output["data"] == ["arXiv:0911.3380", "doi:10.1234/2512.06790"]
 
 
+def test_cli_safe_dir_name(capsys):
+    assert cli.main(["safe-dir-name", "0911.3380", "astro-ph/0610514", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"] == "0911.3380_x_astro-ph_0610514"
+
+
 def test_cli_llm_infer_main_references(monkeypatch, capsys):
     def infer(text, provider="auto", model=None, refresh=False):
         return {

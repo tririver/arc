@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -52,6 +53,11 @@ def cache_root() -> Path:
     if project_root := _project_root():
         return project_root / "cache" / "arc-paper"
     return Path.home() / ".cache" / "arc" / "arc-paper"
+
+
+def text_query_cache_path(namespace: str, text: str) -> Path:
+    key = hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
+    return cache_root() / "queries" / namespace / f"{key}.json"
 
 
 def now_iso() -> str:

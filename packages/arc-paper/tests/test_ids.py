@@ -1,4 +1,11 @@
-from arc_paper.ids import arxiv_path_id, doi_value, extract_paper_ids, inspire_recid, normalize_paper_id
+from arc_paper.ids import (
+    arxiv_path_id,
+    doi_value,
+    extract_paper_ids,
+    inspire_recid,
+    normalize_paper_id,
+    paper_ids_safe_dir_name,
+)
 
 
 def test_normalize_new_arxiv_id():
@@ -32,7 +39,7 @@ def test_extract_paper_ids_from_natural_language():
     text = (
         "Use arXiv:0911.3380v2, inspire:837197, and "
         "https://doi.org/10.1088/1475-7516/2010/04/027. "
-        "Also compare 2512.06790 and astro-ph/0610514. "
+        "Also compare 2512.06790. Also compare astro-ph/0610514. "
         "Do not extract the arXiv-like suffix inside doi:10.1234/2512.06790."
     )
 
@@ -53,3 +60,17 @@ def test_extract_paper_ids_deduplicates_and_accepts_urls():
     )
 
     assert extract_paper_ids(text) == ["arXiv:hep-th/0601001", "inspire:12345"]
+
+
+def test_paper_ids_safe_dir_name():
+    assert paper_ids_safe_dir_name(["arXiv:0911.3380"]) == "0911.3380"
+    assert (
+        paper_ids_safe_dir_name(["arXiv:0911.3380", "astro-ph/0610514"])
+        == "0911.3380_x_astro-ph_0610514"
+    )
+    assert paper_ids_safe_dir_name(["inspire:837197", "doi:10.1007/JHEP01(2010)117"]) == (
+        "inspire_837197_x_doi_10.1007_jhep01_2010_117"
+    )
+    assert paper_ids_safe_dir_name(["doi:10.1088/1475-7516/2010/04/027"]) == (
+        "doi_10.1088_1475-7516_2010_04_027"
+    )

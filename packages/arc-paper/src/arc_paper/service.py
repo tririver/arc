@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
-from .cache import CachePaths, cache_root, read_json, write_json
+from .cache import CachePaths, cache_root, now_iso, read_json, text_query_cache_path, write_json
 from .ids import arxiv_path_id
 from .ids import extract_paper_ids as _extract_paper_ids
 from .ids import normalize_paper_id
+from .ids import paper_ids_safe_dir_name as _paper_ids_safe_dir_name
 from .parse.ar5iv_html import get_section as parsed_get_section
 from .parse.ar5iv_html import parse_html
 from .parse.equations import find_equation_context
@@ -30,6 +32,14 @@ def extract_paper_ids(text: str) -> dict[str, Any]:
     return ok(_extract_paper_ids(text))
 
 
+def paper_ids_safe_dir_name(ids: str | Iterable[str]) -> dict[str, Any]:
+    raw_values = [ids] if isinstance(ids, str) else list(ids or [])
+    values = [str(item) for item in raw_values if str(item).strip()]
+    if not values:
+        return err("paper_ids_required", "At least one paper id is required.")
+    return ok(_paper_ids_safe_dir_name(values), provider="local")
+
+
 def llm_infer_main_references(
     text: str,
     *,
@@ -37,12 +47,39 @@ def llm_infer_main_references(
     model: str | None = None,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    explicit_ids = _extract_paper_ids(text)
+    query_text = (text or "").strip()
+    cache_path = text_query_cache_path("main-references", query_text)
+    cached = read_json(cache_path) if not refresh else None
+
+    explicit_ids = _extract_paper_ids(query_text)
     if explicit_ids:
-        return ok(explicit_ids, provider="local-parser", llm_used=False)
+        meta = {"provider": "local-parser", "llm_used": False}
+        if (
+            isinstance(cached, dict)
+            and cached.get("paper_ids") == explicit_ids
+            and (cached.get("meta") or {}).get("provider") == "local-parser"
+        ):
+            return ok(
+                explicit_ids,
+                **meta,
+                cache="hit",
+                cache_path=str(cache_path),
+                cached_at=cached.get("created_at"),
+            )
+        _write_reference_query_cache(cache_path, query_text=query_text, paper_ids=explicit_ids, meta=meta)
+        return ok(explicit_ids, **meta, cache="write", cache_path=str(cache_path))
+    if isinstance(cached, dict) and isinstance(cached.get("paper_ids"), list):
+        meta = dict(cached.get("meta") or {})
+        return ok(
+            cached["paper_ids"],
+            **meta,
+            cache="hit",
+            cache_path=str(cache_path),
+            cached_at=cached.get("created_at"),
+        )
     try:
         result = infer_main_references(
-            text,
+            query_text,
             provider=provider,
             model=model,
             refresh=refresh,
@@ -54,16 +91,41 @@ def llm_infer_main_references(
         return err(exc.code, exc.message)
     except Exception as exc:
         return err("reference_inference_failed", str(exc))
+    meta = {
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "llm_used": True,
+        "focus_scope": result.get("focus_scope"),
+        "warnings": result.get("warnings", []),
+        "verified_references": result.get("verified_references", []),
+        "rejected_candidates": result.get("rejected_candidates", []),
+        "raw_llm_response": result.get("raw_llm_response"),
+    }
+    _write_reference_query_cache(cache_path, query_text=query_text, paper_ids=result["paper_ids"], meta=meta)
     return ok(
         result["paper_ids"],
-        provider=result.get("provider"),
-        model=result.get("model"),
-        llm_used=True,
-        focus_scope=result.get("focus_scope"),
-        warnings=result.get("warnings", []),
-        verified_references=result.get("verified_references", []),
-        rejected_candidates=result.get("rejected_candidates", []),
-        raw_llm_response=result.get("raw_llm_response"),
+        **meta,
+        cache="write",
+        cache_path=str(cache_path),
+    )
+
+
+def _write_reference_query_cache(
+    cache_path: Path,
+    *,
+    query_text: str,
+    paper_ids: list[str],
+    meta: dict[str, Any],
+) -> None:
+    write_json(
+        cache_path,
+        {
+            "schema_version": "arc.paper.main_reference_query.v1",
+            "query_text": query_text,
+            "paper_ids": paper_ids,
+            "meta": meta,
+            "created_at": now_iso(),
+        },
     )
 
 
