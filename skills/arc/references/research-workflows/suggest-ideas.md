@@ -18,7 +18,6 @@ Read these before executing:
 Read `<project-dir>/context.json`. Use the exact `user_intent`, `provider`,
 configured `model_tier` when present, and existing domain artifact paths from
 the project. Do not substitute a paraphrased research goal into idea prompts.
-Use exact model names only when the project context explicitly provides one.
 
 ### Phase 1: Ensure Domain Context
 
@@ -62,10 +61,7 @@ Use this package-level structure:
 }
 ```
 
-Use `model_tier` values `high`, `medium`, or `low`. The idea workflow should
-normally use `high`; `arc-llm` owns the host-specific model and reasoning
-mapping. Set `model` only when the project context explicitly requires an exact
-provider model.
+Choose `model_tier: "high"` if available.
 
 Step 4: Add the requested number of independent loops. For the initial test,
 use two loops and keep `max_concurrent_loops=2`. Future runs may increase the
