@@ -42,9 +42,9 @@ ENRICH_REFERENCES_DESCRIPTION = (
 )
 SECTION_DESCRIPTION = "Section heading, section number, or section id to retrieve from the ar5iv full text."
 QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
-FULL_TEXT_QUERY_DESCRIPTION = "Word or phrase to search for in cached ar5iv full text."
+FULL_TEXT_QUERY_DESCRIPTION = "Word or phrase to search for in cached parsed ar5iv text."
 SEARCH_LIMIT_DESCRIPTION = "Maximum number of full-text search hits to return, clamped to 1..200."
-SEARCH_CONTEXT_DESCRIPTION = "Number of nearby cached full-text lines to include before and after each hit, clamped to 0..5."
+SEARCH_CONTEXT_DESCRIPTION = "Number of nearby parsed section lines to include in each hit snippet, clamped to 0..5."
 CASE_SENSITIVE_DESCRIPTION = "When true, full-text search is case-sensitive."
 TEXT_DESCRIPTION = "Natural-language text that may contain arXiv, INSPIRE, or DOI paper identifiers."
 BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
@@ -125,7 +125,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         query=str(args.get("query", "")),
         refresh=bool(args.get("refresh", False)),
         limit=int(args.get("limit", 20)),
-        context=int(args.get("context", 0)),
+        context=int(args.get("context", 1)),
         case_sensitive=bool(args.get("case_sensitive", False)),
     ),
     "get_equation_context": lambda args: service.get_equation_context(
@@ -716,8 +716,8 @@ def _register_tools(app: Any) -> None:
 
     @app.tool(
         description=(
-            "Search cached ar5iv full text for one or more papers, or all cached papers when no paper_id "
-            "is supplied. Use this to check whether terms, methods, or proposed ideas appear in cached papers."
+            "Search cached parsed ar5iv text for one or more papers, or all cached papers when no paper_id "
+            "is supplied. Use returned MCP or CLI commands to fetch the whole section or paper metadata."
         )
     )
     def search_full_text(
@@ -726,7 +726,7 @@ def _register_tools(app: Any) -> None:
         paper_ids: PaperIds = None,
         refresh: Refresh = False,
         limit: SearchLimit = 20,
-        context: SearchContext = 0,
+        context: SearchContext = 1,
         case_sensitive: CaseSensitive = False,
     ) -> Any:
         return service.search_full_text(

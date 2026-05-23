@@ -19,6 +19,21 @@ def test_toc_and_sections():
     assert "Intro text." in section["data"]["text"]
 
 
+def test_parse_html_includes_equation_contexts():
+    parsed = parse_html(sample_html(), paper_id="arXiv:0000.0000")
+
+    assert parsed["equations"] == [
+        {
+            "id": "E1",
+            "equation": "E = mc^2",
+            "before": "Model text before equation.",
+            "after": "Model text after equation.",
+            "section_id": "S2",
+            "section_title": "2 Model",
+        }
+    ]
+
+
 def test_section_can_be_selected_by_title_fragment():
     parsed = parse_html(sample_html(), paper_id="arXiv:0000.0000")
     section = get_section(parsed, "model")

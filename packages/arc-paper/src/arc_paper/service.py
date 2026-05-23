@@ -19,7 +19,7 @@ from .providers import Ar5ivProvider, InspireProvider
 from .providers.base import ProviderError
 from .reference_inference import ReferenceInferenceError, infer_main_references
 from .results import err, ok
-from .search import FullTextSearchFile, search_cached_full_text
+from .search import FullTextSearchFile, search_parsed_full_text
 from .summary.input_pack import build_input_pack
 from .summary.providers.select import select_summary_provider
 from .summary.schema import load_summary_prompt, load_summary_schema
@@ -196,12 +196,12 @@ def search_full_text(
     query: str,
     refresh: bool = False,
     limit: int = 20,
-    context: int = 0,
+    context: int = 1,
     case_sensitive: bool = False,
 ) -> dict[str, Any]:
     try:
         files, missing_papers = _full_text_search_files(ids, refresh=refresh)
-        hits, meta = search_cached_full_text(
+        hits, meta = search_parsed_full_text(
             files,
             query,
             limit=limit,
@@ -329,9 +329,8 @@ def _section_one(paper_id: str, section: str, *, refresh: bool) -> dict[str, Any
 
 def _equation_one(paper_id: str, query: str, *, refresh: bool) -> dict[str, Any]:
     try:
-        full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
-        html = _ar5iv.get_html(full_text_id, refresh=refresh)
-        return ok(find_equation_context(html, query), provider="ar5iv")
+        parsed = _parsed(paper_id, refresh=refresh)
+        return ok(find_equation_context(parsed.get("equations") or [], query), provider="ar5iv")
     except ProviderError as exc:
         return err(exc.code, exc.message)
     except Exception as exc:
@@ -363,10 +362,9 @@ def _full_text_search_files(
     for raw in raw_ids:
         full_text_id = _full_text_paper_id(str(raw), refresh=refresh)
         paths = CachePaths.for_paper(full_text_id)
-        if refresh:
-            _ar5iv.get_html(full_text_id, refresh=True)
-        if paths.ar5iv_html.exists():
-            files_by_path[paths.ar5iv_html] = FullTextSearchFile(full_text_id, paths.ar5iv_html)
+        _parsed(full_text_id, refresh=refresh)
+        if paths.ar5iv_parsed.exists():
+            files_by_path[paths.ar5iv_parsed] = FullTextSearchFile(full_text_id, paths.ar5iv_parsed)
         else:
             missing.append(full_text_id)
     return list(files_by_path.values()), missing
@@ -374,7 +372,7 @@ def _full_text_search_files(
 
 def _all_cached_full_text_files() -> list[FullTextSearchFile]:
     files = []
-    for path in sorted((cache_root() / "papers").glob("*/ar5iv/fulltext.html")):
+    for path in sorted((cache_root() / "papers").glob("*/ar5iv/parsed.json")):
         files.append(FullTextSearchFile(unquote(path.parent.parent.name), path))
     return files
 

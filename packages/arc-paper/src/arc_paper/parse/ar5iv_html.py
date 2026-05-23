@@ -7,10 +7,11 @@ from typing import Any
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from ..results import err, ok
+from .equations import extract_equation_contexts
 
 
 HEADING_NAMES = ("h1", "h2", "h3", "h4", "h5", "h6")
-PARSER_VERSION = 5
+PARSER_VERSION = 6
 INLINE_LABEL_TAG_NAMES = ("b", "strong", "em", "i", "span")
 REFERENCE_LABELS = {"references", "bibliography"}
 INLINE_SECTION_LABELS = {
@@ -52,6 +53,7 @@ def parse_html(html: str, *, paper_id: str = "") -> dict[str, Any]:
         "source_hash": hashlib.sha256(html.encode("utf-8")).hexdigest(),
         "toc": toc,
         "sections": sections,
+        "equations": extract_equation_contexts(soup),
     }
 
 

@@ -188,6 +188,7 @@ def _search_parsed_candidates(
     case_sensitive: bool,
 ) -> tuple[list[dict[str, Any]], bool]:
     hits: list[dict[str, Any]] = []
+    hit_by_snippet: dict[tuple[str, str], int] = {}
     normalized_query = _normalize_search_text(query, case_sensitive=case_sensitive)
     for search_file in files:
         parsed = _read_parsed_json(search_file.path)
@@ -206,8 +207,15 @@ def _search_parsed_candidates(
             )
             if not hit:
                 continue
+            dedupe_key = (hit["paper_id"], _normalize_search_text(hit["snippet"], case_sensitive=False))
+            if dedupe_key in hit_by_snippet:
+                existing_index = hit_by_snippet[dedupe_key]
+                if _is_more_specific_section(hit, hits[existing_index]):
+                    hits[existing_index] = hit
+                continue
             if len(hits) >= limit:
                 return hits, True
+            hit_by_snippet[dedupe_key] = len(hits)
             hits.append(hit)
     return hits, False
 
@@ -276,6 +284,14 @@ def _parsed_hit(
 
 def _mcp_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _is_more_specific_section(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+    candidate_id = str(candidate.get("section_id") or "")
+    current_id = str(current.get("section_id") or "")
+    if current_id and candidate_id.startswith(f"{current_id}."):
+        return True
+    return candidate_id.count(".") > current_id.count(".")
 
 
 def _contains_query(text: str, query: str, *, case_sensitive: bool) -> bool:
@@ -426,12 +442,12 @@ def _hit(
     }
 
 
-def _clean_snippet(text: str) -> str:
+def _clean_snippet(text: str, *, max_length: int = 900) -> str:
     compact = " ".join(str(text or "").split())
     if "<" in compact and ">" in compact:
         compact = BeautifulSoup(compact, "lxml").get_text(" ", strip=True)
         compact = " ".join(compact.split())
     compact = re.sub(r"\s+", " ", compact).strip()
-    if len(compact) > 500:
-        return f"{compact[:497].rstrip()}..."
+    if len(compact) > max_length:
+        return f"{compact[: max_length - 3].rstrip()}..."
     return compact

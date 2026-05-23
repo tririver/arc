@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     search_full_text.add_argument("--query", required=True)
     search_full_text.add_argument("--refresh", action="store_true")
     search_full_text.add_argument("--limit", type=int, default=20)
-    search_full_text.add_argument("--context", type=int, default=0)
+    search_full_text.add_argument("--context", type=int, default=1)
     search_full_text.add_argument("--case-sensitive", action="store_true")
     search_full_text.add_argument("--json", action="store_true")
 

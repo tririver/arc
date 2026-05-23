@@ -1,5 +1,5 @@
 from arc_paper import reference_inference, service
-from arc_paper.cache import CachePaths, read_json, text_query_cache_path, write_json, write_text
+from arc_paper.cache import CachePaths, read_json, text_query_cache_path, write_json
 from arc_paper.parse.ar5iv_html import PARSER_VERSION
 from arc_paper.providers.base import ProviderError
 
@@ -217,13 +217,48 @@ def test_toc_section_and_equation_context(monkeypatch, tmp_path):
     assert service.get_equation_context("0911.3380", "x = y")["data"][0]["after"] == "After."
 
 
-def parsed_cache(paper_id: str, sections: list[dict]):
+def test_equation_context_uses_cached_parsed_json_without_fetch(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    paths = CachePaths.for_paper("arXiv:0911.3380")
+    write_json(
+        paths.ar5iv_parsed,
+        parsed_cache(
+            "arXiv:0911.3380",
+            [{"section_id": "S2", "title": "2 Model", "level": 2, "text": "A section."}],
+            equations=[
+                {
+                    "id": "E1",
+                    "equation": "x = y",
+                    "before": "Before.",
+                    "after": "After.",
+                    "section_id": "S2",
+                    "section_title": "2 Model",
+                }
+            ],
+        ),
+    )
+
+    class FailingAr5iv:
+        def get_html(self, paper_id, *, refresh=False):
+            raise AssertionError("cached equation context must not fetch HTML")
+
+    monkeypatch.setattr(service, "_ar5iv", FailingAr5iv())
+
+    result = service.get_equation_context("0911.3380", "x = y")
+
+    assert result["ok"] is True
+    assert result["data"][0]["id"] == "E1"
+    assert result["data"][0]["section_id"] == "S2"
+
+
+def parsed_cache(paper_id: str, sections: list[dict], equations: list[dict] | None = None):
     return {
         "paper_id": paper_id,
         "parser_version": PARSER_VERSION,
         "source_hash": "test-source",
         "toc": [{"id": section["section_id"], "title": section["title"], "level": section["level"]} for section in sections],
         "sections": sections,
+        "equations": equations or [],
     }
 
 
@@ -311,6 +346,28 @@ def test_search_full_text_can_search_all_cached_papers(monkeypatch, tmp_path):
     assert result["meta"]["searched_files"] == 2
 
 
+def test_search_full_text_deduplicates_nested_section_snippets(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    paths = CachePaths.for_paper("arXiv:0911.3380")
+    duplicated_text = "The squeezed limit contains a scalar exchange signal."
+    write_json(
+        paths.ar5iv_parsed,
+        parsed_cache(
+            "arXiv:0911.3380",
+            [
+                {"section_id": "S2", "title": "2 Model", "level": 2, "text": duplicated_text},
+                {"section_id": "S2.SS1", "title": "2.1 Exchange", "level": 3, "text": duplicated_text},
+            ],
+        ),
+    )
+
+    result = service.search_full_text("0911.3380", query="scalar exchange", limit=10)
+
+    assert result["ok"] is True
+    assert len(result["data"]) == 1
+    assert result["data"][0]["section_id"] == "S2.SS1"
+
+
 def test_search_full_text_python_fallback(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     paths = CachePaths.for_paper("arXiv:0911.3380")
@@ -330,18 +387,20 @@ def test_search_full_text_python_fallback(monkeypatch, tmp_path):
     assert result["meta"]["search_backend"] == "python-parsed-json"
 
 
-def test_stale_parsed_cache_is_reparsed_from_cached_html(monkeypatch, tmp_path):
+def test_stale_parsed_cache_is_reparsed_from_ar5iv_fetch(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     paths = CachePaths.for_paper("arXiv:0911.3380")
     write_json(paths.ar5iv_parsed, {"paper_id": "arXiv:0911.3380", "toc": [], "sections": []})
-    write_text(
-        paths.ar5iv_html,
-        """
-        <html><body>
-          <p><span class="ltx_text ltx_font_bold">Discussion</span>— Main result.</p>
-        </body></html>
-        """,
-    )
+
+    class ReparseAr5iv:
+        def get_html(self, paper_id, *, refresh=False):
+            return """
+            <html><body>
+              <p><span class="ltx_text ltx_font_bold">Discussion</span>— Main result.</p>
+            </body></html>
+            """
+
+    monkeypatch.setattr(service, "_ar5iv", ReparseAr5iv())
 
     result = service.get_section("0911.3380", "discussion")
 

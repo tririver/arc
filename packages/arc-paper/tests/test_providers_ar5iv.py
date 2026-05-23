@@ -1,5 +1,6 @@
 import httpx
 
+from arc_paper.cache import CachePaths
 from arc_paper.providers.ar5iv import Ar5ivProvider, ar5iv_url
 
 
@@ -8,7 +9,7 @@ def test_ar5iv_url_uses_arxiv_path_id():
     assert ar5iv_url("arXiv:hep-th/0601001") == "https://ar5iv.labs.arxiv.org/html/hep-th/0601001"
 
 
-def test_ar5iv_get_html_writes_and_reuses_cache(monkeypatch, tmp_path):
+def test_ar5iv_get_html_does_not_write_html_cache_by_default(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     calls = []
 
@@ -18,10 +19,25 @@ def test_ar5iv_get_html_writes_and_reuses_cache(monkeypatch, tmp_path):
 
     provider = Ar5ivProvider(client=httpx.Client(transport=httpx.MockTransport(handler)))
     assert provider.get_html("arXiv:0911.3380") == "<html>paper</html>"
+    assert provider.get_html("arXiv:0911.3380") == "<html>paper</html>"
+    assert calls == [
+        "https://ar5iv.labs.arxiv.org/html/0911.3380",
+        "https://ar5iv.labs.arxiv.org/html/0911.3380",
+    ]
+    assert not CachePaths.for_paper("arXiv:0911.3380").ar5iv_html.exists()
+
+
+def test_ar5iv_get_html_ignores_existing_html_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    paths = CachePaths.for_paper("arXiv:0911.3380")
+    paths.ar5iv_html.parent.mkdir(parents=True, exist_ok=True)
+    paths.ar5iv_html.write_text("<html>stale cache</html>", encoding="utf-8")
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, text="<html>fresh network</html>")
+
+    provider = Ar5ivProvider(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert provider.get_html("arXiv:0911.3380") == "<html>fresh network</html>"
     assert calls == ["https://ar5iv.labs.arxiv.org/html/0911.3380"]
-
-    def failing_handler(request):
-        raise AssertionError("cache hit should not call network")
-
-    cached_provider = Ar5ivProvider(client=httpx.Client(transport=httpx.MockTransport(failing_handler)))
-    assert cached_provider.get_html("arXiv:0911.3380") == "<html>paper</html>"
