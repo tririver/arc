@@ -9,6 +9,7 @@ from typing import Any
 
 from .host import detect_host, select_llm_provider
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
+from .proposers_reviewer_bench.runner import run_proposers_reviewer_bench
 from .providers.config import PROVIDER_CONFIG_SCHEMA, load_provider_config, parse_provider_config, provider_config_path
 from .runner import resolve_llm_config, run_json, run_text
 
@@ -52,6 +53,12 @@ def _build_parser() -> argparse.ArgumentParser:
     loop_parser.add_argument("--dry-run", action="store_true")
     loop_parser.add_argument("--max-concurrent-loops", type=int, default=None)
     loop_parser.add_argument("--provider-config", default=None)
+
+    bench_parser = sub.add_parser("proposers-reviewer-bench")
+    bench_parser.add_argument("--config", required=True)
+    bench_parser.add_argument("--json", action="store_true")
+    bench_parser.add_argument("--dry-run", action="store_true")
+    bench_parser.add_argument("--provider-config", default=None)
 
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
@@ -125,6 +132,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
             base_env=_provider_config_env(args) if args.provider_config else None,
             dry_run=args.dry_run,
             max_concurrent_loops=args.max_concurrent_loops,
+        )
+    if args.command == "proposers-reviewer-bench":
+        return run_proposers_reviewer_bench(
+            _read_json_file(args.config),
+            base_env=_provider_config_env(args) if args.provider_config else None,
+            dry_run=args.dry_run,
         )
     if args.command == "providers":
         if args.providers_command == "list":
@@ -328,7 +341,7 @@ def _providers_init(args: argparse.Namespace) -> dict[str, Any]:
                 "base_url": "https://api.deepseek.com/v1",
                 "api_key": "replace-with-your-deepseek-api-key",
                 "models": {"default": "deepseek-chat", "high": "deepseek-reasoner"},
-                "json_mode": "json_schema",
+                "json_mode": "json_object",
             },
             {
                 "id": "ollama",

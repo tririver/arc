@@ -33,18 +33,22 @@ class OpenAICompatibleProvider:
         model: str | None = None,
     ) -> dict[str, Any]:
         resolved_model = self._require_model(model)
+        json_mode = self.config.json_mode
         request: dict[str, Any] = {
             "model": resolved_model,
-            "messages": _json_messages(prompt, self.config.json_mode),
+            "messages": _json_messages(prompt, json_mode),
         }
         response_format = _response_format(self.config, schema or {"type": "object"})
         if response_format:
             request["response_format"] = response_format
-        content = self._create(request)
         try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise LLMWorkerError(f"{self.name} JSON output was not valid JSON: {exc}") from exc
+            content = self._create(request)
+        except LLMWorkerError as exc:
+            fallback = _response_format_fallback_mode(json_mode, exc)
+            if fallback is None:
+                raise
+            content = self._create(_json_request(resolved_model, prompt, fallback))
+        payload = _parse_json_object(content, provider_name=self.name)
         if not isinstance(payload, dict):
             raise LLMWorkerError(f"{self.name} JSON output was not an object")
         return payload
@@ -105,8 +109,69 @@ def _response_format(provider: ConfiguredProvider, schema: dict[str, Any]) -> di
     }
 
 
+def _json_request(model: str, prompt: str, json_mode: str) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "model": model,
+        "messages": _json_messages(prompt, json_mode),
+    }
+    response_format = _response_format_for_mode(json_mode)
+    if response_format:
+        request["response_format"] = response_format
+    return request
+
+
+def _response_format_for_mode(json_mode: str) -> dict[str, Any] | None:
+    if json_mode == "json_object":
+        return {"type": "json_object"}
+    if json_mode == "none":
+        return None
+    raise ValueError(f"unsupported fallback json_mode: {json_mode}")
+
+
+def _response_format_fallback_mode(json_mode: str, exc: LLMWorkerError) -> str | None:
+    if not _is_response_format_unavailable(str(exc)):
+        return None
+    if json_mode == "json_schema":
+        return "json_object"
+    if json_mode == "json_object":
+        return "none"
+    return None
+
+
+def _is_response_format_unavailable(message: str) -> bool:
+    normalized = message.lower()
+    return "response_format" in normalized and (
+        "unavailable" in normalized
+        or "unsupported" in normalized
+        or "not support" in normalized
+        or "not supported" in normalized
+    )
+
+
+def _parse_json_object(content: str, *, provider_name: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as first_exc:
+        decoder = json.JSONDecoder()
+        start = content.find("{")
+        if start < 0:
+            raise LLMWorkerError(f"{provider_name} JSON output was not valid JSON: {first_exc}") from first_exc
+        try:
+            payload, _ = decoder.raw_decode(content[start:])
+        except json.JSONDecodeError:
+            raise LLMWorkerError(f"{provider_name} JSON output was not valid JSON: {first_exc}") from first_exc
+    if not isinstance(payload, dict):
+        raise LLMWorkerError(f"{provider_name} JSON output was not an object")
+    return payload
+
+
 def _json_messages(prompt: str, json_mode: str) -> list[dict[str, str]]:
     if json_mode == "json_object":
+        return [
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": prompt},
+        ]
+    if json_mode == "none":
         return [
             {"role": "system", "content": "Return JSON only."},
             {"role": "user", "content": prompt},

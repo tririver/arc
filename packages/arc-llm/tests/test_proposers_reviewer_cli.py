@@ -89,3 +89,25 @@ def test_cli_max_concurrent_loops_overrides_operational_concurrency(tmp_path, mo
     cli._dispatch(args)
 
     assert captured["kwargs"]["max_concurrent_loops"] == 4
+
+
+def test_cli_runs_proposers_reviewer_bench_from_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config = minimal_config()
+    config["bench"] = {"samples": 2, "max_rounds": 1}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    captured = {}
+
+    def fake_run(config, **kwargs):
+        captured["config"] = config
+        captured["kwargs"] = kwargs
+        return {"status": "completed", "best_run_id": "run_001_iter000_current"}
+
+    monkeypatch.setattr(cli, "run_proposers_reviewer_bench", fake_run, raising=False)
+
+    args = cli._build_parser().parse_args(["proposers-reviewer-bench", "--config", str(config_path), "--json"])
+    result = cli._dispatch(args)
+
+    assert result["status"] == "completed"
+    assert captured["config"]["run_id"] == "run_001"
+    assert captured["kwargs"]["dry_run"] is False

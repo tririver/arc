@@ -73,7 +73,7 @@ Provider config may store a raw API key in a local ignored config file:
         "default": "deepseek-chat",
         "high": "deepseek-reasoner"
       },
-      "json_mode": "json_schema"
+      "json_mode": "json_object"
     },
     {
       "id": "ollama",
@@ -172,6 +172,37 @@ ARC_RUN_LLM_TESTS=1 ARC_RUN_NET_TESTS=1 \
 
 Set `ARC_LLM_TEST_PROVIDER` or `ARC_LLM_TEST_MODEL` to override the provider or
 model for that opt-in run.
+
+## Proposers-Reviewer Benchmarks
+
+Use the benchmark wrapper to run many independent loop samples, ask an LLM to
+inspect artifact paths and suggest prompt edits, then rerun candidates in an
+improve-and-measure loop:
+
+```bash
+arc-llm proposers-reviewer-bench --config bench-config.json --json
+```
+
+The input is the normal proposers-reviewer batch JSON plus an optional `bench`
+object. Defaults are `samples: 25`, `max_rounds: 5`, `max_iterations: 10`,
+`patience: 3`, `max_concurrent_loops: 100`, and `default_provider: "deepseek"`.
+The wrapper materializes sample loop IDs such as `idea_001` through `idea_025`
+from the first configured loop template.
+
+The improver is given score summaries and artifact file paths such as
+`transcript.jsonl`; it should read detailed histories from disk instead of
+receiving every correspondence inline. Automated edits are applied only to
+explicit prompt-template targets, and reviewer prompt edits are disabled unless
+`bench.allow_reviewer_prompt_edits` is true.
+
+Bench materialization also asks each worker to add a top-level
+`suggested_improvement` object in its output JSON. The prompt optimizer is told
+to judge those worker suggestions alongside scores, transcripts, reviews, tool
+traces, and the current prompt. It must not directly follow every suggestion.
+For DeepSeek-style providers, `bench.improver_context_mode: "auto"` includes
+expanded artifact excerpts by default, bounded by
+`bench.improver_context_max_chars`. Use `"paths"` to send only file paths or
+`"expanded"` to force inline artifact excerpts.
 
 ## Model Tiers
 

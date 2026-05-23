@@ -267,18 +267,20 @@ def _parsed_hit(
     matched_in: str,
 ) -> dict[str, Any]:
     section_selector = section_id or section_title
+    section_mcp = f"get_section(paper_id={_mcp_string(paper_id)}, section={_mcp_string(section_selector)})"
+    section_cli = f"arc-paper get-section {shlex.quote(paper_id)} --section {shlex.quote(section_selector)} --json"
+    metadata_mcp = f"get_metadata(paper_id={_mcp_string(paper_id)})"
+    metadata_cli = f"arc-paper get-metadata {shlex.quote(paper_id)} --json"
     return {
         "paper_id": paper_id,
         "section_id": section_id,
         "section_title": section_title,
         "matched_in": matched_in,
         "snippet": snippet,
-        "get_section_mcp": f"get_section(paper_id={_mcp_string(paper_id)}, section={_mcp_string(section_selector)})",
-        "get_section_cli": (
-            f"arc-paper get-section {shlex.quote(paper_id)} --section {shlex.quote(section_selector)} --json"
-        ),
-        "get_metadata_mcp": f"get_metadata(paper_id={_mcp_string(paper_id)})",
-        "get_metadata_cli": f"arc-paper get-metadata {shlex.quote(paper_id)} --json",
+        "next_steps": {
+            "read_section": {"mcp": section_mcp, "cli": section_cli},
+            "get_metadata": {"mcp": metadata_mcp, "cli": metadata_cli},
+        },
     }
 
 

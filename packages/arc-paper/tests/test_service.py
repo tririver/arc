@@ -299,10 +299,20 @@ def test_search_full_text_uses_cached_parsed_json_without_fetch(monkeypatch, tmp
     assert "Inflationary loops are not relevant here." in hit["snippet"]
     assert "collapsed-channel signal" in hit["snippet"]
     assert "following sentence should also help" in hit["snippet"]
-    assert hit["get_section_mcp"] == 'get_section(paper_id="arXiv:0911.3380", section="S2")'
-    assert hit["get_section_cli"] == "arc-paper get-section arXiv:0911.3380 --section S2 --json"
-    assert hit["get_metadata_mcp"] == 'get_metadata(paper_id="arXiv:0911.3380")'
-    assert hit["get_metadata_cli"] == "arc-paper get-metadata arXiv:0911.3380 --json"
+    assert hit["next_steps"] == {
+        "read_section": {
+            "mcp": 'get_section(paper_id="arXiv:0911.3380", section="S2")',
+            "cli": "arc-paper get-section arXiv:0911.3380 --section S2 --json",
+        },
+        "get_metadata": {
+            "mcp": 'get_metadata(paper_id="arXiv:0911.3380")',
+            "cli": "arc-paper get-metadata arXiv:0911.3380 --json",
+        },
+    }
+    assert "get_section_mcp" not in hit
+    assert "get_section_cli" not in hit
+    assert "get_metadata_mcp" not in hit
+    assert "get_metadata_cli" not in hit
     assert "line_number" not in hit
     assert "context_before" not in hit
     assert "context_after" not in hit

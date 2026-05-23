@@ -22,7 +22,7 @@
         "medium": "deepseek-v4-flash",
         "high": "deepseek-v4-pro"
       },
-      "json_mode": "json_schema"
+      "json_mode": "json_object"
     },
     {
       "id": "ollama",

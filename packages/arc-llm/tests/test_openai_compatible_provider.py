@@ -37,6 +37,19 @@ class FakeCompletions:
         return FakeCompletion(self.response)
 
 
+class SequencedCompletions:
+    def __init__(self, events):
+        self.events = list(events)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        event = self.events.pop(0)
+        if isinstance(event, Exception):
+            raise event
+        return FakeCompletion(event)
+
+
 class FakeChat:
     def __init__(self, completions: FakeCompletions):
         self.completions = completions
@@ -119,6 +132,42 @@ def test_generate_json_can_use_json_object_mode_for_local_compatibility():
     assert completions.calls[0]["response_format"] == {"type": "json_object"}
     assert completions.calls[0]["messages"][0]["role"] == "system"
     assert "JSON" in completions.calls[0]["messages"][0]["content"]
+
+
+def test_generate_json_recovers_first_object_from_trailing_model_text():
+    completions = FakeCompletions('{"ok": true, "mode": "first"}\n{"ignored": true}')
+    config = provider_config(json_mode="json_object")
+    provider = OpenAICompatibleProvider(
+        config,
+        env={},
+        client_factory=lambda **kwargs: FakeClient(completions),
+    )
+
+    assert provider.generate_json("Return JSON", schema={"type": "object"}, model="deepseek-chat") == {
+        "ok": True,
+        "mode": "first",
+    }
+
+
+def test_generate_json_falls_back_to_json_object_when_json_schema_is_unavailable():
+    completions = SequencedCompletions(
+        [
+            RuntimeError("This response_format type is unavailable now secret-key"),
+            json.dumps({"ok": True, "mode": "fallback"}),
+        ]
+    )
+    provider = OpenAICompatibleProvider(
+        provider_config(),
+        env={},
+        client_factory=lambda **kwargs: FakeClient(completions),
+    )
+
+    result = provider.generate_json("Return JSON", schema={"type": "object"}, model="deepseek-chat")
+
+    assert result == {"ok": True, "mode": "fallback"}
+    assert completions.calls[0]["response_format"]["type"] == "json_schema"
+    assert completions.calls[1]["response_format"] == {"type": "json_object"}
+    assert completions.calls[1]["messages"][0]["role"] == "system"
 
 
 def test_missing_required_api_key_fails_before_calling_client():

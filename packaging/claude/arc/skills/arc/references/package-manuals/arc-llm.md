@@ -70,6 +70,43 @@ JSON output:
 arc-llm run-json --prompt "Return {\"ok\": true}" --schema schema.json --provider auto --json
 ```
 
+## Proposers-Reviewer Loops
+
+Run reusable proposer/reviewer workflows from JSON:
+
+```bash
+arc-llm proposers-reviewer-loop --config loop-config.json --json
+```
+
+Validate without LLM calls:
+
+```bash
+arc-llm proposers-reviewer-loop --config loop-config.json --dry-run --json
+```
+
+## Proposers-Reviewer Benchmarks
+
+Run many independent loop samples, ask an LLM to inspect artifact paths and
+suggest prompt edits, then rerun candidates in an improve-and-measure loop:
+
+```bash
+arc-llm proposers-reviewer-bench --config bench-config.json --json
+```
+
+The input is the normal proposers-reviewer batch JSON plus an optional `bench`
+object. Defaults include `samples: 25`, `max_rounds: 5`,
+`max_iterations: 10`, `patience: 3`, `max_concurrent_loops: 100`, and
+`default_provider: "deepseek"`.
+
+Bench materialization asks each worker to add a top-level
+`suggested_improvement` object in its output JSON. The prompt optimizer is told
+to judge those worker suggestions alongside scores, transcripts, reviews, tool
+traces, and the current prompt. It must not directly follow every suggestion.
+For DeepSeek-style providers, `bench.improver_context_mode: "auto"` includes
+expanded artifact excerpts by default, bounded by
+`bench.improver_context_max_chars`. Use `"paths"` to send only file paths or
+`"expanded"` to force inline artifact excerpts.
+
 ## Runtime Options
 
 By default ARC keeps provider calls lightweight. Enable extra capability only
