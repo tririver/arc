@@ -1,5 +1,6 @@
 from arc_paper import reference_inference, service
 from arc_paper.cache import CachePaths, read_json, text_query_cache_path, write_json, write_text
+from arc_paper.parse.ar5iv_html import PARSER_VERSION
 from arc_paper.providers.base import ProviderError
 
 
@@ -216,42 +217,91 @@ def test_toc_section_and_equation_context(monkeypatch, tmp_path):
     assert service.get_equation_context("0911.3380", "x = y")["data"][0]["after"] == "After."
 
 
-def test_search_full_text_uses_cached_ar5iv_html_without_fetch(monkeypatch, tmp_path):
+def parsed_cache(paper_id: str, sections: list[dict]):
+    return {
+        "paper_id": paper_id,
+        "parser_version": PARSER_VERSION,
+        "source_hash": "test-source",
+        "toc": [{"id": section["section_id"], "title": section["title"], "level": section["level"]} for section in sections],
+        "sections": sections,
+    }
+
+
+def test_search_full_text_uses_cached_parsed_json_without_fetch(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     paths = CachePaths.for_paper("arXiv:0911.3380")
-    write_text(
-        paths.ar5iv_html,
-        """
-        <html><body>
-          <p>Inflationary loops are not relevant here.</p>
-          <p>The scalar trispectrum contains a collapsed-channel signal.</p>
-        </body></html>
-        """,
+    write_json(
+        paths.ar5iv_parsed,
+        parsed_cache(
+            "arXiv:0911.3380",
+            [
+                {
+                    "section_id": "S2",
+                    "title": "2 Model",
+                    "level": 2,
+                    "text": "Inflationary loops are not relevant here.\n"
+                    "The scalar trispectrum contains a collapsed-channel signal.\n"
+                    "This following sentence should also help the reader.",
+                }
+            ],
+        ),
     )
 
     class FailingAr5iv:
         def get_html(self, paper_id, *, refresh=False):
-            raise AssertionError("cached full-text search must not fetch")
+            raise AssertionError("cached parsed full-text search must not fetch")
 
     monkeypatch.setattr(service, "_ar5iv", FailingAr5iv())
 
-    result = service.search_full_text("0911.3380", query="collapsed-channel", context=1)
+    result = service.search_full_text("0911.3380", query="collapsed-channel")
 
     assert result["ok"] is True
-    assert result["data"][0]["paper_id"] == "arXiv:0911.3380"
-    assert result["data"][0]["line_number"] == 4
-    assert "collapsed-channel signal" in result["data"][0]["snippet"]
-    assert result["data"][0]["context_before"] == ["Inflationary loops are not relevant here."]
+    hit = result["data"][0]
+    assert hit["paper_id"] == "arXiv:0911.3380"
+    assert hit["section_id"] == "S2"
+    assert hit["section_title"] == "2 Model"
+    assert hit["matched_in"] == "section_text"
+    assert "Inflationary loops are not relevant here." in hit["snippet"]
+    assert "collapsed-channel signal" in hit["snippet"]
+    assert "following sentence should also help" in hit["snippet"]
+    assert hit["get_section_mcp"] == 'get_section(paper_id="arXiv:0911.3380", section="S2")'
+    assert hit["get_section_cli"] == "arc-paper get-section arXiv:0911.3380 --section S2 --json"
+    assert hit["get_metadata_mcp"] == 'get_metadata(paper_id="arXiv:0911.3380")'
+    assert hit["get_metadata_cli"] == "arc-paper get-metadata arXiv:0911.3380 --json"
+    assert "line_number" not in hit
+    assert "context_before" not in hit
+    assert "context_after" not in hit
+    assert "cache_path" not in hit
     assert result["meta"]["provider"] == "local-cache"
     assert result["meta"]["searched_files"] == 1
+    assert result["meta"]["context"] == 1
 
 
 def test_search_full_text_can_search_all_cached_papers(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     first = CachePaths.for_paper("arXiv:0911.3380")
     second = CachePaths.for_paper("arXiv:astro-ph/0610514")
-    write_text(first.ar5iv_html, "<p>heavy scalar exchange</p>")
-    write_text(second.ar5iv_html, "<p>heavy scalar exchange in a second paper</p>")
+    write_json(
+        first.ar5iv_parsed,
+        parsed_cache(
+            "arXiv:0911.3380",
+            [{"section_id": "S1", "title": "1 Intro", "level": 2, "text": "heavy scalar exchange"}],
+        ),
+    )
+    write_json(
+        second.ar5iv_parsed,
+        parsed_cache(
+            "arXiv:astro-ph/0610514",
+            [
+                {
+                    "section_id": "S1",
+                    "title": "1 Intro",
+                    "level": 2,
+                    "text": "heavy scalar exchange in a second paper",
+                }
+            ],
+        ),
+    )
 
     result = service.search_full_text(None, query="heavy scalar", limit=1)
 
@@ -264,14 +314,20 @@ def test_search_full_text_can_search_all_cached_papers(monkeypatch, tmp_path):
 def test_search_full_text_python_fallback(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     paths = CachePaths.for_paper("arXiv:0911.3380")
-    write_text(paths.ar5iv_html, "<p>Boostless contact terms.</p>")
+    write_json(
+        paths.ar5iv_parsed,
+        parsed_cache(
+            "arXiv:0911.3380",
+            [{"section_id": "S1", "title": "1 Intro", "level": 2, "text": "Boostless contact terms."}],
+        ),
+    )
     monkeypatch.setattr("arc_paper.search.shutil.which", lambda name: None)
 
     result = service.search_full_text("0911.3380", query="boostless", case_sensitive=False)
 
     assert result["ok"] is True
     assert result["data"][0]["snippet"] == "Boostless contact terms."
-    assert result["meta"]["search_backend"] == "python"
+    assert result["meta"]["search_backend"] == "python-parsed-json"
 
 
 def test_stale_parsed_cache_is_reparsed_from_cached_html(monkeypatch, tmp_path):

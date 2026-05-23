@@ -9,6 +9,7 @@ from typing import Any
 
 from .host import detect_host, select_llm_provider
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
+from .providers.config import PROVIDER_CONFIG_SCHEMA, load_provider_config, parse_provider_config, provider_config_path
 from .runner import resolve_llm_config, run_json, run_text
 
 
@@ -50,12 +51,36 @@ def _build_parser() -> argparse.ArgumentParser:
     loop_parser.add_argument("--json", action="store_true")
     loop_parser.add_argument("--dry-run", action="store_true")
     loop_parser.add_argument("--max-concurrent-loops", type=int, default=None)
+    loop_parser.add_argument("--provider-config", default=None)
 
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
     doctor_sub.add_parser("host")
     doctor_sub.add_parser("provider")
     doctor_sub.add_parser("config")
+
+    providers = sub.add_parser("providers")
+    providers_sub = providers.add_subparsers(dest="providers_command", required=True)
+    providers_list = providers_sub.add_parser("list")
+    providers_list.add_argument("--provider-config", default=None)
+    providers_doctor = providers_sub.add_parser("doctor")
+    providers_doctor.add_argument("--provider-config", default=None)
+    providers_init = providers_sub.add_parser("init")
+    providers_init.add_argument("--provider-config", default=None)
+    providers_init.add_argument("--force", action="store_true")
+    providers_add = providers_sub.add_parser("add")
+    providers_add_sub = providers_add.add_subparsers(dest="provider_type", required=True)
+    openai_add = providers_add_sub.add_parser("openai-compatible")
+    openai_add.add_argument("--provider-config", default=None)
+    openai_add.add_argument("--id", required=True)
+    openai_add.add_argument("--base-url", required=True)
+    openai_add.add_argument("--api-key", default=None)
+    openai_add.add_argument("--api-key-optional", action="store_true")
+    openai_add.add_argument("--model", default=None)
+    openai_add.add_argument("--low-model", default=None)
+    openai_add.add_argument("--medium-model", default=None)
+    openai_add.add_argument("--high-model", default=None)
+    openai_add.add_argument("--json-mode", choices=["json_schema", "json_object", "none"], default="json_schema")
     return parser
 
 
@@ -97,13 +122,31 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "proposers-reviewer-loop":
         return run_proposers_reviewer_batch(
             _read_json_file(args.config),
+            base_env=_provider_config_env(args) if args.provider_config else None,
             dry_run=args.dry_run,
             max_concurrent_loops=args.max_concurrent_loops,
         )
+    if args.command == "providers":
+        if args.providers_command == "list":
+            return _providers_list(args)
+        if args.providers_command == "doctor":
+            payload = _providers_list(args)
+            selected = select_llm_provider(env=_provider_config_env(args))
+            payload["auto_selection"] = {
+                "provider": selected.provider,
+                "host": selected.host.host,
+                "signals": selected.signals,
+            }
+            return payload
+        if args.providers_command == "init":
+            return _providers_init(args)
+        if args.providers_command == "add":
+            return _providers_add(args)
     raise AssertionError(f"Unhandled command: {args.command}")
 
 
 def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--provider-config", default=None)
     parser.add_argument("--allow-internet", action="store_true")
     parser.add_argument("--allow-mcp", action="store_true")
     parser.add_argument("--mcp-mode", choices=["user-config", "arc-only"], default=None)
@@ -142,6 +185,7 @@ def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
     overrides: dict[str, str] = {}
+    _put(overrides, "ARC_LLM_PROVIDER_CONFIG", getattr(args, "provider_config", None))
     if args.allow_internet:
         overrides["ARC_CODEX_ALLOW_INTERNET"] = "true"
         overrides["ARC_CLAUDE_ALLOW_INTERNET"] = "true"
@@ -234,6 +278,145 @@ def _read_json_file(value: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON file must contain an object: {value}")
     return payload
+
+
+def _provider_config_env(args: argparse.Namespace) -> dict[str, str]:
+    env = dict(os.environ)
+    if provider_config := getattr(args, "provider_config", None):
+        env["ARC_LLM_PROVIDER_CONFIG"] = provider_config
+    return env
+
+
+def _providers_list(args: argparse.Namespace) -> dict[str, Any]:
+    env = _provider_config_env(args)
+    config = load_provider_config(env=env)
+    configured = []
+    for provider in config.providers:
+        configured.append(
+            {
+                "id": provider.id,
+                "type": provider.type,
+                "base_url": provider.base_url,
+                "api_key_optional": provider.api_key_optional,
+                "has_api_key": provider.has_api_key(env=env),
+                "usable": provider.is_usable(env=env),
+                "models": provider.models or {},
+                "json_mode": provider.json_mode,
+            }
+        )
+    return {
+        "schema_version": "arc.llm.providers.list.v1",
+        "config_path": config.path,
+        "default": config.default,
+        "builtins": ["codex-cli", "claude-cli", "manual"],
+        "configured": configured,
+    }
+
+
+def _providers_init(args: argparse.Namespace) -> dict[str, Any]:
+    env = _provider_config_env(args)
+    path = provider_config_path(env=env)
+    if path.exists() and not args.force:
+        return {"status": "exists", "config_path": str(path)}
+    payload = {
+        "_comment": _provider_config_comment(path),
+        "schema_version": PROVIDER_CONFIG_SCHEMA,
+        "providers": [
+            {
+                "id": "deepseek",
+                "type": "openai-compatible",
+                "base_url": "https://api.deepseek.com/v1",
+                "api_key": "replace-with-your-deepseek-api-key",
+                "models": {"default": "deepseek-chat", "high": "deepseek-reasoner"},
+                "json_mode": "json_schema",
+            },
+            {
+                "id": "ollama",
+                "type": "openai-compatible",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "api_key_optional": True,
+                "models": {"default": "llama3.1"},
+                "json_mode": "json_object",
+            },
+        ],
+    }
+    _write_provider_config(path, payload)
+    return {"status": "written", "config_path": str(path)}
+
+
+def _providers_add(args: argparse.Namespace) -> dict[str, Any]:
+    env = _provider_config_env(args)
+    path = provider_config_path(env=env)
+    payload = _read_provider_config_payload(path)
+    providers = payload.setdefault("providers", [])
+    if not isinstance(providers, list):
+        raise ValueError("providers must be a list")
+    provider = {
+        "id": args.id,
+        "type": "openai-compatible",
+        "base_url": args.base_url,
+        "json_mode": args.json_mode,
+    }
+    if args.api_key:
+        provider["api_key"] = args.api_key
+    if args.api_key_optional:
+        provider["api_key_optional"] = True
+    models = {
+        key: value
+        for key, value in {
+            "default": args.model,
+            "low": args.low_model,
+            "medium": args.medium_model,
+            "high": args.high_model,
+        }.items()
+        if value
+    }
+    if models:
+        provider["models"] = models
+    payload.setdefault("_comment", _provider_config_comment(path))
+    replaced = False
+    for index, item in enumerate(providers):
+        if isinstance(item, dict) and item.get("id") == args.id:
+            providers[index] = provider
+            replaced = True
+            break
+    if not replaced:
+        providers.append(provider)
+    parse_provider_config(payload, path=str(path))
+    _write_provider_config(path, payload)
+    return {"status": "written", "config_path": str(path), "provider": args.id}
+
+
+def _read_provider_config_payload(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "_comment": _provider_config_comment(path),
+            "schema_version": PROVIDER_CONFIG_SCHEMA,
+            "providers": [],
+        }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Provider config must contain an object: {path}")
+    return payload
+
+
+def _write_provider_config(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _provider_config_comment(path: Path) -> list[str]:
+    project_path = Path.cwd() / "llm-providers.json"
+    return [
+        "ARC LLM provider config. JSON does not support comments; this _comment field is informational.",
+        "Rename examples/llm-providers.example.json to llm-providers.json, then put it in one of these locations.",
+        f"Project-local default: {project_path}",
+        "Linux user config: ~/.config/arc/llm-providers.json",
+        "macOS user config: ~/.config/arc/llm-providers.json",
+        "Windows user config: %USERPROFILE%\\.config\\arc\\llm-providers.json",
+        f"This generated file is currently at: {path}",
+        "This file may contain API keys. Keep real llm-providers.json files out of git.",
+    ]
 
 
 if __name__ == "__main__":

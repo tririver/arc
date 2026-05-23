@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from .providers.config import ProviderConfigError, load_provider_config, select_default_configured_provider
+
 
 @dataclass(frozen=True)
 class HostDetection:
@@ -58,6 +60,17 @@ def select_llm_provider(
         return ProviderSelection(provider=explicit_provider, host=host, signals=["explicit"])
     if provider := env.get("ARC_LLM_PROVIDER"):
         return ProviderSelection(provider=provider, host=host, signals=[f"env:ARC_LLM_PROVIDER={provider}"])
+    try:
+        configured = select_default_configured_provider(env=env)
+        if configured:
+            config = load_provider_config(env=env)
+            return ProviderSelection(
+                provider=configured.id,
+                host=host,
+                signals=[f"provider-config:{config.path}:{configured.id}"],
+            )
+    except ProviderConfigError as exc:
+        return ProviderSelection(provider="manual", host=host, signals=[f"provider-config-error:{exc}"])
     if host.host == "codex":
         return ProviderSelection(provider="codex-cli", host=host, signals=host.signals)
     if host.host == "claude-code":

@@ -31,6 +31,29 @@ Codex: ARC_AGENT_HOST=codex, ARC_LLM_PROVIDER=codex-cli
 Claude Code: ARC_AGENT_HOST=claude-code, ARC_LLM_PROVIDER=claude-cli
 ```
 
+Configured OpenAI-compatible providers:
+
+```bash
+arc-llm providers list
+arc-llm providers doctor
+```
+
+Provider config defaults are checked in this order: `./llm-providers.json`,
+then `~/.config/arc/llm-providers.json`. From this checkout, the project-local
+default is `/arc-dev/llm-providers.json`. Override it with
+`ARC_LLM_PROVIDER_CONFIG` or `--provider-config`. The file is only for URL-based
+providers such as DeepSeek, Ollama, LM Studio, vLLM, and OpenRouter. Built-in
+providers `codex-cli`, `claude-cli`, and `manual` are not configured there.
+
+Provider config may store a raw `api_key` in a local ignored config file. Do
+not commit real provider configs. The repository includes a redacted example at
+`examples/llm-providers.example.json`; rename it to `llm-providers.json` and
+put it in one of the default locations. Local files named `llm-providers.json`
+are ignored by git. Store provider API keys in the local config file as
+`api_key`; use `api_key_optional` only for local endpoints that do not require a
+key. With `--provider auto`, ARC first uses configured providers with available
+API keys, then optional local configured providers, then host providers.
+
 ## Direct Prompt Tests
 
 Use direct `arc-llm` calls only for debugging or standalone LLM tasks.
@@ -56,6 +79,7 @@ Common options:
 
 ```text
 --provider auto
+--provider-config <path>
 --model <model>
 --allow-internet
 --allow-mcp

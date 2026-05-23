@@ -25,9 +25,36 @@ echo '{"task":"say ok"}' | arc-llm run-json --provider auto
 echo 'Say ok.' | arc-llm run-text --provider auto
 ```
 
-`arc-llm` owns host detection, provider selection, model defaults, and
-Codex/Claude CLI prompt execution. Other packages should use it instead of
-shelling out to host LLMs directly.
+`arc-llm` owns host detection, provider selection, model defaults, Codex/Claude
+CLI prompt execution, and optional OpenAI-compatible HTTP providers. Other
+packages should use it instead of shelling out to host LLMs directly.
+
+URL-based providers such as DeepSeek, Ollama, LM Studio, vLLM, or OpenRouter
+live in a local provider config file, not in source control:
+
+```bash
+arc-llm providers init
+arc-llm providers add openai-compatible \
+  --id deepseek \
+  --base-url https://api.deepseek.com/v1 \
+  --api-key sk-... \
+  --model deepseek-chat \
+  --high-model deepseek-reasoner
+arc-llm providers list
+```
+
+Default config discovery checks `/arc-dev/llm-providers.json` first when you
+run ARC from this checkout, then `~/.config/arc/llm-providers.json`. Override
+the path with `ARC_LLM_PROVIDER_CONFIG` or `--provider-config`. Real provider
+config files may store raw `api_key` values and should stay out of source
+control. The repo includes a redacted example at
+`examples/llm-providers.example.json`; rename that example to
+`llm-providers.json` and put it in a default config location. Local files named
+`llm-providers.json` are ignored by git. Generated configs include a `_comment`
+field with Linux, macOS, and Windows placement notes.
+`--provider auto` first uses configured providers with available API keys,
+then optional local configured providers, then the built-in `codex-cli`,
+`claude-cli`, and `manual` providers.
 
 ## Paper
 

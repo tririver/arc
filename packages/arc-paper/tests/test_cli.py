@@ -111,7 +111,7 @@ def test_cli_get_section(monkeypatch, capsys):
 
 
 def test_cli_search_full_text(monkeypatch, capsys):
-    def search_full_text(ids, *, query, refresh=False, limit=20, context=0, case_sensitive=False):
+    def search_full_text(ids, *, query, refresh=False, limit=20, context=1, case_sensitive=False):
         return {
             "ok": True,
             "data": [{"paper_id": ids, "snippet": query}],
@@ -151,6 +151,18 @@ def test_cli_search_full_text(monkeypatch, capsys):
     assert output["meta"]["context"] == 2
     assert output["meta"]["case_sensitive"] is True
     assert output["meta"]["refresh"] is True
+
+
+def test_cli_search_full_text_defaults_to_one_context_line(monkeypatch, capsys):
+    def search_full_text(ids, *, query, refresh=False, limit=20, context=1, case_sensitive=False):
+        return {"ok": True, "data": [], "meta": {"context": context}}
+
+    monkeypatch.setattr(cli.service, "search_full_text", search_full_text)
+
+    assert cli.main(["search-full-text", "0911.3380", "--query", "scalar exchange", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["meta"]["context"] == 1
 
 
 def test_cli_doctor_host(monkeypatch, capsys):

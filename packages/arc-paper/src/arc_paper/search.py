@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -15,6 +16,55 @@ from bs4 import BeautifulSoup
 class FullTextSearchFile:
     paper_id: str
     path: Path
+
+
+def search_parsed_full_text(
+    files: list[FullTextSearchFile],
+    query: str,
+    *,
+    limit: int = 20,
+    context: int = 1,
+    case_sensitive: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalized_query = (query or "").strip()
+    if not normalized_query:
+        raise ValueError("query is required")
+    normalized_limit = max(1, min(int(limit), 200))
+    normalized_context = max(0, min(int(context), 5))
+    backend = "python-parsed-json"
+    candidate_files = files
+
+    if files and shutil.which("rg"):
+        matched_files = _parsed_files_with_ripgrep(files, normalized_query, case_sensitive=case_sensitive)
+        if matched_files is not None:
+            candidate_files = matched_files
+            backend = "ripgrep-parsed-json"
+
+    if not candidate_files:
+        return [], {
+            "search_backend": backend,
+            "searched_files": len(files),
+            "limit": normalized_limit,
+            "context": normalized_context,
+            "case_sensitive": case_sensitive,
+            "truncated": False,
+        }
+
+    hits, truncated = _search_parsed_candidates(
+        candidate_files,
+        normalized_query,
+        limit=normalized_limit,
+        context=normalized_context,
+        case_sensitive=case_sensitive,
+    )
+    return hits, {
+        "search_backend": backend,
+        "searched_files": len(files),
+        "limit": normalized_limit,
+        "context": normalized_context,
+        "case_sensitive": case_sensitive,
+        "truncated": truncated,
+    }
 
 
 def search_cached_full_text(
@@ -82,6 +132,188 @@ def search_cached_full_text(
 
 def _backend_name() -> str:
     return "ripgrep" if shutil.which("rg") else "python"
+
+
+def _parsed_files_with_ripgrep(
+    files: list[FullTextSearchFile],
+    query: str,
+    *,
+    case_sensitive: bool,
+) -> list[FullTextSearchFile] | None:
+    path_by_text = {str(item.path): item for item in files}
+    cmd = [
+        shutil.which("rg") or "rg",
+        "--files-with-matches",
+        "--color",
+        "never",
+    ]
+    if not case_sensitive:
+        cmd.append("--ignore-case")
+    pattern = _json_search_pattern(query)
+    if pattern == query:
+        cmd.append("--fixed-strings")
+    cmd.extend(["--", pattern])
+    cmd.extend(str(item.path) for item in files)
+    try:
+        completed = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode not in (0, 1):
+        return None
+    matched = []
+    seen: set[str] = set()
+    for raw_path in completed.stdout.splitlines():
+        path_text = raw_path.strip()
+        if path_text in seen:
+            continue
+        seen.add(path_text)
+        if item := path_by_text.get(path_text):
+            matched.append(item)
+    return matched
+
+
+def _json_search_pattern(query: str) -> str:
+    tokens = [token for token in re.split(r"\s+", query.strip()) if token]
+    if len(tokens) <= 1:
+        return query
+    return r"(?:\\n|\s)+".join(re.escape(token) for token in tokens)
+
+
+def _search_parsed_candidates(
+    files: list[FullTextSearchFile],
+    query: str,
+    *,
+    limit: int,
+    context: int,
+    case_sensitive: bool,
+) -> tuple[list[dict[str, Any]], bool]:
+    hits: list[dict[str, Any]] = []
+    normalized_query = _normalize_search_text(query, case_sensitive=case_sensitive)
+    for search_file in files:
+        parsed = _read_parsed_json(search_file.path)
+        if not parsed:
+            continue
+        paper_id = str(parsed.get("paper_id") or search_file.paper_id)
+        for section in parsed.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            hit = _section_search_hit(
+                paper_id,
+                section,
+                normalized_query,
+                case_sensitive=case_sensitive,
+                context=context,
+            )
+            if not hit:
+                continue
+            if len(hits) >= limit:
+                return hits, True
+            hits.append(hit)
+    return hits, False
+
+
+def _read_parsed_json(path: Path) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _section_search_hit(
+    paper_id: str,
+    section: dict[str, Any],
+    query: str,
+    *,
+    case_sensitive: bool,
+    context: int,
+) -> dict[str, Any] | None:
+    section_id = str(section.get("section_id") or "")
+    section_title = str(section.get("title") or "")
+    text = str(section.get("text") or "")
+    if _contains_query(section_title, query, case_sensitive=case_sensitive):
+        return _parsed_hit(
+            paper_id,
+            section_id=section_id,
+            section_title=section_title,
+            snippet=_title_snippet(section_title, text),
+            matched_in="section_title",
+        )
+    if not _contains_query(text, query, case_sensitive=case_sensitive):
+        return None
+    return _parsed_hit(
+        paper_id,
+        section_id=section_id,
+        section_title=section_title,
+        snippet=_section_snippet(text, query, context=context, case_sensitive=case_sensitive),
+        matched_in="section_text",
+    )
+
+
+def _parsed_hit(
+    paper_id: str,
+    *,
+    section_id: str,
+    section_title: str,
+    snippet: str,
+    matched_in: str,
+) -> dict[str, Any]:
+    section_selector = section_id or section_title
+    return {
+        "paper_id": paper_id,
+        "section_id": section_id,
+        "section_title": section_title,
+        "matched_in": matched_in,
+        "snippet": snippet,
+        "get_section_mcp": f"get_section(paper_id={_mcp_string(paper_id)}, section={_mcp_string(section_selector)})",
+        "get_section_cli": (
+            f"arc-paper get-section {shlex.quote(paper_id)} --section {shlex.quote(section_selector)} --json"
+        ),
+        "get_metadata_mcp": f"get_metadata(paper_id={_mcp_string(paper_id)})",
+        "get_metadata_cli": f"arc-paper get-metadata {shlex.quote(paper_id)} --json",
+    }
+
+
+def _mcp_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _contains_query(text: str, query: str, *, case_sensitive: bool) -> bool:
+    return query in _normalize_search_text(text, case_sensitive=case_sensitive)
+
+
+def _normalize_search_text(text: str, *, case_sensitive: bool) -> str:
+    compact = " ".join(str(text or "").split())
+    return compact if case_sensitive else compact.lower()
+
+
+def _title_snippet(title: str, text: str) -> str:
+    lines = _snippet_lines(text)
+    if not lines:
+        return _clean_snippet(title)
+    return _clean_snippet("\n".join([title, lines[0]]))
+
+
+def _section_snippet(text: str, query: str, *, context: int, case_sensitive: bool) -> str:
+    lines = _snippet_lines(text)
+    for index, line in enumerate(lines):
+        if _contains_query(line, query, case_sensitive=case_sensitive):
+            start = max(0, index - context)
+            end = min(len(lines), index + context + 1)
+            return _clean_snippet("\n".join(lines[start:end]))
+    compact = _clean_snippet(text, max_length=1200)
+    match_at = _normalize_search_text(compact, case_sensitive=case_sensitive).find(query)
+    if match_at < 0:
+        return compact
+    start = max(0, match_at - 300)
+    end = min(len(compact), match_at + len(query) + 300)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(compact) else ""
+    return f"{prefix}{compact[start:end].strip()}{suffix}"
+
+
+def _snippet_lines(text: str) -> list[str]:
+    return [line for line in (_clean_snippet(raw) for raw in str(text or "").splitlines()) if line]
 
 
 def _search_with_ripgrep(

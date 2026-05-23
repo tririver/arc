@@ -3,6 +3,14 @@
 cache/
 arc-tests/
 
+# Local secrets and provider credentials
+.env
+.env.*
+!.env.example
+llm-providers.json
+llm-providers.local.json
+.arc-llm-providers.json
+
 # Python bytecode and caches
 __pycache__/
 *.py[cod]

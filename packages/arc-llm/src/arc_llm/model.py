@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import Mapping
 
+from .providers.config import ProviderConfigError, configured_provider
+
 
 PROVIDER_MODEL_ENV = {
     "codex-cli": "ARC_CODEX_MODEL",
@@ -55,9 +57,22 @@ def resolve_model(
     if model := env.get("ARC_LLM_MODEL"):
         return model
     tier = _resolve_tier(provider_name, model_tier, env=env)
+    if configured := _configured_provider(provider_name, env=env):
+        if tier:
+            if model := configured.model_for_tier(tier):
+                return model
+        if model := configured.default_model():
+            return model
     if tier:
         return _model_for_tier(provider_name, tier)
     return DEFAULT_PROVIDER_MODELS.get(provider_name)
+
+
+def _configured_provider(provider_name: str, *, env: Mapping[str, str]) :
+    try:
+        return configured_provider(provider_name, env=env)
+    except ProviderConfigError:
+        return None
 
 
 def _resolve_tier(provider_name: str, explicit_tier: str | None, *, env: Mapping[str, str]) -> str | None:

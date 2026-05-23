@@ -41,6 +41,9 @@ def test_provider_selection_prefers_env():
     assert provider.host.host == "codex"
 
 
-def test_provider_selection_uses_detected_host():
-    provider = select_llm_provider(env={}, process_chain=["claude -p"])
+def test_provider_selection_uses_detected_host(tmp_path):
+    provider = select_llm_provider(
+        env={"ARC_LLM_PROVIDER_CONFIG": str(tmp_path / "missing.json")},
+        process_chain=["claude -p"],
+    )
     assert provider.provider == "claude-cli"

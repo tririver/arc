@@ -29,7 +29,7 @@ def test_call_tool_extracts_paper_ids(monkeypatch):
 
 
 def test_call_tool_searches_full_text(monkeypatch):
-    def search_full_text(ids, *, query, refresh=False, limit=20, context=0, case_sensitive=False):
+    def search_full_text(ids, *, query, refresh=False, limit=20, context=1, case_sensitive=False):
         return {
             "ok": True,
             "data": {
@@ -62,6 +62,17 @@ def test_call_tool_searches_full_text(monkeypatch):
     assert result["data"]["limit"] == 5
     assert result["data"]["context"] == 2
     assert result["data"]["case_sensitive"] is True
+
+
+def test_call_tool_search_full_text_defaults_to_one_context_line(monkeypatch):
+    def search_full_text(ids, *, query, refresh=False, limit=20, context=1, case_sensitive=False):
+        return {"ok": True, "data": {"context": context}}
+
+    monkeypatch.setattr(server.service, "search_full_text", search_full_text)
+
+    result = server.call_tool("search_full_text", {"paper_id": "0911.3380", "query": "scalar exchange"})
+
+    assert result["data"]["context"] == 1
 
 
 def test_call_tool_paper_ids_safe_dir_name():
@@ -185,7 +196,7 @@ def test_fastmcp_tools_have_discovery_metadata():
 
     assert "natural-language text" in by_name["extract_paper_ids"].description
     assert "0911.3380" in by_name["paper_ids_safe_dir_name"].description
-    assert "cached ar5iv full text" in by_name["search_full_text"].description
+    assert "cached parsed ar5iv text" in by_name["search_full_text"].description
     assert "web search" in by_name["llm_infer_main_references"].description
     assert "arXiv papers" in by_name["get_title"].description
     assert "LLM summary" in by_name["llm_generate_summary"].description

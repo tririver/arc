@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "ARC LLM provider config. JSON does not support comments; this _comment field is informational.",
+    "Rename examples/llm-providers.example.json to llm-providers.json, then put it in one of these locations.",
+    "Project-local default: <your-arc-folder>/llm-providers.json",
+    "Linux user config: ~/.config/arc/llm-providers.json",
+    "macOS user config: ~/.config/arc/llm-providers.json",
+    "Windows user config: %USERPROFILE%\\.config\\arc\\llm-providers.json",
+    "This file may contain API keys. Keep real llm-providers.json files out of git."
+  ],
+  "schema_version": "arc.llm.providers.v1",
+  "default": "deepseek",
+  "providers": [
+    {
+      "id": "deepseek",
+      "type": "openai-compatible",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "replace-with-your-deepseek-api-key",
+      "models": {
+        "default": "deepseek-v4-flash",
+        "low": "deepseek-v4-flash",
+        "medium": "deepseek-v4-flash",
+        "high": "deepseek-v4-pro"
+      },
+      "json_mode": "json_schema"
+    },
+    {
+      "id": "ollama",
+      "type": "openai-compatible",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api_key_optional": true,
+      "models": {
+        "default": "llama3.1"
+      },
+      "json_mode": "json_object"
+    }
+  ]
+}
