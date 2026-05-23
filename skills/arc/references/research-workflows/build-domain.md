@@ -28,7 +28,19 @@ Do not substitute a paraphrased intent string into ARC calls.
 
 ### Phase 2: Build Domain Caches
 
-Step 1: For each `<seed-paper>` in `seed_paper_list`, call the MCP tool
+Concurrent domain builds are safe when each build targets a distinct ARC
+domain id. ARC writes domain artifacts under per-domain cache directories, MCP
+background jobs use per-job directories, and shared paper caches use atomic
+cache-file replacement. Do not run duplicate builds for the same domain id in
+parallel; keep one build for that domain, or run duplicate-domain rebuilds
+sequentially if `refresh=true`.
+
+Step 1: Resolve the domain id for each `<seed-paper>` with the exact
+`<user-intent>`. If multiple entries resolve to the same domain id, keep one
+entry for Phase 2 and record the duplicate in `<project-dir>/context.json` or a
+visible workflow note.
+
+Step 2: For each distinct `<seed-paper>` in `seed_paper_list`, call the MCP tool
 `llm_domain_build` with:
 
 ```text
@@ -41,17 +53,25 @@ workers=<workers>
 background=true
 ```
 
-Step 2: If the MCP response contains `status: "job_running"` and `job_id`,
-immediately run:
+If there is more than one distinct domain, launch all `llm_domain_build`
+background jobs before watching any of them. This allows independent domains to
+build concurrently while preserving per-job result inspection.
+
+Step 3: For every MCP response that contains `status: "job_running"` and
+`job_id`, run:
 
 ```bash
 arc-mcp jobs watch <job-id> --json
 ```
 
-Step 3: Inspect the returned JSON body. Do not treat command exit code alone as
-success. Continue only when the job result is successful. If the job failed,
-was cancelled, or returned `needs_llm`, print `WARNING:` with the reason and
-stop.
+Watch all launched jobs to a terminal result. If host or MCP execution cannot
+run jobs concurrently, fall back to watching/running them sequentially without
+changing the artifact contract.
+
+Step 4: Inspect each returned JSON body. Do not treat command exit code alone
+as success. Continue only when every domain job result is successful. If any
+job failed, was cancelled, or returned `needs_llm`, print `WARNING:` with the
+reason and stop before copying project-local artifacts.
 
 ### Phase 3: Copy Domain Artifacts
 
