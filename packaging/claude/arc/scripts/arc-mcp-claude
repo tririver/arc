@@ -7,4 +7,10 @@ export ARC_CLAUDE_MODEL="${ARC_CLAUDE_MODEL:-haiku}"
 export ARC_PAPER_CACHE="${ARC_PAPER_CACHE:-/arc-dev/cache/arc-paper}"
 export ARC_DOMAIN_CACHE="${ARC_DOMAIN_CACHE:-/arc-dev/cache/arc-domain}"
 
-exec arc-mcp "$@"
+if [[ -n "${ARC_MCP_COMMAND:-}" ]]; then
+  exec "${ARC_MCP_COMMAND}" "$@"
+elif [[ -x /arc-dev/packages/arc-paper/.venv/bin/arc-mcp ]]; then
+  exec /arc-dev/packages/arc-paper/.venv/bin/arc-mcp "$@"
+else
+  exec arc-mcp "$@"
+fi

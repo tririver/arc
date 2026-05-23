@@ -15,7 +15,8 @@ Read the relevant reference before calling ARC tools. These reads are required,
 not optional.
 
 - User choices, automation mode, and confirmation behavior: read
-  `references/rules/interaction.md`.
+  `references/rules/interaction.md`. Any ARC user question must use the
+  selection tool; do not wait for typed input.
 - Scientific claims, gap scoring, automated workflow decisions, warning
   behavior, or robustness-sensitive execution: read
   `references/rules/integrity.md`.

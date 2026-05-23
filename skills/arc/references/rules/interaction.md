@@ -1,7 +1,7 @@
 # ARC Interaction Reference
 
-Use this reference whenever ARC needs a user choice, confirmation, or mode
-decision.
+Use this reference whenever ARC needs any user question, choice,
+confirmation, or mode decision.
 
 ## Automation Modes
 
@@ -16,9 +16,11 @@ planning calculations.
 
 ## Discrete Selection Protocol
 
-Always ask choices through the host's discrete selection tool when it is
-available. The default/recommended option must be first, so pressing Enter
-chooses it.
+Always ask user questions through the host's discrete selection tool. Do not
+write a prose question or numbered list and wait for typed input.
+
+The default/recommended option must be first, so pressing Enter chooses it.
+The user can use arrow keys to choose another option.
 
 Every choice prompt must:
 
@@ -28,8 +30,9 @@ Every choice prompt must:
 - Avoid open-ended prose questions when a bounded choice can express the
   decision.
 
-If the host genuinely has no discrete selection UI/tool, show the same options
-as a numbered list with `Let's discuss` last.
+If the selection tool is unavailable and a question is required, stop and
+report that ARC cannot present the required selection UI in the current mode.
+Do not replace it with typed-input prompting.
 
 ## Existing Project Directory
 
