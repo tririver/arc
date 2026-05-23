@@ -40,9 +40,10 @@ cancel any job because it is slow or time consuming.
 ### Phase 1: Setup
 
 Step 1: Decide the automation level.
-If the user asks for automatic or non-interactive work, use `auto`. If the user
-asks to review or confirm steps, use `interactive`. If unclear, ask with the
-discrete selection protocol in `references/rules/interaction.md`.
+Use an explicit user choice. If the user asks for automatic or non-interactive
+work, use `auto`. If the user asks to review or confirm steps, use
+`interactive`. Do not treat `continue`, `resume`, or a bare approval to proceed
+as `auto`. 
 
 Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as
