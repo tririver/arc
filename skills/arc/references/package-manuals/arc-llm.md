@@ -47,6 +47,55 @@ JSON output:
 arc-llm run-json --prompt "Return {\"ok\": true}" --schema schema.json --provider auto --json
 ```
 
+## Proposers-Reviewer Loops
+
+Use the package loop for reusable LLM workflows where one or more proposers
+produce outputs, one reviewer responds, and the exchange repeats for a
+configured number of rounds.
+
+Run from a JSON config:
+
+```bash
+arc-llm proposers-reviewer-loop --config loop-config.json --json
+```
+
+Validate a config without LLM calls:
+
+```bash
+arc-llm proposers-reviewer-loop --config loop-config.json --dry-run --json
+```
+
+The config must set `run_dir` directly. ARC writes artifacts under:
+
+```text
+<run_dir>/<run_id>/
+```
+
+For example, the idea workflow uses:
+
+```json
+{
+  "run_dir": "<project-dir>/suggest-ideas",
+  "run_id": "<run-id>"
+}
+```
+
+The loop runner owns all artifact writes. Worker prompts and outputs are stored
+under per-loop and per-round directories, so distinct loops can run
+concurrently without sharing mutable context.
+
+Optional true-LLM integration tests are skipped by default. To run them
+explicitly:
+
+```bash
+ARC_RUN_LLM_TESTS=1 ARC_RUN_NET_TESTS=1 \
+  packages/arc-paper/.venv/bin/python -m pytest \
+  packages/arc-llm/tests/test_proposers_reviewer_llm_integration.py -q
+```
+
+Set `ARC_LLM_TEST_PROVIDER` or `ARC_LLM_TEST_MODEL` to override the provider or
+model for that opt-in run.
+
 ## Runtime Options
 
 By default ARC keeps provider calls lightweight. Enable extra capability only

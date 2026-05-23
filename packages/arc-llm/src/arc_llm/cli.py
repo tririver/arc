@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .host import detect_host, select_llm_provider
+from .proposers_reviewer.runner import run_proposers_reviewer_batch
 from .runner import resolve_llm_config, run_json, run_text
 
 
@@ -41,6 +42,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run_text_parser.add_argument("--model", default=None)
     _shared_runtime_args(run_text_parser)
     _llm_runtime_args(run_text_parser)
+
+    loop_parser = sub.add_parser("proposers-reviewer-loop")
+    loop_parser.add_argument("--config", required=True)
+    loop_parser.add_argument("--json", action="store_true")
+    loop_parser.add_argument("--dry-run", action="store_true")
+    loop_parser.add_argument("--max-concurrent-loops", type=int, default=None)
 
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
@@ -82,6 +89,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
             provider=args.provider,
             model=args.model,
             env=_runtime_env(args),
+        )
+    if args.command == "proposers-reviewer-loop":
+        return run_proposers_reviewer_batch(
+            _read_json_file(args.config),
+            dry_run=args.dry_run,
+            max_concurrent_loops=args.max_concurrent_loops,
         )
     raise AssertionError(f"Unhandled command: {args.command}")
 
@@ -184,6 +197,13 @@ def _read_schema(value: str | None) -> dict[str, Any] | None:
     if not value:
         return None
     return json.loads(Path(value).read_text(encoding="utf-8"))
+
+
+def _read_json_file(value: str) -> dict[str, Any]:
+    payload = json.loads(Path(value).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON file must contain an object: {value}")
+    return payload
 
 
 if __name__ == "__main__":
