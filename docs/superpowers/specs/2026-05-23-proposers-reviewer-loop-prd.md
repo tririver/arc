@@ -42,8 +42,8 @@ prompt context, runtime permissions, or output files.
 - Provide a reusable `arc-llm` proposers-reviewer loop for idea generation,
   calculation comparison, and later ARC workflows.
 - Accept a JSON configuration file rather than complex CLI strings.
-- Let callers configure the runs directory in JSON so different ARC workflows
-  can keep independent run roots.
+- Let callers configure the run directory in JSON so different ARC workflows
+  can keep independent shallow run roots.
 - Support multiple proposers per loop.
 - Support exactly one reviewer per loop in v1 while preserving a config shape
   that can later support multiple reviewers.
@@ -165,7 +165,7 @@ The config is one run containing one or more independent loops.
 {
   "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
   "run_id": "idea-test-2026-05-23",
-  "runs_dir": "project/suggest-ideas/runs",
+  "run_dir": "project/suggest-ideas",
   "max_concurrent_loops": 2,
   "defaults": {
     "provider": "auto",
@@ -226,8 +226,8 @@ The config is one run containing one or more independent loops.
 ### Validation Rules
 
 - `schema_version` must be recognized.
-- `runs_dir` is required and points to the directory that contains run
-  subdirectories.
+- `run_dir` is required and points to the configured workflow run directory
+  that contains `<run_id>` subdirectories.
 - `run_id` must be filesystem-safe after normalization.
 - `loop_id` values must be unique within the run.
 - v1 requires exactly one reviewer in `reviewers`.
@@ -305,13 +305,13 @@ The reviewer prompt includes all current-round proposer outputs.
 
 ## Directory Structure
 
-Use one caller-configured runs directory with isolated run and loop
-subdirectories. The `runs_dir` field points directly at the directory that
-contains `<run_id>` directories; `arc-llm` must not append another hard-coded
-`runs/` component.
+Use one caller-configured run directory with isolated run and loop
+subdirectories. The `run_dir` field points directly at the configured workflow
+directory that contains `<run_id>` directories; `arc-llm` must not append an
+intermediate hard-coded `runs/` component.
 
 ```text
-<runs_dir>/
+<run_dir>/
   <run_id>/
     config.json
     manifest.json
@@ -342,14 +342,14 @@ contains `<run_id>` directories; `arc-llm` must not append another hard-coded
             ...
 ```
 
-Example workflow-specific run roots:
+Example workflow-specific run directories:
 
 ```json
-{ "runs_dir": "project/suggest-ideas/runs" }
+{ "run_dir": "project/suggest-ideas" }
 ```
 
 ```json
-{ "runs_dir": "project/calculate/runs" }
+{ "run_dir": "project/calculate" }
 ```
 
 `manifest.json` records the run-level plan and loop paths. `state.json` records
@@ -453,7 +453,7 @@ thin orchestration workflow:
 1. Read `<project-dir>/context.json`.
 2. Ensure `build-domain.md` has produced domain artifacts.
 3. Build an `arc-llm` loop config with
-   `runs_dir=<project-dir>/suggest-ideas/runs`.
+   `run_dir=<project-dir>/suggest-ideas`.
 4. Launch two independent idea loops for the initial test.
 5. Set `max_concurrent_loops=2`.
 6. Set `max_rounds=5`.
@@ -522,7 +522,7 @@ loop artifacts through the package writer.
 - `arc-llm proposers-reviewer-loop --config <config.json> --json` runs a fake
   provider test config with two loops concurrently and produces isolated loop
   directories.
-- The runner writes under the configured `runs_dir/<run_id>/` path without
+- The runner writes under the configured `run_dir/<run_id>/` path without
   appending an extra implicit `runs/` component.
 - Each loop records all prompts, contexts, outputs, reviews, state, and
   transcript entries for every completed round.
