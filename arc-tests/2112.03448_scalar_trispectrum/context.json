@@ -1,0 +1,15 @@
+{
+  "automation_level": "auto",
+  "workflow": "suggest-ideas",
+  "original_request": "test idea generation: try the following \"related to 2112.03448, find a research direction in calculating scalar trispectrum.\" See if it can trigger idea generation, and how the result goes",
+  "user_intent": "related to 2112.03448, find a research direction in calculating scalar trispectrum",
+  "project_dir": "/arc-dev/arc-tests/2112.03448_scalar_trispectrum",
+  "seed_paper_list": [
+    "2112.03448"
+  ],
+  "provider": "auto",
+  "model": null,
+  "model_tier": "high",
+  "workers": 4,
+  "refresh": false
+}

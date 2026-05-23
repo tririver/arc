@@ -457,16 +457,19 @@ thin orchestration workflow:
 5. Set `max_concurrent_loops=2`.
 6. Set `max_rounds=5`.
 7. Set `early_stop.enabled=false`.
-8. Give the idea proposer the user intent and internet permission.
-9. Optionally give proposers domain summaries and ARC paper-tool access notes.
+8. Give the idea proposer the user intent, internet permission, and MCP
+   permission.
+9. Attach every `<project-dir>/domain/**/*.md` file, including reports from
+   multiple built domains, and ARC paper-tool guidance to proposer context;
+   exclude non-Markdown artifacts and noisy project files.
 10. Give the reviewer full available permissions.
 11. Use strong configured models for proposer and reviewer.
 12. Preserve all loop artifacts.
 13. Report artifact paths and state that final idea selection is based on the
     recorded loop artifacts, not memory.
 
-The workflow may later vary loop configs to test whether domain summaries,
-paper tools, internet access, or other context improves idea quality.
+The workflow may later vary loop configs to test which domain Markdown files,
+tool permissions, or distilled context improve idea quality.
 
 ## Security And Permission Model
 

@@ -1,0 +1,148 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "controller",
+    "proposer_messages",
+    "review_payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "arc.llm.review_envelope.v1"
+    },
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "message",
+        "stop_requested"
+      ],
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "stop_requested": {
+          "type": "boolean"
+        }
+      }
+    },
+    "proposer_messages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proposer_001"
+      ],
+      "properties": {
+        "proposer_001": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "message"
+          ],
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "review_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "marks",
+        "reviewer_benchmark",
+        "improvement_comments",
+        "evidence_checked",
+        "tool_queries_used"
+      ],
+      "properties": {
+        "marks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "newness_evidence",
+            "feasibility",
+            "scientific_value",
+            "user_intent_fit",
+            "first_calculation_clarity",
+            "total_score"
+          ],
+          "properties": {
+            "newness_evidence": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "feasibility": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "scientific_value": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "user_intent_fit": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "first_calculation_clarity": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "total_score": {
+              "type": "number",
+              "minimum": 5,
+              "maximum": 25
+            }
+          }
+        },
+        "reviewer_benchmark": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "same_direction_alternative",
+            "preserves_proposer_direction",
+            "comparison"
+          ],
+          "properties": {
+            "same_direction_alternative": {
+              "type": "string"
+            },
+            "preserves_proposer_direction": {
+              "type": "boolean"
+            },
+            "comparison": {
+              "type": "string"
+            }
+          }
+        },
+        "improvement_comments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence_checked": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tool_queries_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": "arc.llm.proposers_reviewer_manifest.v1",
+  "run_id": "smoke_20260523T0543Z",
+  "loops": [
+    {
+      "loop_id": "idea_001",
+      "path": "/arc-dev/arc-tests/2112.03448_scalar_trispectrum/suggest-ideas/smoke_20260523T0543Z/loops/idea_001"
+    },
+    {
+      "loop_id": "idea_002",
+      "path": "/arc-dev/arc-tests/2112.03448_scalar_trispectrum/suggest-ideas/smoke_20260523T0543Z/loops/idea_002"
+    }
+  ]
+}

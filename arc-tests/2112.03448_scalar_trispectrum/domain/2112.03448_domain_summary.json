@@ -1,0 +1,221 @@
+{
+  "schema_version": "arc.domain_summary.v1",
+  "domain_title": "Cosmological collider and cosmological bootstrap for scalar trispectra",
+  "brief_introduction": "This domain studies primordial cosmological correlators, especially scalar trispectra, using bootstrap, symmetry, unitarity, cutting, dispersion, and related amplitude-inspired methods. The main goal is to reconstruct late-time inflationary observables directly from boundary consistency conditions, often by relating them to flat-space amplitudes, then extending to exchange, spin, loop, and strongly coupled sectors.",
+  "foundation_paper": {
+    "paper_id": "arXiv:1811.00024",
+    "title": "The Cosmological Bootstrap: Inflationary Correlators from Symmetries and Singularities",
+    "reason": "It directly develops analytic four-point inflationary correlators and the symmetry/singularity bootstrap logic used by later trispectrum and cosmological-collider papers."
+  },
+  "methodology": [
+    {
+      "claim": "Core method: fix correlators from symmetries, singularities, and absence of unphysical poles rather than bulk time evolution.",
+      "papers": [
+        "arXiv:1811.00024",
+        "arXiv:2103.08649",
+        "arXiv:2009.02898"
+      ]
+    },
+    {
+      "claim": "Weight-shifting and spin-raising operators generate spinning or massless external correlators from scalar seeds.",
+      "papers": [
+        "arXiv:1811.00024",
+        "arXiv:2005.04234",
+        "arXiv:1910.14051"
+      ]
+    },
+    {
+      "claim": "Contact trispectra and higher-point contact terms can be reconstructed from flat-space amplitudes via contact reconstruction / dressing rules.",
+      "papers": [
+        "arXiv:2106.15468",
+        "arXiv:2602.03841",
+        "arXiv:2404.05712"
+      ]
+    },
+    {
+      "claim": "Unitarity-based cutting rules and dispersion relations reconstruct correlators from discontinuities and enforce sum rules.",
+      "papers": [
+        "arXiv:2104.06587",
+        "arXiv:2602.05546",
+        "arXiv:2602.03841"
+      ]
+    },
+    {
+      "claim": "Loop and spectral methods extend the program beyond tree level, including one-loop and resummed signals.",
+      "papers": [
+        "arXiv:2211.03810",
+        "arXiv:2601.00952",
+        "arXiv:2602.09977",
+        "arXiv:2408.16386"
+      ]
+    }
+  ],
+  "mainstream_directions": [
+    {
+      "direction": "Scalar trispectrum and contact reconstruction",
+      "papers": [
+        "arXiv:2106.15468",
+        "arXiv:2502.04434",
+        "arXiv:2502.06931"
+      ]
+    },
+    {
+      "direction": "Boostless / boost-breaking cosmological collider bootstrap",
+      "papers": [
+        "arXiv:2010.12818",
+        "arXiv:2205.00013",
+        "arXiv:2603.15728"
+      ]
+    },
+    {
+      "direction": "Unitarity, cuts, and dispersion for correlators",
+      "papers": [
+        "arXiv:2104.06587",
+        "arXiv:2602.03841",
+        "arXiv:2602.05546"
+      ]
+    },
+    {
+      "direction": "Loop-level cosmological correlators and spectral decomposition",
+      "papers": [
+        "arXiv:2211.03810",
+        "arXiv:2601.00952",
+        "arXiv:2602.09977",
+        "arXiv:2408.16386"
+      ]
+    },
+    {
+      "direction": "Geometric/combinatorial formulations: polytopes, tubings, kinematic flow, cluster structure",
+      "papers": [
+        "arXiv:1709.02813",
+        "arXiv:2312.05303",
+        "arXiv:2504.14890",
+        "arXiv:2603.08670",
+        "arXiv:2412.19881"
+      ]
+    },
+    {
+      "direction": "Spin, Grassmannian, and higher-spin correlators",
+      "papers": [
+        "arXiv:2005.04234",
+        "arXiv:2602.07117",
+        "arXiv:2603.24656",
+        "arXiv:2508.21633"
+      ]
+    },
+    {
+      "direction": "Strongly coupled sectors and unparticles in inflation",
+      "papers": [
+        "arXiv:2503.17840",
+        "arXiv:2512.23796",
+        "arXiv:2603.13486"
+      ]
+    }
+  ],
+  "open_questions": [
+    {
+      "question": "How can exchange trispectra be reconstructed as cleanly as contact terms, especially beyond tree level?",
+      "papers": [
+        "arXiv:2106.15468",
+        "arXiv:2602.05546",
+        "arXiv:2502.04434"
+      ]
+    },
+    {
+      "question": "What is the systematic boundary-only formulation of the boostless bootstrap for exchange and spinning correlators?",
+      "papers": [
+        "arXiv:2010.12818",
+        "arXiv:2205.00013",
+        "arXiv:2602.07117"
+      ]
+    },
+    {
+      "question": "What is the general loop-level basis, and how do singularities organize across loops and different backgrounds?",
+      "papers": [
+        "arXiv:2211.03810",
+        "arXiv:2601.00952",
+        "arXiv:2408.16386"
+      ]
+    },
+    {
+      "question": "Can the geometric/combinatorial structures (cosmohedra, tubings, cluster adjacency, kinematic flow) unify full correlators, not just integrands or selected graph families?",
+      "papers": [
+        "arXiv:2412.19881",
+        "arXiv:2504.14890",
+        "arXiv:2603.08670",
+        "arXiv:2312.05303"
+      ]
+    },
+    {
+      "question": "How far do the cosmological collider signatures remain distinguishable once one includes realistic backgrounds, boosts breaking, loops, and observational systematics?",
+      "papers": [
+        "arXiv:2603.15728",
+        "arXiv:2502.06931",
+        "arXiv:2602.12232",
+        "arXiv:2602.09977"
+      ]
+    }
+  ],
+  "reading_guide": [
+    {
+      "purpose": "Start here for the field logic and the selected foundation.",
+      "papers": [
+        "arXiv:1811.00024",
+        "arXiv:1503.08043"
+      ]
+    },
+    {
+      "purpose": "For trispectrum reconstruction and the bridge from flat-space amplitudes.",
+      "papers": [
+        "arXiv:2106.15468",
+        "arXiv:2602.03841",
+        "arXiv:2602.05546"
+      ]
+    },
+    {
+      "purpose": "For bootstrap rules, exchange diagrams, and spin.",
+      "papers": [
+        "arXiv:2103.08649",
+        "arXiv:2010.12818",
+        "arXiv:2005.04234",
+        "arXiv:2205.00013"
+      ]
+    },
+    {
+      "purpose": "For loop corrections and spectral methods.",
+      "papers": [
+        "arXiv:2211.03810",
+        "arXiv:2601.00952",
+        "arXiv:2602.09977",
+        "arXiv:2408.16386"
+      ]
+    },
+    {
+      "purpose": "For geometry and combinatorics of correlators.",
+      "papers": [
+        "arXiv:1709.02813",
+        "arXiv:2312.05303",
+        "arXiv:2504.14890",
+        "arXiv:2603.08670",
+        "arXiv:2412.19881"
+      ]
+    },
+    {
+      "purpose": "For phenomenology and observational searches of collider signals.",
+      "papers": [
+        "arXiv:2603.15728",
+        "arXiv:2502.04434",
+        "arXiv:2502.06931",
+        "arXiv:2602.12232"
+      ]
+    }
+  ],
+  "warnings": [
+    "Seed paper arXiv:2112.03448 has fewer than 100 citations, so it is not ideal as a foundation under a citation-support rule.",
+    "Several listed 2026 papers are very recent and may be provisional.",
+    "5 papers have no cached conclusion/outlook/discussion section."
+  ],
+  "summary_method": "llm",
+  "domain_id": "arXiv_2112_03448_8580a5dc85",
+  "created_at": "2026-05-23T05:43:05.358015+00:00"
+}

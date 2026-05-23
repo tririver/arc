@@ -1,0 +1,55 @@
+{
+  "schema_version": "arc.llm.review_envelope.v1",
+  "controller": {
+    "message": "Review complete. No stop requested, but the next proposer pass should tighten novelty against recent single-exchange trispectrum work and fix the branch structure of the collapsed-limit target.",
+    "stop_requested": false
+  },
+  "proposer_messages": {
+    "proposer_001": {
+      "message": "The direction is well matched to the request: it uses the 2112.03448 cutting-rule viewpoint on a scalar trispectrum calculation, gives a concrete first channel, and proposes useful checks against cutting, contact ambiguity, and CMB templates. The main weakness is novelty evidence. A December 2025 paper, arXiv:2512.07941, is directly about single massive-scalar exchange in the trispectrum and its local/nonlocal split, so the proposal needs to explain what is not already covered there. Also fix or clarify the schematic nonanalytic scaling: the displayed product has opposite ±iμ powers on the two sides, which cancels the q-oscillatory phase; the first deliverable should define the branch basis and normalization precisely."
+    }
+  },
+  "review_payload": {
+    "marks": {
+      "newness_evidence": 2.0,
+      "feasibility": 3.7,
+      "scientific_value": 3.2,
+      "user_intent_fit": 4.4,
+      "first_calculation_clarity": 2.8,
+      "total_score": 16.1
+    },
+    "reviewer_benchmark": {
+      "same_direction_alternative": "A stronger same-direction benchmark would be an operator-basis cut/dispersion atlas for principal-series scalar exchange in the scalar trispectrum: start with sigma dot(pi)^2, but formulate the result as branch coefficients for the independent boost-breaking pi-pi-sigma cubic vertices, arbitrary c_sigma/c_pi, and a Keldysh/dispersive local-vs-nonlocal split checked against arXiv:2104.06587, arXiv:2512.07941, arXiv:2602.05546, and arXiv:2602.03841. The first calculation would still be the s-channel collapsed coefficient and phase, but with the four branch pairings, normalization, and zeta conversion explicitly fixed.",
+      "preserves_proposer_direction": true,
+      "comparison": "The proposer’s idea is narrower and probably more feasible as a first calculation, but it is weaker than this benchmark on novelty protection and on defining exactly which nonanalytic branch data are being computed. It is roughly equal on user-intent fit because both are centered on the 2112.03448 cutting-rule perspective and scalar trispectra."
+    },
+    "improvement_comments": [
+      "Add arXiv:2512.07941 to the prior-art gate. Its abstract says it focuses on single massive-scalar exchange in the trispectrum and decomposes the signal into local and nonlocal pieces using Keldysh heavy-field propagators, which is very close to the proposed novelty claim.",
+      "Check older quasi-single-field trispectrum literature explicitly, starting with arXiv:0911.3380, before claiming the sigma dot(pi)^2 collapsed trispectrum coefficient is new.",
+      "Clarify the collapsed-limit branch structure. The displayed term (q/K_L)^(3/2+i mu)(q/K_R)^(3/2-i mu) is not visibly oscillatory in q; the target should specify whether the physical nonanalytic terms are same-branch products, mixed-branch products, or a basis of all branch pairings.",
+      "Specify conventions needed for a reproducible coefficient: canonical normalization, pi and sigma sound speeds, mass parameter, coupling dimension, zeta = -H pi conversion, time-coordinate powers, and whether analytic/contact terms are being subtracted before or after permutations.",
+      "Do not use arXiv:1811.00024 as the only benchmark for the first check. It is essential, but the direct scalar-exchange/cut comparison should also pass arXiv:2104.06587 and the newer local/nonlocal split in arXiv:2512.07941.",
+      "Strengthen the publishable angle by moving from a single vertex to a small boost-breaking cubic-operator basis, or by proving that sigma dot(pi)^2 with c_sigma != 1 gives a template-distinguishable phase/pair-ratio dependence not already captured by Philcox-style separable templates.",
+      "For the phenomenology check, define whether the projection uses only the collapsed-limit template or a completed four-point shape; the latter is needed if the claim is distinguishability in actual CMB trispectrum estimators."
+    ],
+    "evidence_checked": [
+      "ARC MCP get_metadata was attempted first for the key papers and again for arXiv:2512.07941; both calls returned as cancelled, so source checks used arXiv pages afterward.",
+      "arXiv:2112.03448: cutting rule for cosmological collider signals, classifying local and nonlocal signal origins and extracting them analytically. https://arxiv.org/abs/2112.03448",
+      "arXiv:2104.06587: single-cut rules, including an explicit check for four massless scalars exchanging a massive scalar. https://arxiv.org/abs/2104.06587",
+      "arXiv:1811.00024: analytic four-point scalar-exchange bootstrap and weight-shifting relation to massless scalars. https://arxiv.org/abs/1811.00024",
+      "arXiv:2106.15468: general boostless scalar contact trispectrum and contact reconstruction from amplitudes. https://arxiv.org/abs/2106.15468",
+      "arXiv:2205.00013: boost-breaking massive-exchange scalar bispectra, including phase changes and sound-speed effects. https://arxiv.org/abs/2205.00013",
+      "arXiv:2502.04434: CMB trispectrum templates and estimators including scalar field exchange and massive exchange. https://arxiv.org/abs/2502.04434",
+      "arXiv:2602.05546 and arXiv:2602.03841: 2026 dispersion/discontinuity reconstruction and dressing-rule context. https://arxiv.org/abs/2602.05546 ; https://arxiv.org/abs/2602.03841",
+      "arXiv:2512.07941: directly relevant single massive-scalar exchange trispectrum, local/nonlocal Keldysh split, open EFT interpretation. https://arxiv.org/abs/2512.07941",
+      "arXiv:0911.3380: quasi-single-field inflation paper already emphasizing potentially large trispectra. https://arxiv.org/abs/0911.3380"
+    ],
+    "tool_queries_used": [
+      "mcp__arc.get_metadata for 2112.03448, 1811.00024, 2106.15468, 2104.06587, 2205.00013, 2502.04434, 2602.05546, 2602.03841 -> cancelled",
+      "mcp__arc.get_metadata for 2512.07941 -> cancelled",
+      "web.open for arXiv pages 2112.03448, 2104.06587, 2106.15468, 2205.00013, 2502.04434, 1811.00024, 2602.05546, 2602.03841, 2512.07941, 0911.3380, 2404.09547",
+      "web.search_query: sigma dot pi trispectrum quasi single field exchange scalar trispectrum; scalar trispectrum massive scalar exchange cosmological collider; quasi-single-field trispectrum massive scalar exchange; boost-breaking scalar exchange trispectrum",
+      "tool_search for subagent tooling; no subagent was spawned because the discovered spawn tool explicitly requires an explicit user request for delegation"
+    ]
+  }
+}
