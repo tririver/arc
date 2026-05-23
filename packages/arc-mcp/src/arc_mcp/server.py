@@ -20,7 +20,7 @@ MCP_JOBS = MCPJobManager(max_workers=1)
 SERVER_INSTRUCTIONS = (
     "Use ARC when a user asks about theoretical-physics papers or arXiv papers: "
     "titles, abstracts, authors, references, citing papers, citation counts, "
-    "ar5iv table of contents, sections, equation context, cached LLM paper summaries, "
+    "ar5iv table of contents, sections, full-text search, equation context, cached LLM paper summaries, "
     "or cached research-domain artifacts from a seed paper. "
     "Tools that may call an LLM provider are prefixed with llm_. "
     "Paper IDs may be passed with or without the arXiv: prefix, as INSPIRE recids, "
@@ -42,6 +42,10 @@ ENRICH_REFERENCES_DESCRIPTION = (
 )
 SECTION_DESCRIPTION = "Section heading, section number, or section id to retrieve from the ar5iv full text."
 QUERY_DESCRIPTION = "Equation label, symbol, or phrase to find nearby equation context in the paper."
+FULL_TEXT_QUERY_DESCRIPTION = "Word or phrase to search for in cached ar5iv full text."
+SEARCH_LIMIT_DESCRIPTION = "Maximum number of full-text search hits to return, clamped to 1..200."
+SEARCH_CONTEXT_DESCRIPTION = "Number of nearby cached full-text lines to include before and after each hit, clamped to 0..5."
+CASE_SENSITIVE_DESCRIPTION = "When true, full-text search is case-sensitive."
 TEXT_DESCRIPTION = "Natural-language text that may contain arXiv, INSPIRE, or DOI paper identifiers."
 BATCH_NAME_DESCRIPTION = "Name of a summary batch stored in ARC's local SQLite batch database."
 DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific interest or desired subfield scope."
@@ -64,6 +68,10 @@ Refresh = Annotated[bool, Field(description=REFRESH_DESCRIPTION)]
 EnrichReferences = Annotated[bool, Field(description=ENRICH_REFERENCES_DESCRIPTION)]
 Section = Annotated[str, Field(description=SECTION_DESCRIPTION)]
 EquationQuery = Annotated[str, Field(description=QUERY_DESCRIPTION)]
+FullTextQuery = Annotated[str, Field(description=FULL_TEXT_QUERY_DESCRIPTION)]
+SearchLimit = Annotated[int, Field(description=SEARCH_LIMIT_DESCRIPTION)]
+SearchContext = Annotated[int, Field(description=SEARCH_CONTEXT_DESCRIPTION)]
+CaseSensitive = Annotated[bool, Field(description=CASE_SENSITIVE_DESCRIPTION)]
 NaturalText = Annotated[str, Field(description=TEXT_DESCRIPTION)]
 BatchName = Annotated[str, Field(description=BATCH_NAME_DESCRIPTION)]
 DomainIntent = Annotated[str, Field(description=DOMAIN_INTENT_DESCRIPTION)]
@@ -111,6 +119,14 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         _paper_ids(args),
         str(args["section"]),
         refresh=bool(args.get("refresh", False)),
+    ),
+    "search_full_text": lambda args: service.search_full_text(
+        _paper_ids(args),
+        query=str(args.get("query", "")),
+        refresh=bool(args.get("refresh", False)),
+        limit=int(args.get("limit", 20)),
+        context=int(args.get("context", 0)),
+        case_sensitive=bool(args.get("case_sensitive", False)),
     ),
     "get_equation_context": lambda args: service.get_equation_context(
         _paper_ids(args),
@@ -697,6 +713,30 @@ def _register_tools(app: Any) -> None:
         refresh: Refresh = False,
     ) -> Any:
         return service.get_section(_one_or_many(paper_id, paper_ids), section, refresh=refresh)
+
+    @app.tool(
+        description=(
+            "Search cached ar5iv full text for one or more papers, or all cached papers when no paper_id "
+            "is supplied. Use this to check whether terms, methods, or proposed ideas appear in cached papers."
+        )
+    )
+    def search_full_text(
+        query: FullTextQuery,
+        paper_id: PaperId = None,
+        paper_ids: PaperIds = None,
+        refresh: Refresh = False,
+        limit: SearchLimit = 20,
+        context: SearchContext = 0,
+        case_sensitive: CaseSensitive = False,
+    ) -> Any:
+        return service.search_full_text(
+            _one_or_many(paper_id, paper_ids),
+            query=query,
+            refresh=refresh,
+            limit=limit,
+            context=context,
+            case_sensitive=case_sensitive,
+        )
 
     @app.tool(
         description=(

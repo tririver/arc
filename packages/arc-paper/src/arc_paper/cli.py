@@ -76,6 +76,15 @@ def main(argv: list[str] | None = None) -> int:
     section.add_argument("--refresh", action="store_true")
     section.add_argument("--json", action="store_true")
 
+    search_full_text = sub.add_parser("search-full-text")
+    search_full_text.add_argument("paper_ids", nargs="*")
+    search_full_text.add_argument("--query", required=True)
+    search_full_text.add_argument("--refresh", action="store_true")
+    search_full_text.add_argument("--limit", type=int, default=20)
+    search_full_text.add_argument("--context", type=int, default=0)
+    search_full_text.add_argument("--case-sensitive", action="store_true")
+    search_full_text.add_argument("--json", action="store_true")
+
     equation = sub.add_parser("get-equation-context")
     equation.add_argument("paper_ids", nargs="+")
     equation.add_argument("--query", required=True)
@@ -216,6 +225,18 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.get_toc(paper_ids, refresh=args.refresh)
     if command == "get-section":
         return service.get_section(paper_ids, args.section, refresh=args.refresh)
+    if command == "search-full-text":
+        search_ids = None
+        if args.paper_ids:
+            search_ids = args.paper_ids[0] if len(args.paper_ids) == 1 else args.paper_ids
+        return service.search_full_text(
+            search_ids,
+            query=args.query,
+            refresh=args.refresh,
+            limit=args.limit,
+            context=args.context,
+            case_sensitive=args.case_sensitive,
+        )
     if command == "get-equation-context":
         return service.get_equation_context(paper_ids, args.query, refresh=args.refresh)
     if command in {"get-llm-summary", "llm-summary"}:

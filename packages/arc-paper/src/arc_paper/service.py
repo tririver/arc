@@ -4,6 +4,7 @@ import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from .cache import CachePaths, cache_root, now_iso, read_json, text_query_cache_path, write_json
 from .ids import arxiv_path_id
@@ -18,6 +19,7 @@ from .providers import Ar5ivProvider, InspireProvider
 from .providers.base import ProviderError
 from .reference_inference import ReferenceInferenceError, infer_main_references
 from .results import err, ok
+from .search import FullTextSearchFile, search_cached_full_text
 from .summary.input_pack import build_input_pack
 from .summary.providers.select import select_summary_provider
 from .summary.schema import load_summary_prompt, load_summary_schema
@@ -188,6 +190,39 @@ def get_equation_context(ids: str | Iterable[str], query: str, *, refresh: bool 
     return _map(ids, lambda paper_id: _equation_one(paper_id, query, refresh=refresh))
 
 
+def search_full_text(
+    ids: str | Iterable[str] | None,
+    *,
+    query: str,
+    refresh: bool = False,
+    limit: int = 20,
+    context: int = 0,
+    case_sensitive: bool = False,
+) -> dict[str, Any]:
+    try:
+        files, missing_papers = _full_text_search_files(ids, refresh=refresh)
+        hits, meta = search_cached_full_text(
+            files,
+            query,
+            limit=limit,
+            context=context,
+            case_sensitive=case_sensitive,
+        )
+    except ValueError as exc:
+        return err("search_query_required", str(exc))
+    except ProviderError as exc:
+        return err(exc.code, exc.message)
+    except Exception as exc:
+        return err("paper_search_error", str(exc))
+    return ok(
+        hits,
+        provider="local-cache",
+        query=(query or "").strip(),
+        missing_papers=missing_papers,
+        **meta,
+    )
+
+
 def get_llm_summary(
     ids: str | Iterable[str],
     *,
@@ -313,6 +348,35 @@ def _parsed(paper_id: str, *, refresh: bool) -> dict[str, Any]:
     parsed = parse_html(html, paper_id=normalize_paper_id(full_text_id))
     write_json(paths.ar5iv_parsed, parsed)
     return parsed
+
+
+def _full_text_search_files(
+    ids: str | Iterable[str] | None,
+    *,
+    refresh: bool,
+) -> tuple[list[FullTextSearchFile], list[str]]:
+    if ids is None:
+        return _all_cached_full_text_files(), []
+    raw_ids = [ids] if isinstance(ids, str) else list(ids or [])
+    files_by_path: dict[Path, FullTextSearchFile] = {}
+    missing: list[str] = []
+    for raw in raw_ids:
+        full_text_id = _full_text_paper_id(str(raw), refresh=refresh)
+        paths = CachePaths.for_paper(full_text_id)
+        if refresh:
+            _ar5iv.get_html(full_text_id, refresh=True)
+        if paths.ar5iv_html.exists():
+            files_by_path[paths.ar5iv_html] = FullTextSearchFile(full_text_id, paths.ar5iv_html)
+        else:
+            missing.append(full_text_id)
+    return list(files_by_path.values()), missing
+
+
+def _all_cached_full_text_files() -> list[FullTextSearchFile]:
+    files = []
+    for path in sorted((cache_root() / "papers").glob("*/ar5iv/fulltext.html")):
+        files.append(FullTextSearchFile(unquote(path.parent.parent.name), path))
+    return files
 
 
 def _full_text_paper_id(paper_id: str, *, refresh: bool) -> str:

@@ -28,6 +28,42 @@ def test_call_tool_extracts_paper_ids(monkeypatch):
     assert result == {"ok": True, "data": ["0911.3380"]}
 
 
+def test_call_tool_searches_full_text(monkeypatch):
+    def search_full_text(ids, *, query, refresh=False, limit=20, context=0, case_sensitive=False):
+        return {
+            "ok": True,
+            "data": {
+                "ids": ids,
+                "query": query,
+                "refresh": refresh,
+                "limit": limit,
+                "context": context,
+                "case_sensitive": case_sensitive,
+            },
+        }
+
+    monkeypatch.setattr(server.service, "search_full_text", search_full_text)
+
+    result = server.call_tool(
+        "search_full_text",
+        {
+            "paper_id": "0911.3380",
+            "query": "scalar trispectrum",
+            "refresh": True,
+            "limit": 5,
+            "context": 2,
+            "case_sensitive": True,
+        },
+    )
+
+    assert result["data"]["ids"] == "0911.3380"
+    assert result["data"]["query"] == "scalar trispectrum"
+    assert result["data"]["refresh"] is True
+    assert result["data"]["limit"] == 5
+    assert result["data"]["context"] == 2
+    assert result["data"]["case_sensitive"] is True
+
+
 def test_call_tool_paper_ids_safe_dir_name():
     result = server.call_tool("paper_ids_safe_dir_name", {"paper_ids": ["0911.3380", "astro-ph/0610514"]})
 
@@ -149,11 +185,13 @@ def test_fastmcp_tools_have_discovery_metadata():
 
     assert "natural-language text" in by_name["extract_paper_ids"].description
     assert "0911.3380" in by_name["paper_ids_safe_dir_name"].description
+    assert "cached ar5iv full text" in by_name["search_full_text"].description
     assert "web search" in by_name["llm_infer_main_references"].description
     assert "arXiv papers" in by_name["get_title"].description
     assert "LLM summary" in by_name["llm_generate_summary"].description
     assert "INSPIRE metadata" in by_name["get_metadata"].description
     assert by_name["get_title"].inputSchema["properties"]["paper_id"]["description"].startswith("Single paper")
+    assert "query" in by_name["search_full_text"].inputSchema["properties"]
     assert "limit" in by_name["get_citers"].inputSchema["properties"]
     assert "sort" in by_name["get_citers"].inputSchema["properties"]
     assert "enrich" in by_name["get_references"].inputSchema["properties"]

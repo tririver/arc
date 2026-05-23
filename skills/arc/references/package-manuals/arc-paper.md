@@ -1,8 +1,9 @@
 # Arc Paper Package
 
 `arc-paper` is the single-paper information package. Use it for metadata,
-INSPIRE references/citers, ar5iv full text, table of contents, section lookup,
-equation context, LLM paper summaries, and paper-summary batches.
+INSPIRE references/citers, ar5iv full text, cached full-text search, table of
+contents, section lookup, equation context, LLM paper summaries, and
+paper-summary batches.
 
 All single-paper operations in higher-level tools should go through
 `arc-paper`.
@@ -59,8 +60,18 @@ arc-paper get-citers <seed-paper> --limit 1000 --sort mostcited --json
 arc-paper get-citer-count <seed-paper> --json
 arc-paper get-toc <seed-paper> --json
 arc-paper get-section <seed-paper> --section <section> --json
+arc-paper search-full-text <seed-paper> --query "<word-or-phrase>" --context 1 --json
 arc-paper get-equation-context <seed-paper> --query "<equation-query>" --json
 ```
+
+Use `search-full-text` to search cached ar5iv full text. When paper ids are
+omitted, it searches all cached full-text papers:
+
+```bash
+arc-paper search-full-text --query "<word-or-phrase>" --limit 20 --json
+```
+
+It uses `rg` when available and falls back to Python search.
 
 ### Phase 2: Resolve missing sections.
 Step 1: If `get-section` cannot find the requested section, read the returned
@@ -166,6 +177,7 @@ get_citers
 get_citer_count
 get_toc
 get_section
+search_full_text
 get_equation_context
 llm_get_summary
 llm_generate_summary

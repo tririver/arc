@@ -82,7 +82,7 @@ Each loop must set:
         "content": "<full markdown text>"
       }
     ],
-    "arc_paper_tool_notes": "ARC paper MCP tools are available. Use them before internet search when checking papers, citations, references, sections, equation context, or nearby literature."
+    "arc_paper_tool_notes": "ARC paper MCP tools are available. Use them before internet search when checking papers, citations, references, sections, cached full-text terms, equation context, or nearby literature. Especially use search_full_text to search cached ar5iv full text for relevant words or phrases. Example MCP call: search_full_text(paper_id=\"<paper-id>\", query=\"<phrase>\", context=1, limit=10). CLI equivalent: arc-paper search-full-text <paper-id> --query \"<phrase>\" --context 1 --limit 10 --json. Useful paper tools include get_metadata, get_abstract, get_references, get_citers, get_citer_count, get_toc, get_section, search_full_text, get_equation_context, llm_get_summary, and llm_generate_summary. For CLI usage, run arc-paper <command> --help; for MCP usage, read the host-provided tool descriptions and input schema."
   },
   "proposers": [],
   "reviewers": []
@@ -98,7 +98,7 @@ files, ARC paper-tool guidance, MCP permission, and internet permission:
   "id": "proposer_001",
   "prompt": {
     "system": "You are a theoretical-physics researcher proposing one concrete, calculable research idea.",
-    "template": "Use the exact user_intent, domain_markdown_files, arc_paper_tool_notes, and full prior correspondence below. Propose or revise exactly one idea for the user's intent. Use ARC paper tools before internet search when checking papers, citations, references, sections, equation context, or nearby literature. Record literature checks and uncertainty honestly."
+    "template": "Use the exact user_intent, domain_markdown_files, arc_paper_tool_notes, and full prior correspondence below. Propose or revise exactly one idea for the user's intent. Use ARC paper tools before internet search when checking papers, citations, references, cached full-text terms, equation context, or nearby literature. Use search_full_text for cached ar5iv full-text checks. Record literature checks and uncertainty honestly."
   },
   "output_schema": {
     "type": "object"
@@ -122,7 +122,7 @@ match. The reviewer has all available permissions:
   "id": "reviewer_001",
   "prompt": {
     "system": "You are a skeptical but constructive theoretical-physics reviewer.",
-    "template": "Review the current proposer output against the user's intent and all prior correspondence. Do not accept or reject. In review_payload.marks, give numeric marks for newness_evidence, feasibility, scientific_value, user_intent_fit, and first_calculation_clarity on a 1-5 reviewer-relative scale against the best same-direction benchmark idea you can propose: 5 far better, 4 slightly better, 3 roughly equal, 2 slightly worse, 1 far worse. Decimal scores are allowed. For newness_evidence, mark confidence and usefulness of the not-done-before claim, not exoticness. Set total_score to the sum of the five marks. Return concrete improvement comments and separate messages to the controller and proposer."
+    "template": "Review the current proposer output against the user's intent, arc_paper_tool_notes, and all prior correspondence. Do not accept or reject. Search both local paper sources and the internet when judging evidence_of_novelty. Use ARC paper tools first, especially search_full_text for cached ar5iv full-text searches, then use internet search when needed. In review_payload.marks, give evidence_of_novelty on a 0-10 scale: 10 means you are completely confident from the checked evidence that the idea has not been done before, and 0 means you are completely confident it has already been done. This is evidence for the binary done/not-done question, not a score for how exotic or conceptually novel the idea feels. Give feasibility, scientific_value, user_intent_fit, and first_calculation_clarity on a 1-5 reviewer-relative scale against the best same-direction benchmark idea you can propose: 5 far better, 4 slightly better, 3 roughly equal, 2 slightly worse, 1 far worse. Decimal scores are allowed. Set total_score to the sum of all five marks. Return concrete improvement comments, evidence checked, tool queries used, and separate messages to the controller and proposer."
   },
   "output_schema": "<copy suggest-ideas-reviewer-output.schema.json here>",
   "runtime": {
@@ -175,7 +175,7 @@ not hide weak or worse later rounds.
 
 The appendix must start with a rounds-and-marks summary table. Include one row
 per loop and round, with columns for `loop_id`, `round`, idea title or short
-label, `newness_evidence`, `feasibility`, `scientific_value`,
+label, `evidence_of_novelty`, `feasibility`, `scientific_value`,
 `user_intent_fit`, `first_calculation_clarity`, and `total_score`. After the
 table, append the detailed correspondence history grouped by loop and round:
 proposer prompt, proposer output, reviewer message to the controller, reviewer
