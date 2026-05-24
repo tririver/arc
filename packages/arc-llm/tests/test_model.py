@@ -24,7 +24,7 @@ def test_fast_defaults():
 def test_model_tier_resolves_provider_specific_model_when_no_exact_model_is_set():
     assert resolve_model("codex-cli", model_tier="high", env={}) == "gpt-5.5"
     assert resolve_model("codex-cli", model_tier="medium", env={}) == "gpt-5.4"
-    assert resolve_model("codex-cli", model_tier="low", env={}) == "gpt-5.4-mini"
+    assert resolve_model("codex-cli", model_tier="low", env={}) == "gpt-5.3-codex-spark"
     assert resolve_model("claude-cli", model_tier="high", env={}) == "opus"
 
 

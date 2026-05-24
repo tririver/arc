@@ -23,7 +23,7 @@ DEFAULT_PROVIDER_MODELS = {
 
 PROVIDER_MODEL_TIERS = {
     "codex-cli": {
-        "low": "gpt-5.4-mini",
+        "low": "gpt-5.3-codex-spark",
         "medium": "gpt-5.4",
         "high": "gpt-5.5",
     },
