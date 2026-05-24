@@ -325,7 +325,7 @@ def _caller_context(
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
 ) -> dict[str, Any]:
-    allowed_context = copy.deepcopy(step.allowed_context)
+    allowed_context = _sanitize_caller_allowed_context(step.allowed_context)
     foundation_context = _foundation_context_for_step(step)
     if foundation_context is not None:
         allowed_context.pop("foundation_file", None)
@@ -394,10 +394,17 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
                 "pairwise_symbolic_checks. Let A, B, and C be the final mathematical results "
                 "from proposer_001, proposer_002, and proposer_003 when those proposer ids "
                 "are active. Use SymPy whenever available to simplify A-B, B-C, and A-C. "
+                "If used_sympy=true, pairwise_symbolic_checks.sympy_code must include "
+                "the actual code for A-B, B-C, and A-C using expand first and then "
+                "simplify, for example simplify(expand(A-B)). "
                 "Before marking all_agree, at least two of A-B=0, B-C=0, and A-C=0 must "
                 "be true. Never mark all_agree by visual inspection or because the results "
                 "seem to agree. If SymPy is unavailable, perform explicit algebraic checks "
                 "and set used_sympy=false with the reason in pairwise_symbolic_checks.notes. "
+                "Manual all_agree must show explicit A-B, B-C, and A-C algebraic "
+                "differences reducing to zero; never accept by string equality, spacing, "
+                "formatting, or visual comparison. If you cannot write those explicit "
+                "differences, use the numerical fallback instead. "
                 "If an analytic check cannot be done, perform numerical checks on at least "
                 "10 randomly selected data points and report check_method=numerical, "
                 "sample_count, numerical_relative_error as a relative error, and the sampled check history. "
@@ -580,8 +587,17 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
         sympy_code = str(checks.get("sympy_code", "")).lower()
         if "expand" not in sympy_code or "simplify" not in sympy_code:
             raise ValueError("SymPy all_agree requires sympy_code showing expand and simplify checks")
-    elif method in {"analytic", "mixed"} and not str(checks.get("notes", "")).strip():
-        raise ValueError("analytic all_agree without SymPy requires explicit notes")
+    elif method in {"analytic", "mixed"}:
+        notes = str(checks.get("notes", "")).strip()
+        if not notes:
+            raise ValueError("analytic all_agree without SymPy requires explicit notes")
+        history_text = "\n".join(str(item) for item in checks.get("check_history", []))
+        lowered_evidence = f"{notes}\n{history_text}".lower()
+        weak_markers = ["spacing", "string", "formatting", "visual", "inspection", "identical"]
+        if any(marker in lowered_evidence for marker in weak_markers):
+            raise ValueError("manual all_agree cannot rely on string, spacing, formatting, or visual comparison")
+        if not all(marker in lowered_evidence for marker in ["a-b", "b-c", "a-c"]):
+            raise ValueError("manual all_agree requires explicit A-B, B-C, and A-C algebraic differences")
     if method in {"numerical", "mixed"}:
         sample_count = checks.get("sample_count")
         if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 10:
@@ -673,6 +689,19 @@ def _convention_is_checked(item: Mapping[str, Any]) -> bool:
 
 
 _FOUNDATION_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path"}
+_CALLER_ALLOWED_CONTEXT_OMIT_KEYS = _FOUNDATION_CONTEXT_OMIT_KEYS | {"source_commands"}
+
+
+def _sanitize_caller_allowed_context(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_caller_allowed_context(item)
+            for key, item in value.items()
+            if str(key) not in _CALLER_ALLOWED_CONTEXT_OMIT_KEYS
+        }
+    if isinstance(value, list):
+        return [_sanitize_caller_allowed_context(item) for item in value]
+    return copy.deepcopy(value)
 
 
 def _sanitize_foundation_context_item(value: Any) -> Any:

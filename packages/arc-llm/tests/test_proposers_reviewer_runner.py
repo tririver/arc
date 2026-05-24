@@ -219,6 +219,31 @@ def test_prompt_artifacts_can_be_disabled(tmp_path):
     assert (run_root / "loops/loop_001/rounds/round_001/proposer_outputs/proposer_001.json").exists()
 
 
+def test_prompt_artifacts_put_instructions_before_variable_context_for_cache_reuse(tmp_path):
+    prompts = []
+
+    def static_runner(prompt, **_):
+        prompts.append(prompt)
+        if "reviewer system" in prompt:
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    run_proposers_reviewer_batch(base_config(tmp_path, max_rounds=1), json_runner=static_runner, base_env={})
+
+    first_prompt = prompts[0]
+    assert first_prompt.startswith("## ARC Worker Instructions\n")
+    assert first_prompt.index("### System") < first_prompt.index("## ARC Worker Context")
+    assert first_prompt.index("### Task") < first_prompt.index("## ARC Worker Context")
+
+
 def test_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
 
@@ -419,7 +444,7 @@ def test_worker_envs_are_isolated_and_os_environ_is_not_mutated(tmp_path, monkey
 
 
 def _context_from_prompt(prompt: str) -> dict[str, Any]:
-    match = re.search(r"^## ARC Worker Context\n(?P<context>\{.*?\})\n## Prompt", prompt, re.S | re.M)
+    match = re.search(r"^## ARC Worker Context\n(?P<context>\{.*\})\s*$", prompt, re.S | re.M)
     assert match, prompt
     return json.loads(match.group("context"))
 

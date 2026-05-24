@@ -94,7 +94,10 @@ Step 4: Reviewers may use SymPy. For analytic checks, use `expand` first, then
 Do not modify original equations.
 
 Step 5: Before `all_agree`, at least two of `A-B=0`, `B-C=0`, and `A-C=0`
-must be true. Never accept agreement by visual inspection.
+must be true. Never accept agreement by visual inspection, string equality,
+spacing, or formatting. If SymPy is unavailable, either write explicit
+algebraic differences for `A-B`, `B-C`, and `A-C`, or use the numerical
+fallback.
 
 Step 6: If analytic checking is not possible, use at least 10 randomly selected
 data points. The minimum numerical fallback is 10 randomly selected data points.

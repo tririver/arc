@@ -62,6 +62,10 @@ def test_bench_config_defaults_materialize_twenty_five_deepseek_loops(tmp_path):
     reviewer = payload["loops"][0]["reviewers"][0]
     assert "suggested_improvement" in proposer["prompt"]["template"]
     assert "suggested_improvement" in reviewer["prompt"]["template"]
+    assert "Separate reusable workflow/prompt improvements from domain-specific advice" in proposer["prompt"][
+        "template"
+    ]
+    assert "Domain-specific technical suggestions should be framed as advice" in reviewer["prompt"]["template"]
     assert "suggested_improvement" in proposer["output_schema"]["properties"]
     assert "suggested_improvement" in reviewer["output_schema"]["properties"]
 
@@ -267,6 +271,8 @@ def test_bench_runner_accepts_significant_prompt_improvement(tmp_path):
     assert "transcript.jsonl" in improver.calls[0]
     assert "suggested_improvement" in improver.calls[0]
     assert "Do not directly follow every `suggested_improvement`" in improver.calls[0]
+    assert "Do not propose prompt-template edits that require domain-specific objects" in improver.calls[0]
+    assert "belongs in reviewer-to-proposer feedback inside a run" in improver.calls[0]
     assert "Use scalar-exchange search terms before proposing." in improver.calls[0]
     candidate_payload = batch_runner.calls[1]
     assert "Before proposing, run a novelty scouting pass." in candidate_payload["loops"][0]["proposers"][0]["prompt"][

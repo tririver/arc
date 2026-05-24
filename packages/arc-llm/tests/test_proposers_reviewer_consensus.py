@@ -71,6 +71,7 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "SymPy" in reviewer_template
     assert "expand" in reviewer_template
     assert "simplify" in reviewer_template
+    assert "sympy_code" in reviewer_template
     assert "substitutions" in reviewer_template
     assert "A-B" in reviewer_template
     assert "B-C" in reviewer_template
@@ -138,6 +139,10 @@ def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path
                 "allowed_context": {
                     "foundation_file": str(foundation_path),
                     "target_equation_id": "eq_target",
+                    "source_commands": [
+                        "get_section(paper_id=\"arXiv:1\", section=\"S1\")",
+                        "arc-paper get-section arXiv:1 --section S1 --json",
+                    ],
                 },
             }
         ],
@@ -156,7 +161,10 @@ def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path
     assert "source_path" not in foundation_context
     assert "sources" not in json.dumps(foundation_context)
     assert "arc-paper" not in json.dumps(foundation_context)
-    assert "foundation_file" not in fake.calls[0]["loops"][0]["caller_context"]["allowed_context"]
+    allowed_context = fake.calls[0]["loops"][0]["caller_context"]["allowed_context"]
+    assert "foundation_file" not in allowed_context
+    assert "source_commands" not in allowed_context
+    assert "arc-paper" not in json.dumps(allowed_context)
 
 
 def test_foundation_check_fails_when_target_equation_is_missing(tmp_path):
@@ -394,6 +402,34 @@ def test_consensus_rejects_sympy_all_agree_without_expand_and_simplify(tmp_path)
 
     assert result["status"] == "failed"
     assert "expand" in result["steps"][0]["error"]
+
+
+def test_consensus_rejects_manual_all_agree_by_string_or_spacing_comparison(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": "Manual comparison found only spacing differences.",
+                    "check_method": "analytic",
+                    "check_history": [
+                        "Compared A and B: only difference is spacing.",
+                        "Compared B and C: identical.",
+                        "Compared A and C: identical.",
+                    ],
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "manual all_agree" in result["steps"][0]["error"]
 
 
 def test_consensus_dry_run_does_not_call_batch_runner(tmp_path):

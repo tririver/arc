@@ -153,6 +153,9 @@ For example, the idea workflow uses:
 The loop runner owns all artifact writes. Worker prompts and outputs are stored
 under per-loop and per-round directories, so distinct loops can run
 concurrently without sharing mutable context.
+Rendered worker prompts place stable worker instructions before the JSON context
+to improve provider prefix-cache reuse. Callers that put variable placeholders
+directly in prompt templates may still reduce cache reuse for those prompts.
 
 `artifact_options.save_prompts` defaults to `true`. When enabled, full rendered
 worker prompts are stored under each round's `prompts/` directory for
@@ -218,6 +221,9 @@ Bench materialization also asks each worker to add a top-level
 `suggested_improvement` object in its output JSON. The prompt optimizer is told
 to judge those worker suggestions alongside scores, transcripts, reviews, tool
 traces, and the current prompt. It must not directly follow every suggestion.
+Reusable prompt edits should transfer across theoretical-physics domains;
+domain-specific technical advice belongs in reviewer-to-proposer feedback, not
+global prompt templates.
 For DeepSeek-style providers, `bench.improver_context_mode: "auto"` includes
 expanded artifact excerpts by default, bounded by
 `bench.improver_context_max_chars`. Use `"paths"` to send only file paths or

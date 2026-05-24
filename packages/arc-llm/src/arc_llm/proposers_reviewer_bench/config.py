@@ -13,9 +13,11 @@ IMPROVEMENT_SCHEMA = "arc.llm.proposers_reviewer_bench.improvement.v1"
 SUGGESTED_IMPROVEMENT_FIELD = "suggested_improvement"
 SUGGESTED_IMPROVEMENT_PROMPT = (
     "Benchmark prompt-improvement note: In your output JSON, add a top-level "
-    "`suggested_improvement` object. Use it to suggest concise, concrete "
-    "improvements to this worker prompt, the provided context, tool permissions, "
-    "or scoring/review instructions for future benchmark runs."
+    "`suggested_improvement` object. Separate reusable workflow/prompt "
+    "improvements from domain-specific advice. Reusable prompt suggestions "
+    "should transfer across research domains. Domain-specific technical "
+    "suggestions should be framed as advice for this proposer/reviewer exchange, "
+    "not as global prompt-template edits."
 )
 
 
