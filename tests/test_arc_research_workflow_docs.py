@@ -146,6 +146,43 @@ def test_research_workflow_filter_script_omits_unchecked_context(tmp_path) -> No
     assert filtered["omitted_equation_ids"] == ["eq_unchecked"]
 
 
+def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
+    run_root = tmp_path / "suggest-ideas" / "run_001"
+    _write_idea_round(run_root, "idea_001", 1, "first", total=10, novelty=4)
+    _write_idea_round(run_root, "idea_001", 2, "better", total=15, novelty=3)
+    _write_idea_round(run_root, "idea_002", 1, "high novelty", total=15, novelty=8)
+    _write_idea_round(run_root, "idea_002", 2, "lower", total=12, novelty=9)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WF / "scripts/rank-suggested-ideas.py"),
+            str(run_root),
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    ranking = json.loads(result.stdout)["ranking"]
+    assert [(item["loop_id"], item["round"], item["title"]) for item in ranking] == [
+        ("idea_002", 1, "high novelty"),
+        ("idea_001", 2, "better"),
+    ]
+
+
+def test_suggest_ideas_report_delivery_uses_ranking_script_and_handoff_prompt() -> None:
+    for name in ["suggest-ideas.md", "suggest-ideas-no-info.md"]:
+        text = (WF / name).read_text(encoding="utf-8")
+        assert "scripts/rank-suggested-ideas.py" in text
+        assert "Ranked Selected Ideas" in text
+        assert "Next-phase research prompt" in text
+        assert "Preserve the selected round's structured proposer output" in text
+        assert "unchanged" in text
+
+
 def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:
     expected = {
         "research-plan": "arc.research_plan.v1",
@@ -246,6 +283,10 @@ def test_packaged_workflow_copies_match_source() -> None:
         assert (packaged / script).read_text(encoding="utf-8") == (WF / script).read_text(
             encoding="utf-8"
         )
+        script = Path("scripts/rank-suggested-ideas.py")
+        assert (packaged / script).read_text(encoding="utf-8") == (WF / script).read_text(
+            encoding="utf-8"
+        )
 
 
 def test_packaged_skill_references_include_required_workflow_inputs() -> None:
@@ -254,9 +295,13 @@ def test_packaged_skill_references_include_required_workflow_inputs() -> None:
         Path("references/research-workflows/suggest-ideas.md"),
         Path("references/research-workflows/suggest-ideas-batch.template.json"),
         Path("references/research-workflows/suggest-ideas-loop.template.json"),
+        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-no-info-loop.template.json"),
+        Path("references/research-workflows/suggest-ideas-no-info-proposer.template.json"),
         Path("references/research-workflows/suggest-ideas-proposer.template.json"),
         Path("references/research-workflows/suggest-ideas-reviewer.template.json"),
         Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
+        Path("references/research-workflows/scripts/rank-suggested-ideas.py"),
         Path("references/package-manuals/arc-domain.md"),
         Path("references/package-manuals/arc-llm.md"),
         Path("references/package-manuals/arc-mcp.md"),
@@ -277,9 +322,13 @@ def test_packaged_skill_references_stay_synced_with_source() -> None:
         Path("references/research-workflows/suggest-ideas.md"),
         Path("references/research-workflows/suggest-ideas-batch.template.json"),
         Path("references/research-workflows/suggest-ideas-loop.template.json"),
+        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-no-info-loop.template.json"),
+        Path("references/research-workflows/suggest-ideas-no-info-proposer.template.json"),
         Path("references/research-workflows/suggest-ideas-proposer.template.json"),
         Path("references/research-workflows/suggest-ideas-reviewer.template.json"),
         Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
+        Path("references/research-workflows/scripts/rank-suggested-ideas.py"),
     ]
 
     expected_files: list[Path] = []
@@ -317,3 +366,32 @@ def test_interaction_reference_allows_portable_typed_fallback() -> None:
     assert "when no discrete selection" in text or "if no discrete selection" in text
     assert "enter the exact option label" in text
     assert "cannot present the required selection ui" not in text
+
+
+def _write_idea_round(
+    run_root: Path,
+    loop_id: str,
+    round_number: int,
+    title: str,
+    *,
+    total: float,
+    novelty: float,
+) -> None:
+    round_root = run_root / "loops" / loop_id / "rounds" / f"round_{round_number:03d}"
+    proposer_dir = round_root / "proposer_outputs"
+    review_dir = round_root / "reviews"
+    proposer_dir.mkdir(parents=True)
+    review_dir.mkdir(parents=True)
+    (proposer_dir / "proposer_001.json").write_text(json.dumps({"title": title}), encoding="utf-8")
+    marks = {
+        "evidence_of_novelty": novelty,
+        "feasibility": 3,
+        "scientific_value": 3,
+        "user_intent_fit": 3,
+        "first_calculation_clarity": 3,
+        "total_score": total,
+    }
+    (review_dir / "reviewer_001.json").write_text(
+        json.dumps({"review_payload": {"marks": marks}}),
+        encoding="utf-8",
+    )

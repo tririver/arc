@@ -107,19 +107,33 @@ artifacts and cite the relevant rounds and reviewer marks.
 
 Step 4: Write `<project-dir>/suggest-ideas/<run-id>/suggested-ideas.md` for
 this phase. Collect each loop's recorded proposer outputs and reviewer reviews
-from the artifact root. In the main text, outline the generated ideas and their
-stated motivation, calculation target, required checks, and main reviewer
-concerns. Do not hide weak or worse later rounds.
+from the artifact root. Use
+`references/research-workflows/scripts/rank-suggested-ideas.py` to select each
+loop's highest-marked round and rank the selected ideas:
 
-The appendix must start with a rounds-and-marks summary table. Include one row
-per loop and round, with columns for `loop_id`, `round`, idea title or short
-label, `evidence_of_novelty`, `feasibility`, `scientific_value`,
-`user_intent_fit`, `first_calculation_clarity`, and `total_score`. After the
-table, append the detailed correspondence history grouped by loop and round:
-proposer output, reviewer message to the controller, reviewer message to the
-proposer, and full `review_payload`. Full rendered prompts are debug artifacts
-under each round's `prompts/` directory; mention their paths when useful, but do
-not paste them into the correspondence appendix by default.
+```bash
+python3 references/research-workflows/scripts/rank-suggested-ideas.py \
+  <project-dir>/suggest-ideas/<run-id>/ \
+  --format markdown
+```
+
+The report must have two main sections:
+
+1. `Summary`: outline all generated ideas and include compact tables for every
+   loop's idea title by round, reviewer marks by round, and mark changes across
+   review rounds. Do not hide weak rounds or later rounds that became worse.
+2. `Ranked Selected Ideas`: use only the highest-`total_score` round from each
+   loop, sorted by the ranking script. Give each selected idea its own
+   subsection. Preserve the selected round's structured proposer output
+   unchanged, include the reviewer marks and main reviewer concerns, and then
+   add a derived `Next-phase research prompt` for `research-plan` or
+   `research-execute`. The derived prompt must only rewrite the selected
+   `idea_summary`, `calculation_plan`, `validation_checks`, `risks`, and latest
+   reviewer concerns; do not add new scientific claims or strengthen novelty.
+
+Full rendered prompts are debug artifacts under each round's `prompts/`
+directory; mention their paths when useful, but do not paste them into the
+report by default.
 
 After `suggested-ideas.md` is generated, copy it to
 `<project-dir>/suggested-ideas.md` so human readers can inspect the main
