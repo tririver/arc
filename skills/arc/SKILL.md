@@ -68,6 +68,8 @@ Include `automation_level`, `workflow`, `original_request`, `user_intent`,
 
 ### Phase 2: Route Selection
 
+Resolve the user's intent and classify it into one of the three cases below.
+
 Case 1: Build domain references only.
 Read and execute `references/research-workflows/build-domain.md`.
 

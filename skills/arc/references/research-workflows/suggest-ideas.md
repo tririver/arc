@@ -6,9 +6,9 @@ caller-specific prompts, permissions, and artifacts.
 
 ## Inputs
 
-Read `<project-dir>/context.json`. Use the exact `user_intent`, `provider`,
-configured `model_tier` when present, and existing domain artifact paths from
-the project. Do not substitute a paraphrased research goal into idea prompts.
+Read `<project-dir>/context.json`. Use the exact `user_intent` and existing
+domain artifact paths from the project. Do not substitute a paraphrased
+research goal into idea prompts.
 
 ### Phase 1: Ensure Domain Context
 
@@ -49,19 +49,11 @@ Use this package-level structure:
   "artifact_options": {
     "save_prompts": true
   },
-  "defaults": {
-    "provider": "<provider>",
-    "model_tier": "high"
-  },
   "loops": []
 }
 ```
 
-Choose `model_tier: "high"` if available.
-
-Step 4: Add the requested number of independent loops. For the initial test,
-use two loops and keep `max_concurrent_loops=2`. Future runs may increase the
-loop count by adding more loop objects and raising `max_concurrent_loops`.
+Step 4: Add the requested number of independent loops. Run `5` loops and keep `max_concurrent_loops=10`. 
 Keep `artifact_options.save_prompts=true` for debugging unless the project
 context explicitly disables prompt artifacts.
 

@@ -3,14 +3,13 @@
 Use this workflow to run a comparison idea-generation loop where proposers get
 only the user's exact intent and internet access. This is an ablation of
 `suggest-ideas.md`: do not feed proposers ARC domain Markdown files, ARC paper
-tool guidance, or MCP access. Keep reviewer permissions the same as the normal
-idea workflow so review quality remains comparable.
+tool guidance, local paper-cache context, or MCP access. Keep the reviewer
+configuration the same as the normal idea workflow.
 
 ## Inputs
 
-Read `<project-dir>/context.json`. Use the exact `user_intent`, `provider`,
-and configured `model_tier` when present. Do not substitute a paraphrased
-research goal into idea prompts.
+Read `<project-dir>/context.json`. Use the exact `user_intent`. Do not
+substitute a paraphrased research goal into idea prompts.
 
 ### Phase 1: Prepare Comparison Run
 
@@ -46,19 +45,18 @@ Use this package-level structure:
   "artifact_options": {
     "save_prompts": true
   },
-  "defaults": {
-    "provider": "<provider>",
-    "model_tier": "high"
-  },
   "loops": []
 }
 ```
 
-Choose `model_tier: "high"` if available.
+Step 2: Add the requested number of independent loops. Run `5` loops and keep `max_concurrent_loops=10`.
+Keep `artifact_options.save_prompts=true` for debugging unless the project
+context explicitly disables prompt artifacts.
 
-Step 2: Add the requested number of independent loops. For the comparison test,
-use two loops and keep `max_concurrent_loops=2`. Future runs may increase the
-loop count by adding loop objects and raising `max_concurrent_loops`.
+Do not attach Markdown files under `<project-dir>/domain/` to
+`caller_context`. Do not attach ARC-generated reports, paper summaries, paper
+tool notes, local paper-cache guidance, logs, transcripts, or unrelated project
+notes.
 
 Each loop must set:
 
@@ -70,27 +68,23 @@ Each loop must set:
     "enabled": false
   },
   "caller_context": {
-    "user_intent": "<user_intent>",
-    "comparison_condition": "no_info_proposer"
+    "user_intent": "<user_intent>"
   },
   "proposers": [],
   "reviewers": []
 }
 ```
 
-Do not include `domain_markdown_files`, `arc_paper_tool_notes`, paper summaries,
-paper ids beyond what appears in the user's intent, or any ARC-generated report
-text in the proposer context.
-
-Step 3: Configure one proposer per idea loop. The proposer must receive only
-the user's exact intent, full prior correspondence, and internet permission:
+Step 3: Configure one proposer per idea loop for the no-info comparison
+workflow. The proposer must receive only the user's exact intent, full prior
+correspondence, internet permission, and no MCP permission:
 
 ```json
 {
   "id": "proposer_001",
   "prompt": {
     "system": "You are a theoretical-physics researcher proposing one concrete, calculable research idea.",
-    "template": "Use only the exact user_intent and full prior correspondence below. Do not assume access to ARC-built domain summaries, ARC paper tools, local paper caches, or MCP tools. You may use internet search. Propose or revise exactly one idea for the user's intent. Record literature checks and uncertainty honestly."
+    "template": "Use only the exact user_intent and full prior correspondence below. Do not use ARC-built domain summaries, ARC paper tools, local paper caches, or MCP tools. You may use internet search. Propose or revise exactly one idea for the user's intent. Before finalizing, run a focused novelty-scouting pass using internet search for public evidence. Record each check with the source, query or lookup, and short result. If related work is close, state the overlap and what remains different or missing. Make the first calculation concrete: state the object to compute, setup and assumptions, main calculational route, expected deliverable, and validation or comparison checks using relevant known limits, benchmarks, special cases, or adjacent results. Cite source locations when available."
   },
   "output_schema": {
     "type": "object"
@@ -115,7 +109,7 @@ match. The reviewer has ARC-only MCP and internet permission:
   "id": "reviewer_001",
   "prompt": {
     "system": "You are a skeptical but constructive theoretical-physics reviewer.",
-    "template": "Review the current proposer output against the user's intent and all prior correspondence. Do not accept or reject. Search both local paper sources and the internet when judging evidence_of_novelty. ARC's local paper database can provide deep paper metadata, sections, cached full text, references, citers, equation context, and domain context; make targeted ARC checks before assigning low novelty evidence. Use ARC paper tools first, especially search_full_text for cached ar5iv full-text searches, then use internet search to catch uncached, very recent, or non-arXiv public evidence before final novelty judgment. Avoid open-ended exhaustive searching: use enough focused ARC and web queries to support the novelty mark, then summarize the evidence. Useful ARC paper tools include get_metadata, get_abstract, get_references, get_citers, get_citer_count, get_toc, get_section, search_full_text, get_equation_context, llm_get_summary, and llm_generate_summary; run --help for CLI usage or read MCP tool schemas for MCP usage. Example full-text query: search_full_text(paper_id=\"<paper-id>\", query=\"<phrase>\", context=1, limit=10). In review_payload.marks, give evidence_of_novelty on a 0-10 scale: 10 means you are completely confident from the checked evidence that the idea has not been done before, and 0 means you are completely confident it has already been done. This is evidence for the binary done/not-done question, not a score for how exotic or conceptually novel the idea feels. Give feasibility, scientific_value, user_intent_fit, and first_calculation_clarity on a 1-5 reviewer-relative scale against the best same-direction benchmark idea you can propose: 5 far better, 4 slightly better, 3 roughly equal, 2 slightly worse, 1 far worse. Decimal scores are allowed. Set total_score to the sum of all five marks. Return concrete improvement comments, evidence checked, tool queries used, and separate messages to the controller and proposer."
+    "template": "Review the current proposer output against the user's intent, arc_paper_tool_notes, and all prior correspondence. Do not accept or reject. Search both local paper sources and the internet when judging evidence_of_novelty. ARC's local paper database can provide deep paper metadata, sections, cached full text, references, citers, equation context, and domain context; make targeted ARC checks before assigning low novelty evidence. Use ARC paper tools first, especially search_full_text for cached ar5iv full-text searches, then use internet search to catch uncached, very recent, or non-arXiv public evidence before final novelty judgment. Avoid open-ended exhaustive searching: use enough focused ARC and web queries to support the novelty mark, then summarize the evidence. In review_payload.marks, give evidence_of_novelty on a 0-10 scale: 10 means you are completely confident from the checked evidence that the idea has not been done before, and 0 means you are completely confident it has already been done. This is evidence for the binary done/not-done question, not a score for how exotic or conceptually novel the idea feels. Give feasibility, scientific_value, user_intent_fit, and first_calculation_clarity on a 1-5 reviewer-relative scale against the best same-direction benchmark idea you can propose: 5 far better, 4 slightly better, 3 roughly equal, 2 slightly worse, 1 far worse. Decimal scores are allowed. Set total_score to the sum of all five marks. Return concrete improvement comments, evidence checked, tool queries used, and separate messages to the controller and proposer. In the message to the proposer, make improvement comments technically concrete for the current idea. When novelty claims lack source/query/result records or the first calculation is under-specified, ask for the missing evidence, calculational ingredients, and validation or comparison checks. When relevant, ask for domain-specific details such as the precise setup, assumptions, observable, known limits, comparison targets, regularization choices, numerical checks, or other field-appropriate ingredients. Keep these as tailored reviewer comments, not generic workflow requirements."
   },
   "output_schema": "<copy suggest-ideas-reviewer-output.schema.json here>",
   "runtime": {
@@ -164,9 +158,10 @@ memory. Any later idea selection or report must read the recorded loop
 artifacts and cite the relevant rounds and reviewer marks.
 
 Step 4: Write `<project-dir>/suggest-ideas/<run-id>/report.md` for this phase.
-In the main text, outline the generated ideas and their stated motivation,
-calculation target, required checks, and main reviewer concerns. Do not hide
-weak or worse later rounds.
+Collect each loop's recorded proposer outputs and reviewer reviews from the
+artifact root. In the main text, outline the generated ideas and their stated
+motivation, calculation target, required checks, and main reviewer concerns. Do
+not hide weak or worse later rounds.
 
 The appendix must start with a rounds-and-marks summary table. Include one row
 per loop and round, with columns for `loop_id`, `round`, idea title or short

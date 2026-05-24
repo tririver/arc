@@ -16,7 +16,7 @@ def test_generic_env_is_fallback():
 
 
 def test_fast_defaults():
-    assert resolve_model("codex-cli", env={}) == "gpt-5.4-mini"
+    assert resolve_model("codex-cli", env={}) == "gpt-5.3-codex-spark"
     assert resolve_model("claude-cli", env={}) == "haiku"
     assert resolve_model("manual", env={}) is None
 

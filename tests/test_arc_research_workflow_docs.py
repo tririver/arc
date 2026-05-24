@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,8 @@ def test_arc_skill_routes_case_3_to_three_research_workflows() -> None:
     text = (ROOT / "skills/arc/SKILL.md").read_text(encoding="utf-8")
 
     assert "references/research-workflows/calculate.md" not in text
+    assert "classify" in text.lower()
+    assert "three cases" in text.lower()
     assert "research-plan.md" in text
     assert "research-foundation.md" in text
     assert "research-execute.md" in text
@@ -155,6 +158,36 @@ def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:
         markdown = (WF / f"{stem}.md").read_text(encoding="utf-8")
         assert schema["properties"]["schema_version"]["const"] == schema_version
         assert schema_version in markdown
+
+
+def test_suggest_ideas_no_info_keeps_reviewer_block_synced() -> None:
+    normal = (WF / "suggest-ideas.md").read_text(encoding="utf-8")
+    no_info = (WF / "suggest-ideas-no-info.md").read_text(encoding="utf-8")
+
+    assert _json_fence_containing(no_info, '"id": "reviewer_001"') == _json_fence_containing(
+        normal, '"id": "reviewer_001"'
+    )
+
+
+def test_suggest_ideas_no_info_limits_only_proposer_context_and_tools() -> None:
+    text = (WF / "suggest-ideas-no-info.md").read_text(encoding="utf-8")
+    loop_block = _json_fence_containing(text, '"caller_context"')
+    proposer_block = _json_fence_containing(text, '"id": "proposer_001"')
+
+    assert '"user_intent": "<user_intent>"' in loop_block
+    assert "domain_markdown_files" not in loop_block
+    assert "arc_paper_tool_notes" not in loop_block
+    assert '"allow_internet": true' in proposer_block
+    assert '"allow_mcp": false' in proposer_block
+    assert "arc_paper_tool_notes" not in proposer_block
+
+
+def _json_fence_containing(text: str, marker: str) -> str:
+    for match in re.finditer(r"```json\n(.*?)\n```", text, re.DOTALL):
+        block = match.group(1)
+        if marker in block:
+            return block
+    raise AssertionError(f"missing JSON block containing {marker}")
 
 
 def test_research_foundation_schema_requires_evidence_for_checked_equations() -> None:

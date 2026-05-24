@@ -17,7 +17,7 @@ PROVIDER_MODEL_TIER_ENV = {
 }
 
 DEFAULT_PROVIDER_MODELS = {
-    "codex-cli": "gpt-5.4-mini",
+    "codex-cli": "gpt-5.3-codex-spark",
     "claude-cli": "haiku",
 }
 
