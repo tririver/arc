@@ -111,3 +111,35 @@ def test_cli_runs_proposers_reviewer_bench_from_config(tmp_path, monkeypatch):
     assert result["status"] == "completed"
     assert captured["config"]["run_id"] == "run_001"
     assert captured["kwargs"]["dry_run"] is False
+
+
+def test_cli_runs_proposers_reviewer_consensus_from_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "consensus.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.llm.proposers_reviewer_consensus.config.v1",
+                "run_id": "calc_001",
+                "run_dir": str(tmp_path / "execute"),
+                "steps": [{"step_id": "step_001", "prompt": "derive x"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(config, **kwargs):
+        captured["config"] = config
+        captured["kwargs"] = kwargs
+        return {"status": "dry_run"}
+
+    monkeypatch.setattr(cli, "run_proposers_reviewer_consensus", fake_run, raising=False)
+
+    args = cli._build_parser().parse_args(
+        ["proposers-reviewer-consensus", "--config", str(config_path), "--dry-run", "--json"]
+    )
+    result = cli._dispatch(args)
+
+    assert result == {"status": "dry_run"}
+    assert captured["config"]["run_id"] == "calc_001"
+    assert captured["kwargs"]["dry_run"] is True

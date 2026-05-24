@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from arc_llm.model import VALID_MODEL_TIERS
 from arc_llm.proposers_reviewer.config import BATCH_CONFIG_SCHEMA, ConfigError, load_batch_config
 
 
@@ -28,6 +29,7 @@ class BenchOptions:
     patience: int = 3
     max_concurrent_loops: int = 100
     default_provider: str = "deepseek"
+    sample_model_tier: str | None = "medium"
     improver_provider: str = "deepseek"
     improver_model: str | None = None
     improver_model_tier: str | None = "high"
@@ -74,7 +76,11 @@ def materialize_batch_payload(
     source["schema_version"] = BATCH_CONFIG_SCHEMA
     source["run_id"] = f"{config.batch_payload['run_id']}_iter{iteration_index:03d}_{candidate_id}"
     source["max_concurrent_loops"] = options.max_concurrent_loops
-    source["defaults"] = _defaults_with_provider(source.get("defaults"), options.default_provider)
+    source["defaults"] = _defaults_with_provider_and_model_tier(
+        source.get("defaults"),
+        default_provider=options.default_provider,
+        sample_model_tier=options.sample_model_tier,
+    )
 
     raw_loops = source.get("loops")
     if not isinstance(raw_loops, list) or not raw_loops:
@@ -85,6 +91,7 @@ def materialize_batch_payload(
         loop = copy.deepcopy(template_loop)
         loop["loop_id"] = f"{options.sample_loop_id_prefix}_{options.sample_loop_id_start + index:03d}"
         loop["max_rounds"] = options.max_rounds
+        _apply_sample_model_tier(loop, options.sample_model_tier)
         _add_suggested_improvement_hint(loop)
         loops.append(loop)
     source["loops"] = loops
@@ -222,9 +229,10 @@ def _parse_options(raw: Mapping[str, Any]) -> BenchOptions:
         patience=_positive_int(raw.get("patience", 3), "bench.patience"),
         max_concurrent_loops=_positive_int(raw.get("max_concurrent_loops", 100), "bench.max_concurrent_loops"),
         default_provider=_nonempty_text(raw.get("default_provider", "deepseek"), "bench.default_provider"),
+        sample_model_tier=_model_tier(raw.get("sample_model_tier", "medium"), "bench.sample_model_tier"),
         improver_provider=_nonempty_text(raw.get("improver_provider", raw.get("default_provider", "deepseek")), "bench.improver_provider"),
         improver_model=_optional_text(raw.get("improver_model"), "bench.improver_model"),
-        improver_model_tier=_optional_text(raw.get("improver_model_tier", "high"), "bench.improver_model_tier"),
+        improver_model_tier=_model_tier(raw.get("improver_model_tier", "high"), "bench.improver_model_tier"),
         score_path=_nonempty_text(raw.get("score_path", "review_payload.marks.total_score"), "bench.score_path"),
         min_delta=_float(raw.get("min_delta", 0.3), "bench.min_delta"),
         min_z=_float(raw.get("min_z", 1.0), "bench.min_z"),
@@ -236,12 +244,31 @@ def _parse_options(raw: Mapping[str, Any]) -> BenchOptions:
     )
 
 
-def _defaults_with_provider(raw_defaults: Any, default_provider: str) -> dict[str, Any]:
+def _defaults_with_provider_and_model_tier(
+    raw_defaults: Any,
+    *,
+    default_provider: str,
+    sample_model_tier: str | None,
+) -> dict[str, Any]:
     defaults = _dict(raw_defaults, "defaults")
     provider = str(defaults.get("provider", "auto") or "auto")
     if provider == "auto":
         defaults["provider"] = default_provider
+    if sample_model_tier and not defaults.get("model"):
+        defaults["model_tier"] = sample_model_tier
     return defaults
+
+
+def _apply_sample_model_tier(loop: dict[str, Any], sample_model_tier: str | None) -> None:
+    if not sample_model_tier:
+        return
+    for worker_key in ("proposers", "reviewers"):
+        workers = loop.get(worker_key, [])
+        if not isinstance(workers, list):
+            continue
+        for worker in workers:
+            if isinstance(worker, dict) and not worker.get("model"):
+                worker["model_tier"] = sample_model_tier
 
 
 def _apply_prompt_template_edit(payload: dict[str, Any], *, target: str, operation: str, text: str) -> None:
@@ -321,6 +348,15 @@ def _optional_text(value: Any, field_name: str) -> str | None:
     text = str(value).strip()
     if not text:
         return None
+    return text
+
+
+def _model_tier(value: Any, field_name: str) -> str | None:
+    text = _optional_text(value, field_name)
+    if text is None:
+        return None
+    if text not in VALID_MODEL_TIERS:
+        raise ConfigError(f"{field_name} must be one of: high, medium, low")
     return text
 
 

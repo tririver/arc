@@ -178,17 +178,18 @@ def _run_loop_rounds(
         review_prompt_path = round_paths.prompt(reviewer.id)
         if artifact_options.save_prompts:
             atomic_write_text(review_prompt_path, review_prompt)
-        review_output = _call_json_runner_with_error_artifact(
+        review_output = _call_reviewer_with_validation_retry(
             json_runner,
             review_prompt,
             worker=reviewer,
+            loop=loop,
             round_number=round_number,
             error_path=round_paths.worker_error(reviewer.id),
             prompt_path=review_prompt_path if artifact_options.save_prompts else None,
+            save_prompt=artifact_options.save_prompts,
             base_env=base_env,
             process_chain=process_chain,
         )
-        _validate_review_envelope(review_output, loop)
         atomic_write_json(round_paths.review(reviewer.id), review_output)
 
         round_events = _round_events(
@@ -271,6 +272,61 @@ def _run_proposers(
             outputs[proposer.id] = output
             atomic_write_json(round_paths.proposer_output(proposer.id), output)
     return dict(sorted(outputs.items()))
+
+
+def _call_reviewer_with_validation_retry(
+    json_runner: JsonRunner | None,
+    prompt: str,
+    *,
+    worker: WorkerConfig,
+    loop: LoopConfig,
+    round_number: int,
+    error_path: Path,
+    prompt_path: Path | None,
+    save_prompt: bool,
+    base_env: Mapping[str, str] | None,
+    process_chain: list[str] | None,
+) -> dict[str, Any]:
+    review_output = _call_json_runner_with_error_artifact(
+        json_runner,
+        prompt,
+        worker=worker,
+        round_number=round_number,
+        error_path=error_path,
+        prompt_path=prompt_path,
+        base_env=base_env,
+        process_chain=process_chain,
+    )
+    try:
+        _validate_review_envelope(review_output, loop)
+        return review_output
+    except Exception as exc:
+        retry_prompt = _review_validation_retry_prompt(prompt, exc)
+        if save_prompt and prompt_path is not None:
+            atomic_write_text(prompt_path, retry_prompt)
+        review_output = _call_json_runner_with_error_artifact(
+            json_runner,
+            retry_prompt,
+            worker=worker,
+            round_number=round_number,
+            error_path=error_path,
+            prompt_path=prompt_path,
+            base_env=base_env,
+            process_chain=process_chain,
+        )
+        _validate_review_envelope(review_output, loop)
+        return review_output
+
+
+def _review_validation_retry_prompt(prompt: str, exc: Exception) -> str:
+    return (
+        f"{prompt.rstrip()}\n\n"
+        "## Reviewer Output Retry\n"
+        f"Previous reviewer response failed validation: {exc}\n"
+        "Retry the review. Return exactly one JSON object using schema_version "
+        f"{REVIEW_ENVELOPE_SCHEMA}, with controller, proposer_messages for every proposer, "
+        "and review_payload. Do not return a proposer idea or any non-envelope object.\n"
+    )
 
 
 def _call_json_runner_with_error_artifact(

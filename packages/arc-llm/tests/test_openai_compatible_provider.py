@@ -98,7 +98,7 @@ def test_generate_json_uses_json_schema_response_format_and_parses_content():
     completions = FakeCompletions(json.dumps({"ok": True}))
 
     provider = OpenAICompatibleProvider(
-        provider_config(),
+        provider_config(id="openaiish", base_url="https://api.openaiish.example/v1"),
         env={},
         client_factory=lambda **kwargs: FakeClient(completions),
     )
@@ -108,9 +108,22 @@ def test_generate_json_uses_json_schema_response_format_and_parses_content():
     assert result == {"ok": True}
     response_format = completions.calls[0]["response_format"]
     assert response_format["type"] == "json_schema"
-    assert response_format["json_schema"]["name"] == "arc_deepseek_output"
+    assert response_format["json_schema"]["name"] == "arc_openaiish_output"
     assert response_format["json_schema"]["schema"] == {"type": "object"}
     assert response_format["json_schema"]["strict"] is True
+
+
+def test_deepseek_json_schema_config_uses_json_object_compatibility_mode():
+    completions = FakeCompletions(json.dumps({"ok": True}))
+    provider = OpenAICompatibleProvider(
+        provider_config(json_mode="json_schema"),
+        env={},
+        client_factory=lambda **kwargs: FakeClient(completions),
+    )
+
+    assert provider.generate_json("Return JSON", schema={"type": "object"}, model="deepseek-chat") == {"ok": True}
+    assert completions.calls[0]["response_format"] == {"type": "json_object"}
+    assert "JSON Schema" in completions.calls[0]["messages"][0]["content"]
 
 
 def test_generate_json_can_use_json_object_mode_for_local_compatibility():
@@ -132,6 +145,8 @@ def test_generate_json_can_use_json_object_mode_for_local_compatibility():
     assert completions.calls[0]["response_format"] == {"type": "json_object"}
     assert completions.calls[0]["messages"][0]["role"] == "system"
     assert "JSON" in completions.calls[0]["messages"][0]["content"]
+    assert "JSON Schema" in completions.calls[0]["messages"][0]["content"]
+    assert '"type": "object"' in completions.calls[0]["messages"][0]["content"]
 
 
 def test_generate_json_recovers_first_object_from_trailing_model_text():
@@ -149,6 +164,30 @@ def test_generate_json_recovers_first_object_from_trailing_model_text():
     }
 
 
+def test_generate_json_retries_once_when_model_returns_malformed_json():
+    completions = SequencedCompletions(
+        [
+            '{"ok": "unterminated"',
+            '{"ok": "\\q"}',
+            json.dumps({"ok": True, "mode": "retry"}),
+        ]
+    )
+    config = provider_config(json_mode="json_object")
+    provider = OpenAICompatibleProvider(
+        config,
+        env={},
+        client_factory=lambda **kwargs: FakeClient(completions),
+    )
+
+    assert provider.generate_json("Return JSON", schema={"type": "object"}, model="deepseek-chat") == {
+        "ok": True,
+        "mode": "retry",
+    }
+    assert len(completions.calls) == 3
+    assert "Previous response was invalid JSON" in completions.calls[1]["messages"][0]["content"]
+    assert "Escape every backslash" in completions.calls[1]["messages"][0]["content"]
+
+
 def test_generate_json_falls_back_to_json_object_when_json_schema_is_unavailable():
     completions = SequencedCompletions(
         [
@@ -157,7 +196,7 @@ def test_generate_json_falls_back_to_json_object_when_json_schema_is_unavailable
         ]
     )
     provider = OpenAICompatibleProvider(
-        provider_config(),
+        provider_config(id="openaiish", base_url="https://api.openaiish.example/v1"),
         env={},
         client_factory=lambda **kwargs: FakeClient(completions),
     )
@@ -168,6 +207,7 @@ def test_generate_json_falls_back_to_json_object_when_json_schema_is_unavailable
     assert completions.calls[0]["response_format"]["type"] == "json_schema"
     assert completions.calls[1]["response_format"] == {"type": "json_object"}
     assert completions.calls[1]["messages"][0]["role"] == "system"
+    assert "JSON Schema" in completions.calls[1]["messages"][0]["content"]
 
 
 def test_missing_required_api_key_fails_before_calling_client():

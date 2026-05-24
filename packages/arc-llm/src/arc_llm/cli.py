@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .host import detect_host, select_llm_provider
+from .proposers_reviewer.consensus import run_proposers_reviewer_consensus
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
 from .proposers_reviewer_bench.runner import run_proposers_reviewer_bench
 from .providers.config import PROVIDER_CONFIG_SCHEMA, load_provider_config, parse_provider_config, provider_config_path
@@ -59,6 +60,12 @@ def _build_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("--json", action="store_true")
     bench_parser.add_argument("--dry-run", action="store_true")
     bench_parser.add_argument("--provider-config", default=None)
+
+    consensus_parser = sub.add_parser("proposers-reviewer-consensus")
+    consensus_parser.add_argument("--config", required=True)
+    consensus_parser.add_argument("--json", action="store_true")
+    consensus_parser.add_argument("--dry-run", action="store_true")
+    consensus_parser.add_argument("--provider-config", default=None)
 
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
@@ -135,6 +142,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
         )
     if args.command == "proposers-reviewer-bench":
         return run_proposers_reviewer_bench(
+            _read_json_file(args.config),
+            base_env=_provider_config_env(args) if args.provider_config else None,
+            dry_run=args.dry_run,
+        )
+    if args.command == "proposers-reviewer-consensus":
+        return run_proposers_reviewer_consensus(
             _read_json_file(args.config),
             base_env=_provider_config_env(args) if args.provider_config else None,
             dry_run=args.dry_run,

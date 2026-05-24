@@ -161,6 +161,20 @@ debugging. These prompt artifacts are not included in later worker context or
 reviews, controller messages, and reviewer-to-proposer messages. Worker-call
 errors are written under each round's `errors/` directory.
 
+## Proposers-Reviewer Consensus
+
+Use the consensus wrapper for calculation workflows that need several
+independent proposers, one reviewer, and selective recalculation when only one
+proposer appears wrong:
+
+```bash
+arc-llm proposers-reviewer-consensus --config consensus-config.json --json
+arc-llm proposers-reviewer-consensus --config consensus-config.json --dry-run --json
+```
+
+The wrapper owns the agreement policy, locked outputs, selective recalculation,
+and the forced `blocked_for_user` stop when the recalculation limit is reached.
+
 Optional true-LLM integration tests are skipped by default. To run them
 explicitly:
 
@@ -188,6 +202,11 @@ object. Defaults are `samples: 25`, `max_rounds: 5`, `max_iterations: 10`,
 `patience: 3`, `max_concurrent_loops: 100`, and `default_provider: "deepseek"`.
 The wrapper materializes sample loop IDs such as `idea_001` through `idea_025`
 from the first configured loop template.
+Benchmark sample workers default to `bench.sample_model_tier: "medium"` so
+large batches use the provider's faster/cheaper test model when available
+(DeepSeek Flash in the standard config). The prompt improver defaults to
+`bench.improver_model_tier: "high"` so result analysis and prompt improvement
+use the stronger configured model (DeepSeek Pro in the standard config).
 
 The improver is given score summaries and artifact file paths such as
 `transcript.jsonl`; it should read detailed histories from disk instead of

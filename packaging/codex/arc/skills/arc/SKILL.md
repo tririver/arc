@@ -40,9 +40,10 @@ cancel any job because it is slow or time consuming.
 ### Phase 1: Setup
 
 Step 1: Decide the automation level.
-If the user asks for automatic or non-interactive work, use `auto`. If the user
-asks to review or confirm steps, use `interactive`. If unclear, ask with the
-discrete selection protocol in `references/rules/interaction.md`.
+Use an explicit user choice. If the user asks for automatic or non-interactive
+work, use `auto`. If the user asks to review or confirm steps, use
+`interactive`. Do not treat `continue`, `resume`, or a bare approval to proceed
+as `auto`. 
 
 Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as
@@ -75,8 +76,9 @@ First complete Case 1. Then read and execute
 `references/research-workflows/suggest-ideas.md`.
 
 Case 3: Calculate from an explicit idea.
-If the idea is explicit enough to make an immediate action plan, read and
-execute `references/research-workflows/calculate.md` directly. If the idea is
-not explicit enough, first complete Case 1 and Case 2, then proceed to
-`references/research-workflows/calculate.md` only after a concrete idea is
-selected.
+If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
+the user to select one concrete idea.
+If the idea is explicit enough:
+Step 1: Read and execute `references/research-workflows/research-plan.md`.
+Step 2: Read and execute `references/research-workflows/research-foundation.md`.
+Step 3: Read and execute `references/research-workflows/research-execute.md`.

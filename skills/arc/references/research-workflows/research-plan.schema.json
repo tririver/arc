@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ARC Research Plan",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "idea",
+    "literature_checks",
+    "foundation_strategy",
+    "steps",
+    "plan_review"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "arc.research_plan.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "idea": {
+      "type": "object",
+      "required": ["title", "statement"],
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "statement": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "literature_checks": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "foundation_strategy": {
+      "type": "object",
+      "required": [
+        "first_principles",
+        "useful_results_to_check",
+        "validation_only_results"
+      ],
+      "properties": {
+        "first_principles": {"type": "array"},
+        "useful_results_to_check": {"type": "array"},
+        "validation_only_results": {"type": "array"}
+      },
+      "additionalProperties": true
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "step_id",
+          "kind",
+          "goal",
+          "quantity_to_calculate",
+          "quantity_dependencies",
+          "allowed_inputs",
+          "substeps",
+          "expected_output",
+          "verification"
+        ],
+        "properties": {
+          "step_id": {"type": "string", "minLength": 1},
+          "kind": {
+            "enum": ["foundation_check", "new_calculation"]
+          },
+          "goal": {"type": "string", "minLength": 1},
+          "quantity_to_calculate": {"type": "string", "minLength": 1},
+          "quantity_dependencies": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "allowed_inputs": {"type": "array"},
+          "substeps": {"type": "array"},
+          "expected_output": {"type": "string", "minLength": 1},
+          "verification": {"type": "array"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "plan_review": {
+      "type": "object",
+      "required": ["reviewer", "status", "findings"],
+      "properties": {
+        "reviewer": {"enum": ["independent_reviewer", "main_agent"]},
+        "status": {"enum": ["accepted", "revision_required"]},
+        "findings": {"type": "array"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

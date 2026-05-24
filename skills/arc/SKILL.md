@@ -76,8 +76,9 @@ First complete Case 1. Then read and execute
 `references/research-workflows/suggest-ideas.md`.
 
 Case 3: Calculate from an explicit idea.
-If the idea is explicit enough to make an immediate action plan, read and
-execute `references/research-workflows/calculate.md` directly. If the idea is
-not explicit enough, first complete Case 1 and Case 2, then proceed to
-`references/research-workflows/calculate.md` only after a concrete idea is
-selected.
+If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
+the user to select one concrete idea.
+If the idea is explicit enough:
+Step 1: Read and execute `references/research-workflows/research-plan.md`.
+Step 2: Read and execute `references/research-workflows/research-foundation.md`.
+Step 3: Read and execute `references/research-workflows/research-execute.md`.

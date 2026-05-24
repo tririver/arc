@@ -1,7 +1,8 @@
 import pytest
+from importlib.resources import files
 from jsonschema import ValidationError
 
-from arc_paper.summary.schema import load_summary_schema, validate_summary
+from arc_paper.summary.schema import load_summary_prompt, load_summary_schema, validate_summary
 
 
 def valid_summary():
@@ -47,6 +48,17 @@ def valid_summary():
 def test_summary_schema_loads():
     schema = load_summary_schema()
     assert schema["$id"] == "arc.paper-summary-v1"
+
+
+def test_summary_resources_are_package_local():
+    summary_package = files("arc_paper.summary")
+    assert (summary_package / "schemas" / "paper-summary-v1.schema.json").is_file()
+    assert (summary_package / "prompts" / "paper-summary-v1.md").is_file()
+
+
+def test_summary_prompt_loads_from_package_resource():
+    prompt = load_summary_prompt()
+    assert "You are summarizing a physics paper" in prompt
 
 
 def test_valid_summary_passes_schema():

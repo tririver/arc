@@ -112,10 +112,6 @@ def _unique_tmp_path(path: Path) -> Path:
 
 def _project_root() -> Path | None:
     for parent in Path(__file__).resolve().parents:
-        if (
-            (parent / "packages" / "arc-paper").is_dir()
-            and (parent / "schemas").is_dir()
-            and (parent / "prompts").is_dir()
-        ):
+        if (parent / "packages" / "arc-paper" / "pyproject.toml").is_file():
             return parent
     return None

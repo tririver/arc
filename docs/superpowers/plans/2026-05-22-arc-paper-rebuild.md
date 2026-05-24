@@ -47,8 +47,8 @@
 
 ### Shared Assets
 
-- `schemas/paper-summary-v1.schema.json`: stable output schema used by CLI, MCP, and host CLI providers.
-- `prompts/paper-summary-v1.md`: prompt template for high-quality paper summaries.
+- `packages/arc-paper/src/arc_paper/summary/schemas/paper-summary-v1.schema.json`: stable output schema used by CLI, MCP, and host CLI providers.
+- `packages/arc-paper/src/arc_paper/summary/prompts/paper-summary-v1.md`: prompt template for high-quality paper summaries.
 - `examples/arc-paper/papers.txt`: sample IDs for batch testing.
 
 ### Adapters
@@ -436,8 +436,8 @@ Expected: all pass.
 ### Task 6: Summary Schema, Prompt, Input Pack, And Store
 
 **Files:**
-- Create: `schemas/paper-summary-v1.schema.json`
-- Create: `prompts/paper-summary-v1.md`
+- Create: `packages/arc-paper/src/arc_paper/summary/schemas/paper-summary-v1.schema.json`
+- Create: `packages/arc-paper/src/arc_paper/summary/prompts/paper-summary-v1.md`
 - Create: `packages/arc-paper/src/arc_paper/summary/__init__.py`
 - Create: `packages/arc-paper/src/arc_paper/summary/schema.py`
 - Create: `packages/arc-paper/src/arc_paper/summary/input_pack.py`
@@ -1013,7 +1013,7 @@ get-llm-summary returns cache hit or needs_llm
 2. Implement Milestone 1 completely before touching LLM features.
 3. Run a live manual check for one modern arXiv ID and one old-style ID.
 4. Implement Milestone 2 and generate 3-5 summaries with `manual`, `codex-cli`, and `claude-cli` providers.
-5. Tune `prompts/paper-summary-v1.md` on 10 hand-picked papers before batch work.
+5. Tune `packages/arc-paper/src/arc_paper/summary/prompts/paper-summary-v1.md` on 10 hand-picked papers before batch work.
 6. Implement Milestone 3 and run `--max-items 10` before any 500-paper batch.
 7. Implement Milestone 4 adapters after the package CLI is stable.
 

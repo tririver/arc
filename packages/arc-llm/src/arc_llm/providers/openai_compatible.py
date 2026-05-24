@@ -10,6 +10,7 @@ from .config import ConfiguredProvider
 
 
 ClientFactory = Callable[..., Any]
+MAX_JSON_PARSE_ATTEMPTS = 3
 
 
 class OpenAICompatibleProvider:
@@ -33,12 +34,13 @@ class OpenAICompatibleProvider:
         model: str | None = None,
     ) -> dict[str, Any]:
         resolved_model = self._require_model(model)
-        json_mode = self.config.json_mode
+        json_mode = _effective_json_mode(self.config)
+        schema_payload = schema or {"type": "object"}
         request: dict[str, Any] = {
             "model": resolved_model,
-            "messages": _json_messages(prompt, json_mode),
+            "messages": _json_messages(prompt, json_mode, schema=schema_payload),
         }
-        response_format = _response_format(self.config, schema or {"type": "object"})
+        response_format = _response_format(self.config, schema_payload)
         if response_format:
             request["response_format"] = response_format
         try:
@@ -47,8 +49,14 @@ class OpenAICompatibleProvider:
             fallback = _response_format_fallback_mode(json_mode, exc)
             if fallback is None:
                 raise
-            content = self._create(_json_request(resolved_model, prompt, fallback))
-        payload = _parse_json_object(content, provider_name=self.name)
+            content = self._create(_json_request(resolved_model, prompt, fallback, schema=schema_payload))
+        payload = self._parse_with_retries(
+            content,
+            prompt=prompt,
+            model=resolved_model,
+            json_mode=json_mode,
+            schema=schema_payload,
+        )
         if not isinstance(payload, dict):
             raise LLMWorkerError(f"{self.name} JSON output was not an object")
         return payload
@@ -85,6 +93,35 @@ class OpenAICompatibleProvider:
             raise LLMWorkerError(f"{self.name} requires a model from --model, ARC_LLM_MODEL, or provider config")
         return resolved
 
+    def _parse_with_retries(
+        self,
+        content: str,
+        *,
+        prompt: str,
+        model: str,
+        json_mode: str,
+        schema: dict[str, Any],
+    ) -> dict[str, Any]:
+        error = ""
+        for attempt in range(1, MAX_JSON_PARSE_ATTEMPTS + 1):
+            try:
+                return _parse_json_object(content, provider_name=self.name)
+            except LLMWorkerError as exc:
+                error = str(exc)
+                if attempt == MAX_JSON_PARSE_ATTEMPTS:
+                    raise
+                content = self._create(
+                    _json_retry_request(
+                        model,
+                        prompt,
+                        json_mode,
+                        schema=schema,
+                        error=error,
+                        attempt=attempt + 1,
+                    )
+                )
+        raise LLMWorkerError(error or f"{self.name} JSON output was not valid JSON")
+
 
 def _openai_client_factory() -> ClientFactory:
     try:
@@ -95,9 +132,10 @@ def _openai_client_factory() -> ClientFactory:
 
 
 def _response_format(provider: ConfiguredProvider, schema: dict[str, Any]) -> dict[str, Any] | None:
-    if provider.json_mode == "none":
+    json_mode = _effective_json_mode(provider)
+    if json_mode == "none":
         return None
-    if provider.json_mode == "json_object":
+    if json_mode == "json_object":
         return {"type": "json_object"}
     return {
         "type": "json_schema",
@@ -109,14 +147,49 @@ def _response_format(provider: ConfiguredProvider, schema: dict[str, Any]) -> di
     }
 
 
-def _json_request(model: str, prompt: str, json_mode: str) -> dict[str, Any]:
+def _effective_json_mode(provider: ConfiguredProvider) -> str:
+    if provider.json_mode == "json_schema" and _is_deepseek_provider(provider):
+        return "json_object"
+    return provider.json_mode
+
+
+def _is_deepseek_provider(provider: ConfiguredProvider) -> bool:
+    text = f"{provider.id} {provider.base_url}".lower()
+    return "deepseek" in text
+
+
+def _json_request(model: str, prompt: str, json_mode: str, *, schema: dict[str, Any]) -> dict[str, Any]:
     request: dict[str, Any] = {
         "model": model,
-        "messages": _json_messages(prompt, json_mode),
+        "messages": _json_messages(prompt, json_mode, schema=schema),
     }
     response_format = _response_format_for_mode(json_mode)
     if response_format:
         request["response_format"] = response_format
+    return request
+
+
+def _json_retry_request(
+    model: str,
+    prompt: str,
+    json_mode: str,
+    *,
+    schema: dict[str, Any],
+    error: str,
+    attempt: int,
+) -> dict[str, Any]:
+    request = _json_request(model, prompt, json_mode, schema=schema)
+    retry_note = (
+        f"Previous response was invalid JSON. This is repair attempt {attempt}. "
+        "Retry the same task and return exactly one valid JSON object. "
+        "Do not include markdown, comments, a second JSON object, or unescaped quotes/newlines inside strings. "
+        "Escape every backslash that appears inside a JSON string, for example use \\\\mu rather than \\mu. "
+        f"Error: {error}"
+    )
+    if request["messages"] and request["messages"][0]["role"] == "system":
+        request["messages"][0]["content"] = f"{request['messages'][0]['content']}\n\n{retry_note}"
+    else:
+        request["messages"].insert(0, {"role": "system", "content": retry_note})
     return request
 
 
@@ -165,18 +238,27 @@ def _parse_json_object(content: str, *, provider_name: str) -> dict[str, Any]:
     return payload
 
 
-def _json_messages(prompt: str, json_mode: str) -> list[dict[str, str]]:
+def _json_messages(prompt: str, json_mode: str, *, schema: dict[str, Any] | None = None) -> list[dict[str, str]]:
     if json_mode == "json_object":
         return [
-            {"role": "system", "content": "Return JSON only."},
+            {"role": "system", "content": _json_only_system_message(schema)},
             {"role": "user", "content": prompt},
         ]
     if json_mode == "none":
         return [
-            {"role": "system", "content": "Return JSON only."},
+            {"role": "system", "content": _json_only_system_message(schema)},
             {"role": "user", "content": prompt},
         ]
     return [{"role": "user", "content": prompt}]
+
+
+def _json_only_system_message(schema: dict[str, Any] | None) -> str:
+    if not schema:
+        return "Return exactly one JSON object and no other text."
+    return (
+        "Return exactly one JSON object and no other text. The object must match this JSON Schema:\n"
+        f"{json.dumps(schema, indent=2, ensure_ascii=False)}"
+    )
 
 
 def _first_message_content(completion: Any) -> str:

@@ -357,6 +357,51 @@ def test_review_envelope_requires_review_payload(tmp_path):
     assert "review.review_payload must be an object" in result["loops"][0]["error"]
 
 
+def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_path):
+    calls = []
+
+    def invalid_then_valid_reviewer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        calls.append({"worker_id": context["worker_id"], "prompt": prompt})
+        if context["worker_id"].startswith("reviewer"):
+            reviewer_calls = [call for call in calls if call["worker_id"].startswith("reviewer")]
+            if len(reviewer_calls) == 1:
+                return {"message": "not an envelope"}
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "valid after retry", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {
+            "worker_id": context["worker_id"],
+            "round": context["round_number"],
+            "content": "proposal",
+        }
+
+    result = run_proposers_reviewer_batch(
+        base_config(tmp_path, max_rounds=1),
+        json_runner=invalid_then_valid_reviewer,
+        base_env={},
+    )
+
+    reviewer_prompts = [call["prompt"] for call in calls if call["worker_id"].startswith("reviewer")]
+    review = json.loads(
+        (tmp_path / "suggest-ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert len(reviewer_prompts) == 2
+    assert "Previous reviewer response failed validation" in reviewer_prompts[1]
+    assert "review schema_version must be arc.llm.review_envelope.v1" in reviewer_prompts[1]
+    assert review["controller"]["message"] == "valid after retry"
+
+
 def test_worker_envs_are_isolated_and_os_environ_is_not_mutated(tmp_path, monkeypatch):
     monkeypatch.delenv("ARC_CODEX_ALLOW_INTERNET", raising=False)
     monkeypatch.delenv("ARC_CODEX_ENABLE_MCP", raising=False)

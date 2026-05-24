@@ -90,6 +90,22 @@ def test_bench_config_accepts_overrides_without_changing_batch_shape(tmp_path):
     assert {loop["max_rounds"] for loop in payload["loops"]} == {4}
 
 
+def test_bench_defaults_use_flash_tier_for_sample_workers_and_high_tier_for_improver(tmp_path):
+    raw = base_payload(tmp_path)
+    raw["defaults"]["model_tier"] = "high"
+    raw["loops"][0]["proposers"][0]["model_tier"] = "high"
+    raw["loops"][0]["reviewers"][0]["model_tier"] = "high"
+
+    config = load_bench_config(raw)
+    payload = materialize_batch_payload(config, iteration_index=0, candidate_id="current")
+
+    assert config.options.sample_model_tier == "medium"
+    assert config.options.improver_model_tier == "high"
+    assert payload["defaults"]["model_tier"] == "medium"
+    assert payload["loops"][0]["proposers"][0]["model_tier"] == "medium"
+    assert payload["loops"][0]["reviewers"][0]["model_tier"] == "medium"
+
+
 def test_apply_improvement_edits_restricts_reviewer_changes_by_default(tmp_path):
     payload = base_payload(tmp_path)
     improvement = {

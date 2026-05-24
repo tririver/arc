@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ARC Research Execute Report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "proposer_count",
+    "max_recalculations",
+    "steps"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "arc.research_execute.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "proposer_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_recalculations": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": ["completed", "blocked_for_user", "failed"]
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step_id", "kind", "status", "attempts"],
+        "properties": {
+          "step_id": {"type": "string", "minLength": 1},
+          "kind": {
+            "enum": ["foundation_check", "new_calculation"]
+          },
+          "status": {
+            "enum": ["accepted", "blocked_for_user", "failed"]
+          },
+          "attempts": {"type": "array"},
+          "accepted_output": {
+            "type": ["object", "null"]
+          },
+          "blocked_output": {
+            "type": ["object", "null"]
+          },
+          "reviewer_consensus": {
+            "type": ["object", "null"]
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

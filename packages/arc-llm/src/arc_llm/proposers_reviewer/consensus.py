@@ -1,0 +1,591 @@
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import asdict, dataclass, is_dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from .artifacts import RunPaths, atomic_write_json
+from .config import ConfigError, SAFE_ID_RE
+from .runner import JsonRunner, run_proposers_reviewer_batch
+
+
+CONSENSUS_CONFIG_SCHEMA = "arc.llm.proposers_reviewer_consensus.config.v1"
+CONSENSUS_RESULT_SCHEMA = "arc.llm.proposers_reviewer_consensus.result.v1"
+REVIEW_ENVELOPE_SCHEMA = "arc.llm.review_envelope.v1"
+
+BatchRunner = Callable[..., dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ConsensusStep:
+    step_id: str
+    prompt: str
+    kind: str
+    allowed_context: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ConsensusConfig:
+    schema_version: str
+    run_id: str
+    run_dir: Path
+    proposer_count: int
+    max_recalculations: int
+    defaults: dict[str, Any]
+    artifact_options: dict[str, Any]
+    steps: list[ConsensusStep]
+
+
+def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
+    data = copy.deepcopy(dict(payload))
+    schema_version = _required_text(data, "schema_version")
+    if schema_version != CONSENSUS_CONFIG_SCHEMA:
+        raise ConfigError(f"schema_version must be {CONSENSUS_CONFIG_SCHEMA}")
+
+    run_id = _safe_id(_required_text(data, "run_id"), "run_id")
+    run_dir = Path(_required_text(data, "run_dir")).expanduser()
+    proposer_count = _positive_int(data.get("proposer_count", 3), "proposer_count")
+    max_recalculations = _positive_int(data.get("max_recalculations", 3), "max_recalculations")
+    defaults = _dict(data.get("defaults", {}), "defaults")
+    artifact_options = _dict(data.get("artifact_options", {"save_prompts": True}), "artifact_options")
+    if "save_prompts" not in artifact_options:
+        artifact_options["save_prompts"] = True
+    if not isinstance(artifact_options.get("save_prompts"), bool):
+        raise ConfigError("artifact_options.save_prompts must be a boolean")
+
+    raw_steps = data.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ConfigError("steps must be a non-empty list")
+
+    steps: list[ConsensusStep] = []
+    seen_step_ids: set[str] = set()
+    for raw_step in raw_steps:
+        step_data = _dict(raw_step, "steps[]")
+        step_id = _safe_id(_required_text(step_data, "step_id"), "step_id")
+        if step_id in seen_step_ids:
+            raise ConfigError(f"duplicate step_id: {step_id}")
+        seen_step_ids.add(step_id)
+        kind = str(step_data.get("kind", "new_calculation") or "new_calculation")
+        if kind not in {"foundation_check", "new_calculation"}:
+            raise ConfigError("step.kind must be foundation_check or new_calculation")
+        steps.append(
+            ConsensusStep(
+                step_id=step_id,
+                prompt=_required_text(step_data, "prompt"),
+                kind=kind,
+                allowed_context=_dict(step_data.get("allowed_context", {}), f"{step_id}.allowed_context"),
+            )
+        )
+
+    return ConsensusConfig(
+        schema_version=schema_version,
+        run_id=run_id,
+        run_dir=run_dir,
+        proposer_count=proposer_count,
+        max_recalculations=max_recalculations,
+        defaults=defaults,
+        artifact_options=artifact_options,
+        steps=steps,
+    )
+
+
+def run_proposers_reviewer_consensus(
+    config: ConsensusConfig | Mapping[str, Any],
+    *,
+    batch_runner: BatchRunner | None = None,
+    json_runner: JsonRunner | None = None,
+    base_env: Mapping[str, str] | None = None,
+    process_chain: list[str] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    consensus = config if isinstance(config, ConsensusConfig) else load_consensus_config(config)
+    paths = RunPaths(run_dir=consensus.run_dir, run_id=consensus.run_id)
+    if dry_run:
+        return _dry_run_result(consensus, paths)
+
+    paths.run_root.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(paths.config, _jsonable(consensus))
+
+    runner = batch_runner or run_proposers_reviewer_batch
+    step_results: list[dict[str, Any]] = []
+    overall_status = "completed"
+    for step in consensus.steps:
+        step_result = _run_consensus_step(
+            consensus,
+            step,
+            runner=runner,
+            json_runner=json_runner,
+            base_env=base_env,
+            process_chain=process_chain,
+            run_root=paths.run_root,
+        )
+        step_results.append(step_result)
+        if step_result["status"] == "blocked_for_user":
+            overall_status = "blocked_for_user"
+            break
+        if step_result["status"] == "failed":
+            overall_status = "failed"
+            break
+
+    result = {
+        "schema_version": CONSENSUS_RESULT_SCHEMA,
+        "status": overall_status,
+        "run_id": consensus.run_id,
+        "run_root": str(paths.run_root),
+        "proposer_count": consensus.proposer_count,
+        "max_recalculations": consensus.max_recalculations,
+        "steps": step_results,
+    }
+    atomic_write_json(paths.state, result)
+    return result
+
+
+def _run_consensus_step(
+    config: ConsensusConfig,
+    step: ConsensusStep,
+    *,
+    runner: BatchRunner,
+    json_runner: JsonRunner | None,
+    base_env: Mapping[str, str] | None,
+    process_chain: list[str] | None,
+    run_root: Path,
+) -> dict[str, Any]:
+    all_proposer_ids = _proposer_ids(config.proposer_count)
+    active_proposer_ids = list(all_proposer_ids)
+    locked_outputs: dict[str, Any] = {}
+    attempts: list[dict[str, Any]] = []
+    max_attempts = config.max_recalculations + 1
+
+    for attempt_number in range(1, max_attempts + 1):
+        batch_config = _attempt_batch_config(
+            config,
+            step,
+            attempt_number=attempt_number,
+            active_proposer_ids=active_proposer_ids,
+            locked_outputs=locked_outputs,
+            run_root=run_root,
+        )
+        batch_result = runner(
+            batch_config,
+            json_runner=json_runner,
+            base_env=base_env,
+            process_chain=process_chain,
+            dry_run=False,
+            max_concurrent_loops=1,
+        )
+        attempt_paths = _attempt_paths(batch_config)
+        attempt_record = {
+            "attempt_number": attempt_number,
+            "active_proposer_ids": list(active_proposer_ids),
+            "batch_run_id": batch_config["run_id"],
+            "batch_loop_id": batch_config["loops"][0]["loop_id"],
+            "batch_root": str(attempt_paths["run_root"]),
+            "review_path": str(attempt_paths["review_path"]),
+        }
+        if batch_result.get("status") != "completed":
+            attempt_record["batch_result"] = batch_result
+            attempts.append(attempt_record)
+            return {
+                "step_id": step.step_id,
+                "kind": step.kind,
+                "status": "failed",
+                "attempts": attempts,
+                "accepted_output": None,
+                "blocked_output": None,
+                "reviewer_consensus": None,
+                "error": "attempt batch did not complete",
+            }
+
+        try:
+            review = _read_json(attempt_paths["review_path"])
+            consensus = _review_consensus(review, active_proposer_ids=active_proposer_ids)
+        except Exception as exc:
+            attempt_record["error"] = str(exc)
+            attempts.append(attempt_record)
+            return {
+                "step_id": step.step_id,
+                "kind": step.kind,
+                "status": "failed",
+                "attempts": attempts,
+                "accepted_output": None,
+                "blocked_output": None,
+                "reviewer_consensus": None,
+                "error": str(exc),
+            }
+        proposer_outputs = _read_proposer_outputs(attempt_paths["round_root"], active_proposer_ids)
+        attempt_record["consensus"] = consensus
+        attempt_record["proposer_output_paths"] = {
+            proposer_id: str(attempt_paths["round_root"] / "proposer_outputs" / f"{proposer_id}.json")
+            for proposer_id in active_proposer_ids
+        }
+        attempts.append(attempt_record)
+
+        status = str(consensus.get("status", "unresolved"))
+        if status == "all_agree":
+            accepted_result = consensus.get("accepted_result")
+            return {
+                "step_id": step.step_id,
+                "kind": step.kind,
+                "status": "accepted",
+                "attempts": attempts,
+                "accepted_output": accepted_result
+                if accepted_result is not None
+                else {"proposer_outputs": proposer_outputs},
+                "blocked_output": None,
+                "reviewer_consensus": consensus,
+            }
+
+        if attempt_number >= max_attempts:
+            return {
+                "step_id": step.step_id,
+                "kind": step.kind,
+                "status": "blocked_for_user",
+                "attempts": attempts,
+                "accepted_output": None,
+                "blocked_output": {
+                    "analysis": str(consensus.get("analysis", "")),
+                    "last_consensus": consensus,
+                },
+                "reviewer_consensus": consensus,
+            }
+
+        if status == "two_agree":
+            next_active = _next_active_for_two_agree(consensus, all_proposer_ids)
+            if next_active is not None:
+                agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), all_proposer_ids)
+                for proposer_id in agreed_ids:
+                    if proposer_id in proposer_outputs:
+                        locked_outputs[proposer_id] = proposer_outputs[proposer_id]
+                active_proposer_ids = next_active
+                continue
+
+        active_proposer_ids = list(all_proposer_ids)
+        locked_outputs = {}
+
+    raise AssertionError("unreachable consensus loop exit")
+
+
+def _attempt_batch_config(
+    config: ConsensusConfig,
+    step: ConsensusStep,
+    *,
+    attempt_number: int,
+    active_proposer_ids: list[str],
+    locked_outputs: dict[str, Any],
+    run_root: Path,
+) -> dict[str, Any]:
+    attempt_id = f"{step.step_id}_attempt_{attempt_number:03d}"
+    return {
+        "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
+        "run_id": attempt_id,
+        "run_dir": str(run_root / "attempt_batches"),
+        "max_concurrent_loops": 1,
+        "artifact_options": {"save_prompts": bool(config.artifact_options.get("save_prompts", True))},
+        "defaults": copy.deepcopy(config.defaults),
+        "loops": [
+            {
+                "loop_id": attempt_id,
+                "max_rounds": 1,
+                "early_stop": {"enabled": False},
+                "caller_context": {
+                    "step_id": step.step_id,
+                    "step_kind": step.kind,
+                    "step_prompt": step.prompt,
+                    "allowed_context": step.allowed_context,
+                    "attempt_number": attempt_number,
+                    "active_proposer_ids": active_proposer_ids,
+                    "locked_outputs": copy.deepcopy(locked_outputs),
+                    "max_recalculations": config.max_recalculations,
+                    "consensus_instruction": "Work only on this calculation step. Respect locked_outputs as already accepted unless explicitly asked to check them.",
+                },
+                "proposers": [_proposer_config(proposer_id) for proposer_id in active_proposer_ids],
+                "reviewers": [_reviewer_config(active_proposer_ids)],
+            }
+        ],
+    }
+
+
+def _proposer_config(proposer_id: str) -> dict[str, Any]:
+    return {
+        "id": proposer_id,
+        "prompt": {
+            "system": "You are an independent theoretical-physics calculation proposer.",
+            "template": (
+                "Use caller_context.step_prompt and caller_context.allowed_context. "
+                "Return one JSON object with result_summary, derivation, assumptions, "
+                "reliable_until, and final_result. Put the final mathematical result in "
+                "final_result using explicit symbols so a reviewer can compare it with "
+                "other proposers by evaluating A-B, B-C, and A-C. Do not coordinate with "
+                "other proposers.\n\n"
+                "{caller_context_json}"
+            ),
+        },
+        "output_schema": {"type": "object"},
+    }
+
+
+def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
+    return {
+        "id": "reviewer_001",
+        "prompt": {
+            "system": "You are a skeptical theoretical-physics consensus reviewer.",
+            "template": (
+                "Compare current_proposer_outputs_json for the current calculation step. "
+                "Return exactly one arc.llm.review_envelope.v1 JSON object. The top-level object "
+                "must contain schema_version, controller, proposer_messages, and review_payload. "
+                f"proposer_messages must contain these keys: {', '.join(active_proposer_ids)}. "
+                "In review_payload.consensus, "
+                "set status to all_agree, two_agree, all_disagree, or unresolved. Include "
+                "accepted_result, agreed_proposer_ids, likely_wrong_proposer_ids, "
+                "recalculate_proposer_ids, reliable_until, analysis, and "
+                "pairwise_symbolic_checks. Let A, B, and C be the final mathematical results "
+                "from proposer_001, proposer_002, and proposer_003 when those proposer ids "
+                "are active. Use SymPy whenever available to simplify A-B, B-C, and A-C. "
+                "Before marking all_agree, at least two of A-B=0, B-C=0, and A-C=0 must "
+                "be true. Never mark all_agree by visual inspection or because the results "
+                "seem to agree. If SymPy is unavailable, perform explicit algebraic checks "
+                "and set used_sympy=false with the reason in pairwise_symbolic_checks.notes. "
+                "If exactly one proposer is likely wrong, name only that proposer for "
+                "recalculation; otherwise ask all proposers to recalculate.\n\n"
+                "{current_proposer_outputs_json}"
+            ),
+        },
+        "output_schema": _reviewer_output_schema(active_proposer_ids),
+        "runtime": {"allow_mcp": True, "mcp_mode": "arc-only"},
+    }
+
+
+def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
+    proposer_message_properties = {
+        proposer_id: {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+            },
+            "additionalProperties": True,
+        }
+        for proposer_id in active_proposer_ids
+    }
+    return {
+        "type": "object",
+        "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
+        "properties": {
+            "schema_version": {"const": REVIEW_ENVELOPE_SCHEMA},
+            "controller": {
+                "type": "object",
+                "required": ["message", "stop_requested"],
+                "properties": {
+                    "message": {"type": "string"},
+                    "stop_requested": {"type": "boolean"},
+                    "stop_reason": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "proposer_messages": {
+                "type": "object",
+                "required": active_proposer_ids,
+                "properties": proposer_message_properties,
+                "additionalProperties": True,
+            },
+            "review_payload": {
+                "type": "object",
+                "required": ["consensus"],
+                "properties": {
+                    "consensus": {
+                        "type": "object",
+                        "required": [
+                            "status",
+                            "accepted_result",
+                            "agreed_proposer_ids",
+                            "likely_wrong_proposer_ids",
+                            "recalculate_proposer_ids",
+                            "reliable_until",
+                            "analysis",
+                            "pairwise_symbolic_checks",
+                        ],
+                        "properties": {
+                            "status": {
+                                "enum": ["all_agree", "two_agree", "all_disagree", "unresolved"]
+                            },
+                            "accepted_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+                            "agreed_proposer_ids": {
+                                "type": "array",
+                                "items": {"enum": active_proposer_ids},
+                            },
+                            "likely_wrong_proposer_ids": {
+                                "type": "array",
+                                "items": {"enum": active_proposer_ids},
+                            },
+                            "recalculate_proposer_ids": {
+                                "type": "array",
+                                "items": {"enum": active_proposer_ids},
+                            },
+                            "reliable_until": {"type": "string"},
+                            "analysis": {"type": "string"},
+                            "pairwise_symbolic_checks": {
+                                "type": "object",
+                                "required": [
+                                    "used_sympy",
+                                    "A_minus_B_zero",
+                                    "B_minus_C_zero",
+                                    "A_minus_C_zero",
+                                    "true_count",
+                                    "notes",
+                                ],
+                                "properties": {
+                                    "used_sympy": {"type": "boolean"},
+                                    "A_minus_B_zero": {"type": "boolean"},
+                                    "B_minus_C_zero": {"type": "boolean"},
+                                    "A_minus_C_zero": {"type": "boolean"},
+                                    "true_count": {"type": "integer", "minimum": 0, "maximum": 3},
+                                    "sympy_code": {"type": "string"},
+                                    "notes": {"type": "string"},
+                                },
+                                "additionalProperties": True,
+                            },
+                        },
+                        "additionalProperties": True,
+                    }
+                },
+                "additionalProperties": True,
+            },
+        },
+        "additionalProperties": True,
+    }
+
+
+def _attempt_paths(batch_config: Mapping[str, Any]) -> dict[str, Path]:
+    run_root = Path(str(batch_config["run_dir"])) / str(batch_config["run_id"])
+    loop_id = str(batch_config["loops"][0]["loop_id"])
+    round_root = run_root / "loops" / loop_id / "rounds" / "round_001"
+    return {
+        "run_root": run_root,
+        "round_root": round_root,
+        "review_path": round_root / "reviews" / "reviewer_001.json",
+    }
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object at {path}")
+    return payload
+
+
+def _review_consensus(review: Mapping[str, Any], *, active_proposer_ids: list[str]) -> dict[str, Any]:
+    if review.get("schema_version") != REVIEW_ENVELOPE_SCHEMA:
+        raise ValueError(f"review schema_version must be {REVIEW_ENVELOPE_SCHEMA}")
+    payload = review.get("review_payload")
+    if not isinstance(payload, dict):
+        raise ValueError("review.review_payload must be an object")
+    consensus = payload.get("consensus")
+    if not isinstance(consensus, dict):
+        raise ValueError("review.review_payload.consensus must be an object")
+    status = consensus.get("status")
+    if status not in {"all_agree", "two_agree", "all_disagree", "unresolved"}:
+        raise ValueError("consensus.status must be all_agree, two_agree, all_disagree, or unresolved")
+    if status == "all_agree" and len(active_proposer_ids) >= 3:
+        _validate_all_agree_pairwise_checks(consensus)
+    return dict(consensus)
+
+
+def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
+    checks = consensus.get("pairwise_symbolic_checks")
+    if not isinstance(checks, dict):
+        raise ValueError("all_agree requires review_payload.consensus.pairwise_symbolic_checks")
+    pairwise_keys = ["A_minus_B_zero", "B_minus_C_zero", "A_minus_C_zero"]
+    pairwise_true_count = sum(1 for key in pairwise_keys if checks.get(key) is True)
+    reported_true_count = checks.get("true_count")
+    if isinstance(reported_true_count, int):
+        pairwise_true_count = min(pairwise_true_count, reported_true_count)
+    if pairwise_true_count < 2:
+        raise ValueError("all_agree requires at least two true pairwise symbolic checks")
+
+
+def _read_proposer_outputs(round_root: Path, proposer_ids: list[str]) -> dict[str, Any]:
+    outputs: dict[str, Any] = {}
+    for proposer_id in proposer_ids:
+        path = round_root / "proposer_outputs" / f"{proposer_id}.json"
+        if path.exists():
+            outputs[proposer_id] = _read_json(path)
+    return outputs
+
+
+def _next_active_for_two_agree(consensus: Mapping[str, Any], all_proposer_ids: list[str]) -> list[str] | None:
+    recalculate = _valid_ids(consensus.get("recalculate_proposer_ids", []), all_proposer_ids)
+    likely_wrong = _valid_ids(consensus.get("likely_wrong_proposer_ids", []), all_proposer_ids)
+    next_active = recalculate or likely_wrong
+    if len(next_active) == 1:
+        return next_active
+    return None
+
+
+def _valid_ids(raw_ids: Any, all_proposer_ids: list[str]) -> list[str]:
+    if not isinstance(raw_ids, list):
+        return []
+    allowed = set(all_proposer_ids)
+    return [str(item) for item in raw_ids if str(item) in allowed]
+
+
+def _proposer_ids(count: int) -> list[str]:
+    return [f"proposer_{index:03d}" for index in range(1, count + 1)]
+
+
+def _dry_run_result(config: ConsensusConfig, paths: RunPaths) -> dict[str, Any]:
+    return {
+        "schema_version": CONSENSUS_RESULT_SCHEMA,
+        "status": "dry_run",
+        "run_id": config.run_id,
+        "run_root": str(paths.run_root),
+        "proposer_count": config.proposer_count,
+        "max_recalculations": config.max_recalculations,
+        "steps": [{"step_id": step.step_id, "kind": step.kind} for step in config.steps],
+    }
+
+
+def _required_text(data: Mapping[str, Any], key: str) -> str:
+    value = data.get(key)
+    if value is None:
+        raise ConfigError(f"{key} is required")
+    text = str(value).strip()
+    if not text:
+        raise ConfigError(f"{key} is required")
+    return text
+
+
+def _dict(value: Any, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"{field_name} must be an object")
+    return copy.deepcopy(value)
+
+
+def _positive_int(value: Any, field_name: str) -> int:
+    try:
+        parsed = int(value)
+    except Exception as exc:
+        raise ConfigError(f"{field_name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{field_name} must be a positive integer")
+    return parsed
+
+
+def _safe_id(value: str, field_name: str) -> str:
+    if not SAFE_ID_RE.fullmatch(value):
+        raise ConfigError(f"{field_name} must contain only letters, numbers, dot, underscore, or dash")
+    return value
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value):
+        return {key: _jsonable(item) for key, item in asdict(value).items()}
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
