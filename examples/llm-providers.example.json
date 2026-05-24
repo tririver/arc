@@ -9,6 +9,7 @@
     "This file may contain API keys. Keep real llm-providers.json files out of git."
   ],
   "schema_version": "arc.llm.providers.v1",
+  "auto_provider_priority": "host-first",
   "default": "deepseek",
   "providers": [
     {

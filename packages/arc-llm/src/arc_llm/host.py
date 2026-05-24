@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .providers.config import ProviderConfigError, load_provider_config, select_default_configured_provider
+from .providers.config import (
+    AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST,
+    ProviderConfigError,
+    load_provider_config,
+    select_default_configured_provider,
+)
 
 
 @dataclass(frozen=True)
@@ -61,21 +66,37 @@ def select_llm_provider(
     if provider := env.get("ARC_LLM_PROVIDER"):
         return ProviderSelection(provider=provider, host=host, signals=[f"env:ARC_LLM_PROVIDER={provider}"])
     try:
+        config = load_provider_config(env=env)
+        if config.auto_provider_priority == AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST:
+            configured = select_default_configured_provider(env=env)
+            if configured:
+                return ProviderSelection(
+                    provider=configured.id,
+                    host=host,
+                    signals=[f"provider-config:{config.path}:{configured.id}"],
+                )
+        if native := _host_native_provider(host):
+            return ProviderSelection(provider=native, host=host, signals=host.signals)
         configured = select_default_configured_provider(env=env)
         if configured:
-            config = load_provider_config(env=env)
             return ProviderSelection(
                 provider=configured.id,
                 host=host,
                 signals=[f"provider-config:{config.path}:{configured.id}"],
             )
     except ProviderConfigError as exc:
+        if native := _host_native_provider(host):
+            return ProviderSelection(provider=native, host=host, signals=[*host.signals, f"provider-config-error:{exc}"])
         return ProviderSelection(provider="manual", host=host, signals=[f"provider-config-error:{exc}"])
-    if host.host == "codex":
-        return ProviderSelection(provider="codex-cli", host=host, signals=host.signals)
-    if host.host == "claude-code":
-        return ProviderSelection(provider="claude-cli", host=host, signals=host.signals)
     return ProviderSelection(provider="manual", host=host, signals=host.signals)
+
+
+def _host_native_provider(host: HostDetection) -> str | None:
+    if host.host == "codex":
+        return "codex-cli"
+    if host.host == "claude-code":
+        return "claude-cli"
+    return None
 
 
 def _has_command_token(text: str, token: str) -> bool:

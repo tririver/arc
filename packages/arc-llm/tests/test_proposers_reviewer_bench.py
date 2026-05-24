@@ -45,7 +45,7 @@ def base_payload(tmp_path: Path) -> dict[str, Any]:
     }
 
 
-def test_bench_config_defaults_materialize_twenty_five_deepseek_loops(tmp_path):
+def test_bench_config_defaults_materialize_ten_deepseek_loops(tmp_path):
     config = load_bench_config(base_payload(tmp_path))
 
     payload = materialize_batch_payload(config, iteration_index=0, candidate_id="current")
@@ -54,9 +54,9 @@ def test_bench_config_defaults_materialize_twenty_five_deepseek_loops(tmp_path):
     assert payload["run_id"] == "bench_seed_iter000_current"
     assert payload["max_concurrent_loops"] == 100
     assert payload["defaults"]["provider"] == "deepseek"
-    assert len(payload["loops"]) == 25
+    assert len(payload["loops"]) == 10
     assert payload["loops"][0]["loop_id"] == "idea_001"
-    assert payload["loops"][-1]["loop_id"] == "idea_025"
+    assert payload["loops"][-1]["loop_id"] == "idea_010"
     assert {loop["max_rounds"] for loop in payload["loops"]} == {5}
     proposer = payload["loops"][0]["proposers"][0]
     reviewer = payload["loops"][0]["reviewers"][0]

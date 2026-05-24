@@ -334,6 +334,7 @@ def _providers_list(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": "arc.llm.providers.list.v1",
         "config_path": config.path,
         "default": config.default,
+        "auto_provider_priority": config.auto_provider_priority,
         "builtins": ["codex-cli", "claude-cli", "manual"],
         "configured": configured,
     }
@@ -347,6 +348,7 @@ def _providers_init(args: argparse.Namespace) -> dict[str, Any]:
     payload = {
         "_comment": _provider_config_comment(path),
         "schema_version": PROVIDER_CONFIG_SCHEMA,
+        "auto_provider_priority": "host-first",
         "providers": [
             {
                 "id": "deepseek",

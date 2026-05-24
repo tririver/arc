@@ -10,19 +10,21 @@ from arc_llm.providers.config import ProviderConfigError, load_provider_config, 
 from arc_llm.providers.select import select_provider
 
 
-def write_config(tmp_path, providers, *, default=None):
+def write_config(tmp_path, providers, *, default=None, auto_provider_priority=None):
     path = tmp_path / "llm-providers.json"
-    write_payload(path, providers, default=default)
+    write_payload(path, providers, default=default, auto_provider_priority=auto_provider_priority)
     return str(path)
 
 
-def write_payload(path, providers, *, default=None):
+def write_payload(path, providers, *, default=None, auto_provider_priority=None):
     payload = {
         "schema_version": "arc.llm.providers.v1",
         "providers": providers,
     }
     if default is not None:
         payload["default"] = default
+    if auto_provider_priority is not None:
+        payload["auto_provider_priority"] = auto_provider_priority
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -97,8 +99,46 @@ def test_load_provider_config_supports_file_api_key(tmp_path):
 
     assert config.path == path
     assert config.default == "deepseek"
+    assert config.auto_provider_priority == "host-first"
     assert config.providers[0].id == "deepseek"
     assert config.providers[0].api_key == "secret-value"
+
+
+def test_load_provider_config_supports_configured_first_auto_priority(tmp_path):
+    path = write_config(
+        tmp_path,
+        [
+            {
+                "id": "deepseek",
+                "type": "openai-compatible",
+                "base_url": "https://api.deepseek.example/v1",
+                "api_key": "secret-value",
+            }
+        ],
+        auto_provider_priority="configured-first",
+    )
+
+    config = load_provider_config(env={"ARC_LLM_PROVIDER_CONFIG": path})
+
+    assert config.auto_provider_priority == "configured-first"
+
+
+def test_load_provider_config_rejects_unknown_auto_priority(tmp_path):
+    path = write_config(
+        tmp_path,
+        [
+            {
+                "id": "deepseek",
+                "type": "openai-compatible",
+                "base_url": "https://api.deepseek.example/v1",
+                "api_key": "secret-value",
+            }
+        ],
+        auto_provider_priority="deepseek-first",
+    )
+
+    with pytest.raises(ProviderConfigError, match="auto_provider_priority"):
+        load_provider_config(env={"ARC_LLM_PROVIDER_CONFIG": path})
 
 
 def test_provider_config_rejects_api_key_env(tmp_path):
@@ -179,7 +219,7 @@ def test_usable_configured_providers_treat_inline_api_key_as_key_present(tmp_pat
     assert [item.id for item in usable_configured_providers(env={"ARC_LLM_PROVIDER_CONFIG": path})] == ["deepseek"]
 
 
-def test_auto_provider_selection_prefers_usable_config_default_before_host(tmp_path):
+def test_auto_provider_selection_prefers_native_host_before_config_default(tmp_path):
     path = write_config(
         tmp_path,
         [
@@ -197,6 +237,37 @@ def test_auto_provider_selection_prefers_usable_config_default_before_host(tmp_p
             },
         ],
         default="deepseek",
+    )
+
+    selected = select_llm_provider(
+        env={"ARC_LLM_PROVIDER_CONFIG": path},
+        process_chain=["codex exec"],
+    )
+
+    assert selected.provider == "codex-cli"
+    assert selected.host.host == "codex"
+    assert selected.signals == ["parent:codex exec"]
+
+
+def test_auto_provider_selection_can_prefer_configured_default_before_host(tmp_path):
+    path = write_config(
+        tmp_path,
+        [
+            {
+                "id": "ollama",
+                "type": "openai-compatible",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "api_key_optional": True,
+            },
+            {
+                "id": "deepseek",
+                "type": "openai-compatible",
+                "base_url": "https://api.deepseek.example/v1",
+                "api_key": "secret-value",
+            },
+        ],
+        default="deepseek",
+        auto_provider_priority="configured-first",
     )
 
     selected = select_llm_provider(
@@ -229,7 +300,7 @@ def test_auto_provider_selection_uses_file_order_when_default_is_unusable(tmp_pa
         default="openrouter",
     )
 
-    selected = select_llm_provider(env={"ARC_LLM_PROVIDER_CONFIG": path}, process_chain=["codex exec"])
+    selected = select_llm_provider(env={"ARC_LLM_PROVIDER_CONFIG": path}, process_chain=[])
 
     assert selected.provider == "ollama"
 

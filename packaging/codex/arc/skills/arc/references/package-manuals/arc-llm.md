@@ -63,6 +63,7 @@ Provider config may store a raw API key in a local ignored config file:
     "Windows user config: %USERPROFILE%\\.config\\arc\\llm-providers.json"
   ],
   "schema_version": "arc.llm.providers.v1",
+  "auto_provider_priority": "host-first",
   "providers": [
     {
       "id": "deepseek",
@@ -94,9 +95,10 @@ The repository includes a redacted example at
 put it in one of the default locations. Do not commit a real provider config.
 Local files named `llm-providers.json` are ignored by git. Store provider API
 keys in the local config file as `api_key`; use `api_key_optional` only for
-local endpoints that do not require a key. With `--provider auto`, ARC first
-uses configured providers with available API keys, then optional local
-configured providers, then host providers.
+local endpoints that do not require a key. With `--provider auto`, ARC uses
+native host providers first by default: Codex selects `codex-cli`, and Claude
+Code selects `claude-cli`. Set `"auto_provider_priority": "configured-first"`
+in `llm-providers.json` to restore configured-provider-first selection.
 
 ## Direct Prompt Tests
 
@@ -201,9 +203,9 @@ arc-llm proposers-reviewer-bench --config bench-config.json --json
 ```
 
 The input is the normal proposers-reviewer batch JSON plus an optional `bench`
-object. Defaults are `samples: 25`, `max_rounds: 5`, `max_iterations: 10`,
+object. Defaults are `samples: 10`, `max_rounds: 5`, `max_iterations: 10`,
 `patience: 3`, `max_concurrent_loops: 100`, and `default_provider: "deepseek"`.
-The wrapper materializes sample loop IDs such as `idea_001` through `idea_025`
+The wrapper materializes sample loop IDs such as `idea_001` through `idea_010`
 from the first configured loop template.
 Benchmark sample workers default to `bench.sample_model_tier: "medium"` so
 large batches use the provider's faster/cheaper test model when available

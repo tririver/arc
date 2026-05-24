@@ -13,6 +13,11 @@ LOCAL_PROVIDER_CONFIG_PATH = Path("llm-providers.json")
 DEFAULT_PROVIDER_CONFIG_PATH = Path("~/.config/arc/llm-providers.json")
 OPENAI_COMPATIBLE_TYPE = "openai-compatible"
 VALID_JSON_MODES = frozenset({"json_schema", "json_object", "none"})
+AUTO_PROVIDER_PRIORITY_HOST_FIRST = "host-first"
+AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST = "configured-first"
+VALID_AUTO_PROVIDER_PRIORITIES = frozenset(
+    {AUTO_PROVIDER_PRIORITY_HOST_FIRST, AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST}
+)
 
 
 class ProviderConfigError(ValueError):
@@ -61,6 +66,7 @@ class ProviderConfig:
     path: str
     default: str | None
     providers: list[ConfiguredProvider]
+    auto_provider_priority: str = AUTO_PROVIDER_PRIORITY_HOST_FIRST
 
     def provider(self, provider_id: str) -> ConfiguredProvider | None:
         for provider in self.providers:
@@ -107,6 +113,12 @@ def parse_provider_config(payload: Mapping[str, Any], *, path: str = "") -> Prov
     default = payload.get("default")
     if default is not None:
         default = _safe_id(str(default).strip(), "default")
+    auto_provider_priority = str(payload.get("auto_provider_priority") or AUTO_PROVIDER_PRIORITY_HOST_FIRST).strip()
+    if auto_provider_priority not in VALID_AUTO_PROVIDER_PRIORITIES:
+        raise ProviderConfigError(
+            "auto_provider_priority must be one of: "
+            + ", ".join(sorted(VALID_AUTO_PROVIDER_PRIORITIES))
+        )
     raw_providers = payload.get("providers")
     if raw_providers is None:
         raw_providers = []
@@ -120,7 +132,12 @@ def parse_provider_config(payload: Mapping[str, Any], *, path: str = "") -> Prov
         seen.add(provider.id)
     if default and default not in seen:
         raise ProviderConfigError(f"default provider is not defined: {default}")
-    return ProviderConfig(path=path, default=default, providers=providers)
+    return ProviderConfig(
+        path=path,
+        default=default,
+        providers=providers,
+        auto_provider_priority=auto_provider_priority,
+    )
 
 
 def configured_provider(provider_id: str, *, env: Mapping[str, str] | None = None) -> ConfiguredProvider | None:

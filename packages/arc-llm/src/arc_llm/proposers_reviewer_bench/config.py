@@ -23,7 +23,7 @@ SUGGESTED_IMPROVEMENT_PROMPT = (
 
 @dataclass(frozen=True)
 class BenchOptions:
-    samples: int = 25
+    samples: int = 10
     sample_loop_id_prefix: str = "idea"
     sample_loop_id_start: int = 1
     max_rounds: int = 5
@@ -223,7 +223,7 @@ def _suggested_improvement_schema() -> dict[str, Any]:
 
 def _parse_options(raw: Mapping[str, Any]) -> BenchOptions:
     return BenchOptions(
-        samples=_positive_int(raw.get("samples", 25), "bench.samples"),
+        samples=_positive_int(raw.get("samples", 10), "bench.samples"),
         sample_loop_id_prefix=_nonempty_text(raw.get("sample_loop_id_prefix", "idea"), "bench.sample_loop_id_prefix"),
         sample_loop_id_start=_positive_int(raw.get("sample_loop_id_start", 1), "bench.sample_loop_id_start"),
         max_rounds=_positive_int(raw.get("max_rounds", 5), "bench.max_rounds"),
