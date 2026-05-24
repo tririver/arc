@@ -182,6 +182,18 @@ def test_suggest_ideas_no_info_limits_only_proposer_context_and_tools() -> None:
     assert "arc_paper_tool_notes" not in proposer_block
 
 
+def test_suggest_ideas_proposer_schemas_are_codex_strict() -> None:
+    for name in ["suggest-ideas.md", "suggest-ideas-no-info.md"]:
+        text = (WF / name).read_text(encoding="utf-8")
+        proposer = json.loads(_json_fence_containing(text, '"id": "proposer_001"'))
+        schema = proposer["output_schema"]
+
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        assert "title" in schema["required"]
+        assert "calculation_plan" in schema["required"]
+
+
 def _json_fence_containing(text: str, marker: str) -> str:
     for match in re.finditer(r"```json\n(.*?)\n```", text, re.DOTALL):
         block = match.group(1)

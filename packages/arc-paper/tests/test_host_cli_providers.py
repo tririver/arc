@@ -79,7 +79,7 @@ def test_codex_cli_provider_writes_prompt_and_reads_output(monkeypatch):
     assert captured["input"] not in captured["cmd"]
 
 
-def test_codex_cli_provider_uses_spark_default_model(monkeypatch):
+def test_codex_cli_provider_uses_mini_default_model(monkeypatch):
     summary = valid_summary()
     captured = {}
 
@@ -95,7 +95,7 @@ def test_codex_cli_provider_uses_spark_default_model(monkeypatch):
 
     CodexCliProvider().generate_summary(llm_task())
 
-    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "gpt-5.3-codex-spark"
+    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "gpt-5.4-mini"
     assert captured["input"]
 
 

@@ -1,8 +1,8 @@
 from arc_paper.summary.model import resolve_summary_model
 
 
-def test_codex_default_summary_model_is_spark():
-    assert resolve_summary_model("codex-cli", env={}) == "gpt-5.3-codex-spark"
+def test_codex_default_summary_model_is_mini():
+    assert resolve_summary_model("codex-cli", env={}) == "gpt-5.4-mini"
 
 
 def test_claude_default_summary_model_is_haiku():
