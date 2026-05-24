@@ -50,6 +50,40 @@
           },
           "reviewer_consensus": {
             "type": ["object", "null"]
+          },
+          "check_history": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "check_method": {
+            "enum": ["analytic", "numerical", "mixed"]
+          },
+          "numerical_relative_error": {
+            "type": ["number", "null"],
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "foundation_versions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["target_equation_id", "path", "check_history"],
+        "properties": {
+          "target_equation_id": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1},
+          "check_method": {
+            "enum": ["analytic", "numerical", "mixed"]
+          },
+          "numerical_relative_error": {
+            "type": ["number", "null"],
+            "minimum": 0
+          },
+          "check_history": {
+            "type": "array",
+            "items": {"type": "string"}
           }
         },
         "additionalProperties": true

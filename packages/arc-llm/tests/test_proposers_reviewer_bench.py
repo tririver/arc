@@ -106,6 +106,13 @@ def test_bench_defaults_use_flash_tier_for_sample_workers_and_high_tier_for_impr
     assert payload["loops"][0]["reviewers"][0]["model_tier"] == "medium"
 
 
+def test_bench_defaults_use_soft_prompt_optimizer_acceptance_thresholds(tmp_path):
+    config = load_bench_config(base_payload(tmp_path))
+
+    assert config.options.min_delta == 0.15
+    assert config.options.min_z == 0.5
+
+
 def test_apply_improvement_edits_restricts_reviewer_changes_by_default(tmp_path):
     payload = base_payload(tmp_path)
     improvement = {

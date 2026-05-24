@@ -34,8 +34,8 @@ class BenchOptions:
     improver_model: str | None = None
     improver_model_tier: str | None = "high"
     score_path: str = "review_payload.marks.total_score"
-    min_delta: float = 0.3
-    min_z: float = 1.0
+    min_delta: float = 0.15
+    min_z: float = 0.5
     allow_reviewer_prompt_edits: bool = False
     improver_context_mode: str = "auto"
     improver_context_max_chars: int = 600_000
@@ -234,8 +234,8 @@ def _parse_options(raw: Mapping[str, Any]) -> BenchOptions:
         improver_model=_optional_text(raw.get("improver_model"), "bench.improver_model"),
         improver_model_tier=_model_tier(raw.get("improver_model_tier", "high"), "bench.improver_model_tier"),
         score_path=_nonempty_text(raw.get("score_path", "review_payload.marks.total_score"), "bench.score_path"),
-        min_delta=_float(raw.get("min_delta", 0.3), "bench.min_delta"),
-        min_z=_float(raw.get("min_z", 1.0), "bench.min_z"),
+        min_delta=_float(raw.get("min_delta", 0.15), "bench.min_delta"),
+        min_z=_float(raw.get("min_z", 0.5), "bench.min_z"),
         allow_reviewer_prompt_edits=_bool(raw.get("allow_reviewer_prompt_edits", False), "bench.allow_reviewer_prompt_edits"),
         improver_context_mode=_context_mode(raw.get("improver_context_mode", "auto"), "bench.improver_context_mode"),
         improver_context_max_chars=_positive_int(

@@ -57,16 +57,157 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     ]
     reviewer = fake.calls[0]["loops"][0]["reviewers"][0]
     reviewer_template = reviewer["prompt"]["template"]
+    proposer = fake.calls[0]["loops"][0]["proposers"][0]
+    proposer_template = proposer["prompt"]["template"]
+    caller_context = fake.calls[0]["loops"][0]["caller_context"]
+    assert "Scientific Integrity Notice" in caller_context["integrity_reference"]["content"]
+    assert "integrity_reference" in proposer_template
+    assert "integrity_reference" in reviewer_template
+    assert "very clearly step by step" in proposer_template
+    assert "never skip a step" in proposer_template
+    assert proposer["runtime"]["allow_internet"] is False
+    assert proposer["runtime"]["allow_mcp"] is False
+    assert reviewer["runtime"]["allow_mcp"] is False
     assert "SymPy" in reviewer_template
+    assert "expand" in reviewer_template
+    assert "simplify" in reviewer_template
+    assert "substitutions" in reviewer_template
     assert "A-B" in reviewer_template
     assert "B-C" in reviewer_template
     assert "A-C" in reviewer_template
+    assert "10 randomly selected data points" in reviewer_template
+    assert "relative error" in reviewer_template
+    assert "check history" in reviewer_template
     assert "at least two" in reviewer_template
     assert "Never mark all_agree" in reviewer_template
     consensus_properties = reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["properties"]
     assert "pairwise_symbolic_checks" in consensus_properties
     pairwise_properties = consensus_properties["pairwise_symbolic_checks"]["properties"]
     assert "used_sympy" in pairwise_properties
+
+
+def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path):
+    foundation = {
+        "schema_version": "arc.research_foundation.v1",
+        "run_id": "run_001",
+        "version": 1,
+        "conventions": [
+            {"id": "conv_checked", "check_status": "checked", "consistency_status": "normalized"},
+            {"id": "conv_unchecked", "check_status": "not_checked", "consistency_status": "normalized"},
+        ],
+        "equations": [
+            {
+                "id": "eq_axiom",
+                "axiom_status": "axiom",
+                "check_status": "not_checked",
+                "sources": [{"paper_id": "arXiv:1", "mcp": "get_section(...)", "cli": "arc-paper ..."}],
+            },
+            {
+                "id": "eq_checked",
+                "axiom_status": "not_axiom",
+                "check_status": "checked_analytic",
+                "sources": [{"paper_id": "arXiv:2", "mcp": "get_section(...)", "cli": "arc-paper ..."}],
+            },
+            {
+                "id": "eq_target",
+                "axiom_status": "not_axiom",
+                "check_status": "not_checked",
+                "sources": [{"paper_id": "arXiv:3", "mcp": "get_section(...)", "cli": "arc-paper ..."}],
+            },
+            {"id": "eq_unchecked", "axiom_status": "not_axiom", "check_status": "not_checked"},
+        ],
+    }
+    foundation_path = tmp_path / "foundation.json"
+    foundation_path.write_text(json.dumps(foundation), encoding="utf-8")
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        steps=[
+            {
+                "step_id": "check_eq_target",
+                "kind": "foundation_check",
+                "prompt": "check target",
+                "allowed_context": {
+                    "foundation_file": str(foundation_path),
+                    "target_equation_id": "eq_target",
+                },
+            }
+        ],
+    )
+
+    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    foundation_context = fake.calls[0]["loops"][0]["caller_context"]["foundation_context"]
+    assert foundation_context["target_equation"]["id"] == "eq_target"
+    assert [item["id"] for item in foundation_context["allowed_equations"]] == [
+        "eq_axiom",
+        "eq_checked",
+    ]
+    assert [item["id"] for item in foundation_context["allowed_conventions"]] == ["conv_checked"]
+    assert "eq_unchecked" in foundation_context["omitted_equation_ids"]
+    assert "source_path" not in foundation_context
+    assert "sources" not in json.dumps(foundation_context)
+    assert "arc-paper" not in json.dumps(foundation_context)
+    assert "foundation_file" not in fake.calls[0]["loops"][0]["caller_context"]["allowed_context"]
+
+
+def test_foundation_check_fails_when_target_equation_is_missing(tmp_path):
+    foundation_path = tmp_path / "foundation.json"
+    foundation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.research_foundation.v1",
+                "run_id": "run_001",
+                "version": 1,
+                "conventions": [],
+                "equations": [{"id": "eq_other", "axiom_status": "axiom", "check_status": "not_checked"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake = FakeBatchRunner([])
+    config = minimal_config(
+        tmp_path,
+        steps=[
+            {
+                "step_id": "check_missing",
+                "kind": "foundation_check",
+                "prompt": "check target",
+                "allowed_context": {
+                    "foundation_file": str(foundation_path),
+                    "target_equation_id": "eq_missing",
+                },
+            }
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "target_equation_id eq_missing was not found" in result["steps"][0]["error"]
+    assert fake.calls == []
+
+
+def test_consensus_fails_when_integrity_reference_is_missing(tmp_path):
+    fake = FakeBatchRunner([])
+    config = minimal_config(
+        tmp_path,
+        defaults={"integrity_reference_path": str(tmp_path / "missing-integrity.md")},
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "integrity" in result["steps"][0]["error"].lower()
+    assert fake.calls == []
 
 
 def test_consensus_two_agree_recalculates_only_likely_wrong_proposer(tmp_path):
@@ -175,6 +316,86 @@ def test_consensus_rejects_all_agree_without_pairwise_symbolic_checks(tmp_path):
     assert "pairwise_symbolic_checks" in result["steps"][0]["error"]
 
 
+def test_consensus_rejects_numerical_all_agree_with_too_few_samples(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "check_method": "numerical",
+                    "sample_count": 9,
+                    "numerical_relative_error": 1e-8,
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "at least 10" in result["steps"][0]["error"]
+
+
+def test_consensus_rejects_all_agree_without_check_method(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={"check_method": ""},
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "check_method" in result["steps"][0]["error"]
+
+
+def test_consensus_rejects_mixed_all_agree_with_too_few_samples(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "check_method": "mixed",
+                    "sample_count": 9,
+                    "numerical_relative_error": 1e-8,
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "at least 10" in result["steps"][0]["error"]
+
+
+def test_consensus_rejects_sympy_all_agree_without_expand_and_simplify(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={"sympy_code": "simplify(A-B)"},
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "expand" in result["steps"][0]["error"]
+
+
 def test_consensus_dry_run_does_not_call_batch_runner(tmp_path):
     def fail_batch_runner(*args, **kwargs):
         raise AssertionError("dry-run must not call the batch runner")
@@ -238,6 +459,7 @@ def consensus_review(
     recalculate: list[str] | None = None,
     accepted: dict[str, Any] | None = None,
     pairwise_checks: bool = True,
+    pairwise_check_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     consensus: dict[str, Any] = {
         "status": status,
@@ -249,15 +471,22 @@ def consensus_review(
         "analysis": "review analysis",
     }
     if pairwise_checks:
-        consensus["pairwise_symbolic_checks"] = {
+        pairwise_payload = {
             "used_sympy": True,
             "A_minus_B_zero": True,
             "B_minus_C_zero": True,
             "A_minus_C_zero": True,
             "true_count": 3,
-            "sympy_code": "simplify(A-B); simplify(B-C); simplify(A-C)",
+            "sympy_code": "simplify(expand(A-B)); simplify(expand(B-C)); simplify(expand(A-C))",
             "notes": "fake pairwise checks",
+            "check_method": "analytic",
+            "numerical_relative_error": None,
+            "sample_count": 0,
+            "check_history": ["expanded and simplified"],
         }
+        if pairwise_check_overrides:
+            pairwise_payload.update(pairwise_check_overrides)
+        consensus["pairwise_symbolic_checks"] = pairwise_payload
     return {
         "schema_version": "arc.llm.review_envelope.v1",
         "controller": {"message": "reviewed", "stop_requested": False},

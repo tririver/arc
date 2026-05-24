@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -159,14 +160,26 @@ def _run_consensus_step(
     max_attempts = config.max_recalculations + 1
 
     for attempt_number in range(1, max_attempts + 1):
-        batch_config = _attempt_batch_config(
-            config,
-            step,
-            attempt_number=attempt_number,
-            active_proposer_ids=active_proposer_ids,
-            locked_outputs=locked_outputs,
-            run_root=run_root,
-        )
+        try:
+            batch_config = _attempt_batch_config(
+                config,
+                step,
+                attempt_number=attempt_number,
+                active_proposer_ids=active_proposer_ids,
+                locked_outputs=locked_outputs,
+                run_root=run_root,
+            )
+        except Exception as exc:
+            return {
+                "step_id": step.step_id,
+                "kind": step.kind,
+                "status": "failed",
+                "attempts": attempts,
+                "accepted_output": None,
+                "blocked_output": None,
+                "reviewer_consensus": None,
+                "error": str(exc),
+            }
         batch_result = runner(
             batch_config,
             json_runner=json_runner,
@@ -277,6 +290,13 @@ def _attempt_batch_config(
     run_root: Path,
 ) -> dict[str, Any]:
     attempt_id = f"{step.step_id}_attempt_{attempt_number:03d}"
+    caller_context = _caller_context(
+        config,
+        step,
+        attempt_number=attempt_number,
+        active_proposer_ids=active_proposer_ids,
+        locked_outputs=locked_outputs,
+    )
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
         "run_id": attempt_id,
@@ -289,22 +309,41 @@ def _attempt_batch_config(
                 "loop_id": attempt_id,
                 "max_rounds": 1,
                 "early_stop": {"enabled": False},
-                "caller_context": {
-                    "step_id": step.step_id,
-                    "step_kind": step.kind,
-                    "step_prompt": step.prompt,
-                    "allowed_context": step.allowed_context,
-                    "attempt_number": attempt_number,
-                    "active_proposer_ids": active_proposer_ids,
-                    "locked_outputs": copy.deepcopy(locked_outputs),
-                    "max_recalculations": config.max_recalculations,
-                    "consensus_instruction": "Work only on this calculation step. Respect locked_outputs as already accepted unless explicitly asked to check them.",
-                },
+                "caller_context": caller_context,
                 "proposers": [_proposer_config(proposer_id) for proposer_id in active_proposer_ids],
                 "reviewers": [_reviewer_config(active_proposer_ids)],
             }
         ],
     }
+
+
+def _caller_context(
+    config: ConsensusConfig,
+    step: ConsensusStep,
+    *,
+    attempt_number: int,
+    active_proposer_ids: list[str],
+    locked_outputs: dict[str, Any],
+) -> dict[str, Any]:
+    allowed_context = copy.deepcopy(step.allowed_context)
+    foundation_context = _foundation_context_for_step(step)
+    if foundation_context is not None:
+        allowed_context.pop("foundation_file", None)
+    context = {
+        "step_id": step.step_id,
+        "step_kind": step.kind,
+        "step_prompt": step.prompt,
+        "allowed_context": allowed_context,
+        "attempt_number": attempt_number,
+        "active_proposer_ids": active_proposer_ids,
+        "locked_outputs": copy.deepcopy(locked_outputs),
+        "max_recalculations": config.max_recalculations,
+        "integrity_reference": _integrity_reference(config.defaults.get("integrity_reference_path")),
+        "consensus_instruction": "Work only on this calculation step. Respect locked_outputs as already accepted unless explicitly asked to check them.",
+    }
+    if foundation_context is not None:
+        context["foundation_context"] = foundation_context
+    return context
 
 
 def _proposer_config(proposer_id: str) -> dict[str, Any]:
@@ -313,7 +352,13 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
         "prompt": {
             "system": "You are an independent theoretical-physics calculation proposer.",
             "template": (
-                "Use caller_context.step_prompt and caller_context.allowed_context. "
+                "First read and follow caller_context.integrity_reference.content. "
+                "Use only caller_context.step_prompt, caller_context.allowed_context, "
+                "caller_context.foundation_context when present, accepted locked_outputs, "
+                "and your own SymPy/local algebra. Do not use the internet or paper tools. "
+                "If a Wolfram MCP is available without paper or internet tools, it may be "
+                "used only for algebraic verification. Do the calculation very clearly "
+                "step by step; never skip a step. "
                 "Return one JSON object with result_summary, derivation, assumptions, "
                 "reliable_until, and final_result. Put the final mathematical result in "
                 "final_result using explicit symbols so a reviewer can compare it with "
@@ -323,6 +368,7 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
             ),
         },
         "output_schema": {"type": "object"},
+        "runtime": {"allow_internet": False, "allow_mcp": False, "codex_sandbox": "read-only"},
     }
 
 
@@ -332,7 +378,12 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
         "prompt": {
             "system": "You are a skeptical theoretical-physics consensus reviewer.",
             "template": (
+                "First read and follow caller_context.integrity_reference.content. "
                 "Compare current_proposer_outputs_json for the current calculation step. "
+                "Do not modify original equations. For analytic checks, first use expand, "
+                "then simplify, then substitutions from checked equations in "
+                "caller_context.foundation_context. Document the substitution/check history "
+                "in pairwise_symbolic_checks.check_history. "
                 "Return exactly one arc.llm.review_envelope.v1 JSON object. The top-level object "
                 "must contain schema_version, controller, proposer_messages, and review_payload. "
                 f"proposer_messages must contain these keys: {', '.join(active_proposer_ids)}. "
@@ -347,13 +398,16 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
                 "be true. Never mark all_agree by visual inspection or because the results "
                 "seem to agree. If SymPy is unavailable, perform explicit algebraic checks "
                 "and set used_sympy=false with the reason in pairwise_symbolic_checks.notes. "
+                "If an analytic check cannot be done, perform numerical checks on at least "
+                "10 randomly selected data points and report check_method=numerical, "
+                "sample_count, numerical_relative_error as a relative error, and the sampled check history. "
                 "If exactly one proposer is likely wrong, name only that proposer for "
                 "recalculation; otherwise ask all proposers to recalculate.\n\n"
                 "{current_proposer_outputs_json}"
             ),
         },
         "output_schema": _reviewer_output_schema(active_proposer_ids),
-        "runtime": {"allow_mcp": True, "mcp_mode": "arc-only"},
+        "runtime": {"allow_mcp": False, "codex_sandbox": "read-only"},
     }
 
 
@@ -433,6 +487,8 @@ def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
                                     "A_minus_C_zero",
                                     "true_count",
                                     "notes",
+                                    "check_method",
+                                    "check_history",
                                 ],
                                 "properties": {
                                     "used_sympy": {"type": "boolean"},
@@ -442,6 +498,18 @@ def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
                                     "true_count": {"type": "integer", "minimum": 0, "maximum": 3},
                                     "sympy_code": {"type": "string"},
                                     "notes": {"type": "string"},
+                                    "check_method": {
+                                        "enum": ["analytic", "numerical", "mixed"]
+                                    },
+                                    "sample_count": {"type": "integer", "minimum": 0},
+                                    "numerical_relative_error": {
+                                        "type": ["number", "null"],
+                                        "minimum": 0
+                                    },
+                                    "check_history": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
                                 },
                                 "additionalProperties": True,
                             },
@@ -502,6 +570,149 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
         pairwise_true_count = min(pairwise_true_count, reported_true_count)
     if pairwise_true_count < 2:
         raise ValueError("all_agree requires at least two true pairwise symbolic checks")
+    method = str(checks.get("check_method", "")).strip().lower()
+    if method not in {"analytic", "numerical", "mixed"}:
+        raise ValueError("all_agree requires check_method to be analytic, numerical, or mixed")
+    used_sympy = checks.get("used_sympy")
+    if not isinstance(used_sympy, bool):
+        raise ValueError("all_agree requires used_sympy to be true or false")
+    if used_sympy:
+        sympy_code = str(checks.get("sympy_code", "")).lower()
+        if "expand" not in sympy_code or "simplify" not in sympy_code:
+            raise ValueError("SymPy all_agree requires sympy_code showing expand and simplify checks")
+    elif method in {"analytic", "mixed"} and not str(checks.get("notes", "")).strip():
+        raise ValueError("analytic all_agree without SymPy requires explicit notes")
+    if method in {"numerical", "mixed"}:
+        sample_count = checks.get("sample_count")
+        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 10:
+            raise ValueError("numerical all_agree requires at least 10 randomly selected data points")
+        relative_error = checks.get("numerical_relative_error")
+        if (
+            not isinstance(relative_error, (int, float))
+            or isinstance(relative_error, bool)
+            or not math.isfinite(float(relative_error))
+        ):
+            raise ValueError("numerical all_agree requires numerical_relative_error")
+    history = checks.get("check_history")
+    if not isinstance(history, list) or not history:
+        raise ValueError("all_agree requires documented pairwise check history")
+
+
+def _foundation_context_for_step(step: ConsensusStep) -> dict[str, Any] | None:
+    foundation_path = step.allowed_context.get("foundation_file")
+    if not foundation_path or step.kind != "foundation_check":
+        return None
+    target_equation_id = str(step.allowed_context.get("target_equation_id", "")).strip()
+    if not target_equation_id:
+        raise ValueError("target_equation_id is required for foundation_check steps")
+    path = Path(str(foundation_path))
+    payload = _read_json(path)
+    return filter_foundation_context(
+        payload,
+        target_equation_id=target_equation_id,
+    )
+
+
+def filter_foundation_context(
+    payload: Mapping[str, Any],
+    *,
+    target_equation_id: str = "",
+) -> dict[str, Any]:
+    equations = payload.get("equations", [])
+    if not isinstance(equations, list):
+        equations = []
+    allowed_equations = []
+    omitted_equation_ids = []
+    target_equation = None
+    target_equation_id = target_equation_id.strip()
+    if not target_equation_id:
+        raise ValueError("target_equation_id is required")
+    for item in equations:
+        if not isinstance(item, dict):
+            continue
+        equation_id = str(item.get("id", ""))
+        if target_equation_id and equation_id == target_equation_id:
+            target_equation = _sanitize_foundation_context_item(item)
+            continue
+        if _equation_is_axiom_or_checked(item):
+            allowed_equations.append(_sanitize_foundation_context_item(item))
+        elif equation_id:
+            omitted_equation_ids.append(equation_id)
+    if target_equation is None:
+        raise ValueError(f"target_equation_id {target_equation_id} was not found in foundation equations")
+
+    conventions = payload.get("conventions", [])
+    if not isinstance(conventions, list):
+        conventions = []
+    allowed_conventions = [
+        _sanitize_foundation_context_item(item)
+        for item in conventions
+        if isinstance(item, dict) and _convention_is_checked(item)
+    ]
+    return {
+        "schema_version": "arc.research_foundation_context.v1",
+        "target_equation_id": target_equation_id,
+        "target_equation": target_equation,
+        "allowed_equations": allowed_equations,
+        "allowed_conventions": allowed_conventions,
+        "omitted_equation_ids": omitted_equation_ids,
+        "filter_rule": "Only the target equation plus axiom or checked foundation items are provided.",
+    }
+
+
+def _equation_is_axiom_or_checked(item: Mapping[str, Any]) -> bool:
+    if item.get("axiom_status") == "axiom":
+        return True
+    check_status = str(item.get("check_status", "")).strip().lower()
+    return check_status == "checked" or check_status.startswith("checked_")
+
+
+def _convention_is_checked(item: Mapping[str, Any]) -> bool:
+    check_status = str(item.get("check_status", "")).strip().lower()
+    return check_status == "checked" or check_status.startswith("checked_")
+
+
+_FOUNDATION_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path"}
+
+
+def _sanitize_foundation_context_item(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_foundation_context_item(item)
+            for key, item in value.items()
+            if str(key) not in _FOUNDATION_CONTEXT_OMIT_KEYS
+        }
+    if isinstance(value, list):
+        return [_sanitize_foundation_context_item(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def _integrity_reference(path_value: Any = None) -> dict[str, str]:
+    path = _resolve_integrity_path(path_value)
+    if path is None:
+        raise FileNotFoundError("integrity.md was not found")
+    return {"path": str(path), "content": path.read_text(encoding="utf-8")}
+
+
+def _resolve_integrity_path(path_value: Any = None) -> Path | None:
+    if path_value:
+        requested = Path(str(path_value)).expanduser()
+        candidates = [requested] if requested.is_absolute() else []
+        if not requested.is_absolute():
+            candidates.extend(root / requested for root in [Path.cwd(), *Path.cwd().parents])
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return None
+    return _default_integrity_path()
+
+
+def _default_integrity_path() -> Path | None:
+    for root in [Path.cwd(), *Path.cwd().parents]:
+        candidate = root / "skills/arc/references/rules/integrity.md"
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _read_proposer_outputs(round_root: Path, proposer_ids: list[str]) -> dict[str, Any]:
