@@ -4,6 +4,7 @@ import re
 
 from arc_domain import foundation
 from arc_domain import service
+from arc_domain import summary as domain_summary
 from arc_domain.cache import DomainPaths, domain_id_for, read_json
 from arc_domain import paper
 
@@ -24,6 +25,7 @@ def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     assert paths.foundation_selection.exists()
     assert paths.domain_graph.exists()
     assert paths.evidence_pack.exists()
+    assert paths.paper_json_pack.exists()
     assert paths.domain_summary.exists()
     assert paths.network_html.exists()
     assert data["foundation"]["selected_foundation"]["paper_id"] == FOUNDATION
@@ -42,6 +44,13 @@ def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     assert domain["reference_edge_count"] == 2
     assert domain["reference_edge_score"] == 1.0
     assert any(node["role"] == "common_reference" for node in graph["nodes"])
+    paper_pack = read_json(paths.paper_json_pack)
+    graph_ids = {node["paper_id"] for node in graph["nodes"]}
+    assert paper_pack["schema_version"] == "arc.domain_paper_json_pack.v1"
+    assert paper_pack["paper_count"] == len(graph_ids)
+    assert {item["paper_id"] for item in paper_pack["papers"]} == graph_ids
+    assert all("metadata" in item and "toc" in item and "references" in item for item in paper_pack["papers"])
+    assert _toc_calls == graph_ids
     assert read_json(paths.domain_summary)["summary_method"] == "deterministic_fallback"
     html = paths.network_html.read_text(encoding="utf-8")
     graph_data = re.search(r'<script id="graph-data" type="application/json">(.*?)</script>', html, re.S)
@@ -74,6 +83,7 @@ def test_status_and_cached_summary(monkeypatch, tmp_path):
 
     assert status["ok"] is True
     assert status["data"]["artifacts"]["domain_summary"]["exists"] is True
+    assert status["data"]["artifacts"]["paper_json_pack"]["exists"] is True
     assert summary["ok"] is True
     assert graph["ok"] is True
 
@@ -156,11 +166,44 @@ def test_foundation_repair_rejects_later_parent_foundations():
     assert "later than the selected foundation year" in selection["rejected_candidates"][0]["reason"]
 
 
+def test_domain_summary_contract_uses_faq_remarks_and_research_guidance():
+    prompt = domain_summary._summary_prompt(
+        graph={
+            "foundation_paper": FOUNDATION,
+            "nodes": [{"paper_id": FOUNDATION, "role": "selected_foundation", "title": "Foundation Paper"}],
+            "edges": [],
+        },
+        evidence={"papers": [], "warnings": []},
+        selection={"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation Paper", "reason": "seed"}},
+    )
+    fallback = domain_summary._fallback_summary(
+        graph={"nodes": []},
+        evidence={"papers": [], "warnings": []},
+        selection={"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation Paper", "reason": "seed"}},
+        error="offline",
+    )
+
+    assert "frequently asked questions" in prompt.lower()
+    assert "open questions" not in prompt.lower()
+    assert "open_questions" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
+    assert "open_questions" not in fallback
+    assert fallback["frequently_asked_questions"] == []
+    assert fallback["report_remarks"] == domain_summary.REPORT_REMARKS
+    assert any("not to limit" in item.lower() for item in fallback["report_remarks"])
+    assert fallback["research_guidance"]
+
+
 def _install_fake_paper_query(monkeypatch):
+    global _toc_calls
+    _toc_calls = set()
     monkeypatch.setattr(paper, "metadata", _metadata)
     monkeypatch.setattr(paper, "references", _references)
     monkeypatch.setattr(paper, "citers", _citers)
     monkeypatch.setattr(paper, "section", _section)
+    monkeypatch.setattr(paper, "toc", _toc)
+
+
+_toc_calls: set[str] = set()
 
 
 def _metadata(paper_id, *, refresh=False):
@@ -211,3 +254,8 @@ def _section(paper_id, selector, *, refresh=False):
     if "conclusion" in selector:
         return {"section_id": "S9", "title": "Conclusion", "text": f"Open questions remain for {paper_id}."}
     raise RuntimeError("missing")
+
+
+def _toc(paper_id, *, refresh=False):
+    _toc_calls.add(paper_id)
+    return [{"section_id": "S1", "title": "Introduction"}]

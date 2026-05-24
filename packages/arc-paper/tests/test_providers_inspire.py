@@ -3,6 +3,7 @@ import urllib.parse
 import httpx
 
 from arc_paper.providers.inspire import InspireProvider
+from arc_paper.cache import CachePaths, read_json, write_json
 
 
 INSPIRE_RECORD = {
@@ -186,6 +187,8 @@ def test_inspire_metadata_supports_doi_lookup(monkeypatch, tmp_path):
 
     assert metadata["paper_id"] == "arXiv:0911.3380"
     assert metadata["identifiers"]["doi"] == "10.1088/1475-7516/2010/04/027"
+    assert CachePaths.for_paper("arXiv:0911.3380").inspire_metadata.exists()
+    assert not CachePaths.for_paper("doi:10.1088/1475-7516/2010/04/027").paper_dir.exists()
 
     cached_provider = InspireProvider(
         client=httpx.Client(
@@ -193,6 +196,29 @@ def test_inspire_metadata_supports_doi_lookup(monkeypatch, tmp_path):
         )
     )
     assert cached_provider.get_metadata("doi:10.1088/1475-7516/2010/04/027")["title"] == "A Test Paper"
+
+
+def test_inspire_metadata_migrates_existing_doi_cache_to_arxiv(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    doi = "doi:10.1088/1475-7516/2010/04/027"
+    doi_paths = CachePaths.for_paper(doi)
+    arxiv_paths = CachePaths.for_paper("arXiv:0911.3380")
+    write_json(doi_paths.inspire_metadata, INSPIRE_RECORD)
+    write_json(doi_paths.ar5iv_parsed, {"paper_id": doi, "source": "doi"})
+    write_json(arxiv_paths.ar5iv_parsed, {"paper_id": "arXiv:0911.3380", "source": "old-arxiv"})
+
+    provider = InspireProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError()))
+        )
+    )
+
+    metadata = provider.get_metadata(doi)
+
+    assert metadata["paper_id"] == "arXiv:0911.3380"
+    assert not doi_paths.paper_dir.exists()
+    assert arxiv_paths.inspire_metadata.exists()
+    assert read_json(arxiv_paths.ar5iv_parsed)["source"] == "doi"
 
 
 def test_inspire_references_can_be_enriched_through_single_paper_cache(monkeypatch, tmp_path):

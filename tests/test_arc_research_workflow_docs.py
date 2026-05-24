@@ -289,6 +289,17 @@ def test_packaged_workflow_copies_match_source() -> None:
         )
 
 
+def test_build_domain_report_instructions_include_llm_context_remarks_and_faqs() -> None:
+    text = (WF / "build-domain.md").read_text(encoding="utf-8")
+
+    assert "Frequently Asked Questions" in text
+    assert "practical, tractable variants" in text
+    assert "may already have been resolved" in text
+    assert "inspire ideas, not to limit them" in text
+    assert "paper_json_pack" in text
+    assert "arc-paper" in text
+
+
 def test_packaged_skill_references_include_required_workflow_inputs() -> None:
     required = [
         Path("references/research-workflows/build-domain.md"),

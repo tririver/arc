@@ -7,7 +7,15 @@ from typing import Any
 
 import httpx
 
-from ..cache import CachePaths, ONE_MONTH_SECONDS, read_json, write_json
+from ..cache import (
+    CachePaths,
+    ONE_MONTH_SECONDS,
+    migrate_paper_cache_dir,
+    read_json,
+    read_paper_alias,
+    write_json,
+    write_paper_alias,
+)
 from ..ids import arxiv_path_id, doi_value, inspire_recid, normalize_paper_id
 from .base import ProviderError
 
@@ -42,7 +50,7 @@ class InspireProvider:
         return _normalize_record(raw)
 
     def get_references(self, paper_id: str, *, refresh: bool = False, enrich: bool = False) -> list[dict[str, Any]]:
-        paths = CachePaths.for_paper(paper_id)
+        paths = _cache_paths_for_cached_paper(paper_id)
         references: list[dict[str, Any]]
         if not refresh and (cached := read_json(paths.inspire_references)) and _references_cache_is_current(cached):
             cached, changed = _clean_cached_paper_items(cached)
@@ -58,6 +66,7 @@ class InspireProvider:
                 for item in raw.get("metadata", {}).get("references", [])
                 if (normalized := _normalize_reference(item))
             ]
+            paths = _cache_paths_for_cached_paper(paper_id)
 
         if enrich:
             references = self.enrich_reference_metadata(references, refresh=refresh)
@@ -128,6 +137,7 @@ class InspireProvider:
 
         data = response.json()
         citers = [_normalize_record(hit) for hit in data.get("hits", {}).get("hits", [])]
+        cache_path = _citers_cache_path(paper_id, sort, limit)
         write_json(cache_path, citers)
         return citers
 
@@ -136,8 +146,7 @@ class InspireProvider:
 
     def get_raw_record(self, paper_id: str, *, refresh: bool = False) -> dict[str, Any]:
         normalized_id = normalize_paper_id(paper_id)
-        paths = CachePaths.for_paper(normalized_id)
-        if not refresh and (cached := read_json(paths.inspire_metadata)):
+        if not refresh and (cached := _cached_raw_record(normalized_id)):
             return cached
 
         recid = inspire_recid(normalized_id)
@@ -223,7 +232,7 @@ def _normalize_sort(sort: str) -> str:
 
 
 def _citers_cache_path(paper_id: str, sort: str, limit: int):
-    paths = CachePaths.for_paper(paper_id)
+    paths = _cache_paths_for_cached_paper(paper_id)
     if sort == "mostrecent" and limit == MAX_PAGE_SIZE:
         return paths.inspire_citers
     suffix = sort if limit == MAX_PAGE_SIZE else f"{sort}_{limit}"
@@ -272,18 +281,60 @@ def _normalize_reference(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cache_raw_record(raw: dict[str, Any], *, requested_id: str) -> None:
-    keys = {requested_id}
     metadata = _normalize_record(raw)
-    if paper_id := metadata.get("paper_id"):
-        keys.add(str(paper_id))
-    if recid := metadata.get("inspire_recid"):
-        keys.add(f"inspire:{recid}")
+    canonical_id = _canonical_cache_id(metadata, requested_id=requested_id)
+    keys = _cache_keys(metadata, requested_id=requested_id)
+    for key in keys:
+        if key != canonical_id:
+            migrate_paper_cache_dir(key, canonical_id)
+    write_json(CachePaths.for_paper(canonical_id).inspire_metadata, raw)
+    for key in keys:
+        write_paper_alias(key, canonical_id)
+
+
+def _cached_raw_record(normalized_id: str) -> dict[str, Any] | None:
+    if alias_id := read_paper_alias(normalized_id):
+        if cached := read_json(CachePaths.for_paper(alias_id).inspire_metadata):
+            return cached
+    paths = CachePaths.for_paper(normalized_id)
+    if cached := read_json(paths.inspire_metadata):
+        _cache_raw_record(cached, requested_id=normalized_id)
+        return cached
+    return None
+
+
+def _cache_paths_for_cached_paper(paper_id: str) -> CachePaths:
+    normalized_id = normalize_paper_id(paper_id)
+    if alias_id := read_paper_alias(normalized_id):
+        return CachePaths.for_paper(alias_id)
+    paths = CachePaths.for_paper(normalized_id)
+    if cached := read_json(paths.inspire_metadata):
+        _cache_raw_record(cached, requested_id=normalized_id)
+        if alias_id := read_paper_alias(normalized_id):
+            return CachePaths.for_paper(alias_id)
+    return paths
+
+
+def _canonical_cache_id(metadata: dict[str, Any], *, requested_id: str) -> str:
     if arxiv_id := metadata.get("arxiv_id"):
-        keys.add(f"arXiv:{arxiv_id}")
+        return normalize_paper_id(f"arXiv:{arxiv_id}")
+    return normalize_paper_id(requested_id)
+
+
+def _cache_keys(metadata: dict[str, Any], *, requested_id: str) -> list[str]:
+    requested = normalize_paper_id(requested_id)
+    keys = []
+    if paper_id := metadata.get("paper_id"):
+        keys.append(normalize_paper_id(str(paper_id)))
+    if recid := metadata.get("inspire_recid"):
+        keys.append(normalize_paper_id(f"inspire:{recid}"))
+    if arxiv_id := metadata.get("arxiv_id"):
+        keys.append(normalize_paper_id(f"arXiv:{arxiv_id}"))
     if doi := metadata.get("doi"):
-        keys.add(f"doi:{doi}")
-    for key in {normalize_paper_id(item) for item in keys if item}:
-        write_json(CachePaths.for_paper(key).inspire_metadata, raw)
+        keys.append(normalize_paper_id(f"doi:{doi}"))
+    keys = [key for key in keys if key and key != requested]
+    keys.append(requested)
+    return list(dict.fromkeys(keys))
 
 
 def _reference_lookup_id(reference: dict[str, Any]) -> str:

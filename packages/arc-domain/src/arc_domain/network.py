@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from arc_llm import run_json
-from arc_paper.ids import normalize_paper_id
+from arc_paper.ids import arxiv_path_id, normalize_paper_id
 
 from . import paper
 from .cache import DomainPaths, now_iso, read_json, update_status, write_json
@@ -28,6 +29,7 @@ RECENCY_WEIGHT = 0.5
 INTENT_OVERLAP_WEIGHT = 1.0
 GRAPH_CITER_WEIGHT = 2.0
 REFERENCE_EDGE_WEIGHT = 0.5
+RECENT_ARXIV_WINDOW_DAYS = 365
 
 
 def build_network(
@@ -266,8 +268,12 @@ def _select_domain_papers(
     intent: str,
     selected_count: int,
 ) -> list[dict[str, Any]]:
-    current_year = datetime.now(timezone.utc).year
-    intent_rank = {paper_id: index for index, paper_id in enumerate(intent_ranking.get("ranked_paper_ids") or [], start=1)}
+    now = datetime.now(timezone.utc)
+    current_year = now.year
+    intent_rank = {
+        paper_id: index
+        for index, paper_id in enumerate(intent_ranking.get("ranked_paper_ids") or [], start=1)
+    }
     scored = []
     for item in citer_pool:
         paper_id = normalize_paper_id(item.get("paper_id") or paper_key(item))
@@ -302,10 +308,21 @@ def _select_domain_papers(
         record["in_graph_citer_score"] = 0.0
         record["reference_edge_count"] = 0
         record["reference_edge_score"] = 0.0
+        record["recent_arxiv"] = _is_recent_arxiv_paper(record, now=now)
         record["selection_reason"] = _selection_reason(record, paper_id in intent_rank)
         scored.append(record)
-    scored.sort(key=lambda item: (item["domain_score"], item.get("citation_count") or 0, item.get("year") or 0), reverse=True)
-    return scored[:selected_count]
+    scored.sort(
+        key=lambda item: (item["domain_score"], item.get("citation_count") or 0, item.get("year") or 0),
+        reverse=True,
+    )
+    selected = scored[:selected_count]
+    selected_ids = {item["paper_id"] for item in selected}
+    recent = [
+        item
+        for item in scored[selected_count:]
+        if item.get("recent_arxiv") and item["paper_id"] not in selected_ids
+    ]
+    return [*selected, *recent]
 
 
 def _add_in_graph_citer_scores(
@@ -619,6 +636,8 @@ def _selection_reason(record: dict[str, Any], intent_ranked: bool) -> str:
     parts = []
     if intent_ranked:
         parts.append("LLM intent-ranked")
+    if record.get("recent_arxiv"):
+        parts.append("recent arXiv")
     if record.get("citation_per_year", 0) > 0:
         parts.append("citation-per-year")
     if record.get("in_graph_citer_count", 0) > 0:
@@ -628,3 +647,75 @@ def _selection_reason(record: dict[str, Any], intent_ranked: bool) -> str:
     if record.get("year"):
         parts.append("recency")
     return ", ".join(parts) or "representative foundation citer"
+
+
+def _is_recent_arxiv_paper(
+    record: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    window_days: int = RECENT_ARXIV_WINDOW_DAYS,
+) -> bool:
+    if not _has_arxiv_id(record):
+        return False
+    paper_date = _paper_date(record)
+    if paper_date is None:
+        paper_date = _arxiv_month_date(record)
+    if paper_date is None:
+        return False
+    current = (now or datetime.now(timezone.utc)).date()
+    return paper_date >= current - timedelta(days=window_days)
+
+
+def _has_arxiv_id(record: dict[str, Any]) -> bool:
+    identifiers = record.get("identifiers") or {}
+    values = (
+        record.get("paper_id"),
+        record.get("arxiv_id"),
+        record.get("arxiv"),
+        identifiers.get("paper_id"),
+        identifiers.get("arxiv_id"),
+        identifiers.get("arxiv"),
+    )
+    return any(arxiv_path_id(str(value or "")) for value in values)
+
+
+def _paper_date(record: dict[str, Any]) -> date | None:
+    for key in ("published", "preprint_date", "earliest_date", "created", "updated"):
+        value = str(record.get(key) or "").strip()
+        parsed = _parse_date(value)
+        if parsed is not None:
+            return parsed
+    year = record.get("year")
+    try:
+        return date(int(year), 1, 1) if year else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_date(value: str) -> date | None:
+    if not value:
+        return None
+    match = re.match(r"^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?", value)
+    if not match:
+        return None
+    year = int(match.group(1))
+    month = int(match.group(2) or 1)
+    day = int(match.group(3) or 1)
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _arxiv_month_date(record: dict[str, Any]) -> date | None:
+    paper_id = normalize_paper_id(record.get("paper_id") or paper_key(record))
+    arxiv_id = arxiv_path_id(paper_id)
+    match = re.match(r"^(\d{2})(\d{2})\.", arxiv_id)
+    if not match:
+        return None
+    year = 2000 + int(match.group(1))
+    month = int(match.group(2))
+    try:
+        return date(year, month, 1)
+    except ValueError:
+        return None

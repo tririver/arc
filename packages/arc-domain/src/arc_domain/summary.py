@@ -7,25 +7,41 @@ from arc_llm import run_json
 from .cache import DomainPaths, now_iso, read_json, update_status, write_json
 
 
+REPORT_REMARKS = [
+    (
+        "This report lists prominent outstanding ideas in the field. For automated LLM research, "
+        "use them as context and aim for practical, tractable variants rather than the hardest problems directly."
+    ),
+    (
+        "The questions summarized here come from research papers. They may no longer be new, "
+        "and some may already have been resolved."
+    ),
+    "Use this report to inspire ideas, not to limit them to the directions listed here.",
+]
+
+
 DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "arc.domain-summary-v1",
+    "$id": "arc.domain-summary-v2",
     "type": "object",
     "additionalProperties": False,
     "required": [
         "schema_version",
         "domain_title",
+        "report_remarks",
         "brief_introduction",
         "foundation_paper",
         "methodology",
         "mainstream_directions",
-        "open_questions",
+        "frequently_asked_questions",
+        "research_guidance",
         "reading_guide",
         "warnings",
     ],
     "properties": {
-        "schema_version": {"type": "string", "const": "arc.domain_summary.v1"},
+        "schema_version": {"type": "string", "const": "arc.domain_summary.v2"},
         "domain_title": {"type": "string"},
+        "report_remarks": {"type": "array", "items": {"type": "string"}, "minItems": 3},
         "brief_introduction": {"type": "string"},
         "foundation_paper": {
             "type": "object",
@@ -61,14 +77,28 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
                 },
             },
         },
-        "open_questions": {
+        "frequently_asked_questions": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["question", "papers"],
+                "required": ["question", "papers", "status_note"],
                 "properties": {
                     "question": {"type": "string"},
+                    "papers": {"type": "array", "items": {"type": "string"}},
+                    "status_note": {"type": "string"},
+                },
+            },
+        },
+        "research_guidance": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["guidance", "rationale", "papers"],
+                "properties": {
+                    "guidance": {"type": "string"},
+                    "rationale": {"type": "string"},
                     "papers": {"type": "array", "items": {"type": "string"}},
                 },
             },
@@ -106,7 +136,8 @@ def summarize_domain(
         summary["summary_method"] = "llm"
     except Exception as exc:
         summary = _fallback_summary(graph=graph, evidence=evidence, selection=selection, error=str(exc))
-    summary["schema_version"] = "arc.domain_summary.v1"
+    summary["schema_version"] = "arc.domain_summary.v2"
+    summary["report_remarks"] = list(REPORT_REMARKS)
     summary["domain_id"] = paths.domain_id
     summary["created_at"] = now_iso()
     write_json(paths.domain_summary, summary)
@@ -148,9 +179,29 @@ def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selectio
     return "\n\n".join(
         [
             "Write a compact field briefing for an LLM physicist and a human researcher.",
-            "Use the supplied titles, abstracts, graph roles, and conclusion/outlook/discussion text. Do not invent papers.",
-            "The summary should explain the domain, the selected foundation, core methodology, mainstream directions with reference paper IDs, and open questions mentioned in conclusions.",
+            (
+                "Use the supplied titles, abstracts, graph roles, and conclusion/outlook/discussion text. "
+                "Do not invent papers."
+            ),
+            "This briefing is context for a downstream LLM that will propose better research questions.",
+            (
+                "Include the report_remarks exactly as supplied below, immediately after the title "
+                "when rendered to Markdown."
+            ),
+            (
+                "Explain the domain, selected foundation, core methodology, mainstream directions, "
+                "and Frequently Asked Questions from paper conclusion/outlook sections."
+            ),
+            (
+                "For FAQ entries, include a status_note that says the question came from source papers "
+                "and may already have been resolved."
+            ),
+            (
+                "Add research_guidance that helps the downstream LLM find practical, tractable variants, "
+                "useful first calculations, standard benchmarks, common failure modes, and recent-paper entry points."
+            ),
             "Keep the result concise enough to fit comfortably in a research-agent context.",
+            f"Required report_remarks:\n{REPORT_REMARKS}",
             f"Evidence pack:\n{compact_evidence}",
             "Return JSON only.",
         ]
@@ -168,8 +219,9 @@ def _fallback_summary(
     papers = evidence.get("papers", [])
     domain_papers = [item for item in papers if item.get("role") == "domain_paper"]
     return {
-        "schema_version": "arc.domain_summary.v1",
+        "schema_version": "arc.domain_summary.v2",
         "domain_title": foundation.get("title") or "Research domain",
+        "report_remarks": list(REPORT_REMARKS),
         "brief_introduction": (
             "LLM summary generation was unavailable; this deterministic briefing lists the selected "
             "foundation and the cached domain paper set for follow-up reading."
@@ -187,7 +239,20 @@ def _fallback_summary(
                 "papers": [item.get("paper_id") for item in domain_papers[:15]],
             }
         ],
-        "open_questions": [],
+        "frequently_asked_questions": [],
+        "research_guidance": [
+            {
+                "guidance": (
+                    "Use the selected foundation and high-scoring citing papers to propose practical variants "
+                    "and first calculations."
+                ),
+                "rationale": (
+                    "The deterministic fallback cannot synthesize detailed opportunities, so it preserves "
+                    "the paper set for downstream analysis."
+                ),
+                "papers": [item.get("paper_id") for item in domain_papers[:10]],
+            }
+        ],
         "reading_guide": [
             {
                 "purpose": "Start with the selected foundation and then the highest-scoring citing papers.",

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from arc_domain import foundation
 from arc_domain import network
 from arc_domain.text import paper_key
 
 
-def _paper(paper_id: str, *, title: str | None = None, citations: int = 1) -> dict:
+def _paper(paper_id: str, *, title: str | None = None, citations: int = 1, **extra) -> dict:
     return {
         "paper_id": paper_id,
         "title": title or paper_id,
         "citation_count": citations,
         "identifiers": {"paper_id": paper_id},
+        **extra,
     }
 
 
@@ -122,3 +125,36 @@ def test_foundation_citation_support_threshold_is_configurable():
 
     assert "fewer than 25 citations" in prompt
     assert selection["selected_foundation"]["paper_id"] == "arXiv:2401.00001"
+
+
+def test_domain_selection_keeps_all_recent_arxiv_papers_beyond_selected_count():
+    now = datetime.now(timezone.utc)
+    recent_id = f"arXiv:{now.year % 100:02d}{now.month:02d}.00001"
+    selected = network._select_domain_papers(
+        [
+            _paper(
+                "arXiv:2001.00001",
+                title="Highly cited older paper",
+                citations=10000,
+                year=2020,
+                published="2020-01-01",
+            ),
+            _paper(
+                recent_id,
+                title="Low citation recent paper",
+                citations=0,
+                year=now.year,
+                published=now.date().isoformat(),
+                arxiv_id=recent_id.removeprefix("arXiv:"),
+            ),
+        ],
+        foundation_id="arXiv:1901.00001",
+        intent_ranking={"ranked_paper_ids": []},
+        intent="",
+        selected_count=1,
+    )
+
+    assert [item["paper_id"] for item in selected] == ["arXiv:2001.00001", recent_id]
+    recent = selected[1]
+    assert recent["recent_arxiv"] is True
+    assert "recent arXiv" in recent["selection_reason"]

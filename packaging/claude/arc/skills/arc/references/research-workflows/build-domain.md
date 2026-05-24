@@ -63,6 +63,13 @@ as success. Continue only when every domain job result is successful. If any
 job failed, was cancelled, or returned `needs_llm`, print `WARNING:` with the
 reason and stop before copying project-local artifacts.
 
+The domain build includes the selected domain papers and every arXiv paper in
+the domain candidate pool that appeared within the last year. ARC domain logic
+only chooses the cross-paper set and relations; per-paper metadata,
+references, citers, and ar5iv JSON parsing must come from `arc-paper`.
+`arc-domain` writes `paper_json_pack.json` after fetching the graph papers
+concurrently through the `arc-paper` interface.
+
 ### Phase 3: Copy Domain Artifacts
 
 Step 1: Derive a safe file prefix:
@@ -85,11 +92,32 @@ Step 3: Copy or write project-local files:
 <project-dir>/domain/<seed-safe>_domain.html
 <project-dir>/domain/<seed-safe>_domain_summary.json
 <project-dir>/domain/<seed-safe>_domain_summary.md
+<project-dir>/domain/<seed-safe>_paper_json_pack.json
 ```
 
 Use the graph HTML path for the HTML file. Use the domain summary JSON for the
-JSON file. Render a concise Markdown summary from the JSON for the Markdown
-file.
+JSON file. Use the `paper_json_pack` path from the build result or status for
+the paper JSON pack.
+
+Render a concise Markdown summary from the domain summary JSON. Put the three
+`report_remarks` immediately below `# <domain_title>`:
+
+```text
+This report lists prominent outstanding ideas in the field. For automated LLM
+research, use them as context and aim for practical, tractable variants rather
+than the hardest problems directly.
+
+The questions summarized here come from research papers. They may no longer be
+new, and some may already have been resolved.
+
+Use this report to inspire ideas, not to limit them to the directions listed
+here.
+```
+
+Render source-paper question entries under `## Frequently Asked Questions`,
+not `## Open Questions`. Also include a short `## Research Guidance` section
+from `research_guidance`, because this report is mainly context for another
+LLM to propose better research questions.
 
 After these deliverables are generated, copy the domain HTML file and the
 domain summary Markdown file to `<project-dir>/` with the same file names so

@@ -20,6 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     _llm_args(network)
     llm_network = _seed_command(sub, "llm-build-network")
     _llm_args(llm_network)
+    _seed_command(sub, "build-paper-json-pack")
     evidence = _seed_command(sub, "build-evidence")
     summary = _seed_command(sub, "summarize")
     _llm_args(summary)
@@ -87,6 +88,14 @@ def _dispatch(args: argparse.Namespace) -> Any:
             domain_id=args.domain_id,
             provider=args.provider,
             model=args.model,
+            refresh=args.refresh,
+            workers=args.workers,
+        )
+    if args.command == "build-paper-json-pack":
+        return service.build_paper_json_pack(
+            args.seed_paper,
+            intent=args.intent,
+            domain_id=args.domain_id,
             refresh=args.refresh,
             workers=args.workers,
         )

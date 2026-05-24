@@ -49,6 +49,11 @@ Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as
 automation mode, project directory, and output formatting.
 
+If the request references or attaches accessible files such as `.md`, `.pdf`,
+`.doc`, or `.jpg`, read or extract the relevant content and summarize it as
+part of `<user-intent>`. Treat collaborator notes or images as source context
+for routing, domain building, checking, or later workflows.
+
 Step 3: Resolve `<seed-paper-list>`.
 Use explicit paper identifiers when present. Otherwise infer seed papers from
 `<user-intent>` through ARC paper tools. If a slow MCP call returns a background

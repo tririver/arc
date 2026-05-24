@@ -28,6 +28,7 @@ class DomainPaths:
     selected_papers: Path
     reference_overlap: Path
     domain_graph: Path
+    paper_json_pack: Path
     evidence_pack: Path
     domain_summary: Path
     network_html: Path
@@ -48,6 +49,7 @@ class DomainPaths:
             selected_papers=domain_dir / "selected_papers.json",
             reference_overlap=domain_dir / "reference_overlap.json",
             domain_graph=domain_dir / "domain_graph.json",
+            paper_json_pack=domain_dir / "paper_json_pack.json",
             evidence_pack=domain_dir / "evidence_pack.json",
             domain_summary=domain_dir / "domain_summary.json",
             network_html=domain_dir / "network.html",

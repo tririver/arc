@@ -25,6 +25,7 @@ def test_cli_dispatches_incremental_commands(monkeypatch, capsys):
 
     monkeypatch.setattr(cli.service, "identify_foundation", record("identify-foundation"))
     monkeypatch.setattr(cli.service, "build_network", record("build-network"))
+    monkeypatch.setattr(cli.service, "build_paper_json_pack", record("build-paper-json-pack"))
     monkeypatch.setattr(cli.service, "build_evidence_pack", record("build-evidence"))
     monkeypatch.setattr(cli.service, "summarize_domain", record("summarize"))
     monkeypatch.setattr(cli.service, "build_domain", record("build"))
@@ -35,6 +36,7 @@ def test_cli_dispatches_incremental_commands(monkeypatch, capsys):
     commands = [
         ["identify-foundation", "0911.3380", "--intent", "intent", "--provider", "manual", "--workers", "1"],
         ["build-network", "0911.3380", "--intent", "intent", "--provider", "manual", "--workers", "1"],
+        ["build-paper-json-pack", "0911.3380", "--intent", "intent", "--workers", "1"],
         ["build-evidence", "0911.3380", "--intent", "intent", "--workers", "1"],
         ["summarize", "0911.3380", "--intent", "intent", "--provider", "manual"],
         ["build", "0911.3380", "--intent", "intent", "--provider", "manual", "--workers", "1"],
@@ -49,6 +51,7 @@ def test_cli_dispatches_incremental_commands(monkeypatch, capsys):
     assert [item[0] for item in calls] == [
         "identify-foundation",
         "build-network",
+        "build-paper-json-pack",
         "build-evidence",
         "summarize",
         "build",

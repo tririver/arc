@@ -1,239 +1,638 @@
-# ARC Dev
+# ARC
 
-Advanced Research Compass (ARC) research tooling is organized as Python packages plus thin agent adapters.
+Advanced Research Compass (ARC) is a cache-first research toolkit for
+theoretical-physics papers and paper-centered research workflows. It gives an
+agent, or a human using the command line, structured access to arXiv full text,
+INSPIRE metadata, references, citers, paper summaries, research-domain graphs,
+and multi-agent idea/calculation workflows.
 
-## Packages
+ARC is built around four Python command line tools and one optional MCP server:
 
-Install the current development packages:
+- `arc-paper`: paper metadata, references, citers, ar5iv sections, equation
+  context, full-text search, LLM paper summaries, and paper-summary batches.
+- `arc-domain`: builds a cached research-domain package from a seed paper and
+  optional scientific intent.
+- `arc-llm`: reusable host LLM execution, provider configuration, and
+  proposers-reviewer workflows.
+- `arc-mcp`: exposes ARC tools to MCP clients and manages background jobs.
+- `skills/arc`: agent-facing workflow instructions for domain building, idea
+  generation, and research calculations.
+
+## Who This Is For
+
+Use ARC when you want to:
+
+- Look up reliable paper metadata, references, citers, sections, or equations.
+- Summarize a paper from cached ar5iv/INSPIRE data.
+- Build a research-domain overview from a seed paper.
+- Generate research ideas using domain context and reviewer scoring.
+- Plan and execute a careful symbolic or numerical research calculation with
+  explicit provenance and checks.
+
+Deterministic paper queries do not need an LLM. Paper summaries, domain
+briefings, idea loops, and calculation consensus workflows need a host LLM
+provider.
+
+## Install
+
+Requirements:
+
+- Python 3.11 or newer.
+- Network access for first-time INSPIRE/ar5iv fetches.
+- Codex, Claude Code, or an OpenAI-compatible provider for LLM work.
+
+### Agent Plugin Setup
+
+ARC can be used as a host plugin. The repository contains packaged plugin
+directories for Codex and Claude:
+
+```text
+packaging/codex/arc
+packaging/claude/arc
+```
+
+Those plugin packages include the ARC skill, MCP configuration, and wrapper
+scripts. The wrapper scripts do not currently build or install the Python
+packages automatically. They run `arc-mcp` from `PATH`, or the command pointed
+to by `ARC_MCP_COMMAND`.
+
+Use the plugin directly when `arc-mcp` is already installed in the environment
+seen by the host. Otherwise, install the Python packages once with the source
+install below, then point the plugin at that command:
 
 ```bash
+export ARC_MCP_COMMAND=/path/to/arc/packages/arc-paper/.venv/bin/arc-mcp
+```
+
+Automatic plugin-only bootstrapping would need an additional packaged wheel or
+bootstrap script. The current package is intentionally explicit about the
+Python install step.
+
+### Source Install
+
+For development, local testing, or a plugin host that does not already have
+`arc-mcp` on `PATH`, create one shared virtual environment and install every
+package in editable mode:
+
+```bash
+git clone <repo-url> arc
+cd arc
+
 python3 -m venv packages/arc-paper/.venv
 . packages/arc-paper/.venv/bin/activate
+python -m pip install --upgrade pip
+
 python -m pip install -e packages/arc-llm[test]
 python -m pip install -e packages/arc-paper[test]
 python -m pip install -e packages/arc-domain[test]
-python -m pip install -e packages/arc-mcp
+python -m pip install -e packages/arc-mcp[test]
 ```
 
-## LLM Worker
-
-Reusable host LLM execution:
+Check the installed commands:
 
 ```bash
-arc-llm doctor config
-echo '{"task":"say ok"}' | arc-llm run-json --provider auto
-echo 'Say ok.' | arc-llm run-text --provider auto
+arc-paper --help
+arc-domain --help
+arc-llm --help
+arc-mcp jobs --help
 ```
 
-`arc-llm` owns host detection, provider selection, model defaults, Codex/Claude
-CLI prompt execution, and optional OpenAI-compatible HTTP providers. Other
-packages should use it instead of shelling out to host LLMs directly.
+Run a deterministic smoke test:
 
-URL-based providers such as DeepSeek, Ollama, LM Studio, vLLM, or OpenRouter
-live in a local provider config file, not in source control:
+```bash
+arc-paper extract-paper-ids "Compare arXiv:0911.3380 and hep-th/0601001." --json
+arc-paper get-title arXiv:0911.3380 --json
+```
+
+## Configure LLM Providers
+
+ARC can use built-in host providers or configured OpenAI-compatible providers.
+
+Built-in host providers:
+
+- Codex: `codex-cli`
+- Claude Code: `claude-cli`
+- Manual fallback: `manual`
+
+Check what ARC detects:
+
+```bash
+arc-llm doctor host
+arc-llm doctor provider
+arc-llm doctor config
+arc-paper doctor host --json
+arc-paper doctor provider --json
+```
+
+For URL-based providers such as DeepSeek, Ollama, LM Studio, vLLM, or
+OpenRouter, create a local provider file. The file may contain API keys, so do
+not commit it.
 
 ```bash
 arc-llm providers init
 arc-llm providers add openai-compatible \
   --id deepseek \
   --base-url https://api.deepseek.com/v1 \
-  --api-key sk-... \
-  --model deepseek-chat \
-  --high-model deepseek-reasoner
+  --api-key <key> \
+  --model deepseek-v4-flash \
+  --high-model deepseek-v4-pro \
+  --json-mode json_object
 arc-llm providers list
+arc-llm providers doctor
 ```
 
-Default config discovery checks `/arc-dev/llm-providers.json` first when you
-run ARC from this checkout, then `~/.config/arc/llm-providers.json`. Override
-the path with `ARC_LLM_PROVIDER_CONFIG` or `--provider-config`. Real provider
-config files may store raw `api_key` values and should stay out of source
-control. The repo includes a redacted example at
-`examples/llm-providers.example.json`; rename that example to
-`llm-providers.json` and put it in a default config location. Local files named
-`llm-providers.json` are ignored by git. Generated configs include a `_comment`
-field with Linux, macOS, and Windows placement notes.
-`--provider auto` first uses configured providers with available API keys,
-then optional local configured providers, then the built-in `codex-cli`,
-`claude-cli`, and `manual` providers.
+Provider config discovery checks:
 
-## Paper
+```text
+./llm-providers.json
+~/.config/arc/llm-providers.json
+```
 
-Deterministic paper data:
+Override the path with `ARC_LLM_PROVIDER_CONFIG` or `--provider-config`.
+`examples/llm-providers.example.json` is a redacted starting point.
+
+With `--provider auto`, ARC uses native host providers first by default. Set
+`"auto_provider_priority": "configured-first"` in `llm-providers.json` if you
+want configured providers to win over Codex or Claude.
+
+## Use ARC Through An Agent
+
+For an MCP-capable host, configure an MCP server named `arc` that runs
+`arc-mcp`. If the host does not inherit your activated virtual environment, use
+the full path to the installed command:
+
+```json
+{
+  "mcpServers": {
+    "arc": {
+      "command": "/path/to/arc/packages/arc-paper/.venv/bin/arc-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+Packaged host adapters are included:
+
+- Codex package: `packaging/codex/arc`
+- Claude package: `packaging/claude/arc`
+
+Their `.mcp.json` files call host-specific wrapper scripts:
+
+```text
+packaging/codex/arc/scripts/arc-mcp-codex
+packaging/claude/arc/scripts/arc-mcp-claude
+```
+
+The wrappers set `ARC_AGENT_HOST`, `ARC_LLM_PROVIDER`, and default model
+environment variables before executing `arc-mcp`.
+
+When using the ARC skill, ask the agent in research terms. Examples:
+
+```text
+Use ARC to summarize arXiv:0911.3380.
+Use ARC to build a domain for arXiv:0911.3380 focused on quasi-single-field inflation observables.
+Use ARC to suggest research ideas about cosmological collider scalar exchange.
+Use ARC to plan and execute the selected calculation idea.
+```
+
+ARC workflows use two automation modes:
+
+- `auto`: continue with safe defaults, while preserving visible warnings.
+- `interactive`: ask for confirmation after major workflow steps.
+
+If you do not specify a mode and the choice matters, the skill asks once.
+
+## Use ARC From The CLI
+
+The CLI is useful for direct paper checks, scripting, debugging, and working
+without an MCP host.
+
+### Paper Metadata And Full Text
 
 ```bash
-arc-paper extract-paper-ids "Compare 0911.3380 and doi:10.1234/2512.06790" --json
-arc-paper safe-dir-name 0911.3380 astro-ph/0610514 --json
-arc-paper get-title arXiv:0911.3380 --json
-arc-paper get-references arXiv:0911.3380 --json
+arc-paper get-metadata arXiv:0911.3380 --json
+arc-paper get-references arXiv:0911.3380 --enrich --json
+arc-paper get-citers arXiv:0911.3380 --limit 1000 --sort mostrecent --json
+arc-paper get-citers arXiv:0911.3380 --limit 1000 --sort mostcited --json
+arc-paper get-citer-count arXiv:0911.3380 --json
 arc-paper get-toc arXiv:0911.3380 --json
 arc-paper get-section arXiv:0911.3380 --section S2 --json
+arc-paper search-full-text arXiv:0911.3380 --query "bispectrum" --context 1 --json
+arc-paper get-equation-context arXiv:0911.3380 --query "f_NL" --json
 ```
 
-LLM summaries:
+Paper IDs can be written as new arXiv IDs, old arXiv IDs, INSPIRE record IDs,
+or DOI IDs:
+
+```text
+0911.3380
+arXiv:0911.3380
+hep-th/0601001
+inspire:837197
+doi:10.1088/1475-7516/2010/04/027
+```
+
+### Paper Summaries
+
+Use `llm-summary` to read a cached summary or generate one when an LLM provider
+is available:
 
 ```bash
-arc-paper llm-summary arXiv:0911.3380 --json
+arc-paper llm-summary arXiv:0911.3380 --provider auto --json
+```
+
+Use `llm-generate-summary` when you explicitly want to regenerate or choose a
+provider/model:
+
+```bash
 arc-paper llm-generate-summary arXiv:0911.3380 --provider auto --json
+arc-paper llm-generate-summary arXiv:0911.3380 --provider deepseek --model deepseek-v4-pro --json
 ```
 
-`llm-summary` first reads the local summary cache. If the summary is missing
-and a host LLM provider is available, it generates and caches the summary
-automatically. `llm-generate-summary` remains available when you want an
-explicit generation command or provider override. Legacy aliases
-`get-llm-summary` and `generate-llm-summary` still work.
-`llm-infer-main-references` also caches inferred paper ids by stripped input
-text; if explicit ids are found, it returns them directly without calling an
-LLM.
+If no runnable LLM provider is available, ARC returns a `needs_llm` task with
+the prompt, input pack, and schema. Generate schema-valid JSON separately and
+store it:
 
-Summary generation uses fast host defaults unless overridden: Codex uses
-`gpt-5.4-mini`, and Claude Code uses `haiku`. The LLM pipeline summarizes paper
-sections sequentially first, then synthesizes the final paper summary from the
-title, abstract, table of contents, and compact section summaries. The final
-JSON keeps `toc` as navigation metadata and stores the richer per-section text
-under `section_summaries`; it does not rewrite those into one-sentence TOC
-entries. References are intentionally not included in the summary input pack.
+```bash
+arc-paper store-llm-summary arXiv:0911.3380 --summary-json summary.json --json
+```
 
-When called through MCP, tools that may invoke the host LLM are prefixed
-`llm_`. They start the work, wait briefly, and return before the MCP client
-timeout. If the result is not ready, they return a `job_id`. Set
-`background=true` to skip the inline wait and get a `job_id` immediately.
-Poll `job_status` and read with `job_result`, or use the blocking CLI watcher:
+### Summary Batches
+
+For many papers, put one paper ID per line in a text file:
+
+```bash
+arc-paper summary-batch create papers.txt --name qft-summaries --json
+arc-paper summary-batch prefetch qft-summaries --workers 8 --json
+arc-paper summary-batch run qft-summaries --provider auto --concurrency 2 --max-items 10 --json
+arc-paper summary-batch status qft-summaries --json
+arc-paper summary-batch run qft-summaries --provider auto --concurrency 2 --json
+arc-paper summary-batch export qft-summaries --format jsonl --output summaries.jsonl --json
+```
+
+Review a small chunk before launching a large batch.
+
+### Research Domains
+
+A domain is a cached package built from a seed paper plus optional intent. It
+contains foundation selection, selected papers, citation graph data, an HTML
+network, an evidence pack, and a compact field briefing.
+
+```bash
+arc-domain llm-build arXiv:0911.3380 \
+  --intent "quasi-single-field inflation observables" \
+  --provider auto \
+  --json
+
+arc-domain status arXiv:0911.3380 \
+  --intent "quasi-single-field inflation observables" \
+  --json
+
+arc-domain get-summary arXiv:0911.3380 \
+  --intent "quasi-single-field inflation observables" \
+  --json
+
+arc-domain get-graph arXiv:0911.3380 \
+  --intent "quasi-single-field inflation observables" \
+  --json
+```
+
+Use the exact same intent string when reading the cache. Different intent
+strings produce different domain IDs.
+
+### Direct LLM Checks
+
+Most users should call `arc-paper`, `arc-domain`, or MCP tools instead of
+calling `arc-llm` directly. Direct LLM calls are useful for diagnosis:
+
+```bash
+arc-llm run-text --prompt "Say hello." --provider auto
+arc-llm run-json --prompt "Return {\"ok\": true}" --provider auto --json
+```
+
+## MCP Tools And Background Jobs
+
+ARC MCP exposes paper tools, domain tools, job tools, and doctor tools. Tools
+that may invoke a host LLM use the `llm_` prefix.
+
+Paper tools:
+
+```text
+extract_paper_ids
+paper_ids_safe_dir_name
+llm_infer_main_references
+get_title
+get_abstract
+get_authors
+get_metadata
+get_references
+get_citers
+get_citer_count
+get_toc
+get_section
+search_full_text
+get_equation_context
+llm_get_summary
+llm_generate_summary
+store_llm_summary
+summary_batch_create
+summary_batch_prefetch
+llm_summary_batch_run
+summary_batch_status
+summary_batch_export
+summary_batch_retry_failed
+```
+
+Domain tools:
+
+```text
+llm_domain_build
+llm_domain_get_summary
+llm_domain_get_graph
+domain_status
+domain_get_summary
+domain_get_graph
+```
+
+Job and doctor tools:
+
+```text
+job_status
+job_result
+list_jobs
+cancel_job
+doctor_host
+doctor_provider
+doctor_cache
+```
+
+Long-running MCP calls can return a `job_id`. Use the CLI watcher to block
+until a terminal result:
+
+```bash
+arc-mcp jobs watch <job_id> --json
+arc-mcp jobs watch <job_id> --progress-jsonl
+arc-mcp jobs root --json
+arc-mcp jobs status <job_id> --json
+arc-mcp jobs result <job_id> --json
+arc-mcp jobs list --json
+arc-mcp jobs cancel <job_id> --json
+```
+
+For slow tools or large launches, pass `background=true` from MCP so the tool
+returns immediately with a job ID. Do not cancel jobs unless you explicitly no
+longer want the result.
+
+## End-To-End Research Workflows
+
+The `skills/arc` layer turns the package commands into user-facing research
+workflows. It writes a project directory with `context.json` and durable
+artifacts so results can be inspected and resumed.
+
+### 1. Build Domain References
+
+Input: a seed paper and optional intent.
+
+Output includes:
+
+```text
+<project-dir>/context.json
+<project-dir>/domain/<seed-safe>_domain.html
+<project-dir>/domain/<seed-safe>_domain_summary.json
+<project-dir>/domain/<seed-safe>_domain_summary.md
+<project-dir>/domain/foundation_<foundation-safe>.md
+```
+
+Use this when you need a reliable overview of a local research area before
+asking for ideas or calculations.
+
+### 2. Suggest Research Ideas
+
+Input: a not-yet-explicit research request plus built domain context.
+
+The normal workflow feeds ARC-built domain Markdown to proposers. The no-info
+workflow intentionally withholds ARC domain context for comparison. Both use
+reviewer marks and write a ranked selected-ideas report:
+
+```text
+<project-dir>/suggest-ideas/<run-id>/
+<project-dir>/suggest-ideas/<run-id>/suggested-ideas.md
+<project-dir>/suggested-ideas.md
+```
+
+The report preserves weak rounds and reviewer concerns; it should not invent
+novelty claims or hide failed ideas.
+
+### 3. Plan And Execute A Calculation
+
+Input: one explicit calculation idea.
+
+The calculation workflow has three phases:
+
+1. `research-plan`: gather evidence, separate first principles from derived
+   claims, and write a reviewable calculation plan.
+2. `research-foundation`: build versioned foundation JSON with conventions,
+   equations, confidence labels, and source locations.
+3. `research-execute`: check non-axiom foundation equations and execute new
+   calculation steps through proposers-reviewer consensus.
+
+Primary outputs:
+
+```text
+<project-dir>/calculate/<run-id>/plan.json
+<project-dir>/calculate/<run-id>/research-plan.md
+<project-dir>/calculate/<run-id>/foundation/latest.json
+<project-dir>/calculate/<run-id>/foundation/research-foundation.md
+<project-dir>/calculate/<run-id>/execute/consensus.config.json
+<project-dir>/calculate/<run-id>/report.md
+<project-dir>/report.md
+```
+
+The workflow is deliberately conservative: it requires source evidence,
+explicit quantity contracts, independent agreement checks, and recorded
+validation history before accepting results.
+
+## Caches And Refreshing
+
+ARC is cache-first. Repeated calls usually read local JSON/HTML artifacts
+instead of refetching data or rerunning LLM work.
+
+Default checkout cache paths:
+
+```text
+cache/arc-paper/
+cache/arc-domain/
+cache/arc-mcp/
+```
+
+Outside this checkout, ARC uses:
+
+```text
+~/.cache/arc/arc-paper/
+~/.cache/arc/arc-domain/
+~/.cache/arc/arc-mcp/
+```
+
+Set these environment variables to override cache locations:
+
+```bash
+export ARC_PAPER_CACHE=/path/to/arc-paper-cache
+export ARC_DOMAIN_CACHE=/path/to/arc-domain-cache
+export ARC_MCP_CACHE=/path/to/arc-mcp-cache
+```
+
+Use `--refresh` only when you intentionally want fresh source data or a forced
+rebuild:
+
+```bash
+arc-paper get-metadata arXiv:0911.3380 --refresh --json
+arc-domain llm-build arXiv:0911.3380 --intent "..." --refresh --json
+```
+
+Diagnose cache state:
+
+```bash
+arc-paper doctor cache arXiv:0911.3380 --json
+arc-mcp jobs root --json
+```
+
+Useful environment variables:
+
+```text
+ARC_AGENT_HOST                    Force host detection, for example codex or claude-code.
+ARC_LLM_PROVIDER                  Force provider selection, for example codex-cli, claude-cli, deepseek, or manual.
+ARC_LLM_PROVIDER_CONFIG           Override the provider config file path.
+ARC_LLM_MODEL                     Override the exact model for any provider.
+ARC_LLM_MODEL_TIER                Select low, medium, or high model tier where supported.
+ARC_CODEX_MODEL                   Override the Codex built-in provider model.
+ARC_CODEX_MODEL_TIER              Override the Codex model tier.
+ARC_CLAUDE_MODEL                  Override the Claude built-in provider model.
+ARC_CLAUDE_MODEL_TIER             Override the Claude model tier.
+ARC_PAPER_CACHE                   Override the arc-paper cache root.
+ARC_DOMAIN_CACHE                  Override the arc-domain cache root.
+ARC_MCP_CACHE                     Override the arc-mcp job/cache root.
+XDG_CACHE_HOME                    Base cache directory when ARC-specific cache vars are unset.
+ARC_MCP_INLINE_WAIT_SEC           Inline MCP wait before returning a background job.
+ARC_MCP_TOOL_TIMEOUT_SEC          Host MCP tool timeout used to derive inline wait.
+ARC_MCP_BACKGROUND_MARGIN_SEC     Safety margin subtracted from the MCP tool timeout.
+```
+
+## Troubleshooting
+
+If a paper query fails:
+
+```bash
+arc-paper extract-paper-ids "<your input>" --json
+arc-paper doctor cache <paper-id> --json
+arc-paper get-metadata <paper-id> --refresh --json
+```
+
+If LLM generation is unavailable:
+
+```bash
+arc-llm doctor host
+arc-llm doctor provider
+arc-llm providers doctor
+```
+
+If an MCP call returns a job ID:
 
 ```bash
 arc-mcp jobs watch <job_id> --json
 ```
 
-MCP jobs are persisted under `cache/arc-mcp/jobs/`, so MCP tools and CLI tools
-read the same job state. Completed section summaries are cached as they finish,
-so a failed or interrupted paper-summary job can resume without paying again for
-sections that already completed. MCP background jobs do not stream or push a
-completion notification; clients should poll or use the CLI watcher. Do not call
-`cancel_job` unless the user explicitly asks.
-
-MCP LLM tools use this deadline rule: `ARC_MCP_INLINE_WAIT_SEC` if set;
-otherwise `ARC_MCP_TOOL_TIMEOUT_SEC - ARC_MCP_BACKGROUND_MARGIN_SEC`; otherwise
-a best-effort Codex `tool_timeout_sec` read from `~/.codex/config.toml`;
-otherwise 90 seconds.
-
-Job status includes ETA information after enough matching jobs have completed.
-ARC stores runtime history in `cache/arc-mcp/stats/jobs.sqlite`; before three
-similar samples exist, ETA is marked as unavailable.
-
-Batch workflow:
+If a domain summary or graph is missing:
 
 ```bash
-arc-paper summary-batch create papers.txt --name qft-ideas --json
-arc-paper summary-batch prefetch qft-ideas --workers 8 --json
-arc-paper summary-batch run qft-ideas --provider auto --concurrency 2 --max-items 10 --json
-arc-paper summary-batch status qft-ideas --json
-arc-paper summary-batch export qft-ideas --format jsonl --output summaries.jsonl --json
+arc-domain status <seed-paper> --intent "<same-intent>" --json
+arc-domain llm-build <seed-paper> --intent "<same-intent>" --json
 ```
 
-## Host Detection
-
-Plugins should set:
-
-```text
-ARC_AGENT_HOST=codex
-ARC_LLM_PROVIDER=codex-cli
-```
-
-or:
-
-```text
-ARC_AGENT_HOST=claude-code
-ARC_LLM_PROVIDER=claude-cli
-```
-
-Without plugin env, `arc-paper` falls back to parent-process detection.
-
-Debug:
+Network integration tests are opt-in because they call external services:
 
 ```bash
-arc-paper doctor host --json
-arc-paper doctor provider --json
-arc-paper doctor cache 0911.3380 --json
+ARC_RUN_NET_TESTS=1 packages/arc-paper/.venv/bin/python -m pytest tests/integration -q
 ```
 
-When ARC is run from this checkout without `ARC_PAPER_CACHE` or
-`XDG_CACHE_HOME`, arc-paper data is cached under:
-
-```text
-/arc-dev/cache/arc-paper/
-```
-
-## Domain Info
-
-Build a cached research-domain package from one seed paper plus an optional
-intent:
+True LLM integration tests are also opt-in:
 
 ```bash
-arc-domain llm-build 0911.3380 --intent "quasi-single-field inflation observables" --json
-arc-domain status 0911.3380 --intent "quasi-single-field inflation observables" --json
-arc-domain get-summary 0911.3380 --intent "quasi-single-field inflation observables" --json
-arc-domain get-graph 0911.3380 --intent "quasi-single-field inflation observables" --json
+ARC_RUN_LLM_TESTS=1 ARC_RUN_NET_TESTS=1 \
+  packages/arc-paper/.venv/bin/python -m pytest \
+  packages/arc-llm/tests/test_proposers_reviewer_llm_integration.py -q
 ```
 
-`arc-domain` uses `arc-paper` for all single-paper operations. It
-identifies a likely foundation paper, builds a citation-domain graph of up to
-about 60 nodes, renders `network.html`, builds an evidence pack from titles,
-abstracts, and conclusion/outlook sections, then asks `arc-llm` for a
-compact field briefing. If the host LLM is unavailable, deterministic fallback
-artifacts are still written so the cache is inspectable. Legacy aliases such as
-`arc-domain build` still work.
+## Developer Notes
 
-When ARC is run from this checkout without `ARC_DOMAIN_CACHE` or
-`XDG_CACHE_HOME`, domain data is cached under:
+This repository is organized as Python packages plus thin agent adapters.
+`0_ref/` is read-only reference material and must not be modified.
 
-```text
-/arc-dev/cache/arc-domain/
-```
+Package boundaries:
 
-ARC MCP job state is cached under:
+- `packages/arc-llm` owns reusable host LLM execution: host detection,
+  provider selection, model defaults, direct prompt calls, configured
+  OpenAI-compatible providers, and proposers-reviewer runners.
+- `packages/arc-paper` owns deterministic paper data access, ID normalization,
+  cache layout, ar5iv parsing, INSPIRE access, paper-summary contracts,
+  paper-summary orchestration, full-text search, and summary batches.
+- `packages/arc-domain` owns research-domain construction from seed papers:
+  foundation selection, domain paper selection, graph artifacts, evidence
+  packs, HTML rendering, and domain summaries. It calls `arc-paper` for
+  single-paper work and `arc-llm` for LLM work.
+- `packages/arc-mcp` stays a thin MCP adapter over package service functions
+  and background-job management.
+- `skills/arc`, `packaging/`, prompts, and schemas describe or wrap package
+  behavior; they should not reimplement package internals.
 
-```text
-/arc-dev/cache/arc-mcp/
-```
+Development rules:
 
-## MCP
+- Keep ARC general-purpose across theoretical-physics domains. Do not hard-code
+  seed papers, author names, subfield labels, or field-specific keyword lists.
+- Apply the instruction review gate before changing ARC instructions,
+  workflows, prompts, schemas, tests, package behavior, MCP tools, packaging
+  metadata, or durable documentation. Changes should be portable across
+  supported hosts and compatible with ARC's general-purpose research goals.
+- Keep agent instructions portable across Codex, Claude Code, Cursor, GitHub
+  Copilot, and similar hosts. Use generic terms such as agent, host, skill
+  directory, MCP server, and workflow unless a file is host-specific.
+- Keep skills concise. Put detailed workflows and troubleshooting in reference
+  files.
+- Unit tests must not require network access. Use `ARC_RUN_NET_TESTS=1` only
+  for explicit network integration runs.
+- Keep `0_ref/` read-only. Treat `cache/` and `arc-tests/` as generated,
+  reference, or local-test material rather than normal source edits.
+- Durable docs, skills, prompts, schemas, comments, package metadata, and
+  workflow files should be written in English unless there is a specific reason
+  to do otherwise.
 
-Install the packages above, then configure the MCP server command as
-`arc-mcp`. The ARC MCP server exposes paper tools such as `get_metadata`,
-`get_references`, `get_citers`, `get_section`, `extract_paper_ids`, and
-`paper_ids_safe_dir_name`, and cache-only domain tools.
-`llm_infer_main_references` first extracts explicit paper ids without an LLM;
-if none are present, it uses web search and verifies the result through INSPIRE.
-Anything that can invoke the host LLM has an `llm_` prefix:
-
-```text
-llm_infer_main_references(text, provider="auto", background=true)
-paper_ids_safe_dir_name(paper_ids=["0911.3380", "astro-ph/0610514"])
-llm_get_summary(paper_id, provider="auto")
-llm_generate_summary(paper_id, provider="auto")
-llm_generate_summary(paper_id, provider="auto", background=true)
-llm_domain_build(seed_paper, intent="", provider="auto", background=true)
-domain_status(job_id) or domain_status(seed_paper, intent="")
-domain_get_summary(seed_paper, intent="")
-domain_get_graph(seed_paper, intent="")
-job_status(job_id)
-job_result(job_id)
-cancel_job(job_id)
-```
-
-`llm_domain_build` may return a completed result if it finishes before the MCP
-deadline margin, otherwise it returns a `job_id`. For massive launches, pass
-`background=true` so ARC returns immediately after scheduling the job. In skill
-workflows, prefer:
+Focused test command:
 
 ```bash
-arc-mcp jobs watch <job_id> --json
+packages/arc-paper/.venv/bin/python -m pytest \
+  packages/arc-llm/tests \
+  packages/arc-paper/tests \
+  packages/arc-domain/tests \
+  packages/arc-mcp/tests
 ```
 
-Then read the cached summary or graph. `domain_get_summary` and
-`domain_get_graph` are cache-only. Use `llm_domain_get_summary` or
-`llm_domain_get_graph` when a missing artifact should trigger a domain build.
+Full local suite used by this checkout:
 
-## Reference Code
+```bash
+packages/arc-paper/.venv/bin/python -m pytest \
+  packages/arc-llm/tests \
+  packages/arc-paper/tests \
+  packages/arc-domain/tests \
+  packages/arc-mcp/tests \
+  tests -q
+```
 
-`0_ref/` is read-only reference material. New code must not modify it or preserve
-old compatibility assumptions.
+When changing packaged skills or workflows, keep source and packaged copies in
+sync. The repository tests check that key files under `skills/arc` match the
+Codex and Claude packaged copies.
+
+Useful docs/packaging check:
+
+```bash
+packages/arc-paper/.venv/bin/python -m pytest tests/test_arc_research_workflow_docs.py -q
+```

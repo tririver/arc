@@ -8,6 +8,7 @@ from .cache import DomainPaths, domain_id_for, now_iso, read_json, update_status
 from .evidence import build_evidence_pack as _build_evidence_pack
 from .foundation import identify_foundation as _identify_foundation
 from .network import build_network as _build_network
+from .paper_pack import build_paper_json_pack as _build_paper_json_pack
 from .render import render_network_html
 from .results import err, ok
 from .summary import summarize_domain as _summarize_domain
@@ -113,6 +114,23 @@ def build_evidence_pack(
         return err("domain_evidence_failed", str(exc))
 
 
+def build_paper_json_pack(
+    seed_paper: str,
+    *,
+    intent: str = "",
+    domain_id: str | None = None,
+    refresh: bool = False,
+    workers: int = 8,
+) -> dict[str, Any]:
+    try:
+        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id)
+        if not paths.domain_graph.exists():
+            raise FileNotFoundError("domain_graph.json missing; run build-network first")
+        return ok(_build_paper_json_pack(paths=paths, refresh=refresh, workers=workers))
+    except Exception as exc:
+        return err("domain_paper_json_pack_failed", str(exc))
+
+
 def summarize_domain(
     seed_paper: str,
     *,
@@ -161,6 +179,7 @@ def build_domain(
             workers=workers,
         )
         html = render_network_html(paths=paths)
+        paper_pack = _build_paper_json_pack(paths=paths, refresh=refresh, workers=workers)
         evidence = _build_evidence_pack(paths=paths, refresh=refresh, workers=workers)
         summary = _summarize_domain(paths=paths, provider=provider, model=model)
         return ok(
@@ -174,6 +193,7 @@ def build_domain(
                     "graph_path": network["graph_path"],
                     "network_html_path": html["network_html_path"],
                 },
+                "paper_json_pack_path": paper_pack["paper_json_pack_path"],
                 "evidence_pack_path": evidence["evidence_pack_path"],
                 "domain_summary_path": summary["domain_summary_path"],
                 "summary": summary["summary"],
@@ -199,6 +219,7 @@ def status(seed_paper: str | None = None, *, intent: str = "", domain_id: str | 
                 "selected_papers": _exists(paths.selected_papers),
                 "reference_overlap": _exists(paths.reference_overlap),
                 "domain_graph": _exists(paths.domain_graph),
+                "paper_json_pack": _exists(paths.paper_json_pack),
                 "evidence_pack": _exists(paths.evidence_pack),
                 "domain_summary": _exists(paths.domain_summary),
                 "network_html": _exists(paths.network_html),
