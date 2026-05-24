@@ -91,6 +91,10 @@ Use the graph HTML path for the HTML file. Use the domain summary JSON for the
 JSON file. Render a concise Markdown summary from the JSON for the Markdown
 file.
 
+After these deliverables are generated, copy the domain HTML file and the
+domain summary Markdown file to `<project-dir>/` with the same file names so
+human readers can inspect the main project reports together.
+
 ### Phase 4: Summarize Foundation Papers
 
 Step 1: Read the selected foundation paper id from the domain build result or
@@ -117,6 +121,10 @@ Derive `<foundation-safe>` with `arc-paper safe-dir-name <foundation-paper>
 
 Do not depend on copying a cache file. Cache-hit responses may not include a
 stable file path, so write the returned summary content into the project.
+
+After each foundation summary Markdown file is generated, copy it to
+`<project-dir>/` with the same file name so human readers can inspect the main
+project reports together.
 
 ### Phase 5: Interactive Review
 

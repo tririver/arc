@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -161,46 +160,42 @@ def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:
         assert schema_version in markdown
 
 
-def test_suggest_ideas_no_info_keeps_reviewer_block_synced() -> None:
+def test_suggest_ideas_references_reviewer_template() -> None:
     normal = (WF / "suggest-ideas.md").read_text(encoding="utf-8")
-    no_info = (WF / "suggest-ideas-no-info.md").read_text(encoding="utf-8")
+    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
 
-    assert _json_fence_containing(no_info, '"id": "reviewer_001"') == _json_fence_containing(
-        normal, '"id": "reviewer_001"'
-    )
+    assert "suggest-ideas-reviewer.template.json" in normal
+    assert reviewer["id"] == "reviewer_001"
+    assert reviewer["runtime"]["allow_mcp"] is True
+    assert reviewer["runtime"]["mcp_mode"] == "arc-only"
 
 
-def test_suggest_ideas_no_info_limits_only_proposer_context_and_tools() -> None:
-    text = (WF / "suggest-ideas-no-info.md").read_text(encoding="utf-8")
-    loop_block = _json_fence_containing(text, '"caller_context"')
-    proposer_block = _json_fence_containing(text, '"id": "proposer_001"')
+def test_suggest_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:
+    text = (WF / "suggest-ideas.md").read_text(encoding="utf-8")
+    batch = json.loads((WF / "suggest-ideas-batch.template.json").read_text(encoding="utf-8"))
+    loop = json.loads((WF / "suggest-ideas-loop.template.json").read_text(encoding="utf-8"))
+    proposer = json.loads((WF / "suggest-ideas-proposer.template.json").read_text(encoding="utf-8"))
 
-    assert '"user_intent": "<user_intent>"' in loop_block
-    assert "domain_markdown_files" not in loop_block
-    assert "arc_paper_tool_notes" not in loop_block
-    assert '"allow_internet": true' in proposer_block
-    assert '"allow_mcp": false' in proposer_block
-    assert "arc_paper_tool_notes" not in proposer_block
+    assert "suggest-ideas-batch.template.json" in text
+    assert "suggest-ideas-loop.template.json" in text
+    assert "suggest-ideas-proposer.template.json" in text
+    assert batch["schema_version"] == "arc.llm.proposers_reviewer_batch.config.v1"
+    assert batch["max_concurrent_loops"] == 10
+    assert "domain_markdown_files" in loop["caller_context"]
+    assert "arc_paper_tool_notes" in loop["caller_context"]
+    assert proposer["runtime"]["allow_internet"] is True
+    assert proposer["runtime"]["allow_mcp"] is True
+    assert proposer["runtime"]["mcp_mode"] == "arc-only"
 
 
 def test_suggest_ideas_proposer_schemas_are_codex_strict() -> None:
-    for name in ["suggest-ideas.md", "suggest-ideas-no-info.md"]:
-        text = (WF / name).read_text(encoding="utf-8")
-        proposer = json.loads(_json_fence_containing(text, '"id": "proposer_001"'))
-        schema = proposer["output_schema"]
+    proposer = json.loads((WF / "suggest-ideas-proposer.template.json").read_text(encoding="utf-8"))
+    schema = proposer["output_schema"]
 
-        assert schema["type"] == "object"
-        assert schema["additionalProperties"] is False
-        assert "title" in schema["required"]
-        assert "calculation_plan" in schema["required"]
-
-
-def _json_fence_containing(text: str, marker: str) -> str:
-    for match in re.finditer(r"```json\n(.*?)\n```", text, re.DOTALL):
-        block = match.group(1)
-        if marker in block:
-            return block
-    raise AssertionError(f"missing JSON block containing {marker}")
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert "title" in schema["required"]
+    assert "calculation_plan" in schema["required"]
 
 
 def test_research_foundation_schema_requires_evidence_for_checked_equations() -> None:
@@ -257,7 +252,10 @@ def test_packaged_skill_references_include_required_workflow_inputs() -> None:
     required = [
         Path("references/research-workflows/build-domain.md"),
         Path("references/research-workflows/suggest-ideas.md"),
-        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-batch.template.json"),
+        Path("references/research-workflows/suggest-ideas-loop.template.json"),
+        Path("references/research-workflows/suggest-ideas-proposer.template.json"),
+        Path("references/research-workflows/suggest-ideas-reviewer.template.json"),
         Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
         Path("references/package-manuals/arc-domain.md"),
         Path("references/package-manuals/arc-llm.md"),
@@ -277,7 +275,10 @@ def test_packaged_skill_references_stay_synced_with_source() -> None:
         Path("references/package-manuals"),
         Path("references/research-workflows/build-domain.md"),
         Path("references/research-workflows/suggest-ideas.md"),
-        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-batch.template.json"),
+        Path("references/research-workflows/suggest-ideas-loop.template.json"),
+        Path("references/research-workflows/suggest-ideas-proposer.template.json"),
+        Path("references/research-workflows/suggest-ideas-reviewer.template.json"),
         Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
     ]
 

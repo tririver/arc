@@ -1,0 +1,12 @@
+{
+  "loop_id": "<loop-id>",
+  "max_rounds": 5,
+  "early_stop": {
+    "enabled": false
+  },
+  "caller_context": {
+    "user_intent": "<user_intent>"
+  },
+  "proposers": [],
+  "reviewers": []
+}

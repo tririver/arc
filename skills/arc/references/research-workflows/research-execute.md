@@ -126,3 +126,6 @@ for instructions. Do not continue in auto mode.
 Step 3: If all steps are accepted, write `report.md` with accepted outputs,
 reviewer consensus summaries, unresolved risks, and artifact paths. Do not
 claim a result that is not present in accepted consensus output.
+
+After `report.md` is generated, copy it to `<project-dir>/report.md` so human
+readers can inspect the main project reports together.

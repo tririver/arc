@@ -8,6 +8,7 @@ Write artifacts under:
 ```text
 <project-dir>/calculate/<run-id>/foundation/foundation.v001.json
 <project-dir>/calculate/<run-id>/foundation/latest.json
+<project-dir>/calculate/<run-id>/foundation/research-foundation.md
 ```
 
 Each foundation file must use `schema_version: "arc.research_foundation.v1"`.
@@ -89,3 +90,9 @@ full-text search command that can recover the relevant location.
 
 Step 3: Do not mark a non-axiom equation as checked. The execute workflow must
 create one checking step for every non-axiom equation.
+
+Step 4: Render `latest.json` into `research-foundation.md` with the chosen
+conventions, equations, confidence labels, source locations, and any version
+change notes. After `research-foundation.md` is generated, copy it to
+`<project-dir>/research-foundation.md` so human readers can inspect the main
+project reports together.

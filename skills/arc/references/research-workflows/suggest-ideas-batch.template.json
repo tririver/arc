@@ -1,0 +1,10 @@
+{
+  "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
+  "run_id": "<run-id>",
+  "run_dir": "<project-dir>/suggest-ideas",
+  "max_concurrent_loops": 10,
+  "artifact_options": {
+    "save_prompts": true
+  },
+  "loops": []
+}

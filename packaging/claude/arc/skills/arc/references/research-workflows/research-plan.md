@@ -7,7 +7,7 @@ Write artifacts under:
 
 ```text
 <project-dir>/calculate/<run-id>/plan.json
-<project-dir>/calculate/<run-id>/plan.md
+<project-dir>/calculate/<run-id>/research-plan.md
 ```
 
 `plan.json` must use `schema_version: "arc.research_plan.v1"`.
@@ -99,8 +99,12 @@ Step 4: At the end of every step, make the quantity contract explicit:
 calculate which quantity, in terms of which quantity, and what is not allowed
 as an input. If this cannot be stated clearly, split the step again.
 
-Step 5: Write `plan.json` and a human-readable `plan.md`. The JSON is the
-source of truth for later workflow phases.
+Step 5: Write `plan.json` and a human-readable `research-plan.md`. The JSON is
+the source of truth for later workflow phases.
+
+After `research-plan.md` is generated, copy it to
+`<project-dir>/research-plan.md` so human readers can inspect the main project
+reports together.
 
 ## Phase 4: Review The Plan
 
@@ -119,5 +123,6 @@ the first calculation step is clear
 difficult steps have enough substeps
 ```
 
-Step 3: If the review finds gaps, revise `plan.json` and `plan.md`, then review
-the plan again. Proceed only when the review is recorded in both artifacts.
+Step 3: If the review finds gaps, revise `plan.json` and `research-plan.md`,
+then review the plan again. Proceed only when the review is recorded in both
+artifacts.
