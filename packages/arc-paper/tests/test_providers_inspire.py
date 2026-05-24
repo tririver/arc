@@ -134,6 +134,38 @@ def test_inspire_metadata_and_references_are_cached(monkeypatch, tmp_path):
     assert cached_provider.get_references("arXiv:0911.3380")[0]["title"] == "A Reference"
 
 
+def test_inspire_metadata_and_references_strip_arxiv_versions(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    record = {
+        **INSPIRE_RECORD,
+        "metadata": {
+            **INSPIRE_RECORD["metadata"],
+            "arxiv_eprints": [{"value": "0911.3380v2"}],
+            "references": [
+                {
+                    "record": {"$ref": "https://inspirehep.net/api/literature/456"},
+                    "reference": {"title": "A Reference", "arxiv_eprint": "0801.0001v3"},
+                }
+            ],
+        },
+    }
+
+    def handler(request):
+        assert str(request.url) == "https://inspirehep.net/api/arxiv/0911.3380"
+        return httpx.Response(200, json=record)
+
+    provider = InspireProvider(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    metadata = provider.get_metadata("arXiv:0911.3380v2")
+    references = provider.get_references("arXiv:0911.3380v2")
+
+    assert metadata["paper_id"] == "arXiv:0911.3380"
+    assert metadata["arxiv_id"] == "0911.3380"
+    assert metadata["identifiers"]["arxiv"] == "arXiv:0911.3380"
+    assert references[0]["paper_id"] == "arXiv:0801.0001"
+    assert references[0]["arxiv_id"] == "0801.0001"
+    assert references[0]["identifiers"]["arxiv"] == "arXiv:0801.0001"
+
+
 def test_inspire_metadata_supports_doi_lookup(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     record = {

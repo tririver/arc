@@ -52,7 +52,8 @@ def render_prompt(worker: WorkerConfig, context: dict[str, Any]) -> str:
     if worker.prompt.system:
         sections.extend(["### System", worker.prompt.system])
     sections.extend(["### Task", rendered_template])
-    sections.extend(["## ARC Worker Context", json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)])
+    if worker.runtime.get("append_context", True):
+        sections.extend(["## ARC Worker Context", json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)])
     return "\n".join(sections).rstrip() + "\n"
 
 

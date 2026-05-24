@@ -210,6 +210,40 @@ def test_generate_json_falls_back_to_json_object_when_json_schema_is_unavailable
     assert "JSON Schema" in completions.calls[1]["messages"][0]["content"]
 
 
+def test_generate_json_repair_after_response_format_fallback_uses_fallback_json_mode():
+    completions = SequencedCompletions(
+        [
+            RuntimeError("response_format json_schema is not supported"),
+            '{"ok": "unterminated"',
+            json.dumps({"ok": True, "mode": "fallback-retry"}),
+        ]
+    )
+    provider = OpenAICompatibleProvider(
+        provider_config(id="openaiish", base_url="https://api.openaiish.example/v1"),
+        env={},
+        client_factory=lambda **kwargs: FakeClient(completions),
+    )
+
+    result = provider.generate_json("Return JSON", schema={"type": "object"}, model="deepseek-chat")
+
+    assert result == {"ok": True, "mode": "fallback-retry"}
+    assert completions.calls[1]["response_format"] == {"type": "json_object"}
+    assert completions.calls[2]["response_format"] == {"type": "json_object"}
+    assert "Previous response was invalid JSON" in completions.calls[2]["messages"][0]["content"]
+
+
+def test_generate_json_repair_errors_are_llm_worker_errors_for_unsupported_retry_mode():
+    completions = SequencedCompletions(['{"ok": "unterminated"'])
+    provider = OpenAICompatibleProvider(
+        provider_config(id="openaiish", base_url="https://api.openaiish.example/v1"),
+        env={},
+        client_factory=lambda **kwargs: FakeClient(completions),
+    )
+
+    with pytest.raises(LLMWorkerError, match="unsupported fallback json_mode"):
+        provider.generate_json("Return JSON", schema={"type": "object"}, model="deepseek-chat")
+
+
 def test_missing_required_api_key_fails_before_calling_client():
     called = False
 

@@ -53,9 +53,7 @@ Use this package-level structure:
 }
 ```
 
-Step 4: Add the requested number of independent loops. For the initial test,
-use two loops and keep `max_concurrent_loops=2`. Future runs may increase the
-loop count by adding more loop objects and raising `max_concurrent_loops`.
+Step 4: Add the requested number of independent loops. Run `5` loops and keep `max_concurrent_loops=10`.
 Keep `artifact_options.save_prompts=true` for debugging unless the project
 context explicitly disables prompt artifacts.
 

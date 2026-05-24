@@ -21,6 +21,7 @@ get_citers
 get_citer_count
 get_toc
 get_section
+search_full_text
 get_equation_context
 llm_get_summary
 llm_generate_summary

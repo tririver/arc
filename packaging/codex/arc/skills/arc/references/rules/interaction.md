@@ -16,8 +16,9 @@ planning calculations.
 
 ## Discrete Selection Protocol
 
-Always ask user questions through the host's discrete selection tool. Do not
-write a prose question or numbered list and wait for typed input.
+Ask user questions through the host's discrete selection tool when one is
+available. Do not use open-ended prose questions when a bounded choice can
+express the decision.
 
 The default/recommended option must be first, so pressing Enter chooses it.
 The user can use arrow keys to choose another option.
@@ -30,9 +31,11 @@ Every choice prompt must:
 - Avoid open-ended prose questions when a bounded choice can express the
   decision.
 
-If the selection tool is unavailable and a question is required, stop and
-report that ARC cannot present the required selection UI in the current mode.
-Do not replace it with typed-input prompting.
+If no discrete selection tool is available and a question is required, use a
+portable typed fallback with the same bounded options. Present the options as a
+short numbered list, mark the first option as the default, and ask the user to
+enter the exact option label or number. Pressing Enter selects the default.
+Keep `Let's discuss` as the final option.
 
 ## Existing Project Directory
 

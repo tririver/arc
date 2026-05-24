@@ -11,6 +11,7 @@ import jsonschema
 
 ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "skills/arc/references/research-workflows"
+SKILL = ROOT / "skills/arc"
 
 
 def test_research_calculation_workflow_files_exist() -> None:
@@ -250,3 +251,68 @@ def test_packaged_workflow_copies_match_source() -> None:
         assert (packaged / script).read_text(encoding="utf-8") == (WF / script).read_text(
             encoding="utf-8"
         )
+
+
+def test_packaged_skill_references_include_required_workflow_inputs() -> None:
+    required = [
+        Path("references/research-workflows/build-domain.md"),
+        Path("references/research-workflows/suggest-ideas.md"),
+        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
+        Path("references/package-manuals/arc-domain.md"),
+        Path("references/package-manuals/arc-llm.md"),
+        Path("references/package-manuals/arc-mcp.md"),
+        Path("references/package-manuals/arc-paper.md"),
+    ]
+
+    for host in ["codex", "claude"]:
+        packaged_skill = ROOT / f"packaging/{host}/arc/skills/arc"
+        for relative in required:
+            assert (packaged_skill / relative).is_file()
+
+
+def test_packaged_skill_references_stay_synced_with_source() -> None:
+    synced_roots = [
+        Path("SKILL.md"),
+        Path("references/package-manuals"),
+        Path("references/research-workflows/build-domain.md"),
+        Path("references/research-workflows/suggest-ideas.md"),
+        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
+    ]
+
+    expected_files: list[Path] = []
+    for relative in synced_roots:
+        source = SKILL / relative
+        if source.is_dir():
+            expected_files.extend(path.relative_to(SKILL) for path in source.glob("*"))
+        else:
+            expected_files.append(relative)
+
+    for host in ["codex", "claude"]:
+        packaged_skill = ROOT / f"packaging/{host}/arc/skills/arc"
+        for relative in expected_files:
+            assert (packaged_skill / relative).read_text(encoding="utf-8") == (
+                SKILL / relative
+            ).read_text(encoding="utf-8")
+
+
+def test_adapter_scripts_use_installed_arc_mcp_without_repo_local_defaults() -> None:
+    for host in ["codex", "claude"]:
+        script = ROOT / f"packaging/{host}/arc/scripts/arc-mcp-{host}"
+        text = script.read_text(encoding="utf-8")
+
+        assert "/arc-dev" not in text
+        assert ".venv/bin/arc-mcp" not in text
+        assert "ARC_PAPER_CACHE" not in text
+        assert "ARC_DOMAIN_CACHE" not in text
+        assert 'exec arc-mcp "$@"' in text
+
+
+def test_interaction_reference_allows_portable_typed_fallback() -> None:
+    text = (ROOT / "skills/arc/references/rules/interaction.md").read_text(encoding="utf-8").lower()
+
+    assert "typed fallback" in text
+    assert "when no discrete selection" in text or "if no discrete selection" in text
+    assert "enter the exact option label" in text
+    assert "cannot present the required selection ui" not in text

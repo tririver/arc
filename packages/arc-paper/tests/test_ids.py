@@ -23,6 +23,12 @@ def test_arxiv_path_id_rejects_non_arxiv():
     assert arxiv_path_id("doi:10.1000/example") == ""
 
 
+def test_arxiv_path_id_rejects_invalid_arxiv_like_ids():
+    assert arxiv_path_id("arXiv:not-a-paper") == ""
+    assert arxiv_path_id("https://arxiv.org/abs/foo/1234567") == ""
+    assert normalize_paper_id("https://arxiv.org/abs/foo/1234567") == "https://arxiv.org/abs/foo/1234567"
+
+
 def test_normalize_inspire_recid():
     assert normalize_paper_id("recid:154280") == "inspire:154280"
     assert normalize_paper_id("inspire:154280") == "inspire:154280"

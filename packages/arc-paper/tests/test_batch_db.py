@@ -24,3 +24,17 @@ def test_mark_status_and_retry_failed(monkeypatch, tmp_path):
 
     db.retry_failed("qft")
     assert db.status_counts("qft") == {"queued": 1}
+
+
+def test_create_batch_replaces_existing_items(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    db = BatchDB.default()
+    db.create_batch("qft", ["0911.3380"], "paper-summary-v1")
+    db.mark_status("qft", "0911.3380", "done", summary_path="/tmp/old.json")
+
+    db.create_batch("qft", ["hep-th/0601001"], "paper-summary-v1")
+
+    assert db.status_counts("qft") == {"queued": 1}
+    assert [item.paper_id for item in db.next_items("qft", status="queued", limit=10)] == [
+        "arXiv:hep-th/0601001"
+    ]

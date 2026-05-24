@@ -41,10 +41,11 @@ class BatchDB:
                 "INSERT OR REPLACE INTO batches(name, created_at, prompt_version) VALUES (?, ?, ?)",
                 (name, now, prompt_version),
             )
+            conn.execute("DELETE FROM batch_items WHERE batch_name = ?", (name,))
             for paper_id in unique:
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO batch_items(
+                    INSERT INTO batch_items(
                       batch_name, paper_id, status, attempts, updated_at
                     ) VALUES (?, ?, 'queued', 0, ?)
                     """,

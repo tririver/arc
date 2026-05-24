@@ -1,38 +1,34 @@
-# Suggest Ideas Workflow
+# Suggest Ideas No-Info Workflow
 
-Use this workflow to run ARC idea-generation loops from project-local domain
-context. The loop execution is owned by `arc-llm`; this skill prepares
-caller-specific prompts, permissions, and artifacts.
+Use this workflow to run a comparison idea-generation loop where proposers get
+only the user's exact intent and internet access. This is an ablation of
+`suggest-ideas.md`: do not feed proposers ARC domain Markdown files, ARC paper
+tool guidance, local paper-cache context, or MCP access. Keep the reviewer
+configuration the same as the normal idea workflow.
 
 ## Inputs
 
-Read `<project-dir>/context.json`. Use the exact `user_intent` and existing
-domain artifact paths from the project. Do not substitute a paraphrased
-research goal into idea prompts.
+Read `<project-dir>/context.json`. Use the exact `user_intent`. Do not
+substitute a paraphrased research goal into idea prompts.
 
-### Phase 1: Ensure Domain Context
-
-Step 1: Complete Case 1 (building domain references with
-`references/research-workflows/build-domain.md`) before Case 2 (suggesting
-research ideas from a not-yet-explicit request).
-
-Step 2: Verify that `<project-dir>/domain/` contains the domain summaries and
-foundation summaries produced by the domain workflow. At least one
-`<project-dir>/domain/**/*.md` file must be present. If a domain artifact is
-missing, print `WARNING:` and stop before idea generation.
-
-### Phase 2: Prepare Idea Loop Config
+### Phase 1: Prepare Comparison Run
 
 Step 1: Create `<project-dir>/suggest-ideas/`.
 
-Step 2: Choose a filesystem-safe `<run-id>` for this idea run. The run
-directory must be:
+Step 2: Choose a filesystem-safe `<run-id>` that makes the ablation clear, for
+example `no_info_<timestamp>`. The run directory must be:
 
 ```text
 <project-dir>/suggest-ideas/<run-id>/
 ```
 
-Step 3: Write an `arc-llm` proposers-reviewer-loop config JSON to:
+Step 3: Do not require or attach `<project-dir>/domain/**/*.md` files for this
+workflow. The point of this comparison is to withhold ARC-built domain context
+from proposers.
+
+### Phase 2: Prepare Idea Loop Config
+
+Step 1: Write an `arc-llm` proposers-reviewer-loop config JSON to:
 
 ```text
 <project-dir>/suggest-ideas/<run-id>.config.json
@@ -53,14 +49,14 @@ Use this package-level structure:
 }
 ```
 
-Step 4: Add the requested number of independent loops. Run `5` loops and keep `max_concurrent_loops=10`.
+Step 2: Add the requested number of independent loops. Run `5` loops and keep `max_concurrent_loops=10`.
 Keep `artifact_options.save_prompts=true` for debugging unless the project
 context explicitly disables prompt artifacts.
 
-Attach all Markdown files under `<project-dir>/domain/` to `caller_context`,
-including all reports and summaries from multiple built domains. Sort them by
-relative path and include their full Markdown text. Do not attach HTML, JSON,
-logs, lock files, cache files, transcripts, or unrelated project notes.
+Do not attach Markdown files under `<project-dir>/domain/` to
+`caller_context`. Do not attach ARC-generated reports, paper summaries, paper
+tool notes, local paper-cache guidance, logs, transcripts, or unrelated project
+notes.
 
 Each loop must set:
 
@@ -72,31 +68,23 @@ Each loop must set:
     "enabled": false
   },
   "caller_context": {
-    "user_intent": "<user_intent>",
-    "domain_markdown_files": [
-      {
-        "path": "domain/<relative-path>.md",
-        "content": "<full markdown text>"
-      }
-    ],
-    "arc_paper_tool_notes": "ARC paper MCP tools are available. ARC's local paper database can provide deeper paper metadata, sections, cached full text, references, citers, equation context, and domain context than a web snippet. Use these tools before internet search when checking papers, citations, references, sections, cached full-text terms, equation context, or nearby literature. Especially use search_full_text to search cached ar5iv full text for relevant words or phrases. Example MCP call: search_full_text(paper_id=\"<paper-id>\", query=\"<phrase>\", context=1, limit=10). CLI equivalent: arc-paper search-full-text <paper-id> --query \"<phrase>\" --context 1 --limit 10 --json. Useful paper tools include get_metadata, get_abstract, get_references, get_citers, get_citer_count, get_toc, get_section, search_full_text, get_equation_context, llm_get_summary, and llm_generate_summary. Still use internet search to catch uncached, very recent, or non-arXiv public evidence before judging novelty. For CLI usage, run arc-paper <command> --help; for MCP usage, read the host-provided tool descriptions and input schema."
+    "user_intent": "<user_intent>"
   },
   "proposers": [],
   "reviewers": []
 }
 ```
 
-Step 5: Configure one proposer per idea loop for the current idea workflow.
-The proposer must receive the user's exact intent, attached domain Markdown
-files, ARC paper-tool guidance, ARC-only MCP permission, and internet
-permission:
+Step 3: Configure one proposer per idea loop for the no-info comparison
+workflow. The proposer must receive only the user's exact intent, full prior
+correspondence, internet permission, and no MCP permission:
 
 ```json
 {
   "id": "proposer_001",
   "prompt": {
     "system": "You are a theoretical-physics researcher proposing one concrete, calculable research idea.",
-    "template": "Use the exact user_intent, domain_markdown_files, arc_paper_tool_notes, and full prior correspondence below. Propose or revise exactly one idea for the user's intent. Before finalizing, run a focused novelty-scouting pass: use ARC paper tools before internet search on the most likely overlapping domain sources, use search_full_text for cached ar5iv full-text checks, and use internet search for uncached, very recent, or non-arXiv public evidence. Record each check with the source, query or lookup, and short result. If related work is close, state the overlap and what remains different or missing. Make the first calculation concrete: state the object to compute, setup and assumptions, main calculational route, expected deliverable, and validation or comparison checks using relevant known limits, benchmarks, special cases, or adjacent results. Cite source locations such as sections or equations when available."
+    "template": "Use only the exact user_intent and full prior correspondence below. Do not use ARC-built domain summaries, ARC paper tools, local paper caches, or MCP tools. You may use internet search. Propose or revise exactly one idea for the user's intent. Before finalizing, run a focused novelty-scouting pass using internet search for public evidence. Record each check with the source, query or lookup, and short result. If related work is close, state the overlap and what remains different or missing. Make the first calculation concrete: state the object to compute, setup and assumptions, main calculational route, expected deliverable, and validation or comparison checks using relevant known limits, benchmarks, special cases, or adjacent results. Cite source locations when available."
   },
   "output_schema": {
     "type": "object",
@@ -145,14 +133,13 @@ permission:
   },
   "runtime": {
     "allow_internet": true,
-    "allow_mcp": true,
-    "mcp_mode": "arc-only",
+    "allow_mcp": false,
     "codex_sandbox": "read-only"
   }
 }
 ```
 
-Step 6: Configure exactly one reviewer per loop. Set `output_schema` to the
+Step 4: Configure exactly one reviewer per loop. Set `output_schema` to the
 JSON object in
 `references/research-workflows/suggest-ideas-reviewer-output.schema.json`. The
 written config must contain the schema object, not the placeholder string below.

@@ -84,3 +84,18 @@ If the idea is explicit enough:
 Step 1: Read and execute `references/research-workflows/research-plan.md`.
 Step 2: Read and execute `references/research-workflows/research-foundation.md`.
 Step 3: Read and execute `references/research-workflows/research-execute.md`.
+
+### Phase 3: Self-Reflection
+
+Before marking any ARC workflow complete, append a self-reflection entry to
+`<project-dir>/self-reflect.md`. Use this file name because the step records
+after-action reflection, not only optional suggestions.
+
+Include concrete, portable improvement suggestions when the run reveals a
+workflow, prompt, package, documentation, cache, or test weakness. Make each
+suggestion actionable: affected file or phase, evidence from the run, exact
+command or edit to try, and an acceptance check.
+
+If no concrete improvement was found, still append a dated entry saying that no
+actionable ARC improvement was identified for this run. The workflow is not
+complete until this append step is done.

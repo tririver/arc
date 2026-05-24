@@ -144,14 +144,21 @@ def build_network(
 
 
 def _merged_citers(foundation_id: str, *, refresh: bool, limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
     recent = paper.citers(foundation_id, refresh=refresh, limit=limit, sort="mostrecent")
     cited = paper.citers(foundation_id, refresh=refresh, limit=limit, sort="mostcited")
     merged: dict[str, dict[str, Any]] = {}
+    source_ids: dict[str, list[str]] = {"mostrecent": [], "mostcited": []}
     for source, items in (("mostrecent", recent), ("mostcited", cited)):
+        seen_in_source: set[str] = set()
         for index, item in enumerate(items):
             paper_id = normalize_paper_id(paper_key(item))
             if not paper_id or paper_id == foundation_id:
                 continue
+            if paper_id not in seen_in_source:
+                source_ids[source].append(paper_id)
+                seen_in_source.add(paper_id)
             record = dict(item)
             record["paper_id"] = paper_id
             record.setdefault("citer_sources", [])
@@ -160,13 +167,35 @@ def _merged_citers(foundation_id: str, *, refresh: bool, limit: int) -> list[dic
             record[f"{source}_rank"] = index + 1
             if paper_id in merged:
                 existing = merged[paper_id]
-                existing.update({key: value for key, value in record.items() if value not in ("", None, [])})
-                existing["citer_sources"] = sorted(set(existing.get("citer_sources", [])) | set(record["citer_sources"]))
+                existing.update(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key != "citer_sources" and value not in ("", None, [])
+                    }
+                )
+                for label in record["citer_sources"]:
+                    if label not in existing["citer_sources"]:
+                        existing["citer_sources"].append(label)
             else:
                 merged[paper_id] = record
-            if len(merged) >= limit:
-                break
-    return list(merged.values())[:limit]
+
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    max_source_len = max((len(ids) for ids in source_ids.values()), default=0)
+    for index in range(max_source_len):
+        for source in ("mostrecent", "mostcited"):
+            ids = source_ids[source]
+            if index >= len(ids):
+                continue
+            paper_id = ids[index]
+            if paper_id in seen:
+                continue
+            ordered.append(merged[paper_id])
+            seen.add(paper_id)
+            if len(ordered) >= limit:
+                return ordered
+    return ordered
 
 
 def _rank_by_intent(

@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export ARC_AGENT_HOST=codex
+export ARC_AGENT_HOST="${ARC_AGENT_HOST:-codex}"
 export ARC_LLM_PROVIDER="${ARC_LLM_PROVIDER:-codex-cli}"
 export ARC_CODEX_MODEL="${ARC_CODEX_MODEL:-gpt-5.4-mini}"
-export ARC_PAPER_CACHE="${ARC_PAPER_CACHE:-/arc-dev/cache/arc-paper}"
-export ARC_DOMAIN_CACHE="${ARC_DOMAIN_CACHE:-/arc-dev/cache/arc-domain}"
 
 if [[ -n "${ARC_MCP_COMMAND:-}" ]]; then
   exec "${ARC_MCP_COMMAND}" "$@"
-elif [[ -x /arc-dev/packages/arc-paper/.venv/bin/arc-mcp ]]; then
-  exec /arc-dev/packages/arc-paper/.venv/bin/arc-mcp "$@"
 else
   exec arc-mcp "$@"
 fi

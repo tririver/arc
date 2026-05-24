@@ -6,6 +6,7 @@ import json
 import pytest
 
 from arc_llm.proposers_reviewer.config import ConfigError, load_batch_config, worker_env
+from arc_llm.proposers_reviewer.prompts import render_prompt, reviewer_context
 
 
 def minimal_config() -> dict:
@@ -203,3 +204,33 @@ def test_invalid_model_tier_fails():
 
     with pytest.raises(ConfigError, match="model_tier must be one of"):
         load_batch_config(payload)
+
+
+def test_worker_runtime_can_disable_appended_full_context():
+    payload = minimal_config()
+    payload["loops"][0]["caller_context"] = {
+        "user_intent": "test intent",
+        "domain_markdown_files": [{"path": "domain/report.md", "content": "domain text"}],
+    }
+    reviewer_payload = payload["loops"][0]["reviewers"][0]
+    reviewer_payload["runtime"]["append_context"] = False
+    reviewer_payload["prompt"]["template"] = (
+        "review only this\n{current_proposer_outputs_json}\n{correspondence_json}"
+    )
+    config = load_batch_config(payload)
+    loop = config.loops[0]
+    reviewer = loop.reviewers[0]
+    context = reviewer_context(
+        loop=loop,
+        worker=reviewer,
+        round_number=1,
+        correspondence=[],
+        current_proposer_outputs={"proposer_001": {"title": "visible idea"}},
+    )
+
+    prompt = render_prompt(reviewer, context)
+
+    assert "visible idea" in prompt
+    assert "domain_markdown_files" not in prompt
+    assert "domain text" not in prompt
+    assert "## ARC Worker Context" not in prompt

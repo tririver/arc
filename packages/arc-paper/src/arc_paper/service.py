@@ -389,10 +389,11 @@ def _full_text_paper_id(paper_id: str, *, refresh: bool) -> str:
 
 def _summary_status(paper_id: str, *, refresh: bool) -> dict[str, Any]:
     task = _build_summary_task(paper_id, refresh=refresh)
+    summary_paper_id = str(task["input_pack"]["paper_id"])
     source_hash = task["input_pack"]["source_hash"]
-    if not refresh and (cached := read_summary(paper_id, source_hash=source_hash)):
+    if not refresh and (cached := read_summary(summary_paper_id, source_hash=source_hash)):
         return ok(cached, provider="local-cache", cache="hit")
-    return _needs_llm(paper_id, task)
+    return _needs_llm(summary_paper_id, task)
 
 
 def _get_or_generate_summary_one(
@@ -449,7 +450,8 @@ def _generate_from_status(
         return status
     try:
         summary = selected.generate_summary(status["llm_task"], model=model, progress_callback=progress_callback)
-        path = store_summary(paper_id, summary)
+        summary_paper_id = str(status.get("paper_id") or paper_id)
+        path = store_summary(summary_paper_id, summary)
     except Exception as exc:
         return err("summary_generation_failed", str(exc))
     return ok(summary, provider=selected.name, cache="write", summary_path=str(path))
@@ -457,9 +459,10 @@ def _generate_from_status(
 
 def _build_summary_task(paper_id: str, *, refresh: bool) -> dict[str, Any]:
     metadata = _inspire.get_metadata(paper_id, refresh=refresh)
-    parsed = _parsed(paper_id, refresh=refresh)
+    summary_paper_id = _summary_paper_id(paper_id, metadata)
+    parsed = _parsed(summary_paper_id, refresh=refresh)
     input_pack = build_input_pack(
-        paper_id,
+        summary_paper_id,
         metadata=metadata,
         parsed=parsed,
     )
@@ -486,6 +489,14 @@ def _needs_llm(paper_id: str, task: dict[str, Any]) -> dict[str, Any]:
             "store_command": f"arc-paper store-llm-summary {normalized} --summary-json -"
         },
     }
+
+
+def _summary_paper_id(requested_id: str, metadata: dict[str, Any]) -> str:
+    if metadata_id := normalize_paper_id(str(metadata.get("paper_id") or "")):
+        return metadata_id
+    if arxiv_id := arxiv_path_id(str(metadata.get("arxiv_id") or "")):
+        return normalize_paper_id(f"arXiv:{arxiv_id}")
+    return normalize_paper_id(requested_id)
 
 
 def _map(ids: str | Iterable[str], func: Callable[[str], dict[str, Any]]):

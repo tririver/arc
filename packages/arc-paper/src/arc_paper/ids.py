@@ -14,7 +14,8 @@ OLD_STYLE_ARXIV_RE = re.compile(
     re.IGNORECASE,
 )
 ARXIV_URL_RE = re.compile(
-    r"arxiv\.org/(?:abs|pdf)/((?:\d{4}\.\d{4,5})|(?:[a-z-]+/\d{7}))(?:v\d+)?",
+    rf"\b(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/"
+    rf"((?:\d{{4}}\.\d{{4,5}})|(?:{ARXIV_ARCHIVE_PATTERN}/\d{{7}}))(?:v\d+)?(?:\.pdf)?",
     re.IGNORECASE,
 )
 ARXIV_URL_EXTRACT_RE = re.compile(
@@ -54,14 +55,8 @@ def normalize_paper_id(identifier: str) -> str:
     if not text:
         return ""
 
-    if match := ARXIV_URL_RE.search(text):
-        return f"arXiv:{match.group(1)}"
-    if match := NEW_STYLE_ARXIV_RE.match(text):
-        return f"arXiv:{match.group(1)}"
-    if match := OLD_STYLE_ARXIV_RE.match(text):
-        return f"arXiv:{match.group(1)}"
-    if text.lower().startswith("arxiv:"):
-        return "arXiv:" + _strip_version(text.split(":", 1)[1])
+    if arxiv_id := _normalized_arxiv_id(text):
+        return f"arXiv:{arxiv_id}"
     if match := INSPIRE_RECID_RE.match(text):
         return f"inspire:{match.group(1)}"
     if match := DOI_ID_RE.match(text):
@@ -70,10 +65,7 @@ def normalize_paper_id(identifier: str) -> str:
 
 
 def arxiv_path_id(identifier: str) -> str:
-    normalized = normalize_paper_id(identifier)
-    if not normalized.startswith("arXiv:"):
-        return ""
-    return normalized.split(":", 1)[1]
+    return _normalized_arxiv_id(identifier)
 
 
 def inspire_recid(identifier: str) -> str:
@@ -134,6 +126,19 @@ def extract_paper_ids(text: str) -> list[str]:
 
 def _strip_version(arxiv_id: str) -> str:
     return re.sub(r"v\d+$", "", arxiv_id.strip(), flags=re.IGNORECASE)
+
+
+def _normalized_arxiv_id(identifier: str) -> str:
+    text = (identifier or "").strip()
+    if not text:
+        return ""
+    if match := ARXIV_URL_RE.search(text):
+        return match.group(1)
+    if match := NEW_STYLE_ARXIV_RE.match(text):
+        return match.group(1)
+    if match := OLD_STYLE_ARXIV_RE.match(text):
+        return match.group(1)
+    return ""
 
 
 def _normalize_doi(value: str) -> str:

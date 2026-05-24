@@ -6,6 +6,8 @@ import hashlib
 from collections import Counter
 from typing import Iterable
 
+from arc_paper.ids import arxiv_path_id, doi_value, inspire_recid, normalize_paper_id
+
 
 STOPWORDS = {
     "the", "and", "for", "with", "from", "into", "that", "this", "their",
@@ -50,15 +52,39 @@ def deterministic_sample(items: list[dict], *, count: int, seed: str) -> list[di
 
 
 def paper_key(paper: dict) -> str:
-    return str(
-        paper.get("paper_id")
-        or paper.get("id")
-        or (paper.get("identifiers") or {}).get("paper_id")
-        or (paper.get("identifiers") or {}).get("arxiv")
-        or (paper.get("identifiers") or {}).get("inspire")
-        or paper.get("title")
-        or ""
-    )
+    identifiers = paper.get("identifiers") or {}
+    for value in (
+        paper.get("paper_id"),
+        paper.get("id"),
+        _prefixed_identifier("arXiv", paper.get("arxiv_id") or paper.get("arxiv")),
+        _prefixed_identifier("inspire", paper.get("inspire_recid")),
+        paper.get("doi"),
+        identifiers.get("paper_id"),
+        _prefixed_identifier("arXiv", identifiers.get("arxiv_id") or identifiers.get("arxiv")),
+        _prefixed_identifier("inspire", identifiers.get("inspire")),
+        _prefixed_identifier("inspire", identifiers.get("inspire_recid")),
+        identifiers.get("doi"),
+    ):
+        stable_id = stable_paper_id(value)
+        if stable_id:
+            return stable_id
+    return ""
+
+
+def stable_paper_id(identifier: object) -> str:
+    if identifier is None:
+        return ""
+    normalized = normalize_paper_id(str(identifier))
+    if arxiv_path_id(normalized) or doi_value(normalized) or inspire_recid(normalized):
+        return normalized
+    return ""
+
+
+def _prefixed_identifier(prefix: str, value: object) -> str:
+    text = str(value or "").strip()
+    if not text or ":" in text:
+        return text
+    return f"{prefix}:{text}"
 
 
 def normalize_authors(authors: Iterable[str] | None, *, limit: int = 5) -> str:

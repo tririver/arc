@@ -223,6 +223,60 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "background" in by_name["llm_domain_get_summary"].inputSchema["properties"]
     assert "background" in by_name["llm_domain_get_graph"].inputSchema["properties"]
     assert "background" in by_name["llm_summary_batch_run"].inputSchema["properties"]
+    assert "summary_batch_create" in by_name
+    assert "summary_batch_prefetch" in by_name
+    assert "summary_batch_status" in by_name
+    assert "summary_batch_export" in by_name
+    assert "summary_batch_retry_failed" in by_name
+    provider_description = by_name["llm_generate_summary"].inputSchema["properties"]["provider"]["description"]
+    assert "configured provider id" in provider_description
+
+
+def test_call_tool_dispatches_summary_batch_tools(monkeypatch, tmp_path):
+    papers_file = tmp_path / "papers.txt"
+    papers_file.write_text("0911.3380\n# comment\nastro-ph/0610514\n", encoding="utf-8")
+    output_file = tmp_path / "summaries.jsonl"
+    created = {}
+
+    class FakeBatchDB:
+        @classmethod
+        def default(cls):
+            return cls()
+
+        def create_batch(self, name, paper_ids, prompt_version):
+            created["create"] = {
+                "name": name,
+                "paper_ids": paper_ids,
+                "prompt_version": prompt_version,
+            }
+
+        def status_counts(self, name):
+            return {"queued": 2, "name": name}
+
+        def retry_failed(self, name):
+            created["retry_failed"] = name
+
+    monkeypatch.setattr(server, "BatchDB", FakeBatchDB)
+    monkeypatch.setattr(server, "prefetch_batch", lambda name, workers=4: {"name": name, "workers": workers})
+    monkeypatch.setattr(server, "export_batch", lambda name, output: {"name": name, "output": str(output)})
+
+    create = server.call_tool(
+        "summary_batch_create",
+        {"name": "batch-a", "papers_file": str(papers_file), "prompt_version": "paper-summary-v2"},
+    )
+    prefetch = server.call_tool("summary_batch_prefetch", {"name": "batch-a", "workers": 3})
+    status = server.call_tool("summary_batch_status", {"name": "batch-a"})
+    export = server.call_tool("summary_batch_export", {"name": "batch-a", "output": str(output_file)})
+    retry = server.call_tool("summary_batch_retry_failed", {"name": "batch-a"})
+
+    assert create["ok"] is True
+    assert created["create"]["paper_ids"] == ["0911.3380", "astro-ph/0610514"]
+    assert created["create"]["prompt_version"] == "paper-summary-v2"
+    assert prefetch["data"] == {"name": "batch-a", "workers": 3}
+    assert status["data"]["counts"] == {"queued": 2, "name": "batch-a"}
+    assert export["data"] == {"name": "batch-a", "output": str(output_file)}
+    assert retry["data"]["counts"] == {"queued": 2, "name": "batch-a"}
+    assert created["retry_failed"] == "batch-a"
 
 
 def test_get_llm_summary_starts_background_job_when_uncached(monkeypatch):

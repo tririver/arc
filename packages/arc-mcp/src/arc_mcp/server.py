@@ -52,7 +52,7 @@ DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific inter
 DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by llm_domain_build or arc-domain init."
 CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIRE, clamped to 1..1000."
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
-LLM_PROVIDER_DESCRIPTION = "LLM provider: auto, codex-cli, claude-cli, or manual."
+LLM_PROVIDER_DESCRIPTION = "LLM provider: auto, a built-in provider (codex-cli, claude-cli, manual), or a configured provider id."
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
 BACKGROUND_DESCRIPTION = (
     "When true, start the job and return a background job id immediately instead of waiting inline."
@@ -170,7 +170,12 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "domain_get_graph": lambda args: _domain_artifact(args, artifact="graph"),
     "llm_domain_get_summary": lambda args: _domain_artifact_or_start(args, artifact="summary"),
     "llm_domain_get_graph": lambda args: _domain_artifact_or_start(args, artifact="graph"),
+    "summary_batch_create": lambda args: _summary_batch_create_response(args),
+    "summary_batch_prefetch": lambda args: _summary_batch_prefetch_response(args),
     "llm_summary_batch_run": lambda args: _run_summary_batch_inline(args),
+    "summary_batch_status": lambda args: _summary_batch_status_response(args),
+    "summary_batch_export": lambda args: _summary_batch_export_response(args),
+    "summary_batch_retry_failed": lambda args: _summary_batch_retry_failed_response(args),
 }
 
 
@@ -467,6 +472,47 @@ def _run_summary_batch_job(
     result = run_batch(name, provider=provider, model=model, concurrency=concurrency, max_items=max_items)
     progress({"event": "summary_batch_completed", "name": name})
     return {"ok": True, "data": result, "errors": [], "meta": {}}
+
+
+def _summary_batch_create_response(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args["name"])
+    prompt_version = str(args.get("prompt_version", "paper-summary-v1"))
+    db = BatchDB.default()
+    with open(str(args["papers_file"]), encoding="utf-8") as handle:
+        paper_ids = [line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")]
+    db.create_batch(name, paper_ids, prompt_version)
+    return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+
+
+def _summary_batch_prefetch_response(args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": prefetch_batch(str(args["name"]), workers=int(args.get("workers", 4))),
+        "errors": [],
+        "meta": {},
+    }
+
+
+def _summary_batch_status_response(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args["name"])
+    db = BatchDB.default()
+    return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+
+
+def _summary_batch_export_response(args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": export_batch(str(args["name"]), output=Path(str(args["output"]))),
+        "errors": [],
+        "meta": {},
+    }
+
+
+def _summary_batch_retry_failed_response(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args["name"])
+    db = BatchDB.default()
+    db.retry_failed(name)
+    return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
 
 
 def _wait_or_background(
@@ -879,11 +925,9 @@ def _register_tools(app: Any) -> None:
         name: BatchName,
         prompt_version: Annotated[str, Field(description="Summary prompt/schema version to use.")] = "paper-summary-v1",
     ) -> Any:
-        db = BatchDB.default()
-        with open(papers_file, encoding="utf-8") as handle:
-            paper_ids = [line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")]
-        db.create_batch(name, paper_ids, prompt_version)
-        return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+        return _summary_batch_create_response(
+            {"name": name, "papers_file": papers_file, "prompt_version": prompt_version}
+        )
 
     @app.tool(
         description=(
@@ -895,7 +939,7 @@ def _register_tools(app: Any) -> None:
         name: BatchName,
         workers: Annotated[int, Field(description="Number of parallel prefetch worker threads.")] = 4,
     ) -> Any:
-        return {"ok": True, "data": prefetch_batch(name, workers=workers), "errors": [], "meta": {}}
+        return _summary_batch_prefetch_response({"name": name, "workers": workers})
 
     @app.tool(
         name="llm_summary_batch_run",
@@ -925,21 +969,18 @@ def _register_tools(app: Any) -> None:
 
     @app.tool(description="Get status counts for a resumable paper-summary batch.")
     def summary_batch_status(name: BatchName) -> Any:
-        db = BatchDB.default()
-        return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+        return _summary_batch_status_response({"name": name})
 
     @app.tool(description="Export completed paper summaries from a batch to a JSONL file.")
     def summary_batch_export(
         name: BatchName,
         output: Annotated[str, Field(description="Output path for exported JSONL summaries.")],
     ) -> Any:
-        return {"ok": True, "data": export_batch(name, output=Path(output)), "errors": [], "meta": {}}
+        return _summary_batch_export_response({"name": name, "output": output})
 
     @app.tool(description="Move failed items in a paper-summary batch back to queued status for retry.")
     def summary_batch_retry_failed(name: BatchName) -> Any:
-        db = BatchDB.default()
-        db.retry_failed(name)
-        return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
+        return _summary_batch_retry_failed_response({"name": name})
 
     @app.tool(description="Diagnose which coding-agent host ARC detected, such as Codex or Claude Code.")
     def doctor_host() -> Any:

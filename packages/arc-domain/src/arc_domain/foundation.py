@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import Any
 
 from arc_llm import run_json
@@ -11,7 +12,20 @@ from .cache import DomainPaths, now_iso, update_status, write_json
 from .text import deterministic_sample, normalize_authors, paper_key, token_overlap_score
 
 
-MIN_FOUNDATION_CITATION_COUNT = 100
+@dataclass(frozen=True)
+class FoundationHeuristics:
+    """Configurable foundation-selection heuristics.
+
+    min_citation_count is a prioritization threshold, not an exclusion rule.
+    Lower-citation candidates remain eligible when they are the best same-scope
+    foundation in the supplied evidence.
+    """
+
+    min_citation_count: int = 100
+
+
+DEFAULT_FOUNDATION_HEURISTICS = FoundationHeuristics()
+MIN_FOUNDATION_CITATION_COUNT = DEFAULT_FOUNDATION_HEURISTICS.min_citation_count
 
 
 FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
@@ -82,6 +96,7 @@ def identify_foundation(
     workers: int = 8,
     newest_citer_count: int = 50,
     witness_size: int = 60,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
 ) -> dict[str, Any]:
     seed_id = normalize_paper_id(seed_paper)
     update_status(paths, stage="foundation_started", seed_paper=seed_id, intent=intent)
@@ -116,6 +131,7 @@ def identify_foundation(
         intent=intent,
         refresh=refresh,
         workers=workers,
+        min_citation_count=min_citation_count,
     )
     pool = {
         "schema_version": "arc.domain_foundation_pool.v1",
@@ -138,6 +154,7 @@ def identify_foundation(
         intent=intent,
         provider=provider,
         model=model,
+        min_citation_count=min_citation_count,
     )
     selection["seed_paper"] = seed_id
     selection["intent"] = intent
@@ -168,6 +185,7 @@ def _candidate_records(
     intent: str,
     refresh: bool,
     workers: int,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
 ) -> list[dict[str, Any]]:
     overlap = Counter()
     support: dict[str, list[str]] = defaultdict(list)
@@ -240,7 +258,7 @@ def _candidate_records(
             record["source_role"] = "seed_reference"
         else:
             record["source_role"] = "common_reference"
-        if citation_count < MIN_FOUNDATION_CITATION_COUNT:
+        if citation_count < min_citation_count:
             record["warnings"].append("low_citation_foundation_priority")
         if citation_count >= 1000:
             record["warnings"].append("high_citation_parent_domain_risk")
@@ -255,24 +273,40 @@ def _llm_select_foundation(
     intent: str,
     provider: str,
     model: str | None,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
 ) -> dict[str, Any]:
-    prompt = _foundation_prompt(seed_metadata=seed_metadata, candidates=candidates, intent=intent)
+    prompt = _foundation_prompt(
+        seed_metadata=seed_metadata,
+        candidates=candidates,
+        intent=intent,
+        min_citation_count=min_citation_count,
+    )
     try:
         selection = run_json(prompt, schema=FOUNDATION_SELECTION_SCHEMA, provider=provider, model=model)
         return _repair_selection(selection, candidates, method="llm")
     except Exception as exc:
-        selection = _deterministic_selection(candidates, intent=intent)
+        selection = _deterministic_selection(
+            candidates,
+            intent=intent,
+            min_citation_count=min_citation_count,
+        )
         selection["warnings"].append(f"llm_selection_failed:{exc}")
         return selection
 
 
-def _foundation_prompt(*, seed_metadata: dict[str, Any], candidates: list[dict[str, Any]], intent: str) -> str:
+def _foundation_prompt(
+    *,
+    seed_metadata: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    intent: str,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
+) -> str:
     return "\n\n".join(
         [
             "You are selecting the foundation paper for a theoretical-physics research domain.",
             "Choose exactly one same-scope foundation paper. If an older high-citation candidate is broader than the user's intent, keep it as a parent foundation rather than the selected foundation.",
             "A parent foundation must be earlier than, or at the latest from the same year as, the selected foundation. A later paper can be a child, extension, or successful descendant, but never a parent foundation.",
-            f"Citation support rule: candidates with fewer than {MIN_FOUNDATION_CITATION_COUNT} citations should normally have low priority as the selected foundation, because there is usually not enough literature built on top of them to define a research field. Select such a candidate only if the supplied candidates contain no better-supported same-scope foundation.",
+            f"Citation support heuristic: candidates with fewer than {min_citation_count} citations should normally have low priority as the selected foundation, because there is usually not enough literature built on top of them to define a research field. Select such a candidate only if the supplied candidates contain no better-supported same-scope foundation.",
             "Use only the supplied candidates. Prefer a candidate that defines the domain represented by the seed paper and its newest citers.",
             f"User intent:\n{intent or '(none)'}",
             f"Seed paper:\n{seed_metadata}",
@@ -282,14 +316,19 @@ def _foundation_prompt(*, seed_metadata: dict[str, Any], candidates: list[dict[s
     )
 
 
-def _deterministic_selection(candidates: list[dict[str, Any]], *, intent: str) -> dict[str, Any]:
+def _deterministic_selection(
+    candidates: list[dict[str, Any]],
+    *,
+    intent: str,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
+) -> dict[str, Any]:
     if not candidates:
         selected = {"paper_id": "", "title": "", "reason": "no candidates were available"}
     else:
         ranked = sorted(
             candidates,
             key=lambda item: (
-                int(item.get("citation_count") or 0) >= MIN_FOUNDATION_CITATION_COUNT,
+                int(item.get("citation_count") or 0) >= min_citation_count,
                 item.get("witness_citation_overlap", 0),
                 item.get("intent_overlap", 0),
                 item.get("citation_count", 0),

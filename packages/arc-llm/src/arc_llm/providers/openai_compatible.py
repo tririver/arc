@@ -43,18 +43,20 @@ class OpenAICompatibleProvider:
         response_format = _response_format(self.config, schema_payload)
         if response_format:
             request["response_format"] = response_format
+        active_json_mode = json_mode
         try:
             content = self._create(request)
         except LLMWorkerError as exc:
             fallback = _response_format_fallback_mode(json_mode, exc)
             if fallback is None:
                 raise
+            active_json_mode = fallback
             content = self._create(_json_request(resolved_model, prompt, fallback, schema=schema_payload))
         payload = self._parse_with_retries(
             content,
             prompt=prompt,
             model=resolved_model,
-            json_mode=json_mode,
+            json_mode=active_json_mode,
             schema=schema_payload,
         )
         if not isinstance(payload, dict):
@@ -198,7 +200,7 @@ def _response_format_for_mode(json_mode: str) -> dict[str, Any] | None:
         return {"type": "json_object"}
     if json_mode == "none":
         return None
-    raise ValueError(f"unsupported fallback json_mode: {json_mode}")
+    raise LLMWorkerError(f"unsupported fallback json_mode: {json_mode}")
 
 
 def _response_format_fallback_mode(json_mode: str, exc: LLMWorkerError) -> str | None:

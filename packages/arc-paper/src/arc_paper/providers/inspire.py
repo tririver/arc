@@ -341,7 +341,7 @@ def _reference_recid(item: dict[str, Any]) -> str:
 
 def _reference_arxiv_id(item: dict[str, Any]) -> str:
     raw = item.get("reference") or item
-    return str(raw.get("arxiv_eprint") or raw.get("arxiv_id") or raw.get("eprint") or "")
+    return _normalize_arxiv_value(raw.get("arxiv_eprint") or raw.get("arxiv_id") or raw.get("eprint") or "")
 
 
 def _references_cache_is_current(cached: Any) -> bool:
@@ -386,9 +386,13 @@ def _first_abstract(metadata: dict[str, Any]) -> str:
 def _first_arxiv_id(metadata: dict[str, Any]) -> str:
     for item in metadata.get("arxiv_eprints") or []:
         value = item.get("value") or item.get("eprint")
-        if value:
-            return str(value)
+        if arxiv_id := _normalize_arxiv_value(value):
+            return arxiv_id
     return ""
+
+
+def _normalize_arxiv_value(value: Any) -> str:
+    return arxiv_path_id(str(value or ""))
 
 
 def _first_doi(metadata: dict[str, Any]) -> str:

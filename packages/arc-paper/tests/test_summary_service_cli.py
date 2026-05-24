@@ -75,6 +75,15 @@ class FakeSummaryProvider:
         return summary
 
 
+class RecordingSummaryProvider(FakeSummaryProvider):
+    def __init__(self):
+        self.tasks = []
+
+    def generate_summary(self, task, *, model=None, progress_callback=None):
+        self.tasks.append(task)
+        return super().generate_summary(task, model=model, progress_callback=progress_callback)
+
+
 class ManualSummaryProvider:
     name = "manual"
 
@@ -106,6 +115,22 @@ def test_get_llm_summary_autogenerates_and_caches(monkeypatch, tmp_path):
     assert result["data"]["title"] == "A Test Paper"
     assert result["meta"]["cache"] == "write"
     assert service.get_llm_summary("0911.3380")["meta"]["cache"] == "hit"
+
+
+def test_get_llm_summary_uses_canonical_cache_key_for_aliases(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    provider = RecordingSummaryProvider()
+    monkeypatch.setattr(service, "select_summary_provider", lambda provider_name: provider)
+
+    result = service.get_llm_summary("inspire:837197")
+
+    assert result["ok"] is True
+    assert result["data"]["paper_id"] == "arXiv:0911.3380"
+    assert provider.tasks[0]["input_pack"]["paper_id"] == "arXiv:0911.3380"
+    assert service.get_llm_summary("0911.3380")["meta"]["cache"] == "hit"
+    assert len(provider.tasks) == 1
 
 
 def test_generate_llm_summary_uses_provider_and_caches(monkeypatch, tmp_path):
