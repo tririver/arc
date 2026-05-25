@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,8 @@ def test_research_ideas_launches_five_report_loops_without_postprocessing(tmp_pa
     }
     assert {loop["max_rounds"] for loop in batch_config["loops"]} == {5}
     assert all(loop["early_stop"]["enabled"] is False for loop in batch_config["loops"])
+    assert all(loop["proposers"][0]["model_tier"] == "medium" for loop in batch_config["loops"])
+    assert all(loop["reviewers"][0]["model_tier"] == "medium" for loop in batch_config["loops"])
     assert all(
         loop["reviewers"][0]["output_schema"]["properties"]["schema_version"]["const"]
         == "arc.llm.review_envelope.v1"
@@ -175,6 +178,83 @@ def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path:
         {"path": "domain/nested/details.md", "content": "# Details\n"},
         {"path": "domain/overview.md", "content": "# Overview\n"},
     ]
+
+
+def test_research_ideas_warns_when_reviewer_tier_is_below_proposer(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    workflow_dir = _workflow_dir_with_reviewer_tier(tmp_path, "low")
+    project_dir = tmp_path / "project"
+    config = {
+        "schema_version": "arc.workflow.research_ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "research-ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(workflow_dir),
+        "variant_glob": "suggest-ideas-no-info.variant.json",
+        "loops_per_variant": 1,
+    }
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        json_runner: Any,
+        base_env: dict[str, str] | None,
+        process_chain: list[str] | None,
+        dry_run: bool = False,
+        max_concurrent_loops: int | None = None,
+    ) -> dict[str, Any]:
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(run_root),
+            "loops": [],
+        }
+
+    result = runner.run_research_ideas(config, batch_runner=fake_batch_runner, base_env={})
+
+    warning = "\n".join(result["warnings"])
+    assert "WARNING: REVIEWER MODEL TIER BELOW PROPOSER" in warning
+    assert "no_info_idea_001" in warning
+    assert "proposer_001=medium" in warning
+    assert "reviewer_001=low" in warning
+    warnings_path = Path(result["warnings_path"])
+    assert warnings_path.is_file()
+    warnings_file = warnings_path.read_text(encoding="utf-8")
+    assert "WARNING: Running 1 variants x 1 proposer-reviewer loops" in warnings_file
+    assert "WARNING: REVIEWER MODEL TIER BELOW PROPOSER" in warnings_file
+
+
+def test_research_ideas_cli_prints_warnings(tmp_path: Path, capsys: Any) -> None:
+    runner = _load_runner_module()
+    workflow_dir = _workflow_dir_with_reviewer_tier(tmp_path, "low")
+    project_dir = tmp_path / "project"
+    config_path = tmp_path / "research_ideas.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.workflow.research_ideas.config.v1",
+                "run_id": "ideas_test",
+                "run_dir": str(project_dir / "research-ideas"),
+                "project_dir": str(project_dir),
+                "user_intent": "intent",
+                "variant_config_dir": str(workflow_dir),
+                "variant_glob": "suggest-ideas-no-info.variant.json",
+                "loops_per_variant": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = runner.main(["--config", str(config_path), "--dry-run"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "WARNING: Running 1 variants x 1 proposer-reviewer loops" in captured.out
+    assert "WARNING: REVIEWER MODEL TIER BELOW PROPOSER" in captured.out
+    assert "no_info_idea_001" in captured.out
 
 
 def test_research_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path: Path) -> None:
@@ -287,3 +367,13 @@ def test_research_ideas_result_includes_round_score_table_from_loop_transcripts(
 
 def _write_jsonl(handle: Any, payload: dict[str, Any]) -> None:
     handle.write(json.dumps(payload) + "\n")
+
+
+def _workflow_dir_with_reviewer_tier(tmp_path: Path, tier: str) -> Path:
+    workflow_dir = tmp_path / "workflow"
+    shutil.copytree(WF, workflow_dir)
+    reviewer_path = workflow_dir / "suggest-ideas-reviewer.template.json"
+    reviewer = json.loads(reviewer_path.read_text(encoding="utf-8"))
+    reviewer["model_tier"] = tier
+    reviewer_path.write_text(json.dumps(reviewer, indent=2), encoding="utf-8")
+    return workflow_dir

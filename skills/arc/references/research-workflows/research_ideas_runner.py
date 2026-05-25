@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from arc_llm.proposers_reviewer.artifacts import atomic_write_json
+from arc_llm.proposers_reviewer.artifacts import atomic_write_json, atomic_write_text
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 
 from research_ideas_config import ConfigError, ResearchIdeasConfig, VariantConfig, load_research_ideas_config
@@ -18,6 +18,7 @@ from research_ideas_marking import load_marking_scheme, marking_scheme_for_conte
 
 JsonRunner = Callable[..., dict[str, Any]]
 BatchRunner = Callable[..., dict[str, Any]]
+MODEL_TIER_RANKS = {"low": 1, "medium": 2, "high": 3}
 
 
 @dataclass(frozen=True)
@@ -44,13 +45,18 @@ def run_research_ideas(
     ideas = _materialize_ideas(research_config)
     batch_config = _loop_batch_config(research_config, ideas, run_root=run_root)
     batch_config_path = run_root / "research_ideas_batch_config.json"
-    warnings = [_concurrency_warning(research_config, len(ideas))]
+    warnings_path = run_root / "research_ideas_warnings.txt"
+    warnings = [
+        _concurrency_warning(research_config, len(ideas)),
+        *_model_tier_warnings(batch_config),
+    ]
 
     if dry_run:
         return _result(
             research_config,
             run_root=run_root,
             batch_config_path=batch_config_path,
+            warnings_path=warnings_path,
             warnings=warnings,
             ideas=ideas,
             batch_result={
@@ -63,6 +69,7 @@ def run_research_ideas(
         )
 
     atomic_write_json(batch_config_path, batch_config)
+    _write_warnings(warnings_path, warnings)
     try:
         batch_result = (batch_runner or run_proposers_reviewer_batch)(
             batch_config,
@@ -87,6 +94,7 @@ def run_research_ideas(
         research_config,
         run_root=run_root,
         batch_config_path=batch_config_path,
+        warnings_path=warnings_path,
         warnings=warnings,
         ideas=ideas,
         batch_result=batch_result,
@@ -98,6 +106,7 @@ def _result(
     *,
     run_root: Path,
     batch_config_path: Path,
+    warnings_path: Path,
     warnings: list[str],
     ideas: list[IdeaPlan],
     batch_result: Mapping[str, Any],
@@ -116,6 +125,7 @@ def _result(
         "max_concurrent_loops": len(ideas),
         "max_concurrent_proposal_calls": len(ideas),
         "batch_config_path": str(batch_config_path),
+        "warnings_path": str(warnings_path),
         "loops": [_loop_summary(idea, batch_run_root=batch_run_root) for idea in ideas],
         "round_score_table": round_score_table,
         "batch_result": dict(batch_result),
@@ -432,6 +442,51 @@ def _concurrency_warning(config: ResearchIdeasConfig, proposal_count: int) -> st
     )
 
 
+def _model_tier_warnings(batch_config: Mapping[str, Any]) -> list[str]:
+    problems: list[str] = []
+    for loop in batch_config.get("loops", []):
+        if not isinstance(loop, Mapping):
+            continue
+        reviewers = loop.get("reviewers")
+        proposers = loop.get("proposers")
+        if not isinstance(reviewers, list) or not reviewers or not isinstance(proposers, list):
+            continue
+        reviewer = reviewers[0]
+        if not isinstance(reviewer, Mapping):
+            continue
+        reviewer_tier = _model_tier_text(reviewer.get("model_tier"))
+        reviewer_rank = MODEL_TIER_RANKS.get(reviewer_tier)
+        if reviewer_rank is None:
+            continue
+        reviewer_id = str(reviewer.get("id") or "reviewer")
+        loop_id = str(loop.get("loop_id") or "loop")
+        for proposer in proposers:
+            if not isinstance(proposer, Mapping):
+                continue
+            proposer_tier = _model_tier_text(proposer.get("model_tier"))
+            proposer_rank = MODEL_TIER_RANKS.get(proposer_tier)
+            if proposer_rank is None or reviewer_rank >= proposer_rank:
+                continue
+            proposer_id = str(proposer.get("id") or "proposer")
+            problems.append(f"{loop_id}: {proposer_id}={proposer_tier} > {reviewer_id}={reviewer_tier}")
+    if not problems:
+        return []
+    return [
+        "WARNING: REVIEWER MODEL TIER BELOW PROPOSER. "
+        "Reviewer feedback may be less useful when the reviewer is configured with a lower model tier than the proposer. "
+        "Affected assignments: "
+        + "; ".join(problems)
+    ]
+
+
+def _model_tier_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _write_warnings(path: Path, warnings: list[str]) -> None:
+    atomic_write_text(path, "\n".join(warnings).rstrip() + "\n")
+
+
 def _domain_markdown_files(domain_dir: Path) -> list[dict[str, str]]:
     if not domain_dir.exists():
         return []
@@ -499,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     else:
+        for warning in result.get("warnings", []):
+            print(warning)
         print(result["status"])
         table = result.get("round_score_table", {}).get("markdown")
         if table:
