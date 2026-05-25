@@ -222,6 +222,22 @@ def test_suggest_ideas_marking_scheme_is_centralized() -> None:
     assert "marking_scheme" in reviewer["prompt"]["template"]
 
 
+def test_suggest_ideas_marking_scheme_has_discriminating_score_anchors() -> None:
+    scheme = json.loads((WF / "suggest-ideas-marking-scheme.json").read_text(encoding="utf-8"))
+    guidance = {item["field"]: item["guidance"] for item in scheme["marks"]}
+
+    assert "Use the full numeric range" in scheme["calibration_guidance"]
+    assert "A total score above 90 should be rare" in scheme["calibration_guidance"]
+    assert "merely reasonable idea with unclear novelty or weak execution plan should usually fall around 55-75" in scheme["calibration_guidance"]
+    assert "15: confidently publishable in a top journal" in guidance["novelty"]
+    assert "10: marginally publishable in a top journal" in guidance["novelty"]
+    assert "5: marginally publishable in a second-tier or specialized journal" in guidance["novelty"]
+    assert "0: not publishable" in guidance["novelty"]
+    assert "10: clear plan; each major step can be done by an AI agent" in guidance["planning"]
+    assert "5: has a plan, but some steps are too broad or difficult for an AI agent" in guidance["planning"]
+    assert "0: most steps cannot be done by an AI agent" in guidance["planning"]
+
+
 def test_suggest_ideas_reviewer_comments_turn_marks_into_scientific_guidance() -> None:
     reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
     template = reviewer["prompt"]["template"]
