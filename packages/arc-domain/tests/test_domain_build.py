@@ -16,6 +16,7 @@ FOUNDATION = "arXiv:2301.00001"
 def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
     _install_fake_paper_query(monkeypatch)
+    _install_fake_domain_summary(monkeypatch)
 
     result = service.build_domain(SEED, intent="inflation observables", provider="manual", workers=1)
 
@@ -27,6 +28,7 @@ def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     assert paths.evidence_pack.exists()
     assert paths.paper_json_pack.exists()
     assert paths.domain_summary.exists()
+    assert paths.domain_summary_markdown.exists()
     assert paths.network_html.exists()
     assert data["foundation"]["selected_foundation"]["paper_id"] == FOUNDATION
     graph = read_json(paths.domain_graph)
@@ -51,7 +53,12 @@ def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     assert {item["paper_id"] for item in paper_pack["papers"]} == graph_ids
     assert all("metadata" in item and "toc" in item and "references" in item for item in paper_pack["papers"])
     assert _toc_calls == graph_ids
-    assert read_json(paths.domain_summary)["summary_method"] == "deterministic_fallback"
+    assert read_json(paths.domain_summary)["summary_method"] == "llm"
+    assert data["domain_summary_markdown_path"] == str(paths.domain_summary_markdown)
+    markdown = paths.domain_summary_markdown.read_text(encoding="utf-8")
+    assert "## Key Papers" in markdown
+    assert "Foundation paper:" in markdown
+    assert "Best reference paper:" in markdown
     html = paths.network_html.read_text(encoding="utf-8")
     graph_data = re.search(r'<script id="graph-data" type="application/json">(.*?)</script>', html, re.S)
     assert graph_data
@@ -74,6 +81,7 @@ def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
 def test_status_and_cached_summary(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
     _install_fake_paper_query(monkeypatch)
+    _install_fake_domain_summary(monkeypatch)
     domain_id = domain_id_for(SEED, "intent")
 
     service.build_domain(SEED, intent="intent", domain_id=domain_id, provider="manual", workers=1)
@@ -86,6 +94,49 @@ def test_status_and_cached_summary(monkeypatch, tmp_path):
     assert status["data"]["artifacts"]["paper_json_pack"]["exists"] is True
     assert summary["ok"] is True
     assert graph["ok"] is True
+
+
+def test_summarize_domain_reports_llm_failure_without_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = domain_id_for(SEED, "intent")
+    paths = DomainPaths.for_domain(domain_id)
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    paths.evidence_pack.write_text('{"papers": [], "warnings": []}', encoding="utf-8")
+    paths.domain_graph.write_text('{"nodes": []}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        '{"selected_foundation": {"paper_id": "arXiv:2301.00001", "title": "Foundation", "reason": "seed"}}',
+        encoding="utf-8",
+    )
+
+    def fail_summary(*args, **kwargs):
+        raise RuntimeError("summary prompt too large")
+
+    monkeypatch.setattr(domain_summary, "run_json", fail_summary)
+
+    result = service.summarize_domain(SEED, intent="intent", domain_id=domain_id, provider="auto")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "domain_summary_failed"
+    assert "summary prompt too large" in result["error"]["message"]
+    assert not paths.domain_summary.exists()
+    assert not paths.domain_summary_markdown.exists()
+
+
+def test_get_domain_summary_rejects_cached_deterministic_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = domain_id_for(SEED, "intent")
+    paths = DomainPaths.for_domain(domain_id)
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    paths.domain_summary.write_text(
+        '{"schema_version": "arc.domain_summary.v4", "summary_method": "deterministic_fallback"}',
+        encoding="utf-8",
+    )
+
+    result = service.get_domain_summary(domain_id=domain_id)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "domain_summary_invalid"
+    assert "deterministic fallback" in result["error"]["message"]
 
 
 def test_foundation_prompt_marks_low_citation_candidates_as_low_priority():
@@ -129,6 +180,78 @@ def test_deterministic_foundation_selection_deprioritizes_low_citation_candidate
     assert selection["selected_foundation"]["paper_id"] == "arXiv:2301.00001"
 
 
+def test_foundation_selection_contract_includes_best_reference_paper():
+    prompt = foundation._foundation_prompt(
+        seed_metadata={"paper_id": SEED, "title": "Seed Paper"},
+        candidates=[
+            {
+                "paper_id": "arXiv:2301.00001",
+                "title": "Established Foundation",
+                "citation_count": 180,
+                "intent_overlap": 0.4,
+                "witness_citation_overlap": 8,
+            },
+            {
+                "paper_id": "arXiv:2401.00002",
+                "title": "Clear Modern Method Paper",
+                "citation_count": 80,
+                "intent_overlap": 0.9,
+                "witness_citation_overlap": 3,
+            },
+        ],
+        intent="clear modern method",
+    )
+    selection = foundation._deterministic_selection(
+        [
+            {
+                "paper_id": "arXiv:2301.00001",
+                "title": "Established Foundation",
+                "citation_count": 180,
+                "intent_overlap": 0.4,
+                "witness_citation_overlap": 8,
+            },
+            {
+                "paper_id": "arXiv:2401.00002",
+                "title": "Clear Modern Method Paper",
+                "citation_count": 80,
+                "intent_overlap": 0.9,
+                "witness_citation_overlap": 3,
+            },
+        ],
+        intent="clear modern method",
+    )
+
+    assert "best reference" in prompt.lower()
+    assert "best_reference_paper" in foundation.FOUNDATION_SELECTION_SCHEMA["required"]
+    assert selection["selected_foundation"]["paper_id"] == "arXiv:2301.00001"
+    assert selection["best_reference_paper"]["paper_id"] == "arXiv:2401.00002"
+
+
+def test_foundation_repair_repairs_unknown_best_reference_to_selected_foundation():
+    selection = foundation._repair_selection(
+        {
+            "selected_foundation": {
+                "paper_id": "arXiv:0911.3380",
+                "title": "Selected Foundation",
+                "reason": "selected",
+            },
+            "best_reference_paper": {
+                "paper_id": "arXiv:9999.99999",
+                "title": "Unknown Paper",
+                "reason": "not in candidates",
+            },
+            "parent_foundations": [],
+            "rejected_candidates": [],
+            "warnings": [],
+        },
+        [{"paper_id": "arXiv:0911.3380", "title": "Selected Foundation", "year": 2009}],
+        method="llm",
+    )
+
+    assert selection["best_reference_paper"]["paper_id"] == "arXiv:0911.3380"
+    assert "unknown id" in selection["best_reference_paper"]["reason"]
+
+
 def test_foundation_repair_rejects_later_parent_foundations():
     selection = foundation._repair_selection(
         {
@@ -166,7 +289,7 @@ def test_foundation_repair_rejects_later_parent_foundations():
     assert "later than the selected foundation year" in selection["rejected_candidates"][0]["reason"]
 
 
-def test_domain_summary_contract_uses_faq_remarks_and_research_guidance():
+def test_domain_summary_contract_uses_best_reference_and_new_sections():
     prompt = domain_summary._summary_prompt(
         graph={
             "foundation_paper": FOUNDATION,
@@ -174,23 +297,95 @@ def test_domain_summary_contract_uses_faq_remarks_and_research_guidance():
             "edges": [],
         },
         evidence={"papers": [], "warnings": []},
-        selection={"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation Paper", "reason": "seed"}},
-    )
-    fallback = domain_summary._fallback_summary(
-        graph={"nodes": []},
-        evidence={"papers": [], "warnings": []},
-        selection={"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation Paper", "reason": "seed"}},
-        error="offline",
+        selection={
+            "selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation Paper", "reason": "seed"},
+            "best_reference_paper": {"paper_id": "arXiv:2401.00002", "title": "Best Ref", "reason": "clear"},
+        },
     )
 
-    assert "frequently asked questions" in prompt.lower()
+    assert "best reference" in prompt.lower()
+    assert "foundation paper" in prompt.lower()
+    assert "known solved cases" in prompt.lower()
+    assert "open axes" in prompt.lower()
+    assert "llm_summary" not in prompt
+    assert "discover additional axes" in prompt.lower()
+    assert "idea examples" not in prompt.lower()
+    assert "research directions" not in prompt.lower()
     assert "open questions" not in prompt.lower()
+    assert "report_remarks" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
+    assert "foundation_paper" in domain_summary.DOMAIN_SUMMARY_SCHEMA["required"]
+    assert "research_directions_and_questions" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
+    assert "idea_examples" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
     assert "open_questions" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
-    assert "open_questions" not in fallback
-    assert fallback["frequently_asked_questions"] == []
-    assert fallback["report_remarks"] == domain_summary.REPORT_REMARKS
-    assert any("not to limit" in item.lower() for item in fallback["report_remarks"])
-    assert fallback["research_guidance"]
+    assert "mainstream_directions" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
+    assert "frequently_asked_questions" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
+    assert "research_guidance" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
+    assert "reading_guide" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
+    assert not hasattr(domain_summary, "_fallback_summary")
+
+
+def test_domain_summary_markdown_omits_report_remarks_guidance_and_warnings():
+    markdown = domain_summary.render_summary_markdown(
+        {
+            "domain_title": "Example Domain",
+            "brief_introduction": "Compact intro.",
+            "foundation_paper": {
+                "paper_id": "arXiv:2301.00001",
+                "title": "Foundation Paper",
+                "reason": "Best field-defining citer source.",
+            },
+            "best_reference_paper": {
+                "paper_id": "arXiv:2401.00002",
+                "title": "Best Ref",
+                "reason": "Clear methodology.",
+            },
+            "methodology": [{"claim": "Use residues.", "papers": ["arXiv:2401.00002"]}],
+            "task_focus": {
+                "user_intent": "Compute a tree-level scalar correlator.",
+                "research_scope": "Example domain seeded by a paper.",
+                "priority_rules": ["Satisfy the user request before following attached context."],
+            },
+            "known_solved_cases": [
+                {
+                    "solved_case": "Known four-point massive exchange.",
+                    "why_it_is_solved": "The seed correlator is already derived.",
+                    "transferable_form": "Use a precise observable, setup, and validation limits.",
+                    "forbidden_reuse": "Do not propose the same seed correlator as new.",
+                    "valid_new_axes": ["new observable", "new regime"],
+                    "papers": ["arXiv:2401.00002"],
+                }
+            ],
+            "open_axes_for_new_work": [
+                {
+                    "axis": "Observable",
+                    "guidance": "Move beyond the solved four-point seed when the observable is genuinely distinct.",
+                    "example_variations": ["higher-point correlator", "late-time statistic"],
+                    "papers": ["arXiv:2401.00002"],
+                }
+            ],
+            "warnings": ["missing conclusion text"],
+        }
+    )
+
+    assert markdown.startswith("# Example Domain\n\nCompact intro.\n\n## Task Focus for Idea Generation")
+    assert "This report lists prominent outstanding ideas" not in markdown
+    assert "## Foundation Paper" not in markdown
+    assert "## Best Reference Paper" not in markdown
+    assert "## Key Papers" in markdown
+    assert "- Foundation paper: arXiv:2301.00001: Foundation Paper" in markdown
+    assert "- Best reference paper: arXiv:2401.00002: Best Ref" in markdown
+    assert "## Research Guidance" not in markdown
+    assert "## Research Directions and Questions" not in markdown
+    assert "## Idea Examples" not in markdown
+    assert "## Warnings" not in markdown
+    assert "missing conclusion text" not in markdown
+    assert "## Task Focus for Idea Generation" in markdown
+    assert "Compute a tree-level scalar correlator." in markdown
+    assert "## Known Solved Cases" in markdown
+    assert "Do not propose the same seed correlator as new." in markdown
+    assert "## Open Axes for New Work" in markdown
+    assert "These axes are examples, not a complete list" in markdown
+    assert "discover additional axes" in markdown
 
 
 def _install_fake_paper_query(monkeypatch):
@@ -201,6 +396,53 @@ def _install_fake_paper_query(monkeypatch):
     monkeypatch.setattr(paper, "citers", _citers)
     monkeypatch.setattr(paper, "section", _section)
     monkeypatch.setattr(paper, "toc", _toc)
+
+
+def _install_fake_domain_summary(monkeypatch):
+    monkeypatch.setattr(domain_summary, "run_json", lambda *args, **kwargs: _summary_payload())
+
+
+def _summary_payload():
+    return {
+        "schema_version": "arc.domain_summary.v4",
+        "domain_title": "Example Domain",
+        "brief_introduction": "Compact intro.",
+        "task_focus": {
+            "user_intent": "intent",
+            "research_scope": "Example research scope.",
+            "priority_rules": ["Satisfy the user request first."],
+        },
+        "foundation_paper": {
+            "paper_id": FOUNDATION,
+            "title": "Foundation Paper",
+            "reason": "Best field-defining citer source.",
+        },
+        "best_reference_paper": {
+            "paper_id": "arXiv:2401.00002",
+            "title": "Best Ref",
+            "reason": "Clear methodology.",
+        },
+        "methodology": [{"claim": "Use residues.", "papers": ["arXiv:2401.00002"]}],
+        "known_solved_cases": [
+            {
+                "solved_case": "Known solved case.",
+                "why_it_is_solved": "The central calculation is already available.",
+                "transferable_form": "Use a precise observable and setup.",
+                "forbidden_reuse": "Do not propose the same calculation as new.",
+                "valid_new_axes": ["new observable"],
+                "papers": ["arXiv:2401.00002"],
+            }
+        ],
+        "open_axes_for_new_work": [
+            {
+                "axis": "Observable",
+                "guidance": "Use a genuinely distinct observable.",
+                "example_variations": ["new line ratio"],
+                "papers": ["arXiv:2401.00002"],
+            }
+        ],
+        "warnings": [],
+    }
 
 
 _toc_calls: set[str] = set()

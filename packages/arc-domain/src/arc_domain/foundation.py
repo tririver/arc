@@ -36,6 +36,7 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
     "required": [
         "schema_version",
         "selected_foundation",
+        "best_reference_paper",
         "parent_foundations",
         "rejected_candidates",
         "reasoning",
@@ -44,6 +45,16 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": {"type": "string", "const": "arc.domain_foundation_selection.v1"},
         "selected_foundation": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["paper_id", "title", "reason"],
+            "properties": {
+                "paper_id": {"type": "string"},
+                "title": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+        },
+        "best_reference_paper": {
             "type": "object",
             "additionalProperties": False,
             "required": ["paper_id", "title", "reason"],
@@ -304,7 +315,10 @@ def _foundation_prompt(
     return "\n\n".join(
         [
             "You are selecting the foundation paper for a theoretical-physics research domain.",
-            "Choose exactly one same-scope foundation paper. If an older high-citation candidate is broader than the user's intent, keep it as a parent foundation rather than the selected foundation.",
+            "Choose two papers from the supplied candidates. They may be the same paper.",
+            "First, choose selected_foundation: the same-scope foundation paper that best defines the research field represented by the seed paper and its citers.",
+            "Second, choose best_reference_paper, the best reference: the easiest useful reference for an agent to read before proposing or calculating in the user's intended methodology. Prefer a candidate with a modern method, clear exposition, or comprehensive review-style coverage when that better serves the user's intent.",
+            "If an older high-citation candidate is broader than the user's intent, keep it as a parent foundation rather than the selected foundation.",
             "A parent foundation must be earlier than, or at the latest from the same year as, the selected foundation. A later paper can be a child, extension, or successful descendant, but never a parent foundation.",
             f"Citation support heuristic: candidates with fewer than {min_citation_count} citations should normally have low priority as the selected foundation, because there is usually not enough literature built on top of them to define a research field. Select such a candidate only if the supplied candidates contain no better-supported same-scope foundation.",
             "Use only the supplied candidates. Prefer a candidate that defines the domain represented by the seed paper and its newest citers.",
@@ -342,6 +356,7 @@ def _deterministic_selection(
             "year": best.get("year"),
             "reason": "highest deterministic combination of witness citation overlap, intent overlap, and citation count",
         }
+    best_reference = _deterministic_best_reference(candidates, selected)
     parent_foundations = [
         {
             "paper_id": item.get("paper_id", ""),
@@ -354,6 +369,7 @@ def _deterministic_selection(
     return {
         "schema_version": "arc.domain_foundation_selection.v1",
         "selected_foundation": selected,
+        "best_reference_paper": best_reference,
         "parent_foundations": parent_foundations[:5],
         "rejected_candidates": [],
         "reasoning": f"Deterministic fallback selection. User intent: {intent or '(none)'}.",
@@ -378,6 +394,11 @@ def _repair_selection(selection: dict[str, Any], candidates: list[dict[str, Any]
         if selected_id in candidate_by_id:
             selected.setdefault("title", candidate_by_id[selected_id].get("title", ""))
     selection["selected_foundation"] = selected
+    selection["best_reference_paper"] = _repair_best_reference(
+        selection.get("best_reference_paper"),
+        selected=selected,
+        candidate_by_id=candidate_by_id,
+    )
     selection["parent_foundations"], moved = _valid_parent_foundations(
         selection.get("parent_foundations") or [],
         selected_id=selected_id,
@@ -388,6 +409,61 @@ def _repair_selection(selection: dict[str, Any], candidates: list[dict[str, Any]
     selection["selection_method"] = method
     selection["schema_version"] = "arc.domain_foundation_selection.v1"
     return selection
+
+
+def _deterministic_best_reference(
+    candidates: list[dict[str, Any]],
+    selected: dict[str, Any],
+) -> dict[str, Any]:
+    if not candidates:
+        return {
+            "paper_id": selected.get("paper_id", ""),
+            "title": selected.get("title", ""),
+            "reason": "no separate candidates were available",
+        }
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            item.get("intent_overlap", 0),
+            _candidate_year(item) or 0,
+            item.get("citation_count", 0),
+            item.get("witness_citation_overlap", 0),
+        ),
+        reverse=True,
+    )
+    best = ranked[0]
+    return {
+        "paper_id": best.get("paper_id", ""),
+        "title": best.get("title", ""),
+        "reason": (
+            "highest deterministic combination of intent overlap, recency, "
+            "citation count, and witness support for a readable methodology reference"
+        ),
+    }
+
+
+def _repair_best_reference(
+    best_reference: Any,
+    *,
+    selected: dict[str, Any],
+    candidate_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    candidate = dict(best_reference or selected)
+    candidate_id = normalize_paper_id(str(candidate.get("paper_id") or ""))
+    if candidate_id not in candidate_by_id:
+        selected_id = normalize_paper_id(str(selected.get("paper_id") or ""))
+        selected_candidate = candidate_by_id.get(selected_id, {})
+        return {
+            "paper_id": selected_id,
+            "title": selected.get("title") or selected_candidate.get("title", ""),
+            "reason": "Best-reference LLM selected an unknown id; repaired to the selected foundation",
+        }
+    source = candidate_by_id[candidate_id]
+    return {
+        "paper_id": candidate_id,
+        "title": candidate.get("title") or source.get("title", ""),
+        "reason": candidate.get("reason") or "selected as the best methodology reference",
+    }
 
 
 def _valid_parent_foundations(

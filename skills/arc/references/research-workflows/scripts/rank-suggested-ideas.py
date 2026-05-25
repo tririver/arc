@@ -11,9 +11,9 @@ from typing import Any
 
 MARK_FIELDS = [
     "evidence_of_novelty",
-    "feasibility",
+    "user_intent_relevance",
     "scientific_value",
-    "user_intent_fit",
+    "feasibility",
     "first_calculation_clarity",
     "total_score",
 ]
@@ -83,10 +83,17 @@ def _round_entry(loop_root: Path, round_root: Path) -> dict[str, Any] | None:
         "loop_id": loop_root.name,
         "round": _round_number(round_root),
         "title": str(proposer_output.get("title", "")),
-        "marks": {field: marks.get(field) for field in MARK_FIELDS},
+        "marks": _normalized_marks(marks),
         "proposer_output_path": relative(proposer_output_path),
         "review_path": relative(review_path),
     }
+
+
+def _normalized_marks(marks: dict[str, Any]) -> dict[str, Any]:
+    normalized = {field: marks.get(field) for field in MARK_FIELDS}
+    if normalized.get("user_intent_relevance") is None:
+        normalized["user_intent_relevance"] = marks.get("user_intent_fit")
+    return normalized
 
 
 def _first_json(root: Path) -> Path | None:
@@ -115,9 +122,9 @@ def _rank_key(entry: dict[str, Any]) -> tuple[float, ...]:
     tie_break_order = [
         "total_score",
         "evidence_of_novelty",
-        "feasibility",
+        "user_intent_relevance",
         "scientific_value",
-        "user_intent_fit",
+        "feasibility",
         "first_calculation_clarity",
     ]
     return tuple(float(marks.get(field) or 0.0) for field in tie_break_order) + (float(entry["round"]),)
@@ -125,7 +132,7 @@ def _rank_key(entry: dict[str, Any]) -> tuple[float, ...]:
 
 def markdown_table(payload: dict[str, Any]) -> str:
     lines = [
-        "| Rank | Loop | Round | Total | Novelty | Feasibility | Value | Intent | Clarity | Title |",
+        "| Rank | Loop | Round | Total | Novelty | Intent Relevance | Value | Feasibility | Clarity | Title |",
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for entry in payload["ranking"]:
@@ -133,7 +140,7 @@ def markdown_table(payload: dict[str, Any]) -> str:
         title = entry["title"].replace("|", "/")
         lines.append(
             "| {rank} | {loop_id} | {round} | {total_score:g} | {evidence_of_novelty:g} | "
-            "{feasibility:g} | {scientific_value:g} | {user_intent_fit:g} | "
+            "{user_intent_relevance:g} | {scientific_value:g} | {feasibility:g} | "
             "{first_calculation_clarity:g} | {title} |".format(
                 rank=entry["rank"],
                 loop_id=entry["loop_id"],

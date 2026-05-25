@@ -340,7 +340,7 @@ def _domain_artifact_or_start(args: dict[str, Any], *, artifact: str) -> dict[st
     if result.get("ok") or not args.get("seed_paper"):
         return result
     error_code = (result.get("error") or {}).get("code")
-    if error_code not in {"domain_summary_not_available", "domain_graph_not_available"}:
+    if error_code not in {"domain_summary_not_available", "domain_summary_invalid", "domain_graph_not_available"}:
         return result
     return _start_domain_job_response(args)
 

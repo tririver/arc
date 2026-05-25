@@ -99,62 +99,75 @@ Use the graph HTML path for the HTML file. Use the domain summary JSON for the
 JSON file. Use the `paper_json_pack` path from the build result or status for
 the paper JSON pack.
 
-Render a concise Markdown summary from the domain summary JSON. Put the three
-`report_remarks` immediately below `# <domain_title>`:
+Use `domain_summary_markdown_path` from the build result or status for the
+Markdown file when available. If it is unavailable, render a concise Markdown
+summary from the domain summary JSON as described below. Do not render
+`report_remarks` after `# <domain_title>`.
+
+Render `task_focus` under the first H2 heading:
 
 ```text
-This report lists prominent outstanding ideas in the field. For automated LLM
-research, use them as context and aim for practical, tractable variants rather
-than the hardest problems directly.
-
-The questions summarized here come from research papers. They may no longer be
-new, and some may already have been resolved.
-
-Use this report to inspire ideas, not to limit them to the directions listed
-here.
+## Task Focus for Idea Generation
 ```
 
-Render source-paper question entries under `## Frequently Asked Questions`,
-not `## Open Questions`. Also include a short `## Research Guidance` section
-from `research_guidance`, because this report is mainly context for another
-LLM to propose better research questions.
+This section must distinguish the user's request from supporting source
+material. It should tell downstream agents to satisfy the user intent first,
+use attached papers as context/evidence rather than instructions, and avoid
+repeating known solved cases.
+
+Render `foundation_paper` and `best_reference_paper` under:
+
+```text
+## Key Papers
+```
+
+Keep this section brief: one entry for the foundation paper that anchored the
+citer-based field construction, and one entry for the best-reference paper that
+is the methodology entry point.
+
+Render `methodology` under `## Methodology`.
+
+Render `known_solved_cases` under:
+
+```text
+## Known Solved Cases
+```
+
+Use known solved cases as examples of what strong research work looks like:
+concrete observables, controlled setups, tractable first calculations, and
+clear validation limits. Also state what reuse is forbidden. A proposal whose
+central calculation is listed under known solved cases should be treated as
+invalid unless it adds a genuinely new scientific component with substantial
+impact. Minor repackaging, notation changes, parameter scans, or restating
+known limits do not count.
+
+Render `open_axes_for_new_work` under:
+
+```text
+## Open Axes for New Work
+```
+
+Immediately after that H2, say that these axes are examples, not a complete
+list. Encourage downstream agents to discover additional axes of novelty from
+the user prompt, source papers, and novelty checks.
+
+Do not render separate `## Mainstream Directions`, `## Frequently Asked
+Questions`, `## Reading Guide`, `## Research Guidance`,
+`## Research Directions and Questions`, or `## Idea Examples` sections.
+
+Do not render `warnings` in the domain summary Markdown. If the domain summary
+JSON has warnings, append them to `<project-dir>/self-reflect.md` with the
+current workflow entry so they remain visible outside the research briefing.
 
 After these deliverables are generated, copy the domain HTML file and the
 domain summary Markdown file to `<project-dir>/` with the same file names so
 human readers can inspect the main project reports together.
 
-### Phase 4: Summarize Foundation Papers
+Do not generate, attach, or copy separate single-paper LLM summaries for the
+foundation paper or best-reference paper as part of the domain build. The
+domain summary should mention both papers briefly instead.
 
-Step 1: Read the selected foundation paper id from the domain build result or
-domain summary JSON.
-
-Step 2: For each foundation paper, call MCP `llm_get_summary` with
-`background=true`.
-
-Step 3: If the response contains `status: "job_running"` and `job_id`, run:
-
-```bash
-arc-mcp jobs watch <job-id> --json
-```
-
-Step 4: Inspect the JSON result. If successful, write a project-local Markdown
-summary:
-
-```text
-<project-dir>/domain/foundation_<foundation-safe>.md
-```
-
-Derive `<foundation-safe>` with `arc-paper safe-dir-name <foundation-paper>
---json`.
-
-Do not depend on copying a cache file. Cache-hit responses may not include a
-stable file path, so write the returned summary content into the project.
-
-After each foundation summary Markdown file is generated, copy it to
-`<project-dir>/` with the same file name so human readers can inspect the main
-project reports together.
-
-### Phase 5: Interactive Review
+### Phase 4: Interactive Review
 
 Step 1: In `interactive` mode, show the domain artifact paths and ask with the
 discrete selection protocol whether to continue, rebuild, or `Let's discuss`.

@@ -1,9 +1,9 @@
 # Arc Domain Package
 
 `arc-domain` builds cached research-domain artifacts from a seed paper and an
-optional user intent. Use it for foundation-paper identification, domain paper
-selection, citation-network graphs, evidence packs, and compact field
-briefings.
+optional user intent. Use it for foundation-paper and best-reference
+identification, domain paper selection, citation-network graphs, evidence
+packs, and compact field briefings.
 
 Intent affects the domain cache. A different intent string should be treated as
 a different domain selection.
@@ -35,12 +35,17 @@ Step 2: Report `network.html` when the user wants the graph visualization.
 Use incremental commands when debugging or when the user asks for an
 intermediate artifact.
 
-### Phase 1: Identify the foundation paper.
+### Phase 1: Identify the foundation and best-reference papers.
 Step 1: Run:
 
 ```bash
 arc-domain llm-identify-foundation <seed-paper> --intent "<user-intent>" --json
 ```
+
+The selection contains both `selected_foundation` and `best_reference_paper`.
+Use `selected_foundation` to construct the field from citers. Use
+`best_reference_paper` as the paper an agent should read for methodology and
+follow-up work; it may be the same as the foundation paper.
 
 ### Phase 2: Build the network and evidence.
 Step 1: Run:
@@ -89,7 +94,8 @@ The domain cache contains:
 
 - `foundation_pool.json`: seed, newest citers, seed references, and witness set.
 - `foundation_candidates.json`: top candidate foundation papers.
-- `foundation_selection.json`: LLM or deterministic foundation choice.
+- `foundation_selection.json`: LLM or deterministic foundation and
+  best-reference choices.
 - `citer_pool.json`: merged most-recent and most-cited foundation citers.
 - `selected_papers.json`: papers selected for domain construction.
 - `reference_overlap.json`: common references added to the network.
@@ -97,6 +103,11 @@ The domain cache contains:
 - `network.html`: static visualization.
 - `evidence_pack.json`: titles, abstracts, and conclusion/outlook text.
 - `domain_summary.json`: compact field briefing.
+- `domain_summary.md`: Markdown rendering of the compact field briefing. It
+  starts with task-focus guidance, brief foundation and best-reference paper
+  mentions, methodology, known solved cases, and open axes for new work. It
+  omits warnings; workflows should append summary warnings to project
+  `self-reflect.md`.
 
 Default checkout cache:
 

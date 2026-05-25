@@ -499,6 +499,38 @@ def test_domain_get_summary_starts_build_when_missing(monkeypatch):
     assert started["data"]["provider"] == "manual"
 
 
+def test_domain_get_summary_starts_build_when_cached_summary_invalid(monkeypatch):
+    monkeypatch.setattr(
+        server.domain_service,
+        "get_domain_summary",
+        lambda seed_paper=None, intent="", domain_id=None: {
+            "ok": False,
+            "error": {"code": "domain_summary_invalid", "message": "deterministic fallback summary is invalid"},
+            "errors": [],
+            "meta": {},
+        },
+    )
+
+    def build_domain(seed_paper, intent="", domain_id=None, provider="auto", model=None, refresh=False, workers=8):
+        return {
+            "ok": True,
+            "data": {"seed_paper": seed_paper, "intent": intent, "provider": provider},
+            "errors": [],
+            "meta": {},
+        }
+
+    monkeypatch.setattr(server.domain_service, "build_domain", build_domain)
+
+    started = server.call_tool(
+        "llm_domain_get_summary",
+        {"seed_paper": "0911.3380", "intent": "inflation", "provider": "manual"},
+    )
+
+    assert started["ok"] is True
+    assert started["meta"]["job"]["status"] == "done"
+    assert started["data"]["provider"] == "manual"
+
+
 def test_domain_get_summary_is_cache_only(monkeypatch):
     monkeypatch.setattr(
         server.domain_service,

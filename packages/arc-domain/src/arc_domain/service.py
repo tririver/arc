@@ -196,6 +196,7 @@ def build_domain(
                 "paper_json_pack_path": paper_pack["paper_json_pack_path"],
                 "evidence_pack_path": evidence["evidence_pack_path"],
                 "domain_summary_path": summary["domain_summary_path"],
+                "domain_summary_markdown_path": summary.get("domain_summary_markdown_path"),
                 "summary": summary["summary"],
             }
         )
@@ -222,6 +223,7 @@ def status(seed_paper: str | None = None, *, intent: str = "", domain_id: str | 
                 "paper_json_pack": _exists(paths.paper_json_pack),
                 "evidence_pack": _exists(paths.evidence_pack),
                 "domain_summary": _exists(paths.domain_summary),
+                "domain_summary_markdown": _exists(paths.domain_summary_markdown),
                 "network_html": _exists(paths.network_html),
             },
         }
@@ -236,7 +238,19 @@ def get_domain_summary(seed_paper: str | None = None, *, intent: str = "", domai
         summary = read_json(paths.domain_summary)
         if not summary:
             return err("domain_summary_not_available", f"No domain summary exists for {paths.domain_id}")
-        return ok({"domain_id": paths.domain_id, "summary": summary, "path": str(paths.domain_summary)})
+        if summary.get("summary_method") == "deterministic_fallback":
+            return err(
+                "domain_summary_invalid",
+                f"Cached deterministic fallback summary is invalid for {paths.domain_id}; rerun domain summarization.",
+            )
+        return ok(
+            {
+                "domain_id": paths.domain_id,
+                "summary": summary,
+                "path": str(paths.domain_summary),
+                "markdown_path": str(paths.domain_summary_markdown) if paths.domain_summary_markdown.exists() else None,
+            }
+        )
     except Exception as exc:
         return err("domain_summary_read_failed", str(exc))
 

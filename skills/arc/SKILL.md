@@ -49,6 +49,12 @@ Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as
 automation mode, project directory, and output formatting.
 
+Preserve scientific domain anchors in `<user-intent>`, including phrases such
+as "in the field started by arXiv:..." or "in the literature around ...".
+Those phrases are part of the scientific request, not workflow metadata. Keep
+the same paper identifiers separately in `seed_paper_list` as structured
+routing data.
+
 If the request references or attaches accessible files such as `.md`, `.pdf`,
 `.doc`, or `.jpg`, read or extract the relevant content and summarize it as
 part of `<user-intent>`. Treat collaborator notes or images as source context
@@ -80,7 +86,7 @@ Read and execute `references/research-workflows/build-domain.md`.
 
 Case 2: Suggest research ideas from a not-yet-explicit request.
 First complete Case 1. Then read and execute
-`references/research-workflows/suggest-ideas.md`.
+`references/research-workflows/research-ideas.md`.
 
 Case 3: Calculate from an explicit idea.
 If the idea is not explicit enough, first complete Case 1 and Case 2, then ask

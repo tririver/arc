@@ -74,6 +74,20 @@ must not be modified.
 - Keep `0_ref/` as reference-only material. Do not preserve old compatibility
   when it conflicts with the new package architecture.
 
+## Long-Running Terminal Work
+
+- When a terminal command or background job is still running, be patient and do
+  not poll it more often than once every 10 minutes unless there is a clear
+  reason, such as expected near-term completion, visible error output, or a user
+  request for status.
+- Do not print routine "still running" updates unless the command status
+  changed, an error appeared, or at least 10 minutes passed.
+- Prefer quiet logging for noisy long-running commands: write output to a log
+  file, then inspect only the tail on completion, failure, or an explicit status
+  request.
+- Prefer blocking watcher commands with sensible timeout windows over repeated
+  manual polling when the relevant package or host provides them.
+
 ## Testing
 
 - For package changes, run the focused pytest tests for the touched package

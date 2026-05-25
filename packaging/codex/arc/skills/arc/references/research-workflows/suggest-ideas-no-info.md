@@ -1,5 +1,8 @@
 # Suggest Ideas No-Info Workflow
 
+This is the legacy no-info ablation workflow. New Case 2 runs should use
+`research-ideas.md` with `suggest-ideas-no-info.variant.json` enabled.
+
 Use this workflow to run a comparison idea-generation loop where proposers get
 only the user's exact intent and internet access. This is an ablation of
 `suggest-ideas.md`: do not feed proposers ARC domain Markdown files, ARC paper

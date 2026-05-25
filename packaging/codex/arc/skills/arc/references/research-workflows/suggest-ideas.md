@@ -1,5 +1,9 @@
 # Suggest Ideas Workflow
 
+This is the legacy single-variant, per-loop reviewer workflow. New Case 2 runs
+should use `research-ideas.md`, which discovers enabled variant configs and
+uses one global reviewer for all final ideas.
+
 Use this workflow to run ARC idea-generation loops from project-local domain
 context. The loop execution is owned by `arc-llm`; this skill prepares
 caller-specific prompts, permissions, and artifacts.
@@ -16,10 +20,10 @@ Step 1: Complete Case 1 (building domain references with
 `references/research-workflows/build-domain.md`) before Case 2 (suggesting
 research ideas from a not-yet-explicit request).
 
-Step 2: Verify that `<project-dir>/domain/` contains the domain summaries and
-foundation summaries produced by the domain workflow. At least one
-`<project-dir>/domain/**/*.md` file must be present. If a domain artifact is
-missing, print `WARNING:` and stop before idea generation.
+Step 2: Verify that `<project-dir>/domain/` contains the domain Markdown files
+produced by the domain workflow. At least one `<project-dir>/domain/**/*.md`
+file must be present. If a domain artifact is missing, print `WARNING:` and
+stop before idea generation.
 
 ### Phase 2: Prepare Idea Loop Config
 
