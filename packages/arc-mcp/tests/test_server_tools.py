@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import pytest
@@ -18,6 +19,61 @@ def test_call_tool_dispatches_to_service(monkeypatch):
     result = server.call_tool("get_title", {"paper_id": "arXiv:0911.3380"})
 
     assert result == {"ok": True, "data": "arXiv:0911.3380"}
+
+
+def test_call_tool_md2pdf_starts_background_job_without_waiting(monkeypatch, tmp_path):
+    source = tmp_path / "report.md"
+    output = tmp_path / "report.pdf"
+    source.write_text("# Report\n", encoding="utf-8")
+    release_conversion = threading.Event()
+    calls = {}
+
+    def convert_markdown_to_pdf(**kwargs):
+        calls.update(kwargs)
+        release_conversion.wait(timeout=2)
+        return {
+            "ok": True,
+            "data": {"input_path": str(source), "output_path": str(output), "pdf_size_bytes": 8},
+            "errors": [],
+            "meta": {},
+        }
+
+    monkeypatch.setattr(server.typeset_md2pdf, "convert_markdown_to_pdf", convert_markdown_to_pdf)
+
+    started_at = time.monotonic()
+    result = server.call_tool(
+        "md2pdf",
+        {
+            "input": str(source),
+            "output": str(output),
+            "margin": "2cm",
+            "mainfont": "Noto Sans",
+            "cjk_mainfont": "Noto Sans CJK SC",
+            "resource_path": [str(tmp_path)],
+            "texlive_bin": "",
+        },
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.5
+    assert result["status"] == "job_running"
+    assert result["job_type"] == "md2pdf"
+    assert result["inline_wait_seconds"] == 0.0
+    assert result["background_requested"] is True
+    assert result["job"]["input"] == str(source)
+
+    release_conversion.set()
+    status = _wait_for_mcp_job(result["job_id"])
+    assert status["status"] == "done"
+    completed = server.job_result(result["job_id"])["result"]
+    assert completed["data"]["output_path"] == str(output)
+    assert calls["input_path"] == source
+    assert calls["output_path"] == output
+    assert calls["margin"] == "2cm"
+    assert calls["mainfont"] == "Noto Sans"
+    assert calls["cjk_mainfont"] == "Noto Sans CJK SC"
+    assert calls["resource_paths"] == [tmp_path]
+    assert calls["texlive_bin"] is None
 
 
 def test_call_tool_extracts_paper_ids(monkeypatch):
@@ -194,6 +250,12 @@ def test_fastmcp_tools_have_discovery_metadata():
     tools = asyncio.run(app.list_tools())
     by_name = {tool.name: tool for tool in tools}
 
+    assert "md2pdf" in by_name
+    assert "Markdown" in by_name["md2pdf"].description
+    assert "XeLaTeX" in by_name["md2pdf"].description
+    assert "background" in by_name["md2pdf"].description
+    assert "input" in by_name["md2pdf"].inputSchema["properties"]
+    assert "output" in by_name["md2pdf"].inputSchema["properties"]
     assert "natural-language text" in by_name["extract_paper_ids"].description
     assert "0911.3380" in by_name["paper_ids_safe_dir_name"].description
     assert "cached parsed ar5iv text" in by_name["search_full_text"].description
@@ -587,3 +649,13 @@ def _wait_for_domain_job(job_id):
             return status
         time.sleep(0.01)
     raise AssertionError("domain job did not finish")
+
+
+def _wait_for_mcp_job(job_id):
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        status = server.job_status(job_id)
+        if status["status"] in {"done", "failed", "needs_llm", "cancelled"}:
+            return status
+        time.sleep(0.01)
+    raise AssertionError("MCP job did not finish")

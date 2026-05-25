@@ -92,5 +92,9 @@ python3 references/research-workflows/scripts/rank-suggested-ideas.py \
   --format markdown
 ```
 
+If that Markdown summary is saved under `<project-dir>/` for human readers,
+call MCP `md2pdf(input="<saved-markdown-path>")`. It starts a background PDF
+job; record the returned job id if present and do not wait before continuing.
+
 Do not invent rankings or novelty claims. Use the recorded proposer outputs and
 per-round reviewer reports from the `arc-llm` loop artifacts.

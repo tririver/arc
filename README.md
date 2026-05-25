@@ -6,7 +6,8 @@ agent, or a human using the command line, structured access to arXiv full text,
 INSPIRE metadata, references, citers, paper summaries, research-domain graphs,
 and multi-agent idea/calculation workflows.
 
-ARC is built around four Python command line tools and one optional MCP server:
+ARC is built around five Python command line tools; `arc-mcp` also runs the
+optional MCP server:
 
 - `arc-paper`: paper metadata, references, citers, ar5iv sections, equation
   context, full-text search, LLM paper summaries, and paper-summary batches.
@@ -14,6 +15,8 @@ ARC is built around four Python command line tools and one optional MCP server:
   optional scientific intent.
 - `arc-llm`: reusable host LLM execution, provider configuration, and
   proposers-reviewer workflows.
+- `arc-typeset`: deterministic typesetting utilities, including Markdown to PDF
+  conversion through Pandoc and XeLaTeX.
 - `arc-mcp`: exposes ARC tools to MCP clients and manages background jobs.
 - `skills/arc`: agent-facing workflow instructions for domain building, idea
   generation, and research calculations.
@@ -40,6 +43,8 @@ Requirements:
 - Python 3.11 or newer.
 - Network access for first-time INSPIRE/ar5iv fetches.
 - Codex, Claude Code, or an OpenAI-compatible provider for LLM work.
+- Optional for `arc-typeset md2pdf`: `pandoc`, `xelatex`, and a CJK-capable
+  font such as `Noto Sans CJK SC`.
 
 ### Agent Plugin Setup
 
@@ -85,6 +90,7 @@ python -m pip install --upgrade pip
 python -m pip install -e packages/arc-llm[test]
 python -m pip install -e packages/arc-paper[test]
 python -m pip install -e packages/arc-domain[test]
+python -m pip install -e packages/arc-typeset[test]
 python -m pip install -e packages/arc-mcp[test]
 ```
 
@@ -94,6 +100,7 @@ Check the installed commands:
 arc-paper --help
 arc-domain --help
 arc-llm --help
+arc-typeset --help
 arc-mcp jobs --help
 ```
 
@@ -103,6 +110,17 @@ Run a deterministic smoke test:
 arc-paper extract-paper-ids "Compare arXiv:0911.3380 and hep-th/0601001." --json
 arc-paper get-title arXiv:0911.3380 --json
 ```
+
+Convert a Markdown report to PDF:
+
+```bash
+arc-typeset md2pdf <report>.md --json
+```
+
+The same converter is available from MCP as `md2pdf`.
+The MCP `md2pdf` tool always starts a background job and returns a `job_id`
+immediately; use `job_status`/`job_result` or `arc-mcp jobs watch <job_id>
+--json` to inspect completion.
 
 ## Configure LLM Providers
 

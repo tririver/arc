@@ -163,6 +163,11 @@ After these deliverables are generated, copy the domain HTML file and the
 domain summary Markdown file to `<project-dir>/` with the same file names so
 human readers can inspect the main project reports together.
 
+After copying each domain summary Markdown report to `<project-dir>/`, call
+MCP `md2pdf(input="<project-dir>/<seed-safe>_domain_summary.md")`. It starts a
+background PDF job; record the returned job id if present and do not wait
+before continuing.
+
 Do not generate, attach, or copy separate single-paper LLM summaries for the
 foundation paper or best-reference paper as part of the domain build. The
 domain summary should mention both papers briefly instead.

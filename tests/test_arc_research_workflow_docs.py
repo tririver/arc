@@ -37,6 +37,29 @@ def test_arc_skill_routes_case_3_to_three_research_workflows() -> None:
     assert "research-execute.md" in text
 
 
+def test_arc_skill_requires_nonblocking_pdf_export_for_project_markdown_reports() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8").lower()
+
+    assert "md2pdf" in text
+    assert "background" in text
+    assert "do not wait" in text
+    assert "markdown report" in text
+
+
+def test_research_workflows_start_pdf_export_when_copying_user_facing_markdown() -> None:
+    for name in [
+        "build-domain.md",
+        "research-ideas.md",
+        "research-plan.md",
+        "research-foundation.md",
+        "research-execute.md",
+    ]:
+        text = (WF / name).read_text(encoding="utf-8").lower()
+        assert "md2pdf" in text
+        assert "background" in text
+        assert "do not wait" in text
+
+
 def test_research_workflow_docs_stay_human_readable() -> None:
     for name in ["research-plan.md", "research-foundation.md", "research-execute.md"]:
         text = (WF / name).read_text(encoding="utf-8")

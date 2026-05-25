@@ -106,6 +106,11 @@ After `research-plan.md` is generated, copy it to
 `<project-dir>/research-plan.md` so human readers can inspect the main project
 reports together.
 
+After copying the Markdown report, call
+MCP `md2pdf(input="<project-dir>/research-plan.md")`. It starts a background
+PDF job; record the returned job id if present and do not wait before
+continuing.
+
 ## Phase 4: Review The Plan
 
 Step 1: Review the plan before building the foundation. If the host and

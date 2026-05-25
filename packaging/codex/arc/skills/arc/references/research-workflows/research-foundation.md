@@ -96,3 +96,8 @@ conventions, equations, confidence labels, source locations, and any version
 change notes. After `research-foundation.md` is generated, copy it to
 `<project-dir>/research-foundation.md` so human readers can inspect the main
 project reports together.
+
+After copying the Markdown report, call
+MCP `md2pdf(input="<project-dir>/research-foundation.md")`. It starts a
+background PDF job; record the returned job id if present and do not wait
+before continuing.

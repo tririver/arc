@@ -1,18 +1,18 @@
 {
   "name": "arc",
   "version": "0.1.0",
-  "description": "ARC arc-paper and research-domain workflow tools.",
+  "description": "ARC paper, research-domain, and report typesetting tools.",
   "author": {
     "name": "ARC"
   },
   "license": "MIT",
-  "keywords": ["arc", "papers", "arxiv", "inspire", "research"],
+  "keywords": ["arc", "papers", "arxiv", "inspire", "research", "typesetting", "pdf"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "ARC",
-    "shortDescription": "Paper query and research workflows",
-    "longDescription": "Cache-first ar5iv and INSPIRE paper tools with LLM paper summaries and research-domain construction.",
+    "shortDescription": "Paper query, research workflows, and PDF typesetting",
+    "longDescription": "Cache-first ar5iv and INSPIRE paper tools with LLM paper summaries, research-domain construction, and Markdown-to-PDF report typesetting.",
     "developerName": "ARC",
     "category": "Productivity",
     "capabilities": ["Research", "MCP"],
@@ -20,7 +20,8 @@
       "Summarize arXiv:0911.3380",
       "Get references for a paper",
       "Build a research domain from arXiv:0911.3380",
-      "Create a paper summary batch"
+      "Create a paper summary batch",
+      "Convert a Markdown report to PDF"
     ]
   }
 }

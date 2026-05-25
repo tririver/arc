@@ -31,6 +31,10 @@ not optional.
   behavior: read `references/package-manuals/arc-mcp.md`.
 - Host LLM/provider detection, model choice, direct prompt tests, or provider
   troubleshooting: read `references/package-manuals/arc-llm.md`.
+- User-facing Markdown report export: when a workflow copies a Markdown report
+  to `<project-dir>/` for human readers, call MCP `md2pdf` on the copied file.
+  `md2pdf` starts a background PDF job; record the returned job id if present
+  and do not wait before continuing unless the user explicitly asks.
 
 ## Workflow
 

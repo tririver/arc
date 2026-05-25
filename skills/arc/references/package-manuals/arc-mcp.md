@@ -45,6 +45,12 @@ llm_domain_get_summary
 llm_domain_get_graph
 ```
 
+Typeset tools:
+
+```text
+md2pdf
+```
+
 Job and doctor tools:
 
 ```text
@@ -58,6 +64,7 @@ doctor_cache
 ```
 
 Tools that may invoke a host LLM provider use the `llm_` prefix.
+`md2pdf` always starts a background job and returns immediately.
 
 ## Background Jobs
 
@@ -65,12 +72,14 @@ Use `background=true` for slow tools, large launches, and anything likely to
 exceed the MCP client timeout.
 
 ### Phase 1: Launch the MCP job.
-Step 1: Call the relevant `llm_` tool with `background=true`.
+Step 1: Call `md2pdf` directly, or call the relevant `llm_` tool with
+`background=true`.
 Step 2: Capture the returned `job_id`.
 
 Examples:
 
 ```text
+md2pdf(input="<project-dir>/report.md")
 llm_infer_main_references(text="<user-intent>", background=true)
 llm_generate_summary(paper_id="<seed-paper>", provider="auto", background=true)
 llm_domain_build(seed_paper="<seed-paper>", intent="<user-intent>", background=true)
