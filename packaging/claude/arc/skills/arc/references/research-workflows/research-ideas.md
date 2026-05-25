@@ -68,6 +68,10 @@ All concurrent proposer-reviewer artifacts are owned by `arc-llm` under the
 batch run root. The workflow runner does not copy selected rounds or write a
 project-level latest report while loops are running.
 
+The runner result includes `round_score_table`, a Markdown and structured
+per-loop table of reviewer total scores by round, built from the loop artifacts
+available at completion time.
+
 ### Phase 4: Inspect Artifacts
 
 Report these paths:

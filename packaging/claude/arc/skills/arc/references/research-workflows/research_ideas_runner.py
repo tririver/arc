@@ -13,7 +13,7 @@ from arc_llm.proposers_reviewer.artifacts import atomic_write_json
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 
 from research_ideas_config import ConfigError, ResearchIdeasConfig, VariantConfig, load_research_ideas_config
-from research_ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema
+from research_ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema, normalized_marks
 
 
 JsonRunner = Callable[..., dict[str, Any]]
@@ -103,6 +103,7 @@ def _result(
     batch_result: Mapping[str, Any],
 ) -> dict[str, Any]:
     batch_run_root = Path(str(batch_result.get("run_root", run_root / "idea_loops")))
+    round_score_table = _round_score_table(ideas, batch_run_root=batch_run_root)
     return {
         "schema_version": "arc.workflow.research_ideas.result.v1",
         "status": str(batch_result.get("status", "failed")),
@@ -116,6 +117,7 @@ def _result(
         "max_concurrent_proposal_calls": len(ideas),
         "batch_config_path": str(batch_config_path),
         "loops": [_loop_summary(idea, batch_run_root=batch_run_root) for idea in ideas],
+        "round_score_table": round_score_table,
         "batch_result": dict(batch_result),
     }
 
@@ -232,6 +234,190 @@ def _loop_summary(idea: IdeaPlan, *, batch_run_root: Path) -> dict[str, Any]:
     }
 
 
+def _round_score_table(ideas: list[IdeaPlan], *, batch_run_root: Path) -> dict[str, Any]:
+    rows = [_round_score_row(idea, batch_run_root=batch_run_root) for idea in ideas]
+    max_round = max(
+        (max((int(key) for key in row["total_scores_by_round"]), default=0) for row in rows),
+        default=0,
+    )
+    columns = [
+        "Idea",
+        "Group",
+        "Final Title",
+        *[f"R{round_number}" for round_number in range(1, max_round + 1)],
+        f"Δ R1→R{max_round}" if max_round else "Δ",
+        "Best",
+    ]
+    return {
+        "schema_version": "arc.workflow.research_ideas.round_score_table.v1",
+        "source": "loop_artifacts",
+        "columns": columns,
+        "rows": rows,
+        "markdown": _round_score_markdown(columns, rows, max_round=max_round),
+    }
+
+
+def _round_score_row(idea: IdeaPlan, *, batch_run_root: Path) -> dict[str, Any]:
+    loop_root = batch_run_root / "loops" / idea.loop_id
+    rounds, final_title = _loop_round_scores(loop_root, idea=idea)
+    total_scores = {
+        round_number: marks["total_score"]
+        for round_number, marks in rounds.items()
+        if isinstance(marks.get("total_score"), (int, float))
+    }
+    first_round = min(total_scores, default=None)
+    last_round = max(total_scores, default=None)
+    delta_total = (
+        total_scores[last_round] - total_scores[first_round]
+        if first_round is not None and last_round is not None
+        else None
+    )
+    best_total = max(total_scores.values(), default=None)
+    return {
+        "idea_id": idea.idea_id,
+        "variant_id": idea.variant_id,
+        "group": idea.variant_id,
+        "loop_id": idea.loop_id,
+        "final_title": final_title,
+        "rounds": [
+            {"round": round_number, "marks": rounds[round_number]}
+            for round_number in sorted(rounds)
+        ],
+        "total_scores_by_round": {str(key): value for key, value in sorted(total_scores.items())},
+        "delta_total": delta_total,
+        "best_total": best_total,
+    }
+
+
+def _loop_round_scores(loop_root: Path, *, idea: IdeaPlan) -> tuple[dict[int, dict[str, Any]], str]:
+    scheme = load_marking_scheme(idea.variant.path.parent)
+    transcript_rounds, transcript_title = _loop_round_scores_from_transcript(loop_root, scheme=scheme)
+    if transcript_rounds:
+        return transcript_rounds, transcript_title
+    return _loop_round_scores_from_round_dirs(loop_root, scheme=scheme)
+
+
+def _loop_round_scores_from_transcript(
+    loop_root: Path,
+    *,
+    scheme: Mapping[str, Any],
+) -> tuple[dict[int, dict[str, Any]], str]:
+    transcript = loop_root / "transcript.jsonl"
+    if not transcript.is_file():
+        return {}, ""
+
+    rounds: dict[int, dict[str, Any]] = {}
+    titles: dict[int, str] = {}
+    for line in transcript.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, Mapping):
+            continue
+        round_number = _positive_int(event.get("round_number"))
+        if round_number is None:
+            continue
+        event_type = event.get("type")
+        if event_type == "proposer_output":
+            output = event.get("output")
+            if isinstance(output, Mapping):
+                title = str(output.get("title", "")).strip()
+                if title:
+                    titles[round_number] = title
+        elif event_type == "review":
+            output = event.get("output")
+            if isinstance(output, Mapping):
+                marks = output.get("review_payload", {}).get("marks", {})
+                if isinstance(marks, Mapping) and "total_score" in marks:
+                    rounds[round_number] = normalized_marks(marks, scheme)
+
+    final_title = titles[max(titles)] if titles else ""
+    return rounds, final_title
+
+
+def _loop_round_scores_from_round_dirs(
+    loop_root: Path,
+    *,
+    scheme: Mapping[str, Any],
+) -> tuple[dict[int, dict[str, Any]], str]:
+    rounds_root = loop_root / "rounds"
+    if not rounds_root.is_dir():
+        return {}, ""
+    rounds: dict[int, dict[str, Any]] = {}
+    titles: dict[int, str] = {}
+    for round_root in sorted(path for path in rounds_root.iterdir() if path.is_dir() and path.name.startswith("round_")):
+        round_number = _round_dir_number(round_root)
+        if round_number is None:
+            continue
+        proposer_output = _first_json(round_root / "proposer_outputs")
+        if proposer_output is not None:
+            title = str(_read_json(proposer_output).get("title", "")).strip()
+            if title:
+                titles[round_number] = title
+        review_path = _first_json(round_root / "reviews")
+        if review_path is None:
+            continue
+        marks = _read_json(review_path).get("review_payload", {}).get("marks", {})
+        if isinstance(marks, Mapping) and "total_score" in marks:
+            rounds[round_number] = normalized_marks(marks, scheme)
+    final_title = titles[max(titles)] if titles else ""
+    return rounds, final_title
+
+
+def _round_score_markdown(columns: list[str], rows: list[dict[str, Any]], *, max_round: int) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "|" + "|".join("---:" if column.startswith("R") or column in {"Best"} or column.startswith("Δ") else "---" for column in columns) + "|",
+    ]
+    for row in rows:
+        total_scores = {int(key): value for key, value in row["total_scores_by_round"].items()}
+        values = [
+            row["loop_id"],
+            row["group"],
+            str(row.get("final_title", "")).replace("|", "/"),
+            *[_format_score(total_scores.get(round_number)) for round_number in range(1, max_round + 1)],
+            _format_delta(row.get("delta_total")),
+            _format_score(row.get("best_total")),
+        ]
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _format_score(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    return ""
+
+
+def _format_delta(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return f"{value:+g}"
+    return ""
+
+
+def _positive_int(value: Any) -> int | None:
+    if not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _round_dir_number(round_root: Path) -> int | None:
+    try:
+        value = int(round_root.name.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _first_json(root: Path) -> Path | None:
+    if not root.is_dir():
+        return None
+    return next(iter(sorted(root.glob("*.json"))), None)
+
+
 def _concurrency_warning(config: ResearchIdeasConfig, proposal_count: int) -> str:
     round_counts = sorted({int(_read_json(variant.loop_template).get("max_rounds") or 0) for variant in config.variants})
     if len(round_counts) == 1:
@@ -310,7 +496,13 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         base_env=_provider_config_env(args.provider_config),
     )
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str) if args.json else result["status"])
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(result["status"])
+        table = result.get("round_score_table", {}).get("markdown")
+        if table:
+            print(table)
     return 0 if result.get("status") != "failed" else 1
 
 

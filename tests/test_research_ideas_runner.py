@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -174,3 +175,115 @@ def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path:
         {"path": "domain/nested/details.md", "content": "# Details\n"},
         {"path": "domain/overview.md", "content": "# Overview\n"},
     ]
+
+
+def test_research_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    (project_dir / "domain").mkdir(parents=True)
+    (project_dir / "domain" / "domain_summary.md").write_text("# Domain\n", encoding="utf-8")
+    config = {
+        "schema_version": "arc.workflow.research_ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "research-ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WF),
+        "variant_glob": "suggest-ideas-*.variant.json",
+        "loops_per_variant": 1,
+    }
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        json_runner: Any,
+        base_env: dict[str, str] | None,
+        process_chain: list[str] | None,
+        dry_run: bool = False,
+        max_concurrent_loops: int | None = None,
+    ) -> dict[str, Any]:
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        scores_by_loop = {
+            "domain_idea_001": [77, 78, 78, 78, 78],
+            "no_info_idea_001": [75, 80, 80, 80, 80],
+        }
+        for loop in batch_config["loops"]:
+            loop_id = loop["loop_id"]
+            loop_root = run_root / "loops" / loop_id
+            loop_root.mkdir(parents=True)
+            title = f"{loop_id} final title"
+            with (loop_root / "transcript.jsonl").open("w", encoding="utf-8") as handle:
+                for round_number, total_score in enumerate(scores_by_loop[loop_id], start=1):
+                    _write_jsonl(
+                        handle,
+                        {
+                            "type": "proposer_output",
+                            "round_number": round_number,
+                            "output": {"title": title},
+                        },
+                    )
+                    _write_jsonl(
+                        handle,
+                        {
+                            "type": "review",
+                            "round_number": round_number,
+                            "output": {
+                                "review_payload": {
+                                    "marks": {
+                                        "user_intent_relevance": 20,
+                                        "novelty": 10,
+                                        "confidence_of_novelty": 10,
+                                        "scientific_value": 10,
+                                        "planning": 10,
+                                        "problem_well_definedness": 10,
+                                        "total_score": total_score,
+                                    }
+                                }
+                            },
+                        },
+                    )
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(run_root),
+            "loops": [
+                {
+                    "loop_id": loop["loop_id"],
+                    "status": "completed",
+                    "rounds_completed": 5,
+                    "loop_root": str(run_root / "loops" / loop["loop_id"]),
+                }
+                for loop in batch_config["loops"]
+            ],
+        }
+
+    result = runner.run_research_ideas(config, batch_runner=fake_batch_runner, base_env={})
+
+    table = result["round_score_table"]
+    assert table["schema_version"] == "arc.workflow.research_ideas.round_score_table.v1"
+    assert table["columns"] == [
+        "Idea",
+        "Group",
+        "Final Title",
+        "R1",
+        "R2",
+        "R3",
+        "R4",
+        "R5",
+        "Δ R1→R5",
+        "Best",
+    ]
+    assert [row["loop_id"] for row in table["rows"]] == ["domain_idea_001", "no_info_idea_001"]
+    assert table["rows"][0]["total_scores_by_round"] == {"1": 77, "2": 78, "3": 78, "4": 78, "5": 78}
+    assert table["rows"][0]["delta_total"] == 1
+    assert table["rows"][0]["best_total"] == 78
+    assert table["rows"][1]["total_scores_by_round"] == {"1": 75, "2": 80, "3": 80, "4": 80, "5": 80}
+    assert table["rows"][1]["delta_total"] == 5
+    assert table["rows"][1]["best_total"] == 80
+    assert "| domain_idea_001 | domain | domain_idea_001 final title | 77 | 78 | 78 | 78 | 78 | +1 | 78 |" in table["markdown"]
+    assert "| no_info_idea_001 | no_info | no_info_idea_001 final title | 75 | 80 | 80 | 80 | 80 | +5 | 80 |" in table["markdown"]
+
+
+def _write_jsonl(handle: Any, payload: dict[str, Any]) -> None:
+    handle.write(json.dumps(payload) + "\n")
