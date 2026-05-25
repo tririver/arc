@@ -19,7 +19,7 @@ def _load_runner_module():
         sys.path.remove(str(WF))
 
 
-def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path) -> None:
+def test_research_ideas_runs_five_report_loops_without_global_review(tmp_path: Path) -> None:
     runner = _load_runner_module()
     project_dir = tmp_path / "project"
     (project_dir / "domain").mkdir(parents=True)
@@ -34,11 +34,8 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
         "variant_glob": "suggest-ideas-*.variant.json",
         "loops_per_variant": 1,
         "artifact_options": {"save_prompts": True},
-        "reviewer": {"provider": "manual", "model": None, "model_tier": "high", "allow_tools": False},
     }
     seen_batch_configs: list[dict[str, Any]] = []
-    seen_global_proposals: list[dict[str, Any]] = []
-    seen_global_contexts: list[dict[str, Any]] = []
 
     def fake_batch_runner(
         batch_config: dict[str, Any],
@@ -111,7 +108,7 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
             "loops": loops,
         }
 
-    def fake_global_runner(
+    def forbidden_global_runner(
         prompt: str,
         *,
         schema: dict[str, Any] | None,
@@ -120,49 +117,20 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
         model_tier: str | None,
         env: dict[str, str],
     ) -> dict[str, Any]:
-        context = _context_from_prompt(prompt)
-        seen_global_contexts.append(context)
-        ideas = context["caller_context"]["ideas"]
-        seen_global_proposals.extend(ideas)
-        reviews = {
-            idea["idea_id"]: {
-                "marks": {
-                    "user_intent_relevance": 25,
-                    "novelty": 15,
-                    "confidence_of_novelty": 15,
-                    "scientific_value": 15,
-                    "planning": 15,
-                    "problem_well_definedness": 15,
-                    "total_score": 100,
-                },
-                "main_concerns": [],
-                "evidence_checked": [],
-                "selected_for_next_phase": True,
-                "next_phase_prompt": "next",
-            }
-            for idea in ideas
-        }
-        return {
-            "schema_version": "arc.workflow.research_ideas.global_review.v1",
-            "reviews": reviews,
-            "ranking": [
-                {"rank": index, "idea_id": idea["idea_id"], "total_score": 100}
-                for index, idea in enumerate(ideas, start=1)
-            ],
-            "cross_variant_observations": [],
-        }
+        raise AssertionError("research ideas workflow must not call a global reviewer")
 
     result = runner.run_research_ideas(
         config,
-        json_runner=fake_global_runner,
+        json_runner=forbidden_global_runner,
         batch_runner=fake_batch_runner,
         base_env={},
     )
 
     assert result["status"] == "completed"
     assert result["proposal_count"] == 2
-    assert result["reviewer_call_count"] == 1
+    assert result["reviewer_call_count"] == 0
     assert result["loop_reviewer_call_count"] == 10
+    assert "global_review" not in result
     batch_config = seen_batch_configs[0]
     assert batch_config["max_concurrent_loops"] == 2
     assert {loop["loop_id"] for loop in batch_config["loops"]} == {
@@ -178,22 +146,11 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
     assert "evidence_of_novelty" not in mark_schema["required"]
     assert mark_schema["properties"]["user_intent_relevance"]["maximum"] == 25
     assert mark_schema["properties"]["problem_well_definedness"]["maximum"] == 15
-    assert seen_global_contexts[0]["caller_context"]["marking_scheme"]["total_score"]["maximum"] == 100
-    assert {idea["proposal"]["title"] for idea in seen_global_proposals} == {
-        "domain_idea_001 round 5",
-        "no_info_idea_001 round 5",
-    }
     for idea in result["ideas"]:
         assert idea["selected_round"] == 5
         assert idea["rounds_completed"] == 5
         assert idea["output"]["title"].endswith("round 5")
         assert Path(idea["selected_review_path"]).is_file()
-
-
-def _context_from_prompt(prompt: str) -> dict[str, Any]:
-    marker = "## ARC Worker Context\n"
-    assert marker in prompt
-    return json.loads(prompt.split(marker, 1)[1])
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

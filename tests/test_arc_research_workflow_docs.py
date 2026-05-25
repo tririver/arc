@@ -222,11 +222,13 @@ def test_suggest_ideas_marking_scheme_is_centralized() -> None:
     assert "marking_scheme" in reviewer["prompt"]["template"]
 
 
-def test_research_ideas_workflow_points_to_active_runner_and_global_review() -> None:
+def test_research_ideas_workflow_points_to_active_runner_without_global_review() -> None:
     text = (WF / "research-ideas.md").read_text(encoding="utf-8")
 
     assert "research_ideas_runner.py" in text
-    assert "global reviewer" in text
+    assert "global reviewer" not in text
+    assert "global_review" not in text
+    assert "five reviewer reports per loop" in text
     assert "<project-dir>/research-ideas/<run-id>/research-ideas.md" in text
     assert "<project-dir>/research-ideas.md" in text
 
@@ -303,46 +305,11 @@ def test_suggest_ideas_reviewer_uses_hundred_point_marking_scheme() -> None:
     assert "user_intent_fit" not in reviewer["prompt"]["template"]
 
 
-def test_research_ideas_global_reviewer_uses_hundred_point_marking_scheme() -> None:
-    sys.path.insert(0, str(WF))
-    try:
-        config_module = importlib.import_module("research_ideas_config")
-        runner_module = importlib.import_module("research_ideas_runner")
-    finally:
-        sys.path.remove(str(WF))
+def test_research_ideas_config_template_has_no_global_reviewer() -> None:
+    config = json.loads((WF / "research-ideas.config.template.json").read_text(encoding="utf-8"))
 
-    reviewer = config_module._parse_reviewer({})
-    schema = runner_module._global_review_schema(["domain/idea_001"])
-    marks = schema["properties"]["reviews"]["properties"]["domain/idea_001"]["properties"]["marks"]
-    mark_properties = marks["properties"]
-    ranking_score = schema["properties"]["ranking"]["items"]["properties"]["total_score"]
-
-    assert "marking_scheme" in reviewer.template
-    assert "evidence_of_novelty" not in reviewer.template
-    assert "confidence_of_novelty" not in reviewer.template
-    assert marks["required"] == [
-        "user_intent_relevance",
-        "novelty",
-        "confidence_of_novelty",
-        "scientific_value",
-        "planning",
-        "problem_well_definedness",
-        "total_score",
-    ]
-    assert mark_properties["user_intent_relevance"]["minimum"] == 0
-    assert mark_properties["user_intent_relevance"]["maximum"] == 25
-    assert mark_properties["novelty"]["maximum"] == 15
-    assert mark_properties["confidence_of_novelty"]["maximum"] == 15
-    assert mark_properties["scientific_value"]["minimum"] == 0
-    assert mark_properties["scientific_value"]["maximum"] == 15
-    assert mark_properties["planning"]["minimum"] == 0
-    assert mark_properties["planning"]["maximum"] == 15
-    assert mark_properties["problem_well_definedness"]["minimum"] == 0
-    assert mark_properties["problem_well_definedness"]["maximum"] == 15
-    assert mark_properties["total_score"]["minimum"] == 0
-    assert mark_properties["total_score"]["maximum"] == 100
-    assert ranking_score["minimum"] == 0
-    assert ranking_score["maximum"] == 100
+    assert "reviewer" not in config
+    assert config["loops_per_variant"] == 5
 
 
 def test_suggest_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:

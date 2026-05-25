@@ -9,15 +9,5 @@
   "loops_per_variant": 5,
   "artifact_options": {
     "save_prompts": true
-  },
-  "reviewer": {
-    "provider": "deepseek",
-    "model": null,
-    "model_tier": "high",
-    "allow_tools": true,
-    "runtime": {
-      "allow_internet": true,
-      "allow_mcp": false
-    }
   }
 }

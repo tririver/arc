@@ -10,19 +10,7 @@ from typing import Any, Mapping
 
 RESEARCH_IDEAS_CONFIG_SCHEMA = "arc.workflow.research_ideas.config.v1"
 RESEARCH_IDEAS_VARIANT_SCHEMA = "arc.workflow.research_ideas.variant.v1"
-GLOBAL_REVIEW_SCHEMA = "arc.workflow.research_ideas.global_review.v1"
-VALID_MODEL_TIERS = frozenset({"low", "medium", "high"})
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-GLOBAL_REVIEW_DEFAULT_TEMPLATE = (
-    "Review all proposed ideas on one common scale against the full user intent. "
-    "Use caller_context.marking_scheme as the sole source for mark names, ranges, "
-    "and scoring guidance. Use the supplied proposal "
-    "records, novelty-check notes, and included context. Do not rely on memory for "
-    "novelty confidence; use supplied search evidence and any internet evidence available "
-    "under the configured runtime. Rank all ideas by total_score and use the same scale "
-    "across variants. Return exactly one "
-    f"JSON object with schema_version {GLOBAL_REVIEW_SCHEMA}. Input:\n{{caller_context_json}}"
-)
 
 
 class ConfigError(ValueError):
@@ -48,17 +36,6 @@ class VariantConfig:
 
 
 @dataclass(frozen=True)
-class ReviewerConfig:
-    provider: str
-    model: str | None
-    model_tier: str | None
-    allow_tools: bool
-    runtime: dict[str, Any]
-    system: str
-    template: str
-
-
-@dataclass(frozen=True)
 class ResearchIdeasConfig:
     schema_version: str
     run_id: str
@@ -71,7 +48,6 @@ class ResearchIdeasConfig:
     existing_run_policy: str
     save_prompts: bool
     variants: list[VariantConfig]
-    reviewer: ReviewerConfig
 
 
 def load_research_ideas_config(payload: Mapping[str, Any]) -> ResearchIdeasConfig:
@@ -109,7 +85,6 @@ def load_research_ideas_config(payload: Mapping[str, Any]) -> ResearchIdeasConfi
         existing_run_policy=existing_run_policy,
         save_prompts=bool(artifact_options.get("save_prompts", True)),
         variants=variants,
-        reviewer=_parse_reviewer(data.get("reviewer", {})),
     )
 
 
@@ -172,34 +147,6 @@ def _parse_context_policy(raw: Any, *, path: Path) -> ContextPolicy:
     )
 
 
-def _parse_reviewer(raw: Any) -> ReviewerConfig:
-    data = _dict(raw, "reviewer")
-    allow_tools = _bool(data.get("allow_tools", False), "reviewer.allow_tools")
-    runtime = _dict(data.get("runtime", {}), "reviewer.runtime")
-    if not allow_tools:
-        runtime["allow_mcp"] = False
-    prompt = _dict(data.get("prompt", {}), "reviewer.prompt")
-    return ReviewerConfig(
-        provider=str(data.get("provider", "deepseek") or "deepseek"),
-        model=_optional_text(data.get("model"), "reviewer.model"),
-        model_tier=_model_tier(data.get("model_tier", "high"), "reviewer.model_tier"),
-        allow_tools=allow_tools,
-        runtime=runtime,
-        system=str(
-            prompt.get(
-                "system",
-                "You are a skeptical but constructive theoretical-physics reviewer comparing ARC research ideas.",
-            )
-        ),
-        template=str(
-            prompt.get(
-                "template",
-                GLOBAL_REVIEW_DEFAULT_TEMPLATE,
-            )
-        ),
-    )
-
-
 def _relative_path(base: Path, value: str) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
@@ -255,21 +202,3 @@ def _bool(value: Any, field_name: str) -> bool:
         if text in {"0", "false", "no", "off"}:
             return False
     raise ConfigError(f"{field_name} must be a boolean")
-
-
-def _optional_text(value: Any, field_name: str) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text
-
-
-def _model_tier(value: Any, field_name: str) -> str | None:
-    text = _optional_text(value, field_name)
-    if text is None:
-        return None
-    if text not in VALID_MODEL_TIERS:
-        raise ConfigError(f"{field_name} must be one of: high, medium, low")
-    return text
