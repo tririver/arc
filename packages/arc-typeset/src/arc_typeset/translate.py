@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Any, Callable
+import unicodedata
 
 from . import md2pdf
 
@@ -101,6 +103,7 @@ def translate_markdown(
         translated = str(quality_result.get("revised_markdown", translated))
         quality_issues = list(quality_result.get("issues") or [])
 
+    translated = normalize_markdown_for_pdf(translated)
     output.write_text(translated, encoding="utf-8")
 
     pdf_result: dict[str, Any] | None = None
@@ -296,8 +299,15 @@ def split_markdown_blocks(markdown: str) -> list[MarkdownBlock]:
 def render_translated_markdown(blocks: list[MarkdownBlock], translations: dict[str, str]) -> str:
     rendered: list[str] = []
     for block in blocks:
-        rendered.append(translations.get(block.id, block.text) if block.translatable else block.text)
+        if block.translatable:
+            rendered.append(_preserve_block_boundary(block.text, translations.get(block.id, block.text)))
+        else:
+            rendered.append(block.text)
     return "".join(rendered)
+
+
+def normalize_markdown_for_pdf(markdown: str) -> str:
+    return _normalize_pipe_table_widths(_normalize_block_spacing(markdown))
 
 
 def _build_glossary(
@@ -515,6 +525,181 @@ def _translation_data(
 
 def _is_fence_start(stripped: str) -> bool:
     return stripped.startswith("```") or stripped.startswith("~~~")
+
+
+def _preserve_block_boundary(source: str, translated: str) -> str:
+    output = translated
+    if source.endswith("\n") and not output.endswith("\n"):
+        output += "\n"
+    return output
+
+
+def _normalize_block_spacing(markdown: str) -> str:
+    lines = markdown.splitlines(keepends=True)
+    output: list[str] = []
+    in_fence = False
+    fence = ""
+    in_math = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if in_fence:
+            output.append(line)
+            if stripped.startswith(fence):
+                in_fence = False
+            continue
+        if in_math:
+            output.append(line)
+            if stripped in {"$$", "\\]"}:
+                in_math = False
+            continue
+        if _is_fence_start(stripped):
+            if output and output[-1].strip():
+                output.append("\n")
+            output.append(line)
+            in_fence = True
+            fence = stripped[:3]
+            continue
+        if stripped in {"$$", "\\["}:
+            if output and output[-1].strip():
+                output.append("\n")
+            output.append(line)
+            in_math = True
+            continue
+
+        is_heading = _is_atx_heading(line)
+        is_top_level_list_item = _is_top_level_list_item(line)
+        if is_heading and output and output[-1].strip():
+            output.append("\n")
+        if (
+            is_top_level_list_item
+            and output
+            and output[-1].strip()
+            and not _is_list_item(output[-1])
+            and not _is_atx_heading(output[-1])
+        ):
+            output.append("\n")
+        output.append(line)
+        if is_heading and index + 1 < len(lines) and lines[index + 1].strip():
+            output.append("\n")
+    return "".join(output)
+
+
+def _is_atx_heading(line: str) -> bool:
+    return re.match(r"^#{1,6}\s+\S", line) is not None
+
+
+def _is_top_level_list_item(line: str) -> bool:
+    return re.match(r"^([-+*]|\d+[.)])\s+", line) is not None
+
+
+def _is_list_item(line: str) -> bool:
+    return re.match(r"^\s{0,3}([-+*]|\d+[.)])\s+", line) is not None
+
+
+def _normalize_pipe_table_widths(markdown: str) -> str:
+    lines = markdown.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    in_fence = False
+    fence = ""
+    in_math = False
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if in_fence:
+            output.append(lines[index])
+            if stripped.startswith(fence):
+                in_fence = False
+            index += 1
+            continue
+        if in_math:
+            output.append(lines[index])
+            if stripped in {"$$", "\\]"}:
+                in_math = False
+            index += 1
+            continue
+        if _is_fence_start(stripped):
+            in_fence = True
+            fence = stripped[:3]
+            output.append(lines[index])
+            index += 1
+            continue
+        if stripped in {"$$", "\\["}:
+            in_math = True
+            output.append(lines[index])
+            index += 1
+            continue
+        if index + 1 >= len(lines) or not _is_pipe_table_separator(lines[index + 1]):
+            output.append(lines[index])
+            index += 1
+            continue
+        table_lines = [lines[index], lines[index + 1]]
+        index += 2
+        while index < len(lines) and _looks_like_pipe_row(lines[index]):
+            table_lines.append(lines[index])
+            index += 1
+        output.extend(_normalize_pipe_table(table_lines))
+    return "".join(output)
+
+
+def _normalize_pipe_table(table_lines: list[str]) -> list[str]:
+    if len(table_lines) < 2:
+        return table_lines
+    rows = [_split_pipe_row(line) for line in table_lines]
+    column_count = max((len(row) for row in rows), default=0)
+    if column_count == 0:
+        return table_lines
+    widths: list[int] = []
+    for column in range(column_count):
+        cells = [row[column].strip() for row in rows if column < len(row)]
+        width = max((_display_width(cell) for cell in cells if not _separator_cell(cell)), default=3)
+        widths.append(max(3, min(width, 60)))
+    separator = _split_pipe_row(table_lines[1])
+    normalized_cells = [
+        _separator_cell_with_width(separator[column] if column < len(separator) else "---", widths[column])
+        for column in range(column_count)
+    ]
+    newline = "\n" if table_lines[1].endswith("\n") else ""
+    table_lines[1] = "| " + " | ".join(normalized_cells) + " |" + newline
+    return table_lines
+
+
+def _looks_like_pipe_row(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def _is_pipe_table_separator(line: str) -> bool:
+    if not _looks_like_pipe_row(line):
+        return False
+    cells = _split_pipe_row(line)
+    return bool(cells) and all(_separator_cell(cell.strip()) for cell in cells)
+
+
+def _split_pipe_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return stripped.split("|")
+
+
+def _separator_cell(cell: str) -> bool:
+    return re.fullmatch(r":?-{3,}:?", cell.strip()) is not None
+
+
+def _separator_cell_with_width(cell: str, width: int) -> str:
+    stripped = cell.strip()
+    left = stripped.startswith(":")
+    right = stripped.endswith(":")
+    return f"{':' if left else ''}{'-' * max(3, width)}{':' if right else ''}"
+
+
+def _display_width(text: str) -> int:
+    total = 0
+    for char in text:
+        total += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return total
 
 
 def _error(code: str, message: str) -> dict[str, Any]:

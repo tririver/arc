@@ -74,6 +74,52 @@ def test_translate_markdown_uses_low_tier_by_default_preserves_protected_blocks_
     assert pdf_calls[0]["output_path"] == tmp_path / "report.zh_CN.pdf"
 
 
+def test_translate_markdown_preserves_block_newlines_when_llm_drops_them(tmp_path: Path) -> None:
+    source = tmp_path / "report.md"
+    source.write_text("# Report\n\nParagraph.\n\n## Next\n\n- item\n", encoding="utf-8")
+
+    def fake_json_runner(prompt, *, schema=None, provider="auto", model=None, model_tier=None):
+        if "technical glossary" in prompt:
+            return {"glossary": []}
+        payload = json.loads(prompt.split("BLOCKS_JSON:\n", 1)[1])
+        translations = {
+            "# Report\n": "# 报告",
+            "Paragraph.\n": "段落。",
+            "## Next\n": "## 下一节",
+            "- item\n": "- 条目",
+        }
+        return {"translations": [{"id": item["id"], "text": translations[item["text"]]} for item in payload["blocks"]]}
+
+    result = translate.translate_markdown(source, convert_pdf=False, json_runner=fake_json_runner)
+
+    assert result["ok"] is True
+    text = Path(result["data"]["output_markdown_path"]).read_text(encoding="utf-8")
+    assert text == "# 报告\n\n段落。\n\n## 下一节\n\n- 条目\n"
+
+
+def test_normalize_pipe_table_widths_gives_long_text_columns_more_pdf_width() -> None:
+    markdown = (
+        "| 排名 | 循环 | 标题 |\n"
+        "|---:|---|---|\n"
+        "| 1 | domain_idea_002 | 最小准单场暴胀中的标量化学势交换导致的坍缩极限暴胀子四点谱 |\n"
+    )
+
+    normalized = translate.normalize_markdown_for_pdf(markdown)
+
+    separator = normalized.splitlines()[1]
+    cells = [cell.strip() for cell in separator.strip("|").split("|")]
+    assert len(cells[2].strip(":")) > len(cells[0].strip(":"))
+    assert len(cells[2].strip(":")) > len(cells[1].strip(":"))
+
+
+def test_normalize_markdown_for_pdf_restores_heading_and_list_block_spacing() -> None:
+    markdown = "# 标题\n段落。\n## 下一节\n- 条目\n"
+
+    normalized = translate.normalize_markdown_for_pdf(markdown)
+
+    assert normalized == "# 标题\n\n段落。\n\n## 下一节\n\n- 条目\n"
+
+
 def test_translate_markdown_runs_quality_pass_only_when_requested(tmp_path: Path) -> None:
     source = tmp_path / "report.md"
     source.write_text("A sentence.\n", encoding="utf-8")

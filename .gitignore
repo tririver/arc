@@ -2,6 +2,8 @@
 0_ref/
 cache/
 arc-tests/
+.understandignore
+.understand-anything/
 
 # Local secrets and provider credentials
 .env
@@ -10,6 +12,10 @@ arc-tests/
 llm-providers.json
 llm-providers.local.json
 .arc-llm-providers.json
+
+# NPM, PNPM
+
+.pnpm-store/
 
 # Python bytecode and caches
 __pycache__/
