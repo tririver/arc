@@ -222,6 +222,18 @@ def test_suggest_ideas_marking_scheme_is_centralized() -> None:
     assert "marking_scheme" in reviewer["prompt"]["template"]
 
 
+def test_suggest_ideas_reviewer_comments_turn_marks_into_scientific_guidance() -> None:
+    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
+    template = reviewer["prompt"]["template"]
+
+    assert "Use caller_context.marking_scheme as the organizing checklist for reviewer feedback" in template
+    assert "interpret the assigned mark scientifically" in template
+    assert "what is already working" in template
+    assert "weak or middling" in template
+    assert "Do not restate the marking scheme, discuss score optimization, or tell the proposer how to chase rubric points" in template
+    assert "Add any other scientifically important comments" in template
+
+
 def test_research_ideas_workflow_points_to_active_runner_without_global_review() -> None:
     text = (WF / "research-ideas.md").read_text(encoding="utf-8")
 
