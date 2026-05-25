@@ -50,7 +50,7 @@ class FlakyTextProvider:
 def test_resolve_llm_config_uses_host_and_default_model(tmp_path):
     config = resolve_llm_config(env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"}, process_chain=[])
     assert config.provider == "codex-cli"
-    assert config.model == "gpt-5.4-mini"
+    assert config.model == "gpt-5.4"
     assert config.host.host == "codex"
 
 
@@ -88,7 +88,7 @@ def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):
 
     result = run_text("prompt", env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"}, process_chain=[])
 
-    assert result == "gpt-5.4-mini:prompt"
+    assert result == "gpt-5.4:prompt"
 
 
 def test_run_text_retries_selected_provider_twice_before_success(tmp_path, monkeypatch):
@@ -101,7 +101,7 @@ def test_run_text_retries_selected_provider_twice_before_success(tmp_path, monke
         process_chain=[],
     )
 
-    assert result == "codex-cli:gpt-5.4-mini:prompt"
+    assert result == "codex-cli:gpt-5.4:prompt"
     assert flaky.attempts == 3
 
 

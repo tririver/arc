@@ -216,7 +216,7 @@ packaging/codex/arc/scripts/arc-mcp-codex
 packaging/claude/arc/scripts/arc-mcp-claude
 ```
 
-The wrappers set `ARC_AGENT_HOST`, `ARC_LLM_PROVIDER`, and default model
+The wrappers set `ARC_AGENT_HOST`, `ARC_LLM_PROVIDER`, and default model-tier
 environment variables before executing `arc-mcp`.
 
 When using the ARC skill, ask the agent in research terms. Examples:
@@ -540,7 +540,7 @@ ARC_AGENT_HOST                    Force host detection, for example codex or cla
 ARC_LLM_PROVIDER                  Force provider selection, for example codex-cli, claude-cli, deepseek, or manual.
 ARC_LLM_PROVIDER_CONFIG           Override the provider config file path.
 ARC_LLM_MODEL                     Override the exact model for any provider.
-ARC_LLM_MODEL_TIER                Select low, medium, or high model tier where supported.
+ARC_LLM_MODEL_TIER                Select low, medium, or high model tier where supported; defaults to medium.
 ARC_CODEX_MODEL                   Override the Codex built-in provider model.
 ARC_CODEX_MODEL_TIER              Override the Codex model tier.
 ARC_CLAUDE_MODEL                  Override the Claude built-in provider model.

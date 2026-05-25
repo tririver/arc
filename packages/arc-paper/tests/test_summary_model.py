@@ -1,12 +1,12 @@
 from arc_paper.summary.model import resolve_summary_model
 
 
-def test_codex_default_summary_model_is_mini():
-    assert resolve_summary_model("codex-cli", env={}) == "gpt-5.4-mini"
+def test_codex_default_summary_model_is_medium():
+    assert resolve_summary_model("codex-cli", env={}) == "gpt-5.4"
 
 
-def test_claude_default_summary_model_is_haiku():
-    assert resolve_summary_model("claude-cli", env={}) == "haiku"
+def test_claude_default_summary_model_is_medium():
+    assert resolve_summary_model("claude-cli", env={}) == "sonnet"
 
 
 def test_summary_model_precedence():

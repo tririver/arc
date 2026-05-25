@@ -16,11 +16,6 @@ PROVIDER_MODEL_TIER_ENV = {
     "claude-cli": "ARC_CLAUDE_MODEL_TIER",
 }
 
-DEFAULT_PROVIDER_MODELS = {
-    "codex-cli": "gpt-5.4-mini",
-    "claude-cli": "haiku",
-}
-
 PROVIDER_MODEL_TIERS = {
     "codex-cli": {
         "low": "gpt-5.3-codex-spark",
@@ -32,6 +27,13 @@ PROVIDER_MODEL_TIERS = {
         "medium": "sonnet",
         "high": "opus",
     },
+}
+
+DEFAULT_MODEL_TIER = "medium"
+
+DEFAULT_PROVIDER_MODELS = {
+    "codex-cli": PROVIDER_MODEL_TIERS["codex-cli"][DEFAULT_MODEL_TIER],
+    "claude-cli": PROVIDER_MODEL_TIERS["claude-cli"][DEFAULT_MODEL_TIER],
 }
 
 VALID_MODEL_TIERS = frozenset({"low", "medium", "high"})
@@ -83,7 +85,7 @@ def _resolve_tier(provider_name: str, explicit_tier: str | None, *, env: Mapping
     if tier is None:
         tier = env.get("ARC_LLM_MODEL_TIER")
     if tier is None or not str(tier).strip():
-        return None
+        return DEFAULT_MODEL_TIER
     normalized = str(tier).strip().lower()
     if normalized not in VALID_MODEL_TIERS:
         raise ModelTierError("model_tier must be one of: high, medium, low")

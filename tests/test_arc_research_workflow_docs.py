@@ -234,11 +234,11 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
     assert "| Round | IR | N | CN | SV | PL | WD | T |" in markdown
     assert "| Title | Total Mark | Rank |" not in markdown
     assert "| Loop | Round | Total | Intent Relevance | Novelty | Confidence | Value | Planning | Well-definedness |" in markdown
-    assert "## Appendix: Idea Details" in markdown
+    assert "# Appendix: Idea Details" in markdown
     assert "### 1. high novelty" in markdown
     assert "#### Referee Marks by Round" in markdown
     assert "#### Full Idea Verbatim" in markdown
-    assert "```text" in markdown
+    assert "```text" not in markdown
     assert "Title: high novelty" in markdown
     assert "Idea Summary:" in markdown
     assert "Calculation Plan:" in markdown
@@ -446,6 +446,18 @@ def test_suggest_ideas_proposer_templates_emphasize_marking_scheme_quality_check
         assert "without writing to optimize marks" in template
 
 
+def test_suggest_ideas_proposer_templates_request_report_ready_math() -> None:
+    for name in ["suggest-ideas-proposer.template.json", "suggest-ideas-no-info-proposer.template.json"]:
+        proposer = json.loads((WF / name).read_text(encoding="utf-8"))
+        template = proposer["prompt"]["template"]
+
+        assert "$ρ_E$" in template
+        assert "$T_{ab}$" in template
+        assert "$η_{SL}$" in template
+        assert "$$ΔT(0,b_{ref}) = ...$$" in template
+        assert "do not write ASCII placeholders" in template
+
+
 def test_suggest_ideas_proposer_schemas_are_codex_strict() -> None:
     proposer = json.loads((WF / "suggest-ideas-proposer.template.json").read_text(encoding="utf-8"))
     schema = proposer["output_schema"]
@@ -635,6 +647,10 @@ def test_adapter_scripts_use_installed_arc_mcp_without_repo_local_defaults() -> 
         assert "ARC_PAPER_CACHE" not in text
         assert "ARC_DOMAIN_CACHE" not in text
         assert 'exec arc-mcp "$@"' in text
+        assert "ARC_LLM_MODEL_TIER" not in text
+        assert f"ARC_{host.upper()}_MODEL=" not in text
+        assert f"ARC_{host.upper()}_MODEL_TIER=" in text
+        assert ":-medium}" in text
 
 
 def test_interaction_reference_allows_portable_typed_fallback() -> None:

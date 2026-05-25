@@ -79,7 +79,7 @@ def test_codex_cli_provider_writes_prompt_and_reads_output(monkeypatch):
     assert captured["input"] not in captured["cmd"]
 
 
-def test_codex_cli_provider_uses_mini_default_model(monkeypatch):
+def test_codex_cli_provider_uses_medium_default_model(monkeypatch):
     summary = valid_summary()
     captured = {}
 
@@ -95,7 +95,7 @@ def test_codex_cli_provider_uses_mini_default_model(monkeypatch):
 
     CodexCliProvider().generate_summary(llm_task())
 
-    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "gpt-5.4-mini"
+    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "gpt-5.4"
     assert captured["input"]
 
 
@@ -120,7 +120,7 @@ def test_claude_cli_provider_parses_json_stdout(monkeypatch):
     assert captured["input"] not in captured["cmd"]
 
 
-def test_claude_cli_provider_uses_haiku_default_model(monkeypatch):
+def test_claude_cli_provider_uses_medium_default_model(monkeypatch):
     summary = valid_summary()
     captured = {}
 
@@ -133,5 +133,5 @@ def test_claude_cli_provider_uses_haiku_default_model(monkeypatch):
 
     ClaudeCliProvider().generate_summary(llm_task())
 
-    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "haiku"
+    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "sonnet"
     assert captured["input"]

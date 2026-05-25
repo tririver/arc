@@ -242,6 +242,8 @@ high
 ```
 
 `arc-llm` maps these tiers to provider-specific model and reasoning defaults.
+When no exact model or tier is set, `arc-llm` defaults to the `medium` tier
+(`gpt-5.4` for the Codex/GPT provider).
 Exact model names are advanced overrides for project contexts that intentionally
 pin a provider model.
 

@@ -398,6 +398,28 @@ def test_configured_provider_model_resolution_uses_tiers_and_default(tmp_path):
     assert resolve_model("deepseek", "explicit", env=env) == "explicit"
 
 
+def test_configured_provider_default_uses_medium_tier_when_available(tmp_path):
+    path = write_config(
+        tmp_path,
+        [
+            {
+                "id": "openaiish",
+                "type": "openai-compatible",
+                "base_url": "https://api.openaiish.example/v1",
+                "api_key": "secret-value",
+                "models": {
+                    "default": "gpt-5.4-mini",
+                    "low": "gpt-5.3-codex-spark",
+                    "medium": "gpt-5.4",
+                    "high": "gpt-5.5",
+                },
+            }
+        ],
+    )
+
+    assert resolve_model("openaiish", env={"ARC_LLM_PROVIDER_CONFIG": path}) == "gpt-5.4"
+
+
 def test_select_provider_can_return_configured_provider(tmp_path):
     path = write_config(
         tmp_path,

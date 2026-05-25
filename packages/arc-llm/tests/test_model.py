@@ -15,9 +15,9 @@ def test_generic_env_is_fallback():
     assert resolve_model("claude-cli", env={"ARC_LLM_MODEL": "generic"}) == "generic"
 
 
-def test_fast_defaults():
-    assert resolve_model("codex-cli", env={}) == "gpt-5.4-mini"
-    assert resolve_model("claude-cli", env={}) == "haiku"
+def test_defaults_use_medium_tier():
+    assert resolve_model("codex-cli", env={}) == "gpt-5.4"
+    assert resolve_model("claude-cli", env={}) == "sonnet"
     assert resolve_model("manual", env={}) is None
 
 
