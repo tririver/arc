@@ -2,9 +2,6 @@
 0_ref/
 cache/
 arc-tests/
-0911.3380/
-2001.00868_x_1501.06570/
-2306.05448/
 
 # Local secrets and provider credentials
 .env
