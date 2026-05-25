@@ -49,6 +49,8 @@ Typeset tools:
 
 ```text
 md2pdf
+translate
+batch_translate
 ```
 
 Job and doctor tools:
@@ -64,7 +66,9 @@ doctor_cache
 ```
 
 Tools that may invoke a host LLM provider use the `llm_` prefix.
-`md2pdf` always starts a background job and returns immediately.
+`md2pdf`, `translate`, and `batch_translate` always start background jobs and
+return immediately. Translation defaults to Chinese and low-tier LLMs unless
+the user asks for another language, locale, model, or quality pass.
 
 ## Background Jobs
 
@@ -80,6 +84,8 @@ Examples:
 
 ```text
 md2pdf(input="<project-dir>/report.md")
+translate(input="<project-dir>/report.md")
+batch_translate(project_dir="<project-dir>")
 llm_infer_main_references(text="<user-intent>", background=true)
 llm_generate_summary(paper_id="<seed-paper>", provider="auto", background=true)
 llm_domain_build(seed_paper="<seed-paper>", intent="<user-intent>", background=true)

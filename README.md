@@ -117,10 +117,24 @@ Convert a Markdown report to PDF:
 arc-typeset md2pdf <report>.md --json
 ```
 
+Translate a Markdown report to Chinese and automatically convert the
+translation to PDF:
+
+```bash
+arc-typeset translate <report>.md --json
+```
+
+Batch translate project reports when `<name>.md` and `<name>.pdf` appear in
+the same folder and `<name>.zh_CN.pdf` is missing:
+
+```bash
+arc-typeset batch-translate <project-dir> --json
+```
+
 The same converter is available from MCP as `md2pdf`.
-The MCP `md2pdf` tool always starts a background job and returns a `job_id`
-immediately; use `job_status`/`job_result` or `arc-mcp jobs watch <job_id>
---json` to inspect completion.
+The MCP `md2pdf`, `translate`, and `batch_translate` tools always start
+background jobs and return a `job_id` immediately; use `job_status`/`job_result`
+or `arc-mcp jobs watch <job_id> --json` to inspect completion.
 
 ## Configure LLM Providers
 

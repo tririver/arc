@@ -6,13 +6,13 @@
     "name": "ARC"
   },
   "license": "MIT",
-  "keywords": ["arc", "papers", "arxiv", "inspire", "research", "typesetting", "pdf"],
+  "keywords": ["arc", "papers", "arxiv", "inspire", "research", "typesetting", "pdf", "translation"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "ARC",
-    "shortDescription": "Paper query, research workflows, and PDF typesetting",
-    "longDescription": "Cache-first ar5iv and INSPIRE paper tools with LLM paper summaries, research-domain construction, and Markdown-to-PDF report typesetting.",
+    "shortDescription": "Paper query, research workflows, PDF typesetting, and translation",
+    "longDescription": "Cache-first ar5iv and INSPIRE paper tools with LLM paper summaries, research-domain construction, Markdown-to-PDF report typesetting, and report translation.",
     "developerName": "ARC",
     "category": "Productivity",
     "capabilities": ["Research", "MCP"],
@@ -21,7 +21,8 @@
       "Get references for a paper",
       "Build a research domain from arXiv:0911.3380",
       "Create a paper summary batch",
-      "Convert a Markdown report to PDF"
+      "Convert a Markdown report to PDF",
+      "Translate a Markdown report to Chinese"
     ]
   }
 }
