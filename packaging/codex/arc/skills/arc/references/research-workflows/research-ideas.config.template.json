@@ -14,6 +14,10 @@
     "provider": "deepseek",
     "model": null,
     "model_tier": "high",
-    "allow_tools": false
+    "allow_tools": true,
+    "runtime": {
+      "allow_internet": true,
+      "allow_mcp": false
+    }
   }
 }

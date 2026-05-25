@@ -38,6 +38,7 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
     }
     seen_batch_configs: list[dict[str, Any]] = []
     seen_global_proposals: list[dict[str, Any]] = []
+    seen_global_contexts: list[dict[str, Any]] = []
 
     def fake_batch_runner(
         batch_config: dict[str, Any],
@@ -74,12 +75,13 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
                     },
                     "review_payload": {
                         "marks": {
-                            "evidence_of_novelty": 20 + round_number,
                             "user_intent_relevance": 20,
+                            "novelty": 10,
+                            "confidence_of_novelty": 10 + round_number,
                             "scientific_value": 10,
-                            "feasibility": 10,
-                            "first_calculation_clarity": 5,
-                            "total_score": 65 + round_number,
+                            "planning": 10,
+                            "problem_well_definedness": 10,
+                            "total_score": 70 + round_number,
                         },
                         "reviewer_benchmark": {
                             "same_direction_alternative": "benchmark",
@@ -119,16 +121,18 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
         env: dict[str, str],
     ) -> dict[str, Any]:
         context = _context_from_prompt(prompt)
+        seen_global_contexts.append(context)
         ideas = context["caller_context"]["ideas"]
         seen_global_proposals.extend(ideas)
         reviews = {
             idea["idea_id"]: {
                 "marks": {
-                    "evidence_of_novelty": 30,
-                    "user_intent_relevance": 30,
+                    "user_intent_relevance": 25,
+                    "novelty": 15,
+                    "confidence_of_novelty": 15,
                     "scientific_value": 15,
-                    "feasibility": 15,
-                    "first_calculation_clarity": 10,
+                    "planning": 15,
+                    "problem_well_definedness": 15,
                     "total_score": 100,
                 },
                 "main_concerns": [],
@@ -168,6 +172,13 @@ def test_research_ideas_runs_five_round_loops_then_global_review(tmp_path: Path)
     assert {loop["max_rounds"] for loop in batch_config["loops"]} == {5}
     assert all(loop["early_stop"]["enabled"] is False for loop in batch_config["loops"])
     assert all(loop["reviewers"][0]["output_schema"]["properties"]["schema_version"]["const"] == "arc.llm.review_envelope.v1" for loop in batch_config["loops"])
+    assert all("marking_scheme" in loop["caller_context"] for loop in batch_config["loops"])
+    mark_schema = batch_config["loops"][0]["reviewers"][0]["output_schema"]["properties"]["review_payload"]["properties"]["marks"]
+    assert "confidence_of_novelty" in mark_schema["required"]
+    assert "evidence_of_novelty" not in mark_schema["required"]
+    assert mark_schema["properties"]["user_intent_relevance"]["maximum"] == 25
+    assert mark_schema["properties"]["problem_well_definedness"]["maximum"] == 15
+    assert seen_global_contexts[0]["caller_context"]["marking_scheme"]["total_score"]["maximum"] == 100
     assert {idea["proposal"]["title"] for idea in seen_global_proposals} == {
         "domain_idea_001 round 5",
         "no_info_idea_001 round 5",

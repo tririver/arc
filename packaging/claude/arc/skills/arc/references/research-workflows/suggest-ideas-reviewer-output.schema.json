@@ -62,47 +62,7 @@
       "properties": {
         "marks": {
           "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "evidence_of_novelty",
-            "feasibility",
-            "scientific_value",
-            "user_intent_relevance",
-            "first_calculation_clarity",
-            "total_score"
-          ],
-          "properties": {
-            "evidence_of_novelty": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 30
-            },
-            "feasibility": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 15
-            },
-            "scientific_value": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 15
-            },
-            "user_intent_relevance": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 30
-            },
-            "first_calculation_clarity": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 10
-            },
-            "total_score": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 100
-            }
-          }
+          "$comment": "Generated from suggest-ideas-marking-scheme.json by research_ideas_runner.py."
         },
         "reviewer_benchmark": {
           "type": "object",

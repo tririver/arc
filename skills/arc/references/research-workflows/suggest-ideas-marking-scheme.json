@@ -1,0 +1,63 @@
+{
+  "schema_version": "arc.workflow.research_ideas.marking_scheme.v1",
+  "marks": [
+    {
+      "field": "user_intent_relevance",
+      "label": "Intent Relevance",
+      "minimum": 0,
+      "maximum": 25,
+      "guidance": "Score alignment with the full user intent, including the requested calculation, target domain, constraints, and practical research goal. Do not give high marks for matching isolated keywords while drifting from the user's scientific setting."
+    },
+    {
+      "field": "novelty",
+      "label": "Novelty",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score how publishable the idea would be if worked out successfully. Give 15 if it should be publishable in a top journal of the field. Give 0 if it could not be published anywhere. Do not give extra marks for ideas beyond top-journal novelty; overly creative ideas are not more useful for the current agent workflow."
+    },
+    {
+      "field": "confidence_of_novelty",
+      "label": "Confidence",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score only the evidence that this work has not already been done, not how good the idea is. Give 0 when you are sure it has been done, and 15 when you are sure it is new. Search the internet and, when available, ARC paper tools before assigning this mark; do not rely only on memory. If runtime restrictions prevent new searches, use the supplied search evidence and state the limitation."
+    },
+    {
+      "field": "scientific_value",
+      "label": "Value",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether a leading researcher in this research domain should read the resulting paper if the idea is worked out. Give 15 if it would be a must-read, 10 if it would be good-to-know, and 0 if you would never want to read it."
+    },
+    {
+      "field": "planning",
+      "label": "Planning",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether the question is broken into good-enough pieces where each piece is easy enough to be done by an AI agent."
+    },
+    {
+      "field": "problem_well_definedness",
+      "label": "Well-definedness",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether the question is set up sharply enough. Give 15 if the problem is completely well-defined and a calculation can be set up directly from the problem setup."
+    }
+  ],
+  "total_score": {
+    "field": "total_score",
+    "label": "Total",
+    "minimum": 0,
+    "maximum": 100,
+    "guidance": "Set total_score to the closest integer after summing all listed marks. Rank ideas by total_score on one common scale."
+  },
+  "tie_break_order": [
+    "total_score",
+    "user_intent_relevance",
+    "novelty",
+    "confidence_of_novelty",
+    "scientific_value",
+    "planning",
+    "problem_well_definedness"
+  ]
+}

@@ -5,18 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 
-MARK_FIELDS = [
-    "evidence_of_novelty",
-    "user_intent_relevance",
-    "scientific_value",
-    "feasibility",
-    "first_calculation_clarity",
-    "total_score",
-]
+WORKFLOW_DIR = Path(__file__).resolve().parents[1]
+if str(WORKFLOW_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKFLOW_DIR))
+
+from research_ideas_marking import normalized_marks, rank_key_from_marks, report_columns  # noqa: E402
 
 
 def main() -> None:
@@ -83,18 +81,10 @@ def _round_entry(loop_root: Path, round_root: Path) -> dict[str, Any] | None:
         "loop_id": loop_root.name,
         "round": _round_number(round_root),
         "title": str(proposer_output.get("title", "")),
-        "marks": _normalized_marks(marks),
+        "marks": normalized_marks(marks),
         "proposer_output_path": relative(proposer_output_path),
         "review_path": relative(review_path),
     }
-
-
-def _normalized_marks(marks: dict[str, Any]) -> dict[str, Any]:
-    normalized = {field: marks.get(field) for field in MARK_FIELDS}
-    if normalized.get("user_intent_relevance") is None:
-        normalized["user_intent_relevance"] = marks.get("user_intent_fit")
-    return normalized
-
 
 def _first_json(root: Path) -> Path | None:
     if not root.is_dir():
@@ -118,38 +108,37 @@ def _round_number(round_root: Path) -> int:
 
 
 def _rank_key(entry: dict[str, Any]) -> tuple[float, ...]:
-    marks = entry["marks"]
-    tie_break_order = [
-        "total_score",
-        "evidence_of_novelty",
-        "user_intent_relevance",
-        "scientific_value",
-        "feasibility",
-        "first_calculation_clarity",
-    ]
-    return tuple(float(marks.get(field) or 0.0) for field in tie_break_order) + (float(entry["round"]),)
+    return rank_key_from_marks(entry["marks"], round_number=entry["round"])
 
 
 def markdown_table(payload: dict[str, Any]) -> str:
+    columns = report_columns()
+    mark_headers = " | ".join(column["label"] for column in columns)
+    mark_separator = "|".join("---:" for _ in columns)
     lines = [
-        "| Rank | Loop | Round | Total | Novelty | Intent Relevance | Value | Feasibility | Clarity | Title |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        f"| Rank | Loop | Round | {mark_headers} | Title |",
+        f"|---:|---|---:|{mark_separator}|---|",
     ]
     for entry in payload["ranking"]:
         marks = entry["marks"]
         title = entry["title"].replace("|", "/")
+        mark_values = " | ".join(_format_mark(marks.get(column["field"])) for column in columns)
         lines.append(
-            "| {rank} | {loop_id} | {round} | {total_score:g} | {evidence_of_novelty:g} | "
-            "{user_intent_relevance:g} | {scientific_value:g} | {feasibility:g} | "
-            "{first_calculation_clarity:g} | {title} |".format(
+            "| {rank} | {loop_id} | {round} | {mark_values} | {title} |".format(
                 rank=entry["rank"],
                 loop_id=entry["loop_id"],
                 round=entry["round"],
+                mark_values=mark_values,
                 title=title,
-                **marks,
             )
         )
     return "\n".join(lines)
+
+
+def _format_mark(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    return ""
 
 
 if __name__ == "__main__":

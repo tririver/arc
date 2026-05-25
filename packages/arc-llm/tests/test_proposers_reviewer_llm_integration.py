@@ -10,28 +10,51 @@ import pytest
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 
 
+PROPOSER_IDS = ("proposer_001", "proposer_002", "proposer_003")
+START_VALUES = {"proposer_001": 1, "proposer_002": 2, "proposer_003": 3}
+INCREMENTS = {"proposer_001": 1, "proposer_002": 2, "proposer_003": 3}
+REVIEW_MESSAGES = {
+    proposer_id: f"Add {increment} to your current number next round."
+    for proposer_id, increment in INCREMENTS.items()
+}
+EXPECTED_VALUES_BY_ROUND = {
+    1: {"proposer_001": 1, "proposer_002": 2, "proposer_003": 3},
+    2: {"proposer_001": 2, "proposer_002": 4, "proposer_003": 6},
+    3: {"proposer_001": 3, "proposer_002": 6, "proposer_003": 9},
+}
+
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("ARC_RUN_LLM_TESTS") != "1" or os.environ.get("ARC_RUN_NET_TESTS") != "1",
     reason="true LLM integration test; set ARC_RUN_LLM_TESTS=1 and ARC_RUN_NET_TESTS=1 to run",
 )
 
 
-def test_true_llm_two_proposers_follow_add_one_review_for_three_rounds(tmp_path):
-    config = _true_llm_add_one_config(tmp_path)
+def test_true_llm_three_proposers_follow_targeted_reviews_for_three_rounds(tmp_path):
+    config = _true_llm_targeted_addition_config(tmp_path)
 
     result = run_proposers_reviewer_batch(config)
 
-    values_by_round = _read_values_by_round(tmp_path / "llm-runs" / "true_llm_add_one")
+    outputs_by_round = _read_outputs_by_round(tmp_path / "llm-runs" / "true_llm_targeted_additions")
+    values_by_round = {
+        round_number: {proposer_id: output["value"] for proposer_id, output in outputs.items()}
+        for round_number, outputs in outputs_by_round.items()
+    }
+    received_messages_by_round = {
+        round_number: {proposer_id: output["received_reviewer_message"] for proposer_id, output in outputs.items()}
+        for round_number, outputs in outputs_by_round.items()
+    }
     assert result["status"] == "completed"
     assert result["loops"][0]["rounds_completed"] == 3
-    assert values_by_round == {
-        1: {"proposer_001": 1, "proposer_002": 1},
-        2: {"proposer_001": 2, "proposer_002": 2},
-        3: {"proposer_001": 3, "proposer_002": 3},
+    assert values_by_round == EXPECTED_VALUES_BY_ROUND
+    assert received_messages_by_round == {
+        1: {"proposer_001": "none", "proposer_002": "none", "proposer_003": "none"},
+        2: REVIEW_MESSAGES,
+        3: REVIEW_MESSAGES,
     }
 
 
-def _true_llm_add_one_config(tmp_path: Path) -> dict[str, Any]:
+def _true_llm_targeted_addition_config(tmp_path: Path) -> dict[str, Any]:
     provider = os.environ.get("ARC_LLM_TEST_PROVIDER", "codex-cli")
     model = os.environ.get("ARC_LLM_TEST_MODEL")
     defaults: dict[str, Any] = {
@@ -49,7 +72,7 @@ def _true_llm_add_one_config(tmp_path: Path) -> dict[str, Any]:
 
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
-        "run_id": "true_llm_add_one",
+        "run_id": "true_llm_targeted_additions",
         "run_dir": str(tmp_path / "llm-runs"),
         "max_concurrent_loops": 1,
         "defaults": defaults,
@@ -60,14 +83,12 @@ def _true_llm_add_one_config(tmp_path: Path) -> dict[str, Any]:
                 "early_stop": {"enabled": False},
                 "caller_context": {
                     "task": (
-                        "This is a deterministic integration test. Each proposer starts at 1. "
-                        "After each reviewer request to add 1, that proposer must add exactly 1."
+                        "This is a deterministic integration test for reviewer-to-proposer routing. "
+                        "The proposers start at different values and must use only the latest "
+                        "reviewer message addressed to their own worker_id."
                     )
                 },
-                "proposers": [
-                    _proposer_config("proposer_001"),
-                    _proposer_config("proposer_002"),
-                ],
+                "proposers": [_proposer_config(proposer_id) for proposer_id in PROPOSER_IDS],
                 "reviewers": [_reviewer_config()],
             }
         ],
@@ -81,10 +102,18 @@ def _proposer_config(worker_id: str) -> dict[str, Any]:
             "system": "You are a deterministic arithmetic worker in a test. Follow instructions exactly.",
             "template": (
                 "Return JSON only. Your worker_id is {worker_id}. The current round is {round_number}.\n"
-                "Rule: in round 1, set value to 1. In later rounds, inspect the ARC Worker Context "
-                "correspondence for the latest proposer_message addressed to your worker_id. If it says "
-                "'Add 1 to your current number next round.', find your latest prior proposer_output value "
-                "and set value to that value plus 1. Do not add anything else."
+                "Round 1 rule: set value to your assigned starting value: proposer_001 starts at 1, "
+                "proposer_002 starts at 2, and proposer_003 starts at 3. In round 1 return "
+                "previous_value=0, applied_increment=0, received_reviewer_message='none', and "
+                "followed_instruction=true.\n"
+                "Later-round rule: inspect the ARC Worker Context correspondence. Find the latest "
+                "proposer_message whose worker_id exactly equals your worker_id. Ignore messages for "
+                "other worker_ids. Copy that message string exactly into received_reviewer_message. It "
+                "will be one of: 'Add 1 to your current number next round.', 'Add 2 to your current "
+                "number next round.', or 'Add 3 to your current number next round.'. Extract the "
+                "number N from your own message, find your latest prior proposer_output value, set "
+                "previous_value to that prior value, set applied_increment to N, and set value to "
+                "previous_value + N. Do not use round_number to compute value."
             ),
         },
         "output_schema": {
@@ -94,9 +123,20 @@ def _proposer_config(worker_id: str) -> dict[str, Any]:
                 "worker_id": {"type": "string"},
                 "round": {"type": "integer"},
                 "value": {"type": "integer"},
+                "previous_value": {"type": "integer"},
+                "applied_increment": {"type": "integer"},
+                "received_reviewer_message": {"type": "string"},
                 "followed_instruction": {"type": "boolean"},
             },
-            "required": ["worker_id", "round", "value", "followed_instruction"],
+            "required": [
+                "worker_id",
+                "round",
+                "value",
+                "previous_value",
+                "applied_increment",
+                "received_reviewer_message",
+                "followed_instruction",
+            ],
         },
     }
 
@@ -108,9 +148,11 @@ def _reviewer_config() -> dict[str, Any]:
             "system": "You are a deterministic arithmetic reviewer in a test. Follow instructions exactly.",
             "template": (
                 "Return JSON only using the required review envelope. Inspect current_proposer_outputs. "
-                "For every proposer id present, send exactly this proposer message: "
-                "'Add 1 to your current number next round.' Never request early stop. Put current values "
-                "in review_payload.current_values and set review_payload.request to 'add 1'."
+                "For each proposer id, send exactly the message assigned to that proposer: proposer_001 "
+                "gets 'Add 1 to your current number next round.', proposer_002 gets 'Add 2 to your "
+                "current number next round.', and proposer_003 gets 'Add 3 to your current number next "
+                "round.'. Never request early stop. Put current values in review_payload.current_values "
+                "and the exact message map in review_payload.requests."
             ),
         },
         "output_schema": {
@@ -132,27 +174,35 @@ def _reviewer_config() -> dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "proposer_001": _review_message_schema(),
-                        "proposer_002": _review_message_schema(),
+                        "proposer_001": _review_message_schema(REVIEW_MESSAGES["proposer_001"]),
+                        "proposer_002": _review_message_schema(REVIEW_MESSAGES["proposer_002"]),
+                        "proposer_003": _review_message_schema(REVIEW_MESSAGES["proposer_003"]),
                     },
-                    "required": ["proposer_001", "proposer_002"],
+                    "required": list(PROPOSER_IDS),
                 },
                 "review_payload": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "request": {"type": "string", "const": "add 1"},
+                        "requests": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                proposer_id: {"type": "string", "const": message}
+                                for proposer_id, message in REVIEW_MESSAGES.items()
+                            },
+                            "required": list(PROPOSER_IDS),
+                        },
                         "current_values": {
                             "type": "object",
                             "additionalProperties": False,
                             "properties": {
-                                "proposer_001": {"type": "integer"},
-                                "proposer_002": {"type": "integer"},
+                                proposer_id: {"type": "integer"} for proposer_id in PROPOSER_IDS
                             },
-                            "required": ["proposer_001", "proposer_002"],
+                            "required": list(PROPOSER_IDS),
                         },
                     },
-                    "required": ["request", "current_values"],
+                    "required": ["requests", "current_values"],
                 },
             },
             "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
@@ -160,21 +210,21 @@ def _reviewer_config() -> dict[str, Any]:
     }
 
 
-def _review_message_schema() -> dict[str, Any]:
+def _review_message_schema(message: str) -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"message": {"type": "string"}},
+        "properties": {"message": {"type": "string", "const": message}},
         "required": ["message"],
     }
 
 
-def _read_values_by_round(run_root: Path) -> dict[int, dict[str, int]]:
-    values_by_round: dict[int, dict[str, int]] = {}
+def _read_outputs_by_round(run_root: Path) -> dict[int, dict[str, dict[str, Any]]]:
+    outputs_by_round: dict[int, dict[str, dict[str, Any]]] = {}
     for round_number in (1, 2, 3):
         round_root = run_root / "loops" / "loop_001" / "rounds" / f"round_{round_number:03d}"
-        values_by_round[round_number] = {
-            proposer_id: json.loads((round_root / "proposer_outputs" / f"{proposer_id}.json").read_text())["value"]
-            for proposer_id in ("proposer_001", "proposer_002")
+        outputs_by_round[round_number] = {
+            proposer_id: json.loads((round_root / "proposer_outputs" / f"{proposer_id}.json").read_text())
+            for proposer_id in PROPOSER_IDS
         }
-    return values_by_round
+    return outputs_by_round

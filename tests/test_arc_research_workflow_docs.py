@@ -173,6 +173,7 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
         ("idea_001", 2, "better"),
     ]
     assert ranking[0]["marks"]["user_intent_relevance"] == 6
+    assert ranking[0]["marks"]["confidence_of_novelty"] == 7
     assert "user_intent_fit" not in ranking[0]["marks"]
 
     markdown = subprocess.run(
@@ -187,18 +188,47 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
         capture_output=True,
         text=True,
     ).stdout
-    assert "| Rank | Loop | Round | Total | Novelty | Intent Relevance | Value | Feasibility | Clarity | Title |" in markdown
+    assert "| Rank | Loop | Round | Total | Intent Relevance | Novelty | Confidence | Value | Planning | Well-definedness | Title |" in markdown
     assert "user_intent_fit" not in markdown
 
 
-def test_suggest_ideas_report_delivery_uses_ranking_script_and_handoff_prompt() -> None:
-    for name in ["suggest-ideas.md", "suggest-ideas-no-info.md"]:
-        text = (WF / name).read_text(encoding="utf-8")
-        assert "scripts/rank-suggested-ideas.py" in text
-        assert "Ranked Selected Ideas" in text
-        assert "Next-phase research prompt" in text
-        assert "Preserve the selected round's structured proposer output" in text
-        assert "unchanged" in text
+def test_suggest_ideas_marking_scheme_is_centralized() -> None:
+    scheme = json.loads((WF / "suggest-ideas-marking-scheme.json").read_text(encoding="utf-8"))
+    reviewer_schema_text = (WF / "suggest-ideas-reviewer-output.schema.json").read_text(encoding="utf-8")
+    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
+
+    fields = [item["field"] for item in scheme["marks"]]
+    maxima = {item["field"]: item["maximum"] for item in scheme["marks"]}
+
+    assert fields == [
+        "user_intent_relevance",
+        "novelty",
+        "confidence_of_novelty",
+        "scientific_value",
+        "planning",
+        "problem_well_definedness",
+    ]
+    assert maxima == {
+        "user_intent_relevance": 25,
+        "novelty": 15,
+        "confidence_of_novelty": 15,
+        "scientific_value": 15,
+        "planning": 15,
+        "problem_well_definedness": 15,
+    }
+    assert sum(maxima.values()) == scheme["total_score"]["maximum"] == 100
+    assert "evidence_of_novelty" not in reviewer_schema_text
+    assert "0-30 scale" not in reviewer["prompt"]["template"]
+    assert "marking_scheme" in reviewer["prompt"]["template"]
+
+
+def test_research_ideas_workflow_points_to_active_runner_and_global_review() -> None:
+    text = (WF / "research-ideas.md").read_text(encoding="utf-8")
+
+    assert "research_ideas_runner.py" in text
+    assert "global reviewer" in text
+    assert "<project-dir>/research-ideas/<run-id>/research-ideas.md" in text
+    assert "<project-dir>/research-ideas.md" in text
 
 
 def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:
@@ -215,46 +245,61 @@ def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:
         assert schema_version in markdown
 
 
-def test_suggest_ideas_references_reviewer_template() -> None:
-    normal = (WF / "suggest-ideas.md").read_text(encoding="utf-8")
+def test_suggest_ideas_loop_reviewer_template_has_arc_only_access() -> None:
     reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
 
-    assert "suggest-ideas-reviewer.template.json" in normal
     assert reviewer["id"] == "reviewer_001"
     assert reviewer["runtime"]["allow_mcp"] is True
     assert reviewer["runtime"]["mcp_mode"] == "arc-only"
 
 
 def test_suggest_ideas_reviewer_uses_hundred_point_marking_scheme() -> None:
-    schema = json.loads((WF / "suggest-ideas-reviewer-output.schema.json").read_text(encoding="utf-8"))
-    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
-    marks = schema["properties"]["review_payload"]["properties"]["marks"]
-    mark_properties = marks["properties"]
+    sys.path.insert(0, str(WF))
+    try:
+        config_module = importlib.import_module("research_ideas_config")
+        runner_module = importlib.import_module("research_ideas_runner")
+    finally:
+        sys.path.remove(str(WF))
 
-    assert "user_intent_relevance" in marks["required"]
-    assert "user_intent_fit" not in marks["required"]
-    assert mark_properties["evidence_of_novelty"]["minimum"] == 0
-    assert mark_properties["evidence_of_novelty"]["maximum"] == 30
+    config = config_module.load_research_ideas_config(
+        {
+            "schema_version": "arc.workflow.research_ideas.config.v1",
+            "run_id": "test",
+            "run_dir": "/tmp/arc-test",
+            "project_dir": "/tmp/arc-test-project",
+            "user_intent": "intent",
+            "variant_config_dir": str(WF),
+        }
+    )
+    reviewer_payload = runner_module._loop_reviewer_payload(config.variants[0])
+    marks = reviewer_payload["output_schema"]["properties"]["review_payload"]["properties"]["marks"]
+    mark_properties = marks["properties"]
+    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
+
+    assert marks["required"] == [
+        "user_intent_relevance",
+        "novelty",
+        "confidence_of_novelty",
+        "scientific_value",
+        "planning",
+        "problem_well_definedness",
+        "total_score",
+    ]
     assert mark_properties["user_intent_relevance"]["minimum"] == 0
-    assert mark_properties["user_intent_relevance"]["maximum"] == 30
+    assert mark_properties["user_intent_relevance"]["maximum"] == 25
+    assert mark_properties["novelty"]["maximum"] == 15
+    assert mark_properties["confidence_of_novelty"]["maximum"] == 15
     assert mark_properties["scientific_value"]["minimum"] == 0
     assert mark_properties["scientific_value"]["maximum"] == 15
-    assert mark_properties["feasibility"]["minimum"] == 0
-    assert mark_properties["feasibility"]["maximum"] == 15
-    assert mark_properties["first_calculation_clarity"]["minimum"] == 0
-    assert mark_properties["first_calculation_clarity"]["maximum"] == 10
+    assert mark_properties["planning"]["minimum"] == 0
+    assert mark_properties["planning"]["maximum"] == 15
+    assert mark_properties["problem_well_definedness"]["minimum"] == 0
+    assert mark_properties["problem_well_definedness"]["maximum"] == 15
     assert mark_properties["total_score"]["minimum"] == 0
     assert mark_properties["total_score"]["maximum"] == 100
-    assert "user_intent_relevance" in reviewer["prompt"]["template"]
-    assert "0-30 scale" in reviewer["prompt"]["template"]
-    assert "0-15 scale" in reviewer["prompt"]["template"]
-    assert "0-10 scale" in reviewer["prompt"]["template"]
-    assert "full user intent" in reviewer["prompt"]["template"]
-    assert "Calibrate each mark as a percentage" in reviewer["prompt"]["template"]
-    assert "Ordinary competent ideas should be around 60%" in reviewer["prompt"]["template"]
-    assert "Do not be afraid to assign less than 60%" in reviewer["prompt"]["template"]
-    assert "Above 90% in any dimension" in reviewer["prompt"]["template"]
-    assert "Set total_score to the closest integer" in reviewer["prompt"]["template"]
+    assert "marking_scheme" in reviewer["prompt"]["template"]
+    assert "confidence_of_novelty" not in reviewer["prompt"]["template"]
+    assert "evidence_of_novelty" not in reviewer["prompt"]["template"]
     assert "user_intent_fit" not in reviewer["prompt"]["template"]
 
 
@@ -272,25 +317,28 @@ def test_research_ideas_global_reviewer_uses_hundred_point_marking_scheme() -> N
     mark_properties = marks["properties"]
     ranking_score = schema["properties"]["ranking"]["items"]["properties"]["total_score"]
 
-    assert "0-30 scale" in reviewer.template
-    assert "0-15 scale" in reviewer.template
-    assert "0-10 scale" in reviewer.template
-    assert "0-100" in reviewer.template
-    assert "Calibrate each mark as a percentage" in reviewer.template
-    assert "Ordinary competent ideas should be around 60%" in reviewer.template
-    assert "Do not be afraid to assign less than 60%" in reviewer.template
-    assert "Above 90% in any dimension" in reviewer.template
-    assert "Set total_score to the closest integer" in reviewer.template
-    assert mark_properties["evidence_of_novelty"]["minimum"] == 0
-    assert mark_properties["evidence_of_novelty"]["maximum"] == 30
+    assert "marking_scheme" in reviewer.template
+    assert "evidence_of_novelty" not in reviewer.template
+    assert "confidence_of_novelty" not in reviewer.template
+    assert marks["required"] == [
+        "user_intent_relevance",
+        "novelty",
+        "confidence_of_novelty",
+        "scientific_value",
+        "planning",
+        "problem_well_definedness",
+        "total_score",
+    ]
     assert mark_properties["user_intent_relevance"]["minimum"] == 0
-    assert mark_properties["user_intent_relevance"]["maximum"] == 30
+    assert mark_properties["user_intent_relevance"]["maximum"] == 25
+    assert mark_properties["novelty"]["maximum"] == 15
+    assert mark_properties["confidence_of_novelty"]["maximum"] == 15
     assert mark_properties["scientific_value"]["minimum"] == 0
     assert mark_properties["scientific_value"]["maximum"] == 15
-    assert mark_properties["feasibility"]["minimum"] == 0
-    assert mark_properties["feasibility"]["maximum"] == 15
-    assert mark_properties["first_calculation_clarity"]["minimum"] == 0
-    assert mark_properties["first_calculation_clarity"]["maximum"] == 10
+    assert mark_properties["planning"]["minimum"] == 0
+    assert mark_properties["planning"]["maximum"] == 15
+    assert mark_properties["problem_well_definedness"]["minimum"] == 0
+    assert mark_properties["problem_well_definedness"]["maximum"] == 15
     assert mark_properties["total_score"]["minimum"] == 0
     assert mark_properties["total_score"]["maximum"] == 100
     assert ranking_score["minimum"] == 0
@@ -298,14 +346,13 @@ def test_research_ideas_global_reviewer_uses_hundred_point_marking_scheme() -> N
 
 
 def test_suggest_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:
-    text = (WF / "suggest-ideas.md").read_text(encoding="utf-8")
     batch = json.loads((WF / "suggest-ideas-batch.template.json").read_text(encoding="utf-8"))
+    variant = json.loads((WF / "suggest-ideas-domain.variant.json").read_text(encoding="utf-8"))
     loop = json.loads((WF / "suggest-ideas-loop.template.json").read_text(encoding="utf-8"))
     proposer = json.loads((WF / "suggest-ideas-proposer.template.json").read_text(encoding="utf-8"))
 
-    assert "suggest-ideas-batch.template.json" in text
-    assert "suggest-ideas-loop.template.json" in text
-    assert "suggest-ideas-proposer.template.json" in text
+    assert variant["loop_template"] == "suggest-ideas-loop.template.json"
+    assert variant["proposer_template"] == "suggest-ideas-proposer.template.json"
     assert batch["schema_version"] == "arc.llm.proposers_reviewer_batch.config.v1"
     assert batch["max_concurrent_loops"] == 10
     assert "domain_markdown_files" in loop["caller_context"]
@@ -411,11 +458,14 @@ def test_arc_skill_preserves_seed_domain_anchor_in_user_intent() -> None:
 
 
 def test_suggest_ideas_requires_domain_markdown_not_single_paper_summaries() -> None:
-    text = (WF / "suggest-ideas.md").read_text(encoding="utf-8")
+    variant = json.loads((WF / "suggest-ideas-domain.variant.json").read_text(encoding="utf-8"))
+    loop = json.loads((WF / "suggest-ideas-loop.template.json").read_text(encoding="utf-8"))
 
-    assert "domain Markdown" in text
-    assert "best-reference paper summaries" not in text
-    assert "single-paper LLM summaries" not in text
+    assert variant["context_policy"]["require_domain_markdown"] is True
+    assert variant["context_policy"]["attach_domain_markdown"] is True
+    assert "domain_markdown_files" in loop["caller_context"]
+    assert "best-reference paper summaries" not in json.dumps(loop)
+    assert "single-paper LLM summaries" not in json.dumps(loop)
 
 
 def test_packaged_skill_references_include_required_workflow_inputs() -> None:
@@ -424,12 +474,12 @@ def test_packaged_skill_references_include_required_workflow_inputs() -> None:
         Path("references/research-workflows/research-ideas.md"),
         Path("references/research-workflows/research-ideas.config.template.json"),
         Path("references/research-workflows/research_ideas_config.py"),
+        Path("references/research-workflows/research_ideas_marking.py"),
         Path("references/research-workflows/research_ideas_runner.py"),
-        Path("references/research-workflows/suggest-ideas.md"),
         Path("references/research-workflows/suggest-ideas-batch.template.json"),
         Path("references/research-workflows/suggest-ideas-domain.variant.json"),
         Path("references/research-workflows/suggest-ideas-loop.template.json"),
-        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-marking-scheme.json"),
         Path("references/research-workflows/suggest-ideas-no-info-loop.template.json"),
         Path("references/research-workflows/suggest-ideas-no-info-proposer.template.json"),
         Path("references/research-workflows/suggest-ideas-no-info.variant.json"),
@@ -457,12 +507,12 @@ def test_packaged_skill_references_stay_synced_with_source() -> None:
         Path("references/research-workflows/research-ideas.md"),
         Path("references/research-workflows/research-ideas.config.template.json"),
         Path("references/research-workflows/research_ideas_config.py"),
+        Path("references/research-workflows/research_ideas_marking.py"),
         Path("references/research-workflows/research_ideas_runner.py"),
-        Path("references/research-workflows/suggest-ideas.md"),
         Path("references/research-workflows/suggest-ideas-batch.template.json"),
         Path("references/research-workflows/suggest-ideas-domain.variant.json"),
         Path("references/research-workflows/suggest-ideas-loop.template.json"),
-        Path("references/research-workflows/suggest-ideas-no-info.md"),
+        Path("references/research-workflows/suggest-ideas-marking-scheme.json"),
         Path("references/research-workflows/suggest-ideas-no-info-loop.template.json"),
         Path("references/research-workflows/suggest-ideas-no-info-proposer.template.json"),
         Path("references/research-workflows/suggest-ideas-no-info.variant.json"),
@@ -525,11 +575,12 @@ def _write_idea_round(
     review_dir.mkdir(parents=True)
     (proposer_dir / "proposer_001.json").write_text(json.dumps({"title": title}), encoding="utf-8")
     marks = {
-        "evidence_of_novelty": novelty,
-        "feasibility": 3,
+        "novelty": novelty,
+        "confidence_of_novelty": 7,
+        "planning": 3,
         "scientific_value": 3,
         "user_intent_relevance": 6,
-        "first_calculation_clarity": 3,
+        "problem_well_definedness": 3,
         "total_score": total,
     }
     (review_dir / "reviewer_001.json").write_text(

@@ -110,7 +110,15 @@ class FakeJsonRunner:
         }
 
 
-class AddOneReviewRunner:
+TARGETED_START_VALUES = {"proposer_001": 1, "proposer_002": 2, "proposer_003": 3}
+TARGETED_INCREMENTS = {"proposer_001": 1, "proposer_002": 2, "proposer_003": 3}
+TARGETED_REVIEW_MESSAGES = {
+    proposer_id: f"Add {increment} to your current number next round."
+    for proposer_id, increment in TARGETED_INCREMENTS.items()
+}
+
+
+class TargetedArithmeticReviewRunner:
     def __call__(
         self,
         prompt: str,
@@ -131,35 +139,40 @@ class AddOneReviewRunner:
             return {
                 "schema_version": "arc.llm.review_envelope.v1",
                 "controller": {
-                    "message": "Both proposers must add 1 next round.",
+                    "message": "Each proposer must use only its addressed increment next round.",
                     "stop_requested": False,
                     "stop_reason": "",
                 },
                 "proposer_messages": {
-                    proposer_id: {"message": "Add 1 to your current number next round."}
+                    proposer_id: {"message": TARGETED_REVIEW_MESSAGES[proposer_id]}
                     for proposer_id in values
                 },
                 "review_payload": {
                     "round": round_number,
                     "current_values": values,
-                    "request": "add 1",
+                    "requests": {proposer_id: TARGETED_REVIEW_MESSAGES[proposer_id] for proposer_id in values},
                 },
             }
 
         previous = _latest_proposer_value(context["correspondence"], worker_id)
         review_message = _latest_proposer_message(context["correspondence"], worker_id)
         if previous is None:
-            value = 1
+            value = TARGETED_START_VALUES[worker_id]
+            increment = 0
             followed_review = False
-        elif review_message == "Add 1 to your current number next round.":
-            value = previous + 1
+        elif review_message == TARGETED_REVIEW_MESSAGES[worker_id]:
+            increment = TARGETED_INCREMENTS[worker_id]
+            value = previous + increment
             followed_review = True
         else:
+            increment = 0
             value = previous
             followed_review = False
         return {
             "worker_id": worker_id,
             "round": round_number,
+            "received_reviewer_message": review_message or "none",
+            "applied_increment": increment,
             "value": value,
             "followed_review": followed_review,
         }
@@ -258,30 +271,45 @@ def test_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
     assert error["message"] == "simulated provider failure"
 
 
-def test_two_proposers_follow_add_one_reviewer_request_for_three_rounds(tmp_path):
+def test_three_proposers_follow_targeted_reviewer_requests_for_three_rounds(tmp_path):
+    config = base_config(tmp_path, max_rounds=3)
+    third_proposer = json.loads(json.dumps(config["loops"][0]["proposers"][0]))
+    third_proposer["id"] = "proposer_003"
+    config["loops"][0]["proposers"].append(third_proposer)
+
     result = run_proposers_reviewer_batch(
-        base_config(tmp_path, max_rounds=3),
-        json_runner=AddOneReviewRunner(),
+        config,
+        json_runner=TargetedArithmeticReviewRunner(),
         base_env={},
     )
 
     run_root = tmp_path / "suggest-ideas" / "run_001"
     values_by_round = {}
+    received_messages_by_round = {}
     for round_number in (1, 2, 3):
         round_root = run_root / "loops" / "loop_001" / "rounds" / f"round_{round_number:03d}"
-        values_by_round[round_number] = {
-            "proposer_001": json.loads((round_root / "proposer_outputs" / "proposer_001.json").read_text())["value"],
-            "proposer_002": json.loads((round_root / "proposer_outputs" / "proposer_002.json").read_text())["value"],
+        proposer_outputs = {
+            proposer_id: json.loads((round_root / "proposer_outputs" / f"{proposer_id}.json").read_text())
+            for proposer_id in TARGETED_START_VALUES
+        }
+        values_by_round[round_number] = {proposer_id: output["value"] for proposer_id, output in proposer_outputs.items()}
+        received_messages_by_round[round_number] = {
+            proposer_id: output["received_reviewer_message"] for proposer_id, output in proposer_outputs.items()
         }
         review = json.loads((round_root / "reviews" / "reviewer_001.json").read_text())
-        assert review["review_payload"]["request"] == "add 1"
+        assert review["review_payload"]["requests"] == TARGETED_REVIEW_MESSAGES
 
     assert result["status"] == "completed"
     assert result["loops"][0]["rounds_completed"] == 3
     assert values_by_round == {
-        1: {"proposer_001": 1, "proposer_002": 1},
-        2: {"proposer_001": 2, "proposer_002": 2},
-        3: {"proposer_001": 3, "proposer_002": 3},
+        1: {"proposer_001": 1, "proposer_002": 2, "proposer_003": 3},
+        2: {"proposer_001": 2, "proposer_002": 4, "proposer_003": 6},
+        3: {"proposer_001": 3, "proposer_002": 6, "proposer_003": 9},
+    }
+    assert received_messages_by_round == {
+        1: {"proposer_001": "none", "proposer_002": "none", "proposer_003": "none"},
+        2: TARGETED_REVIEW_MESSAGES,
+        3: TARGETED_REVIEW_MESSAGES,
     }
 
 

@@ -22,6 +22,14 @@ from research_ideas_config import (
     VariantConfig,
     load_research_ideas_config,
 )
+from research_ideas_marking import (
+    load_marking_scheme,
+    marking_scheme_for_context,
+    marks_schema,
+    normalized_marks as normalize_scheme_marks,
+    rank_key_from_marks,
+    report_columns,
+)
 
 
 JsonRunner = Callable[..., dict[str, Any]]
@@ -208,6 +216,7 @@ def _caller_context(config: ResearchIdeasConfig, *, variant: VariantConfig, idea
     caller_context["user_intent"] = config.user_intent
     caller_context["variant_id"] = variant.variant_id
     caller_context["idea_id"] = idea_id
+    caller_context["marking_scheme"] = marking_scheme_for_context(load_marking_scheme(variant.path.parent))
     if variant.context_policy.attach_domain_markdown:
         markdown_files = _domain_markdown_files(config.project_dir / "domain")
         if variant.context_policy.require_domain_markdown and not markdown_files:
@@ -367,9 +376,16 @@ def _worker_payload(worker: WorkerConfig) -> dict[str, Any]:
 
 def _loop_reviewer_payload(variant: VariantConfig) -> dict[str, Any]:
     workflow_dir = variant.path.parent
+    scheme = load_marking_scheme(workflow_dir)
     payload = _read_json(workflow_dir / "suggest-ideas-reviewer.template.json")
-    payload["output_schema"] = _read_json(workflow_dir / "suggest-ideas-reviewer-output.schema.json")
+    payload["output_schema"] = _reviewer_output_schema(workflow_dir, scheme=scheme)
     return payload
+
+
+def _reviewer_output_schema(workflow_dir: Path, *, scheme: Mapping[str, Any]) -> dict[str, Any]:
+    schema = _read_json(workflow_dir / "suggest-ideas-reviewer-output.schema.json")
+    schema["properties"]["review_payload"]["properties"]["marks"] = marks_schema(scheme)
+    return schema
 
 
 def _selected_proposal_results(
@@ -480,15 +496,7 @@ def _first_json(root: Path) -> Path | None:
 
 
 def _normalized_marks(raw_marks: Any) -> dict[str, Any]:
-    marks = raw_marks if isinstance(raw_marks, Mapping) else {}
-    return {
-        "evidence_of_novelty": marks.get("evidence_of_novelty"),
-        "user_intent_relevance": marks.get("user_intent_relevance", marks.get("user_intent_fit")),
-        "scientific_value": marks.get("scientific_value"),
-        "feasibility": marks.get("feasibility"),
-        "first_calculation_clarity": marks.get("first_calculation_clarity"),
-        "total_score": marks.get("total_score"),
-    }
+    return normalize_scheme_marks(raw_marks)
 
 
 def _round_number(round_root: Path) -> int:
@@ -500,15 +508,7 @@ def _round_number(round_root: Path) -> int:
 
 def _round_rank_key(entry: Mapping[str, Any]) -> tuple[float, ...]:
     marks = entry.get("marks", {})
-    fields = [
-        "total_score",
-        "evidence_of_novelty",
-        "user_intent_relevance",
-        "scientific_value",
-        "feasibility",
-        "first_calculation_clarity",
-    ]
-    return tuple(float(marks.get(field) or 0.0) for field in fields) + (float(entry.get("round") or 0),)
+    return rank_key_from_marks(marks, round_number=float(entry.get("round") or 0))
 
 
 def _planned_loop_reviewer_call_count(ideas: list[IdeaPlan]) -> int:
@@ -537,7 +537,8 @@ def _run_global_review(
     process_chain: list[str] | None,
 ) -> dict[str, Any]:
     idea_ids = [item["idea_id"] for item in proposal_results]
-    schema = _global_review_schema(idea_ids)
+    scheme = load_marking_scheme(config.variant_config_dir)
+    schema = _global_review_schema(idea_ids, scheme=scheme)
     worker = WorkerConfig(
         id="global_reviewer",
         prompt=PromptConfig(system=config.reviewer.system, template=config.reviewer.template),
@@ -550,14 +551,15 @@ def _run_global_review(
     context = {
         "role": "research_ideas_global_reviewer",
         "worker_id": worker.id,
-        "caller_context": {
-            "user_intent": config.user_intent,
-            "review_scope": "all_final_ideas",
-            "instructions": [
-                "Review every idea_id exactly once.",
-                "Use one common scoring scale across all variants.",
-                "Use only supplied proposal records and included context; do not use tools.",
-            ],
+            "caller_context": {
+                "user_intent": config.user_intent,
+                "review_scope": "all_final_ideas",
+                "marking_scheme": marking_scheme_for_context(scheme),
+                "instructions": [
+                    "Review every idea_id exactly once.",
+                    "Use one common scoring scale across all variants.",
+                    "Use caller_context.marking_scheme as the sole source of mark fields, ranges, and guidance.",
+                ],
             "ideas": [
                 {
                     "idea_id": item["idea_id"],
@@ -614,7 +616,9 @@ def _call_json(
     )
 
 
-def _global_review_schema(idea_ids: list[str]) -> dict[str, Any]:
+def _global_review_schema(idea_ids: list[str], *, scheme: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    data = scheme or load_marking_scheme()
+    total = data["total_score"]
     return {
         "type": "object",
         "additionalProperties": False,
@@ -625,7 +629,7 @@ def _global_review_schema(idea_ids: list[str]) -> dict[str, Any]:
                 "type": "object",
                 "additionalProperties": False,
                 "required": idea_ids,
-                "properties": {idea_id: _review_item_schema() for idea_id in idea_ids},
+                "properties": {idea_id: _review_item_schema(data) for idea_id in idea_ids},
             },
             "ranking": {
                 "type": "array",
@@ -636,7 +640,11 @@ def _global_review_schema(idea_ids: list[str]) -> dict[str, Any]:
                     "properties": {
                         "rank": {"type": "integer"},
                         "idea_id": {"type": "string", "enum": idea_ids},
-                        "total_score": {"type": "number", "minimum": 0, "maximum": 100},
+                        "total_score": {
+                            "type": "number",
+                            "minimum": total["minimum"],
+                            "maximum": total["maximum"],
+                        },
                     },
                 },
             },
@@ -645,32 +653,13 @@ def _global_review_schema(idea_ids: list[str]) -> dict[str, Any]:
     }
 
 
-def _review_item_schema() -> dict[str, Any]:
+def _review_item_schema(scheme: Mapping[str, Any] | None = None) -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": True,
         "required": ["marks", "main_concerns", "evidence_checked", "selected_for_next_phase", "next_phase_prompt"],
         "properties": {
-            "marks": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": [
-                    "evidence_of_novelty",
-                    "user_intent_relevance",
-                    "scientific_value",
-                    "feasibility",
-                    "first_calculation_clarity",
-                    "total_score",
-                ],
-                "properties": {
-                    "evidence_of_novelty": {"type": "number", "minimum": 0, "maximum": 30},
-                    "user_intent_relevance": {"type": "number", "minimum": 0, "maximum": 30},
-                    "scientific_value": {"type": "number", "minimum": 0, "maximum": 15},
-                    "feasibility": {"type": "number", "minimum": 0, "maximum": 15},
-                    "first_calculation_clarity": {"type": "number", "minimum": 0, "maximum": 10},
-                    "total_score": {"type": "number", "minimum": 0, "maximum": 100},
-                },
-            },
+            "marks": marks_schema(scheme),
             "main_concerns": {"type": "array", "items": {"type": "string"}},
             "evidence_checked": {"type": "array", "items": {"type": "string"}},
             "selected_for_next_phase": {"type": "boolean"},
@@ -703,8 +692,12 @@ def _write_report(
     proposal_results: list[dict[str, Any]],
     review: Mapping[str, Any],
 ) -> Path:
+    scheme = load_marking_scheme(config.variant_config_dir)
+    columns = report_columns(scheme)
     review_items = review.get("reviews", {})
     ranking = review.get("ranking", [])
+    mark_header = " | ".join(column["label"] for column in columns)
+    mark_separator = "|".join("---:" for _ in columns)
     lines = [
         "# Research Ideas",
         "",
@@ -720,8 +713,8 @@ def _write_report(
             "",
             "## Ideas",
             "",
-            "| Idea ID | Variant | Selected Round | Title | Total | Novelty | Intent | Value | Feasibility | Clarity |",
-            "|---|---|---:|---|---:|---:|---:|---:|---:|---:|",
+            f"| Idea ID | Variant | Selected Round | Title | {mark_header} |",
+            f"|---|---|---:|---|{mark_separator}|",
         ]
     )
     for item in proposal_results:
@@ -731,11 +724,10 @@ def _write_report(
         title = output.get("title", "") if isinstance(output, Mapping) else ""
         if not isinstance(marks, Mapping):
             marks = {}
+        mark_values = " | ".join(str(_mark(marks, column["field"])) for column in columns)
         lines.append(
             f"| `{item['idea_id']}` | `{item['variant_id']}` | {item.get('selected_round', '')} | "
-            f"{title} | {_mark(marks, 'total_score')} | {_mark(marks, 'evidence_of_novelty')} | "
-            f"{_mark(marks, 'user_intent_relevance')} | {_mark(marks, 'scientific_value')} | "
-            f"{_mark(marks, 'feasibility')} | {_mark(marks, 'first_calculation_clarity')} |"
+            f"{title} | {mark_values} |"
         )
     lines.extend(["", "## Ranking", ""])
     if isinstance(ranking, list):
