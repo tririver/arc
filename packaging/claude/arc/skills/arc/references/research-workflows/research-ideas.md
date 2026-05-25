@@ -42,7 +42,8 @@ python3 references/research-workflows/research_ideas_runner.py \
 ```
 
 Step 2: Print any returned `WARNING:` messages. Unlimited loop concurrency is
-intentional for this workflow.
+intentional for this workflow. The dry run reports the generated loop plan but
+does not create run artifacts.
 
 ### Phase 3: Run Ideas
 
@@ -57,16 +58,35 @@ python3 references/research-workflows/research_ideas_runner.py \
 Step 2: Continue only if the returned status is `completed`. If status is
 `failed`, print `WARNING:` with the error and artifact root.
 
-### Phase 4: Report Artifacts
+The workflow runner writes only the generated batch config before launch:
+
+```text
+<project-dir>/research-ideas/<run-id>/research_ideas_batch_config.json
+```
+
+All concurrent proposer-reviewer artifacts are owned by `arc-llm` under the
+batch run root. The workflow runner does not copy selected rounds or write a
+project-level latest report while loops are running.
+
+### Phase 4: Inspect Artifacts
 
 Report these paths:
 
 ```text
 <project-dir>/research-ideas/<run-id>/
-<project-dir>/research-ideas/<run-id>/loop_batch/idea_loops/loops/
-<project-dir>/research-ideas/<run-id>/research-ideas.md
-<project-dir>/research-ideas.md
+<project-dir>/research-ideas/<run-id>/research_ideas_batch_config.json
+<project-dir>/research-ideas/<run-id>/idea_loops/
+<project-dir>/research-ideas/<run-id>/idea_loops/loops/
+```
+
+Step 1: After the run completes, use the read-only ranking helper when a
+ranked or Markdown summary is needed:
+
+```bash
+python3 references/research-workflows/scripts/rank-suggested-ideas.py \
+  <project-dir>/research-ideas/<run-id>/idea_loops \
+  --format markdown
 ```
 
 Do not invent rankings or novelty claims. Use the recorded proposer outputs and
-per-round reviewer reports.
+per-round reviewer reports from the `arc-llm` loop artifacts.

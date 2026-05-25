@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,7 +18,7 @@ def _load_runner_module():
         sys.path.remove(str(WF))
 
 
-def test_research_ideas_runs_five_report_loops_without_global_review(tmp_path: Path) -> None:
+def test_research_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path) -> None:
     runner = _load_runner_module()
     project_dir = tmp_path / "project"
     (project_dir / "domain").mkdir(parents=True)
@@ -49,63 +48,20 @@ def test_research_ideas_runs_five_report_loops_without_global_review(tmp_path: P
         assert dry_run is False
         seen_batch_configs.append(batch_config)
         run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
-        loops = []
-        for loop in batch_config["loops"]:
-            loop_id = loop["loop_id"]
-            loop_root = run_root / "loops" / loop_id
-            for round_number in range(1, 6):
-                round_root = loop_root / "rounds" / f"round_{round_number:03d}"
-                proposal = {
-                    "title": f"{loop_id} round {round_number}",
-                    "idea_summary": "summary",
-                    "motivation": "motivation",
-                    "novelty_checks": [f"check {round_number}"],
-                    "calculation_plan": "plan",
-                    "validation_checks": ["validation"],
-                    "risks": ["risk"],
-                }
-                review = {
-                    "schema_version": "arc.llm.review_envelope.v1",
-                    "controller": {"message": "continue", "stop_requested": False},
-                    "proposer_messages": {
-                        "proposer_001": {"message": f"revise after round {round_number}"}
-                    },
-                    "review_payload": {
-                        "marks": {
-                            "user_intent_relevance": 20,
-                            "novelty": 10,
-                            "confidence_of_novelty": 10 + round_number,
-                            "scientific_value": 10,
-                            "planning": 10,
-                            "problem_well_definedness": 10,
-                            "total_score": 70 + round_number,
-                        },
-                        "reviewer_benchmark": {
-                            "same_direction_alternative": "benchmark",
-                            "preserves_proposer_direction": True,
-                            "comparison": "comparison",
-                        },
-                        "improvement_comments": [f"comment {round_number}"],
-                        "evidence_checked": ["evidence"],
-                        "tool_queries_used": ["query"],
-                    },
-                }
-                _write_json(round_root / "proposer_outputs" / "proposer_001.json", proposal)
-                _write_json(round_root / "reviews" / "reviewer_001.json", review)
-            loops.append(
-                {
-                    "loop_id": loop_id,
-                    "status": "completed",
-                    "rounds_completed": loop["max_rounds"],
-                    "loop_root": str(loop_root),
-                }
-            )
         return {
             "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
             "status": "completed",
             "run_id": batch_config["run_id"],
             "run_root": str(run_root),
-            "loops": loops,
+            "loops": [
+                {
+                    "loop_id": loop["loop_id"],
+                    "status": "completed",
+                    "rounds_completed": loop["max_rounds"],
+                    "loop_root": str(run_root / "loops" / loop["loop_id"]),
+                }
+                for loop in batch_config["loops"]
+            ],
         }
 
     def forbidden_global_runner(
@@ -131,7 +87,13 @@ def test_research_ideas_runs_five_report_loops_without_global_review(tmp_path: P
     assert result["reviewer_call_count"] == 0
     assert result["loop_reviewer_call_count"] == 10
     assert "global_review" not in result
+    assert "ideas" not in result
+    assert "report" not in result
+    assert Path(result["batch_config_path"]).is_file()
+
     batch_config = seen_batch_configs[0]
+    assert batch_config["run_dir"] == str(project_dir / "research-ideas" / "ideas_test")
+    assert batch_config["run_id"] == "idea_loops"
     assert batch_config["max_concurrent_loops"] == 2
     assert {loop["loop_id"] for loop in batch_config["loops"]} == {
         "domain_idea_001",
@@ -139,20 +101,21 @@ def test_research_ideas_runs_five_report_loops_without_global_review(tmp_path: P
     }
     assert {loop["max_rounds"] for loop in batch_config["loops"]} == {5}
     assert all(loop["early_stop"]["enabled"] is False for loop in batch_config["loops"])
-    assert all(loop["reviewers"][0]["output_schema"]["properties"]["schema_version"]["const"] == "arc.llm.review_envelope.v1" for loop in batch_config["loops"])
+    assert all(
+        loop["reviewers"][0]["output_schema"]["properties"]["schema_version"]["const"]
+        == "arc.llm.review_envelope.v1"
+        for loop in batch_config["loops"]
+    )
     assert all("marking_scheme" in loop["caller_context"] for loop in batch_config["loops"])
-    mark_schema = batch_config["loops"][0]["reviewers"][0]["output_schema"]["properties"]["review_payload"]["properties"]["marks"]
+    mark_schema = batch_config["loops"][0]["reviewers"][0]["output_schema"]["properties"]["review_payload"][
+        "properties"
+    ]["marks"]
     assert "confidence_of_novelty" in mark_schema["required"]
     assert "evidence_of_novelty" not in mark_schema["required"]
     assert mark_schema["properties"]["user_intent_relevance"]["maximum"] == 25
     assert mark_schema["properties"]["problem_well_definedness"]["maximum"] == 15
-    for idea in result["ideas"]:
-        assert idea["selected_round"] == 5
-        assert idea["rounds_completed"] == 5
-        assert idea["output"]["title"].endswith("round 5")
-        assert Path(idea["selected_review_path"]).is_file()
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    assert {loop["loop_id"] for loop in result["loops"]} == {
+        "domain_idea_001",
+        "no_info_idea_001",
+    }
+    assert result["batch_result"]["run_root"] == str(project_dir / "research-ideas" / "ideas_test" / "idea_loops")

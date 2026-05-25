@@ -241,8 +241,10 @@ def test_research_ideas_workflow_points_to_active_runner_without_global_review()
     assert "global reviewer" not in text
     assert "global_review" not in text
     assert "five reviewer reports per loop" in text
-    assert "<project-dir>/research-ideas/<run-id>/research-ideas.md" in text
-    assert "<project-dir>/research-ideas.md" in text
+    assert "<project-dir>/research-ideas/<run-id>/idea_loops/loops/" in text
+    assert "scripts/rank-suggested-ideas.py" in text
+    assert "<project-dir>/research-ideas/<run-id>/research-ideas.md" not in text
+    assert "<project-dir>/research-ideas.md" not in text
 
 
 def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:

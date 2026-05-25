@@ -66,8 +66,8 @@ def load_research_ideas_config(payload: Mapping[str, Any]) -> ResearchIdeasConfi
         raise ConfigError("variant_glob is required")
     loops_per_variant = _positive_int(data.get("loops_per_variant", 5), "loops_per_variant")
     existing_run_policy = str(data.get("existing_run_policy", "fail")).strip() or "fail"
-    if existing_run_policy not in {"fail", "overwrite"}:
-        raise ConfigError("existing_run_policy must be fail or overwrite")
+    if existing_run_policy != "fail":
+        raise ConfigError("existing_run_policy must be fail")
     artifact_options = _dict(data.get("artifact_options", {}), "artifact_options")
     variants = _discover_variants(variant_config_dir, variant_glob)
     if not variants:
