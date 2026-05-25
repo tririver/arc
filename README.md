@@ -453,10 +453,10 @@ reviewer marks and write a ranked selected-ideas report:
 <project-dir>/ranked-ideas.md
 ```
 
-The report starts with a readable paragraph list of titles and marks, then appends
-one detail section per idea with all round-by-round referee marks and selected
-handoff text: title, idea summary, and calculation plan. It should not invent
-novelty claims or hide failed idea history.
+The report starts with a compact marked summary for each selected idea, then
+appends one detail section per idea with all round-by-round referee marks and
+selected handoff text: title, idea summary, and calculation plan. It should not
+invent novelty claims or hide failed idea history.
 
 ### 3. Plan And Execute A Calculation
 
@@ -476,10 +476,12 @@ Primary outputs:
 ```text
 <project-dir>/calculate/<run-id>/plan.json
 <project-dir>/calculate/<run-id>/research-plan.md
+<project-dir>/research-plan.md
 <project-dir>/calculate/<run-id>/foundation/latest.json
 <project-dir>/calculate/<run-id>/foundation/research-foundation.md
+<project-dir>/research-foundation.md
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
-<project-dir>/calculate/<run-id>/report.md
+<project-dir>/calculate/<run-id>/calculation-report.md
 <project-dir>/calculation-report.md
 ```
 

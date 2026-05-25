@@ -9,7 +9,8 @@ Write artifacts under:
 ```text
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
 <project-dir>/calculate/<run-id>/execute/<consensus-run-id>/
-<project-dir>/calculate/<run-id>/report.md
+<project-dir>/calculate/<run-id>/calculation-report.md
+<project-dir>/calculation-report.md
 ```
 
 Execution reports must use `schema_version: "arc.research_execute.v1"`.
@@ -123,15 +124,13 @@ Step 2: Inspect the returned JSON. If any step returns `blocked_for_user`
 because the recalculation limit was reached, stop immediately and ask the user
 for instructions. Do not continue in auto mode.
 
-Step 3: If all steps are accepted, write `report.md` with accepted outputs,
-reviewer consensus summaries, unresolved risks, and artifact paths. Do not
-claim a result that is not present in accepted consensus output.
+Step 3: If all steps are accepted, write `calculation-report.md` directly to
+both `<project-dir>/calculate/<run-id>/calculation-report.md` and
+`<project-dir>/calculation-report.md`. Include accepted outputs, reviewer
+consensus summaries, unresolved risks, and artifact paths. Do not claim a
+result that is not present in accepted consensus output.
 
-After `report.md` is generated, copy it to
-`<project-dir>/calculation-report.md` so human readers can inspect the main
-project reports together.
-
-After copying the Markdown report, call
+After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/calculation-report.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait
 before continuing.

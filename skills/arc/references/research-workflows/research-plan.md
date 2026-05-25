@@ -8,6 +8,7 @@ Write artifacts under:
 ```text
 <project-dir>/calculate/<run-id>/plan.json
 <project-dir>/calculate/<run-id>/research-plan.md
+<project-dir>/research-plan.md
 ```
 
 `plan.json` must use `schema_version: "arc.research_plan.v1"`.
@@ -99,14 +100,12 @@ Step 4: At the end of every step, make the quantity contract explicit:
 calculate which quantity, in terms of which quantity, and what is not allowed
 as an input. If this cannot be stated clearly, split the step again.
 
-Step 5: Write `plan.json` and a human-readable `research-plan.md`. The JSON is
-the source of truth for later workflow phases.
+Step 5: Write `plan.json` and write the human-readable report directly to both
+`<project-dir>/calculate/<run-id>/research-plan.md` and
+`<project-dir>/research-plan.md`. The JSON is the source of truth for later
+workflow phases.
 
-After `research-plan.md` is generated, copy it to
-`<project-dir>/research-plan.md` so human readers can inspect the main project
-reports together.
-
-After copying the Markdown report, call
+After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/research-plan.md")`. It starts a background
 PDF job; record the returned job id if present and do not wait before
 continuing.

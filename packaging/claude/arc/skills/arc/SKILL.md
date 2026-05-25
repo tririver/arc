@@ -21,6 +21,8 @@ not optional.
   behavior, or robustness-sensitive execution: read
   `references/rules/integrity.md`.
 - General ARC operating rules: read `references/rules/operating.md`.
+- ARC workflow completion checks and improvement notes: read
+  `references/rules/self-reflection.md`.
 - Single-paper metadata, full text, sections, equations, citers, references,
   paper summaries, or summary batches: read
   `references/package-manuals/arc-paper.md`.
@@ -31,8 +33,8 @@ not optional.
   behavior: read `references/package-manuals/arc-mcp.md`.
 - Host LLM/provider detection, model choice, direct prompt tests, or provider
   troubleshooting: read `references/package-manuals/arc-llm.md`.
-- User-facing Markdown report export: when a workflow copies a Markdown report
-  to `<project-dir>/` for human readers, call MCP `md2pdf` on the copied file.
+- User-facing Markdown report export: when a workflow writes a Markdown report
+  to `<project-dir>/` for human readers, call MCP `md2pdf` on that project-level file.
   `md2pdf` starts a background PDF job; record the returned job id if present
   and do not wait before continuing unless the user explicitly asks.
 
@@ -102,27 +104,4 @@ Step 3: Read and execute `references/research-workflows/research-execute.md`.
 
 ### Phase 3: Self-Reflection
 
-Before marking any ARC workflow complete, check the requested skill outcome
-against the artifacts and user-facing result. Confirm that the workflow
-delivered what the skill requested. If it did not, identify the concrete gap
-and likely reason, such as missing inputs, failed checks, incomplete artifacts,
-tool/runtime limits, or an instruction conflict.
-
-Append the outcome check and self-reflection entry to
-`<project-dir>/self-reflect.md`. 
-
-Start each suggestion with `Git: <commit-hash>`. 
-
-Include concrete, portable improvement suggestions when the run reveals a
-workflow, prompt, package, documentation, cache, or test weakness. 
-
-If the requested outcome was not delivered, append the reason and at least one
-actionable follow-up suggestion unless the blocker is entirely outside ARC's
-control.
-
-Make the suggestion actionable: affected file or phase, evidence from the run, exact
-command or edit to try, and an acceptance check.
-
-If no concrete improvement was found, still append a dated entry saying that no
-actionable ARC improvement was identified for this run. The workflow is not
-complete until this append step is done.
+Read and follow `references/rules/self-reflection.md`.

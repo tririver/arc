@@ -61,7 +61,7 @@ changing the artifact contract.
 Step 4: Inspect each returned JSON body. Do not treat command exit code alone
 as success. Continue only when every domain job result is successful. If any
 job failed, was cancelled, or returned `needs_llm`, print `WARNING:` with the
-reason and stop before copying project-local artifacts.
+reason and stop before exporting project-local artifacts.
 
 The domain build includes the selected domain papers and every arXiv paper in
 the domain candidate pool that appeared within the last year. ARC domain logic
@@ -159,11 +159,11 @@ Do not render `warnings` in the domain summary Markdown. If the domain summary
 JSON has warnings, append them to `<project-dir>/self-reflect.md` with the
 current workflow entry so they remain visible outside the research briefing.
 
-After these deliverables are generated, copy the domain HTML file and the
+After these deliverables are generated, export the domain HTML file and the
 domain summary Markdown file to `<project-dir>/` with the same file names so
 human readers can inspect the main project reports together.
 
-After copying each domain summary Markdown report to `<project-dir>/`, call
+After writing each domain summary Markdown report to `<project-dir>/`, call
 MCP `md2pdf(input="<project-dir>/<seed-safe>_domain_summary.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait
 before continuing.

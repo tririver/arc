@@ -9,6 +9,7 @@ Write artifacts under:
 <project-dir>/calculate/<run-id>/foundation/foundation.v001.json
 <project-dir>/calculate/<run-id>/foundation/latest.json
 <project-dir>/calculate/<run-id>/foundation/research-foundation.md
+<project-dir>/research-foundation.md
 ```
 
 Each foundation file must use `schema_version: "arc.research_foundation.v1"`.
@@ -91,13 +92,12 @@ full-text search command that can recover the relevant location.
 Step 3: Do not mark a non-axiom equation as checked. The execute workflow must
 create one checking step for every non-axiom equation.
 
-Step 4: Render `latest.json` into `research-foundation.md` with the chosen
-conventions, equations, confidence labels, source locations, and any version
-change notes. After `research-foundation.md` is generated, copy it to
-`<project-dir>/research-foundation.md` so human readers can inspect the main
-project reports together.
+Step 4: Render `latest.json` into `research-foundation.md` directly at both
+`<project-dir>/calculate/<run-id>/foundation/research-foundation.md` and
+`<project-dir>/research-foundation.md` with the chosen conventions, equations,
+confidence labels, source locations, and any version change notes.
 
-After copying the Markdown report, call
+After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/research-foundation.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait
 before continuing.

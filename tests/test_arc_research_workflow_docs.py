@@ -46,7 +46,7 @@ def test_arc_skill_requires_nonblocking_pdf_export_for_project_markdown_reports(
     assert "markdown report" in text
 
 
-def test_research_workflows_start_pdf_export_when_copying_user_facing_markdown() -> None:
+def test_research_workflows_start_pdf_export_for_user_facing_markdown() -> None:
     for name in [
         "build-domain.md",
         "research-ideas.md",
@@ -74,6 +74,9 @@ def test_research_plan_requires_review_after_drafting() -> None:
     assert "review the plan" in text.lower()
     assert "independent reviewer" in text.lower()
     assert "main agent" in text.lower()
+    assert "<project-dir>/calculate/<run-id>/research-plan.md" in text
+    assert "<project-dir>/research-plan.md" in text
+    assert 'md2pdf(input="<project-dir>/research-plan.md")' in text
 
 
 def test_research_plan_requires_explicit_step_quantity_contracts() -> None:
@@ -91,6 +94,9 @@ def test_research_foundation_requires_convention_alignment_checks() -> None:
     assert "multiple papers" in text
     assert "convention_check" in text
     assert "check loop" in text
+    assert "<project-dir>/calculate/<run-id>/foundation/research-foundation.md" in text
+    assert "<project-dir>/research-foundation.md" in text
+    assert 'md2pdf(input="<project-dir>/research-foundation.md")' in text
 
 
 def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
@@ -113,9 +119,10 @@ def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
 def test_research_execute_delivers_named_calculation_report() -> None:
     text = (WF / "research-execute.md").read_text(encoding="utf-8")
 
-    assert "<project-dir>/calculate/<run-id>/report.md" in text
+    assert "<project-dir>/calculate/<run-id>/calculation-report.md" in text
     assert "<project-dir>/calculation-report.md" in text
     assert 'md2pdf(input="<project-dir>/calculation-report.md")' in text
+    assert "<project-dir>/calculate/<run-id>/report.md" not in text
     assert "<project-dir>/report.md" not in text
 
 
@@ -220,8 +227,11 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
         capture_output=True,
         text=True,
     ).stdout
-    assert "Suggested ideas:\n\n" in markdown
-    assert "high novelty (Mark: 15)\n\nbetter (Mark: 15)" in markdown
+    assert "# Suggested Ideas\n\n" in markdown
+    assert "Abbreviations:\n\nIR=intent relevance" in markdown
+    assert "## `idea_002`\n\nhigh novelty" in markdown
+    assert "## `idea_001`\n\nbetter" in markdown
+    assert "| Round | IR | N | CN | SV | PL | WD | T |" in markdown
     assert "| Title | Total Mark | Rank |" not in markdown
     assert "| Loop | Round | Total | Intent Relevance | Novelty | Confidence | Value | Planning | Well-definedness |" in markdown
     assert "## Appendix: Idea Details" in markdown

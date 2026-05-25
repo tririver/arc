@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -117,24 +118,56 @@ def _rank_key(entry: dict[str, Any]) -> tuple[float, ...]:
 
 
 def markdown_table(payload: dict[str, Any]) -> str:
-    lines = [_summary_table(payload), "", "## Appendix: Idea Details"]
+    lines = [_summary_table(payload), "", "# Appendix: Idea Details"]
     for entry in payload["ranking"]:
         lines.extend(["", *_appendix_section(entry)])
     return "\n".join(lines)
 
 
 def _summary_table(payload: dict[str, Any]) -> str:
-    lines = ["Suggested ideas:", ""]
+    lines = [
+        "# Suggested Ideas",
+        "",
+        "Abbreviations:",
+        "",
+        "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
+        "PL=planning, WD=well-definedness, T=total.",
+    ]
     for entry in payload["ranking"]:
-        lines.append(
-            "{title} (Mark: {total})".format(
-                title=_table_text(entry["title"]),
-                total=_format_mark(entry["marks"].get("total_score")),
-            )
-        )
-        lines.append("")
+        lines.extend(["", *_round_marks_summary_section(entry)])
     if lines and lines[-1] == "":
         lines.pop()
+    return "\n".join(lines)
+
+
+def _round_marks_summary_section(entry: dict[str, Any]) -> list[str]:
+    return [
+        f"## `{entry['loop_id']}`",
+        "",
+        _heading_text(entry["title"]),
+        "",
+        _compact_round_marks_table(entry),
+    ]
+
+
+def _compact_round_marks_table(entry: dict[str, Any]) -> str:
+    columns = [
+        ("IR", "user_intent_relevance"),
+        ("N", "novelty"),
+        ("CN", "confidence_of_novelty"),
+        ("SV", "scientific_value"),
+        ("PL", "planning"),
+        ("WD", "problem_well_definedness"),
+        ("T", "total_score"),
+    ]
+    lines = [
+        "| Round | IR | N | CN | SV | PL | WD | T |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for round_entry in entry.get("rounds", []):
+        marks = round_entry["marks"]
+        mark_values = " | ".join(_format_mark(marks.get(field)) for _, field in columns)
+        lines.append(f"| {round_entry['round']} | {mark_values} |")
     return "\n".join(lines)
 
 
@@ -153,7 +186,7 @@ def _appendix_section(entry: dict[str, Any]) -> list[str]:
         "",
         "#### Full Idea Verbatim",
         "",
-        *_fenced_text_block(_handoff_text(entry.get("proposer_output", {}))),
+        _handoff_text(entry.get("proposer_output", {})),
     ]
 
 
@@ -184,13 +217,6 @@ def _format_mark(value: Any) -> str:
     return ""
 
 
-def _table_text(value: Any, *, max_width: int | None = None) -> str:
-    text = str(value).replace("|", "/").replace("\n", " ").strip()
-    if max_width:
-        text = "<br>".join(_wrap_words(text, max_width=max_width))
-    return text
-
-
 def _heading_text(value: Any) -> str:
     text = str(value).replace("\n", " ").strip()
     return text or "Untitled Idea"
@@ -205,46 +231,75 @@ def _handoff_text(value: Any) -> str:
     ]
     lines: list[str] = []
     for label, item in fields:
-        text = str(item or "").strip()
-        wrapped = _wrap_words(text, max_width=76) if text else [""]
-        lines.append(f"{label}: {wrapped[0]}")
-        lines.extend(f"  {line}" for line in wrapped[1:])
+        text = _math_markdown_text(str(item or "").strip())
+        lines.append(f"{label}: {text}")
         lines.append("")
     if lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines)
 
 
-def _fenced_text_block(text: str) -> list[str]:
-    return ["```text", text.rstrip(), "```"]
+def _math_markdown_text(text: str) -> str:
+    text = re.sub(r"`([^`]+)`", _math_markdown_span, text)
+    text = _display_math_lines(text)
+    return _inline_raw_math_tokens(text)
 
 
-def _wrap_words(text: str, *, max_width: int) -> list[str]:
-    text = str(text)
-    if len(text) <= max_width:
-        return [text]
-    words = []
-    for word in text.split(" "):
-        words.extend(_split_long_token(word, max_width=max_width))
+def _math_markdown_span(match: re.Match[str]) -> str:
+    content = match.group(1)
+    if _looks_like_math(content):
+        return f"${_format_math(content)}$"
+    return match.group(0)
+
+
+def _looks_like_math(text: str) -> bool:
+    return bool(re.search(r"[=<>^_∫⟨⟩δΔκγρτλπℓεαβηθΦΣ{}|≈≤≥]", text))
+
+
+def _inline_raw_math_tokens(text: str) -> str:
+    parts = re.split(r"(\$\$.*?\$\$|\$.*?\$)", text, flags=re.DOTALL)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(
+            r"(?<![\w$])([A-Za-z]+\^[A-Za-z0-9]+_[A-Za-z0-9+-]+)(?![\w])",
+            lambda m: f"${_format_math(m.group(1))}$",
+            parts[index],
+        )
+        parts[index] = re.sub(
+            r"(?<![\w$])([A-Za-zαβγδεηθκλρτΦΣΔπℓ]+_[A-Za-z0-9+-]+)(?![\w])",
+            lambda m: f"${_format_math(m.group(1))}$",
+            parts[index],
+        )
+    return "".join(parts)
+
+
+def _display_math_lines(text: str) -> str:
     lines: list[str] = []
-    current = ""
-    for word in words:
-        if not current:
-            current = word
-        elif len(current) + 1 + len(word) <= max_width:
-            current = f"{current} {word}"
+    for line in text.splitlines():
+        stripped = line.strip().rstrip(",")
+        math_span = re.fullmatch(r"\$(.+)\$", stripped)
+        if math_span and _looks_like_display_equation(math_span.group(1)):
+            lines.extend(["$$", math_span.group(1), "$$"])
+        elif _looks_like_display_equation(stripped):
+            lines.extend(["$$", _format_math(stripped), "$$"])
         else:
-            lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines or [""]
+            lines.append(line)
+    return "\n".join(lines)
 
 
-def _split_long_token(token: str, *, max_width: int) -> list[str]:
-    if len(token) <= max_width:
-        return [token]
-    return [token[index : index + max_width] for index in range(0, len(token), max_width)]
+def _looks_like_display_equation(text: str) -> bool:
+    if not text or ":" in text[:24]:
+        return False
+    return bool(re.match(r"^([A-Za-zαβγδεηθκλρτΦΣΔπℓ]+[A-Za-z0-9_]*\(|∫|\\int)", text))
+
+
+def _format_math(text: str) -> str:
+    text = str(text).strip()
+    text = re.sub(
+        r"\b([A-Za-zαβγδεηθκλρτΦΣΔπℓ]+(?:\^[A-Za-z0-9]+)?)_([A-Za-z0-9+-]+)(?![\w])",
+        lambda m: f"{m.group(1)}_{{{m.group(2)}}}",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
 
 
 if __name__ == "__main__":

@@ -84,31 +84,51 @@ Report these paths:
 ```
 
 Step 1: After the run completes, use the read-only ranking helper to write the
-deterministic ranked ideas report:
+deterministic ranked ideas report directly to both readable destinations:
 
 ```bash
 python3 references/research-workflows/scripts/rank-suggested-ideas.py \
   <project-dir>/research-ideas/<run-id>/idea_loops \
   --format markdown \
   > <project-dir>/research-ideas/<run-id>/ranked-ideas.md
+
+python3 references/research-workflows/scripts/rank-suggested-ideas.py \
+  <project-dir>/research-ideas/<run-id>/idea_loops \
+  --format markdown \
+  > <project-dir>/ranked-ideas.md
 ```
 
-Step 2: Copy the same report to `<project-dir>/ranked-ideas.md` so human
-readers can inspect the main project reports together.
+The report must start with `# Suggested Ideas`, then `Abbreviations:`, then a
+blank-line-separated abbreviation line in the form `IR=intent relevance,
+N=novelty, CN=confidence of novelty, SV=scientific value, PL=planning,
+WD=well-definedness, T=total.` List each ranked idea in the same form used by
+`round_marks_by_idea.md`: a loop-id heading, the selected title, and the
+compact round marks table with columns `Round`, `IR`, `N`, `CN`, `SV`, `PL`,
+`WD`, and `T`. The report must then include `# Appendix: Idea Details` with one subsection per
+ranked idea. Each subsection lists all referee marks from
+every round in that idea loop and quotes only the selected handoff text: title,
+idea summary, and calculation plan. Render that handoff text as normal
+Markdown paragraphs, not a fenced code block. Use PDF-friendly wrapping for
+long titles and proposer text; avoid wide tables with long prose.
 
-The report must start with `Suggested ideas:` followed by one blank line, then
-one idea per paragraph in the form `<Title> (Mark: <Mark>)`, separated by blank
-lines. Do not use a table or dense numbered list for the summary. The report
-must then include an appendix with one subsection
-per ranked idea. Each subsection lists all referee marks from every round in
-that idea loop and quotes only the selected handoff text: title, idea summary,
-and calculation plan. Use PDF-friendly wrapping for long titles and proposer
-text; avoid wide code blocks or wide tables with long prose.
-
-Step 3: After copying the Markdown report, call
+Step 2: After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/ranked-ideas.md")`. It starts a background
 PDF job; record the returned job id if present and do not wait before
 continuing.
 
 Do not invent rankings or novelty claims. Use the recorded proposer outputs and
 per-round reviewer reports from the `arc-llm` loop artifacts.
+
+### Phase 5: Select Next Action
+
+Step 1: Print the top three ranked ideas on screen.
+
+Step 2: If the workflow is running in auto mode, use the host's discrete select
+or menu tool to ask whether to proceed to calculation for ranked idea #1, ranked
+idea #2, ranked idea #3, enter a different idea number, or quit. Use ranked idea
+#1 as the default selection when the host supports pressing enter for the
+default. Use arrow-key selection when the host supports it. If no discrete
+select tool is available, ask for the same choice as numbered input.
+
+If the workflow is running in interactive mode, quit after printing the top
+three ideas.
