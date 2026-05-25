@@ -83,18 +83,32 @@ Report these paths:
 <project-dir>/research-ideas/<run-id>/idea_loops/loops/
 ```
 
-Step 1: After the run completes, use the read-only ranking helper when a
-ranked or Markdown summary is needed:
+Step 1: After the run completes, use the read-only ranking helper to write the
+deterministic ranked ideas report:
 
 ```bash
 python3 references/research-workflows/scripts/rank-suggested-ideas.py \
   <project-dir>/research-ideas/<run-id>/idea_loops \
-  --format markdown
+  --format markdown \
+  > <project-dir>/research-ideas/<run-id>/ranked-ideas.md
 ```
 
-If that Markdown summary is saved under `<project-dir>/` for human readers,
-call MCP `md2pdf(input="<saved-markdown-path>")`. It starts a background PDF
-job; record the returned job id if present and do not wait before continuing.
+Step 2: Copy the same report to `<project-dir>/ranked-ideas.md` so human
+readers can inspect the main project reports together.
+
+The report must start with `Suggested ideas:` followed by one blank line, then
+one idea per paragraph in the form `<Title> (Mark: <Mark>)`, separated by blank
+lines. Do not use a table or dense numbered list for the summary. The report
+must then include an appendix with one subsection
+per ranked idea. Each subsection lists all referee marks from every round in
+that idea loop and quotes only the selected handoff text: title, idea summary,
+and calculation plan. Use PDF-friendly wrapping for long titles and proposer
+text; avoid wide code blocks or wide tables with long prose.
+
+Step 3: After copying the Markdown report, call
+MCP `md2pdf(input="<project-dir>/ranked-ideas.md")`. It starts a background
+PDF job; record the returned job id if present and do not wait before
+continuing.
 
 Do not invent rankings or novelty claims. Use the recorded proposer outputs and
 per-round reviewer reports from the `arc-llm` loop artifacts.

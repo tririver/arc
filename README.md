@@ -448,13 +448,15 @@ workflow intentionally withholds ARC domain context for comparison. Both use
 reviewer marks and write a ranked selected-ideas report:
 
 ```text
-<project-dir>/suggest-ideas/<run-id>/
-<project-dir>/suggest-ideas/<run-id>/suggested-ideas.md
-<project-dir>/suggested-ideas.md
+<project-dir>/research-ideas/<run-id>/
+<project-dir>/research-ideas/<run-id>/ranked-ideas.md
+<project-dir>/ranked-ideas.md
 ```
 
-The report preserves weak rounds and reviewer concerns; it should not invent
-novelty claims or hide failed ideas.
+The report starts with a readable paragraph list of titles and marks, then appends
+one detail section per idea with all round-by-round referee marks and selected
+handoff text: title, idea summary, and calculation plan. It should not invent
+novelty claims or hide failed idea history.
 
 ### 3. Plan And Execute A Calculation
 
@@ -478,7 +480,7 @@ Primary outputs:
 <project-dir>/calculate/<run-id>/foundation/research-foundation.md
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
 <project-dir>/calculate/<run-id>/report.md
-<project-dir>/report.md
+<project-dir>/calculation-report.md
 ```
 
 The workflow is deliberately conservative: it requires source evidence,

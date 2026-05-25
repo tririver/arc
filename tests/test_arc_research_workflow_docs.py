@@ -110,6 +110,15 @@ def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
     assert "wolfram" in text
 
 
+def test_research_execute_delivers_named_calculation_report() -> None:
+    text = (WF / "research-execute.md").read_text(encoding="utf-8")
+
+    assert "<project-dir>/calculate/<run-id>/report.md" in text
+    assert "<project-dir>/calculation-report.md" in text
+    assert 'md2pdf(input="<project-dir>/calculation-report.md")' in text
+    assert "<project-dir>/report.md" not in text
+
+
 def test_research_workflow_filter_script_exists() -> None:
     script = WF / "scripts/filter-foundation-context.py"
 
@@ -211,7 +220,21 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
         capture_output=True,
         text=True,
     ).stdout
-    assert "| Rank | Loop | Round | Total | Intent Relevance | Novelty | Confidence | Value | Planning | Well-definedness | Title |" in markdown
+    assert "Suggested ideas:\n\n" in markdown
+    assert "high novelty (Mark: 15)\n\nbetter (Mark: 15)" in markdown
+    assert "| Title | Total Mark | Rank |" not in markdown
+    assert "| Loop | Round | Total | Intent Relevance | Novelty | Confidence | Value | Planning | Well-definedness |" in markdown
+    assert "## Appendix: Idea Details" in markdown
+    assert "### 1. high novelty" in markdown
+    assert "#### Referee Marks by Round" in markdown
+    assert "#### Full Idea Verbatim" in markdown
+    assert "```text" in markdown
+    assert "Title: high novelty" in markdown
+    assert "Idea Summary:" in markdown
+    assert "Calculation Plan:" in markdown
+    assert "novelty_checks:" not in markdown
+    assert "motivation:" not in markdown
+    assert "```json" not in markdown
     assert "user_intent_fit" not in markdown
 
 
@@ -284,6 +307,16 @@ def test_research_ideas_workflow_points_to_active_runner_without_global_review()
     assert "scripts/rank-suggested-ideas.py" in text
     assert "<project-dir>/research-ideas/<run-id>/research-ideas.md" not in text
     assert "<project-dir>/research-ideas.md" not in text
+
+
+def test_research_ideas_workflow_has_deterministic_ranked_report_deliverable() -> None:
+    text = (WF / "research-ideas.md").read_text(encoding="utf-8")
+
+    assert "<project-dir>/research-ideas/<run-id>/ranked-ideas.md" in text
+    assert "<project-dir>/ranked-ideas.md" in text
+    assert 'md2pdf(input="<project-dir>/ranked-ideas.md")' in text
+    assert "ranked_ideas.md" not in text
+    assert "<project-dir>/suggested-ideas.md" not in text
 
 
 def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:
@@ -545,8 +578,11 @@ def test_packaged_skill_references_stay_synced_with_source() -> None:
         Path("SKILL.md"),
         Path("references/package-manuals"),
         Path("references/research-workflows/build-domain.md"),
+        Path("references/research-workflows/research-execute.md"),
+        Path("references/research-workflows/research-foundation.md"),
         Path("references/research-workflows/research-ideas.md"),
         Path("references/research-workflows/research-ideas.config.template.json"),
+        Path("references/research-workflows/research-plan.md"),
         Path("references/research-workflows/research_ideas_config.py"),
         Path("references/research-workflows/research_ideas_marking.py"),
         Path("references/research-workflows/research_ideas_runner.py"),

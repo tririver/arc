@@ -127,9 +127,11 @@ Step 3: If all steps are accepted, write `report.md` with accepted outputs,
 reviewer consensus summaries, unresolved risks, and artifact paths. Do not
 claim a result that is not present in accepted consensus output.
 
-After `report.md` is generated, copy it to `<project-dir>/report.md` so human
-readers can inspect the main project reports together.
+After `report.md` is generated, copy it to
+`<project-dir>/calculation-report.md` so human readers can inspect the main
+project reports together.
 
 After copying the Markdown report, call
-MCP `md2pdf(input="<project-dir>/report.md")`. It starts a background PDF job;
-record the returned job id if present and do not wait before continuing.
+MCP `md2pdf(input="<project-dir>/calculation-report.md")`. It starts a
+background PDF job; record the returned job id if present and do not wait
+before continuing.

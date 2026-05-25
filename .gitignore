@@ -59,3 +59,5 @@ Thumbs.db
 *.tmp
 *.swp
 *.swo
+.understand-anything/config.json
+.understand-anything/config.json
