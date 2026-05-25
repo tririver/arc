@@ -119,3 +119,58 @@ def test_research_ideas_launches_five_report_loops_without_postprocessing(tmp_pa
         "no_info_idea_001",
     }
     assert result["batch_result"]["run_root"] == str(project_dir / "research-ideas" / "ideas_test" / "idea_loops")
+
+
+def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    domain_dir = project_dir / "domain"
+    (domain_dir / "nested").mkdir(parents=True)
+    (domain_dir / "overview.md").write_text("# Overview\n", encoding="utf-8")
+    (domain_dir / "nested" / "details.md").write_text("# Details\n", encoding="utf-8")
+    (domain_dir / "notes.txt").write_text("not attached\n", encoding="utf-8")
+    config = {
+        "schema_version": "arc.workflow.research_ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "research-ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WF),
+        "variant_glob": "suggest-ideas-domain.variant.json",
+        "loops_per_variant": 1,
+    }
+    seen_batch_configs: list[dict[str, Any]] = []
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        json_runner: Any,
+        base_env: dict[str, str] | None,
+        process_chain: list[str] | None,
+        dry_run: bool = False,
+        max_concurrent_loops: int | None = None,
+    ) -> dict[str, Any]:
+        seen_batch_configs.append(batch_config)
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(run_root),
+            "loops": [
+                {
+                    "loop_id": batch_config["loops"][0]["loop_id"],
+                    "status": "completed",
+                    "rounds_completed": 5,
+                    "loop_root": str(run_root / "loops" / batch_config["loops"][0]["loop_id"]),
+                }
+            ],
+        }
+
+    runner.run_research_ideas(config, batch_runner=fake_batch_runner, base_env={})
+
+    domain_files = seen_batch_configs[0]["loops"][0]["caller_context"]["domain_markdown_files"]
+    assert domain_files == [
+        {"path": "domain/nested/details.md", "content": "# Details\n"},
+        {"path": "domain/overview.md", "content": "# Overview\n"},
+    ]

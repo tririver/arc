@@ -343,6 +343,27 @@ def test_suggest_ideas_full_info_template_includes_domain_context_and_arc_tools(
     assert proposer["runtime"]["mcp_mode"] == "arc-only"
 
 
+def test_suggest_ideas_no_info_description_mentions_shared_marking_scheme() -> None:
+    variant = json.loads((WF / "suggest-ideas-no-info.variant.json").read_text(encoding="utf-8"))
+    description = variant["description"]
+
+    assert "common marking scheme" in description
+    assert "no ARC domain Markdown" in description
+    assert "no ARC paper-tool guidance" in description
+    assert "no MCP access" in description
+
+
+def test_suggest_ideas_proposer_templates_emphasize_marking_scheme_quality_checklist() -> None:
+    for name in ["suggest-ideas-proposer.template.json", "suggest-ideas-no-info-proposer.template.json"]:
+        proposer = json.loads((WF / name).read_text(encoding="utf-8"))
+        template = proposer["prompt"]["template"]
+
+        assert "caller_context.marking_scheme" in template
+        assert "**Very Important**: Before finalizing, use caller_context.marking_scheme" in template
+        assert "scientific quality checklist" in template
+        assert "without writing to optimize marks" in template
+
+
 def test_suggest_ideas_proposer_schemas_are_codex_strict() -> None:
     proposer = json.loads((WF / "suggest-ideas-proposer.template.json").read_text(encoding="utf-8"))
     schema = proposer["output_schema"]

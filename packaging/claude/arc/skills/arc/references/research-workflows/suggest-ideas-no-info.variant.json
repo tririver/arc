@@ -1,7 +1,7 @@
 {
   "schema_version": "arc.workflow.research_ideas.variant.v1",
   "variant_id": "no_info",
-  "description": "Proposer receives only the exact user intent and internet access; no ARC domain Markdown, paper-tool guidance, local cache context, or MCP access.",
+  "description": "Proposer receives the exact user intent, common marking scheme, prior correspondence, and internet access; no ARC domain Markdown, no ARC paper-tool guidance, no local cache context, and no MCP access.",
   "loop_template": "suggest-ideas-no-info-loop.template.json",
   "proposer_template": "suggest-ideas-no-info-proposer.template.json",
   "context_policy": {
