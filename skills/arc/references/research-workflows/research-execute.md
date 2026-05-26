@@ -27,7 +27,7 @@ Step 2: Create a consensus config:
   "run_id": "<consensus-run-id>",
   "run_dir": "<project-dir>/calculate/<run-id>/execute",
   "proposer_count": 3,
-  "max_recalculations": 3,
+  "max_recalculations": 2,
   "defaults": {
     "integrity_reference_path": "skills/arc/references/rules/integrity.md"
   },
@@ -39,11 +39,15 @@ Step 2: Create a consensus config:
 ```
 
 Step 3: Keep `proposer_count` and `max_recalculations` configurable. Defaults
-are 3 proposers and 3 recalculations.
+are 3 proposers and 2 recalculations, giving 3 total attempts:
+1 initial attempt + 2 recalculations.
 
 ## Phase 2: Add Foundation Checks
 
 Step 1: Skip equations with `axiom_status: "axiom"`.
+
+Foundation checks use the same 3-proposer reviewer consensus as new
+calculation steps, with the same acceptance standard and no single-proposer acceptance.
 
 Step 2: For every other foundation equation, add one step before new
 calculations:
@@ -110,7 +114,7 @@ marks the target equation checked. Keep the original equation unchanged and add
 the reviewer check history, method, relative error when numerical, and accepted
 consensus artifact path.
 
-## Phase 5: Run Consensus
+## Phase 5: Run Consensus And Refine Blocks
 
 Step 1: Run:
 
@@ -120,15 +124,34 @@ arc-llm proposers-reviewer-consensus \
   --json
 ```
 
-Step 2: Inspect the returned JSON. If any step returns `blocked_for_user`
-because the recalculation limit was reached, stop immediately and ask the user
-for instructions. Do not continue in auto mode.
+Step 2: Inspect the returned JSON. If a step returns `blocked_for_user` after
+3 total attempts, enter `blocked_refinement`.
 
-Step 3: If all steps are accepted, write `calculation-report.md` directly to
-both `<project-dir>/calculate/<run-id>/calculation-report.md` and
-`<project-dir>/calculation-report.md`. Include accepted outputs, reviewer
-consensus summaries, unresolved risks, and artifact paths. Do not claim a
-result that is not present in accepted consensus output.
+Step 3: In `blocked_refinement`, review plan.json, reviewer reports, and, if
+needed, proposer calculations. Treat the block as evidence that the step is too
+difficult unless the step is already atomic.
+
+Step 4: If the blocked step can be split, split the blocked step and revise the plan into smaller steps.
+The first replacement step must end at the last calculation all proposers agree
+on. Each replacement step must have one clear quantity, inputs, output, and
+check. Then rerun the 3-proposer reviewer consensus on the refined step.
+
+Step 5: If the blocked step is already atomic and cannot be split further, stop
+as blocked. Do not choose a proposer yourself.
+
+Step 6: Write `calculation-report.md` even when blocked, directly to both
+`<project-dir>/calculate/<run-id>/calculation-report.md` and
+`<project-dir>/calculation-report.md`. Include accepted outputs, blocked step,
+disagreement map, reviewer-report summary, proposer positions, artifact paths,
+and the exact expert question: which proposer or result is correct, or what
+instruction should continue the calculation.
+
+Step 7: If the human expert decides that one proposer or result is correct,
+continue from that premise and mark it as human-resolved in the next report.
+If all steps are accepted without human intervention, write the same report with
+accepted outputs, reviewer consensus summaries, unresolved risks, and artifact
+paths. Do not claim a result that is not present in accepted consensus output or
+human-resolved input.
 
 After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/calculation-report.md")`. It starts a

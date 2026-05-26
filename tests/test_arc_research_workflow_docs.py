@@ -116,6 +116,36 @@ def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
     assert "wolfram" in text
 
 
+def test_research_execute_uses_three_total_consensus_attempts() -> None:
+    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+
+    assert '"max_recalculations": 2' in text
+    assert "3 total attempts" in text
+    assert "1 initial attempt + 2 recalculations" in text
+    assert "4 attempts" not in text
+
+
+def test_research_execute_foundation_checks_use_same_three_proposer_standard() -> None:
+    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+
+    assert "foundation checks use the same 3-proposer reviewer consensus" in text
+    assert "same acceptance standard" in text
+    assert "no single-proposer acceptance" in text
+
+
+def test_research_execute_refines_or_reports_when_blocked() -> None:
+    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+
+    assert "blocked_refinement" in text
+    assert "review plan.json" in text
+    assert "reviewer reports" in text
+    assert "proposer calculations" in text
+    assert "split the blocked step" in text
+    assert "already atomic" in text
+    assert "write `calculation-report.md` even when blocked" in text
+    assert "which proposer or result is correct" in text
+
+
 def test_research_execute_delivers_named_calculation_report() -> None:
     text = (WF / "research-execute.md").read_text(encoding="utf-8")
 

@@ -97,6 +97,8 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
     assert "Explicit commands $\\rho_{E}$ and $\\partial^a T_{ab}=0$ stay unchanged." in markdown
     assert "$$\nT_{kk}(t,ρ,z)=A q(t/τ) sech(z/L)\n$$" in markdown
     assert "$$\nΔT(0,b_{ref}) = -4 G ∫ d^4x T_{kk}(x)\n$$" in markdown
+    assert "$$\nE(α,β;N)=E_diag(N)+2\\,\\Re[z]\n$$" in markdown
+    assert "$$\n$$\nE(α,β;N)" not in markdown
     assert "\\operatorname" not in markdown
 
 
@@ -116,7 +118,8 @@ def _write_round(run_root: Path, loop_id: str, round_number: int, *, title: str,
                     "Geometry `δ_ij` and `α ∈ {0,0.3}`. "
                     "Explicit commands `\\rho_E` and `\\partial^a T_ab=0` stay unchanged.\n\n"
                     "T_kk(t,ρ,z)=A q(t/τ) sech(z/L)\n\n"
-                    "ΔT(0,b_ref) = -4 G ∫ d^4x T_kk(x),"
+                    "ΔT(0,b_ref) = -4 G ∫ d^4x T_kk(x),\n\n"
+                    "$$\nE(α,β;N)=E_diag(N)+2\\,\\Re[z]\n$$"
                 ),
             }
         ),

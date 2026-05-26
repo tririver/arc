@@ -274,8 +274,16 @@ def _inline_raw_math_tokens(text: str) -> str:
 
 def _display_math_lines(text: str) -> str:
     lines: list[str] = []
+    in_display_math = False
     for line in text.splitlines():
         stripped = line.strip().rstrip(",")
+        if stripped == "$$":
+            lines.append(line)
+            in_display_math = not in_display_math
+            continue
+        if in_display_math:
+            lines.append(line)
+            continue
         math_span = re.fullmatch(r"\$(.+)\$", stripped)
         if math_span and _looks_like_display_equation(math_span.group(1)):
             lines.extend(["$$", math_span.group(1), "$$"])

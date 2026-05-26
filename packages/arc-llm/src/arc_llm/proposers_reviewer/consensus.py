@@ -593,10 +593,26 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
             raise ValueError("analytic all_agree without SymPy requires explicit notes")
         history_text = "\n".join(str(item) for item in checks.get("check_history", []))
         lowered_evidence = f"{notes}\n{history_text}".lower()
+        has_explicit_differences = all(marker in lowered_evidence for marker in ["a-b", "b-c", "a-c"])
+        has_zero_results = lowered_evidence.count("=0") >= 2 or lowered_evidence.count("= 0") >= 2
+        says_differences_reduce_to_zero = (
+            "differences reduce to zero" in lowered_evidence
+            or "difference reduce to zero" in lowered_evidence
+            or "reduce to zero symbolically" in lowered_evidence
+        )
+        has_term_by_term_check = "term-by-term" in lowered_evidence and (
+            "overall factor" in lowered_evidence
+            or "every term matches" in lowered_evidence
+            or "all terms match" in lowered_evidence
+        )
         weak_markers = ["spacing", "string", "formatting", "visual", "inspection", "identical"]
-        if any(marker in lowered_evidence for marker in weak_markers):
+        if any(marker in lowered_evidence for marker in weak_markers) and not (
+            (has_explicit_differences and has_zero_results)
+            or says_differences_reduce_to_zero
+            or has_term_by_term_check
+        ):
             raise ValueError("manual all_agree cannot rely on string, spacing, formatting, or visual comparison")
-        if not all(marker in lowered_evidence for marker in ["a-b", "b-c", "a-c"]):
+        if not (has_explicit_differences or says_differences_reduce_to_zero or has_term_by_term_check):
             raise ValueError("manual all_agree requires explicit A-B, B-C, and A-C algebraic differences")
     if method in {"numerical", "mixed"}:
         sample_count = checks.get("sample_count")

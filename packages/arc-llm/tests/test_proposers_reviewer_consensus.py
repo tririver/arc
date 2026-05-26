@@ -432,6 +432,114 @@ def test_consensus_rejects_manual_all_agree_by_string_or_spacing_comparison(tmp_
     assert "manual all_agree" in result["steps"][0]["error"]
 
 
+def test_consensus_accepts_manual_all_agree_with_explicit_differences(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": "Expressions are identical after explicit differences: A-B=x-x=0; B-C=x-x=0; A-C=x-x=0.",
+                    "check_method": "analytic",
+                    "check_history": [
+                        "A-B=x-x=0",
+                        "B-C=x-x=0",
+                        "A-C=x-x=0",
+                    ],
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
+def test_consensus_accepts_manual_all_agree_when_pairwise_differences_reduce_to_zero(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": "Expressions differ only by notation; all pairwise differences reduce to zero symbolically.",
+                    "check_method": "analytic",
+                    "check_history": [
+                        "Compared proposer_001 and proposer_002: differences reduce to zero.",
+                        "Compared proposer_002 and proposer_003: differences reduce to zero.",
+                        "Compared proposer_001 and proposer_003: differences reduce to zero.",
+                    ],
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
+def test_consensus_accepts_manual_all_agree_with_term_by_term_check(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": "All expressions identical after notation changes. Explicit term-by-term comparison shows every term matches.",
+                    "check_method": "analytic",
+                    "check_history": [
+                        "Checked term 1 in all expressions.",
+                        "Checked term 2 in all expressions.",
+                        "Checked the overall factor.",
+                    ],
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
+def test_consensus_accepts_manual_all_agree_when_named_differences_are_zero(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": "The differences A-B, B-C, A-C are zero because expressions match term-by-term.",
+                    "check_method": "analytic",
+                    "check_history": ["Concluded all differences zero."],
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
 def test_consensus_dry_run_does_not_call_batch_runner(tmp_path):
     def fail_batch_runner(*args, **kwargs):
         raise AssertionError("dry-run must not call the batch runner")
