@@ -21,7 +21,11 @@ def _load_rank_module() -> Any:
 
 def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> None:
     ranker = _load_rank_module()
-    run_root = tmp_path / "idea_loops"
+    run_root = tmp_path / "decoherence_bell" / "idea_loops"
+    (tmp_path / "decoherence_bell.config.json").write_text(
+        json.dumps({"user_intent": "suggest research directions about decoherence and Bell inequality test in cosmology"}),
+        encoding="utf-8",
+    )
     _write_round(
         run_root,
         "domain_idea_001",
@@ -67,26 +71,56 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
             "total_score": 83,
         },
     )
+    _write_round(
+        run_root,
+        "domain_idea_003",
+        1,
+        title="Intent-bearing idea",
+        marks={
+            "user_intent_relevance": 25,
+            "novelty": 10,
+            "confidence_of_novelty": 8,
+            "scientific_value": 12,
+            "planning": 14,
+            "problem_well_definedness": 14,
+            "total_score": 84,
+        },
+    )
 
     markdown = ranker.markdown_table(ranker.rank_run(run_root))
     first_section = markdown.split("# Appendix: Idea Details", 1)[0]
 
     assert first_section.startswith(
+        "# Intent of the User\n\n"
+        "Suggest research directions about decoherence and Bell inequality test in cosmology.\n\n"
         "# Suggested Ideas\n\n"
         "Abbreviations:\n\n"
         "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
         "PL=planning, WD=well-definedness, T=total.\n\n"
+        "## `domain_idea_001`\n\n"
+        "Lower scoring idea\n\n"
+        "| Round | IR | N | CN | SV | PL | WD | T |\n"
+        "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        "| 1 | 20 | 8 | 7 | 9 | 10 | 10 | 64 |\n\n"
         "## `domain_idea_002`\n\n"
         "Higher scoring idea\n\n"
         "| Round | IR | N | CN | SV | PL | WD | T |\n"
         "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         "| 1 | 24 | 10 | 8 | 12 | 14 | 14 | 82 |\n"
-        "| 2 | 25 | 10 | 8 | 12 | 14 | 14 | 83 |"
+        "| 2 | 25 | 10 | 8 | 12 | 14 | 14 | 83 |\n\n"
+        "## `domain_idea_003`\n\n"
+        "Intent-bearing idea\n\n"
+        "| Round | IR | N | CN | SV | PL | WD | T |\n"
+        "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        "| 1 | 25 | 10 | 8 | 12 | 14 | 14 | 84 |"
     )
-    assert "\n\n## `domain_idea_001`\n\nLower scoring idea\n\n| Round | IR | N | CN | SV | PL | WD | T |" in first_section
+    assert "\n# Suggested Ideas\n" in markdown
     assert "Higher scoring idea (Mark: 83)" not in first_section
-    assert "\n# Appendix: Idea Details\n" in markdown
-    assert "\n## Appendix: Idea Details\n" not in markdown
+    assert "\n# Ranked Ideas and Details\n" in markdown
+    assert "\n# Appendix: Idea Details\n" not in markdown
+    details_section = markdown.split("# Ranked Ideas and Details", 1)[1]
+    assert details_section.index("### 1. Intent-bearing idea") < details_section.index("### 2. Higher scoring idea")
+    assert details_section.index("### 2. Higher scoring idea") < details_section.index("### 3. Lower scoring idea")
     assert "#### Full Idea Verbatim" in markdown
     assert "```text" not in markdown
     assert "Title: Higher scoring idea" in markdown

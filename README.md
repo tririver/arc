@@ -475,11 +475,11 @@ Primary outputs:
 
 ```text
 <project-dir>/calculate/<run-id>/plan.json
-<project-dir>/calculate/<run-id>/research-plan.md
-<project-dir>/research-plan.md
+<project-dir>/calculate/<run-id>/initial-research-plan.md
+<project-dir>/initial-research-plan.md
 <project-dir>/calculate/<run-id>/foundation/latest.json
-<project-dir>/calculate/<run-id>/foundation/research-foundation.md
-<project-dir>/research-foundation.md
+<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md
+<project-dir>/initial-research-foundation.md
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
 <project-dir>/calculate/<run-id>/calculation-report.md
 <project-dir>/calculation-report.md

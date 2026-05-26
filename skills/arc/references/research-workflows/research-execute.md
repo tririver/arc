@@ -1,6 +1,6 @@
 # Research Execute Workflow
 
-Use this workflow after `research-foundation.md`. It checks non-axiom
+Use this workflow after `initial-research-foundation.md`. It checks non-axiom
 foundation equations and then performs the new calculation steps through
 `arc-llm` consensus execution.
 
@@ -89,30 +89,48 @@ Step 1: Enclose `integrity.md` for both proposer and reviewer prompts.
 Step 2: Proposer prompts must require a very clear step-by-step derivation and
 must say never skip a step.
 
-Step 3: Proposers must not use the internet or paper tools. They may use only
-the provided foundation context, accepted prior outputs, SymPy or local algebra,
-and a Wolfram MCP only when the host can expose that algebra tool without
-internet or paper access. If tool allowlisting is unavailable, keep MCP disabled.
+Step 3: Proposers may use ARC paper MCP tools to read the main reference and
+cited source sections named by `plan.json` or
+`foundation/latest.json`. Internet search is allowed only for source discovery
+or uncached paper access. Proposers must cite any paper tool or internet source
+they use. Other paper tools are not allowed. Proposers must not use
+validation-only final formulas as derivation inputs.
+They may also use SymPy, local algebra, and Wolfram only for algebraic checks.
 
-Step 4: Reviewers may use SymPy. For analytic checks, use `expand` first, then
+Step 4: Proposers must strictly derive from the foundation context and accepted
+prior outputs. External sources may inspire methods, but proposers do not directly use any result
+from papers or the internet unless that result is in
+the foundation file or has already been accepted. If they need an external
+identity or intermediate result, they must derive it inside the current
+calculation. Warn that external sources may use different conventions; map any
+notation back to the foundation conventions before using it.
+
+Step 5: Reviewers may use SymPy. For analytic checks, use `expand` first, then
 `simplify`, then substitutions from checked equations in the foundation file.
 Do not modify original equations.
 
-Step 5: Before `all_agree`, at least two of `A-B=0`, `B-C=0`, and `A-C=0`
+Step 6: Before `all_agree`, at least two of `A-B=0`, `B-C=0`, and `A-C=0`
 must be true. Never accept agreement by visual inspection, string equality,
 spacing, or formatting. If SymPy is unavailable, either write explicit
 algebraic differences for `A-B`, `B-C`, and `A-C`, or use the numerical
 fallback.
 
-Step 6: If analytic checking is not possible, use at least 10 randomly selected
+Step 7: If analytic checking is not possible, use at least 10 randomly selected
 data points. The minimum numerical fallback is 10 randomly selected data points.
 Record `check_method: "numerical"`, the relative error, the sample count, and
 the check history.
 
-Step 7: For an accepted foundation check, write a new foundation version that
+Step 8: For an accepted foundation check, write a new foundation version that
 marks the target equation checked. Keep the original equation unchanged and add
 the reviewer check history, method, relative error when numerical, and accepted
-consensus artifact path.
+consensus artifact path. Do not rewrite `initial-research-foundation.md`;
+human-facing foundation changes belong in the final report appendix.
+
+Step 9: When a new calculation result is accepted and will be useful as a later
+input, write a new foundation version with a concise derived quantity record.
+Record the statement, explanation, source step id, dependency ids, check status,
+and consensus artifact. Keep paper-sourced equations and derived quantities
+visibly separate in `latest.json`.
 
 ## Phase 5: Run Consensus And Refine Blocks
 
@@ -134,7 +152,10 @@ difficult unless the step is already atomic.
 Step 4: If the blocked step can be split, split the blocked step and revise the plan into smaller steps.
 The first replacement step must end at the last calculation all proposers agree
 on. Each replacement step must have one clear quantity, inputs, output, and
-check. Then rerun the 3-proposer reviewer consensus on the refined step.
+check. Then rerun the 3-proposer reviewer consensus on the refined step. Append each blocked_refinement event
+to the plan revision history inside
+`# Appendix 2: Calculation Status`; do not create a separate plan-revision
+report.
 
 Step 5: If the blocked step is already atomic and cannot be split further, stop
 as blocked. Do not choose a proposer yourself.
@@ -143,7 +164,13 @@ Step 6: Write `calculation-report.md` even when blocked, directly to both
 `<project-dir>/calculate/<run-id>/calculation-report.md` and
 `<project-dir>/calculation-report.md`. Include accepted outputs, blocked step,
 disagreement map, reviewer-report summary, proposer positions, artifact paths,
-and the exact expert question: which proposer or result is correct, or what
+the exact expert question, `# Appendix 1: Research Foundation Updates`, and
+`# Appendix 2: Calculation Status`. The first appendix must render the latest
+foundation updates from `foundation/latest.json`, including checked equations,
+derived quantities, version notes, and consensus artifacts. The second appendix
+must summarize original steps, each blocked_refinement, plan revision history,
+what changed, the replacement config, and whether that refined step was
+accepted or blocked. Ask which proposer or result is correct, or what
 instruction should continue the calculation.
 
 Step 7: If the human expert decides that one proposer or result is correct,

@@ -1,15 +1,16 @@
 # Research Foundation Workflow
 
-Use this workflow after `research-plan.md`. The output is versioned foundation
-JSON. Do not verify equations here; checking belongs to `research-execute.md`.
+Use this workflow after `initial-research-plan.md`. The output is versioned
+foundation JSON. Do not verify equations here; checking belongs to
+`research-execute.md`.
 
 Write artifacts under:
 
 ```text
 <project-dir>/calculate/<run-id>/foundation/foundation.v001.json
 <project-dir>/calculate/<run-id>/foundation/latest.json
-<project-dir>/calculate/<run-id>/foundation/research-foundation.md
-<project-dir>/research-foundation.md
+<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md
+<project-dir>/initial-research-foundation.md
 ```
 
 Each foundation file must use `schema_version: "arc.research_foundation.v1"`.
@@ -48,6 +49,7 @@ Each equation must include:
 {
   "id": "eq_001",
   "label": "short human label",
+  "explanation": "brief context, what the relation means, allowed use, limits, and convention warnings when relevant",
   "latex": "...",
   "role": "first_principle | useful_result | convention | validation_only",
   "convention_ids": ["conv_001"],
@@ -81,6 +83,18 @@ Use `published_high` only when the cited source has more than 50 citations.
 Use `published_low` for cited sources with 50 or fewer citations. Use
 `not_in_publications` only for equations introduced by this workflow.
 
+Each equation explanation must be readable by a later proposer. Use this one
+field for brief context, interpretation, validity limits, allowed use,
+forbidden use, and convention warnings when those details matter. Do not add
+separate sparse fields for these notes.
+
+Do not put a loose `\sim` relation, proportionality, or vague asymptotic claim
+as a usable foundation equation. If such a relation is needed later, make it a
+research-plan step to derive a precise equality, definition, or explicitly
+bounded approximation before proposers use it as input. A loose asymptotic
+source statement may be mentioned in `explanation` or kept `validation_only`,
+but it is not a usable foundation equation.
+
 ## Phase 4: Preserve Sources For Later Checks
 
 Step 1: For every source, include both an MCP reminder and a CLI command that
@@ -92,12 +106,12 @@ full-text search command that can recover the relevant location.
 Step 3: Do not mark a non-axiom equation as checked. The execute workflow must
 create one checking step for every non-axiom equation.
 
-Step 4: Render `latest.json` into `research-foundation.md` directly at both
-`<project-dir>/calculate/<run-id>/foundation/research-foundation.md` and
-`<project-dir>/research-foundation.md` with the chosen conventions, equations,
-confidence labels, source locations, and any version change notes.
+Step 4: Render `latest.json` into `initial-research-foundation.md` directly at
+both `<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md`
+and `<project-dir>/initial-research-foundation.md` with the chosen conventions,
+equations, confidence labels, source locations, and any version change notes.
 
 After writing the project-level Markdown report, call
-MCP `md2pdf(input="<project-dir>/research-foundation.md")`. It starts a
+MCP `md2pdf(input="<project-dir>/initial-research-foundation.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait
 before continuing.

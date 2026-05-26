@@ -62,6 +62,7 @@
         "required": [
           "id",
           "label",
+          "explanation",
           "latex",
           "role",
           "axiom_status",
@@ -74,6 +75,7 @@
         "properties": {
           "id": {"type": "string", "minLength": 1},
           "label": {"type": "string", "minLength": 1},
+          "explanation": {"type": "string", "minLength": 1},
           "latex": {"type": "string", "minLength": 1},
           "role": {
             "enum": [
@@ -166,6 +168,38 @@
             }
           }
         ],
+        "additionalProperties": true
+      }
+    },
+    "derived_quantities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "explanation",
+          "latex",
+          "source_step_id",
+          "depends_on",
+          "check_status",
+          "consensus_artifact"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "label": {"type": "string", "minLength": 1},
+          "explanation": {"type": "string", "minLength": 1},
+          "latex": {"type": "string", "minLength": 1},
+          "source_step_id": {"type": "string", "minLength": 1},
+          "depends_on": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "check_status": {
+            "enum": ["accepted_consensus", "human_resolved"]
+          },
+          "consensus_artifact": {"type": "string", "minLength": 1}
+        },
         "additionalProperties": true
       }
     }

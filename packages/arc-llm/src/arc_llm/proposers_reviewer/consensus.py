@@ -355,10 +355,19 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
                 "First read and follow caller_context.integrity_reference.content. "
                 "Use only caller_context.step_prompt, caller_context.allowed_context, "
                 "caller_context.foundation_context when present, accepted locked_outputs, "
-                "and your own SymPy/local algebra. Do not use the internet or paper tools. "
-                "If a Wolfram MCP is available without paper or internet tools, it may be "
-                "used only for algebraic verification. Do the calculation very clearly "
-                "step by step; never skip a step. "
+                "your own SymPy/local algebra, and cited source context you inspect. "
+                "You may use ARC paper MCP tools to read the main reference and cited "
+                "sections named in the plan or foundation context. Internet search is "
+                "allowed only for source discovery or uncached paper access. Cite any "
+                "paper tool or internet source you use. Do not use validation-only final "
+                "formulas as derivation inputs. Wolfram may be used only for algebraic "
+                "verification. You must strictly derive from the foundation context and "
+                "accepted locked_outputs. External sources may inspire methods, but do not "
+                "directly use any result from papers or the internet unless it appears in "
+                "the foundation file or accepted locked_outputs. If you need an external "
+                "identity or intermediate result, derive it here. External sources may use "
+                "different conventions; map notation back to foundation conventions before "
+                "using it. Do the calculation very clearly step by step; never skip a step. "
                 "Return one JSON object with result_summary, derivation, assumptions, "
                 "reliable_until, and final_result. Put the final mathematical result in "
                 "final_result using explicit symbols so a reviewer can compare it with "
@@ -368,7 +377,12 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
             ),
         },
         "output_schema": {"type": "object"},
-        "runtime": {"allow_internet": False, "allow_mcp": False, "codex_sandbox": "read-only"},
+        "runtime": {
+            "allow_internet": True,
+            "allow_mcp": True,
+            "mcp_mode": "arc-only",
+            "codex_sandbox": "read-only",
+        },
     }
 
 

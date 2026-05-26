@@ -74,9 +74,10 @@ def test_research_plan_requires_review_after_drafting() -> None:
     assert "review the plan" in text.lower()
     assert "independent reviewer" in text.lower()
     assert "main agent" in text.lower()
-    assert "<project-dir>/calculate/<run-id>/research-plan.md" in text
-    assert "<project-dir>/research-plan.md" in text
-    assert 'md2pdf(input="<project-dir>/research-plan.md")' in text
+    assert "<project-dir>/calculate/<run-id>/initial-research-plan.md" in text
+    assert "<project-dir>/initial-research-plan.md" in text
+    assert 'md2pdf(input="<project-dir>/initial-research-plan.md")' in text
+    assert "<project-dir>/research-plan.md" not in text
 
 
 def test_research_plan_requires_explicit_step_quantity_contracts() -> None:
@@ -85,6 +86,11 @@ def test_research_plan_requires_explicit_step_quantity_contracts() -> None:
     assert "calculate which quantity" in text
     assert "in terms of which quantity" in text
     assert "end of every step" in text
+    assert "at least 20 steps" in text
+    assert "soft guidance" in text
+    assert "do not disclose the exact expected expression" in text
+    assert "derive the target quantity in terms of named dependencies" in text
+    assert "expected final formula" in text
 
 
 def test_research_foundation_requires_convention_alignment_checks() -> None:
@@ -94,9 +100,17 @@ def test_research_foundation_requires_convention_alignment_checks() -> None:
     assert "multiple papers" in text
     assert "convention_check" in text
     assert "check loop" in text
-    assert "<project-dir>/calculate/<run-id>/foundation/research-foundation.md" in text
-    assert "<project-dir>/research-foundation.md" in text
-    assert 'md2pdf(input="<project-dir>/research-foundation.md")' in text
+    assert '"explanation"' in text
+    assert "loose `\\sim`" in text
+    assert "not a usable foundation equation" in text
+    assert "derive a precise equality" in text
+    assert "<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md" in text
+    assert "<project-dir>/initial-research-foundation.md" in text
+    assert 'md2pdf(input="<project-dir>/initial-research-foundation.md")' in text
+    assert "<project-dir>/research-foundation.md" not in text
+    assert '"background"' not in text
+    assert '"meaning"' not in text
+    assert '"relation_type"' not in text
 
 
 def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
@@ -113,6 +127,13 @@ def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
     assert "unchecked" in text
     assert "internet" in text
     assert "paper tools" in text
+    assert "proposers may use arc paper mcp tools" in text
+    assert "read the main reference" in text
+    assert "validation-only final formulas" in text
+    assert "strictly derive from the foundation" in text
+    assert "external sources may inspire methods" in text
+    assert "do not directly use any result" in text
+    assert "different conventions" in text
     assert "wolfram" in text
 
 
@@ -143,6 +164,11 @@ def test_research_execute_refines_or_reports_when_blocked() -> None:
     assert "split the blocked step" in text
     assert "already atomic" in text
     assert "write `calculation-report.md` even when blocked" in text
+    assert "# appendix 1: research foundation updates" in text
+    assert "# appendix 2: calculation status" in text
+    assert "plan revision history" in text
+    assert "append each blocked_refinement event" in text
+    assert "do not rewrite `initial-research-foundation.md`" in text
     assert "which proposer or result is correct" in text
 
 
@@ -259,13 +285,15 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
     ).stdout
     assert "# Suggested Ideas\n\n" in markdown
     assert "Abbreviations:\n\nIR=intent relevance" in markdown
-    assert "## `idea_002`\n\nhigh novelty" in markdown
-    assert "## `idea_001`\n\nbetter" in markdown
+    summary = markdown.split("# Ranked Ideas and Details", 1)[0]
+    details = markdown.split("# Ranked Ideas and Details", 1)[1]
+    assert summary.index("## `idea_001`\n\nbetter") < summary.index("## `idea_002`\n\nhigh novelty")
     assert "| Round | IR | N | CN | SV | PL | WD | T |" in markdown
     assert "| Title | Total Mark | Rank |" not in markdown
     assert "| Loop | Round | Total | Intent Relevance | Novelty | Confidence | Value | Planning | Well-definedness |" in markdown
-    assert "# Appendix: Idea Details" in markdown
-    assert "### 1. high novelty" in markdown
+    assert "# Ranked Ideas and Details" in markdown
+    assert "# Appendix: Idea Details" not in markdown
+    assert details.index("### 1. high novelty") < details.index("### 2. better")
     assert "#### Referee Marks by Round" in markdown
     assert "#### Full Idea Verbatim" in markdown
     assert "```text" not in markdown
@@ -500,9 +528,12 @@ def test_suggest_ideas_proposer_schemas_are_codex_strict() -> None:
 
 def test_research_foundation_schema_requires_evidence_for_checked_equations() -> None:
     schema = json.loads((WF / "research-foundation.schema.json").read_text(encoding="utf-8"))
+    assert "explanation" in schema["properties"]["equations"]["items"]["required"]
+    assert "derived_quantities" in schema["properties"]
     equation = {
         "id": "eq_001",
         "label": "checked result",
+        "explanation": "Readable context and allowed use.",
         "latex": "x=y",
         "role": "useful_result",
         "axiom_status": "not_axiom",

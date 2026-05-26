@@ -7,8 +7,8 @@ Write artifacts under:
 
 ```text
 <project-dir>/calculate/<run-id>/plan.json
-<project-dir>/calculate/<run-id>/research-plan.md
-<project-dir>/research-plan.md
+<project-dir>/calculate/<run-id>/initial-research-plan.md
+<project-dir>/initial-research-plan.md
 ```
 
 `plan.json` must use `schema_version: "arc.research_plan.v1"`.
@@ -79,8 +79,10 @@ Step 1: Make the first calculation step the first nontrivial derivation after
 the accepted foundation setup.
 
 Step 2: Break difficult derivations into small steps that a not-strong agent
-can complete. If a step needs multiple identities, limits, field redefinitions,
-or approximations, split it into substeps.
+can complete. As soft guidance, a typical research project should have at least 20 steps.
+Use fewer only when the calculation is genuinely smaller. If a
+step needs multiple identities, limits, field redefinitions, or approximations,
+split it into substeps.
 
 Step 3: For every step, specify:
 
@@ -98,15 +100,17 @@ verification
 
 Step 4: At the end of every step, make the quantity contract explicit:
 calculate which quantity, in terms of which quantity, and what is not allowed
-as an input. If this cannot be stated clearly, split the step again.
+as an input. Do not disclose the exact expected expression or expected final formula.
+Instead, say to derive the target quantity in terms of named dependencies.
+If this cannot be stated clearly, split the step again.
 
-Step 5: Write `plan.json` and write the human-readable report directly to both
-`<project-dir>/calculate/<run-id>/research-plan.md` and
-`<project-dir>/research-plan.md`. The JSON is the source of truth for later
-workflow phases.
+Step 5: Write `plan.json` and write the initial human-readable report directly
+to both `<project-dir>/calculate/<run-id>/initial-research-plan.md` and
+`<project-dir>/initial-research-plan.md`. The JSON is the source of truth for
+later workflow phases.
 
 After writing the project-level Markdown report, call
-MCP `md2pdf(input="<project-dir>/research-plan.md")`. It starts a background
+MCP `md2pdf(input="<project-dir>/initial-research-plan.md")`. It starts a background
 PDF job; record the returned job id if present and do not wait before
 continuing.
 
@@ -127,6 +131,6 @@ the first calculation step is clear
 difficult steps have enough substeps
 ```
 
-Step 3: If the review finds gaps, revise `plan.json` and `research-plan.md`,
-then review the plan again. Proceed only when the review is recorded in both
-artifacts.
+Step 3: If the review finds gaps, revise `plan.json` and
+`initial-research-plan.md`, then review the plan again. Proceed only when the
+review is recorded in both artifacts.

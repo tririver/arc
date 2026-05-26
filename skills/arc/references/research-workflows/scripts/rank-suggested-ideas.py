@@ -56,6 +56,8 @@ def rank_run(run_root: Path) -> dict[str, Any]:
     return {
         "schema_version": "arc.suggest_ideas.selected_rounds.v1",
         "run_root": str(run_root),
+        "user_intent": _run_user_intent(run_root),
+        "summary_order": selected,
         "ranking": ranking,
     }
 
@@ -106,6 +108,23 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _run_user_intent(run_root: Path) -> str:
+    candidates = [
+        run_root.parent.parent / f"{run_root.parent.name}.config.json",
+        run_root.parent / "config.json",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            intent = _read_json(path).get("user_intent", "")
+        except (OSError, json.JSONDecodeError, SystemExit):
+            continue
+        if isinstance(intent, str) and intent.strip():
+            return intent.strip()
+    return ""
+
+
 def _round_number(round_root: Path) -> int:
     try:
         return int(round_root.name.split("_", 1)[1])
@@ -118,10 +137,31 @@ def _rank_key(entry: dict[str, Any]) -> tuple[float, ...]:
 
 
 def markdown_table(payload: dict[str, Any]) -> str:
-    lines = [_summary_table(payload), "", "# Appendix: Idea Details"]
+    lines = [
+        _intent_section(payload.get("user_intent", "")),
+        "",
+        _summary_table(payload),
+        "",
+        "# Ranked Ideas and Details",
+    ]
     for entry in payload["ranking"]:
         lines.extend(["", *_appendix_section(entry)])
     return "\n".join(lines)
+
+
+def _intent_section(intent: Any) -> str:
+    text = _intent_summary(str(intent or ""))
+    return "\n".join(["# Intent of the User", "", text])
+
+
+def _intent_summary(intent: str) -> str:
+    text = re.sub(r"\s+", " ", intent).strip()
+    if not text:
+        return "Not recorded in run config."
+    text = text[0].upper() + text[1:]
+    if text[-1] not in ".!?":
+        text += "."
+    return text
 
 
 def _summary_table(payload: dict[str, Any]) -> str:
@@ -133,7 +173,7 @@ def _summary_table(payload: dict[str, Any]) -> str:
         "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
         "PL=planning, WD=well-definedness, T=total.",
     ]
-    for entry in payload["ranking"]:
+    for entry in payload.get("summary_order", payload["ranking"]):
         lines.extend(["", *_round_marks_summary_section(entry)])
     if lines and lines[-1] == "":
         lines.pop()

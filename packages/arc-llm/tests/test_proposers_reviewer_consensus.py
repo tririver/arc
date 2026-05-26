@@ -65,8 +65,18 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "integrity_reference" in reviewer_template
     assert "very clearly step by step" in proposer_template
     assert "never skip a step" in proposer_template
-    assert proposer["runtime"]["allow_internet"] is False
-    assert proposer["runtime"]["allow_mcp"] is False
+    assert proposer["runtime"]["allow_internet"] is True
+    assert proposer["runtime"]["allow_mcp"] is True
+    assert proposer["runtime"]["mcp_mode"] == "arc-only"
+    assert "ARC paper MCP tools" in proposer_template
+    assert "read the main reference" in proposer_template
+    assert "internet search" in proposer_template.lower()
+    assert "validation-only final formulas" in proposer_template
+    lower_proposer_template = proposer_template.lower()
+    assert "strictly derive from the foundation" in lower_proposer_template
+    assert "external sources may inspire methods" in lower_proposer_template
+    assert "do not directly use any result" in lower_proposer_template
+    assert "different conventions" in lower_proposer_template
     assert reviewer["runtime"]["allow_mcp"] is False
     assert "SymPy" in reviewer_template
     assert "expand" in reviewer_template
