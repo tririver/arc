@@ -767,7 +767,10 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
             raise ValueError("analytic all_agree without SymPy requires explicit notes")
         history_text = "\n".join(str(item) for item in checks.get("check_history", []))
         lowered_evidence = f"{notes}\n{history_text}".lower()
-        has_explicit_differences = all(marker in lowered_evidence for marker in ["a-b", "b-c", "a-c"])
+        has_explicit_differences = all(
+            any(marker in lowered_evidence for marker in markers)
+            for markers in [["a-b", "a - b"], ["b-c", "b - c"], ["a-c", "a - c"]]
+        )
         has_zero_results = lowered_evidence.count("=0") >= 2 or lowered_evidence.count("= 0") >= 2
         says_differences_reduce_to_zero = (
             "differences reduce to zero" in lowered_evidence

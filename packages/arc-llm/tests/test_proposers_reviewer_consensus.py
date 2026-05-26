@@ -513,6 +513,34 @@ def test_consensus_accepts_manual_all_agree_with_explicit_differences(tmp_path):
     assert result["steps"][0]["status"] == "accepted"
 
 
+def test_consensus_accepts_manual_all_agree_with_spaced_difference_labels(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": "Explicit differences are zero.",
+                    "check_method": "analytic",
+                    "check_history": [
+                        "A - B: x - x = 0",
+                        "B - C: x - x = 0",
+                        "A - C: x - x = 0",
+                    ],
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
 def test_consensus_accepts_manual_all_agree_when_pairwise_differences_reduce_to_zero(tmp_path):
     fake = FakeBatchRunner(
         [

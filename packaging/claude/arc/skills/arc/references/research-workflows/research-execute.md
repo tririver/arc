@@ -155,10 +155,20 @@ Step 3: In `blocked_refinement`, review plan.json, reviewer reports, and, if
 needed, proposer calculations. Treat the block as evidence that the step is too
 difficult unless the step is already atomic.
 
-Step 4: If the blocked step can be split, split the blocked step and revise the plan into smaller steps.
-The first replacement step must end at the last calculation all proposers agree
-on. Each replacement step must have one clear quantity, inputs, output, and
-check. Then rerun the 3-proposer reviewer consensus on the refined step. Append each blocked_refinement event
+Step 4: If the blocked step can be split, revise the plan into smaller steps.
+Each replacement step must have one clear quantity, inputs, output, and check.
+The first replacement step should stop at the last calculation all proposers can
+agree on.
+
+If the full expression is still hard to split into complete sub-results, first
+choose controlled limits or projections that are simpler but relevant, such as
+one branch, one contour choice, one contraction, leading power only,
+equal-mass/equal-scale limit, or coefficient-stripped form. Ask proposers to
+agree on those limited results before returning to the full expression. If
+proposers already disagree in a controlled limit, continue refining around that
+limit instead of asking for the full expression.
+
+Then rerun the 3-proposer reviewer consensus on the refined step. Append each blocked_refinement event
 to the plan revision history inside
 `# Appendix 2: Calculation Status`; do not create a separate plan-revision
 report.
@@ -170,7 +180,7 @@ Step 6: Write `calculation-report.md` even when blocked, directly to both
 `<project-dir>/calculate/<run-id>/calculation-report.md` and
 `<project-dir>/calculation-report.md`. Include accepted outputs, blocked step,
 disagreement map, reviewer-report summary, proposer positions, artifact paths,
-the exact expert question, `# Appendix 1: Research Foundation Updates`, and
+the exact expert question, `# Appendix 1: Latest Research Foundation`, and
 `# Appendix 2: Calculation Status`. The first appendix must render the latest
 foundation updates from `foundation/latest.json`, including checked equations,
 derived quantities, version notes, and consensus artifacts. The second appendix

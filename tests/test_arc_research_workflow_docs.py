@@ -172,10 +172,14 @@ def test_research_execute_refines_or_reports_when_blocked() -> None:
     assert "review plan.json" in text
     assert "reviewer reports" in text
     assert "proposer calculations" in text
-    assert "split the blocked step" in text
+    assert "revise the plan into smaller steps" in text
     assert "already atomic" in text
+    assert "controlled limits or projections" in text
+    assert "one branch" in text
+    assert "coefficient-stripped form" in text
+    assert "before returning to the full expression" in text
     assert "write `calculation-report.md` even when blocked" in text
-    assert "# appendix 1: research foundation updates" in text
+    assert "# appendix 1: latest research foundation" in text
     assert "# appendix 2: calculation status" in text
     assert "plan revision history" in text
     assert "append each blocked_refinement event" in text
