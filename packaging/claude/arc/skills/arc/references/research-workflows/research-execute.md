@@ -115,18 +115,24 @@ spacing, or formatting. If SymPy is unavailable, either write explicit
 algebraic differences for `A-B`, `B-C`, and `A-C`, or use the numerical
 fallback.
 
-Step 7: If analytic checking is not possible, use at least 10 randomly selected
+Step 7: If a reviewer still suggests `all_agree` but its report is below this
+standard, the main agent must not stop immediately. First run an independent
+SymPy check of `A-B`, `B-C`, and `A-C` from proposer final results. If SymPy proves agreement,
+accept and record the fallback check. If the main agent cannot
+prove agreement, pause for human review.
+
+Step 8: If analytic checking is not possible, use at least 10 randomly selected
 data points. The minimum numerical fallback is 10 randomly selected data points.
 Record `check_method: "numerical"`, the relative error, the sample count, and
 the check history.
 
-Step 8: For an accepted foundation check, write a new foundation version that
+Step 9: For an accepted foundation check, write a new foundation version that
 marks the target equation checked. Keep the original equation unchanged and add
 the reviewer check history, method, relative error when numerical, and accepted
 consensus artifact path. Do not rewrite `initial-research-foundation.md`;
 human-facing foundation changes belong in the final report appendix.
 
-Step 9: When a new calculation result is accepted and will be useful as a later
+Step 10: When a new calculation result is accepted and will be useful as a later
 input, write a new foundation version with a concise derived quantity record.
 Record the statement, explanation, source step id, dependency ids, check status,
 and consensus artifact. Keep paper-sourced equations and derived quantities

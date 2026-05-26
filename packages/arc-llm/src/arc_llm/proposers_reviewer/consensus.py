@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -213,7 +214,12 @@ def _run_consensus_step(
 
         try:
             review = _read_json(attempt_paths["review_path"])
-            consensus = _review_consensus(review, active_proposer_ids=active_proposer_ids)
+            proposer_outputs = _read_proposer_outputs(attempt_paths["round_root"], active_proposer_ids)
+            consensus = _review_consensus(
+                review,
+                active_proposer_ids=active_proposer_ids,
+                proposer_outputs=proposer_outputs,
+            )
         except Exception as exc:
             attempt_record["error"] = str(exc)
             attempts.append(attempt_record)
@@ -227,7 +233,6 @@ def _run_consensus_step(
                 "reviewer_consensus": None,
                 "error": str(exc),
             }
-        proposer_outputs = _read_proposer_outputs(attempt_paths["round_root"], active_proposer_ids)
         attempt_record["consensus"] = consensus
         attempt_record["proposer_output_paths"] = {
             proposer_id: str(attempt_paths["round_root"] / "proposer_outputs" / f"{proposer_id}.json")
@@ -563,7 +568,12 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _review_consensus(review: Mapping[str, Any], *, active_proposer_ids: list[str]) -> dict[str, Any]:
+def _review_consensus(
+    review: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+    proposer_outputs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     if review.get("schema_version") != REVIEW_ENVELOPE_SCHEMA:
         raise ValueError(f"review schema_version must be {REVIEW_ENVELOPE_SCHEMA}")
     payload = review.get("review_payload")
@@ -576,8 +586,158 @@ def _review_consensus(review: Mapping[str, Any], *, active_proposer_ids: list[st
     if status not in {"all_agree", "two_agree", "all_disagree", "unresolved"}:
         raise ValueError("consensus.status must be all_agree, two_agree, all_disagree, or unresolved")
     if status == "all_agree" and len(active_proposer_ids) >= 3:
-        _validate_all_agree_pairwise_checks(consensus)
+        try:
+            _validate_all_agree_pairwise_checks(consensus)
+        except ValueError as exc:
+            fallback_checks = _main_agent_sympy_agreement_check(
+                proposer_outputs or {},
+                active_proposer_ids=active_proposer_ids,
+                validation_error=str(exc),
+            )
+            if fallback_checks is None:
+                raise
+            consensus = dict(consensus)
+            consensus["pairwise_symbolic_checks"] = fallback_checks
+            consensus["main_agent_agreement_check"] = {
+                "status": "accepted_by_sympy_fallback",
+                "reason": str(exc),
+            }
+            _validate_all_agree_pairwise_checks(consensus)
     return dict(consensus)
+
+
+def _main_agent_sympy_agreement_check(
+    proposer_outputs: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+    validation_error: str,
+) -> dict[str, Any] | None:
+    try:
+        from sympy import Symbol, expand, simplify, sympify
+    except Exception:
+        return None
+
+    parsed_by_id: dict[str, dict[str, Any]] = {}
+    for proposer_id in active_proposer_ids[:3]:
+        payload = proposer_outputs.get(proposer_id)
+        if not isinstance(payload, dict):
+            return None
+        parsed = _extract_named_final_expressions(payload.get("final_result"))
+        if not parsed:
+            return None
+        parsed_by_id[proposer_id] = parsed
+
+    common_names = set.intersection(*(set(parsed) for parsed in parsed_by_id.values()))
+    if not common_names:
+        return None
+
+    pair_ids = [
+        ("A_minus_B_zero", active_proposer_ids[0], active_proposer_ids[1], "A-B"),
+        ("B_minus_C_zero", active_proposer_ids[1], active_proposer_ids[2], "B-C"),
+        ("A_minus_C_zero", active_proposer_ids[0], active_proposer_ids[2], "A-C"),
+    ]
+    pair_results: dict[str, bool] = {}
+    history: list[str] = [
+        f"Main-agent SymPy fallback used after reviewer validation failed: {validation_error}",
+        f"Parsed common named final_result expressions: {', '.join(sorted(common_names))}.",
+    ]
+    code_lines = ["from sympy import Symbol, expand, simplify, sympify"]
+
+    for result_key, left_id, right_id, label in pair_ids:
+        pair_zero = True
+        for expression_name in sorted(common_names):
+            locals_map: dict[str, Any] = {}
+            left_expr = _sympify_named_expression(
+                str(parsed_by_id[left_id][expression_name]),
+                Symbol=Symbol,
+                sympify=sympify,
+                locals_map=locals_map,
+            )
+            right_expr = _sympify_named_expression(
+                str(parsed_by_id[right_id][expression_name]),
+                Symbol=Symbol,
+                sympify=sympify,
+                locals_map=locals_map,
+            )
+            if left_expr is None or right_expr is None:
+                return None
+            difference = simplify(expand(left_expr - right_expr))
+            is_zero = bool(difference == 0)
+            pair_zero = pair_zero and is_zero
+            history.append(f"{label} for {expression_name}: simplify(expand(left-right)) -> {difference}.")
+            code_lines.append(
+                f"# {label} for {expression_name}: simplify(expand(({parsed_by_id[left_id][expression_name]}) - ({parsed_by_id[right_id][expression_name]})))"
+            )
+        pair_results[result_key] = pair_zero
+
+    true_count = sum(1 for value in pair_results.values() if value)
+    if true_count < 2:
+        return None
+    return {
+        "used_sympy": True,
+        "A_minus_B_zero": pair_results["A_minus_B_zero"],
+        "B_minus_C_zero": pair_results["B_minus_C_zero"],
+        "A_minus_C_zero": pair_results["A_minus_C_zero"],
+        "true_count": true_count,
+        "sympy_code": "\n".join(code_lines),
+        "notes": "Main agent fallback proved proposer agreement with SymPy after reviewer evidence was below standard.",
+        "check_method": "analytic",
+        "sample_count": 0,
+        "numerical_relative_error": None,
+        "check_history": history,
+        "fallback_source": "main_agent_sympy",
+    }
+
+
+def _extract_named_final_expressions(final_result: Any) -> dict[str, str]:
+    if isinstance(final_result, dict):
+        return {
+            str(key): str(value).strip()
+            for key, value in final_result.items()
+            if isinstance(value, str) and _looks_like_expression(value)
+        }
+    if not isinstance(final_result, str):
+        return {}
+    expressions: dict[str, str] = {}
+    for raw_line in final_result.splitlines():
+        line = raw_line.strip()
+        if "=" not in line:
+            continue
+        left, right = line.split("=", 1)
+        name_match = re.search(r"([A-Za-z][A-Za-z0-9_]*)\s*$", left.strip())
+        if not name_match:
+            continue
+        expression = _strip_expression_comment(right)
+        if expression and _looks_like_expression(expression):
+            expressions[name_match.group(1)] = expression
+    return expressions
+
+
+def _strip_expression_comment(value: str) -> str:
+    expression = value.strip()
+    expression = expression.split("#", 1)[0].strip()
+    expression = expression.split(",", 1)[0].strip()
+    expression = expression.split(";", 1)[0].strip()
+    expression = re.split(r"\s+\(", expression, maxsplit=1)[0].strip()
+    return expression.rstrip(".")
+
+
+def _looks_like_expression(value: str) -> bool:
+    if not value.strip():
+        return False
+    without_names = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", "", value.replace("^", "**"))
+    return re.fullmatch(r"[\d\s+\-*/().]*", without_names) is not None
+
+
+def _sympify_named_expression(value: str, *, Symbol: Any, sympify: Any, locals_map: dict[str, Any]) -> Any | None:
+    expression = value.replace("^", "**")
+    names = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", expression))
+    for name in names:
+        locals_map.setdefault(name, Symbol(name))
+    try:
+        return sympify(expression, locals=locals_map)
+    except Exception:
+        return None
 
 
 def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:

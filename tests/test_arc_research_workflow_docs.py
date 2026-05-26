@@ -154,6 +154,17 @@ def test_research_execute_foundation_checks_use_same_three_proposer_standard() -
     assert "no single-proposer acceptance" in text
 
 
+def test_research_execute_uses_main_agent_sympy_fallback_for_bad_all_agree_review() -> None:
+    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+
+    assert "reviewer still suggests `all_agree`" in text
+    assert "report is below this" in text
+    assert "main agent" in text
+    assert "sympy check of `a-b`, `b-c`, and `a-c`" in text
+    assert "if sympy proves agreement" in text
+    assert "pause for human review" in text
+
+
 def test_research_execute_refines_or_reports_when_blocked() -> None:
     text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
 

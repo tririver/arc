@@ -442,6 +442,49 @@ def test_consensus_rejects_manual_all_agree_by_string_or_spacing_comparison(tmp_
     assert "manual all_agree" in result["steps"][0]["error"]
 
 
+def test_consensus_accepts_main_agent_sympy_fallback_for_bad_reviewer_evidence(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": "Manual comparison found only spacing differences.",
+                    "check_method": "analytic",
+                    "check_history": [
+                        "Compared A and B as strings.",
+                        "Compared B and C by visual inspection.",
+                        "Compared A and C: identical.",
+                    ],
+                },
+            )
+        ],
+        proposer_outputs={
+            "proposer_001": {"final_result": "W_gt_kernel = f_eta*fstar_etap\nW_lt_kernel = g_eta*gstar_etap"},
+            "proposer_002": {
+                "final_result": {
+                    "W_gt_kernel": "f_eta * fstar_etap",
+                    "W_lt_kernel": "g_eta * gstar_etap",
+                }
+            },
+            "proposer_003": {
+                "final_result": "W_gt_kernel = f_eta*fstar_etap\nW_lt_kernel = g_eta*gstar_etap"
+            },
+        },
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    checks = result["steps"][0]["reviewer_consensus"]["pairwise_symbolic_checks"]
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+    assert checks["used_sympy"] is True
+    assert checks["fallback_source"] == "main_agent_sympy"
+
+
 def test_consensus_accepts_manual_all_agree_with_explicit_differences(tmp_path):
     fake = FakeBatchRunner(
         [
@@ -567,8 +610,14 @@ def test_consensus_dry_run_does_not_call_batch_runner(tmp_path):
 
 
 class FakeBatchRunner:
-    def __init__(self, reviews: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        reviews: list[dict[str, Any]],
+        *,
+        proposer_outputs: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         self.reviews = list(reviews)
+        self.proposer_outputs = proposer_outputs or {}
         self.calls: list[dict[str, Any]] = []
 
     @property
@@ -588,8 +637,12 @@ class FakeBatchRunner:
         for proposer in loop["proposers"]:
             path = round_root / "proposer_outputs" / f"{proposer['id']}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
+            payload = self.proposer_outputs.get(
+                proposer["id"],
+                {"proposer_id": proposer["id"], "call_number": call_number},
+            )
             path.write_text(
-                json.dumps({"proposer_id": proposer["id"], "call_number": call_number}) + "\n",
+                json.dumps(payload) + "\n",
                 encoding="utf-8",
             )
         review = self.reviews.pop(0)
