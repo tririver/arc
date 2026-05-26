@@ -4,6 +4,7 @@ cache/
 arc-tests/
 .understandignore
 .understand-anything/
+.claude/
 
 # Local secrets and provider credentials
 .env
