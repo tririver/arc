@@ -173,10 +173,25 @@ to the plan revision history inside
 `# Appendix 2: Calculation Status`; do not create a separate plan-revision
 report.
 
-Step 5: If the blocked step is already atomic and cannot be split further, stop
+Step 5: If the block is caused by inadequate foundation or a wrong plan, do not
+silently continue. Classify it as `foundation_inadequate` when definitions or
+premises are missing but expandable without inconsistency, `foundation_conflict`
+when existing foundation items appear inconsistent, or `plan_wrong` when the
+step is not viable but a revised plan remains physically interesting.
+
+For `foundation_inadequate` or `plan_wrong`, request two independent proposers
+to propose the expansion or revision. Continue only if at least two proposers
+agree, the reviewer agrees, and the main agent agrees after inspection. For
+`foundation_conflict`, stop and ask the human expert unless the same agreement
+process resolves the conflict. In interactive mode, ask human approval before
+applying the revision; in auto mode, apply it and continue. Report the revision
+in `calculation-report.md` with a `**Caution**` paragraph explaining what
+changed, why, who agreed, approval mode, and which later results depend on it.
+
+Step 6: If the blocked step is already atomic and cannot be split further, stop
 as blocked. Do not choose a proposer yourself.
 
-Step 6: Write `calculation-report.md` even when blocked, directly to both
+Step 7: Write `calculation-report.md` even when blocked, directly to both
 `<project-dir>/calculate/<run-id>/calculation-report.md` and
 `<project-dir>/calculation-report.md`. Include accepted outputs, blocked step,
 disagreement map, reviewer-report summary, proposer positions, artifact paths,

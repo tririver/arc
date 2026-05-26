@@ -178,6 +178,15 @@ def test_research_execute_refines_or_reports_when_blocked() -> None:
     assert "one branch" in text
     assert "coefficient-stripped form" in text
     assert "before returning to the full expression" in text
+    assert "foundation_inadequate" in text
+    assert "foundation_conflict" in text
+    assert "plan_wrong" in text
+    assert "two independent proposers" in text
+    assert "the reviewer agrees" in text
+    assert "the main agent agrees" in text
+    assert "interactive mode" in text
+    assert "auto mode" in text
+    assert "**caution**" in text
     assert "write `calculation-report.md` even when blocked" in text
     assert "# appendix 1: latest research foundation" in text
     assert "# appendix 2: calculation status" in text
