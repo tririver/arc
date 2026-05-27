@@ -218,6 +218,9 @@ def _run_consensus_step(
             consensus = _review_consensus(
                 review,
                 active_proposer_ids=active_proposer_ids,
+                selectable_proposer_ids=list(
+                    dict.fromkeys([*active_proposer_ids, *[proposer_id for proposer_id in locked_outputs]])
+                ),
                 proposer_outputs=proposer_outputs,
             )
         except Exception as exc:
@@ -295,6 +298,9 @@ def _attempt_batch_config(
     run_root: Path,
 ) -> dict[str, Any]:
     attempt_id = f"{step.step_id}_attempt_{attempt_number:03d}"
+    selectable_proposer_ids = list(
+        dict.fromkeys([*active_proposer_ids, *[proposer_id for proposer_id in locked_outputs]])
+    )
     caller_context = _caller_context(
         config,
         step,
@@ -316,7 +322,7 @@ def _attempt_batch_config(
                 "early_stop": {"enabled": False},
                 "caller_context": caller_context,
                 "proposers": [_proposer_config(proposer_id) for proposer_id in active_proposer_ids],
-                "reviewers": [_reviewer_config(active_proposer_ids)],
+                "reviewers": [_reviewer_config(active_proposer_ids, selectable_proposer_ids)],
             }
         ],
     }
@@ -373,11 +379,16 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
                 "identity or intermediate result, derive it here. External sources may use "
                 "different conventions; map notation back to foundation conventions before "
                 "using it. Do the calculation very clearly step by step; never skip a step. "
+                "Write all mathematical expressions in derivation, assumptions, and final_result "
+                "as display-ready LaTeX inside Markdown math delimiters or as LaTeX strings in "
+                "JSON fields; avoid ASCII-only math such as rho_2, eta_prime, or T_ab when a "
+                "LaTeX form such as \\rho_2, \\eta', or T_{ab} is intended for the report. "
                 "Return one JSON object with result_summary, derivation, assumptions, "
-                "reliable_until, and final_result. Put the final mathematical result in "
-                "final_result using explicit symbols so a reviewer can compare it with "
-                "other proposers by evaluating A-B, B-C, and A-C. Do not coordinate with "
-                "other proposers.\n\n"
+                "validity_scope, and final_result. Use validity_scope for assumptions, "
+                "conventions, limits, and unresolved dependencies; do not use date-like "
+                "reliability fields. Put the final mathematical result in final_result using "
+                "explicit symbols so a reviewer can compare it with other proposers by "
+                "evaluating A-B, B-C, and A-C. Do not coordinate with other proposers.\n\n"
                 "{caller_context_json}"
             ),
         },
@@ -391,7 +402,7 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
     }
 
 
-def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
+def _reviewer_config(active_proposer_ids: list[str], selectable_proposer_ids: list[str]) -> dict[str, Any]:
     return {
         "id": "reviewer_001",
         "prompt": {
@@ -409,8 +420,15 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
                 "In review_payload.consensus, "
                 "set status to all_agree, two_agree, all_disagree, or unresolved. Include "
                 "accepted_result, agreed_proposer_ids, likely_wrong_proposer_ids, "
-                "recalculate_proposer_ids, reliable_until, analysis, and "
-                "pairwise_symbolic_checks. Let A, B, and C be the final mathematical results "
+                "recalculate_proposer_ids, validity_scope, analysis, and "
+                "pairwise_symbolic_checks. Also include best_written_proposer_id and "
+                "best_written_selection_reason. When status is all_agree, choose "
+                "best_written_proposer_id from agreed_proposer_ids or accepted "
+                "caller_context.locked_outputs by clearest logic, most complete "
+                "details, and best readability; this copy will be used "
+                "for the full calculation appendix. If the status is not all_agree, "
+                "set best_written_proposer_id to null and explain why. "
+                "Let A, B, and C be the final mathematical results "
                 "from proposer_001, proposer_002, and proposer_003 when those proposer ids "
                 "are active. Use SymPy whenever available to simplify A-B, B-C, and A-C. "
                 "If used_sympy=true, pairwise_symbolic_checks.sympy_code must include "
@@ -432,12 +450,14 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
                 "{current_proposer_outputs_json}"
             ),
         },
-        "output_schema": _reviewer_output_schema(active_proposer_ids),
+        "output_schema": _reviewer_output_schema(active_proposer_ids, selectable_proposer_ids),
         "runtime": {"allow_mcp": False, "codex_sandbox": "read-only"},
     }
 
 
-def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
+def _reviewer_output_schema(active_proposer_ids: list[str], selectable_proposer_ids: list[str] | None = None) -> dict[str, Any]:
+    if selectable_proposer_ids is None:
+        selectable_proposer_ids = active_proposer_ids
     proposer_message_properties = {
         proposer_id: {
             "type": "object",
@@ -481,9 +501,11 @@ def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
                             "agreed_proposer_ids",
                             "likely_wrong_proposer_ids",
                             "recalculate_proposer_ids",
-                            "reliable_until",
+                            "validity_scope",
                             "analysis",
                             "pairwise_symbolic_checks",
+                            "best_written_proposer_id",
+                            "best_written_selection_reason",
                         ],
                         "properties": {
                             "status": {
@@ -502,8 +524,15 @@ def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
                                 "type": "array",
                                 "items": {"enum": active_proposer_ids},
                             },
-                            "reliable_until": {"type": "string"},
+                            "validity_scope": {"type": "string"},
                             "analysis": {"type": "string"},
+                            "best_written_proposer_id": {
+                                "anyOf": [
+                                    {"enum": selectable_proposer_ids},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "best_written_selection_reason": {"type": "string"},
                             "pairwise_symbolic_checks": {
                                 "type": "object",
                                 "required": [
@@ -572,8 +601,11 @@ def _review_consensus(
     review: Mapping[str, Any],
     *,
     active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str] | None = None,
     proposer_outputs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if selectable_proposer_ids is None:
+        selectable_proposer_ids = active_proposer_ids
     if review.get("schema_version") != REVIEW_ENVELOPE_SCHEMA:
         raise ValueError(f"review schema_version must be {REVIEW_ENVELOPE_SCHEMA}")
     payload = review.get("review_payload")
@@ -585,6 +617,12 @@ def _review_consensus(
     status = consensus.get("status")
     if status not in {"all_agree", "two_agree", "all_disagree", "unresolved"}:
         raise ValueError("consensus.status must be all_agree, two_agree, all_disagree, or unresolved")
+    if status == "all_agree":
+        _validate_best_written_selection(
+            consensus,
+            active_proposer_ids=active_proposer_ids,
+            selectable_proposer_ids=selectable_proposer_ids,
+        )
     if status == "all_agree" and len(active_proposer_ids) >= 3:
         try:
             _validate_all_agree_pairwise_checks(consensus)
@@ -604,6 +642,25 @@ def _review_consensus(
             }
             _validate_all_agree_pairwise_checks(consensus)
     return dict(consensus)
+
+
+def _validate_best_written_selection(
+    consensus: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str],
+) -> None:
+    best_written = consensus.get("best_written_proposer_id")
+    if not isinstance(best_written, str) or not best_written.strip():
+        raise ValueError("best_written_proposer_id is required for all_agree consensus")
+    if best_written not in selectable_proposer_ids:
+        raise ValueError("best_written_proposer_id must identify an active or locked proposer output")
+    agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), active_proposer_ids)
+    if best_written in active_proposer_ids and best_written not in agreed_ids:
+        raise ValueError("best_written_proposer_id must be one of agreed_proposer_ids for all_agree consensus")
+    reason = consensus.get("best_written_selection_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("best_written_selection_reason is required for all_agree consensus")
 
 
 def _main_agent_sympy_agreement_check(

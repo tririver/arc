@@ -65,6 +65,9 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "integrity_reference" in reviewer_template
     assert "very clearly step by step" in proposer_template
     assert "never skip a step" in proposer_template
+    assert "LaTeX" in proposer_template
+    assert "validity_scope" in proposer_template
+    assert "reliable_until" not in proposer_template
     assert proposer["runtime"]["allow_internet"] is True
     assert proposer["runtime"]["allow_mcp"] is True
     assert proposer["runtime"]["mcp_mode"] == "arc-only"
@@ -93,6 +96,10 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "Never mark all_agree" in reviewer_template
     consensus_properties = reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["properties"]
     assert "pairwise_symbolic_checks" in consensus_properties
+    assert "best_written_proposer_id" in consensus_properties
+    assert "best_written_selection_reason" in consensus_properties
+    assert "validity_scope" in consensus_properties
+    assert "reliable_until" not in consensus_properties
     pairwise_properties = consensus_properties["pairwise_symbolic_checks"]["properties"]
     assert "used_sympy" in pairwise_properties
 
@@ -332,6 +339,42 @@ def test_consensus_rejects_all_agree_without_pairwise_symbolic_checks(tmp_path):
     assert result["status"] == "failed"
     assert result["steps"][0]["status"] == "failed"
     assert "pairwise_symbolic_checks" in result["steps"][0]["error"]
+
+
+def test_consensus_rejects_all_agree_without_best_written_selection(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+                best_written=False,
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "best_written_proposer_id" in result["steps"][0]["error"]
+
+
+def test_consensus_rejects_all_agree_with_best_written_outside_agreed_proposers(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                best_written_proposer_id="proposer_003",
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "agreed_proposer_ids" in result["steps"][0]["error"]
 
 
 def test_consensus_rejects_numerical_all_agree_with_too_few_samples(tmp_path):
@@ -695,6 +738,8 @@ def consensus_review(
     accepted: dict[str, Any] | None = None,
     pairwise_checks: bool = True,
     pairwise_check_overrides: dict[str, Any] | None = None,
+    best_written: bool = True,
+    best_written_proposer_id: str | None = "proposer_001",
 ) -> dict[str, Any]:
     consensus: dict[str, Any] = {
         "status": status,
@@ -702,9 +747,12 @@ def consensus_review(
         "agreed_proposer_ids": agreed or [],
         "likely_wrong_proposer_ids": likely_wrong or [],
         "recalculate_proposer_ids": recalculate or [],
-        "reliable_until": "attempt boundary",
+        "validity_scope": "valid under stated assumptions and foundation conventions",
         "analysis": "review analysis",
     }
+    if best_written:
+        consensus["best_written_proposer_id"] = best_written_proposer_id
+        consensus["best_written_selection_reason"] = "clearest logic and most complete derivation"
     if pairwise_checks:
         pairwise_payload = {
             "used_sympy": True,

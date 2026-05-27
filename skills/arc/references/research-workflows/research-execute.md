@@ -89,6 +89,15 @@ Step 1: Enclose `integrity.md` for both proposer and reviewer prompts.
 Step 2: Proposer prompts must require a very clear step-by-step derivation and
 must say never skip a step.
 
+Step 2a: Proposer outputs that may appear in human reports must write
+mathematical expressions in Markdown/LaTeX form. Use `$...$` for inline math
+and `$$...$$` for display equations in prose fields. In JSON expression fields,
+use LaTeX strings such as `\\rho_2`, `\\eta'`, and `T_{ab}`, not report-facing
+ASCII placeholders such as `rho_2`, `eta_prime`, or `T_ab`. Proposer outputs
+must include `validity_scope` for assumptions, conventions, limits, and
+unresolved dependencies. Do not request or render date-like `reliable_until`
+fields for derivation validity.
+
 Step 3: Proposers may use ARC paper MCP tools to read the main reference and
 cited source sections named by `plan.json` or
 `foundation/latest.json`. Internet search is allowed only for source discovery
@@ -126,13 +135,23 @@ data points. The minimum numerical fallback is 10 randomly selected data points.
 Record `check_method: "numerical"`, the relative error, the sample count, and
 the check history.
 
-Step 9: For an accepted foundation check, write a new foundation version that
+Step 9: For every `all_agree` review, the reviewer must also select one
+proposer output as the full-detail source for the human report. Record this in
+`review_payload.consensus.best_written_proposer_id` with
+`best_written_selection_reason`. Choose from `agreed_proposer_ids` or accepted
+locked outputs from earlier attempts using clearest logic, most complete
+details, and best readability. This choice does not affect correctness
+acceptance; it only chooses which agreeing derivation is rendered in full. If
+the review is not `all_agree`, set
+`best_written_proposer_id` to `null` and explain why.
+
+Step 10: For an accepted foundation check, write a new foundation version that
 marks the target equation checked. Keep the original equation unchanged and add
 the reviewer check history, method, relative error when numerical, and accepted
 consensus artifact path. Do not rewrite `initial-research-foundation.md`;
 human-facing foundation changes belong in the final report appendix.
 
-Step 10: When a new calculation result is accepted and will be useful as a later
+Step 11: When a new calculation result is accepted and will be useful as a later
 input, write a new foundation version with a concise derived quantity record.
 Record the statement, explanation, source step id, dependency ids, check status,
 and consensus artifact. Keep paper-sourced equations and derived quantities
@@ -196,13 +215,66 @@ Step 7: Write `calculation-report.md` even when blocked, directly to both
 `<project-dir>/calculation-report.md`. Include accepted outputs, blocked step,
 disagreement map, reviewer-report summary, proposer positions, artifact paths,
 the exact expert question, `# Appendix 1: Latest Research Foundation`, and
-`# Appendix 2: Calculation Status`. The first appendix must render the latest
-foundation updates from `foundation/latest.json`, including checked equations,
-derived quantities, version notes, and consensus artifacts. The second appendix
-must summarize original steps, each blocked_refinement, plan revision history,
-what changed, the replacement config, and whether that refined step was
-accepted or blocked. Ask which proposer or result is correct, or what
-instruction should continue the calculation.
+`# Appendix 2: Calculation Status`, and `# Appendix 3: Full Calculation
+Details`. The first appendix must render the latest foundation updates from
+`foundation/latest.json`, including checked equations, derived quantities,
+version notes, and consensus artifacts. The second appendix must summarize
+original steps, each blocked_refinement, plan revision history, what changed,
+the replacement config, and whether that refined step was accepted or blocked.
+The third appendix must render one full calculation copy per accepted planned
+calculation step, using the reviewer-selected `best_written_proposer_id`.
+Ask which proposer or result is correct, or what instruction should continue
+the calculation.
+
+Appendix 3 must use this structure:
+
+```text
+# Appendix 3: Full Calculation Details
+
+## Planned Step 1
+
+### Plan
+
+<render the latest active plan step or refined replacement step: goal, quantity
+contract, allowed inputs, dependencies, substeps, expected output, verification
+target, and revision note when it replaced an original step>
+
+### Calculation Details
+
+<render the selected proposer's full derivation/calculation, assumptions,
+validity_scope, source/tool citations, and final_result>
+
+## Planned Step 2
+
+### Plan
+
+...
+
+### Calculation Details
+
+...
+```
+
+For each accepted planned step, render the latest active plan, not the stale
+original plan. If blocked refinement replaced a step, use the replacement step
+that was actually accepted, include the original `step_id`, the replacement
+`step_id`, and the refinement reason. If `plan.json` was revised, read the
+latest `plan.json`; if the refinement is represented only in a replacement
+consensus config, render that replacement config's step prompt and append the
+plan revision history entry from Appendix 2. Then read
+`reviewer_consensus.best_written_proposer_id` from the accepted consensus step
+and find that proposer's JSON in the accepted attempt's `proposer_output_paths`.
+If the selected proposer output was locked from an earlier attempt, locate the
+most recent matching proposer path in earlier `attempts[]`. Render only that
+selected copy in full; do not duplicate the other agreeing derivations. Render
+math from the selected proposer output as Markdown/LaTeX display math where
+possible, not as raw ASCII prose. Do not render date-like `reliable_until`
+fields as scientific validity. Prefer `validity_scope`; if older artifacts only
+contain `reliable_until`, translate it to a short validity-scope note or omit
+it. Still include artifact paths for the selected proposer output, the reviewer
+report, and the consensus run state. If there is no accepted consensus or no
+selected best-written proposer, say why no single full-detail copy is rendered
+and point to the available artifact paths.
 
 Step 7: If the human expert decides that one proposer or result is correct,
 continue from that premise and mark it as human-resolved in the next report.
