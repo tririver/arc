@@ -20,6 +20,14 @@ Ask user questions through the host's discrete selection tool when one is
 available. Do not use open-ended prose questions when a bounded choice can
 express the decision.
 
+Before printing a typed fallback, check the tools available in the current
+turn. In Codex, use `request_user_input` when it is listed as an available
+tool and allowed by the current collaboration mode. Other hosts should use their
+native select/menu tool when available. Do not infer that no discrete tool
+exists from automation mode text alone; only use the typed fallback when no
+suitable tool is available, when Codex reports `request_user_input` unavailable
+in the current collaboration mode, or when a tool call is rejected.
+
 The default/recommended option must be first, so pressing Enter chooses it.
 The user can use arrow keys to choose another option.
 
@@ -27,6 +35,8 @@ Every choice prompt must:
 
 - Use two or more bounded options.
 - Put the recommended/default continuation first.
+- Use raw option labels. Do not include list numbering inside option labels,
+  such as `1. 1`, `2:`, or `3:`.
 - Make the final option exactly `Let's discuss`.
 - Avoid open-ended prose questions when a bounded choice can express the
   decision.

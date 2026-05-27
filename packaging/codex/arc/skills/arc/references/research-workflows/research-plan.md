@@ -104,6 +104,12 @@ as an input. Do not disclose the exact expected expression or expected final for
 Instead, say to derive the target quantity in terms of named dependencies.
 If this cannot be stated clearly, split the step again.
 
+For equations quoted from a reference or collaborator note that need checking,
+do not disclose the target reference equation in `prompt`, `allowed_inputs`, or
+`expected_output`. Make the step a blind reference check: proposers derive the
+quantity from named dependencies, and the execute workflow supplies the target
+only as a reviewer-only reference claim.
+
 Step 5: Write `plan.json` and write the initial human-readable report directly
 to both `<project-dir>/calculate/<run-id>/initial-research-plan.md` and
 `<project-dir>/initial-research-plan.md`. The JSON is the source of truth for

@@ -1,6 +1,6 @@
 ---
 name: arc
-description: Use for ARC research workflows involving paper metadata, arXiv full text, INSPIRE references/citers, paper section lookup, equation context, LLM paper summaries, and research-domain construction from seed papers.
+description: Use for ARC research workflows involving paper metadata, arXiv full text, INSPIRE references/citers, paper section lookup, equation context, LLM paper summaries, research-domain construction from seed papers, and checking Markdown/PDF research notes.
 ---
 
 # Advanced Research Compass (ARC)
@@ -85,7 +85,7 @@ Include `automation_level`, `workflow`, `original_request`, `user_intent`,
 
 ### Phase 2: Route Selection
 
-Resolve the user's intent and classify it into one of the three cases below.
+Resolve the user's intent and classify it into one of the four cases below.
 
 Case 1: Build domain references only.
 Read and execute `references/research-workflows/build-domain.md`.
@@ -94,7 +94,12 @@ Case 2: Suggest research ideas from a not-yet-explicit request.
 First complete Case 1. Then read and execute
 `references/research-workflows/research-ideas.md`.
 
-Case 3: Calculate from an explicit idea.
+Case 3: Check note files or collaborator notes.
+Use when the request asks to check, verify, audit, or mark foundation items in
+one or more accessible `.md` or `.pdf` notes. Read and execute
+`references/research-workflows/check.md`.
+
+Case 4: Calculate from an explicit idea.
 If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
 the user to select one concrete idea.
 If the idea is explicit enough:

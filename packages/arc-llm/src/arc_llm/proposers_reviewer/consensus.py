@@ -26,6 +26,8 @@ class ConsensusStep:
     prompt: str
     kind: str
     allowed_context: dict[str, Any]
+    proposer_runtime: dict[str, Any]
+    reviewer_reference_claim: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,14 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
                 prompt=_required_text(step_data, "prompt"),
                 kind=kind,
                 allowed_context=_dict(step_data.get("allowed_context", {}), f"{step_id}.allowed_context"),
+                proposer_runtime=_dict(
+                    step_data.get("proposer_runtime", {}),
+                    f"{step_id}.proposer_runtime",
+                ),
+                reviewer_reference_claim=_optional_dict(
+                    step_data.get("reviewer_reference_claim"),
+                    f"{step_id}.reviewer_reference_claim",
+                ),
             )
         )
 
@@ -222,6 +232,7 @@ def _run_consensus_step(
                     dict.fromkeys([*active_proposer_ids, *[proposer_id for proposer_id in locked_outputs]])
                 ),
                 proposer_outputs=proposer_outputs,
+                reviewer_reference_claim=step.reviewer_reference_claim,
             )
         except Exception as exc:
             attempt_record["error"] = str(exc)
@@ -244,7 +255,7 @@ def _run_consensus_step(
         attempts.append(attempt_record)
 
         status = str(consensus.get("status", "unresolved"))
-        if status == "all_agree":
+        if status in {"all_agree", "reference_disagrees"}:
             accepted_result = consensus.get("accepted_result")
             return {
                 "step_id": step.step_id,
@@ -321,8 +332,20 @@ def _attempt_batch_config(
                 "max_rounds": 1,
                 "early_stop": {"enabled": False},
                 "caller_context": caller_context,
-                "proposers": [_proposer_config(proposer_id) for proposer_id in active_proposer_ids],
-                "reviewers": [_reviewer_config(active_proposer_ids, selectable_proposer_ids)],
+                "proposers": [
+                    _proposer_config(
+                        proposer_id,
+                        runtime=_proposer_runtime(config, step),
+                    )
+                    for proposer_id in active_proposer_ids
+                ],
+                "reviewers": [
+                    _reviewer_config(
+                        active_proposer_ids,
+                        selectable_proposer_ids,
+                        reviewer_reference_claim=step.reviewer_reference_claim,
+                    )
+                ],
             }
         ],
     }
@@ -357,7 +380,35 @@ def _caller_context(
     return context
 
 
-def _proposer_config(proposer_id: str) -> dict[str, Any]:
+def _proposer_runtime(config: ConsensusConfig, step: ConsensusStep) -> dict[str, Any]:
+    if step.reviewer_reference_claim:
+        runtime = {
+            "allow_internet": False,
+            "allow_mcp": False,
+            "codex_sandbox": "read-only",
+        }
+    elif step.kind == "new_calculation":
+        runtime = {
+            "allow_internet": True,
+            "allow_mcp": True,
+            "mcp_mode": "arc-only",
+            "codex_sandbox": "read-only",
+        }
+    else:
+        runtime = {
+            "allow_internet": False,
+            "allow_mcp": False,
+            "codex_sandbox": "read-only",
+        }
+    runtime.update(_dict(config.defaults.get("proposer_runtime", {}), "defaults.proposer_runtime"))
+    runtime.update(step.proposer_runtime)
+    if runtime.get("allow_mcp") and "mcp_mode" not in runtime:
+        runtime["mcp_mode"] = "arc-only"
+    return runtime
+
+
+def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[str, Any]:
+    source_policy = _proposer_source_policy(runtime)
     return {
         "id": proposer_id,
         "prompt": {
@@ -366,12 +417,8 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
                 "First read and follow caller_context.integrity_reference.content. "
                 "Use only caller_context.step_prompt, caller_context.allowed_context, "
                 "caller_context.foundation_context when present, accepted locked_outputs, "
-                "your own SymPy/local algebra, and cited source context you inspect. "
-                "You may use ARC paper MCP tools to read the main reference and cited "
-                "sections named in the plan or foundation context. Internet search is "
-                "allowed only for source discovery or uncached paper access. Cite any "
-                "paper tool or internet source you use. Do not use validation-only final "
-                "formulas as derivation inputs. Wolfram may be used only for algebraic "
+                "and your own SymPy/local algebra. "
+                f"{source_policy} Wolfram may be used only for algebraic "
                 "verification. You must strictly derive from the foundation context and "
                 "accepted locked_outputs. External sources may inspire methods, but do not "
                 "directly use any result from papers or the internet unless it appears in "
@@ -393,16 +440,48 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
             ),
         },
         "output_schema": {"type": "object"},
-        "runtime": {
-            "allow_internet": True,
-            "allow_mcp": True,
-            "mcp_mode": "arc-only",
-            "codex_sandbox": "read-only",
-        },
+        "runtime": dict(runtime),
     }
 
 
-def _reviewer_config(active_proposer_ids: list[str], selectable_proposer_ids: list[str]) -> dict[str, Any]:
+def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
+    allow_mcp = bool(runtime.get("allow_mcp"))
+    allow_internet = bool(runtime.get("allow_internet"))
+    if not allow_mcp and not allow_internet:
+        return (
+            "Do not use internet search. Do not use ARC paper MCP tools. "
+            "Do not read paper source sections, arXiv pages, INSPIRE pages, "
+            "cached paper text, or any external source. Use only the supplied "
+            "caller_context, accepted locked_outputs, and your own local algebra. "
+            "Do not use validation-only final formulas as derivation inputs."
+        )
+    parts = []
+    if allow_mcp:
+        parts.append(
+            "You may use ARC paper MCP tools only to read the main reference and cited "
+            "sections explicitly named in caller_context."
+        )
+    else:
+        parts.append("Do not use ARC paper MCP tools or cached paper text.")
+    if allow_internet:
+        parts.append("Internet search is allowed only for source discovery or uncached paper access.")
+    else:
+        parts.append("Do not use internet search.")
+    parts.append("Cite any paper tool or internet source you use.")
+    parts.append("Do not use validation-only final formulas as derivation inputs.")
+    return " ".join(parts)
+
+
+def _reviewer_config(
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str],
+    *,
+    reviewer_reference_claim: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    reference_instruction = _reviewer_reference_instruction(
+        reviewer_reference_claim,
+        active_proposer_ids=active_proposer_ids,
+    )
     return {
         "id": "reviewer_001",
         "prompt": {
@@ -426,8 +505,11 @@ def _reviewer_config(active_proposer_ids: list[str], selectable_proposer_ids: li
                 "best_written_proposer_id from agreed_proposer_ids or accepted "
                 "caller_context.locked_outputs by clearest logic, most complete "
                 "details, and best readability; this copy will be used "
-                "for the full calculation appendix. If the status is not all_agree, "
-                "set best_written_proposer_id to null and explain why. "
+                "for the full calculation appendix. When status is reference_disagrees, "
+                "choose best_written_proposer_id from the agreeing blind proposer ids by "
+                "the same clarity rule because the blind proposer result is accepted. "
+                "If the status is neither all_agree nor reference_disagrees, set "
+                "best_written_proposer_id to null and explain why. "
                 "Let A, B, and C be the final mathematical results "
                 "from proposer_001, proposer_002, and proposer_003 when those proposer ids "
                 "are active. Use SymPy whenever available to simplify A-B, B-C, and A-C. "
@@ -446,18 +528,54 @@ def _reviewer_config(active_proposer_ids: list[str], selectable_proposer_ids: li
                 "10 randomly selected data points and report check_method=numerical, "
                 "sample_count, numerical_relative_error as a relative error, and the sampled check history. "
                 "If exactly one proposer is likely wrong, name only that proposer for "
-                "recalculation; otherwise ask all proposers to recalculate.\n\n"
+                "recalculation; otherwise ask all proposers to recalculate. "
+                f"{reference_instruction}\n\n"
                 "{current_proposer_outputs_json}"
             ),
         },
-        "output_schema": _reviewer_output_schema(active_proposer_ids, selectable_proposer_ids),
+        "output_schema": _reviewer_output_schema(
+            active_proposer_ids,
+            selectable_proposer_ids,
+            allow_reference_disagrees=bool(reviewer_reference_claim),
+        ),
         "runtime": {"allow_mcp": False, "codex_sandbox": "read-only"},
     }
 
 
-def _reviewer_output_schema(active_proposer_ids: list[str], selectable_proposer_ids: list[str] | None = None) -> dict[str, Any]:
+def _reviewer_reference_instruction(
+    reviewer_reference_claim: Mapping[str, Any] | None,
+    *,
+    active_proposer_ids: list[str],
+) -> str:
+    if not reviewer_reference_claim:
+        return ""
+    claim_json = json.dumps(reviewer_reference_claim, indent=2, ensure_ascii=False, sort_keys=True)
+    first = active_proposer_ids[0] if len(active_proposer_ids) >= 1 else "proposer_001"
+    second = active_proposer_ids[1] if len(active_proposer_ids) >= 2 else "proposer_002"
+    return (
+        "Reviewer-only blind reference check is active. Do not reveal the reference claim "
+        "to proposers through proposer_messages. Treat A as the final result from "
+        f"{first}, B as the final result from {second}, and C as reviewer_reference_claim. "
+        "For A=B=C, set status=all_agree. For A=B but A-C and B-C are nonzero, "
+        "set status=reference_disagrees, set agreed_proposer_ids to the agreeing proposer ids, "
+        "and put the blind proposer result in accepted_result with reference_claim_status='disagrees'. "
+        "If A and B disagree, do not accept the reference claim merely because one proposer matches it; "
+        "set status=unresolved or all_disagree and request recalculation.\n\n"
+        f"reviewer_reference_claim:\n{claim_json}"
+    )
+
+
+def _reviewer_output_schema(
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str] | None = None,
+    *,
+    allow_reference_disagrees: bool = False,
+) -> dict[str, Any]:
     if selectable_proposer_ids is None:
         selectable_proposer_ids = active_proposer_ids
+    status_values = ["all_agree", "two_agree", "all_disagree", "unresolved"]
+    if allow_reference_disagrees:
+        status_values.append("reference_disagrees")
     proposer_message_properties = {
         proposer_id: {
             "type": "object",
@@ -509,7 +627,7 @@ def _reviewer_output_schema(active_proposer_ids: list[str], selectable_proposer_
                         ],
                         "properties": {
                             "status": {
-                                "enum": ["all_agree", "two_agree", "all_disagree", "unresolved"]
+                                "enum": status_values
                             },
                             "accepted_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
                             "agreed_proposer_ids": {
@@ -603,6 +721,7 @@ def _review_consensus(
     active_proposer_ids: list[str],
     selectable_proposer_ids: list[str] | None = None,
     proposer_outputs: Mapping[str, Any] | None = None,
+    reviewer_reference_claim: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if selectable_proposer_ids is None:
         selectable_proposer_ids = active_proposer_ids
@@ -615,18 +734,26 @@ def _review_consensus(
     if not isinstance(consensus, dict):
         raise ValueError("review.review_payload.consensus must be an object")
     status = consensus.get("status")
-    if status not in {"all_agree", "two_agree", "all_disagree", "unresolved"}:
-        raise ValueError("consensus.status must be all_agree, two_agree, all_disagree, or unresolved")
+    allowed_statuses = {"all_agree", "two_agree", "all_disagree", "unresolved"}
+    if reviewer_reference_claim:
+        allowed_statuses.add("reference_disagrees")
+    if status not in allowed_statuses:
+        message = "consensus.status must be all_agree, two_agree, all_disagree, or unresolved"
+        if reviewer_reference_claim:
+            message += ", or reference_disagrees"
+        raise ValueError(message)
     if status == "all_agree":
         _validate_best_written_selection(
             consensus,
             active_proposer_ids=active_proposer_ids,
             selectable_proposer_ids=selectable_proposer_ids,
         )
-    if status == "all_agree" and len(active_proposer_ids) >= 3:
+    if status == "all_agree" and (len(active_proposer_ids) >= 3 or reviewer_reference_claim):
         try:
             _validate_all_agree_pairwise_checks(consensus)
         except ValueError as exc:
+            if reviewer_reference_claim or len(active_proposer_ids) < 3:
+                raise
             fallback_checks = _main_agent_sympy_agreement_check(
                 proposer_outputs or {},
                 active_proposer_ids=active_proposer_ids,
@@ -641,6 +768,16 @@ def _review_consensus(
                 "reason": str(exc),
             }
             _validate_all_agree_pairwise_checks(consensus)
+    if status == "reference_disagrees":
+        _validate_best_written_selection(
+            consensus,
+            active_proposer_ids=active_proposer_ids,
+            selectable_proposer_ids=selectable_proposer_ids,
+        )
+        _validate_reference_disagrees_pairwise_checks(
+            consensus,
+            active_proposer_ids=active_proposer_ids,
+        )
     return dict(consensus)
 
 
@@ -864,6 +1001,47 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
         raise ValueError("all_agree requires documented pairwise check history")
 
 
+def _validate_reference_disagrees_pairwise_checks(
+    consensus: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+) -> None:
+    checks = consensus.get("pairwise_symbolic_checks")
+    if not isinstance(checks, dict):
+        raise ValueError("reference_disagrees requires pairwise_symbolic_checks")
+    agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), active_proposer_ids)
+    if len(set(agreed_ids)) < 2:
+        raise ValueError("reference_disagrees requires two agreeing blind proposer ids")
+    if checks.get("A_minus_B_zero") is not True:
+        raise ValueError("reference_disagrees requires A-B=0 for the blind proposers")
+    if checks.get("A_minus_C_zero") is not False or checks.get("B_minus_C_zero") is not False:
+        raise ValueError("reference_disagrees requires A-C and B-C to be nonzero")
+    method = str(checks.get("check_method", "")).strip().lower()
+    if method not in {"analytic", "numerical", "mixed"}:
+        raise ValueError("reference_disagrees requires check_method to be analytic, numerical, or mixed")
+    used_sympy = checks.get("used_sympy")
+    if not isinstance(used_sympy, bool):
+        raise ValueError("reference_disagrees requires used_sympy to be true or false")
+    if used_sympy:
+        sympy_code = str(checks.get("sympy_code", "")).lower()
+        if "expand" not in sympy_code or "simplify" not in sympy_code:
+            raise ValueError("SymPy reference_disagrees requires expand and simplify checks")
+    if method in {"numerical", "mixed"}:
+        sample_count = checks.get("sample_count")
+        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 10:
+            raise ValueError("numerical reference_disagrees requires at least 10 randomly selected data points")
+        relative_error = checks.get("numerical_relative_error")
+        if (
+            not isinstance(relative_error, (int, float))
+            or isinstance(relative_error, bool)
+            or not math.isfinite(float(relative_error))
+        ):
+            raise ValueError("numerical reference_disagrees requires numerical_relative_error")
+    history = checks.get("check_history")
+    if not isinstance(history, list) or not history:
+        raise ValueError("reference_disagrees requires documented check history")
+
+
 def _foundation_context_for_step(step: ConsensusStep) -> dict[str, Any] | None:
     foundation_path = step.allowed_context.get("foundation_file")
     if not foundation_path or step.kind != "foundation_check":
@@ -1051,6 +1229,15 @@ def _dict(value: Any, field_name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{field_name} must be an object")
     return copy.deepcopy(value)
+
+
+def _optional_dict(value: Any, field_name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    parsed = _dict(value, field_name)
+    if not parsed:
+        raise ConfigError(f"{field_name} must not be empty when provided")
+    return parsed
 
 
 def _positive_int(value: Any, field_name: str) -> int:

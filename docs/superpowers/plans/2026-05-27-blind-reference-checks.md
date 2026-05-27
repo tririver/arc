@@ -25,13 +25,15 @@ The requested change is acceptable under `AGENTS.md`.
 - Modify `packages/arc-llm/src/arc_llm/proposers_reviewer/consensus.py`
   - Parse optional `steps[].proposer_runtime`.
   - Parse optional `steps[].reviewer_reference_claim`.
-  - Default proposer runtime to no internet and no MCP/paper tools.
+  - Default blind reference checks to no internet and no MCP/paper tools.
+  - Default post-check new calculations to internet and ARC MCP enabled.
   - Inject `reviewer_reference_claim` only into reviewer prompt/schema, never shared `caller_context`.
   - Accept `reference_disagrees` as a terminal checked outcome when two blind proposers agree with each other but disagree with the reviewer-only reference claim.
 
 - Modify `packages/arc-llm/tests/test_proposers_reviewer_consensus.py`
-  - Cover default no-source proposer runtime.
-  - Cover opt-in proposer source access.
+  - Cover blind-check default no-source proposer runtime.
+  - Cover post-check new-calculation default source-enabled proposer runtime.
+  - Cover step-level source access override.
   - Cover reviewer-only reference claim isolation.
   - Cover accepted `reference_disagrees`.
   - Cover rejection when `reference_disagrees` lacks proposer agreement.
@@ -42,7 +44,8 @@ The requested change is acceptable under `AGENTS.md`.
 
 - Modify `skills/arc/references/research-workflows/research-execute.md`
   - Add a compact blind reference check procedure.
-  - State proposers default to no paper tools and no internet.
+  - State blind-check proposers default to no paper tools and no internet.
+  - State post-check new calculations turn paper tools and internet on by default.
   - Show configurable `proposer_runtime`.
   - Explain reviewer-only C comparison outcomes.
 
@@ -81,43 +84,48 @@ In `test_consensus_accepts_all_agree_on_first_attempt`, replace the current prop
 with:
 
 ```python
-    assert proposer["runtime"]["allow_internet"] is False
-    assert proposer["runtime"]["allow_mcp"] is False
-    assert proposer["runtime"]["codex_sandbox"] == "read-only"
-    assert "Do not use internet search" in proposer_template
-    assert "Do not use ARC paper MCP tools" in proposer_template
-    assert "Do not read paper source sections" in proposer_template
+    assert proposer["runtime"]["allow_internet"] is True
+    assert proposer["runtime"]["allow_mcp"] is True
+    assert proposer["runtime"]["mcp_mode"] == "arc-only"
+    assert "You may use ARC paper MCP tools" in proposer_template
+    assert "Internet search is allowed" in proposer_template
 ```
 
-- [ ] **Step 2: Add an opt-in source-access test**
+- [ ] **Step 2: Add a blind-check no-source default test**
 
 Add this test after `test_consensus_accepts_all_agree_on_first_attempt`:
 
 ```python
-def test_consensus_allows_opt_in_proposer_source_access(tmp_path):
+def test_blind_reference_check_disables_proposer_source_access_by_default(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
             )
         ]
     )
     config = minimal_config(
         tmp_path,
-        defaults={"proposer_runtime": {"allow_internet": True, "allow_mcp": True}},
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
     )
 
     run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
 
     proposer = fake.calls[0]["loops"][0]["proposers"][0]
     proposer_template = proposer["prompt"]["template"]
-    assert proposer["runtime"]["allow_internet"] is True
-    assert proposer["runtime"]["allow_mcp"] is True
-    assert proposer["runtime"]["mcp_mode"] == "arc-only"
-    assert "You may use ARC paper MCP tools" in proposer_template
-    assert "Internet search is allowed" in proposer_template
+    assert proposer["runtime"]["allow_internet"] is False
+    assert proposer["runtime"]["allow_mcp"] is False
+    assert "Do not use internet search" in proposer_template
+    assert "Do not use ARC paper MCP tools" in proposer_template
 ```
 
 - [ ] **Step 3: Add a reviewer-only isolation test**
@@ -339,11 +347,25 @@ Add helper before `_proposer_config`:
 
 ```python
 def _proposer_runtime(config: ConsensusConfig, step: ConsensusStep) -> dict[str, Any]:
-    runtime = {
-        "allow_internet": False,
-        "allow_mcp": False,
-        "codex_sandbox": "read-only",
-    }
+    if step.reviewer_reference_claim:
+        runtime = {
+            "allow_internet": False,
+            "allow_mcp": False,
+            "codex_sandbox": "read-only",
+        }
+    elif step.kind == "new_calculation":
+        runtime = {
+            "allow_internet": True,
+            "allow_mcp": True,
+            "mcp_mode": "arc-only",
+            "codex_sandbox": "read-only",
+        }
+    else:
+        runtime = {
+            "allow_internet": False,
+            "allow_mcp": False,
+            "codex_sandbox": "read-only",
+        }
     runtime.update(_dict(config.defaults.get("proposer_runtime", {}), "defaults.proposer_runtime"))
     runtime.update(step.proposer_runtime)
     if runtime.get("allow_mcp") and "mcp_mode" not in runtime:
@@ -683,6 +705,8 @@ def test_research_execute_defaults_to_blind_no_source_reference_checks() -> None
     assert "proposer_runtime" in text
     assert '"allow_internet": false' in text
     assert '"allow_mcp": false' in text
+    assert '"allow_internet": true' in text
+    assert '"allow_mcp": true' in text
     assert "reference_disagrees" in text
 ```
 
@@ -779,10 +803,9 @@ Add a `new_calculation` step with two proposers and a reviewer-only claim:
 }
 ```
 
-Proposers must not use paper tools or internet search by default. If the user
-explicitly requests source access, set `proposer_runtime.allow_mcp` or
-`proposer_runtime.allow_internet` to `true` for that step or in
-`defaults.proposer_runtime`.
+For blind reference checks, proposers must not use paper tools or internet search
+by default. If the user explicitly requests source access, set
+`proposer_runtime.allow_mcp` or `proposer_runtime.allow_internet` to `true`.
 
 The reviewer compares A, B, and C, where A and B are blind proposer results and
 C is `reviewer_reference_claim`. Outcomes:
@@ -792,6 +815,15 @@ A=B=C: reference verified.
 A=B!=C: accept the blind derivation and mark `reference_disagrees`.
 A!=B: proposer disagreement; recalculate or split the step.
 ```
+
+For a post-check new calculation that is not checking a reference formula, turn
+source access on by default unless the user requested otherwise:
+
+```json
+"proposer_runtime": {
+  "allow_internet": true,
+  "allow_mcp": true
+}
 ```
 
 - [ ] **Step 5: Run doc tests and confirm pass after docs update**
@@ -898,8 +930,9 @@ This plan intentionally avoids a new workflow file or large schema migration. It
 
 Expected user-facing behavior:
 
-- By default, proposers cannot use internet or ARC paper tools in calculation consensus.
-- A user can opt in through `defaults.proposer_runtime` or `steps[].proposer_runtime`.
+- Blind reference checks default to no internet or ARC paper tools.
+- Post-check new calculations default to internet and ARC MCP enabled for research context.
+- A user can override either behavior through `defaults.proposer_runtime` or `steps[].proposer_runtime`.
 - Paper-derived equations needing checking stay out of foundation and out of proposer prompts.
 - Reviewer can compare two blind derivations against the hidden reference claim.
 - `A=B!=C` becomes an accepted scientific result: the blind derivation agrees internally, while the reference claim fails or has a convention mismatch.

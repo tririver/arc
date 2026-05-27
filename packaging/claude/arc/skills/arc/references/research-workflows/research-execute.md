@@ -1,26 +1,18 @@
 # Research Execute Workflow
-
 Use this workflow after `initial-research-foundation.md`. It checks non-axiom
-foundation equations and then performs the new calculation steps through
-`arc-llm` consensus execution.
-
+foundation equations, runs blind reference checks, then performs new calculation
+steps through `arc-llm` consensus execution.
 Write artifacts under:
-
 ```text
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
 <project-dir>/calculate/<run-id>/execute/<consensus-run-id>/
 <project-dir>/calculate/<run-id>/calculation-report.md
 <project-dir>/calculation-report.md
 ```
-
 Execution reports must use `schema_version: "arc.research_execute.v1"`.
 
-## Phase 1: Build The Consensus Config
-
-Step 1: Read `plan.json` and `foundation/latest.json`.
-
-Step 2: Create a consensus config:
-
+## Phase 1: Build Consensus Config
+Read `plan.json` and `foundation/latest.json`. Create:
 ```json
 {
   "schema_version": "arc.llm.proposers_reviewer_consensus.config.v1",
@@ -31,116 +23,133 @@ Step 2: Create a consensus config:
   "defaults": {
     "integrity_reference_path": "skills/arc/references/rules/integrity.md"
   },
-  "artifact_options": {
-    "save_prompts": true
-  },
+  "artifact_options": {"save_prompts": true},
   "steps": []
 }
 ```
-
-Step 3: Keep `proposer_count` and `max_recalculations` configurable. Defaults
-are 3 proposers and 2 recalculations, giving 3 total attempts:
-1 initial attempt + 2 recalculations.
+Keep `proposer_count` and `max_recalculations` configurable. Defaults are 3
+proposers and 2 recalculations: 3 total attempts, meaning 1 initial attempt + 2 recalculations.
+Do not increase attempts unless the user asks.
 
 ## Phase 2: Add Foundation Checks
-
-Step 1: Skip equations with `axiom_status: "axiom"`.
-
-Foundation checks use the same 3-proposer reviewer consensus as new
-calculation steps, with the same acceptance standard and no single-proposer acceptance.
-
-Step 2: For every other foundation equation, add one step before new
-calculations:
-
+Skip equations with `axiom_status: "axiom"`. Foundation checks use the same 3-proposer reviewer consensus as new calculation steps, with the same acceptance standard and no single-proposer acceptance.
+For every non-axiom foundation equation, add one step before new calculations:
 ```json
 {
   "step_id": "check_eq_001",
   "kind": "foundation_check",
-  "prompt": "Check equation eq_001. Do not assume it is true. Use only the filtered foundation context, accepted axioms, checked equations, and explicit algebra."
+  "prompt": "Check equation eq_001. Do not assume it is true. Use only the filtered foundation context, accepted axioms, checked equations, and explicit algebra.",
+  "allowed_context": {
+    "foundation_file": "<project-dir>/calculate/<run-id>/foundation/latest.json",
+    "target_equation_id": "eq_001"
+  }
+}
+```
+The runner filters context so proposers see only the target equation plus axiom and checked foundation items. Unchecked equations are omitted. To inspect the
+same filtered context manually, run `python3 scripts/filter-foundation-context.py
+foundation/latest.json --target-equation-id eq_001` from this workflow
+directory.
+
+## Phase 2a: Add Blind Reference Checks
+For paper or note equations that need checking, prefer a blind reference check
+over `foundation_check`. Do not put the target equation in
+`foundation/latest.json`, `prompt`, or `allowed_context`.
+Add a `new_calculation` step with two proposers and reviewer-only C:
+```json
+{
+  "step_id": "blind_ref_eq_001",
+  "kind": "new_calculation",
+  "prompt": "Derive the named target quantity from supplied definitions and checked foundation items. Do not use papers, internet search, or target formulas.",
+  "allowed_context": {
+    "quantity_to_calculate": "target quantity name",
+    "quantity_dependencies": ["dependency names"],
+    "allowed_inputs": ["checked foundation ids only"]
+  },
+  "proposer_runtime": {"allow_internet": false, "allow_mcp": false},
+  "reviewer_reference_claim": {
+    "id": "ref_eq_001",
+    "latex": "...",
+    "source": {"paper_id": "arXiv:...", "section": "..."}
+  }
 }
 ```
 
-Step 3: Put `foundation_file` and `target_equation_id` in `allowed_context`.
-The consensus runner filters the context so proposers see only the target
-equation plus axiom and checked foundation items. Unchecked equations must be
-omitted.
-
-Step 4: To inspect the same filtered context manually, run
-`python3 scripts/filter-foundation-context.py foundation/latest.json --target-equation-id eq_001`
-from this workflow directory.
+For a blind reference check, proposers default to no paper tools and no internet
+search unless the user explicitly requests source access. The reviewer compares
+A and B from blind proposers with C from `reviewer_reference_claim`: `A=B=C`
+verifies the reference; `A=B!=C` accepts the blind derivation and marks
+`reference_disagrees`; `A!=B` means recalculate or split the step.
 
 ## Phase 3: Add New Calculation Steps
 
-Step 1: Append every `plan.json.steps[]` entry with
-`kind: "new_calculation"` after all foundation checks.
+Append every `plan.json.steps[]` entry with `kind: "new_calculation"` after all
+checks. Each prompt must include exact allowed inputs, accepted prior step
+outputs, expected output, and verification target. Later steps must not use
+unaccepted or blocked outputs.
 
-Step 2: Each prompt must include the exact allowed inputs, accepted prior step
-outputs, expected output, and verification target. Do not allow later steps to
-use unaccepted or blocked outputs.
+For each post-check new calculation that is not checking a reference formula,
+turn source access on by default unless the user requested otherwise:
 
-Step 3: At the end of each step prompt, state the required calculation contract:
-calculate which quantity, in terms of which quantity, and what equality or
-limit the reviewer must check.
+```json
+"proposer_runtime": {"allow_internet": true, "allow_mcp": true}
+```
+
+End each step prompt with the quantity contract: calculate which quantity, in
+terms of which quantity, and what equality or limit the reviewer must check.
 
 ## Phase 4: Enforce Calculation Rules
 
-Step 1: Enclose `integrity.md` for both proposer and reviewer prompts.
+Enclose `integrity.md` for proposer and reviewer prompts. Proposers must give a
+clear step-by-step derivation and never skip a step. Report-facing math must be
+valid Markdown/LaTeX; use `validity_scope` for assumptions, conventions, limits,
+and unresolved dependencies.
 
-Step 2: Proposer prompts must require a very clear step-by-step derivation and
-must say never skip a step.
+Proposers may use ARC paper MCP tools only when `proposer_runtime` allows MCP.
+For post-check new calculation steps this is enabled by default, so proposers
+may read the main reference and cited sections named by `plan.json` or
+`foundation/latest.json`. Internet search is allowed only when
+`proposer_runtime` allows it and only for source discovery or uncached paper
+access. Proposers must cite any paper tool or internet source they use. Other
+paper tools are not allowed. Proposers must not use validation-only final formulas as derivation inputs. Wolfram may be used only for algebraic
+verification.
 
-Step 3: Proposers may use ARC paper MCP tools to read the main reference and
-cited source sections named by `plan.json` or
-`foundation/latest.json`. Internet search is allowed only for source discovery
-or uncached paper access. Proposers must cite any paper tool or internet source
-they use. Other paper tools are not allowed. Proposers must not use
-validation-only final formulas as derivation inputs.
-They may also use SymPy, local algebra, and Wolfram only for algebraic checks.
+Proposers must strictly derive from the foundation context and accepted prior
+outputs. External sources may inspire methods, but do not directly use any result from papers or the internet unless that result is in the foundation file
+or already accepted. If an external identity or intermediate result is needed,
+derive it inside the current calculation. External sources may use different conventions; map notation back to foundation conventions before using it.
 
-Step 4: Proposers must strictly derive from the foundation context and accepted
-prior outputs. External sources may inspire methods, but proposers do not directly use any result
-from papers or the internet unless that result is in
-the foundation file or has already been accepted. If they need an external
-identity or intermediate result, they must derive it inside the current
-calculation. Warn that external sources may use different conventions; map any
-notation back to the foundation conventions before using it.
+Reviewers may use SymPy. For analytic checks, use `expand`, then `simplify`,
+then substitutions from checked equations in the foundation file. Do not modify
+original equations. Before `all_agree`, at least two of `A-B=0`, `B-C=0`, and
+`A-C=0` must be true. Never accept by visual inspection, string equality,
+spacing, or formatting. If SymPy is unavailable, write explicit algebraic
+differences or use the numerical fallback.
 
-Step 5: Reviewers may use SymPy. For analytic checks, use `expand` first, then
-`simplify`, then substitutions from checked equations in the foundation file.
-Do not modify original equations.
+If a reviewer still suggests `all_agree` but its report is below this standard,
+the main agent must run an independent SymPy check of `A-B`, `B-C`, and `A-C`.
+If SymPy proves agreement, accept and record the fallback check. If the main
+agent cannot prove agreement, pause for human review. If analytic checking is
+not possible, use at least 10 randomly selected data points and record
+`check_method: "numerical"`, relative error, sample count, and check history.
 
-Step 6: Before `all_agree`, at least two of `A-B=0`, `B-C=0`, and `A-C=0`
-must be true. Never accept agreement by visual inspection, string equality,
-spacing, or formatting. If SymPy is unavailable, either write explicit
-algebraic differences for `A-B`, `B-C`, and `A-C`, or use the numerical
-fallback.
+For every `all_agree` review, record
+`review_payload.consensus.best_written_proposer_id` and
+`best_written_selection_reason`. Pick from agreeing or locked proposer outputs
+using clearest logic and most complete details. This chooses report prose only;
+it does not affect correctness.
 
-Step 7: If a reviewer still suggests `all_agree` but its report is below this
-standard, the main agent must not stop immediately. First run an independent
-SymPy check of `A-B`, `B-C`, and `A-C` from proposer final results. If SymPy proves agreement,
-accept and record the fallback check. If the main agent cannot
-prove agreement, pause for human review.
-
-Step 8: If analytic checking is not possible, use at least 10 randomly selected
-data points. The minimum numerical fallback is 10 randomly selected data points.
-Record `check_method: "numerical"`, the relative error, the sample count, and
-the check history.
-
-Step 9: For an accepted foundation check, write a new foundation version that
-marks the target equation checked. Keep the original equation unchanged and add
-the reviewer check history, method, relative error when numerical, and accepted
-consensus artifact path. Do not rewrite `initial-research-foundation.md`;
-human-facing foundation changes belong in the final report appendix.
-
-Step 10: When a new calculation result is accepted and will be useful as a later
-input, write a new foundation version with a concise derived quantity record.
-Record the statement, explanation, source step id, dependency ids, check status,
-and consensus artifact. Keep paper-sourced equations and derived quantities
-visibly separate in `latest.json`.
+For an accepted foundation check, write a new foundation version marking the
+target equation checked. Keep the original equation unchanged and add reviewer
+check history, method, relative error when numerical, and consensus artifact
+path. Do not rewrite `initial-research-foundation.md`; human-facing foundation
+changes belong in the final report appendix. When a new calculation result is
+accepted and useful later, write a new foundation version with a concise derived
+quantity record, keeping paper-sourced equations and derived quantities visibly
+separate in `latest.json`.
 
 ## Phase 5: Run Consensus And Refine Blocks
 
-Step 1: Run:
+Run:
 
 ```bash
 arc-llm proposers-reviewer-consensus \
@@ -148,70 +157,53 @@ arc-llm proposers-reviewer-consensus \
   --json
 ```
 
-Step 2: Inspect the returned JSON. If a step returns `blocked_for_user` after
-3 total attempts, enter `blocked_refinement`.
+Inspect the returned JSON. If a step returns `blocked_for_user` after 3 total
+attempts, enter `blocked_refinement`: review plan.json, reviewer reports, and,
+if needed, proposer calculations. Treat the block as evidence the step is too
+difficult unless already atomic.
 
-Step 3: In `blocked_refinement`, review plan.json, reviewer reports, and, if
-needed, proposer calculations. Treat the block as evidence that the step is too
-difficult unless the step is already atomic.
+If the blocked step can be split, revise the plan into smaller steps. Each
+replacement step must have one clear quantity, inputs, output, and check. The
+first replacement step should stop at the last calculation all proposers can
+agree on. If full expression splitting is hard, first use controlled limits or projections such as one branch, one contour choice, one contraction, leading
+power only, equal-mass/equal-scale limit, or coefficient-stripped form before returning to the full expression. Append each blocked_refinement event to the
+plan revision history inside `# Appendix 2: Calculation Status`.
 
-Step 4: If the blocked step can be split, revise the plan into smaller steps.
-Each replacement step must have one clear quantity, inputs, output, and check.
-The first replacement step should stop at the last calculation all proposers can
-agree on.
+If the block is caused by missing or wrong premises, classify it as
+`foundation_inadequate`, `foundation_conflict`, or `plan_wrong`. For
+`foundation_inadequate` or `plan_wrong`, request two independent proposers to
+propose the expansion or revision; continue only if two proposers agree, the reviewer agrees, and the main agent agrees after inspection. For
+`foundation_conflict`, stop for the human expert unless that same agreement
+process resolves the conflict. In interactive mode ask approval before applying
+the revision; in auto mode apply it and continue. Report any revision in
+`calculation-report.md` with a `**Caution**` paragraph explaining what changed,
+why, who agreed, approval mode, and dependent later results. If the step is
+already atomic and cannot be split, stop as blocked; do not choose a proposer
+yourself.
 
-If the full expression is still hard to split into complete sub-results, first
-choose controlled limits or projections that are simpler but relevant, such as
-one branch, one contour choice, one contraction, leading power only,
-equal-mass/equal-scale limit, or coefficient-stripped form. Ask proposers to
-agree on those limited results before returning to the full expression. If
-proposers already disagree in a controlled limit, continue refining around that
-limit instead of asking for the full expression.
+## Phase 6: Write The Report
 
-Then rerun the 3-proposer reviewer consensus on the refined step. Append each blocked_refinement event
-to the plan revision history inside
-`# Appendix 2: Calculation Status`; do not create a separate plan-revision
-report.
-
-Step 5: If the block is caused by inadequate foundation or a wrong plan, do not
-silently continue. Classify it as `foundation_inadequate` when definitions or
-premises are missing but expandable without inconsistency, `foundation_conflict`
-when existing foundation items appear inconsistent, or `plan_wrong` when the
-step is not viable but a revised plan remains physically interesting.
-
-For `foundation_inadequate` or `plan_wrong`, request two independent proposers
-to propose the expansion or revision. Continue only if at least two proposers
-agree, the reviewer agrees, and the main agent agrees after inspection. For
-`foundation_conflict`, stop and ask the human expert unless the same agreement
-process resolves the conflict. In interactive mode, ask human approval before
-applying the revision; in auto mode, apply it and continue. Report the revision
-in `calculation-report.md` with a `**Caution**` paragraph explaining what
-changed, why, who agreed, approval mode, and which later results depend on it.
-
-Step 6: If the blocked step is already atomic and cannot be split further, stop
-as blocked. Do not choose a proposer yourself.
-
-Step 7: Write `calculation-report.md` even when blocked, directly to both
+Write `calculation-report.md` even when blocked, directly to both
 `<project-dir>/calculate/<run-id>/calculation-report.md` and
 `<project-dir>/calculation-report.md`. Include accepted outputs, blocked step,
 disagreement map, reviewer-report summary, proposer positions, artifact paths,
-the exact expert question, `# Appendix 1: Latest Research Foundation`, and
-`# Appendix 2: Calculation Status`. The first appendix must render the latest
-foundation updates from `foundation/latest.json`, including checked equations,
-derived quantities, version notes, and consensus artifacts. The second appendix
-must summarize original steps, each blocked_refinement, plan revision history,
-what changed, the replacement config, and whether that refined step was
-accepted or blocked. Ask which proposer or result is correct, or what
-instruction should continue the calculation.
+the exact expert question, `# Appendix 1: Latest Research Foundation`,
+`# Appendix 2: Calculation Status`, and `# Appendix 3: Full Calculation
+Details`. Ask which proposer or result is correct, or what instruction should
+continue the calculation.
 
-Step 7: If the human expert decides that one proposer or result is correct,
-continue from that premise and mark it as human-resolved in the next report.
-If all steps are accepted without human intervention, write the same report with
-accepted outputs, reviewer consensus summaries, unresolved risks, and artifact
-paths. Do not claim a result that is not present in accepted consensus output or
+Appendix 1 renders latest foundation updates from `foundation/latest.json`.
+Appendix 2 summarizes original steps, each blocked_refinement, plan revision
+history, replacement config, and refined-step status. Appendix 3 renders one
+full calculation copy per accepted planned calculation step using
+`best_written_proposer_id`, with plan.json step, selected derivation,
+assumptions, source/tool citations, validity_scope, final_result, and artifact
+paths. If no selected proposer exists, say why and point to artifacts. If a
+human expert resolves a result, continue from that premise and mark it
+human-resolved. Do not claim a result absent from accepted consensus output or
 human-resolved input.
 
 After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/calculation-report.md")`. It starts a
-background PDF job; record the returned job id if present and do not wait
-before continuing.
+background PDF job; record the returned job id if present and do not wait before
+continuing.

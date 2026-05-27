@@ -26,12 +26,13 @@ def test_research_calculation_workflow_files_exist() -> None:
         assert (WF / name).is_file()
 
 
-def test_arc_skill_routes_case_3_to_three_research_workflows() -> None:
+def test_arc_skill_routes_check_and_calculation_workflows() -> None:
     text = (ROOT / "skills/arc/SKILL.md").read_text(encoding="utf-8")
 
     assert "references/research-workflows/calculate.md" not in text
     assert "classify" in text.lower()
-    assert "three cases" in text.lower()
+    assert "four cases" in text.lower()
+    assert "check.md" in text
     assert "research-plan.md" in text
     assert "research-foundation.md" in text
     assert "research-execute.md" in text
@@ -48,6 +49,7 @@ def test_arc_skill_requires_nonblocking_pdf_export_for_project_markdown_reports(
 
 def test_research_workflows_start_pdf_export_for_user_facing_markdown() -> None:
     for name in [
+        "check.md",
         "build-domain.md",
         "research-ideas.md",
         "research-plan.md",
@@ -60,12 +62,59 @@ def test_research_workflows_start_pdf_export_for_user_facing_markdown() -> None:
         assert "do not wait" in text
 
 
+def test_research_ideas_phase_5_uses_clean_selection_prompt() -> None:
+    text = (WF / "research-ideas.md").read_text(encoding="utf-8")
+    lower = text.lower()
+
+    assert "### Phase 5: Select Next Action" in text
+    assert "use the host's discrete" in lower
+    assert "option labels must be the raw labels" in lower
+    assert "`1`" in text
+    assert "`2`" in text
+    assert "`3`" in text
+    assert "`other`" in text
+    assert "or quit" not in lower
+    assert "`Let's discuss`" in text
+    assert "Do not render numbered-list prefixes inside option labels" in text
+    assert "If no discrete selection tool is available, ask only for the idea number" in text
+    assert "`other`. Do not print `quit` or `Let's discuss` in the typed fallback" in text
+
+
+def test_interaction_rules_name_codex_discrete_choice_tool() -> None:
+    text = (SKILL / "references/rules/interaction.md").read_text(encoding="utf-8")
+    lower = text.lower()
+
+    assert "`request_user_input`" in text
+    assert "codex" in lower
+    assert "collaboration mode" in lower
+    assert "before printing a typed fallback" in lower
+    assert "do not include list numbering inside option labels" in lower
+
+
 def test_research_workflow_docs_stay_human_readable() -> None:
-    for name in ["research-plan.md", "research-foundation.md", "research-execute.md"]:
+    for name in [
+        "check.md",
+        "research-plan.md",
+        "research-foundation.md",
+        "research-execute.md",
+    ]:
         text = (WF / name).read_text(encoding="utf-8")
         assert len(text.splitlines()) <= 220
         assert "0_ref/" not in text
         assert "/scripts/" not in text
+
+
+def test_check_workflow_keeps_notes_out_of_proposer_context() -> None:
+    text = (WF / "check.md").read_text(encoding="utf-8").lower()
+
+    assert "markdown or pdf research notes" in text
+    assert "full note body" in text
+    assert "proposer agents" in text
+    assert "claims_to_check" in text
+    assert "blind reference check" in text
+    assert "reviewer_reference_claim" in text
+    assert "user-specified" in text
+    assert "inferred" in text
 
 
 def test_research_plan_requires_review_after_drafting() -> None:
@@ -93,6 +142,14 @@ def test_research_plan_requires_explicit_step_quantity_contracts() -> None:
     assert "expected final formula" in text
 
 
+def test_research_plan_routes_reference_equations_to_blind_checks() -> None:
+    text = (WF / "research-plan.md").read_text(encoding="utf-8").lower()
+
+    assert "do not disclose the target reference equation" in text
+    assert "blind reference check" in text
+    assert "reviewer-only reference claim" in text
+
+
 def test_research_foundation_requires_convention_alignment_checks() -> None:
     text = (WF / "research-foundation.md").read_text(encoding="utf-8").lower()
 
@@ -111,6 +168,14 @@ def test_research_foundation_requires_convention_alignment_checks() -> None:
     assert '"background"' not in text
     assert '"meaning"' not in text
     assert '"relation_type"' not in text
+
+
+def test_research_foundation_keeps_initial_foundation_to_axioms_and_definitions() -> None:
+    text = (WF / "research-foundation.md").read_text(encoding="utf-8").lower()
+
+    assert "only definitions, axioms, conventions, and truly foundational equations" in text
+    assert "do not add paper-derived equations merely so they can be checked" in text
+    assert "blind reference check" in text
 
 
 def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
@@ -135,6 +200,20 @@ def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
     assert "do not directly use any result" in text
     assert "different conventions" in text
     assert "wolfram" in text
+
+
+def test_research_execute_uses_phase_specific_source_defaults() -> None:
+    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+
+    assert "blind reference check" in text
+    assert "reviewer_reference_claim" in text
+    assert "proposer_runtime" in text
+    assert '"allow_internet": false' in text
+    assert '"allow_mcp": false' in text
+    assert '"allow_internet": true' in text
+    assert '"allow_mcp": true' in text
+    assert "reference_disagrees" in text
+    assert "post-check new calculation" in text
 
 
 def test_research_execute_uses_three_total_consensus_attempts() -> None:
@@ -593,6 +672,9 @@ def test_research_foundation_schema_requires_evidence_for_checked_equations() ->
 def test_packaged_workflow_copies_match_source() -> None:
     for host in ["codex", "claude"]:
         packaged = ROOT / f"packaging/{host}/arc/skills/arc/references/research-workflows"
+        assert (packaged / "check.md").read_text(encoding="utf-8") == (
+            WF / "check.md"
+        ).read_text(encoding="utf-8")
         for path in WF.glob("research-*"):
             assert (packaged / path.name).read_text(encoding="utf-8") == path.read_text(
                 encoding="utf-8"
@@ -651,6 +733,7 @@ def test_suggest_ideas_requires_domain_markdown_not_single_paper_summaries() -> 
 
 def test_packaged_skill_references_include_required_workflow_inputs() -> None:
     required = [
+        Path("references/research-workflows/check.md"),
         Path("references/research-workflows/build-domain.md"),
         Path("references/research-workflows/research-ideas.md"),
         Path("references/research-workflows/research-ideas.config.template.json"),
@@ -684,6 +767,7 @@ def test_packaged_skill_references_stay_synced_with_source() -> None:
     synced_roots = [
         Path("SKILL.md"),
         Path("references/package-manuals"),
+        Path("references/research-workflows/check.md"),
         Path("references/research-workflows/build-domain.md"),
         Path("references/research-workflows/research-execute.md"),
         Path("references/research-workflows/research-foundation.md"),

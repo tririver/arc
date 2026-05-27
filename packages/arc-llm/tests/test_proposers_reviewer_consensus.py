@@ -71,9 +71,8 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert proposer["runtime"]["allow_internet"] is True
     assert proposer["runtime"]["allow_mcp"] is True
     assert proposer["runtime"]["mcp_mode"] == "arc-only"
-    assert "ARC paper MCP tools" in proposer_template
-    assert "read the main reference" in proposer_template
-    assert "internet search" in proposer_template.lower()
+    assert "You may use ARC paper MCP tools" in proposer_template
+    assert "Internet search is allowed" in proposer_template
     assert "validation-only final formulas" in proposer_template
     lower_proposer_template = proposer_template.lower()
     assert "strictly derive from the foundation" in lower_proposer_template
@@ -102,6 +101,304 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "reliable_until" not in consensus_properties
     pairwise_properties = consensus_properties["pairwise_symbolic_checks"]["properties"]
     assert "used_sympy" in pairwise_properties
+
+
+def test_blind_reference_check_disables_proposer_source_access_by_default(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    proposer = fake.calls[0]["loops"][0]["proposers"][0]
+    proposer_template = proposer["prompt"]["template"]
+    assert proposer["runtime"]["allow_internet"] is False
+    assert proposer["runtime"]["allow_mcp"] is False
+    assert proposer["runtime"]["codex_sandbox"] == "read-only"
+    assert "Do not use internet search" in proposer_template
+    assert "Do not use ARC paper MCP tools" in proposer_template
+    assert "Do not read paper source sections" in proposer_template
+
+
+def test_consensus_allows_step_opt_in_proposer_source_access_for_blind_check(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "proposer_runtime": {"allow_internet": True, "allow_mcp": True},
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    proposer = fake.calls[0]["loops"][0]["proposers"][0]
+    proposer_template = proposer["prompt"]["template"]
+    assert proposer["runtime"]["allow_internet"] is True
+    assert proposer["runtime"]["allow_mcp"] is True
+    assert proposer["runtime"]["mcp_mode"] == "arc-only"
+    assert "You may use ARC paper MCP tools" in proposer_template
+    assert "Internet search is allowed" in proposer_template
+
+
+def test_reviewer_reference_claim_is_not_shared_with_proposers(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+            )
+        ]
+    )
+    reference_claim = {
+        "id": "ref_eq_001",
+        "label": "target reference equation",
+        "latex": "x = y + z",
+        "source": {"paper_id": "arXiv:1234.5678", "section": "S2"},
+    }
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "kind": "new_calculation",
+                "prompt": "Derive x in terms of y and z from the supplied definitions.",
+                "allowed_context": {"definitions": ["x, y, z are scalar symbols"]},
+                "reviewer_reference_claim": reference_claim,
+            }
+        ],
+    )
+
+    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    loop = fake.calls[0]["loops"][0]
+    caller_context_json = json.dumps(loop["caller_context"])
+    proposer_json = json.dumps(loop["proposers"])
+    reviewer_json = json.dumps(loop["reviewers"])
+    assert "x = y + z" not in caller_context_json
+    assert "x = y + z" not in proposer_json
+    assert "x = y + z" in reviewer_json
+    assert "reviewer_reference_claim" in reviewer_json
+
+
+def test_reviewer_prompt_selects_best_written_for_reference_disagrees(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "reference_disagrees",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x = y - z", "reference_claim_status": "disagrees"},
+                pairwise_check_overrides={
+                    "A_minus_B_zero": True,
+                    "B_minus_C_zero": False,
+                    "A_minus_C_zero": False,
+                    "true_count": 1,
+                },
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    reviewer_template = fake.calls[0]["loops"][0]["reviewers"][0]["prompt"]["template"]
+    assert "When status is reference_disagrees" in reviewer_template
+    assert "choose best_written_proposer_id from the agreeing blind proposer ids" in reviewer_template
+
+
+def test_reference_disagrees_accepts_when_two_blind_proposers_agree(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "reference_disagrees",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x = y - z", "reference_claim_status": "disagrees"},
+                pairwise_check_overrides={
+                    "A_minus_B_zero": True,
+                    "B_minus_C_zero": False,
+                    "A_minus_C_zero": False,
+                    "true_count": 1,
+                    "sympy_code": (
+                        "simplify(expand(A-B)); "
+                        "simplify(expand(B-C)); "
+                        "simplify(expand(A-C))"
+                    ),
+                    "check_history": [
+                        "A-B reduces to 0.",
+                        "B-C reduces to 2*z.",
+                        "A-C reduces to 2*z.",
+                    ],
+                },
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+    assert result["steps"][0]["reviewer_consensus"]["status"] == "reference_disagrees"
+    assert result["steps"][0]["accepted_output"]["reference_claim_status"] == "disagrees"
+
+
+def test_reference_disagrees_requires_blind_proposer_agreement(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "reference_disagrees",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "A_minus_B_zero": False,
+                    "B_minus_C_zero": False,
+                    "A_minus_C_zero": False,
+                    "true_count": 0,
+                    "sympy_code": (
+                        "simplify(expand(A-B)); "
+                        "simplify(expand(B-C)); "
+                        "simplify(expand(A-C))"
+                    ),
+                },
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "reference_disagrees requires A-B=0" in result["steps"][0]["error"]
+
+
+def test_reference_disagrees_requires_two_agreeing_blind_proposer_ids(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "reference_disagrees",
+                agreed=["proposer_001"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "A_minus_B_zero": True,
+                    "B_minus_C_zero": False,
+                    "A_minus_C_zero": False,
+                    "true_count": 1,
+                    "sympy_code": (
+                        "simplify(expand(A-B)); "
+                        "simplify(expand(B-C)); "
+                        "simplify(expand(A-C))"
+                    ),
+                },
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "reference_disagrees requires two agreeing blind proposer ids" in result["steps"][0]["error"]
+
+
+def test_blind_reference_all_agree_requires_pairwise_checks_with_reference_claim(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                pairwise_checks=False,
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "pairwise_symbolic_checks" in result["steps"][0]["error"]
 
 
 def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path):

@@ -43,6 +43,11 @@ make it as convenient as possible for the calculation, mark the item
 
 ## Phase 3: Record Equations And Confidence Labels
 
+The initial foundation should contain only definitions, axioms, conventions, and truly foundational equations
+that are allowed as starting points. Do not add paper-derived equations merely so they can be checked. If a reference equation
+needs verification before use, keep it out of `equations[]` and route it
+through a blind reference check in `research-execute.md`.
+
 Each equation must include:
 
 ```json
