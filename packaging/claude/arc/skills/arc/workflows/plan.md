@@ -1,4 +1,4 @@
-# Research Plan Workflow
+# Plan Workflow
 
 Use this workflow after the user has selected one explicit calculation idea.
 The output is a careful, reviewable plan. Do not start deriving equations here.
@@ -7,11 +7,11 @@ Write artifacts under:
 
 ```text
 <project-dir>/calculate/<run-id>/plan.json
-<project-dir>/calculate/<run-id>/initial-research-plan.md
-<project-dir>/initial-research-plan.md
+<project-dir>/calculate/<run-id>/initial-plan.md
+<project-dir>/initial-plan.md
 ```
 
-`plan.json` must use `schema_version: "arc.research_plan.v1"`.
+`plan.json` must use `schema_version: "arc.plan.v1"`.
 
 ## Inputs
 
@@ -111,12 +111,12 @@ quantity from named dependencies, and the execute workflow supplies the target
 only as a reviewer-only reference claim.
 
 Step 5: Write `plan.json` and write the initial human-readable report directly
-to both `<project-dir>/calculate/<run-id>/initial-research-plan.md` and
-`<project-dir>/initial-research-plan.md`. The JSON is the source of truth for
+to both `<project-dir>/calculate/<run-id>/initial-plan.md` and
+`<project-dir>/initial-plan.md`. The JSON is the source of truth for
 later workflow phases.
 
 After writing the project-level Markdown report, call
-MCP `md2pdf(input="<project-dir>/initial-research-plan.md")`. It starts a background
+MCP `md2pdf(input="<project-dir>/initial-plan.md")`. It starts a background
 PDF job; record the returned job id if present and do not wait before
 continuing.
 
@@ -138,5 +138,5 @@ difficult steps have enough substeps
 ```
 
 Step 3: If the review finds gaps, revise `plan.json` and
-`initial-research-plan.md`, then review the plan again. Proceed only when the
+`initial-plan.md`, then review the plan again. Proceed only when the
 review is recorded in both artifacts.

@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-MARKING_SCHEME_SCHEMA = "arc.workflow.research_ideas.marking_scheme.v1"
-DEFAULT_MARKING_SCHEME_FILENAME = "suggest-ideas-marking-scheme.json"
+MARKING_SCHEME_SCHEMA = "arc.workflow.ideas.marking_scheme.v1"
+DEFAULT_MARKING_SCHEME_FILENAME = "ideas-marking-scheme.json"
 
 
 def load_marking_scheme(workflow_dir: Path | str | None = None) -> dict[str, Any]:
@@ -99,6 +99,8 @@ def report_columns(scheme: Mapping[str, Any] | None = None) -> list[dict[str, st
 
 def _scheme_path(workflow_dir: Path | str | None) -> Path:
     root = Path(workflow_dir).expanduser() if workflow_dir is not None else Path(__file__).resolve().parent
+    if root.name == "scripts":
+        root = root.parent / "json"
     return root / DEFAULT_MARKING_SCHEME_FILENAME
 
 

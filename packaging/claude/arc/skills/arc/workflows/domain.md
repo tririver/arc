@@ -51,7 +51,7 @@ Step 3: For every MCP response that contains `status: "job_running"` and
 `job_id`, run:
 
 ```bash
-arc-mcp jobs watch <job-id> --json
+arc-mcp watch <job-id> --json
 ```
 
 Watch all launched jobs to a terminal result. If host or MCP execution cannot

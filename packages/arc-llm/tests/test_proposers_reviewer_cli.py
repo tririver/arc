@@ -9,7 +9,7 @@ def minimal_config() -> dict:
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
         "run_id": "run_001",
-        "run_dir": "project/suggest-ideas",
+        "run_dir": "project/ideas",
         "loops": [
             {
                 "loop_id": "loop_001",

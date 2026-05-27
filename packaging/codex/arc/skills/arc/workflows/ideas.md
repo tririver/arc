@@ -1,4 +1,4 @@
-# Research Ideas Workflow
+# Ideas Workflow
 
 Use this workflow for Case 2 idea generation. It runs every enabled idea
 variant as concurrent proposer-reviewer loops. Each loop has exactly one
@@ -11,21 +11,21 @@ Read `<project-dir>/context.json`. Use the exact `user_intent`.
 
 ### Phase 1: Prepare Config
 
-Step 1: Create `<project-dir>/research-ideas/`.
+Step 1: Create `<project-dir>/ideas/`.
 
 Step 2: Copy
-`references/research-workflows/research-ideas.config.template.json` to:
+`workflows/json/ideas.config.template.json` to:
 
 ```text
-<project-dir>/research-ideas/<run-id>.config.json
+<project-dir>/ideas/<run-id>.config.json
 ```
 
 Step 3: Replace `<run-id>`, `<project-dir>`, `<user_intent>`, and
-`<skill-workflow-dir>`.
+`<skill-workflow-json-dir>`.
 
-Step 4: Keep `variant_glob` as `suggest-ideas-*.variant.json`. To disable a
+Step 4: Keep `variant_glob` as `ideas-*.variant.json`. To disable a
 variant, rename it so it no longer matches, for example
-`suggest-ideas-no-info.variant_inactivated.json`.
+`ideas-no-info.variant_inactivated.json`.
 
 Step 5: Keep `loops_per_variant` at `5` unless the run should use a different
 number of concurrent instances for each setup.
@@ -35,8 +35,8 @@ number of concurrent instances for each setup.
 Step 1: Run:
 
 ```bash
-python3 references/research-workflows/research_ideas_runner.py \
-  --config <project-dir>/research-ideas/<run-id>.config.json \
+python3 workflows/scripts/ideas_runner.py \
+  --config <project-dir>/ideas/<run-id>.config.json \
   --dry-run \
   --json
 ```
@@ -50,8 +50,8 @@ does not create run artifacts.
 Step 1: Run:
 
 ```bash
-python3 references/research-workflows/research_ideas_runner.py \
-  --config <project-dir>/research-ideas/<run-id>.config.json \
+python3 workflows/scripts/ideas_runner.py \
+  --config <project-dir>/ideas/<run-id>.config.json \
   --json
 ```
 
@@ -61,7 +61,7 @@ Step 2: Continue only if the returned status is `completed`. If status is
 The workflow runner writes only the generated batch config before launch:
 
 ```text
-<project-dir>/research-ideas/<run-id>/research_ideas_batch_config.json
+<project-dir>/ideas/<run-id>/ideas_batch_config.json
 ```
 
 All concurrent proposer-reviewer artifacts are owned by `arc-llm` under the
@@ -77,28 +77,28 @@ available at completion time.
 Report these paths:
 
 ```text
-<project-dir>/research-ideas/<run-id>/
-<project-dir>/research-ideas/<run-id>/research_ideas_batch_config.json
-<project-dir>/research-ideas/<run-id>/idea_loops/
-<project-dir>/research-ideas/<run-id>/idea_loops/loops/
+<project-dir>/ideas/<run-id>/
+<project-dir>/ideas/<run-id>/ideas_batch_config.json
+<project-dir>/ideas/<run-id>/idea_loops/
+<project-dir>/ideas/<run-id>/idea_loops/loops/
 ```
 
 Step 1: After the run completes, use the read-only ranking helper to write the
 deterministic ranked ideas report directly to both readable destinations:
 
 ```bash
-python3 references/research-workflows/scripts/rank-suggested-ideas.py \
-  <project-dir>/research-ideas/<run-id>/idea_loops \
+python3 workflows/scripts/rank-ideas.py \
+  <project-dir>/ideas/<run-id>/idea_loops \
   --format markdown \
-  > <project-dir>/research-ideas/<run-id>/ranked-ideas.md
+  > <project-dir>/ideas/<run-id>/ranked-ideas.md
 
-python3 references/research-workflows/scripts/rank-suggested-ideas.py \
-  <project-dir>/research-ideas/<run-id>/idea_loops \
+python3 workflows/scripts/rank-ideas.py \
+  <project-dir>/ideas/<run-id>/idea_loops \
   --format markdown \
   > <project-dir>/ranked-ideas.md
 ```
 
-The report must start with `# Suggested Ideas`, then `Abbreviations:`, then a
+The report must start with `# Ideas`, then `Abbreviations:`, then a
 blank-line-separated abbreviation line in the form `IR=intent relevance,
 N=novelty, CN=confidence of novelty, SV=scientific value, PL=planning,
 WD=well-definedness, T=total.` List each ranked idea in the same form used by
@@ -124,7 +124,7 @@ per-round reviewer reports from the `arc-llm` loop artifacts.
 Step 1: Print the top three ranked ideas on screen.
 
 Step 2: If the workflow is running in auto mode, use the host's discrete
-selection tool, following `references/rules/interaction.md`, to ask whether to
+selection tool, following `rules/interaction.md`, to ask whether to
 proceed to calculation. Use these option labels exactly:
 
 - `1` (default): proceed with ranked idea #1.

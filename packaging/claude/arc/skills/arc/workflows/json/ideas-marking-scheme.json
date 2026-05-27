@@ -1,5 +1,5 @@
 {
-  "schema_version": "arc.workflow.research_ideas.marking_scheme.v1",
+  "schema_version": "arc.workflow.ideas.marking_scheme.v1",
   "calibration_guidance": "Use the full numeric range. Do not assign mid-high scores by default just because an idea is plausible. A total score above 85 should mean the idea is clearly strong across most dimensions. A total score above 90 should be rare. A merely reasonable idea with unclear novelty or weak execution plan should usually fall around 55-75, not 80+.",
   "marks": [
     {

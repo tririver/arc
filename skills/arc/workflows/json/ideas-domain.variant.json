@@ -1,9 +1,9 @@
 {
-  "schema_version": "arc.workflow.research_ideas.variant.v1",
+  "schema_version": "arc.workflow.ideas.variant.v1",
   "variant_id": "domain",
   "description": "Proposer receives ARC domain Markdown, ARC paper-tool guidance, internet access, and ARC-only MCP access.",
-  "loop_template": "suggest-ideas-loop.template.json",
-  "proposer_template": "suggest-ideas-proposer.template.json",
+  "loop_template": "ideas-loop.template.json",
+  "proposer_template": "ideas-proposer.template.json",
   "context_policy": {
     "require_domain_markdown": true,
     "attach_domain_markdown": true,

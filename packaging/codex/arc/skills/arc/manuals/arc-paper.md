@@ -1,7 +1,7 @@
 # Arc Paper Package
 
 `arc-paper` is the single-paper information package. Use it for metadata,
-INSPIRE references/citers, parsed ar5iv JSON, cached full-text search, table of
+INSPIRE references and citers, parsed ar5iv JSON, cached full-text search, table of
 contents, section lookup, equation context, LLM paper summaries, and
 paper-summary batches.
 
@@ -97,8 +97,8 @@ Step 1: Use this when the user asks to regenerate, choose a provider, or bypass
 an old cache:
 
 ```bash
-arc-paper llm-generate-summary <seed-paper> --provider auto --json
-arc-paper llm-generate-summary <seed-paper> --provider codex-cli --model <model> --json
+arc-paper llm-generate-summary <paper-id> [<paper-id> ...] --provider auto --json
+arc-paper llm-generate-summary <paper-id> --provider codex-cli --model <model> --json
 ```
 
 Step 2: Use `--refresh` only when the user wants fresh source data or a forced
@@ -162,7 +162,7 @@ arc-paper summary-batch retry-failed <batch-name> --json
 
 ## MCP Tools
 
-Read `references/package-manuals/arc-mcp.md` before using MCP.
+Read `manuals/arc-mcp.md` before using MCP.
 
 Paper MCP tools:
 
@@ -193,7 +193,7 @@ summary_batch_retry_failed
 ```
 
 For LLM paper summaries through MCP, use `background=true` for slow or massive
-launches and then follow `references/package-manuals/arc-mcp.md`.
+launches and then follow `manuals/arc-mcp.md`.
 
 ## Cache Notes
 

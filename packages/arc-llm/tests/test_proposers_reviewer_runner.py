@@ -13,7 +13,7 @@ def base_config(tmp_path: Path, *, max_rounds: int = 2, early_stop: bool = False
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
         "run_id": "run_001",
-        "run_dir": str(tmp_path / "suggest-ideas"),
+        "run_dir": str(tmp_path / "ideas"),
         "max_concurrent_loops": 2,
         "defaults": {"provider": "manual", "model": "fake-model"},
         "loops": [
@@ -184,7 +184,7 @@ def test_runner_sends_only_reply_correspondence_while_saving_prompt_artifacts(tm
     result = run_proposers_reviewer_batch(base_config(tmp_path), json_runner=fake, base_env={})
 
     assert result["status"] == "completed"
-    run_root = tmp_path / "suggest-ideas" / "run_001"
+    run_root = tmp_path / "ideas" / "run_001"
     round1_p1_prompt_path = run_root / "loops/loop_001/rounds/round_001/prompts/proposer_001.md"
     round1_p1_prompt = round1_p1_prompt_path.read_text(
         encoding="utf-8"
@@ -225,7 +225,7 @@ def test_prompt_artifacts_can_be_disabled(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(), base_env={})
 
-    run_root = tmp_path / "suggest-ideas" / "run_001"
+    run_root = tmp_path / "ideas" / "run_001"
     assert result["status"] == "completed"
     assert not (run_root / "loops/loop_001/rounds/round_001/prompts/proposer_001.md").exists()
     assert not (run_root / "loops/loop_001/rounds/round_001/prompts/reviewer_001.md").exists()
@@ -262,7 +262,7 @@ def test_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(fail_loop="loop_001"), base_env={})
 
-    error_path = tmp_path / "suggest-ideas/run_001/loops/loop_001/rounds/round_001/errors/proposer_001.json"
+    error_path = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/errors/proposer_001.json"
     error = json.loads(error_path.read_text(encoding="utf-8"))
 
     assert result["status"] == "failed"
@@ -283,7 +283,7 @@ def test_three_proposers_follow_targeted_reviewer_requests_for_three_rounds(tmp_
         base_env={},
     )
 
-    run_root = tmp_path / "suggest-ideas" / "run_001"
+    run_root = tmp_path / "ideas" / "run_001"
     values_by_round = {}
     received_messages_by_round = {}
     for round_number in (1, 2, 3):
@@ -322,7 +322,7 @@ def test_two_loops_run_in_isolated_directories(tmp_path):
     result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(), base_env={})
 
     assert result["status"] == "completed"
-    run_root = tmp_path / "suggest-ideas" / "run_001"
+    run_root = tmp_path / "ideas" / "run_001"
     assert (run_root / "loops" / "loop_001" / "state.json").exists()
     assert (run_root / "loops" / "loop_002" / "state.json").exists()
     assert sorted(item["loop_id"] for item in result["loops"]) == ["loop_001", "loop_002"]
@@ -360,7 +360,7 @@ def test_early_stop_request_is_recorded_but_ignored_when_disabled(tmp_path):
 
     loop = result["loops"][0]
     review = json.loads(
-        (tmp_path / "suggest-ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
             encoding="utf-8"
         )
     )
@@ -382,7 +382,7 @@ def test_failed_loop_does_not_corrupt_successful_loop(tmp_path):
     assert result["status"] == "failed"
     assert statuses["loop_001"] == "completed"
     assert statuses["loop_bad"] == "failed"
-    assert (tmp_path / "suggest-ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").exists()
+    assert (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").exists()
 
 
 def test_review_envelope_requires_review_payload(tmp_path):
@@ -443,7 +443,7 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
 
     reviewer_prompts = [call["prompt"] for call in calls if call["worker_id"].startswith("reviewer")]
     review = json.loads(
-        (tmp_path / "suggest-ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
             encoding="utf-8"
         )
     )

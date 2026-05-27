@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from arc_mcp import cli
 from arc_mcp import worker
 from arc_mcp.jobs import MCPJobCancelled, MCPJobManager, resolve_inline_wait_seconds
 
@@ -140,6 +141,18 @@ def test_process_worker_persists_failed_status(tmp_path, monkeypatch):
     status = manager.status(job_id)
     assert status["status"] == "failed"
     assert status["error"]["code"] == "job_failed"
+
+
+def test_cli_accepts_flat_job_commands(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ARC_MCP_CACHE", str(tmp_path))
+
+    assert cli.main(["root", "--json"]) == 0
+    flat = capsys.readouterr().out
+    assert str(tmp_path) in flat
+
+    assert cli.main(["jobs", "root", "--json"]) == 0
+    nested = capsys.readouterr().out
+    assert str(tmp_path) in nested
 
 
 def test_worker_dispatches_md2pdf_job(monkeypatch, tmp_path):

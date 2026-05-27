@@ -1106,7 +1106,7 @@ def filter_foundation_context(
         if isinstance(item, dict) and _convention_is_checked(item)
     ]
     return {
-        "schema_version": "arc.research_foundation_context.v1",
+        "schema_version": "arc.foundation_context.v1",
         "target_equation_id": target_equation_id,
         "target_equation": target_equation,
         "allowed_equations": allowed_equations,
@@ -1178,7 +1178,7 @@ def _resolve_integrity_path(path_value: Any = None) -> Path | None:
 
 def _default_integrity_path() -> Path | None:
     for root in [Path.cwd(), *Path.cwd().parents]:
-        candidate = root / "skills/arc/references/rules/integrity.md"
+        candidate = root / "skills/arc/rules/integrity.md"
         if candidate.exists():
             return candidate
     return None

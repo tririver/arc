@@ -403,7 +403,7 @@ def test_blind_reference_all_agree_requires_pairwise_checks_with_reference_claim
 
 def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path):
     foundation = {
-        "schema_version": "arc.research_foundation.v1",
+        "schema_version": "arc.foundation.v1",
         "run_id": "run_001",
         "version": 1,
         "conventions": [
@@ -486,7 +486,7 @@ def test_foundation_check_fails_when_target_equation_is_missing(tmp_path):
     foundation_path.write_text(
         json.dumps(
             {
-                "schema_version": "arc.research_foundation.v1",
+                "schema_version": "arc.foundation.v1",
                 "run_id": "run_001",
                 "version": 1,
                 "conventions": [],

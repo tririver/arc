@@ -14,11 +14,11 @@ from arc_llm.proposers_reviewer.artifacts import (
 
 
 def test_run_paths_use_configured_run_dir_as_direct_parent(tmp_path):
-    paths = RunPaths(run_dir=tmp_path / "project" / "suggest-ideas", run_id="run_001")
+    paths = RunPaths(run_dir=tmp_path / "project" / "ideas", run_id="run_001")
     loop_paths = paths.loop("loop_001")
     round_paths = loop_paths.round(1)
 
-    assert paths.run_root == tmp_path / "project" / "suggest-ideas" / "run_001"
+    assert paths.run_root == tmp_path / "project" / "ideas" / "run_001"
     assert loop_paths.loop_root == paths.run_root / "loops" / "loop_001"
     assert round_paths.context_dir == loop_paths.loop_root / "rounds" / "round_001" / "context"
     assert round_paths.proposer_output("proposer_001") == (

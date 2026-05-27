@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ARC Research Execute Report",
+  "title": "ARC Calculate Report",
   "type": "object",
   "required": [
     "schema_version",
@@ -11,7 +11,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "arc.research_execute.v1"
+      "const": "arc.calculate.v1"
     },
     "run_id": {
       "type": "string",

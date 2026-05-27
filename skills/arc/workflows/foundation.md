@@ -1,19 +1,19 @@
-# Research Foundation Workflow
+# Foundation Workflow
 
-Use this workflow after `initial-research-plan.md`. The output is versioned
+Use this workflow after `initial-plan.md`. The output is versioned
 foundation JSON. Do not verify equations here; checking belongs to
-`research-execute.md`.
+`calculate.md`.
 
 Write artifacts under:
 
 ```text
 <project-dir>/calculate/<run-id>/foundation/foundation.v001.json
 <project-dir>/calculate/<run-id>/foundation/latest.json
-<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md
-<project-dir>/initial-research-foundation.md
+<project-dir>/calculate/<run-id>/foundation/initial-foundation.md
+<project-dir>/initial-foundation.md
 ```
 
-Each foundation file must use `schema_version: "arc.research_foundation.v1"`.
+Each foundation file must use `schema_version: "arc.foundation.v1"`.
 
 ## Phase 1: Prepare Versioned Foundation JSON
 
@@ -39,14 +39,14 @@ convention and the chosen convention in `conventions`.
 Step 3: If the convention is not consistent or the translation is uncertain,
 make it as convenient as possible for the calculation, mark the item
 `convention_check`, and add it as a non-axiom item for the check loop in
-`research-execute.md`.
+`calculate.md`.
 
 ## Phase 3: Record Equations And Confidence Labels
 
 The initial foundation should contain only definitions, axioms, conventions, and truly foundational equations
 that are allowed as starting points. Do not add paper-derived equations merely so they can be checked. If a reference equation
 needs verification before use, keep it out of `equations[]` and route it
-through a blind reference check in `research-execute.md`.
+through a blind reference check in `calculate.md`.
 
 Each equation must include:
 
@@ -95,7 +95,7 @@ separate sparse fields for these notes.
 
 Do not put a loose `\sim` relation, proportionality, or vague asymptotic claim
 as a usable foundation equation. If such a relation is needed later, make it a
-research-plan step to derive a precise equality, definition, or explicitly
+plan step to derive a precise equality, definition, or explicitly
 bounded approximation before proposers use it as input. A loose asymptotic
 source statement may be mentioned in `explanation` or kept `validation_only`,
 but it is not a usable foundation equation.
@@ -108,15 +108,15 @@ future agents can run to inspect the section or equation context.
 Step 2: Prefer exact sections. If no exact section is known, include a TOC or
 full-text search command that can recover the relevant location.
 
-Step 3: Do not mark a non-axiom equation as checked. The execute workflow must
+Step 3: Do not mark a non-axiom equation as checked. The calculate workflow must
 create one checking step for every non-axiom equation.
 
-Step 4: Render `latest.json` into `initial-research-foundation.md` directly at
-both `<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md`
-and `<project-dir>/initial-research-foundation.md` with the chosen conventions,
+Step 4: Render `latest.json` into `initial-foundation.md` directly at
+both `<project-dir>/calculate/<run-id>/foundation/initial-foundation.md`
+and `<project-dir>/initial-foundation.md` with the chosen conventions,
 equations, confidence labels, source locations, and any version change notes.
 
 After writing the project-level Markdown report, call
-MCP `md2pdf(input="<project-dir>/initial-research-foundation.md")`. It starts a
+MCP `md2pdf(input="<project-dir>/initial-foundation.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait
 before continuing.

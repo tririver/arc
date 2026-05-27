@@ -185,7 +185,7 @@ def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selectio
                 "Do not invent papers."
             ),
             (
-                "This briefing is context for a downstream LLM that will propose better research ideas. "
+                "This briefing is context for a downstream LLM that will propose better ideas. "
                 "Clearly separate the user's task focus from supporting source material."
             ),
             (

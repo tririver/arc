@@ -8,9 +8,9 @@ to proposer agents.
 This workflow reuses:
 
 ```text
-references/research-workflows/research-plan.md
-references/research-workflows/research-foundation.md
-references/research-workflows/research-execute.md
+workflows/plan.md
+workflows/foundation.md
+workflows/calculate.md
 ```
 
 ## Phase 1: Read Notes
@@ -66,15 +66,15 @@ Step 1: Treat the note check as an explicit calculation idea: verify the note
 claims from the accepted foundation, with no new conjecture unless required to
 check a claim.
 
-Step 2: Execute `research-plan.md`. For each item in `claims_to_check`, create
+Step 2: Execute `plan.md`. For each item in `claims_to_check`, create
 a blind reference check. The proposer prompt must name the quantity to derive,
 its dependencies, and allowed checked inputs, but must not disclose the note's
 target formula or result.
 
-Step 3: Execute `research-foundation.md`. The foundation contains only accepted
+Step 3: Execute `foundation.md`. The foundation contains only accepted
 definitions, axioms, conventions, and truly foundational equations.
 
-Step 4: Execute `research-execute.md`. Put each note claim into
+Step 4: Execute `calculate.md`. Put each note claim into
 `reviewer_reference_claim` only. The reviewer may compare proposer derivations
 against the note claim; proposers must not see the note claim unless the user
 explicitly requests non-blind checking.
@@ -94,5 +94,5 @@ context_only
 
 For each status, include the source note path and page, section, heading, or
 label when available. Do not claim a note detail is verified unless
-`research-execute.md` accepted it by consensus or the user explicitly resolved
+`calculate.md` accepted it by consensus or the user explicitly resolved
 it.

@@ -50,7 +50,7 @@ def filter_foundation_context(
     ]
 
     return {
-        "schema_version": "arc.research_foundation_context.v1",
+        "schema_version": "arc.foundation_context.v1",
         "target_equation_id": target_equation_id,
         "target_equation": target_equation,
         "allowed_equations": allowed_equations,

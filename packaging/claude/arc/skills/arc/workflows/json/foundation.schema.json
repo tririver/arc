@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ARC Research Foundation",
+  "title": "ARC Foundation",
   "type": "object",
   "required": [
     "schema_version",
@@ -12,7 +12,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "arc.research_foundation.v1"
+      "const": "arc.foundation.v1"
     },
     "run_id": {
       "type": "string",

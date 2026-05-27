@@ -62,7 +62,7 @@
       "properties": {
         "marks": {
           "type": "object",
-          "$comment": "Generated from suggest-ideas-marking-scheme.json by research_ideas_runner.py."
+          "$comment": "Generated from ideas-marking-scheme.json by ideas_runner.py."
         },
         "reviewer_benchmark": {
           "type": "object",

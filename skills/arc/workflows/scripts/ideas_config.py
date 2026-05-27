@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESEARCH_IDEAS_CONFIG_SCHEMA = "arc.workflow.research_ideas.config.v1"
-RESEARCH_IDEAS_VARIANT_SCHEMA = "arc.workflow.research_ideas.variant.v1"
+IDEAS_CONFIG_SCHEMA = "arc.workflow.ideas.config.v1"
+IDEAS_VARIANT_SCHEMA = "arc.workflow.ideas.variant.v1"
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -36,7 +36,7 @@ class VariantConfig:
 
 
 @dataclass(frozen=True)
-class ResearchIdeasConfig:
+class IdeasConfig:
     schema_version: str
     run_id: str
     run_dir: Path
@@ -50,18 +50,18 @@ class ResearchIdeasConfig:
     variants: list[VariantConfig]
 
 
-def load_research_ideas_config(payload: Mapping[str, Any]) -> ResearchIdeasConfig:
+def load_ideas_config(payload: Mapping[str, Any]) -> IdeasConfig:
     data = copy.deepcopy(dict(payload))
     schema_version = _required_text(data, "schema_version")
-    if schema_version != RESEARCH_IDEAS_CONFIG_SCHEMA:
-        raise ConfigError(f"schema_version must be {RESEARCH_IDEAS_CONFIG_SCHEMA}")
+    if schema_version != IDEAS_CONFIG_SCHEMA:
+        raise ConfigError(f"schema_version must be {IDEAS_CONFIG_SCHEMA}")
 
     run_id = _safe_id(_required_text(data, "run_id"), "run_id")
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
     project_dir = Path(_required_text(data, "project_dir")).expanduser()
     user_intent = _required_text(data, "user_intent")
     variant_config_dir = Path(_required_text(data, "variant_config_dir")).expanduser()
-    variant_glob = str(data.get("variant_glob", "suggest-ideas-*.variant.json") or "").strip()
+    variant_glob = str(data.get("variant_glob", "ideas-*.variant.json") or "").strip()
     if not variant_glob:
         raise ConfigError("variant_glob is required")
     loops_per_variant = _positive_int(data.get("loops_per_variant", 5), "loops_per_variant")
@@ -71,9 +71,9 @@ def load_research_ideas_config(payload: Mapping[str, Any]) -> ResearchIdeasConfi
     artifact_options = _dict(data.get("artifact_options", {}), "artifact_options")
     variants = _discover_variants(variant_config_dir, variant_glob)
     if not variants:
-        raise ConfigError(f"No enabled research-ideas variants found in {variant_config_dir} with {variant_glob}")
+        raise ConfigError(f"No enabled ideas variants found in {variant_config_dir} with {variant_glob}")
 
-    return ResearchIdeasConfig(
+    return IdeasConfig(
         schema_version=schema_version,
         run_id=run_id,
         run_dir=run_dir,
@@ -108,8 +108,8 @@ def _parse_variant(payload: Mapping[str, Any], *, path: Path) -> VariantConfig |
     schema_version = str(payload.get("schema_version", "")).strip()
     if not schema_version:
         raise ConfigError(f"{path}.schema_version is required")
-    if schema_version != RESEARCH_IDEAS_VARIANT_SCHEMA:
-        raise ConfigError(f"{path}.schema_version must be {RESEARCH_IDEAS_VARIANT_SCHEMA}")
+    if schema_version != IDEAS_VARIANT_SCHEMA:
+        raise ConfigError(f"{path}.schema_version must be {IDEAS_VARIANT_SCHEMA}")
     if payload.get("enabled", True) is False:
         return None
     variant_id = _safe_id(_variant_required_text(payload, "variant_id", path), f"{path}.variant_id")

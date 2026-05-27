@@ -7,11 +7,11 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "skills/arc/references/research-workflows/scripts/rank-suggested-ideas.py"
+SCRIPT = ROOT / "skills/arc/workflows/scripts/rank-ideas.py"
 
 
 def _load_rank_module() -> Any:
-    spec = importlib.util.spec_from_file_location("rank_suggested_ideas", SCRIPT)
+    spec = importlib.util.spec_from_file_location("rank_ideas", SCRIPT)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -93,7 +93,7 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
     assert first_section.startswith(
         "# Intent of the User\n\n"
         "Suggest research directions about decoherence and Bell inequality test in cosmology.\n\n"
-        "# Suggested Ideas\n\n"
+        "# Ideas\n\n"
         "Abbreviations:\n\n"
         "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
         "PL=planning, WD=well-definedness, T=total.\n\n"
@@ -114,7 +114,7 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
         "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         "| 1 | 25 | 10 | 8 | 12 | 14 | 14 | 84 |"
     )
-    assert "\n# Suggested Ideas\n" in markdown
+    assert "\n# Ideas\n" in markdown
     assert "Higher scoring idea (Mark: 83)" not in first_section
     assert "\n# Ranked Ideas and Details\n" in markdown
     assert "\n# Appendix: Idea Details\n" not in markdown

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rank the best scored round from each ARC suggest-ideas loop."""
+"""Rank the best scored round from each ARC ideas loop."""
 
 from __future__ import annotations
 
@@ -15,14 +15,14 @@ WORKFLOW_DIR = Path(__file__).resolve().parents[1]
 if str(WORKFLOW_DIR) not in sys.path:
     sys.path.insert(0, str(WORKFLOW_DIR))
 
-from research_ideas_marking import normalized_marks, rank_key_from_marks, report_columns  # noqa: E402
+from ideas_marking import normalized_marks, rank_key_from_marks, report_columns  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Select each loop's highest-marked round and rank the selected ideas."
     )
-    parser.add_argument("run_root", type=Path, help="suggest-ideas run artifact root")
+    parser.add_argument("run_root", type=Path, help="ideas run artifact root")
     parser.add_argument("--format", choices=["json", "markdown"], default="markdown")
     args = parser.parse_args()
 
@@ -54,7 +54,7 @@ def rank_run(run_root: Path) -> dict[str, Any]:
         entry["rank"] = index
 
     return {
-        "schema_version": "arc.suggest_ideas.selected_rounds.v1",
+        "schema_version": "arc.ideas.selected_rounds.v1",
         "run_root": str(run_root),
         "user_intent": _run_user_intent(run_root),
         "summary_order": selected,
@@ -166,7 +166,7 @@ def _intent_summary(intent: str) -> str:
 
 def _summary_table(payload: dict[str, Any]) -> str:
     lines = [
-        "# Suggested Ideas",
+        "# Ideas",
         "",
         "Abbreviations:",
         "",

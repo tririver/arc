@@ -10,14 +10,20 @@ a different domain selection.
 
 ## Full Build CLI
 
-### Phase 1: Start from a seed paper.
+### Phase 1: Initialize or build from a seed paper.
 Step 1: If the user gives an intent, pass it exactly after trimming outer
 whitespace.
 Step 2: Run:
 
 ```bash
+arc-domain init <seed-paper> --intent "<user-intent>" --json
 arc-domain llm-build <seed-paper> --intent "<user-intent>" --json
 ```
+
+Use `--domain-id <id>` when resuming a named domain package, `--refresh` to
+refetch deterministic source data, and `--workers <n>` for parallel paper-data
+work. `arc-domain build` is the same full build surface with provider/model
+options exposed.
 
 ### Phase 2: Inspect cached artifacts.
 Step 1: Check status and read outputs.
@@ -52,6 +58,7 @@ Step 1: Run:
 
 ```bash
 arc-domain llm-build-network <seed-paper> --intent "<user-intent>" --json
+arc-domain build-paper-json-pack <seed-paper> --intent "<user-intent>" --json
 arc-domain build-evidence <seed-paper> --intent "<user-intent>" --json
 ```
 
@@ -64,7 +71,7 @@ arc-domain llm-summarize <seed-paper> --intent "<user-intent>" --json
 
 ## MCP Tools
 
-Read `references/package-manuals/arc-mcp.md` before using MCP.
+Read `manuals/arc-mcp.md` before using MCP.
 
 Domain MCP tools:
 
@@ -86,7 +93,7 @@ Step 1: Call `llm_domain_build`, `llm_domain_get_summary`, or
 `llm_domain_get_graph`.
 Step 2: Use `background=true` for slow builds or large job launches.
 Step 3: Follow the background-job procedure in
-`references/package-manuals/arc-mcp.md`.
+`manuals/arc-mcp.md`.
 
 ## Artifacts
 

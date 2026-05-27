@@ -28,7 +28,7 @@ Use ARC when you want to:
 - Look up reliable paper metadata, references, citers, sections, or equations.
 - Summarize a paper from cached ar5iv/INSPIRE data.
 - Build a research-domain overview from a seed paper.
-- Generate research ideas using domain context and reviewer scoring.
+- Generate ideas using domain context and reviewer scoring.
 - Plan and execute a careful symbolic or numerical research calculation with
   explicit provenance and checks.
 
@@ -101,7 +101,7 @@ arc-paper --help
 arc-domain --help
 arc-llm --help
 arc-typeset --help
-arc-mcp jobs --help
+arc-mcp --help
 ```
 
 Run a deterministic smoke test:
@@ -134,7 +134,7 @@ arc-typeset batch-translate <project-dir> --json
 The same converter is available from MCP as `md2pdf`.
 The MCP `md2pdf`, `translate`, and `batch_translate` tools always start
 background jobs and return a `job_id` immediately; use `job_status`/`job_result`
-or `arc-mcp jobs watch <job_id> --json` to inspect completion.
+or `arc-mcp watch <job_id> --json` to inspect completion.
 
 ## Configure LLM Providers
 
@@ -181,7 +181,8 @@ Provider config discovery checks:
 ```
 
 Override the path with `ARC_LLM_PROVIDER_CONFIG` or `--provider-config`.
-`examples/llm-providers.example.json` is a redacted starting point.
+Use `arc-llm providers init` to create the redacted starting file, then add
+providers with `arc-llm providers add openai-compatible`.
 
 With `--provider auto`, ARC uses native host providers first by default. Set
 `"auto_provider_priority": "configured-first"` in `llm-providers.json` if you
@@ -224,7 +225,7 @@ When using the ARC skill, ask the agent in research terms. Examples:
 ```text
 Use ARC to summarize arXiv:0911.3380.
 Use ARC to build a domain for arXiv:0911.3380 focused on quasi-single-field inflation observables.
-Use ARC to suggest research ideas about cosmological collider scalar exchange.
+Use ARC to develop ideas about cosmological collider scalar exchange.
 Use ARC to plan and execute the selected calculation idea.
 ```
 
@@ -403,13 +404,13 @@ Long-running MCP calls can return a `job_id`. Use the CLI watcher to block
 until a terminal result:
 
 ```bash
-arc-mcp jobs watch <job_id> --json
-arc-mcp jobs watch <job_id> --progress-jsonl
-arc-mcp jobs root --json
-arc-mcp jobs status <job_id> --json
-arc-mcp jobs result <job_id> --json
-arc-mcp jobs list --json
-arc-mcp jobs cancel <job_id> --json
+arc-mcp watch <job_id> --json
+arc-mcp watch <job_id> --progress-jsonl
+arc-mcp root --json
+arc-mcp status <job_id> --json
+arc-mcp result <job_id> --json
+arc-mcp list --json
+arc-mcp cancel <job_id> --json
 ```
 
 For slow tools or large launches, pass `background=true` from MCP so the tool
@@ -439,7 +440,7 @@ Output includes:
 Use this when you need a reliable overview of a local research area before
 asking for ideas or calculations.
 
-### 2. Suggest Research Ideas
+### 2. Ideas
 
 Input: a not-yet-explicit research request plus built domain context.
 
@@ -448,8 +449,8 @@ workflow intentionally withholds ARC domain context for comparison. Both use
 reviewer marks and write a ranked selected-ideas report:
 
 ```text
-<project-dir>/research-ideas/<run-id>/
-<project-dir>/research-ideas/<run-id>/ranked-ideas.md
+<project-dir>/ideas/<run-id>/
+<project-dir>/ideas/<run-id>/ranked-ideas.md
 <project-dir>/ranked-ideas.md
 ```
 
@@ -464,22 +465,22 @@ Input: one explicit calculation idea.
 
 The calculation workflow has three phases:
 
-1. `research-plan`: gather evidence, separate first principles from derived
+1. `plan`: gather evidence, separate first principles from derived
    claims, and write a reviewable calculation plan.
-2. `research-foundation`: build versioned foundation JSON with conventions,
+2. `foundation`: build versioned foundation JSON with conventions,
    equations, confidence labels, and source locations.
-3. `research-execute`: check non-axiom foundation equations and execute new
+3. `calculate`: check non-axiom foundation equations and execute new
    calculation steps through proposers-reviewer consensus.
 
 Primary outputs:
 
 ```text
 <project-dir>/calculate/<run-id>/plan.json
-<project-dir>/calculate/<run-id>/initial-research-plan.md
-<project-dir>/initial-research-plan.md
+<project-dir>/calculate/<run-id>/initial-plan.md
+<project-dir>/initial-plan.md
 <project-dir>/calculate/<run-id>/foundation/latest.json
-<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md
-<project-dir>/initial-research-foundation.md
+<project-dir>/calculate/<run-id>/foundation/initial-foundation.md
+<project-dir>/initial-foundation.md
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
 <project-dir>/calculate/<run-id>/calculation-report.md
 <project-dir>/calculation-report.md
@@ -530,7 +531,7 @@ Diagnose cache state:
 
 ```bash
 arc-paper doctor cache arXiv:0911.3380 --json
-arc-mcp jobs root --json
+arc-mcp root --json
 ```
 
 Useful environment variables:
@@ -575,7 +576,7 @@ arc-llm providers doctor
 If an MCP call returns a job ID:
 
 ```bash
-arc-mcp jobs watch <job_id> --json
+arc-mcp watch <job_id> --json
 ```
 
 If a domain summary or graph is missing:

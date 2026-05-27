@@ -96,7 +96,7 @@ llm_summary_batch_run(name="<batch-name>", provider="auto", concurrency=2, backg
 Step 1: Immediately run:
 
 ```bash
-arc-mcp jobs watch <job_id> --json
+arc-mcp watch <job_id> --json
 ```
 
 Step 2: Use the watcher output as the final result when it completes.
@@ -111,13 +111,13 @@ Do not call `cancel_job` unless the user explicitly asks.
 ## Job CLI
 
 ```bash
-arc-mcp jobs root --json
-arc-mcp jobs list --json
-arc-mcp jobs status <job_id> --json
-arc-mcp jobs result <job_id> --json
-arc-mcp jobs watch <job_id> --json
-arc-mcp jobs watch <job_id> --progress-jsonl
-arc-mcp jobs cancel <job_id> --json
+arc-mcp root --json
+arc-mcp list --json
+arc-mcp status <job_id> --json
+arc-mcp result <job_id> --json
+arc-mcp watch <job_id> --json
+arc-mcp watch <job_id> --progress-jsonl
+arc-mcp cancel <job_id> --json
 ```
 
 `watch --json` blocks until a terminal result. `watch --progress-jsonl` streams
@@ -151,5 +151,5 @@ Job state is persisted under:
 cache/arc-mcp/jobs/<job_id>/
 ```
 
-MCP tools and `arc-mcp jobs ...` read the same persisted job files. ETA appears
+MCP tools and the `arc-mcp` job CLI read the same persisted job files. ETA appears
 after enough matching jobs have completed.

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ARC Research Plan",
+  "title": "ARC Plan",
   "type": "object",
   "required": [
     "schema_version",
@@ -13,7 +13,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "arc.research_plan.v1"
+      "const": "arc.plan.v1"
     },
     "run_id": {
       "type": "string",

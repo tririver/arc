@@ -13,7 +13,7 @@ def minimal_config() -> dict:
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
         "run_id": "idea-test",
-        "run_dir": "project/suggest-ideas",
+        "run_dir": "project/ideas",
         "max_concurrent_loops": 2,
         "defaults": {
             "provider": "auto",
@@ -54,7 +54,7 @@ def test_valid_config_parses_and_merges_defaults():
     config = load_batch_config(minimal_config())
 
     assert config.schema_version == "arc.llm.proposers_reviewer_batch.config.v1"
-    assert str(config.run_dir) == "project/suggest-ideas"
+    assert str(config.run_dir) == "project/ideas"
     assert config.run_id == "idea-test"
     assert config.max_concurrent_loops == 2
     assert config.artifact_options.save_prompts is True

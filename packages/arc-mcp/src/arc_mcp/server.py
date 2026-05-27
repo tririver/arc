@@ -808,7 +808,7 @@ def _wait_or_background(
         "inline_wait_seconds": inline_wait,
         "background_requested": background,
         "next": {
-            "cli_command": f"arc-mcp jobs watch {job_id} --json",
+            "cli_command": f"arc-mcp watch {job_id} --json",
             "tool": "job_status",
             "arguments": {"job_id": job_id},
             "poll_after_seconds": poll_after_seconds,

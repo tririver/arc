@@ -12,8 +12,8 @@ from typing import Any, Callable, Mapping
 from arc_llm.proposers_reviewer.artifacts import atomic_write_json, atomic_write_text
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 
-from research_ideas_config import ConfigError, ResearchIdeasConfig, VariantConfig, load_research_ideas_config
-from research_ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema, normalized_marks
+from ideas_config import ConfigError, IdeasConfig, VariantConfig, load_ideas_config
+from ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema, normalized_marks
 
 
 JsonRunner = Callable[..., dict[str, Any]]
@@ -31,8 +31,8 @@ class IdeaPlan:
     caller_context: dict[str, Any]
 
 
-def run_research_ideas(
-    config: ResearchIdeasConfig | Mapping[str, Any],
+def run_ideas(
+    config: IdeasConfig | Mapping[str, Any],
     *,
     json_runner: JsonRunner | None = None,
     batch_runner: BatchRunner | None = None,
@@ -40,20 +40,20 @@ def run_research_ideas(
     process_chain: list[str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    research_config = config if isinstance(config, ResearchIdeasConfig) else load_research_ideas_config(config)
-    run_root = research_config.run_dir / research_config.run_id
-    ideas = _materialize_ideas(research_config)
-    batch_config = _loop_batch_config(research_config, ideas, run_root=run_root)
-    batch_config_path = run_root / "research_ideas_batch_config.json"
-    warnings_path = run_root / "research_ideas_warnings.txt"
+    ideas_config = config if isinstance(config, IdeasConfig) else load_ideas_config(config)
+    run_root = ideas_config.run_dir / ideas_config.run_id
+    ideas = _materialize_ideas(ideas_config)
+    batch_config = _loop_batch_config(ideas_config, ideas, run_root=run_root)
+    batch_config_path = run_root / "ideas_batch_config.json"
+    warnings_path = run_root / "ideas_warnings.txt"
     warnings = [
-        _concurrency_warning(research_config, len(ideas)),
+        _concurrency_warning(ideas_config, len(ideas)),
         *_model_tier_warnings(batch_config),
     ]
 
     if dry_run:
         return _result(
-            research_config,
+            ideas_config,
             run_root=run_root,
             batch_config_path=batch_config_path,
             warnings_path=warnings_path,
@@ -91,7 +91,7 @@ def run_research_ideas(
         }
 
     return _result(
-        research_config,
+        ideas_config,
         run_root=run_root,
         batch_config_path=batch_config_path,
         warnings_path=warnings_path,
@@ -102,7 +102,7 @@ def run_research_ideas(
 
 
 def _result(
-    config: ResearchIdeasConfig,
+    config: IdeasConfig,
     *,
     run_root: Path,
     batch_config_path: Path,
@@ -114,7 +114,7 @@ def _result(
     batch_run_root = Path(str(batch_result.get("run_root", run_root / "idea_loops")))
     round_score_table = _round_score_table(ideas, batch_run_root=batch_run_root)
     return {
-        "schema_version": "arc.workflow.research_ideas.result.v1",
+        "schema_version": "arc.workflow.ideas.result.v1",
         "status": str(batch_result.get("status", "failed")),
         "run_id": config.run_id,
         "run_root": str(run_root),
@@ -132,7 +132,7 @@ def _result(
     }
 
 
-def _materialize_ideas(config: ResearchIdeasConfig) -> list[IdeaPlan]:
+def _materialize_ideas(config: IdeasConfig) -> list[IdeaPlan]:
     ideas: list[IdeaPlan] = []
     for variant in config.variants:
         for idea_index in range(1, config.loops_per_variant + 1):
@@ -150,7 +150,7 @@ def _materialize_ideas(config: ResearchIdeasConfig) -> list[IdeaPlan]:
     return ideas
 
 
-def _caller_context(config: ResearchIdeasConfig, *, variant: VariantConfig, idea_id: str) -> dict[str, Any]:
+def _caller_context(config: IdeasConfig, *, variant: VariantConfig, idea_id: str) -> dict[str, Any]:
     loop_template = _read_json(variant.loop_template)
     caller_context = copy.deepcopy(loop_template.get("caller_context", {}))
     if not isinstance(caller_context, dict):
@@ -172,7 +172,7 @@ def _caller_context(config: ResearchIdeasConfig, *, variant: VariantConfig, idea
     return caller_context
 
 
-def _loop_batch_config(config: ResearchIdeasConfig, ideas: list[IdeaPlan], *, run_root: Path) -> dict[str, Any]:
+def _loop_batch_config(config: IdeasConfig, ideas: list[IdeaPlan], *, run_root: Path) -> dict[str, Any]:
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
         "run_id": "idea_loops",
@@ -214,13 +214,13 @@ def _merged_worker_payload(template: Mapping[str, Any], overrides: Mapping[str, 
 def _loop_reviewer_payload(variant: VariantConfig) -> dict[str, Any]:
     workflow_dir = variant.path.parent
     scheme = load_marking_scheme(workflow_dir)
-    payload = _read_json(workflow_dir / "suggest-ideas-reviewer.template.json")
+    payload = _read_json(workflow_dir / "ideas-reviewer.template.json")
     payload["output_schema"] = _reviewer_output_schema(workflow_dir, scheme=scheme)
     return payload
 
 
 def _reviewer_output_schema(workflow_dir: Path, *, scheme: Mapping[str, Any]) -> dict[str, Any]:
-    schema = _read_json(workflow_dir / "suggest-ideas-reviewer-output.schema.json")
+    schema = _read_json(workflow_dir / "ideas-reviewer-output.schema.json")
     schema["properties"]["review_payload"]["properties"]["marks"] = marks_schema(scheme)
     return schema
 
@@ -259,7 +259,7 @@ def _round_score_table(ideas: list[IdeaPlan], *, batch_run_root: Path) -> dict[s
         "Best",
     ]
     return {
-        "schema_version": "arc.workflow.research_ideas.round_score_table.v1",
+        "schema_version": "arc.workflow.ideas.round_score_table.v1",
         "source": "loop_artifacts",
         "columns": columns,
         "rows": rows,
@@ -428,7 +428,7 @@ def _first_json(root: Path) -> Path | None:
     return next(iter(sorted(root.glob("*.json"))), None)
 
 
-def _concurrency_warning(config: ResearchIdeasConfig, proposal_count: int) -> str:
+def _concurrency_warning(config: IdeasConfig, proposal_count: int) -> str:
     round_counts = sorted({int(_read_json(variant.loop_template).get("max_rounds") or 0) for variant in config.variants})
     if len(round_counts) == 1:
         round_text = f"{round_counts[0]} reviewer reports per loop"
@@ -536,7 +536,7 @@ def _read_config_file(path: str) -> dict[str, Any]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ARC research-ideas workflow helper")
+    parser = argparse.ArgumentParser(description="ARC ideas workflow helper")
     parser.add_argument("--config", required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true")
@@ -546,7 +546,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    result = run_research_ideas(
+    result = run_ideas(
         _read_config_file(args.config),
         dry_run=args.dry_run,
         base_env=_provider_config_env(args.provider_config),

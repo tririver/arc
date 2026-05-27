@@ -10,32 +10,33 @@ import jsonschema
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WF = ROOT / "skills/arc/references/research-workflows"
+WF = ROOT / "skills/arc/workflows"
+WJ = WF / "json"
+WS = WF / "scripts"
 SKILL = ROOT / "skills/arc"
 
 
-def test_research_calculation_workflow_files_exist() -> None:
+def test_calculation_workflow_files_exist() -> None:
     for name in [
-        "research-plan.md",
-        "research-foundation.md",
-        "research-execute.md",
-        "research-plan.schema.json",
-        "research-foundation.schema.json",
-        "research-execute.schema.json",
+        "plan.md",
+        "foundation.md",
+        "calculate.md",
     ]:
         assert (WF / name).is_file()
+    for name in ["plan.schema.json", "foundation.schema.json", "calculate.schema.json"]:
+        assert (WJ / name).is_file()
 
 
 def test_arc_skill_routes_check_and_calculation_workflows() -> None:
     text = (ROOT / "skills/arc/SKILL.md").read_text(encoding="utf-8")
 
-    assert "references/research-workflows/calculate.md" not in text
+    assert "references/" not in text
     assert "classify" in text.lower()
     assert "four cases" in text.lower()
     assert "check.md" in text
-    assert "research-plan.md" in text
-    assert "research-foundation.md" in text
-    assert "research-execute.md" in text
+    assert "plan.md" in text
+    assert "foundation.md" in text
+    assert "calculate.md" in text
 
 
 def test_arc_skill_requires_nonblocking_pdf_export_for_project_markdown_reports() -> None:
@@ -47,14 +48,14 @@ def test_arc_skill_requires_nonblocking_pdf_export_for_project_markdown_reports(
     assert "markdown report" in text
 
 
-def test_research_workflows_start_pdf_export_for_user_facing_markdown() -> None:
+def test_workflows_start_pdf_export_for_user_facing_markdown() -> None:
     for name in [
         "check.md",
-        "build-domain.md",
-        "research-ideas.md",
-        "research-plan.md",
-        "research-foundation.md",
-        "research-execute.md",
+        "domain.md",
+        "ideas.md",
+        "plan.md",
+        "foundation.md",
+        "calculate.md",
     ]:
         text = (WF / name).read_text(encoding="utf-8").lower()
         assert "md2pdf" in text
@@ -62,8 +63,8 @@ def test_research_workflows_start_pdf_export_for_user_facing_markdown() -> None:
         assert "do not wait" in text
 
 
-def test_research_ideas_phase_5_uses_clean_selection_prompt() -> None:
-    text = (WF / "research-ideas.md").read_text(encoding="utf-8")
+def test_ideas_phase_5_uses_clean_selection_prompt() -> None:
+    text = (WF / "ideas.md").read_text(encoding="utf-8")
     lower = text.lower()
 
     assert "### Phase 5: Select Next Action" in text
@@ -81,7 +82,7 @@ def test_research_ideas_phase_5_uses_clean_selection_prompt() -> None:
 
 
 def test_interaction_rules_name_codex_discrete_choice_tool() -> None:
-    text = (SKILL / "references/rules/interaction.md").read_text(encoding="utf-8")
+    text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8")
     lower = text.lower()
 
     assert "`request_user_input`" in text
@@ -91,12 +92,12 @@ def test_interaction_rules_name_codex_discrete_choice_tool() -> None:
     assert "do not include list numbering inside option labels" in lower
 
 
-def test_research_workflow_docs_stay_human_readable() -> None:
+def test_workflow_docs_stay_human_readable() -> None:
     for name in [
         "check.md",
-        "research-plan.md",
-        "research-foundation.md",
-        "research-execute.md",
+        "plan.md",
+        "foundation.md",
+        "calculate.md",
     ]:
         text = (WF / name).read_text(encoding="utf-8")
         assert len(text.splitlines()) <= 220
@@ -117,20 +118,20 @@ def test_check_workflow_keeps_notes_out_of_proposer_context() -> None:
     assert "inferred" in text
 
 
-def test_research_plan_requires_review_after_drafting() -> None:
-    text = (WF / "research-plan.md").read_text(encoding="utf-8")
+def test_plan_requires_review_after_drafting() -> None:
+    text = (WF / "plan.md").read_text(encoding="utf-8")
 
     assert "review the plan" in text.lower()
     assert "independent reviewer" in text.lower()
     assert "main agent" in text.lower()
-    assert "<project-dir>/calculate/<run-id>/initial-research-plan.md" in text
-    assert "<project-dir>/initial-research-plan.md" in text
-    assert 'md2pdf(input="<project-dir>/initial-research-plan.md")' in text
-    assert "<project-dir>/research-plan.md" not in text
+    assert "<project-dir>/calculate/<run-id>/initial-plan.md" in text
+    assert "<project-dir>/initial-plan.md" in text
+    assert 'md2pdf(input="<project-dir>/initial-plan.md")' in text
+    assert "<project-dir>/plan.md" not in text
 
 
-def test_research_plan_requires_explicit_step_quantity_contracts() -> None:
-    text = (WF / "research-plan.md").read_text(encoding="utf-8").lower()
+def test_plan_requires_explicit_step_quantity_contracts() -> None:
+    text = (WF / "plan.md").read_text(encoding="utf-8").lower()
 
     assert "calculate which quantity" in text
     assert "in terms of which quantity" in text
@@ -142,16 +143,16 @@ def test_research_plan_requires_explicit_step_quantity_contracts() -> None:
     assert "expected final formula" in text
 
 
-def test_research_plan_routes_reference_equations_to_blind_checks() -> None:
-    text = (WF / "research-plan.md").read_text(encoding="utf-8").lower()
+def test_plan_routes_reference_equations_to_blind_checks() -> None:
+    text = (WF / "plan.md").read_text(encoding="utf-8").lower()
 
     assert "do not disclose the target reference equation" in text
     assert "blind reference check" in text
     assert "reviewer-only reference claim" in text
 
 
-def test_research_foundation_requires_convention_alignment_checks() -> None:
-    text = (WF / "research-foundation.md").read_text(encoding="utf-8").lower()
+def test_foundation_requires_convention_alignment_checks() -> None:
+    text = (WF / "foundation.md").read_text(encoding="utf-8").lower()
 
     assert "consistent convention" in text
     assert "multiple papers" in text
@@ -161,25 +162,25 @@ def test_research_foundation_requires_convention_alignment_checks() -> None:
     assert "loose `\\sim`" in text
     assert "not a usable foundation equation" in text
     assert "derive a precise equality" in text
-    assert "<project-dir>/calculate/<run-id>/foundation/initial-research-foundation.md" in text
-    assert "<project-dir>/initial-research-foundation.md" in text
-    assert 'md2pdf(input="<project-dir>/initial-research-foundation.md")' in text
-    assert "<project-dir>/research-foundation.md" not in text
+    assert "<project-dir>/calculate/<run-id>/foundation/initial-foundation.md" in text
+    assert "<project-dir>/initial-foundation.md" in text
+    assert 'md2pdf(input="<project-dir>/initial-foundation.md")' in text
+    assert "<project-dir>/foundation.md" not in text
     assert '"background"' not in text
     assert '"meaning"' not in text
     assert '"relation_type"' not in text
 
 
-def test_research_foundation_keeps_initial_foundation_to_axioms_and_definitions() -> None:
-    text = (WF / "research-foundation.md").read_text(encoding="utf-8").lower()
+def test_foundation_keeps_initial_foundation_to_axioms_and_definitions() -> None:
+    text = (WF / "foundation.md").read_text(encoding="utf-8").lower()
 
     assert "only definitions, axioms, conventions, and truly foundational equations" in text
     assert "do not add paper-derived equations merely so they can be checked" in text
     assert "blind reference check" in text
 
 
-def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
-    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+def test_calculate_requires_solid_symbolic_and_filtered_checks() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
     assert "integrity.md" in text
     assert "expand" in text
@@ -202,8 +203,8 @@ def test_research_execute_requires_solid_symbolic_and_filtered_checks() -> None:
     assert "wolfram" in text
 
 
-def test_research_execute_uses_phase_specific_source_defaults() -> None:
-    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+def test_calculate_uses_phase_specific_source_defaults() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
     assert "blind reference check" in text
     assert "reviewer_reference_claim" in text
@@ -216,8 +217,8 @@ def test_research_execute_uses_phase_specific_source_defaults() -> None:
     assert "post-check new calculation" in text
 
 
-def test_research_execute_uses_three_total_consensus_attempts() -> None:
-    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+def test_calculate_uses_three_total_consensus_attempts() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
     assert '"max_recalculations": 2' in text
     assert "3 total attempts" in text
@@ -225,16 +226,16 @@ def test_research_execute_uses_three_total_consensus_attempts() -> None:
     assert "4 attempts" not in text
 
 
-def test_research_execute_foundation_checks_use_same_three_proposer_standard() -> None:
-    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+def test_calculate_foundation_checks_use_same_three_proposer_standard() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
     assert "foundation checks use the same 3-proposer reviewer consensus" in text
     assert "same acceptance standard" in text
     assert "no single-proposer acceptance" in text
 
 
-def test_research_execute_uses_main_agent_sympy_fallback_for_bad_all_agree_review() -> None:
-    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+def test_calculate_uses_main_agent_sympy_fallback_for_bad_all_agree_review() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
     assert "reviewer still suggests `all_agree`" in text
     assert "report is below this" in text
@@ -244,8 +245,8 @@ def test_research_execute_uses_main_agent_sympy_fallback_for_bad_all_agree_revie
     assert "pause for human review" in text
 
 
-def test_research_execute_refines_or_reports_when_blocked() -> None:
-    text = (WF / "research-execute.md").read_text(encoding="utf-8").lower()
+def test_calculate_refines_or_reports_when_blocked() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
     assert "blocked_refinement" in text
     assert "review plan.json" in text
@@ -267,16 +268,16 @@ def test_research_execute_refines_or_reports_when_blocked() -> None:
     assert "auto mode" in text
     assert "**caution**" in text
     assert "write `calculation-report.md` even when blocked" in text
-    assert "# appendix 1: latest research foundation" in text
+    assert "# appendix 1: latest foundation" in text
     assert "# appendix 2: calculation status" in text
     assert "plan revision history" in text
     assert "append each blocked_refinement event" in text
-    assert "do not rewrite `initial-research-foundation.md`" in text
+    assert "do not rewrite `initial-foundation.md`" in text
     assert "which proposer or result is correct" in text
 
 
-def test_research_execute_delivers_named_calculation_report() -> None:
-    text = (WF / "research-execute.md").read_text(encoding="utf-8")
+def test_calculate_delivers_named_calculation_report() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8")
 
     assert "<project-dir>/calculate/<run-id>/calculation-report.md" in text
     assert "<project-dir>/calculation-report.md" in text
@@ -285,8 +286,8 @@ def test_research_execute_delivers_named_calculation_report() -> None:
     assert "<project-dir>/report.md" not in text
 
 
-def test_research_workflow_filter_script_exists() -> None:
-    script = WF / "scripts/filter-foundation-context.py"
+def test_workflow_filter_script_exists() -> None:
+    script = WS / "filter-foundation-context.py"
 
     assert script.is_file()
     text = script.read_text(encoding="utf-8")
@@ -294,9 +295,9 @@ def test_research_workflow_filter_script_exists() -> None:
     assert "omitted_equation_ids" in text
 
 
-def test_research_workflow_filter_script_omits_unchecked_context(tmp_path) -> None:
+def test_workflow_filter_script_omits_unchecked_context(tmp_path) -> None:
     foundation = {
-        "schema_version": "arc.research_foundation.v1",
+        "schema_version": "arc.foundation.v1",
         "run_id": "run_001",
         "version": 1,
         "conventions": [
@@ -325,7 +326,7 @@ def test_research_workflow_filter_script_omits_unchecked_context(tmp_path) -> No
     result = subprocess.run(
         [
             sys.executable,
-            str(WF / "scripts/filter-foundation-context.py"),
+            str(WS / "filter-foundation-context.py"),
             str(foundation_path),
             "--target-equation-id",
             "eq_target",
@@ -345,8 +346,8 @@ def test_research_workflow_filter_script_omits_unchecked_context(tmp_path) -> No
     assert filtered["omitted_equation_ids"] == ["eq_unchecked"]
 
 
-def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
-    run_root = tmp_path / "suggest-ideas" / "run_001"
+def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
+    run_root = tmp_path / "ideas" / "run_001"
     _write_idea_round(run_root, "idea_001", 1, "first", total=10, novelty=4)
     _write_idea_round(run_root, "idea_001", 2, "better", total=15, novelty=3)
     _write_idea_round(run_root, "idea_002", 1, "high novelty", total=15, novelty=8)
@@ -355,7 +356,7 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
     result = subprocess.run(
         [
             sys.executable,
-            str(WF / "scripts/rank-suggested-ideas.py"),
+            str(WS / "rank-ideas.py"),
             str(run_root),
             "--format",
             "json",
@@ -377,7 +378,7 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
     markdown = subprocess.run(
         [
             sys.executable,
-            str(WF / "scripts/rank-suggested-ideas.py"),
+            str(WS / "rank-ideas.py"),
             str(run_root),
             "--format",
             "markdown",
@@ -386,7 +387,7 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
         capture_output=True,
         text=True,
     ).stdout
-    assert "# Suggested Ideas\n\n" in markdown
+    assert "# Ideas\n\n" in markdown
     assert "Abbreviations:\n\nIR=intent relevance" in markdown
     summary = markdown.split("# Ranked Ideas and Details", 1)[0]
     details = markdown.split("# Ranked Ideas and Details", 1)[1]
@@ -409,10 +410,10 @@ def test_suggest_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> N
     assert "user_intent_fit" not in markdown
 
 
-def test_suggest_ideas_marking_scheme_is_centralized() -> None:
-    scheme = json.loads((WF / "suggest-ideas-marking-scheme.json").read_text(encoding="utf-8"))
-    reviewer_schema_text = (WF / "suggest-ideas-reviewer-output.schema.json").read_text(encoding="utf-8")
-    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
+def test_ideas_marking_scheme_is_centralized() -> None:
+    scheme = json.loads((WJ / "ideas-marking-scheme.json").read_text(encoding="utf-8"))
+    reviewer_schema_text = (WJ / "ideas-reviewer-output.schema.json").read_text(encoding="utf-8")
+    reviewer = json.loads((WJ / "ideas-reviewer.template.json").read_text(encoding="utf-8"))
 
     fields = [item["field"] for item in scheme["marks"]]
     maxima = {item["field"]: item["maximum"] for item in scheme["marks"]}
@@ -439,8 +440,8 @@ def test_suggest_ideas_marking_scheme_is_centralized() -> None:
     assert "marking_scheme" in reviewer["prompt"]["template"]
 
 
-def test_suggest_ideas_marking_scheme_has_discriminating_score_anchors() -> None:
-    scheme = json.loads((WF / "suggest-ideas-marking-scheme.json").read_text(encoding="utf-8"))
+def test_ideas_marking_scheme_has_discriminating_score_anchors() -> None:
+    scheme = json.loads((WJ / "ideas-marking-scheme.json").read_text(encoding="utf-8"))
     guidance = {item["field"]: item["guidance"] for item in scheme["marks"]}
 
     assert "Use the full numeric range" in scheme["calibration_guidance"]
@@ -455,8 +456,8 @@ def test_suggest_ideas_marking_scheme_has_discriminating_score_anchors() -> None
     assert "0: most steps cannot be done by an AI agent" in guidance["planning"]
 
 
-def test_suggest_ideas_reviewer_comments_turn_marks_into_scientific_guidance() -> None:
-    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
+def test_ideas_reviewer_comments_turn_marks_into_scientific_guidance() -> None:
+    reviewer = json.loads((WJ / "ideas-reviewer.template.json").read_text(encoding="utf-8"))
     template = reviewer["prompt"]["template"]
 
     assert "Use caller_context.marking_scheme as the organizing checklist for reviewer feedback" in template
@@ -467,73 +468,73 @@ def test_suggest_ideas_reviewer_comments_turn_marks_into_scientific_guidance() -
     assert "Add any other scientifically important comments" in template
 
 
-def test_research_ideas_workflow_points_to_active_runner_without_global_review() -> None:
-    text = (WF / "research-ideas.md").read_text(encoding="utf-8")
+def test_ideas_workflow_points_to_active_runner_without_global_review() -> None:
+    text = (WF / "ideas.md").read_text(encoding="utf-8")
 
-    assert "research_ideas_runner.py" in text
+    assert "ideas_runner.py" in text
     assert "global reviewer" not in text
     assert "global_review" not in text
     assert "five reviewer reports per loop" in text
-    assert "<project-dir>/research-ideas/<run-id>/idea_loops/loops/" in text
-    assert "scripts/rank-suggested-ideas.py" in text
-    assert "<project-dir>/research-ideas/<run-id>/research-ideas.md" not in text
-    assert "<project-dir>/research-ideas.md" not in text
+    assert "<project-dir>/ideas/<run-id>/idea_loops/loops/" in text
+    assert "scripts/rank-ideas.py" in text
+    assert "<project-dir>/ideas/<run-id>/ideas.md" not in text
+    assert "<project-dir>/ideas.md" not in text
 
 
-def test_research_ideas_workflow_has_deterministic_ranked_report_deliverable() -> None:
-    text = (WF / "research-ideas.md").read_text(encoding="utf-8")
+def test_ideas_workflow_has_deterministic_ranked_report_deliverable() -> None:
+    text = (WF / "ideas.md").read_text(encoding="utf-8")
 
-    assert "<project-dir>/research-ideas/<run-id>/ranked-ideas.md" in text
+    assert "<project-dir>/ideas/<run-id>/ranked-ideas.md" in text
     assert "<project-dir>/ranked-ideas.md" in text
     assert 'md2pdf(input="<project-dir>/ranked-ideas.md")' in text
     assert "ranked_ideas.md" not in text
     assert "<project-dir>/suggested-ideas.md" not in text
 
 
-def test_research_workflow_schemas_are_valid_json_and_referenced() -> None:
+def test_workflow_schemas_are_valid_json_and_referenced() -> None:
     expected = {
-        "research-plan": "arc.research_plan.v1",
-        "research-foundation": "arc.research_foundation.v1",
-        "research-execute": "arc.research_execute.v1",
+        "plan": "arc.plan.v1",
+        "foundation": "arc.foundation.v1",
+        "calculate": "arc.calculate.v1",
     }
 
     for stem, schema_version in expected.items():
-        schema = json.loads((WF / f"{stem}.schema.json").read_text(encoding="utf-8"))
+        schema = json.loads((WJ / f"{stem}.schema.json").read_text(encoding="utf-8"))
         markdown = (WF / f"{stem}.md").read_text(encoding="utf-8")
         assert schema["properties"]["schema_version"]["const"] == schema_version
         assert schema_version in markdown
 
 
-def test_suggest_ideas_loop_reviewer_template_has_arc_only_access() -> None:
-    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
+def test_ideas_loop_reviewer_template_has_arc_only_access() -> None:
+    reviewer = json.loads((WJ / "ideas-reviewer.template.json").read_text(encoding="utf-8"))
 
     assert reviewer["id"] == "reviewer_001"
     assert reviewer["runtime"]["allow_mcp"] is True
     assert reviewer["runtime"]["mcp_mode"] == "arc-only"
 
 
-def test_suggest_ideas_reviewer_uses_hundred_point_marking_scheme() -> None:
-    sys.path.insert(0, str(WF))
+def test_ideas_reviewer_uses_hundred_point_marking_scheme() -> None:
+    sys.path.insert(0, str(WS))
     try:
-        config_module = importlib.import_module("research_ideas_config")
-        runner_module = importlib.import_module("research_ideas_runner")
+        config_module = importlib.import_module("ideas_config")
+        runner_module = importlib.import_module("ideas_runner")
     finally:
-        sys.path.remove(str(WF))
+        sys.path.remove(str(WS))
 
-    config = config_module.load_research_ideas_config(
+    config = config_module.load_ideas_config(
         {
-            "schema_version": "arc.workflow.research_ideas.config.v1",
+            "schema_version": "arc.workflow.ideas.config.v1",
             "run_id": "test",
             "run_dir": "/tmp/arc-test",
             "project_dir": "/tmp/arc-test-project",
             "user_intent": "intent",
-            "variant_config_dir": str(WF),
+            "variant_config_dir": str(WJ),
         }
     )
     reviewer_payload = runner_module._loop_reviewer_payload(config.variants[0])
     marks = reviewer_payload["output_schema"]["properties"]["review_payload"]["properties"]["marks"]
     mark_properties = marks["properties"]
-    reviewer = json.loads((WF / "suggest-ideas-reviewer.template.json").read_text(encoding="utf-8"))
+    reviewer = json.loads((WJ / "ideas-reviewer.template.json").read_text(encoding="utf-8"))
 
     assert marks["required"] == [
         "user_intent_relevance",
@@ -562,21 +563,21 @@ def test_suggest_ideas_reviewer_uses_hundred_point_marking_scheme() -> None:
     assert "user_intent_fit" not in reviewer["prompt"]["template"]
 
 
-def test_research_ideas_config_template_has_no_global_reviewer() -> None:
-    config = json.loads((WF / "research-ideas.config.template.json").read_text(encoding="utf-8"))
+def test_ideas_config_template_has_no_global_reviewer() -> None:
+    config = json.loads((WJ / "ideas.config.template.json").read_text(encoding="utf-8"))
 
     assert "reviewer" not in config
     assert config["loops_per_variant"] == 5
 
 
-def test_suggest_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:
-    batch = json.loads((WF / "suggest-ideas-batch.template.json").read_text(encoding="utf-8"))
-    variant = json.loads((WF / "suggest-ideas-domain.variant.json").read_text(encoding="utf-8"))
-    loop = json.loads((WF / "suggest-ideas-loop.template.json").read_text(encoding="utf-8"))
-    proposer = json.loads((WF / "suggest-ideas-proposer.template.json").read_text(encoding="utf-8"))
+def test_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:
+    batch = json.loads((WJ / "ideas-batch.template.json").read_text(encoding="utf-8"))
+    variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))
+    loop = json.loads((WJ / "ideas-loop.template.json").read_text(encoding="utf-8"))
+    proposer = json.loads((WJ / "ideas-proposer.template.json").read_text(encoding="utf-8"))
 
-    assert variant["loop_template"] == "suggest-ideas-loop.template.json"
-    assert variant["proposer_template"] == "suggest-ideas-proposer.template.json"
+    assert variant["loop_template"] == "ideas-loop.template.json"
+    assert variant["proposer_template"] == "ideas-proposer.template.json"
     assert batch["schema_version"] == "arc.llm.proposers_reviewer_batch.config.v1"
     assert batch["max_concurrent_loops"] == 10
     assert "domain_markdown_files" in loop["caller_context"]
@@ -586,8 +587,8 @@ def test_suggest_ideas_full_info_template_includes_domain_context_and_arc_tools(
     assert proposer["runtime"]["mcp_mode"] == "arc-only"
 
 
-def test_suggest_ideas_no_info_description_mentions_shared_marking_scheme() -> None:
-    variant = json.loads((WF / "suggest-ideas-no-info.variant.json").read_text(encoding="utf-8"))
+def test_ideas_no_info_description_mentions_shared_marking_scheme() -> None:
+    variant = json.loads((WJ / "ideas-no-info.variant.json").read_text(encoding="utf-8"))
     description = variant["description"]
 
     assert "common marking scheme" in description
@@ -596,9 +597,9 @@ def test_suggest_ideas_no_info_description_mentions_shared_marking_scheme() -> N
     assert "no MCP access" in description
 
 
-def test_suggest_ideas_proposer_templates_emphasize_marking_scheme_quality_checklist() -> None:
-    for name in ["suggest-ideas-proposer.template.json", "suggest-ideas-no-info-proposer.template.json"]:
-        proposer = json.loads((WF / name).read_text(encoding="utf-8"))
+def test_ideas_proposer_templates_emphasize_marking_scheme_quality_checklist() -> None:
+    for name in ["ideas-proposer.template.json", "ideas-no-info-proposer.template.json"]:
+        proposer = json.loads((WJ / name).read_text(encoding="utf-8"))
         template = proposer["prompt"]["template"]
 
         assert "caller_context.marking_scheme" in template
@@ -607,9 +608,9 @@ def test_suggest_ideas_proposer_templates_emphasize_marking_scheme_quality_check
         assert "without writing to optimize marks" in template
 
 
-def test_suggest_ideas_proposer_templates_request_report_ready_math() -> None:
-    for name in ["suggest-ideas-proposer.template.json", "suggest-ideas-no-info-proposer.template.json"]:
-        proposer = json.loads((WF / name).read_text(encoding="utf-8"))
+def test_ideas_proposer_templates_request_report_ready_math() -> None:
+    for name in ["ideas-proposer.template.json", "ideas-no-info-proposer.template.json"]:
+        proposer = json.loads((WJ / name).read_text(encoding="utf-8"))
         template = proposer["prompt"]["template"]
 
         assert "$ρ_E$" in template
@@ -619,8 +620,8 @@ def test_suggest_ideas_proposer_templates_request_report_ready_math() -> None:
         assert "do not write ASCII placeholders" in template
 
 
-def test_suggest_ideas_proposer_schemas_are_codex_strict() -> None:
-    proposer = json.loads((WF / "suggest-ideas-proposer.template.json").read_text(encoding="utf-8"))
+def test_ideas_proposer_schemas_are_codex_strict() -> None:
+    proposer = json.loads((WJ / "ideas-proposer.template.json").read_text(encoding="utf-8"))
     schema = proposer["output_schema"]
 
     assert schema["type"] == "object"
@@ -629,8 +630,8 @@ def test_suggest_ideas_proposer_schemas_are_codex_strict() -> None:
     assert "calculation_plan" in schema["required"]
 
 
-def test_research_foundation_schema_requires_evidence_for_checked_equations() -> None:
-    schema = json.loads((WF / "research-foundation.schema.json").read_text(encoding="utf-8"))
+def test_foundation_schema_requires_evidence_for_checked_equations() -> None:
+    schema = json.loads((WJ / "foundation.schema.json").read_text(encoding="utf-8"))
     assert "explanation" in schema["properties"]["equations"]["items"]["required"]
     assert "derived_quantities" in schema["properties"]
     equation = {
@@ -647,7 +648,7 @@ def test_research_foundation_schema_requires_evidence_for_checked_equations() ->
         "sources": [{"paper_id": "arXiv:1", "section": "S1", "mcp": "get_section(...)", "cli": "arc-paper ..."}],
     }
     document = {
-        "schema_version": "arc.research_foundation.v1",
+        "schema_version": "arc.foundation.v1",
         "run_id": "run_001",
         "version": 2,
         "created_from_plan": "plan.json",
@@ -671,26 +672,18 @@ def test_research_foundation_schema_requires_evidence_for_checked_equations() ->
 
 def test_packaged_workflow_copies_match_source() -> None:
     for host in ["codex", "claude"]:
-        packaged = ROOT / f"packaging/{host}/arc/skills/arc/references/research-workflows"
+        packaged = ROOT / f"packaging/{host}/arc/skills/arc/workflows"
         assert (packaged / "check.md").read_text(encoding="utf-8") == (
             WF / "check.md"
         ).read_text(encoding="utf-8")
-        for path in WF.glob("research-*"):
-            assert (packaged / path.name).read_text(encoding="utf-8") == path.read_text(
+        for path in [*WF.glob("*.md"), *WJ.glob("*.json"), *WS.glob("*.py")]:
+            assert (packaged / path.relative_to(WF)).read_text(encoding="utf-8") == path.read_text(
                 encoding="utf-8"
             )
-        script = Path("scripts/filter-foundation-context.py")
-        assert (packaged / script).read_text(encoding="utf-8") == (WF / script).read_text(
-            encoding="utf-8"
-        )
-        script = Path("scripts/rank-suggested-ideas.py")
-        assert (packaged / script).read_text(encoding="utf-8") == (WF / script).read_text(
-            encoding="utf-8"
-        )
 
 
 def test_build_domain_report_instructions_include_task_focus_solved_cases_and_open_axes() -> None:
-    text = (WF / "build-domain.md").read_text(encoding="utf-8")
+    text = (WF / "domain.md").read_text(encoding="utf-8")
 
     assert "Task Focus for Idea Generation" in text
     assert "Key Papers" in text
@@ -720,9 +713,9 @@ def test_arc_skill_preserves_seed_domain_anchor_in_user_intent() -> None:
     assert "seed_paper_list" in text
 
 
-def test_suggest_ideas_requires_domain_markdown_not_single_paper_summaries() -> None:
-    variant = json.loads((WF / "suggest-ideas-domain.variant.json").read_text(encoding="utf-8"))
-    loop = json.loads((WF / "suggest-ideas-loop.template.json").read_text(encoding="utf-8"))
+def test_ideas_requires_domain_markdown_not_single_paper_summaries() -> None:
+    variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))
+    loop = json.loads((WJ / "ideas-loop.template.json").read_text(encoding="utf-8"))
 
     assert variant["context_policy"]["require_domain_markdown"] is True
     assert variant["context_policy"]["attach_domain_markdown"] is True
@@ -733,28 +726,32 @@ def test_suggest_ideas_requires_domain_markdown_not_single_paper_summaries() -> 
 
 def test_packaged_skill_references_include_required_workflow_inputs() -> None:
     required = [
-        Path("references/research-workflows/check.md"),
-        Path("references/research-workflows/build-domain.md"),
-        Path("references/research-workflows/research-ideas.md"),
-        Path("references/research-workflows/research-ideas.config.template.json"),
-        Path("references/research-workflows/research_ideas_config.py"),
-        Path("references/research-workflows/research_ideas_marking.py"),
-        Path("references/research-workflows/research_ideas_runner.py"),
-        Path("references/research-workflows/suggest-ideas-batch.template.json"),
-        Path("references/research-workflows/suggest-ideas-domain.variant.json"),
-        Path("references/research-workflows/suggest-ideas-loop.template.json"),
-        Path("references/research-workflows/suggest-ideas-marking-scheme.json"),
-        Path("references/research-workflows/suggest-ideas-no-info-loop.template.json"),
-        Path("references/research-workflows/suggest-ideas-no-info-proposer.template.json"),
-        Path("references/research-workflows/suggest-ideas-no-info.variant.json"),
-        Path("references/research-workflows/suggest-ideas-proposer.template.json"),
-        Path("references/research-workflows/suggest-ideas-reviewer.template.json"),
-        Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
-        Path("references/research-workflows/scripts/rank-suggested-ideas.py"),
-        Path("references/package-manuals/arc-domain.md"),
-        Path("references/package-manuals/arc-llm.md"),
-        Path("references/package-manuals/arc-mcp.md"),
-        Path("references/package-manuals/arc-paper.md"),
+        Path("workflows/check.md"),
+        Path("workflows/domain.md"),
+        Path("workflows/ideas.md"),
+        Path("workflows/json/ideas.config.template.json"),
+        Path("workflows/json/plan.schema.json"),
+        Path("workflows/json/foundation.schema.json"),
+        Path("workflows/json/calculate.schema.json"),
+        Path("workflows/scripts/ideas_config.py"),
+        Path("workflows/scripts/ideas_marking.py"),
+        Path("workflows/scripts/ideas_runner.py"),
+        Path("workflows/json/ideas-batch.template.json"),
+        Path("workflows/json/ideas-domain.variant.json"),
+        Path("workflows/json/ideas-loop.template.json"),
+        Path("workflows/json/ideas-marking-scheme.json"),
+        Path("workflows/json/ideas-no-info-loop.template.json"),
+        Path("workflows/json/ideas-no-info-proposer.template.json"),
+        Path("workflows/json/ideas-no-info.variant.json"),
+        Path("workflows/json/ideas-proposer.template.json"),
+        Path("workflows/json/ideas-reviewer.template.json"),
+        Path("workflows/json/ideas-reviewer-output.schema.json"),
+        Path("workflows/scripts/rank-ideas.py"),
+        Path("workflows/scripts/filter-foundation-context.py"),
+        Path("manuals/arc-domain.md"),
+        Path("manuals/arc-llm.md"),
+        Path("manuals/arc-mcp.md"),
+        Path("manuals/arc-paper.md"),
     ]
 
     for host in ["codex", "claude"]:
@@ -766,28 +763,32 @@ def test_packaged_skill_references_include_required_workflow_inputs() -> None:
 def test_packaged_skill_references_stay_synced_with_source() -> None:
     synced_roots = [
         Path("SKILL.md"),
-        Path("references/package-manuals"),
-        Path("references/research-workflows/check.md"),
-        Path("references/research-workflows/build-domain.md"),
-        Path("references/research-workflows/research-execute.md"),
-        Path("references/research-workflows/research-foundation.md"),
-        Path("references/research-workflows/research-ideas.md"),
-        Path("references/research-workflows/research-ideas.config.template.json"),
-        Path("references/research-workflows/research-plan.md"),
-        Path("references/research-workflows/research_ideas_config.py"),
-        Path("references/research-workflows/research_ideas_marking.py"),
-        Path("references/research-workflows/research_ideas_runner.py"),
-        Path("references/research-workflows/suggest-ideas-batch.template.json"),
-        Path("references/research-workflows/suggest-ideas-domain.variant.json"),
-        Path("references/research-workflows/suggest-ideas-loop.template.json"),
-        Path("references/research-workflows/suggest-ideas-marking-scheme.json"),
-        Path("references/research-workflows/suggest-ideas-no-info-loop.template.json"),
-        Path("references/research-workflows/suggest-ideas-no-info-proposer.template.json"),
-        Path("references/research-workflows/suggest-ideas-no-info.variant.json"),
-        Path("references/research-workflows/suggest-ideas-proposer.template.json"),
-        Path("references/research-workflows/suggest-ideas-reviewer.template.json"),
-        Path("references/research-workflows/suggest-ideas-reviewer-output.schema.json"),
-        Path("references/research-workflows/scripts/rank-suggested-ideas.py"),
+        Path("manuals"),
+        Path("workflows/check.md"),
+        Path("workflows/domain.md"),
+        Path("workflows/calculate.md"),
+        Path("workflows/foundation.md"),
+        Path("workflows/ideas.md"),
+        Path("workflows/json/ideas.config.template.json"),
+        Path("workflows/json/plan.schema.json"),
+        Path("workflows/json/foundation.schema.json"),
+        Path("workflows/json/calculate.schema.json"),
+        Path("workflows/plan.md"),
+        Path("workflows/scripts/ideas_config.py"),
+        Path("workflows/scripts/ideas_marking.py"),
+        Path("workflows/scripts/ideas_runner.py"),
+        Path("workflows/json/ideas-batch.template.json"),
+        Path("workflows/json/ideas-domain.variant.json"),
+        Path("workflows/json/ideas-loop.template.json"),
+        Path("workflows/json/ideas-marking-scheme.json"),
+        Path("workflows/json/ideas-no-info-loop.template.json"),
+        Path("workflows/json/ideas-no-info-proposer.template.json"),
+        Path("workflows/json/ideas-no-info.variant.json"),
+        Path("workflows/json/ideas-proposer.template.json"),
+        Path("workflows/json/ideas-reviewer.template.json"),
+        Path("workflows/json/ideas-reviewer-output.schema.json"),
+        Path("workflows/scripts/rank-ideas.py"),
+        Path("workflows/scripts/filter-foundation-context.py"),
     ]
 
     expected_files: list[Path] = []
@@ -823,7 +824,7 @@ def test_adapter_scripts_use_installed_arc_mcp_without_repo_local_defaults() -> 
 
 
 def test_interaction_reference_allows_portable_typed_fallback() -> None:
-    text = (ROOT / "skills/arc/references/rules/interaction.md").read_text(encoding="utf-8").lower()
+    text = (ROOT / "skills/arc/rules/interaction.md").read_text(encoding="utf-8").lower()
 
     assert "typed fallback" in text
     assert "when no discrete selection" in text or "if no discrete selection" in text

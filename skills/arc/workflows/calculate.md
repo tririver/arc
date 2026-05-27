@@ -1,5 +1,5 @@
-# Research Execute Workflow
-Use this workflow after `initial-research-foundation.md`. It checks non-axiom
+# Calculate Workflow
+Use this workflow after `initial-foundation.md`. It checks non-axiom
 foundation equations, runs blind reference checks, then performs new calculation
 steps through `arc-llm` consensus execution.
 Write artifacts under:
@@ -9,7 +9,7 @@ Write artifacts under:
 <project-dir>/calculate/<run-id>/calculation-report.md
 <project-dir>/calculation-report.md
 ```
-Execution reports must use `schema_version: "arc.research_execute.v1"`.
+Execution reports must use `schema_version: "arc.calculate.v1"`.
 
 ## Phase 1: Build Consensus Config
 Read `plan.json` and `foundation/latest.json`. Create:
@@ -21,7 +21,7 @@ Read `plan.json` and `foundation/latest.json`. Create:
   "proposer_count": 3,
   "max_recalculations": 2,
   "defaults": {
-    "integrity_reference_path": "skills/arc/references/rules/integrity.md"
+    "integrity_reference_path": "skills/arc/rules/integrity.md"
   },
   "artifact_options": {"save_prompts": true},
   "steps": []
@@ -141,7 +141,7 @@ it does not affect correctness.
 For an accepted foundation check, write a new foundation version marking the
 target equation checked. Keep the original equation unchanged and add reviewer
 check history, method, relative error when numerical, and consensus artifact
-path. Do not rewrite `initial-research-foundation.md`; human-facing foundation
+path. Do not rewrite `initial-foundation.md`; human-facing foundation
 changes belong in the final report appendix. When a new calculation result is
 accepted and useful later, write a new foundation version with a concise derived
 quantity record, keeping paper-sourced equations and derived quantities visibly
@@ -187,7 +187,7 @@ Write `calculation-report.md` even when blocked, directly to both
 `<project-dir>/calculate/<run-id>/calculation-report.md` and
 `<project-dir>/calculation-report.md`. Include accepted outputs, blocked step,
 disagreement map, reviewer-report summary, proposer positions, artifact paths,
-the exact expert question, `# Appendix 1: Latest Research Foundation`,
+the exact expert question, `# Appendix 1: Latest Foundation`,
 `# Appendix 2: Calculation Status`, and `# Appendix 3: Full Calculation
 Details`. Ask which proposer or result is correct, or what instruction should
 continue the calculation.
