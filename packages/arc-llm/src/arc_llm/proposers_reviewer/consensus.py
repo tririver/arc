@@ -122,6 +122,7 @@ def run_proposers_reviewer_consensus(
 
     runner = batch_runner or run_proposers_reviewer_batch
     step_results: list[dict[str, Any]] = []
+    accepted_step_outputs: dict[str, Any] = {}
     overall_status = "completed"
     for step in consensus.steps:
         step_result = _run_consensus_step(
@@ -132,6 +133,7 @@ def run_proposers_reviewer_consensus(
             base_env=base_env,
             process_chain=process_chain,
             run_root=paths.run_root,
+            accepted_step_outputs=accepted_step_outputs,
         )
         step_results.append(step_result)
         if step_result["status"] == "blocked_for_user":
@@ -140,6 +142,8 @@ def run_proposers_reviewer_consensus(
         if step_result["status"] == "failed":
             overall_status = "failed"
             break
+        if step_result["status"] == "accepted":
+            accepted_step_outputs[step.step_id] = copy.deepcopy(step_result["accepted_output"])
 
     result = {
         "schema_version": CONSENSUS_RESULT_SCHEMA,
@@ -163,6 +167,7 @@ def _run_consensus_step(
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
     run_root: Path,
+    accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     all_proposer_ids = _proposer_ids(config.proposer_count)
     active_proposer_ids = list(all_proposer_ids)
@@ -179,6 +184,7 @@ def _run_consensus_step(
                 active_proposer_ids=active_proposer_ids,
                 locked_outputs=locked_outputs,
                 run_root=run_root,
+                accepted_step_outputs=accepted_step_outputs,
             )
         except Exception as exc:
             return {
@@ -307,6 +313,7 @@ def _attempt_batch_config(
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
     run_root: Path,
+    accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     attempt_id = f"{step.step_id}_attempt_{attempt_number:03d}"
     selectable_proposer_ids = list(
@@ -318,6 +325,7 @@ def _attempt_batch_config(
         attempt_number=attempt_number,
         active_proposer_ids=active_proposer_ids,
         locked_outputs=locked_outputs,
+        accepted_step_outputs=accepted_step_outputs,
     )
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
@@ -358,6 +366,7 @@ def _caller_context(
     attempt_number: int,
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
+    accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     allowed_context = _sanitize_caller_allowed_context(step.allowed_context)
     foundation_context = _foundation_context_for_step(step)
@@ -371,9 +380,10 @@ def _caller_context(
         "attempt_number": attempt_number,
         "active_proposer_ids": active_proposer_ids,
         "locked_outputs": copy.deepcopy(locked_outputs),
+        "accepted_prior_step_outputs": copy.deepcopy(dict(accepted_step_outputs)),
         "max_recalculations": config.max_recalculations,
         "integrity_reference": _integrity_reference(config.defaults.get("integrity_reference_path")),
-        "consensus_instruction": "Work only on this calculation step. Respect locked_outputs as already accepted unless explicitly asked to check them.",
+        "consensus_instruction": "Work only on this calculation step. Respect accepted_prior_step_outputs and locked_outputs as already accepted unless explicitly asked to check them.",
     }
     if foundation_context is not None:
         context["foundation_context"] = foundation_context
@@ -417,12 +427,12 @@ def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[st
                 "First read and follow caller_context.integrity_reference.content. "
                 "Use only caller_context.step_prompt, caller_context.allowed_context, "
                 "caller_context.foundation_context when present, accepted locked_outputs, "
-                "and your own SymPy/local algebra. "
+                "caller_context.accepted_prior_step_outputs, and your own SymPy/local algebra. "
                 f"{source_policy} Wolfram may be used only for algebraic "
                 "verification. You must strictly derive from the foundation context and "
-                "accepted locked_outputs. External sources may inspire methods, but do not "
+                "accepted prior step outputs and locked_outputs. External sources may inspire methods, but do not "
                 "directly use any result from papers or the internet unless it appears in "
-                "the foundation file or accepted locked_outputs. If you need an external "
+                "the foundation file, accepted prior step outputs, or accepted locked_outputs. If you need an external "
                 "identity or intermediate result, derive it here. External sources may use "
                 "different conventions; map notation back to foundation conventions before "
                 "using it. Do the calculation very clearly step by step; never skip a step. "
@@ -489,6 +499,8 @@ def _reviewer_config(
             "template": (
                 "First read and follow caller_context.integrity_reference.content. "
                 "Compare current_proposer_outputs_json for the current calculation step. "
+                "Treat caller_context.accepted_prior_step_outputs as accepted context from "
+                "earlier steps, not as current proposer outputs. "
                 "Do not modify original equations. For analytic checks, first use expand, "
                 "then simplify, then substitutions from checked equations in "
                 "caller_context.foundation_context. Document the substitution/check history "

@@ -560,6 +560,38 @@ def test_consensus_two_agree_recalculates_only_likely_wrong_proposer(tmp_path):
     assert fake.caller_context_by_call[1]["locked_outputs"].keys() == {"proposer_001", "proposer_002"}
 
 
+def test_consensus_passes_accepted_prior_step_outputs_to_later_steps(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+            ),
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "y"},
+            ),
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        steps=[
+            {"step_id": "step_001", "prompt": "derive x"},
+            {"step_id": "step_002", "prompt": "derive y from x"},
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert fake.caller_context_by_call[0]["accepted_prior_step_outputs"] == {}
+    assert fake.caller_context_by_call[1]["accepted_prior_step_outputs"] == {
+        "step_001": {"result": "x"}
+    }
+
+
 def test_consensus_two_agree_without_isolated_wrong_proposer_recalculates_all(tmp_path):
     fake = FakeBatchRunner(
         [
