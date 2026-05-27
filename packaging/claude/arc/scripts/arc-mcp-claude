@@ -2,8 +2,8 @@
 set -euo pipefail
 
 export ARC_AGENT_HOST="${ARC_AGENT_HOST:-claude-code}"
-export ARC_LLM_PROVIDER="${ARC_LLM_PROVIDER:-claude-cli}"
-export ARC_CLAUDE_MODEL="${ARC_CLAUDE_MODEL:-haiku}"
+export ARC_LLM_PROVIDER="${ARC_LLM_PROVIDER:-deepseek}"
+export ARC_LLM_MODEL="${ARC_LLM_MODEL:-deepseek-v4-pro}"
 
 if [[ -n "${ARC_MCP_COMMAND:-}" ]]; then
   exec "${ARC_MCP_COMMAND}" "$@"
