@@ -2,6 +2,7 @@
 0_ref/
 cache/
 arc-tests/
+.worktrees/
 .understandignore
 .understand-anything/
 .claude/
