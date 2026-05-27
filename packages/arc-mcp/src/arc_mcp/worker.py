@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Any
 
 from arc_domain import service as domain_service
 from arc_paper import service as paper_service
 from arc_paper.batch.runner import run_batch
 from arc_paper.ids import normalize_paper_id
+from arc_typeset import md2pdf as typeset_md2pdf
+from arc_typeset import translate as typeset_translate
 
 from .jobs import (
     MCPJobCancelled,
@@ -56,6 +59,12 @@ def _dispatch(job_type: str, payload: dict[str, Any], *, job_id: str) -> Any:
         return _domain_build(payload, job_id=job_id)
     if job_type == "summary_batch_run":
         return _summary_batch_run(payload, job_id=job_id)
+    if job_type == "md2pdf":
+        return _md2pdf(payload, job_id=job_id)
+    if job_type == "translate":
+        return _translate(payload, job_id=job_id)
+    if job_type == "batch_translate":
+        return _batch_translate(payload, job_id=job_id)
     raise ValueError(f"Unsupported ARC MCP job type: {job_type}")
 
 
@@ -122,6 +131,77 @@ def _summary_batch_run(payload: dict[str, Any], *, job_id: str) -> dict[str, Any
     )
     record_progress(job_id, {"event": "summary_batch_completed", "name": name})
     return {"ok": True, "data": result, "errors": [], "meta": {}}
+
+
+def _md2pdf(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    _check_cancel(job_id)
+    input_path = Path(str(payload["input"]))
+    output_path = Path(str(payload["output"])) if payload.get("output") else None
+    texlive_bin_raw = payload.get("texlive_bin", str(typeset_md2pdf.DEFAULT_TEXLIVE_BIN))
+    texlive_bin = Path(str(texlive_bin_raw)) if texlive_bin_raw else None
+    record_progress(
+        job_id,
+        {
+            "event": "md2pdf_started",
+            "input": str(input_path),
+            "output": str(output_path) if output_path else None,
+        },
+    )
+    result = typeset_md2pdf.convert_markdown_to_pdf(
+        input_path=input_path,
+        output_path=output_path,
+        texlive_bin=texlive_bin,
+        margin=str(payload.get("margin", typeset_md2pdf.DEFAULT_MARGIN)),
+        mainfont=str(payload.get("mainfont", typeset_md2pdf.DEFAULT_MAINFONT)),
+        cjk_mainfont=str(payload.get("cjk_mainfont", typeset_md2pdf.DEFAULT_CJK_MAINFONT)),
+        resource_paths=[Path(str(path)) for path in payload.get("resource_path") or []] or None,
+    )
+    record_progress(job_id, {"event": "md2pdf_completed" if _result_ok(result) else "md2pdf_failed"})
+    return result
+
+
+def _translate(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    _check_cancel(job_id)
+    input_path = Path(str(payload["input"]))
+    output_path = Path(str(payload["output"])) if payload.get("output") else None
+    target_locale = str(payload.get("target_locale", typeset_translate.DEFAULT_TARGET_LOCALE))
+    record_progress(job_id, {"event": "translate_started", "input": str(input_path), "target_locale": target_locale})
+    result = typeset_translate.translate_markdown(
+        input_path=input_path,
+        output_path=output_path,
+        target_language=str(payload.get("target_language", typeset_translate.DEFAULT_TARGET_LANGUAGE)),
+        target_locale=target_locale,
+        provider=str(payload.get("provider") or "auto"),
+        model=payload.get("model"),
+        model_tier=str(payload.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER)),
+        quality=bool(payload.get("quality", False)),
+        convert_pdf=True,
+        overwrite=bool(payload.get("overwrite", False)),
+    )
+    record_progress(job_id, {"event": "translate_completed" if _result_ok(result) else "translate_failed"})
+    return result
+
+
+def _batch_translate(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    _check_cancel(job_id)
+    project_dir = Path(str(payload["project_dir"]))
+    target_locale = str(payload.get("target_locale", typeset_translate.DEFAULT_TARGET_LOCALE))
+    record_progress(
+        job_id,
+        {"event": "batch_translate_started", "project_dir": str(project_dir), "target_locale": target_locale},
+    )
+    result = typeset_translate.batch_translate_project(
+        project_dir=project_dir,
+        target_language=str(payload.get("target_language", typeset_translate.DEFAULT_TARGET_LANGUAGE)),
+        target_locale=target_locale,
+        provider=str(payload.get("provider") or "auto"),
+        model=payload.get("model"),
+        model_tier=str(payload.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER)),
+        quality=bool(payload.get("quality", False)),
+        overwrite=bool(payload.get("overwrite", False)),
+    )
+    record_progress(job_id, {"event": "batch_translate_completed" if _result_ok(result) else "batch_translate_failed"})
+    return result
 
 
 def _check_cancel(job_id: str) -> None:

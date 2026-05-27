@@ -1,6 +1,6 @@
 ---
 name: arc
-description: Use for ARC research workflows involving paper metadata, arXiv full text, INSPIRE references/citers, paper section lookup, equation context, LLM paper summaries, and research-domain construction from seed papers.
+description: Use for ARC research workflows involving paper metadata, arXiv full text, INSPIRE references and citers, paper section lookup, equation context, LLM paper summaries, research-domain construction from seed papers, and checking Markdown/PDF research notes.
 ---
 
 # Advanced Research Compass (ARC)
@@ -15,22 +15,28 @@ Read the relevant reference before calling ARC tools. These reads are required,
 not optional.
 
 - User choices, automation mode, and confirmation behavior: read
-  `references/rules/interaction.md`. Any ARC user question must use the
+  `rules/interaction.md`. Any ARC user question must use the
   selection tool; do not wait for typed input.
 - Scientific claims, gap scoring, automated workflow decisions, warning
   behavior, or robustness-sensitive execution: read
-  `references/rules/integrity.md`.
-- General ARC operating rules: read `references/rules/operating.md`.
+  `rules/integrity.md`.
+- General ARC operating rules: read `rules/operating.md`.
+- ARC workflow completion checks and improvement notes: read
+  `rules/self-reflection.md`.
 - Single-paper metadata, full text, sections, equations, citers, references,
   paper summaries, or summary batches: read
-  `references/package-manuals/arc-paper.md`.
+  `manuals/arc-paper.md`.
 - Research field/domain construction, foundation-paper selection, domain
   networks, evidence packs, graph HTML, or field briefings: read
-  `references/package-manuals/arc-domain.md`.
+  `manuals/arc-domain.md`.
 - Any MCP tool call, background job, job watcher, timeout, or cancellation
-  behavior: read `references/package-manuals/arc-mcp.md`.
+  behavior: read `manuals/arc-mcp.md`.
 - Host LLM/provider detection, model choice, direct prompt tests, or provider
-  troubleshooting: read `references/package-manuals/arc-llm.md`.
+  troubleshooting: read `manuals/arc-llm.md`.
+- User-facing Markdown report export: when a workflow writes a Markdown report
+  to `<project-dir>/` for human readers, call MCP `md2pdf` on that project-level file.
+  `md2pdf` starts a background PDF job; record the returned job id if present
+  and do not wait before continuing unless the user explicitly asks.
 
 ## Workflow
 
@@ -49,6 +55,12 @@ Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as
 automation mode, project directory, and output formatting.
 
+Preserve scientific domain anchors in `<user-intent>`, including phrases such
+as "in the field started by arXiv:..." or "in the literature around ...".
+Those phrases are part of the scientific request, not workflow metadata. Keep
+the same paper identifiers separately in `seed_paper_list` as structured
+routing data.
+
 If the request references or attaches accessible files such as `.md`, `.pdf`,
 `.doc`, or `.jpg`, read or extract the relevant content and summarize it as
 part of `<user-intent>`. Treat collaborator notes or images as source context
@@ -58,13 +70,13 @@ Step 3: Resolve `<seed-paper-list>`.
 Use explicit paper identifiers when present. Otherwise infer seed papers from
 `<user-intent>` through ARC paper tools. If a slow MCP call returns a background
 job id, immediately use the blocking CLI watcher described in
-`references/package-manuals/arc-mcp.md`.
+`manuals/arc-mcp.md`.
 
 Step 4: Resolve `<project-dir>`.
 Use a user-specified project directory when present. Otherwise derive a safe
 directory name from `<seed-paper-list>` with ARC paper tools. If the directory
 already exists, follow the automation policy in
-`references/rules/interaction.md`.
+`rules/interaction.md`.
 
 Step 5: Write `<project-dir>/context.json`.
 Include `automation_level`, `workflow`, `original_request`, `user_intent`,
@@ -73,46 +85,28 @@ Include `automation_level`, `workflow`, `original_request`, `user_intent`,
 
 ### Phase 2: Route Selection
 
-Resolve the user's intent and classify it into one of the three cases below.
+Resolve the user's intent and classify it into one of the four cases below.
 
 Case 1: Build domain references only.
-Read and execute `references/research-workflows/build-domain.md`.
+Read and execute `workflows/domain.md`.
 
-Case 2: Suggest research ideas from a not-yet-explicit request.
+Case 2: Suggest ideas from a not-yet-explicit request.
 First complete Case 1. Then read and execute
-`references/research-workflows/suggest-ideas.md`.
+`workflows/ideas.md`.
 
-Case 3: Calculate from an explicit idea.
+Case 3: Check note files or collaborator notes.
+Use when the request asks to check, verify, audit, or mark foundation items in
+one or more accessible `.md` or `.pdf` notes. Read and execute
+`workflows/check.md`.
+
+Case 4: Calculate from an explicit idea.
 If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
 the user to select one concrete idea.
 If the idea is explicit enough:
-Step 1: Read and execute `references/research-workflows/research-plan.md`.
-Step 2: Read and execute `references/research-workflows/research-foundation.md`.
-Step 3: Read and execute `references/research-workflows/research-execute.md`.
+Step 1: Read and execute `workflows/plan.md`.
+Step 2: Read and execute `workflows/foundation.md`.
+Step 3: Read and execute `workflows/calculate.md`.
 
 ### Phase 3: Self-Reflection
 
-Before marking any ARC workflow complete, check the requested skill outcome
-against the artifacts and user-facing result. Confirm that the workflow
-delivered what the skill requested. If it did not, identify the concrete gap
-and likely reason, such as missing inputs, failed checks, incomplete artifacts,
-tool/runtime limits, or an instruction conflict.
-
-Append the outcome check and self-reflection entry to
-`<project-dir>/self-reflect.md`. 
-
-Start each suggestion with `Git: <commit-hash>`. 
-
-Include concrete, portable improvement suggestions when the run reveals a
-workflow, prompt, package, documentation, cache, or test weakness. 
-
-If the requested outcome was not delivered, append the reason and at least one
-actionable follow-up suggestion unless the blocker is entirely outside ARC's
-control.
-
-Make the suggestion actionable: affected file or phase, evidence from the run, exact
-command or edit to try, and an acceptance check.
-
-If no concrete improvement was found, still append a dated entry saying that no
-actionable ARC improvement was identified for this run. The workflow is not
-complete until this append step is done.
+Read and follow `rules/self-reflection.md`.

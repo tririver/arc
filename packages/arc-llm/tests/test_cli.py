@@ -169,7 +169,8 @@ def test_providers_init_writes_project_local_config_with_location_comment(tmp_pa
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     comment = "\n".join(payload["_comment"])
     assert result["config_path"] == str(config_path)
-    assert "Rename examples/llm-providers.example.json to llm-providers.json" in comment
+    assert "arc-llm providers init" in comment
+    assert "arc-llm providers add openai-compatible" in comment
     assert "Linux" in comment
     assert "macOS" in comment
     assert "Windows" in comment

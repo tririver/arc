@@ -1,0 +1,64 @@
+{
+  "schema_version": "arc.workflow.ideas.marking_scheme.v1",
+  "calibration_guidance": "Use the full numeric range. Do not assign mid-high scores by default just because an idea is plausible. A total score above 85 should mean the idea is clearly strong across most dimensions. A total score above 90 should be rare. A merely reasonable idea with unclear novelty or weak execution plan should usually fall around 55-75, not 80+.",
+  "marks": [
+    {
+      "field": "user_intent_relevance",
+      "label": "Intent Relevance",
+      "minimum": 0,
+      "maximum": 25,
+      "guidance": "Score alignment with the full user intent, including the requested calculation, target domain, constraints, and practical research goal. 25: directly targets the full user intent, including domain, requested calculation, constraints, and practical goal. 20: mostly matches, with only minor drift or missing detail. 15: relevant but misses an important constraint or focuses on a nearby problem. 10: only partially relevant; could be useful but not really what was asked. 5: weak topical overlap. 0: wrong problem or domain."
+    },
+    {
+      "field": "novelty",
+      "label": "Novelty",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score how publishable the idea would be if worked out successfully, not the evidence that it is new. 15: confidently publishable in a top journal of the field. 10: marginally publishable in a top journal, or clearly publishable in a strong field journal. 5: marginally publishable in a second-tier or specialized journal if executed well. 0: not publishable as research even if completed. Do not give extra marks for ideas beyond top-journal novelty; overly creative ideas are not more useful for the current agent workflow."
+    },
+    {
+      "field": "confidence_of_novelty",
+      "label": "Confidence",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score only the evidence that this work has not already been done, not how good the idea is. Search the internet and, when available, ARC paper tools before assigning this mark; do not rely only on memory. 15: targeted ARC/web search found no close prior work and the idea looks genuinely unclaimed. 10: no direct prior work found, but nearby literature is dense or the search was incomplete. 5: significant risk it has been done; close related work exists and the distinction is not yet secure. 0: search finds the same or essentially equivalent work already done. If runtime restrictions prevent new searches, use the supplied search evidence and state the limitation."
+    },
+    {
+      "field": "scientific_value",
+      "label": "Value",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether a leading researcher in this research domain should read the resulting paper if the idea is worked out. 15: must-read for leading researchers in the domain. 10: good-to-know; useful contribution but not field-shaping. 5: modest niche value or mostly incremental clarification. 0: even if correct, the result would not be worth reading."
+    },
+    {
+      "field": "planning",
+      "label": "Planning",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether the question is broken into good-enough pieces for agent execution. 15: plan is broken into concrete, agent-executable steps with clear inputs, outputs, and validation checks. 10: clear plan; each major step can be done by an AI agent, though some details remain. 5: has a plan, but some steps are too broad or difficult for an AI agent. 0: most steps cannot be done by an AI agent or the plan is essentially absent."
+    },
+    {
+      "field": "problem_well_definedness",
+      "label": "Well-definedness",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether the question is set up sharply enough. 15: problem is sharply specified; the calculation can be set up directly from the proposal. 10: mostly well-defined, but requires a few reasonable choices or assumptions. 5: interesting direction, but key objects, setup, limits, or observables are under-specified. 0: no clear calculable question."
+    }
+  ],
+  "total_score": {
+    "field": "total_score",
+    "label": "Total",
+    "minimum": 0,
+    "maximum": 100,
+    "guidance": "Set total_score to the closest integer after summing all listed marks. Rank ideas by total_score on one common scale."
+  },
+  "tie_break_order": [
+    "total_score",
+    "user_intent_relevance",
+    "novelty",
+    "confidence_of_novelty",
+    "scientific_value",
+    "planning",
+    "problem_well_definedness"
+  ]
+}

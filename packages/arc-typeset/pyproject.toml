@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arc-typeset"
+version = "0.1.0"
+description = "Typesetting utilities for ARC research artifacts."
+requires-python = ">=3.11"
+dependencies = [
+  "arc-llm"
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+arc-typeset = "arc_typeset.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arc_typeset"]

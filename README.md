@@ -6,7 +6,8 @@ agent, or a human using the command line, structured access to arXiv full text,
 INSPIRE metadata, references, citers, paper summaries, research-domain graphs,
 and multi-agent idea/calculation workflows.
 
-ARC is built around four Python command line tools and one optional MCP server:
+ARC is built around five Python command line tools; `arc-mcp` also runs the
+optional MCP server:
 
 - `arc-paper`: paper metadata, references, citers, ar5iv sections, equation
   context, full-text search, LLM paper summaries, and paper-summary batches.
@@ -14,6 +15,8 @@ ARC is built around four Python command line tools and one optional MCP server:
   optional scientific intent.
 - `arc-llm`: reusable host LLM execution, provider configuration, and
   proposers-reviewer workflows.
+- `arc-typeset`: deterministic typesetting utilities, including Markdown to PDF
+  conversion through Pandoc and XeLaTeX.
 - `arc-mcp`: exposes ARC tools to MCP clients and manages background jobs.
 - `skills/arc`: agent-facing workflow instructions for domain building, idea
   generation, and research calculations.
@@ -25,7 +28,7 @@ Use ARC when you want to:
 - Look up reliable paper metadata, references, citers, sections, or equations.
 - Summarize a paper from cached ar5iv/INSPIRE data.
 - Build a research-domain overview from a seed paper.
-- Generate research ideas using domain context and reviewer scoring.
+- Generate ideas using domain context and reviewer scoring.
 - Plan and execute a careful symbolic or numerical research calculation with
   explicit provenance and checks.
 
@@ -40,6 +43,8 @@ Requirements:
 - Python 3.11 or newer.
 - Network access for first-time INSPIRE/ar5iv fetches.
 - Codex, Claude Code, or an OpenAI-compatible provider for LLM work.
+- Optional for `arc-typeset md2pdf`: `pandoc`, `xelatex`, and a CJK-capable
+  font such as `Noto Sans CJK SC`.
 
 ### Agent Plugin Setup
 
@@ -85,6 +90,7 @@ python -m pip install --upgrade pip
 python -m pip install -e packages/arc-llm[test]
 python -m pip install -e packages/arc-paper[test]
 python -m pip install -e packages/arc-domain[test]
+python -m pip install -e packages/arc-typeset[test]
 python -m pip install -e packages/arc-mcp[test]
 ```
 
@@ -94,7 +100,8 @@ Check the installed commands:
 arc-paper --help
 arc-domain --help
 arc-llm --help
-arc-mcp jobs --help
+arc-typeset --help
+arc-mcp --help
 ```
 
 Run a deterministic smoke test:
@@ -103,6 +110,31 @@ Run a deterministic smoke test:
 arc-paper extract-paper-ids "Compare arXiv:0911.3380 and hep-th/0601001." --json
 arc-paper get-title arXiv:0911.3380 --json
 ```
+
+Convert a Markdown report to PDF:
+
+```bash
+arc-typeset md2pdf <report>.md --json
+```
+
+Translate a Markdown report to Chinese and automatically convert the
+translation to PDF:
+
+```bash
+arc-typeset translate <report>.md --json
+```
+
+Batch translate project reports when `<name>.md` and `<name>.pdf` appear in
+the same folder and `<name>.zh_CN.pdf` is missing:
+
+```bash
+arc-typeset batch-translate <project-dir> --json
+```
+
+The same converter is available from MCP as `md2pdf`.
+The MCP `md2pdf`, `translate`, and `batch_translate` tools always start
+background jobs and return a `job_id` immediately; use `job_status`/`job_result`
+or `arc-mcp watch <job_id> --json` to inspect completion.
 
 ## Configure LLM Providers
 
@@ -149,7 +181,8 @@ Provider config discovery checks:
 ```
 
 Override the path with `ARC_LLM_PROVIDER_CONFIG` or `--provider-config`.
-`examples/llm-providers.example.json` is a redacted starting point.
+Use `arc-llm providers init` to create the redacted starting file, then add
+providers with `arc-llm providers add openai-compatible`.
 
 With `--provider auto`, ARC uses native host providers first by default. Set
 `"auto_provider_priority": "configured-first"` in `llm-providers.json` if you
@@ -184,7 +217,7 @@ packaging/codex/arc/scripts/arc-mcp-codex
 packaging/claude/arc/scripts/arc-mcp-claude
 ```
 
-The wrappers set `ARC_AGENT_HOST`, `ARC_LLM_PROVIDER`, and default model
+The wrappers set `ARC_AGENT_HOST`, `ARC_LLM_PROVIDER`, and default model-tier
 environment variables before executing `arc-mcp`.
 
 When using the ARC skill, ask the agent in research terms. Examples:
@@ -192,7 +225,7 @@ When using the ARC skill, ask the agent in research terms. Examples:
 ```text
 Use ARC to summarize arXiv:0911.3380.
 Use ARC to build a domain for arXiv:0911.3380 focused on quasi-single-field inflation observables.
-Use ARC to suggest research ideas about cosmological collider scalar exchange.
+Use ARC to develop ideas about cosmological collider scalar exchange.
 Use ARC to plan and execute the selected calculation idea.
 ```
 
@@ -371,13 +404,13 @@ Long-running MCP calls can return a `job_id`. Use the CLI watcher to block
 until a terminal result:
 
 ```bash
-arc-mcp jobs watch <job_id> --json
-arc-mcp jobs watch <job_id> --progress-jsonl
-arc-mcp jobs root --json
-arc-mcp jobs status <job_id> --json
-arc-mcp jobs result <job_id> --json
-arc-mcp jobs list --json
-arc-mcp jobs cancel <job_id> --json
+arc-mcp watch <job_id> --json
+arc-mcp watch <job_id> --progress-jsonl
+arc-mcp root --json
+arc-mcp status <job_id> --json
+arc-mcp result <job_id> --json
+arc-mcp list --json
+arc-mcp cancel <job_id> --json
 ```
 
 For slow tools or large launches, pass `background=true` from MCP so the tool
@@ -407,7 +440,7 @@ Output includes:
 Use this when you need a reliable overview of a local research area before
 asking for ideas or calculations.
 
-### 2. Suggest Research Ideas
+### 2. Ideas
 
 Input: a not-yet-explicit research request plus built domain context.
 
@@ -416,13 +449,15 @@ workflow intentionally withholds ARC domain context for comparison. Both use
 reviewer marks and write a ranked selected-ideas report:
 
 ```text
-<project-dir>/suggest-ideas/<run-id>/
-<project-dir>/suggest-ideas/<run-id>/suggested-ideas.md
-<project-dir>/suggested-ideas.md
+<project-dir>/ideas/<run-id>/
+<project-dir>/ideas/<run-id>/ranked-ideas.md
+<project-dir>/ranked-ideas.md
 ```
 
-The report preserves weak rounds and reviewer concerns; it should not invent
-novelty claims or hide failed ideas.
+The report starts with a compact marked summary for each selected idea, then
+appends one detail section per idea with all round-by-round referee marks and
+selected handoff text: title, idea summary, and calculation plan. It should not
+invent novelty claims or hide failed idea history.
 
 ### 3. Plan And Execute A Calculation
 
@@ -430,23 +465,25 @@ Input: one explicit calculation idea.
 
 The calculation workflow has three phases:
 
-1. `research-plan`: gather evidence, separate first principles from derived
+1. `plan`: gather evidence, separate first principles from derived
    claims, and write a reviewable calculation plan.
-2. `research-foundation`: build versioned foundation JSON with conventions,
+2. `foundation`: build versioned foundation JSON with conventions,
    equations, confidence labels, and source locations.
-3. `research-execute`: check non-axiom foundation equations and execute new
+3. `calculate`: check non-axiom foundation equations and execute new
    calculation steps through proposers-reviewer consensus.
 
 Primary outputs:
 
 ```text
 <project-dir>/calculate/<run-id>/plan.json
-<project-dir>/calculate/<run-id>/research-plan.md
+<project-dir>/calculate/<run-id>/initial-plan.md
+<project-dir>/initial-plan.md
 <project-dir>/calculate/<run-id>/foundation/latest.json
-<project-dir>/calculate/<run-id>/foundation/research-foundation.md
+<project-dir>/calculate/<run-id>/foundation/initial-foundation.md
+<project-dir>/initial-foundation.md
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
-<project-dir>/calculate/<run-id>/report.md
-<project-dir>/report.md
+<project-dir>/calculate/<run-id>/calculation-report.md
+<project-dir>/calculation-report.md
 ```
 
 The workflow is deliberately conservative: it requires source evidence,
@@ -494,7 +531,7 @@ Diagnose cache state:
 
 ```bash
 arc-paper doctor cache arXiv:0911.3380 --json
-arc-mcp jobs root --json
+arc-mcp root --json
 ```
 
 Useful environment variables:
@@ -504,7 +541,7 @@ ARC_AGENT_HOST                    Force host detection, for example codex or cla
 ARC_LLM_PROVIDER                  Force provider selection, for example codex-cli, claude-cli, deepseek, or manual.
 ARC_LLM_PROVIDER_CONFIG           Override the provider config file path.
 ARC_LLM_MODEL                     Override the exact model for any provider.
-ARC_LLM_MODEL_TIER                Select low, medium, or high model tier where supported.
+ARC_LLM_MODEL_TIER                Select low, medium, or high model tier where supported; defaults to medium.
 ARC_CODEX_MODEL                   Override the Codex built-in provider model.
 ARC_CODEX_MODEL_TIER              Override the Codex model tier.
 ARC_CLAUDE_MODEL                  Override the Claude built-in provider model.
@@ -539,7 +576,7 @@ arc-llm providers doctor
 If an MCP call returns a job ID:
 
 ```bash
-arc-mcp jobs watch <job_id> --json
+arc-mcp watch <job_id> --json
 ```
 
 If a domain summary or graph is missing:

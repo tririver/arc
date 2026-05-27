@@ -9,6 +9,8 @@ from arc_paper.batch.db import BatchDB
 from arc_paper.batch.runner import export_batch, prefetch_batch, run_batch
 from arc_paper.host import detect_host, select_llm_provider
 from arc_paper.ids import normalize_paper_id
+from arc_typeset import md2pdf as typeset_md2pdf
+from arc_typeset import translate as typeset_translate
 from pydantic import Field
 
 from .jobs import MCPJobCancelled, MCPJobManager, resolve_inline_wait_seconds
@@ -21,7 +23,8 @@ SERVER_INSTRUCTIONS = (
     "Use ARC when a user asks about theoretical-physics papers or arXiv papers: "
     "titles, abstracts, authors, references, citing papers, citation counts, "
     "ar5iv table of contents, sections, full-text search, equation context, cached LLM paper summaries, "
-    "or cached research-domain artifacts from a seed paper. "
+    "cached research-domain artifacts from a seed paper, converting Markdown reports to PDF, "
+    "or translating Markdown reports. "
     "Tools that may call an LLM provider are prefixed with llm_. "
     "Paper IDs may be passed with or without the arXiv: prefix, as INSPIRE recids, "
     "or as DOI identifiers, for example 0911.3380, arXiv:0911.3380, "
@@ -61,6 +64,22 @@ JOB_CANCEL_DESCRIPTION = (
     "Cancel an MCP job. Do not use this unless the user explicitly asks; cancelling may waste work "
     "and leave a requested cached artifact unfinished."
 )
+MD2PDF_INPUT_DESCRIPTION = "Markdown file to convert to PDF."
+MD2PDF_OUTPUT_DESCRIPTION = "Optional output PDF path. Defaults to the input path with a .pdf suffix."
+MD2PDF_TEXLIVE_BIN_DESCRIPTION = (
+    "Optional TeX Live bin directory to prepend to PATH. Pass an empty string to avoid modifying PATH."
+)
+MD2PDF_RESOURCE_PATH_DESCRIPTION = (
+    "Optional Pandoc resource path entries for resolving relative images and assets."
+)
+TRANSLATE_INPUT_DESCRIPTION = "Markdown file to translate."
+TRANSLATE_OUTPUT_DESCRIPTION = "Optional translated Markdown output path. Defaults to input.<target_locale>.md."
+TRANSLATE_TARGET_LANGUAGE_DESCRIPTION = "Target natural language for translation. Defaults to Chinese."
+TRANSLATE_TARGET_LOCALE_DESCRIPTION = "Target locale suffix for output files. Defaults to zh_CN."
+TRANSLATE_PROJECT_DIR_DESCRIPTION = "Project directory to scan for same-folder Markdown/PDF report pairs."
+TRANSLATE_QUALITY_DESCRIPTION = "When true, run an additional LLM QA/revision pass after fast translation."
+TRANSLATE_OVERWRITE_DESCRIPTION = "When true, overwrite existing translated Markdown/PDF outputs."
+MODEL_TIER_DESCRIPTION = "LLM model tier for translation work. Defaults to low for speed and cost."
 
 PaperId = Annotated[str | None, Field(description=PAPER_ID_DESCRIPTION)]
 PaperIds = Annotated[list[str] | None, Field(description=PAPER_IDS_DESCRIPTION)]
@@ -81,6 +100,18 @@ CiterSort = Annotated[str, Field(description=CITER_SORT_DESCRIPTION)]
 LLMProvider = Annotated[str, Field(description=LLM_PROVIDER_DESCRIPTION)]
 LLMModel = Annotated[str | None, Field(description=LLM_MODEL_DESCRIPTION)]
 Background = Annotated[bool, Field(description=BACKGROUND_DESCRIPTION)]
+Md2PdfInput = Annotated[str, Field(description=MD2PDF_INPUT_DESCRIPTION)]
+Md2PdfOutput = Annotated[str | None, Field(description=MD2PDF_OUTPUT_DESCRIPTION)]
+Md2PdfTexliveBin = Annotated[str | None, Field(description=MD2PDF_TEXLIVE_BIN_DESCRIPTION)]
+Md2PdfResourcePath = Annotated[list[str] | None, Field(description=MD2PDF_RESOURCE_PATH_DESCRIPTION)]
+TranslateInput = Annotated[str, Field(description=TRANSLATE_INPUT_DESCRIPTION)]
+TranslateOutput = Annotated[str | None, Field(description=TRANSLATE_OUTPUT_DESCRIPTION)]
+TranslateTargetLanguage = Annotated[str, Field(description=TRANSLATE_TARGET_LANGUAGE_DESCRIPTION)]
+TranslateTargetLocale = Annotated[str, Field(description=TRANSLATE_TARGET_LOCALE_DESCRIPTION)]
+TranslateProjectDir = Annotated[str, Field(description=TRANSLATE_PROJECT_DIR_DESCRIPTION)]
+TranslateQuality = Annotated[bool, Field(description=TRANSLATE_QUALITY_DESCRIPTION)]
+TranslateOverwrite = Annotated[bool, Field(description=TRANSLATE_OVERWRITE_DESCRIPTION)]
+ModelTier = Annotated[str, Field(description=MODEL_TIER_DESCRIPTION)]
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -96,6 +127,9 @@ def _paper_ids(args: dict[str, Any]):
 
 
 TOOL_HANDLERS: dict[str, ToolHandler] = {
+    "md2pdf": lambda args: _start_md2pdf_job_response(args),
+    "translate": lambda args: _start_translate_job_response(args),
+    "batch_translate": lambda args: _start_batch_translate_job_response(args),
     "extract_paper_ids": lambda args: service.extract_paper_ids(str(args.get("text", ""))),
     "paper_ids_safe_dir_name": lambda args: service.paper_ids_safe_dir_name(_paper_ids(args)),
     "get_title": lambda args: service.get_title(_paper_ids(args), refresh=bool(args.get("refresh", False))),
@@ -177,6 +211,240 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "summary_batch_export": lambda args: _summary_batch_export_response(args),
     "summary_batch_retry_failed": lambda args: _summary_batch_retry_failed_response(args),
 }
+
+
+def _start_md2pdf_job_response(args: dict[str, Any]) -> dict[str, Any]:
+    input_path = Path(str(args["input"]))
+    output_path = Path(str(args["output"])) if args.get("output") else None
+    texlive_bin_raw = args.get("texlive_bin", str(typeset_md2pdf.DEFAULT_TEXLIVE_BIN))
+    texlive_bin = Path(str(texlive_bin_raw)) if texlive_bin_raw else None
+    margin = str(args.get("margin", typeset_md2pdf.DEFAULT_MARGIN))
+    mainfont = str(args.get("mainfont", typeset_md2pdf.DEFAULT_MAINFONT))
+    cjk_mainfont = str(args.get("cjk_mainfont", typeset_md2pdf.DEFAULT_CJK_MAINFONT))
+    resource_paths = [Path(str(path)) for path in args.get("resource_path") or []] or None
+
+    payload = {
+        "input": str(input_path),
+        "output": str(output_path) if output_path else None,
+        "texlive_bin": str(texlive_bin) if texlive_bin else "",
+        "margin": margin,
+        "mainfont": mainfont,
+        "cjk_mainfont": cjk_mainfont,
+        "resource_path": [str(path) for path in resource_paths or []],
+        "background": True,
+    }
+    job_id = MCP_JOBS.start(
+        job_type="md2pdf",
+        payload=payload,
+        runner=lambda progress, cancel: _run_md2pdf_job(
+            input_path=input_path,
+            output_path=output_path,
+            texlive_bin=texlive_bin,
+            margin=margin,
+            mainfont=mainfont,
+            cjk_mainfont=cjk_mainfont,
+            resource_paths=resource_paths,
+            progress=progress,
+            cancel=cancel,
+        ),
+        status_resolver=_arc_result_status,
+    )
+    return _wait_or_background(
+        job_id,
+        message="Markdown to PDF conversion is running in the background.",
+        poll_after_seconds=1,
+        background=True,
+    )
+
+
+def _run_md2pdf_job(
+    *,
+    input_path: Path,
+    output_path: Path | None,
+    texlive_bin: Path | None,
+    margin: str,
+    mainfont: str,
+    cjk_mainfont: str,
+    resource_paths: list[Path] | None,
+    progress: Callable[[dict[str, Any]], None],
+    cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    if cancel():
+        raise MCPJobCancelled("MCP job cancellation was requested.")
+    progress(
+        {
+            "event": "md2pdf_started",
+            "input": str(input_path),
+            "output": str(output_path) if output_path else None,
+        }
+    )
+    result = typeset_md2pdf.convert_markdown_to_pdf(
+        input_path=input_path,
+        output_path=output_path,
+        texlive_bin=texlive_bin,
+        margin=margin,
+        mainfont=mainfont,
+        cjk_mainfont=cjk_mainfont,
+        resource_paths=resource_paths,
+    )
+    progress({"event": "md2pdf_completed" if _all_ok(result) else "md2pdf_failed"})
+    return result
+
+
+def _start_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
+    input_path = Path(str(args["input"]))
+    output_path = Path(str(args["output"])) if args.get("output") else None
+    target_language = str(args.get("target_language", typeset_translate.DEFAULT_TARGET_LANGUAGE))
+    target_locale = str(args.get("target_locale", typeset_translate.DEFAULT_TARGET_LOCALE))
+    provider = str(args.get("provider", "auto"))
+    model = args.get("model")
+    model_tier = str(args.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER))
+    quality = bool(args.get("quality", False))
+    overwrite = bool(args.get("overwrite", False))
+    payload = {
+        "input": str(input_path),
+        "output": str(output_path) if output_path else None,
+        "target_language": target_language,
+        "target_locale": target_locale,
+        "provider": provider,
+        "model": model,
+        "model_tier": model_tier,
+        "quality": quality,
+        "overwrite": overwrite,
+        "background": True,
+    }
+    job_id = MCP_JOBS.start(
+        job_type="translate",
+        payload=payload,
+        runner=lambda progress, cancel: _run_translate_job(
+            input_path=input_path,
+            output_path=output_path,
+            target_language=target_language,
+            target_locale=target_locale,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            quality=quality,
+            overwrite=overwrite,
+            progress=progress,
+            cancel=cancel,
+        ),
+        status_resolver=_arc_result_status,
+    )
+    return _wait_or_background(
+        job_id,
+        message="Markdown translation is running in the background.",
+        poll_after_seconds=5,
+        background=True,
+    )
+
+
+def _run_translate_job(
+    *,
+    input_path: Path,
+    output_path: Path | None,
+    target_language: str,
+    target_locale: str,
+    provider: str,
+    model: str | None,
+    model_tier: str,
+    quality: bool,
+    overwrite: bool,
+    progress: Callable[[dict[str, Any]], None],
+    cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    if cancel():
+        raise MCPJobCancelled("MCP job cancellation was requested.")
+    progress({"event": "translate_started", "input": str(input_path), "target_locale": target_locale})
+    result = typeset_translate.translate_markdown(
+        input_path=input_path,
+        output_path=output_path,
+        target_language=target_language,
+        target_locale=target_locale,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        quality=quality,
+        convert_pdf=True,
+        overwrite=overwrite,
+    )
+    progress({"event": "translate_completed" if _all_ok(result) else "translate_failed"})
+    return result
+
+
+def _start_batch_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
+    project_dir = Path(str(args["project_dir"]))
+    target_language = str(args.get("target_language", typeset_translate.DEFAULT_TARGET_LANGUAGE))
+    target_locale = str(args.get("target_locale", typeset_translate.DEFAULT_TARGET_LOCALE))
+    provider = str(args.get("provider", "auto"))
+    model = args.get("model")
+    model_tier = str(args.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER))
+    quality = bool(args.get("quality", False))
+    overwrite = bool(args.get("overwrite", False))
+    payload = {
+        "project_dir": str(project_dir),
+        "target_language": target_language,
+        "target_locale": target_locale,
+        "provider": provider,
+        "model": model,
+        "model_tier": model_tier,
+        "quality": quality,
+        "overwrite": overwrite,
+        "background": True,
+    }
+    job_id = MCP_JOBS.start(
+        job_type="batch_translate",
+        payload=payload,
+        runner=lambda progress, cancel: _run_batch_translate_job(
+            project_dir=project_dir,
+            target_language=target_language,
+            target_locale=target_locale,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            quality=quality,
+            overwrite=overwrite,
+            progress=progress,
+            cancel=cancel,
+        ),
+        status_resolver=_arc_result_status,
+    )
+    return _wait_or_background(
+        job_id,
+        message="Batch Markdown translation is running in the background.",
+        poll_after_seconds=10,
+        background=True,
+    )
+
+
+def _run_batch_translate_job(
+    *,
+    project_dir: Path,
+    target_language: str,
+    target_locale: str,
+    provider: str,
+    model: str | None,
+    model_tier: str,
+    quality: bool,
+    overwrite: bool,
+    progress: Callable[[dict[str, Any]], None],
+    cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    if cancel():
+        raise MCPJobCancelled("MCP job cancellation was requested.")
+    progress({"event": "batch_translate_started", "project_dir": str(project_dir), "target_locale": target_locale})
+    result = typeset_translate.batch_translate_project(
+        project_dir=project_dir,
+        target_language=target_language,
+        target_locale=target_locale,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        quality=quality,
+        overwrite=overwrite,
+    )
+    progress({"event": "batch_translate_completed" if _all_ok(result) else "batch_translate_failed"})
+    return result
 
 
 def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
@@ -340,7 +608,7 @@ def _domain_artifact_or_start(args: dict[str, Any], *, artifact: str) -> dict[st
     if result.get("ok") or not args.get("seed_paper"):
         return result
     error_code = (result.get("error") or {}).get("code")
-    if error_code not in {"domain_summary_not_available", "domain_graph_not_available"}:
+    if error_code not in {"domain_summary_not_available", "domain_summary_invalid", "domain_graph_not_available"}:
         return result
     return _start_domain_job_response(args)
 
@@ -540,7 +808,7 @@ def _wait_or_background(
         "inline_wait_seconds": inline_wait,
         "background_requested": background,
         "next": {
-            "cli_command": f"arc-mcp jobs watch {job_id} --json",
+            "cli_command": f"arc-mcp watch {job_id} --json",
             "tool": "job_status",
             "arguments": {"job_id": job_id},
             "poll_after_seconds": poll_after_seconds,
@@ -644,6 +912,98 @@ def _one_or_many(paper_id: str | None = None, paper_ids: list[str] | None = None
 
 
 def _register_tools(app: Any) -> None:
+    @app.tool(
+        description=(
+            "Convert a Markdown file to PDF using Pandoc and XeLaTeX. "
+            "This starts a background job immediately, does not wait inline, "
+            "and is intended for math-heavy ARC reports with CJK font support."
+        )
+    )
+    def md2pdf(
+        input: Md2PdfInput,
+        output: Md2PdfOutput = None,
+        texlive_bin: Md2PdfTexliveBin = str(typeset_md2pdf.DEFAULT_TEXLIVE_BIN),
+        margin: Annotated[str, Field(description="LaTeX geometry margin value.")] = typeset_md2pdf.DEFAULT_MARGIN,
+        mainfont: Annotated[str, Field(description="Main font passed to Pandoc's LaTeX template.")] = (
+            typeset_md2pdf.DEFAULT_MAINFONT
+        ),
+        cjk_mainfont: Annotated[str, Field(description="CJK main font passed to Pandoc's LaTeX template.")] = (
+            typeset_md2pdf.DEFAULT_CJK_MAINFONT
+        ),
+        resource_path: Md2PdfResourcePath = None,
+    ) -> Any:
+        return _start_md2pdf_job_response(
+            {
+                "input": input,
+                "output": output,
+                "texlive_bin": texlive_bin,
+                "margin": margin,
+                "mainfont": mainfont,
+                "cjk_mainfont": cjk_mainfont,
+                "resource_path": resource_path,
+            }
+        )
+
+    @app.tool(
+        description=(
+            "Translate a Markdown report with arc-llm, then convert the translated Markdown to PDF. "
+            "This starts a background job immediately and defaults to Chinese with low-tier LLMs."
+        )
+    )
+    def translate(
+        input: TranslateInput,
+        output: TranslateOutput = None,
+        target_language: TranslateTargetLanguage = typeset_translate.DEFAULT_TARGET_LANGUAGE,
+        target_locale: TranslateTargetLocale = typeset_translate.DEFAULT_TARGET_LOCALE,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
+        model_tier: ModelTier = typeset_translate.DEFAULT_MODEL_TIER,
+        quality: TranslateQuality = False,
+        overwrite: TranslateOverwrite = False,
+    ) -> Any:
+        return _start_translate_job_response(
+            {
+                "input": input,
+                "output": output,
+                "target_language": target_language,
+                "target_locale": target_locale,
+                "provider": provider,
+                "model": model,
+                "model_tier": model_tier,
+                "quality": quality,
+                "overwrite": overwrite,
+            }
+        )
+
+    @app.tool(
+        description=(
+            "Find same-folder Markdown/PDF report pairs in a project and translate missing locale outputs. "
+            "This starts a background job immediately and defaults to Chinese with low-tier LLMs."
+        )
+    )
+    def batch_translate(
+        project_dir: TranslateProjectDir,
+        target_language: TranslateTargetLanguage = typeset_translate.DEFAULT_TARGET_LANGUAGE,
+        target_locale: TranslateTargetLocale = typeset_translate.DEFAULT_TARGET_LOCALE,
+        provider: LLMProvider = "auto",
+        model: LLMModel = None,
+        model_tier: ModelTier = typeset_translate.DEFAULT_MODEL_TIER,
+        quality: TranslateQuality = False,
+        overwrite: TranslateOverwrite = False,
+    ) -> Any:
+        return _start_batch_translate_job_response(
+            {
+                "project_dir": project_dir,
+                "target_language": target_language,
+                "target_locale": target_locale,
+                "provider": provider,
+                "model": model,
+                "model_tier": model_tier,
+                "quality": quality,
+                "overwrite": overwrite,
+            }
+        )
+
     @app.tool(
         description=(
             "Extract normalized paper identifiers from natural-language text. "

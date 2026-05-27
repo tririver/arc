@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+from arc_mcp import cli
+from arc_mcp import worker
 from arc_mcp.jobs import MCPJobCancelled, MCPJobManager, resolve_inline_wait_seconds
 
 
@@ -139,3 +141,137 @@ def test_process_worker_persists_failed_status(tmp_path, monkeypatch):
     status = manager.status(job_id)
     assert status["status"] == "failed"
     assert status["error"]["code"] == "job_failed"
+
+
+def test_cli_accepts_flat_job_commands(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ARC_MCP_CACHE", str(tmp_path))
+
+    assert cli.main(["root", "--json"]) == 0
+    flat = capsys.readouterr().out
+    assert str(tmp_path) in flat
+
+    assert cli.main(["jobs", "root", "--json"]) == 0
+    nested = capsys.readouterr().out
+    assert str(tmp_path) in nested
+
+
+def test_worker_dispatches_md2pdf_job(monkeypatch, tmp_path):
+    source = tmp_path / "report.md"
+    output = tmp_path / "report.pdf"
+    source.write_text("# Report\n", encoding="utf-8")
+    calls = {}
+    events = []
+
+    def convert_markdown_to_pdf(**kwargs):
+        calls.update(kwargs)
+        return {
+            "ok": True,
+            "data": {"input_path": str(source), "output_path": str(output), "pdf_size_bytes": 8},
+            "errors": [],
+            "meta": {},
+        }
+
+    monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
+    monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
+    monkeypatch.setattr(worker.typeset_md2pdf, "convert_markdown_to_pdf", convert_markdown_to_pdf)
+
+    result = worker._dispatch(
+        "md2pdf",
+        {
+            "input": str(source),
+            "output": str(output),
+            "texlive_bin": "",
+            "margin": "2cm",
+            "mainfont": "Noto Sans",
+            "cjk_mainfont": "Noto Sans CJK SC",
+            "resource_path": [str(tmp_path)],
+        },
+        job_id="job-test",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["output_path"] == str(output)
+    assert calls["input_path"] == source
+    assert calls["output_path"] == output
+    assert calls["texlive_bin"] is None
+    assert calls["resource_paths"] == [tmp_path]
+    assert [event["event"] for event in events] == ["md2pdf_started", "md2pdf_completed"]
+
+
+def test_worker_dispatches_translate_job(monkeypatch, tmp_path):
+    source = tmp_path / "report.md"
+    output = tmp_path / "report.zh_CN.md"
+    source.write_text("# Report\n", encoding="utf-8")
+    calls = {}
+    events = []
+
+    def translate_markdown(**kwargs):
+        calls.update(kwargs)
+        return {
+            "ok": True,
+            "data": {
+                "input_markdown_path": str(source),
+                "output_markdown_path": str(output),
+                "output_pdf_path": str(output.with_suffix(".pdf")),
+            },
+            "errors": [],
+            "meta": {},
+        }
+
+    monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
+    monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
+    monkeypatch.setattr(worker.typeset_translate, "translate_markdown", translate_markdown)
+
+    result = worker._dispatch(
+        "translate",
+        {
+            "input": str(source),
+            "output": str(output),
+            "target_language": "Chinese",
+            "target_locale": "zh_CN",
+            "provider": "manual",
+            "model": "test-model",
+            "model_tier": "low",
+            "quality": False,
+        },
+        job_id="job-test",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["output_markdown_path"] == str(output)
+    assert calls["input_path"] == source
+    assert calls["output_path"] == output
+    assert calls["model_tier"] == "low"
+    assert calls["convert_pdf"] is True
+    assert [event["event"] for event in events] == ["translate_started", "translate_completed"]
+
+
+def test_worker_dispatches_batch_translate_job(monkeypatch, tmp_path):
+    calls = {}
+    events = []
+
+    def batch_translate_project(**kwargs):
+        calls.update(kwargs)
+        return {
+            "ok": True,
+            "data": {"project_dir": str(tmp_path), "candidate_count": 1, "translated_count": 1},
+            "errors": [],
+            "meta": {},
+        }
+
+    monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
+    monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
+    monkeypatch.setattr(worker.typeset_translate, "batch_translate_project", batch_translate_project)
+
+    result = worker._dispatch(
+        "batch_translate",
+        {"project_dir": str(tmp_path), "target_language": "Chinese", "target_locale": "zh_CN", "model_tier": "low"},
+        job_id="job-test",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["translated_count"] == 1
+    assert calls["project_dir"] == tmp_path
+    assert calls["target_language"] == "Chinese"
+    assert calls["model_tier"] == "low"
+    assert [event["event"] for event in events] == ["batch_translate_started", "batch_translate_completed"]

@@ -208,6 +208,7 @@ def search_full_text(
             context=context,
             case_sensitive=case_sensitive,
         )
+        hits = _enrich_search_hits_with_cached_metadata(hits)
     except ValueError as exc:
         return err("search_query_required", str(exc))
     except ProviderError as exc:
@@ -221,6 +222,68 @@ def search_full_text(
         missing_papers=missing_papers,
         **meta,
     )
+
+
+def _enrich_search_hits_with_cached_metadata(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    metadata_by_paper: dict[str, dict[str, str]] = {}
+    enriched: list[dict[str, Any]] = []
+    for hit in hits:
+        paper_id = str(hit.get("paper_id") or "")
+        if paper_id not in metadata_by_paper:
+            metadata_by_paper[paper_id] = _cached_search_hit_metadata(paper_id)
+        enriched_hit = dict(hit)
+        enriched_hit.update(metadata_by_paper[paper_id])
+        enriched.append(enriched_hit)
+    return enriched
+
+
+def _cached_search_hit_metadata(paper_id: str) -> dict[str, str]:
+    cached = read_json(CachePaths.for_paper(paper_id).inspire_metadata)
+    metadata = cached.get("metadata", cached) if isinstance(cached, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    authors = _metadata_authors(metadata.get("authors"))
+    return {
+        "title": _metadata_title(metadata),
+        "authors": _format_author_list(authors),
+    }
+
+
+def _metadata_title(metadata: dict[str, Any]) -> str:
+    if title := str(metadata.get("title") or "").strip():
+        return title
+    titles = metadata.get("titles")
+    if isinstance(titles, list):
+        for item in titles:
+            if isinstance(item, dict) and (title := str(item.get("title") or "").strip()):
+                return title
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    return ""
+
+
+def _metadata_authors(raw_authors: Any) -> list[str]:
+    authors: list[str] = []
+    if not isinstance(raw_authors, list):
+        return authors
+    for author in raw_authors:
+        if isinstance(author, str):
+            name = author
+        elif isinstance(author, dict):
+            name = str(author.get("full_name") or author.get("name") or author.get("display_name") or "")
+        else:
+            name = ""
+        if name.strip():
+            authors.append(name.strip())
+    return authors
+
+
+def _format_author_list(authors: list[str]) -> str:
+    if not authors:
+        return ""
+    if len(authors) > 5:
+        return f"{authors[0]} et al."
+    return ", ".join(authors)
 
 
 def get_llm_summary(

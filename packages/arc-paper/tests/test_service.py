@@ -322,6 +322,41 @@ def test_search_full_text_uses_cached_parsed_json_without_fetch(monkeypatch, tmp
     assert result["meta"]["context"] == 1
 
 
+def test_search_full_text_includes_cached_title_and_abbreviated_authors(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    paths = CachePaths.for_paper("arXiv:0911.3380")
+    write_json(
+        paths.ar5iv_parsed,
+        parsed_cache(
+            "arXiv:0911.3380",
+            [{"section_id": "S2", "title": "2 Model", "level": 2, "text": "collapsed-channel signal"}],
+        ),
+    )
+    write_json(
+        paths.inspire_metadata,
+        {
+            "metadata": {
+                "titles": [{"title": "A Search Result Paper"}],
+                "authors": [
+                    {"full_name": "Alice A."},
+                    {"full_name": "Bob B."},
+                    {"full_name": "Carol C."},
+                    {"full_name": "Diego D."},
+                    {"full_name": "Eve E."},
+                    {"full_name": "Frank F."},
+                ],
+            }
+        },
+    )
+
+    result = service.search_full_text("0911.3380", query="collapsed-channel")
+
+    assert result["ok"] is True
+    hit = result["data"][0]
+    assert hit["title"] == "A Search Result Paper"
+    assert hit["authors"] == "Alice A. et al."
+
+
 def test_search_full_text_can_search_all_cached_papers(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     first = CachePaths.for_paper("arXiv:0911.3380")

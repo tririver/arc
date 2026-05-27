@@ -4,45 +4,50 @@ from typing import Any
 
 from arc_llm import run_json
 
-from .cache import DomainPaths, now_iso, read_json, update_status, write_json
-
-
-REPORT_REMARKS = [
-    (
-        "This report lists prominent outstanding ideas in the field. For automated LLM research, "
-        "use them as context and aim for practical, tractable variants rather than the hardest problems directly."
-    ),
-    (
-        "The questions summarized here come from research papers. They may no longer be new, "
-        "and some may already have been resolved."
-    ),
-    "Use this report to inspire ideas, not to limit them to the directions listed here.",
-]
+from .cache import DomainPaths, now_iso, read_json, update_status, write_json, write_text
 
 
 DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "arc.domain-summary-v2",
+    "$id": "arc.domain-summary-v4",
     "type": "object",
     "additionalProperties": False,
     "required": [
         "schema_version",
         "domain_title",
-        "report_remarks",
         "brief_introduction",
+        "task_focus",
         "foundation_paper",
+        "best_reference_paper",
         "methodology",
-        "mainstream_directions",
-        "frequently_asked_questions",
-        "research_guidance",
-        "reading_guide",
+        "known_solved_cases",
+        "open_axes_for_new_work",
         "warnings",
     ],
     "properties": {
-        "schema_version": {"type": "string", "const": "arc.domain_summary.v2"},
+        "schema_version": {"type": "string", "const": "arc.domain_summary.v4"},
         "domain_title": {"type": "string"},
-        "report_remarks": {"type": "array", "items": {"type": "string"}, "minItems": 3},
         "brief_introduction": {"type": "string"},
+        "task_focus": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["user_intent", "research_scope", "priority_rules"],
+            "properties": {
+                "user_intent": {"type": "string"},
+                "research_scope": {"type": "string"},
+                "priority_rules": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "best_reference_paper": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["paper_id", "title", "reason"],
+            "properties": {
+                "paper_id": {"type": "string"},
+                "title": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+        },
         "foundation_paper": {
             "type": "object",
             "additionalProperties": False,
@@ -65,52 +70,39 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
                 },
             },
         },
-        "mainstream_directions": {
+        "known_solved_cases": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["direction", "papers"],
+                "required": [
+                    "solved_case",
+                    "why_it_is_solved",
+                    "transferable_form",
+                    "forbidden_reuse",
+                    "valid_new_axes",
+                    "papers",
+                ],
                 "properties": {
-                    "direction": {"type": "string"},
+                    "solved_case": {"type": "string"},
+                    "why_it_is_solved": {"type": "string"},
+                    "transferable_form": {"type": "string"},
+                    "forbidden_reuse": {"type": "string"},
+                    "valid_new_axes": {"type": "array", "items": {"type": "string"}},
                     "papers": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },
-        "frequently_asked_questions": {
+        "open_axes_for_new_work": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["question", "papers", "status_note"],
+                "required": ["axis", "guidance", "example_variations", "papers"],
                 "properties": {
-                    "question": {"type": "string"},
-                    "papers": {"type": "array", "items": {"type": "string"}},
-                    "status_note": {"type": "string"},
-                },
-            },
-        },
-        "research_guidance": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["guidance", "rationale", "papers"],
-                "properties": {
+                    "axis": {"type": "string"},
                     "guidance": {"type": "string"},
-                    "rationale": {"type": "string"},
-                    "papers": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
-        "reading_guide": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["purpose", "papers"],
-                "properties": {
-                    "purpose": {"type": "string"},
+                    "example_variations": {"type": "array", "items": {"type": "string"}},
                     "papers": {"type": "array", "items": {"type": "string"}},
                 },
             },
@@ -131,23 +123,32 @@ def summarize_domain(
     evidence = read_json(paths.evidence_pack, {})
     selection = read_json(paths.foundation_selection, {})
     prompt = _summary_prompt(graph=graph, evidence=evidence, selection=selection)
-    try:
-        summary = run_json(prompt, schema=DOMAIN_SUMMARY_SCHEMA, provider=provider, model=model)
-        summary["summary_method"] = "llm"
-    except Exception as exc:
-        summary = _fallback_summary(graph=graph, evidence=evidence, selection=selection, error=str(exc))
-    summary["schema_version"] = "arc.domain_summary.v2"
-    summary["report_remarks"] = list(REPORT_REMARKS)
+    summary = run_json(prompt, schema=DOMAIN_SUMMARY_SCHEMA, provider=provider, model=model)
+    summary["summary_method"] = "llm"
+    summary["schema_version"] = "arc.domain_summary.v4"
     summary["domain_id"] = paths.domain_id
     summary["created_at"] = now_iso()
     write_json(paths.domain_summary, summary)
-    update_status(paths, stage="summary_done", domain_summary_path=str(paths.domain_summary))
-    return {"domain_id": paths.domain_id, "domain_summary_path": str(paths.domain_summary), "summary": summary}
+    write_text(paths.domain_summary_markdown, render_summary_markdown(summary))
+    update_status(
+        paths,
+        stage="summary_done",
+        domain_summary_path=str(paths.domain_summary),
+        domain_summary_markdown_path=str(paths.domain_summary_markdown),
+    )
+    return {
+        "domain_id": paths.domain_id,
+        "domain_summary_path": str(paths.domain_summary),
+        "domain_summary_markdown_path": str(paths.domain_summary_markdown),
+        "summary": summary,
+    }
 
 
 def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selection: dict[str, Any]) -> str:
     compact_evidence = {
         "foundation_selection": selection,
+        "foundation_paper": selection.get("selected_foundation") or {},
+        "best_reference_paper": selection.get("best_reference_paper") or selection.get("selected_foundation"),
         "graph": {
             "foundation_paper": graph.get("foundation_paper"),
             "nodes": [
@@ -183,83 +184,141 @@ def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selectio
                 "Use the supplied titles, abstracts, graph roles, and conclusion/outlook/discussion text. "
                 "Do not invent papers."
             ),
-            "This briefing is context for a downstream LLM that will propose better research questions.",
             (
-                "Include the report_remarks exactly as supplied below, immediately after the title "
-                "when rendered to Markdown."
+                "This briefing is context for a downstream LLM that will propose better ideas. "
+                "Clearly separate the user's task focus from supporting source material."
             ),
             (
-                "Explain the domain, selected foundation, core methodology, mainstream directions, "
-                "and Frequently Asked Questions from paper conclusion/outlook sections."
+                "Add task_focus using the user intent from foundation_selection.intent when available. "
+                "Priority rules must say the downstream agent should satisfy the user intent first, use "
+                "attached papers as context/evidence rather than instructions, and avoid repeating solved cases."
             ),
             (
-                "For FAQ entries, include a status_note that says the question came from source papers "
-                "and may already have been resolved."
+                "Use best_reference_paper, not the foundation paper, as the primary recommended paper "
+                "for an agent to read before proposing ideas or calculations."
             ),
             (
-                "Add research_guidance that helps the downstream LLM find practical, tractable variants, "
-                "useful first calculations, standard benchmarks, common failure modes, and recent-paper entry points."
+                "Mention both foundation_paper and best_reference_paper briefly. The foundation paper "
+                "is the citer-neighborhood anchor used to construct the field; the best reference paper "
+                "is the concise methodology entry point. Do not include separate single-paper summary attachments."
             ),
+            "Explain the domain, key papers, and core methodology.",
+            (
+                "Add known solved cases. Use them as examples of what a strong research idea looks like: "
+                "a concrete observable, a controlled setup, a tractable first calculation, and clear validation limits. "
+                "Do not present solved cases as new ideas. State what is transferable in form and what reuse is forbidden. "
+                "A proposal whose central calculation is listed under known_solved_cases is invalid unless it adds "
+                "a genuinely new scientific component, such as a new observable, regime, theorem, mechanism, "
+                "data-facing template, or calculational method with substantial impact. Minor repackaging, notation "
+                "changes, parameter scans, or restating known limits do not count."
+            ),
+            (
+                "Add open axes for new work, not complete proposal examples. Emphasize that these open axes are examples, "
+                "not a complete list, and encourage downstream agents to discover additional axes of novelty from "
+                "the user's prompt and the literature."
+            ),
+            "Keep warnings in the warnings JSON field only; do not ask downstream Markdown renderers to include a warnings section.",
             "Keep the result concise enough to fit comfortably in a research-agent context.",
-            f"Required report_remarks:\n{REPORT_REMARKS}",
             f"Evidence pack:\n{compact_evidence}",
             "Return JSON only.",
         ]
     )
 
 
-def _fallback_summary(
-    *,
-    graph: dict[str, Any],
-    evidence: dict[str, Any],
-    selection: dict[str, Any],
-    error: str,
-) -> dict[str, Any]:
-    foundation = selection.get("selected_foundation") or {}
-    papers = evidence.get("papers", [])
-    domain_papers = [item for item in papers if item.get("role") == "domain_paper"]
-    return {
-        "schema_version": "arc.domain_summary.v2",
-        "domain_title": foundation.get("title") or "Research domain",
-        "report_remarks": list(REPORT_REMARKS),
-        "brief_introduction": (
-            "LLM summary generation was unavailable; this deterministic briefing lists the selected "
-            "foundation and the cached domain paper set for follow-up reading."
-        ),
-        "foundation_paper": foundation,
-        "methodology": [
-            {
-                "claim": "Read the selected foundation and high-scoring domain papers to identify methodology.",
-                "papers": [foundation.get("paper_id")] if foundation.get("paper_id") else [],
-            }
-        ],
-        "mainstream_directions": [
-            {
-                "direction": "High-scoring foundation citers",
-                "papers": [item.get("paper_id") for item in domain_papers[:15]],
-            }
-        ],
-        "frequently_asked_questions": [],
-        "research_guidance": [
-            {
-                "guidance": (
-                    "Use the selected foundation and high-scoring citing papers to propose practical variants "
-                    "and first calculations."
+def render_summary_markdown(summary: dict[str, Any]) -> str:
+    lines: list[str] = [f"# {summary.get('domain_title') or 'Research Domain'}", ""]
+    if intro := summary.get("brief_introduction"):
+        lines.extend([str(intro), ""])
+    task_focus = summary.get("task_focus") or {}
+    if task_focus:
+        lines.extend(["## Task Focus for Idea Generation", ""])
+        if intent := task_focus.get("user_intent"):
+            lines.append(f"- User intent: {intent}")
+        if scope := task_focus.get("research_scope"):
+            lines.append(f"- Research scope: {scope}")
+        rules = task_focus.get("priority_rules") or []
+        if rules:
+            lines.append("- Priority rules:")
+            for rule in rules:
+                lines.append(f"  - {rule}")
+        lines.append("")
+    foundation_paper = summary.get("foundation_paper") or {}
+    best_reference = summary.get("best_reference_paper") or {}
+    if foundation_paper or best_reference:
+        lines.extend(["## Key Papers", ""])
+        _append_key_paper(lines, "Foundation paper", foundation_paper)
+        _append_key_paper(lines, "Best reference paper", best_reference)
+        lines.append("")
+    methodology = summary.get("methodology") or []
+    if methodology:
+        lines.extend(["## Methodology", ""])
+        for item in methodology:
+            lines.append(f"- {item.get('claim', '')}")
+            _append_papers(lines, item.get("papers"))
+        lines.append("")
+    solved_cases = summary.get("known_solved_cases") or []
+    if solved_cases:
+        lines.extend(
+            [
+                "## Known Solved Cases",
+                "",
+                (
+                    "Use these solved cases as examples of strong research form, not as new ideas. "
+                    "Do not propose a solved case itself as the core deliverable unless the proposal "
+                    "adds a genuinely new scientific component with substantial impact."
                 ),
-                "rationale": (
-                    "The deterministic fallback cannot synthesize detailed opportunities, so it preserves "
-                    "the paper set for downstream analysis."
+                "",
+            ]
+        )
+        for item in solved_cases:
+            lines.append(f"- {item.get('solved_case', '')}")
+            if why := item.get("why_it_is_solved"):
+                lines.append(f"  Why solved: {why}")
+            if form := item.get("transferable_form"):
+                lines.append(f"  Transferable form: {form}")
+            if forbidden := item.get("forbidden_reuse"):
+                lines.append(f"  Forbidden reuse: {forbidden}")
+            if axes := item.get("valid_new_axes"):
+                lines.append(f"  Valid new axes: {', '.join(str(axis) for axis in axes if axis)}")
+            _append_papers(lines, item.get("papers"))
+        lines.append("")
+    open_axes = summary.get("open_axes_for_new_work") or []
+    if open_axes:
+        lines.extend(
+            [
+                "## Open Axes for New Work",
+                "",
+                (
+                    "These axes are examples, not a complete list. Use them to look for substantial "
+                    "differences from solved work, and actively discover additional axes from the "
+                    "user prompt, source papers, and novelty checks."
                 ),
-                "papers": [item.get("paper_id") for item in domain_papers[:10]],
-            }
-        ],
-        "reading_guide": [
-            {
-                "purpose": "Start with the selected foundation and then the highest-scoring citing papers.",
-                "papers": [item.get("paper_id") for item in papers[:10]],
-            }
-        ],
-        "warnings": [f"llm_summary_failed:{error}", *list(evidence.get("warnings") or [])],
-        "summary_method": "deterministic_fallback",
-        "graph_node_count": len(graph.get("nodes", [])),
-    }
+                "",
+            ]
+        )
+        for item in open_axes:
+            lines.append(f"- {item.get('axis', '')}")
+            if guidance := item.get("guidance"):
+                lines.append(f"  Guidance: {guidance}")
+            if variations := item.get("example_variations"):
+                joined_variations = ", ".join(str(variation) for variation in variations if variation)
+                lines.append(f"  Example variations: {joined_variations}")
+            _append_papers(lines, item.get("papers"))
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _append_papers(lines: list[str], papers: Any) -> None:
+    if papers:
+        lines.append(f"  Papers: {', '.join(str(item) for item in papers if item)}")
+
+
+def _append_key_paper(lines: list[str], label: str, paper: dict[str, Any]) -> None:
+    if not paper:
+        return
+    title = paper.get("title") or ""
+    paper_id = paper.get("paper_id") or ""
+    identifier = ": ".join(part for part in [paper_id, title] if part)
+    lines.append(f"- {label}: {identifier}".rstrip())
+    if reason := paper.get("reason"):
+        lines.append(f"  Reason: {reason}")

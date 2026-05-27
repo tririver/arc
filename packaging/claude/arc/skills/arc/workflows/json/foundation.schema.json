@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ARC Foundation",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "version",
+    "created_from_plan",
+    "conventions",
+    "equations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "arc.foundation.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "created_from_plan": {
+      "type": "string",
+      "minLength": 1
+    },
+    "change_note": {
+      "type": "string"
+    },
+    "conventions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "chosen_convention",
+          "source_variants",
+          "consistency_status",
+          "check_status"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "chosen_convention": {"type": "string", "minLength": 1},
+          "source_variants": {"type": "array"},
+          "consistency_status": {
+            "enum": ["consistent", "normalized", "convention_check"]
+          },
+          "check_status": {
+            "enum": ["not_checked", "checked"]
+          },
+          "check_step_id": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "equations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "explanation",
+          "latex",
+          "role",
+          "axiom_status",
+          "publication_status",
+          "citation_count",
+          "check_status",
+          "judgment",
+          "sources"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "label": {"type": "string", "minLength": 1},
+          "explanation": {"type": "string", "minLength": 1},
+          "latex": {"type": "string", "minLength": 1},
+          "role": {
+            "enum": [
+              "first_principle",
+              "useful_result",
+              "convention_check",
+              "convention",
+              "validation_only"
+            ]
+          },
+          "convention_ids": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "axiom_status": {
+            "enum": ["axiom", "not_axiom"]
+          },
+          "publication_status": {
+            "enum": ["published_high", "published_low", "not_in_publications"]
+          },
+          "citation_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "check_status": {
+            "enum": ["not_checked", "checked", "checked_analytic", "checked_numerical"]
+          },
+          "check_method": {
+            "enum": ["analytic", "numerical", "mixed"]
+          },
+          "check_history": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"}
+          },
+          "numerical_relative_error": {
+            "type": ["number", "null"],
+            "minimum": 0
+          },
+          "consensus_artifact": {
+            "type": "string",
+            "minLength": 1
+          },
+          "judgment": {
+            "enum": ["reasonable", "doubt"]
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["paper_id", "section", "mcp", "cli"],
+              "properties": {
+                "paper_id": {"type": "string", "minLength": 1},
+                "section": {"type": "string"},
+                "mcp": {"type": "string", "minLength": 1},
+                "cli": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["check_status"],
+              "properties": {
+                "check_status": {
+                  "enum": ["checked", "checked_analytic", "checked_numerical"]
+                }
+              }
+            },
+            "then": {
+              "required": ["check_method", "check_history", "consensus_artifact"]
+            }
+          },
+          {
+            "if": {
+              "required": ["check_status"],
+              "properties": {
+                "check_status": {"const": "checked_numerical"}
+              }
+            },
+            "then": {
+              "required": ["numerical_relative_error"],
+              "properties": {
+                "check_method": {
+                  "enum": ["numerical", "mixed"]
+                }
+              }
+            }
+          }
+        ],
+        "additionalProperties": true
+      }
+    },
+    "derived_quantities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "explanation",
+          "latex",
+          "source_step_id",
+          "depends_on",
+          "check_status",
+          "consensus_artifact"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "label": {"type": "string", "minLength": 1},
+          "explanation": {"type": "string", "minLength": 1},
+          "latex": {"type": "string", "minLength": 1},
+          "source_step_id": {"type": "string", "minLength": 1},
+          "depends_on": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "check_status": {
+            "enum": ["accepted_consensus", "human_resolved"]
+          },
+          "consensus_artifact": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

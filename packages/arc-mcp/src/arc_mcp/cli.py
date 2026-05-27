@@ -15,6 +15,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "jobs":
         return _jobs(argv[1:])
+    if argv and argv[0] in {"status", "result", "watch", "cancel", "list", "root", "-h", "--help"}:
+        return _jobs(argv)
     if argv and argv[0] == "worker":
         parser = argparse.ArgumentParser(description="Run ARC MCP worker")
         parser.add_argument("job_id")

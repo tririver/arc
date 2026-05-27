@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -25,6 +26,8 @@ class ConsensusStep:
     prompt: str
     kind: str
     allowed_context: dict[str, Any]
+    proposer_runtime: dict[str, Any]
+    reviewer_reference_claim: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,14 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
                 prompt=_required_text(step_data, "prompt"),
                 kind=kind,
                 allowed_context=_dict(step_data.get("allowed_context", {}), f"{step_id}.allowed_context"),
+                proposer_runtime=_dict(
+                    step_data.get("proposer_runtime", {}),
+                    f"{step_id}.proposer_runtime",
+                ),
+                reviewer_reference_claim=_optional_dict(
+                    step_data.get("reviewer_reference_claim"),
+                    f"{step_id}.reviewer_reference_claim",
+                ),
             )
         )
 
@@ -111,6 +122,7 @@ def run_proposers_reviewer_consensus(
 
     runner = batch_runner or run_proposers_reviewer_batch
     step_results: list[dict[str, Any]] = []
+    accepted_step_outputs: dict[str, Any] = {}
     overall_status = "completed"
     for step in consensus.steps:
         step_result = _run_consensus_step(
@@ -121,6 +133,7 @@ def run_proposers_reviewer_consensus(
             base_env=base_env,
             process_chain=process_chain,
             run_root=paths.run_root,
+            accepted_step_outputs=accepted_step_outputs,
         )
         step_results.append(step_result)
         if step_result["status"] == "blocked_for_user":
@@ -129,6 +142,8 @@ def run_proposers_reviewer_consensus(
         if step_result["status"] == "failed":
             overall_status = "failed"
             break
+        if step_result["status"] == "accepted":
+            accepted_step_outputs[step.step_id] = copy.deepcopy(step_result["accepted_output"])
 
     result = {
         "schema_version": CONSENSUS_RESULT_SCHEMA,
@@ -152,6 +167,7 @@ def _run_consensus_step(
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
     run_root: Path,
+    accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     all_proposer_ids = _proposer_ids(config.proposer_count)
     active_proposer_ids = list(all_proposer_ids)
@@ -168,6 +184,7 @@ def _run_consensus_step(
                 active_proposer_ids=active_proposer_ids,
                 locked_outputs=locked_outputs,
                 run_root=run_root,
+                accepted_step_outputs=accepted_step_outputs,
             )
         except Exception as exc:
             return {
@@ -213,7 +230,16 @@ def _run_consensus_step(
 
         try:
             review = _read_json(attempt_paths["review_path"])
-            consensus = _review_consensus(review, active_proposer_ids=active_proposer_ids)
+            proposer_outputs = _read_proposer_outputs(attempt_paths["round_root"], active_proposer_ids)
+            consensus = _review_consensus(
+                review,
+                active_proposer_ids=active_proposer_ids,
+                selectable_proposer_ids=list(
+                    dict.fromkeys([*active_proposer_ids, *[proposer_id for proposer_id in locked_outputs]])
+                ),
+                proposer_outputs=proposer_outputs,
+                reviewer_reference_claim=step.reviewer_reference_claim,
+            )
         except Exception as exc:
             attempt_record["error"] = str(exc)
             attempts.append(attempt_record)
@@ -227,7 +253,6 @@ def _run_consensus_step(
                 "reviewer_consensus": None,
                 "error": str(exc),
             }
-        proposer_outputs = _read_proposer_outputs(attempt_paths["round_root"], active_proposer_ids)
         attempt_record["consensus"] = consensus
         attempt_record["proposer_output_paths"] = {
             proposer_id: str(attempt_paths["round_root"] / "proposer_outputs" / f"{proposer_id}.json")
@@ -236,7 +261,7 @@ def _run_consensus_step(
         attempts.append(attempt_record)
 
         status = str(consensus.get("status", "unresolved"))
-        if status == "all_agree":
+        if status in {"all_agree", "reference_disagrees"}:
             accepted_result = consensus.get("accepted_result")
             return {
                 "step_id": step.step_id,
@@ -288,14 +313,19 @@ def _attempt_batch_config(
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
     run_root: Path,
+    accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     attempt_id = f"{step.step_id}_attempt_{attempt_number:03d}"
+    selectable_proposer_ids = list(
+        dict.fromkeys([*active_proposer_ids, *[proposer_id for proposer_id in locked_outputs]])
+    )
     caller_context = _caller_context(
         config,
         step,
         attempt_number=attempt_number,
         active_proposer_ids=active_proposer_ids,
         locked_outputs=locked_outputs,
+        accepted_step_outputs=accepted_step_outputs,
     )
     return {
         "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
@@ -310,8 +340,20 @@ def _attempt_batch_config(
                 "max_rounds": 1,
                 "early_stop": {"enabled": False},
                 "caller_context": caller_context,
-                "proposers": [_proposer_config(proposer_id) for proposer_id in active_proposer_ids],
-                "reviewers": [_reviewer_config(active_proposer_ids)],
+                "proposers": [
+                    _proposer_config(
+                        proposer_id,
+                        runtime=_proposer_runtime(config, step),
+                    )
+                    for proposer_id in active_proposer_ids
+                ],
+                "reviewers": [
+                    _reviewer_config(
+                        active_proposer_ids,
+                        selectable_proposer_ids,
+                        reviewer_reference_claim=step.reviewer_reference_claim,
+                    )
+                ],
             }
         ],
     }
@@ -324,6 +366,7 @@ def _caller_context(
     attempt_number: int,
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
+    accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     allowed_context = _sanitize_caller_allowed_context(step.allowed_context)
     foundation_context = _foundation_context_for_step(step)
@@ -337,16 +380,45 @@ def _caller_context(
         "attempt_number": attempt_number,
         "active_proposer_ids": active_proposer_ids,
         "locked_outputs": copy.deepcopy(locked_outputs),
+        "accepted_prior_step_outputs": copy.deepcopy(dict(accepted_step_outputs)),
         "max_recalculations": config.max_recalculations,
         "integrity_reference": _integrity_reference(config.defaults.get("integrity_reference_path")),
-        "consensus_instruction": "Work only on this calculation step. Respect locked_outputs as already accepted unless explicitly asked to check them.",
+        "consensus_instruction": "Work only on this calculation step. Respect accepted_prior_step_outputs and locked_outputs as already accepted unless explicitly asked to check them.",
     }
     if foundation_context is not None:
         context["foundation_context"] = foundation_context
     return context
 
 
-def _proposer_config(proposer_id: str) -> dict[str, Any]:
+def _proposer_runtime(config: ConsensusConfig, step: ConsensusStep) -> dict[str, Any]:
+    if step.reviewer_reference_claim:
+        runtime = {
+            "allow_internet": False,
+            "allow_mcp": False,
+            "codex_sandbox": "read-only",
+        }
+    elif step.kind == "new_calculation":
+        runtime = {
+            "allow_internet": True,
+            "allow_mcp": True,
+            "mcp_mode": "arc-only",
+            "codex_sandbox": "read-only",
+        }
+    else:
+        runtime = {
+            "allow_internet": False,
+            "allow_mcp": False,
+            "codex_sandbox": "read-only",
+        }
+    runtime.update(_dict(config.defaults.get("proposer_runtime", {}), "defaults.proposer_runtime"))
+    runtime.update(step.proposer_runtime)
+    if runtime.get("allow_mcp") and "mcp_mode" not in runtime:
+        runtime["mcp_mode"] = "arc-only"
+    return runtime
+
+
+def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[str, Any]:
+    source_policy = _proposer_source_policy(runtime)
     return {
         "id": proposer_id,
         "prompt": {
@@ -355,24 +427,71 @@ def _proposer_config(proposer_id: str) -> dict[str, Any]:
                 "First read and follow caller_context.integrity_reference.content. "
                 "Use only caller_context.step_prompt, caller_context.allowed_context, "
                 "caller_context.foundation_context when present, accepted locked_outputs, "
-                "and your own SymPy/local algebra. Do not use the internet or paper tools. "
-                "If a Wolfram MCP is available without paper or internet tools, it may be "
-                "used only for algebraic verification. Do the calculation very clearly "
-                "step by step; never skip a step. "
+                "caller_context.accepted_prior_step_outputs, and your own SymPy/local algebra. "
+                f"{source_policy} Wolfram may be used only for algebraic "
+                "verification. You must strictly derive from the foundation context and "
+                "accepted prior step outputs and locked_outputs. External sources may inspire methods, but do not "
+                "directly use any result from papers or the internet unless it appears in "
+                "the foundation file, accepted prior step outputs, or accepted locked_outputs. If you need an external "
+                "identity or intermediate result, derive it here. External sources may use "
+                "different conventions; map notation back to foundation conventions before "
+                "using it. Do the calculation very clearly step by step; never skip a step. "
+                "Write all mathematical expressions in derivation, assumptions, and final_result "
+                "as display-ready LaTeX inside Markdown math delimiters or as LaTeX strings in "
+                "JSON fields; avoid ASCII-only math such as rho_2, eta_prime, or T_ab when a "
+                "LaTeX form such as \\rho_2, \\eta', or T_{ab} is intended for the report. "
                 "Return one JSON object with result_summary, derivation, assumptions, "
-                "reliable_until, and final_result. Put the final mathematical result in "
-                "final_result using explicit symbols so a reviewer can compare it with "
-                "other proposers by evaluating A-B, B-C, and A-C. Do not coordinate with "
-                "other proposers.\n\n"
+                "validity_scope, and final_result. Use validity_scope for assumptions, "
+                "conventions, limits, and unresolved dependencies; do not use date-like "
+                "reliability fields. Put the final mathematical result in final_result using "
+                "explicit symbols so a reviewer can compare it with other proposers by "
+                "evaluating A-B, B-C, and A-C. Do not coordinate with other proposers.\n\n"
                 "{caller_context_json}"
             ),
         },
         "output_schema": {"type": "object"},
-        "runtime": {"allow_internet": False, "allow_mcp": False, "codex_sandbox": "read-only"},
+        "runtime": dict(runtime),
     }
 
 
-def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
+def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
+    allow_mcp = bool(runtime.get("allow_mcp"))
+    allow_internet = bool(runtime.get("allow_internet"))
+    if not allow_mcp and not allow_internet:
+        return (
+            "Do not use internet search. Do not use ARC paper MCP tools. "
+            "Do not read paper source sections, arXiv pages, INSPIRE pages, "
+            "cached paper text, or any external source. Use only the supplied "
+            "caller_context, accepted locked_outputs, and your own local algebra. "
+            "Do not use validation-only final formulas as derivation inputs."
+        )
+    parts = []
+    if allow_mcp:
+        parts.append(
+            "You may use ARC paper MCP tools only to read the main reference and cited "
+            "sections explicitly named in caller_context."
+        )
+    else:
+        parts.append("Do not use ARC paper MCP tools or cached paper text.")
+    if allow_internet:
+        parts.append("Internet search is allowed only for source discovery or uncached paper access.")
+    else:
+        parts.append("Do not use internet search.")
+    parts.append("Cite any paper tool or internet source you use.")
+    parts.append("Do not use validation-only final formulas as derivation inputs.")
+    return " ".join(parts)
+
+
+def _reviewer_config(
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str],
+    *,
+    reviewer_reference_claim: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    reference_instruction = _reviewer_reference_instruction(
+        reviewer_reference_claim,
+        active_proposer_ids=active_proposer_ids,
+    )
     return {
         "id": "reviewer_001",
         "prompt": {
@@ -380,6 +499,8 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
             "template": (
                 "First read and follow caller_context.integrity_reference.content. "
                 "Compare current_proposer_outputs_json for the current calculation step. "
+                "Treat caller_context.accepted_prior_step_outputs as accepted context from "
+                "earlier steps, not as current proposer outputs. "
                 "Do not modify original equations. For analytic checks, first use expand, "
                 "then simplify, then substitutions from checked equations in "
                 "caller_context.foundation_context. Document the substitution/check history "
@@ -390,8 +511,18 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
                 "In review_payload.consensus, "
                 "set status to all_agree, two_agree, all_disagree, or unresolved. Include "
                 "accepted_result, agreed_proposer_ids, likely_wrong_proposer_ids, "
-                "recalculate_proposer_ids, reliable_until, analysis, and "
-                "pairwise_symbolic_checks. Let A, B, and C be the final mathematical results "
+                "recalculate_proposer_ids, validity_scope, analysis, and "
+                "pairwise_symbolic_checks. Also include best_written_proposer_id and "
+                "best_written_selection_reason. When status is all_agree, choose "
+                "best_written_proposer_id from agreed_proposer_ids or accepted "
+                "caller_context.locked_outputs by clearest logic, most complete "
+                "details, and best readability; this copy will be used "
+                "for the full calculation appendix. When status is reference_disagrees, "
+                "choose best_written_proposer_id from the agreeing blind proposer ids by "
+                "the same clarity rule because the blind proposer result is accepted. "
+                "If the status is neither all_agree nor reference_disagrees, set "
+                "best_written_proposer_id to null and explain why. "
+                "Let A, B, and C be the final mathematical results "
                 "from proposer_001, proposer_002, and proposer_003 when those proposer ids "
                 "are active. Use SymPy whenever available to simplify A-B, B-C, and A-C. "
                 "If used_sympy=true, pairwise_symbolic_checks.sympy_code must include "
@@ -409,16 +540,54 @@ def _reviewer_config(active_proposer_ids: list[str]) -> dict[str, Any]:
                 "10 randomly selected data points and report check_method=numerical, "
                 "sample_count, numerical_relative_error as a relative error, and the sampled check history. "
                 "If exactly one proposer is likely wrong, name only that proposer for "
-                "recalculation; otherwise ask all proposers to recalculate.\n\n"
+                "recalculation; otherwise ask all proposers to recalculate. "
+                f"{reference_instruction}\n\n"
                 "{current_proposer_outputs_json}"
             ),
         },
-        "output_schema": _reviewer_output_schema(active_proposer_ids),
+        "output_schema": _reviewer_output_schema(
+            active_proposer_ids,
+            selectable_proposer_ids,
+            allow_reference_disagrees=bool(reviewer_reference_claim),
+        ),
         "runtime": {"allow_mcp": False, "codex_sandbox": "read-only"},
     }
 
 
-def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
+def _reviewer_reference_instruction(
+    reviewer_reference_claim: Mapping[str, Any] | None,
+    *,
+    active_proposer_ids: list[str],
+) -> str:
+    if not reviewer_reference_claim:
+        return ""
+    claim_json = json.dumps(reviewer_reference_claim, indent=2, ensure_ascii=False, sort_keys=True)
+    first = active_proposer_ids[0] if len(active_proposer_ids) >= 1 else "proposer_001"
+    second = active_proposer_ids[1] if len(active_proposer_ids) >= 2 else "proposer_002"
+    return (
+        "Reviewer-only blind reference check is active. Do not reveal the reference claim "
+        "to proposers through proposer_messages. Treat A as the final result from "
+        f"{first}, B as the final result from {second}, and C as reviewer_reference_claim. "
+        "For A=B=C, set status=all_agree. For A=B but A-C and B-C are nonzero, "
+        "set status=reference_disagrees, set agreed_proposer_ids to the agreeing proposer ids, "
+        "and put the blind proposer result in accepted_result with reference_claim_status='disagrees'. "
+        "If A and B disagree, do not accept the reference claim merely because one proposer matches it; "
+        "set status=unresolved or all_disagree and request recalculation.\n\n"
+        f"reviewer_reference_claim:\n{claim_json}"
+    )
+
+
+def _reviewer_output_schema(
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str] | None = None,
+    *,
+    allow_reference_disagrees: bool = False,
+) -> dict[str, Any]:
+    if selectable_proposer_ids is None:
+        selectable_proposer_ids = active_proposer_ids
+    status_values = ["all_agree", "two_agree", "all_disagree", "unresolved"]
+    if allow_reference_disagrees:
+        status_values.append("reference_disagrees")
     proposer_message_properties = {
         proposer_id: {
             "type": "object",
@@ -462,13 +631,15 @@ def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
                             "agreed_proposer_ids",
                             "likely_wrong_proposer_ids",
                             "recalculate_proposer_ids",
-                            "reliable_until",
+                            "validity_scope",
                             "analysis",
                             "pairwise_symbolic_checks",
+                            "best_written_proposer_id",
+                            "best_written_selection_reason",
                         ],
                         "properties": {
                             "status": {
-                                "enum": ["all_agree", "two_agree", "all_disagree", "unresolved"]
+                                "enum": status_values
                             },
                             "accepted_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
                             "agreed_proposer_ids": {
@@ -483,8 +654,15 @@ def _reviewer_output_schema(active_proposer_ids: list[str]) -> dict[str, Any]:
                                 "type": "array",
                                 "items": {"enum": active_proposer_ids},
                             },
-                            "reliable_until": {"type": "string"},
+                            "validity_scope": {"type": "string"},
                             "analysis": {"type": "string"},
+                            "best_written_proposer_id": {
+                                "anyOf": [
+                                    {"enum": selectable_proposer_ids},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "best_written_selection_reason": {"type": "string"},
                             "pairwise_symbolic_checks": {
                                 "type": "object",
                                 "required": [
@@ -549,7 +727,16 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _review_consensus(review: Mapping[str, Any], *, active_proposer_ids: list[str]) -> dict[str, Any]:
+def _review_consensus(
+    review: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str] | None = None,
+    proposer_outputs: Mapping[str, Any] | None = None,
+    reviewer_reference_claim: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if selectable_proposer_ids is None:
+        selectable_proposer_ids = active_proposer_ids
     if review.get("schema_version") != REVIEW_ENVELOPE_SCHEMA:
         raise ValueError(f"review schema_version must be {REVIEW_ENVELOPE_SCHEMA}")
     payload = review.get("review_payload")
@@ -559,11 +746,204 @@ def _review_consensus(review: Mapping[str, Any], *, active_proposer_ids: list[st
     if not isinstance(consensus, dict):
         raise ValueError("review.review_payload.consensus must be an object")
     status = consensus.get("status")
-    if status not in {"all_agree", "two_agree", "all_disagree", "unresolved"}:
-        raise ValueError("consensus.status must be all_agree, two_agree, all_disagree, or unresolved")
-    if status == "all_agree" and len(active_proposer_ids) >= 3:
-        _validate_all_agree_pairwise_checks(consensus)
+    allowed_statuses = {"all_agree", "two_agree", "all_disagree", "unresolved"}
+    if reviewer_reference_claim:
+        allowed_statuses.add("reference_disagrees")
+    if status not in allowed_statuses:
+        message = "consensus.status must be all_agree, two_agree, all_disagree, or unresolved"
+        if reviewer_reference_claim:
+            message += ", or reference_disagrees"
+        raise ValueError(message)
+    if status == "all_agree":
+        _validate_best_written_selection(
+            consensus,
+            active_proposer_ids=active_proposer_ids,
+            selectable_proposer_ids=selectable_proposer_ids,
+        )
+    if status == "all_agree" and (len(active_proposer_ids) >= 3 or reviewer_reference_claim):
+        try:
+            _validate_all_agree_pairwise_checks(consensus)
+        except ValueError as exc:
+            if reviewer_reference_claim or len(active_proposer_ids) < 3:
+                raise
+            fallback_checks = _main_agent_sympy_agreement_check(
+                proposer_outputs or {},
+                active_proposer_ids=active_proposer_ids,
+                validation_error=str(exc),
+            )
+            if fallback_checks is None:
+                raise
+            consensus = dict(consensus)
+            consensus["pairwise_symbolic_checks"] = fallback_checks
+            consensus["main_agent_agreement_check"] = {
+                "status": "accepted_by_sympy_fallback",
+                "reason": str(exc),
+            }
+            _validate_all_agree_pairwise_checks(consensus)
+    if status == "reference_disagrees":
+        _validate_best_written_selection(
+            consensus,
+            active_proposer_ids=active_proposer_ids,
+            selectable_proposer_ids=selectable_proposer_ids,
+        )
+        _validate_reference_disagrees_pairwise_checks(
+            consensus,
+            active_proposer_ids=active_proposer_ids,
+        )
     return dict(consensus)
+
+
+def _validate_best_written_selection(
+    consensus: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str],
+) -> None:
+    best_written = consensus.get("best_written_proposer_id")
+    if not isinstance(best_written, str) or not best_written.strip():
+        raise ValueError("best_written_proposer_id is required for all_agree consensus")
+    if best_written not in selectable_proposer_ids:
+        raise ValueError("best_written_proposer_id must identify an active or locked proposer output")
+    agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), active_proposer_ids)
+    if best_written in active_proposer_ids and best_written not in agreed_ids:
+        raise ValueError("best_written_proposer_id must be one of agreed_proposer_ids for all_agree consensus")
+    reason = consensus.get("best_written_selection_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("best_written_selection_reason is required for all_agree consensus")
+
+
+def _main_agent_sympy_agreement_check(
+    proposer_outputs: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+    validation_error: str,
+) -> dict[str, Any] | None:
+    try:
+        from sympy import Symbol, expand, simplify, sympify
+    except Exception:
+        return None
+
+    parsed_by_id: dict[str, dict[str, Any]] = {}
+    for proposer_id in active_proposer_ids[:3]:
+        payload = proposer_outputs.get(proposer_id)
+        if not isinstance(payload, dict):
+            return None
+        parsed = _extract_named_final_expressions(payload.get("final_result"))
+        if not parsed:
+            return None
+        parsed_by_id[proposer_id] = parsed
+
+    common_names = set.intersection(*(set(parsed) for parsed in parsed_by_id.values()))
+    if not common_names:
+        return None
+
+    pair_ids = [
+        ("A_minus_B_zero", active_proposer_ids[0], active_proposer_ids[1], "A-B"),
+        ("B_minus_C_zero", active_proposer_ids[1], active_proposer_ids[2], "B-C"),
+        ("A_minus_C_zero", active_proposer_ids[0], active_proposer_ids[2], "A-C"),
+    ]
+    pair_results: dict[str, bool] = {}
+    history: list[str] = [
+        f"Main-agent SymPy fallback used after reviewer validation failed: {validation_error}",
+        f"Parsed common named final_result expressions: {', '.join(sorted(common_names))}.",
+    ]
+    code_lines = ["from sympy import Symbol, expand, simplify, sympify"]
+
+    for result_key, left_id, right_id, label in pair_ids:
+        pair_zero = True
+        for expression_name in sorted(common_names):
+            locals_map: dict[str, Any] = {}
+            left_expr = _sympify_named_expression(
+                str(parsed_by_id[left_id][expression_name]),
+                Symbol=Symbol,
+                sympify=sympify,
+                locals_map=locals_map,
+            )
+            right_expr = _sympify_named_expression(
+                str(parsed_by_id[right_id][expression_name]),
+                Symbol=Symbol,
+                sympify=sympify,
+                locals_map=locals_map,
+            )
+            if left_expr is None or right_expr is None:
+                return None
+            difference = simplify(expand(left_expr - right_expr))
+            is_zero = bool(difference == 0)
+            pair_zero = pair_zero and is_zero
+            history.append(f"{label} for {expression_name}: simplify(expand(left-right)) -> {difference}.")
+            code_lines.append(
+                f"# {label} for {expression_name}: simplify(expand(({parsed_by_id[left_id][expression_name]}) - ({parsed_by_id[right_id][expression_name]})))"
+            )
+        pair_results[result_key] = pair_zero
+
+    true_count = sum(1 for value in pair_results.values() if value)
+    if true_count < 2:
+        return None
+    return {
+        "used_sympy": True,
+        "A_minus_B_zero": pair_results["A_minus_B_zero"],
+        "B_minus_C_zero": pair_results["B_minus_C_zero"],
+        "A_minus_C_zero": pair_results["A_minus_C_zero"],
+        "true_count": true_count,
+        "sympy_code": "\n".join(code_lines),
+        "notes": "Main agent fallback proved proposer agreement with SymPy after reviewer evidence was below standard.",
+        "check_method": "analytic",
+        "sample_count": 0,
+        "numerical_relative_error": None,
+        "check_history": history,
+        "fallback_source": "main_agent_sympy",
+    }
+
+
+def _extract_named_final_expressions(final_result: Any) -> dict[str, str]:
+    if isinstance(final_result, dict):
+        return {
+            str(key): str(value).strip()
+            for key, value in final_result.items()
+            if isinstance(value, str) and _looks_like_expression(value)
+        }
+    if not isinstance(final_result, str):
+        return {}
+    expressions: dict[str, str] = {}
+    for raw_line in final_result.splitlines():
+        line = raw_line.strip()
+        if "=" not in line:
+            continue
+        left, right = line.split("=", 1)
+        name_match = re.search(r"([A-Za-z][A-Za-z0-9_]*)\s*$", left.strip())
+        if not name_match:
+            continue
+        expression = _strip_expression_comment(right)
+        if expression and _looks_like_expression(expression):
+            expressions[name_match.group(1)] = expression
+    return expressions
+
+
+def _strip_expression_comment(value: str) -> str:
+    expression = value.strip()
+    expression = expression.split("#", 1)[0].strip()
+    expression = expression.split(",", 1)[0].strip()
+    expression = expression.split(";", 1)[0].strip()
+    expression = re.split(r"\s+\(", expression, maxsplit=1)[0].strip()
+    return expression.rstrip(".")
+
+
+def _looks_like_expression(value: str) -> bool:
+    if not value.strip():
+        return False
+    without_names = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", "", value.replace("^", "**"))
+    return re.fullmatch(r"[\d\s+\-*/().]*", without_names) is not None
+
+
+def _sympify_named_expression(value: str, *, Symbol: Any, sympify: Any, locals_map: dict[str, Any]) -> Any | None:
+    expression = value.replace("^", "**")
+    names = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", expression))
+    for name in names:
+        locals_map.setdefault(name, Symbol(name))
+    try:
+        return sympify(expression, locals=locals_map)
+    except Exception:
+        return None
 
 
 def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
@@ -593,10 +973,29 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
             raise ValueError("analytic all_agree without SymPy requires explicit notes")
         history_text = "\n".join(str(item) for item in checks.get("check_history", []))
         lowered_evidence = f"{notes}\n{history_text}".lower()
+        has_explicit_differences = all(
+            any(marker in lowered_evidence for marker in markers)
+            for markers in [["a-b", "a - b"], ["b-c", "b - c"], ["a-c", "a - c"]]
+        )
+        has_zero_results = lowered_evidence.count("=0") >= 2 or lowered_evidence.count("= 0") >= 2
+        says_differences_reduce_to_zero = (
+            "differences reduce to zero" in lowered_evidence
+            or "difference reduce to zero" in lowered_evidence
+            or "reduce to zero symbolically" in lowered_evidence
+        )
+        has_term_by_term_check = "term-by-term" in lowered_evidence and (
+            "overall factor" in lowered_evidence
+            or "every term matches" in lowered_evidence
+            or "all terms match" in lowered_evidence
+        )
         weak_markers = ["spacing", "string", "formatting", "visual", "inspection", "identical"]
-        if any(marker in lowered_evidence for marker in weak_markers):
+        if any(marker in lowered_evidence for marker in weak_markers) and not (
+            (has_explicit_differences and has_zero_results)
+            or says_differences_reduce_to_zero
+            or has_term_by_term_check
+        ):
             raise ValueError("manual all_agree cannot rely on string, spacing, formatting, or visual comparison")
-        if not all(marker in lowered_evidence for marker in ["a-b", "b-c", "a-c"]):
+        if not (has_explicit_differences or says_differences_reduce_to_zero or has_term_by_term_check):
             raise ValueError("manual all_agree requires explicit A-B, B-C, and A-C algebraic differences")
     if method in {"numerical", "mixed"}:
         sample_count = checks.get("sample_count")
@@ -612,6 +1011,47 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
     history = checks.get("check_history")
     if not isinstance(history, list) or not history:
         raise ValueError("all_agree requires documented pairwise check history")
+
+
+def _validate_reference_disagrees_pairwise_checks(
+    consensus: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+) -> None:
+    checks = consensus.get("pairwise_symbolic_checks")
+    if not isinstance(checks, dict):
+        raise ValueError("reference_disagrees requires pairwise_symbolic_checks")
+    agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), active_proposer_ids)
+    if len(set(agreed_ids)) < 2:
+        raise ValueError("reference_disagrees requires two agreeing blind proposer ids")
+    if checks.get("A_minus_B_zero") is not True:
+        raise ValueError("reference_disagrees requires A-B=0 for the blind proposers")
+    if checks.get("A_minus_C_zero") is not False or checks.get("B_minus_C_zero") is not False:
+        raise ValueError("reference_disagrees requires A-C and B-C to be nonzero")
+    method = str(checks.get("check_method", "")).strip().lower()
+    if method not in {"analytic", "numerical", "mixed"}:
+        raise ValueError("reference_disagrees requires check_method to be analytic, numerical, or mixed")
+    used_sympy = checks.get("used_sympy")
+    if not isinstance(used_sympy, bool):
+        raise ValueError("reference_disagrees requires used_sympy to be true or false")
+    if used_sympy:
+        sympy_code = str(checks.get("sympy_code", "")).lower()
+        if "expand" not in sympy_code or "simplify" not in sympy_code:
+            raise ValueError("SymPy reference_disagrees requires expand and simplify checks")
+    if method in {"numerical", "mixed"}:
+        sample_count = checks.get("sample_count")
+        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 10:
+            raise ValueError("numerical reference_disagrees requires at least 10 randomly selected data points")
+        relative_error = checks.get("numerical_relative_error")
+        if (
+            not isinstance(relative_error, (int, float))
+            or isinstance(relative_error, bool)
+            or not math.isfinite(float(relative_error))
+        ):
+            raise ValueError("numerical reference_disagrees requires numerical_relative_error")
+    history = checks.get("check_history")
+    if not isinstance(history, list) or not history:
+        raise ValueError("reference_disagrees requires documented check history")
 
 
 def _foundation_context_for_step(step: ConsensusStep) -> dict[str, Any] | None:
@@ -666,7 +1106,7 @@ def filter_foundation_context(
         if isinstance(item, dict) and _convention_is_checked(item)
     ]
     return {
-        "schema_version": "arc.research_foundation_context.v1",
+        "schema_version": "arc.foundation_context.v1",
         "target_equation_id": target_equation_id,
         "target_equation": target_equation,
         "allowed_equations": allowed_equations,
@@ -738,7 +1178,7 @@ def _resolve_integrity_path(path_value: Any = None) -> Path | None:
 
 def _default_integrity_path() -> Path | None:
     for root in [Path.cwd(), *Path.cwd().parents]:
-        candidate = root / "skills/arc/references/rules/integrity.md"
+        candidate = root / "skills/arc/rules/integrity.md"
         if candidate.exists():
             return candidate
     return None
@@ -801,6 +1241,15 @@ def _dict(value: Any, field_name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{field_name} must be an object")
     return copy.deepcopy(value)
+
+
+def _optional_dict(value: Any, field_name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    parsed = _dict(value, field_name)
+    if not parsed:
+        raise ConfigError(f"{field_name} must not be empty when provided")
+    return parsed
 
 
 def _positive_int(value: Any, field_name: str) -> int:

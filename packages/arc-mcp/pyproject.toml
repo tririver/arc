@@ -5,11 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "arc-mcp"
 version = "0.1.0"
-description = "MCP tools for ARC paper query workflows."
+description = "MCP tools for ARC research workflows."
 requires-python = ">=3.11"
 dependencies = [
   "arc-domain",
   "arc-paper",
+  "arc-typeset",
   "mcp>=1.0",
   "pydantic>=2"
 ]

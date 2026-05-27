@@ -2,6 +2,9 @@
 0_ref/
 cache/
 arc-tests/
+.understandignore
+.understand-anything/
+.claude/
 
 # Local secrets and provider credentials
 .env
@@ -10,6 +13,10 @@ arc-tests/
 llm-providers.json
 llm-providers.local.json
 .arc-llm-providers.json
+
+# NPM, PNPM
+
+.pnpm-store/
 
 # Python bytecode and caches
 __pycache__/
@@ -53,3 +60,5 @@ Thumbs.db
 *.tmp
 *.swp
 *.swo
+.understand-anything/config.json
+.understand-anything/config.json

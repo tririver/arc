@@ -31,6 +31,7 @@ class DomainPaths:
     paper_json_pack: Path
     evidence_pack: Path
     domain_summary: Path
+    domain_summary_markdown: Path
     network_html: Path
 
     @classmethod
@@ -52,6 +53,7 @@ class DomainPaths:
             paper_json_pack=domain_dir / "paper_json_pack.json",
             evidence_pack=domain_dir / "evidence_pack.json",
             domain_summary=domain_dir / "domain_summary.json",
+            domain_summary_markdown=domain_dir / "domain_summary.md",
             network_html=domain_dir / "network.html",
         )
 
