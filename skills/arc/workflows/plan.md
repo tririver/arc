@@ -84,6 +84,21 @@ Use fewer only when the calculation is genuinely smaller. If a
 step needs multiple identities, limits, field redefinitions, or approximations,
 split it into substeps.
 
+For equation-heavy work, treat each new nontrivial equation, identity, limit,
+or claimed relation as its own check or derivation step by default. A step may
+contain multiple equations only when they form a short algebraic chain for the
+same target quantity and each equation follows immediately from the previous
+one. If a step contains more than one displayed target equation, state why those
+equations must be checked together. Do not group equations merely because they
+appear in the same section, topic, or source paragraph; section-level grouping
+is for reading order, not calculation-step boundaries.
+
+Before execution, count the nontrivial equations or claims to derive/check, the
+planned calculation/check steps, and the largest number of target equations in
+one step. If the plan has far fewer steps than nontrivial equations or any step
+has an unjustified bundle of target equations, print `WARNING: plan too coarse`
+and revise the plan before running consensus.
+
 Step 3: For every step, specify:
 
 ```text

@@ -4,6 +4,45 @@ This repository contains ARC research tooling rebuilt as Python packages plus
 thin agent adapters. The reference snapshot in `0_ref/` is read-only context and
 must not be modified.
 
+## Project Map
+
+ARC is an agent-skill layer in `skills/arc/` backed by reusable Python packages
+in `packages/`; when the ARC skill is unavailable, agents should read the
+relevant workflow file directly and call the package CLI or MCP tools it names.
+
+- `skills/arc/workflows/domain.md`: Use this workflow to build project-local
+  research-domain artifacts from seed papers, including domain summaries,
+  domain HTML, graph data, and paper JSON packs.
+- `skills/arc/workflows/ideas.md`: Use this workflow to run concurrent
+  proposer-reviewer idea loops, rank completed ideas, and choose a calculation
+  candidate.
+- `skills/arc/workflows/foundation.md`: Use this workflow after
+  `initial-plan.md` to create versioned foundation JSON and Markdown from
+  accepted definitions, conventions, axioms, and source-tracked starting
+  equations.
+- `skills/arc/workflows/plan.md`: Use this workflow after a user selects a
+  concrete calculation idea to gather evidence and write a source-aware,
+  reviewable calculation plan.
+- `skills/arc/workflows/calculate.md`: Use this workflow after
+  `initial-foundation.md` to check non-axiom foundation items, run blind
+  reference checks, execute consensus calculation steps, and write the
+  calculation report.
+- `skills/arc/workflows/check.md`: Use this workflow when the user asks to
+  check Markdown or PDF research notes by separating foundation from claims and
+  verifying claims through the plan/foundation/calculate flow.
+- `packages/arc-domain`: Owns research-domain construction from seed papers,
+  including foundation/domain-paper selection, graph artifacts, evidence packs,
+  HTML rendering, domain summaries, and paper JSON pack exports.
+- `packages/arc-llm`: Owns reusable host LLM execution, provider/model
+  selection, background jobs, proposer-reviewer batches, consensus execution,
+  and related benchmarking helpers.
+- `packages/arc-paper`: Owns deterministic paper access and caching, ID
+  normalization, ar5iv/INSPIRE metadata, references, citers,
+  full-text/equation search, paper summaries, and summary batches.
+- `packages/arc-typeset`: Owns report typesetting utilities, including
+  Markdown-to-PDF conversion, Markdown translation, and batch translation of
+  project reports.
+
 ## Research Tool Development
 
 - Build ARC tools as general theoretical-physics research infrastructure, not
@@ -105,6 +144,9 @@ must not be modified.
   stay opt-in through `ARC_RUN_NET_TESTS=1`.
 - Keep tests close to the module they cover. Use repository-level tests only for
   cross-package integration behavior.
+- Put generated ARC workflow/test-run project artifacts under `arc-tests/`; do
+  not create ad hoc run directories at repository root or inside package
+  directories.
 
 ## Language Policy
 

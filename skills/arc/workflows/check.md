@@ -5,6 +5,11 @@ Markdown or PDF research notes. The goal is to identify the foundation and then
 verify every non-foundation technical claim without exposing the full note body
 to proposer agents.
 
+If the user explicitly asks to use `check.md`, treat that as a request to run
+this workflow, not merely to discuss or summarize it. Do not stop after a
+main-agent inspection unless the workflow is in interactive mode and the user
+needs to review obvious issues before proposer-reviewer execution.
+
 This workflow reuses:
 
 ```text
@@ -60,6 +65,21 @@ MCP `md2pdf(input="<project-dir>/initial-note-check.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait
 before continuing.
 
+### Phase 2a: Main-Agent Preflight
+
+Step 1: Before running proposer-reviewer checks, the main agent must inspect
+the notes directly and list any obvious typos, inconsistent conventions,
+missing factors, sign mistakes, malformed equations, or target/source mapping
+problems it immediately spots.
+
+Step 2: Record these preflight findings in `initial-note-check.md` and
+`note-check-triage.json`. Mark them as preflight findings, not verified
+proposer-reviewer results.
+
+Step 3: In `interactive` mode, pause after preflight and ask the user to review
+the obvious issues before launching proposer-reviewer execution. In `auto`
+mode, do not pause; continue to Phase 3 after recording the findings.
+
 ## Phase 3: Reuse Calculation Workflows
 
 Step 1: Treat the note check as an explicit calculation idea: verify the note
@@ -78,6 +98,12 @@ Step 4: Execute `calculate.md`. Put each note claim into
 `reviewer_reference_claim` only. The reviewer may compare proposer derivations
 against the note claim; proposers must not see the note claim unless the user
 explicitly requests non-blind checking.
+
+Step 5: Directly trigger proposer-reviewer execution through
+`arc-llm proposers-reviewer-consensus --config <config> --json` or the
+equivalent host/MCP wrapper. Do not write the final `calculation-report.md`
+until proposer-reviewer execution has run, unless the report is explicitly a
+blocked or partial-status report that says consensus did not complete.
 
 ## Phase 4: Report
 
