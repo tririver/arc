@@ -532,7 +532,16 @@ def _search_parsed_source_records(
     for equation in parsed.get("equations") or []:
         haystack = " ".join(
             str(equation.get(field) or "")
-            for field in ("id", "equation", "before", "after", "section_title", "tex_label", "printed_equation_number")
+            for field in (
+                "id",
+                "equation",
+                "before",
+                "after",
+                "section_title",
+                "tex_label",
+                "printed_equation_number",
+                "printed_equation_numbers",
+            )
         )
         if _text_contains(haystack, query, case_sensitive=case_sensitive):
             hits.append({"kind": "equation", **equation})

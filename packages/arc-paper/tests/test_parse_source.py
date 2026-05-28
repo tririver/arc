@@ -206,6 +206,144 @@ def test_parse_tex_pdf_brackets_number_between_before_and_after_text(monkeypatch
     assert parsed["equations"][1]["printed_equation_number"] == "8.35"
 
 
+def test_parse_tex_pdf_ignores_inline_references_when_selecting_printed_number(monkeypatch, tmp_path):
+    tex_path = tmp_path / "lecture9.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Cosmology}",
+                r"为了得到$\ddot a$满足的方程，我们对弗里德曼方程 \eqref{eq:friedmann} 求时间导数：",
+                r"\begin{align}",
+                r"& 2H \dot H = \frac{8\pi G}{3} \dot\rho",
+                r"\teq[$\dot\rho = -3H(\rho+p)$]{使用\eqref{eq:continuity}}",
+                r"- 8\pi G H (\rho+p)~,",
+                r"\\ \label{eq:friedmann-dotH}",
+                r"& \mathrm{即} ~ \dot H = \frac{\ddot a}{a} - H^2 = -4\pi G (\rho + p)~.",
+                r"\end{align}",
+                r"再次使用弗里德曼方程消去$H^2$，得",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "\n".join(
+                [
+                    "为了得到 a 满足的方程，我们对弗里德曼方程 (9.15) 求时间导数：",
+                    "使用 (9.8)",
+                    "2H H = 8πG/3 ρ - 8πGH(ρ + p),                  (9.18)",
+                    "即 H = a/a - H2 = -4πG(ρ + p).                  (9.19)",
+                    "再次使用弗里德曼方程消去 H2，得",
+                ]
+            )
+        ],
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
+
+    assert parsed["equations"][0]["printed_equation_number"] == "9.19"
+    assert parsed["equations"][0]["printed_equation_numbers"] == ["9.18", "9.19"]
+
+
+def test_parse_tex_pdf_uses_isolated_printed_number_before_page_break(monkeypatch, tmp_path):
+    tex_path = tmp_path / "lecture9.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Cosmology}",
+                "后续内容中，我们只感兴趣平坦宇宙。其度规为",
+                r"\begin{align}\label{eq:frw-flat}",
+                r"ds^2 = -dt^2 + a^2(t) \left( dr^2 + r^2 d\Omega^2 \right)~.",
+                r"\end{align}",
+                "由均匀、各向同性，宇宙中物质的能动张量可以写成理想流体的形式：",
+                r"\begin{align}",
+                r"T^{\mu\nu} = (\rho + p) u^\mu u^\nu + g^{\mu\nu} p~.",
+                r"\end{align}",
+                r"其协变守恒 $\nabla_\mu T^{\mu \nu}=0$ 的$\nu=0$分量为：",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "\n".join(
+                [
+                    "后续内容中，我们只感兴趣平坦宇宙。其度规为",
+                    "ds2 = -dt2 + a2(t)(dr2 + r2 dΩ2).",
+                    "                                      (9.6)",
+                    "这里，尺度因子 a(t) 的值本身没有物理意义。",
+                    "由均匀、各向同性，宇宙中物质的能动张量可以写成理想流体的形式：",
+                    "Tµν = (ρ + p)uµuν + gµνp",
+                    "                                      (9.7)",
+                ]
+            ),
+            r"其协变守恒 ∇µT µν = 0 的 ν=0 分量为：",
+        ],
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
+
+    assert parsed["equations"][0]["printed_equation_number"] == "9.6"
+    assert parsed["equations"][1]["printed_equation_number"] == "9.7"
+
+
+def test_parse_tex_pdf_records_all_printed_numbers_for_multirow_align(monkeypatch, tmp_path):
+    tex_path = tmp_path / "lecture9.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Inflation}",
+                r"回忆宇宙中只有宇宙常数的宇宙，其膨胀率为指数膨胀。",
+                r"\begin{align}\label{eq:first-sr-param}",
+                r"& \mathrm{第一慢滚参数：}",
+                r"&&\epsilon \equiv - \frac{\dot H}{H^2}~, \\",
+                r"& \mathrm{宇宙加速膨胀的条件：}",
+                r"&&\ddot a >0",
+                r"&&\Rightarrow",
+                r"&&\epsilon <1~, \\",
+                r"& \mathrm{接近指数膨胀的条件：}",
+                r"&&H\simeq \mathrm{常数}",
+                r"&&\Rightarrow",
+                r"&&\epsilon \ll 1~.",
+                r"\end{align}",
+                r"为了解决视界等问题，我们需要暴胀持续足够长时间。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "\n".join(
+                [
+                    "回忆宇宙中只有宇宙常数的宇宙，其膨胀率为指数膨胀。",
+                    "第一慢滚参数： epsilon = -H/H2,                    (9.36)",
+                    "宇宙加速膨胀的条件： a>0 => epsilon < 1,           (9.37)",
+                    "接近指数膨胀的条件： H 常数 => epsilon",
+                    "<< 1.                                                (9.38)",
+                    "为了解决视界等问题，我们需要暴胀持续足够长时间。",
+                ]
+            )
+        ],
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
+
+    assert parsed["equations"][0]["printed_equation_number"] == "9.36"
+    assert parsed["equations"][0]["printed_equation_numbers"] == ["9.36", "9.37", "9.38"]
+
+
 def test_parse_tex_pdf_reports_warning_when_pdf_text_is_unavailable(monkeypatch, tmp_path):
     tex_path = tmp_path / "lecture9.tex"
     tex_path.write_text(

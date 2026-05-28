@@ -10,10 +10,11 @@ from typing import Any
 from .ar5iv_html import parse_html
 
 
-PARSER_VERSION = 9
+PARSER_VERSION = 10
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
 EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"
+MATH_LIKE_CHARS = set("=+-*/^_<>≤≥∝⇒≡−•·√∂∇πρφΩωηε")
 GREEK_TOKEN_NAMES = {
     "\u03b1": "alpha",
     "\u03b2": "beta",
@@ -535,8 +536,13 @@ def _enrich_equations_from_pdf(equations: list[dict[str, Any]], pages: list[str]
                 best_page = (page_index, page)
         if best_page and best_score >= 4:
             equation["pdf_page"] = best_page[0]
-            if number := _best_equation_number(best_page[1], equation):
+            number_context = best_page[1]
+            if best_page[0] < len(pages):
+                number_context = f"{number_context}\n{pages[best_page[0]]}"
+            number, numbers = _best_equation_number_match(number_context, equation)
+            if number:
                 equation["printed_equation_number"] = number
+                equation["printed_equation_numbers"] = numbers or [number]
 
 
 def _pdf_match_score(equation: dict[str, Any], page: str) -> int:
@@ -555,30 +561,238 @@ def _pdf_match_score(equation: dict[str, Any], page: str) -> int:
 
 
 def _best_equation_number(page: str, equation: dict[str, Any]) -> str | None:
-    candidates = [(match.group(1), match.start()) for match in re.finditer(rf"\(({EQUATION_NUMBER_PATTERN})\)", page)]
+    number, _ = _best_equation_number_match(page, equation)
+    return number
+
+
+def _best_equation_number_match(page: str, equation: dict[str, Any]) -> tuple[str | None, list[str]]:
+    candidates = _printed_equation_number_candidates(page)
     if not candidates:
-        return None
-    equation_tokens = set(_search_tokens(str(equation.get("equation") or "")))
+        return None, []
+    focused_equation = _label_focused_equation_text(equation)
+    equation_tokens = set(_search_tokens(focused_equation))
     if not equation_tokens:
-        return candidates[0][0]
+        return candidates[0][0], [candidates[0][0]]
     before_tokens = set(_search_tokens(str(equation.get("before") or "")))
     after_tokens = set(_search_tokens(str(equation.get("after") or "")))
     line_spans = _line_spans(page)
+    has_label_focus = focused_equation != str(equation.get("equation") or "")
     best_number = candidates[0][0]
     best_score = -1
-    for number, offset in candidates:
-        equation_window = _line_window_for_offset(line_spans, offset)
-        before_window = _line_window_before_offset(line_spans, offset)
-        after_window = _line_window_after_offset(line_spans, offset)
+    best_index = 0
+    for candidate_index, (number, offset) in enumerate(candidates):
+        if has_label_focus:
+            equation_window = _line_window_for_offset(line_spans, offset, before_lines=3, after_lines=0)
+        else:
+            equation_window = _line_window_for_offset(line_spans, offset, before_lines=8, after_lines=4)
+        before_window = _line_window_before_offset(line_spans, offset, max_lines=12)
+        after_window = _line_window_after_offset(line_spans, offset, max_lines=12)
         before_score = _token_overlap_score(before_tokens, set(_search_tokens(before_window)))
         after_score = _token_overlap_score(after_tokens, set(_search_tokens(after_window)))
         equation_score = _token_overlap_score(equation_tokens, set(_search_tokens(equation_window)))
-        bracket_bonus = 50 if before_score and after_score else 0
-        score = bracket_bonus + (before_score * 4) + (after_score * 4) + equation_score
+        bracket_bonus = 50 if before_score >= 6 and after_score >= 6 else 0
+        if has_label_focus:
+            score = bracket_bonus + (before_score * 2) + (after_score * 4) + (equation_score * 10)
+        else:
+            score = bracket_bonus + (before_score * 4) + (after_score * 4) + equation_score
         if score > best_score:
             best_score = score
             best_number = number
-    return best_number
+            best_index = candidate_index
+    return best_number, _printed_equation_number_sequence(candidates, best_index, equation)
+
+
+def _printed_equation_number_candidates(text: str) -> list[tuple[str, int]]:
+    candidates: list[tuple[str, int]] = []
+    offset = 0
+    previous_nonempty = ""
+    for raw_line in text.splitlines(keepends=True):
+        line_start = offset
+        offset += len(raw_line)
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        match = re.search(rf"\(({EQUATION_NUMBER_PATTERN})\)\s*$", line)
+        if not match:
+            if stripped:
+                previous_nonempty = stripped
+            continue
+        prefix = line[: match.start()].strip()
+        if _looks_like_printed_number_prefix(prefix, previous_nonempty):
+            candidates.append((match.group(1), line_start + match.start()))
+        if stripped:
+            previous_nonempty = stripped
+    return candidates
+
+
+def _printed_equation_number_sequence(
+    candidates: list[tuple[str, int]], primary_index: int, equation: dict[str, Any]
+) -> list[str]:
+    if not candidates:
+        return []
+    row_count, label_index = _numbered_latex_row_info(equation)
+    if row_count <= 1:
+        return [candidates[primary_index][0]]
+    start = primary_index - label_index
+    end = start + row_count
+    if start < 0:
+        start = 0
+        end = min(len(candidates), row_count)
+    if end > len(candidates):
+        end = len(candidates)
+        start = max(0, end - row_count)
+    numbers = [number for number, _ in candidates[start:end]]
+    if candidates[primary_index][0] not in numbers:
+        return [candidates[primary_index][0]]
+    return list(dict.fromkeys(numbers))
+
+
+def _numbered_latex_row_info(equation: dict[str, Any]) -> tuple[int, int]:
+    raw_tex = str(equation.get("raw_tex") or "")
+    if not raw_tex:
+        return 1, 0
+    rows = _latex_rows(raw_tex)
+    if not rows:
+        return 1, 0
+    tex_label = str(equation.get("tex_label") or "")
+    numbered_rows: list[str] = []
+    label_numbered_index = 0
+    for row in rows:
+        if not _latex_row_is_numbered(row):
+            continue
+        if tex_label and re.search(r"\\label\{" + re.escape(tex_label) + r"\}", row):
+            label_numbered_index = len(numbered_rows)
+        numbered_rows.append(row)
+    if not numbered_rows:
+        return 1, 0
+    return len(numbered_rows), min(label_numbered_index, len(numbered_rows) - 1)
+
+
+def _latex_rows(raw_tex: str) -> list[str]:
+    rows: list[str] = []
+    current: list[str] = []
+    for raw_line in raw_tex.splitlines():
+        line = _strip_environment_commands(raw_line)
+        leading_separator = re.match(r"^\s*\\\\\s*(.*)$", line)
+        if leading_separator and current:
+            current.append(r"\\")
+            rows.append("\n".join(current))
+            current = []
+            remainder = leading_separator.group(1)
+            if remainder.strip():
+                current.append(remainder)
+            continue
+        if line.strip() or current:
+            current.append(line)
+        if _has_row_separator(line):
+            rows.append("\n".join(current))
+            current = []
+    if current:
+        rows.append("\n".join(current))
+    return [row for row in rows if _latex_row_has_content(row)]
+
+
+def _latex_row_is_numbered(row: str) -> bool:
+    if re.search(r"\\(?:nonumber|notag)\b", row):
+        return False
+    return _latex_row_has_content(row)
+
+
+def _latex_row_has_content(row: str) -> bool:
+    row = re.sub(r"\\label\{[^{}]+\}", "", row)
+    row = row.replace(r"\\", "")
+    return _has_latex_content(row)
+
+
+def _looks_like_printed_number_prefix(prefix: str, previous_nonempty: str) -> bool:
+    if not prefix:
+        return True
+    if _has_math_like_text(prefix):
+        return True
+    return bool(re.fullmatch(r"[\d\s.,]+", prefix) and _has_math_like_text(previous_nonempty))
+
+
+def _has_math_like_text(text: str) -> bool:
+    return any(char in MATH_LIKE_CHARS for char in text)
+
+
+def _label_focused_equation_text(equation: dict[str, Any]) -> str:
+    raw_tex = str(equation.get("raw_tex") or "")
+    tex_label = str(equation.get("tex_label") or "")
+    if raw_tex and tex_label:
+        focused = _latex_row_near_label(raw_tex, tex_label)
+        if focused:
+            return focused
+    return str(equation.get("equation") or "")
+
+
+def _latex_row_near_label(raw_tex: str, tex_label: str) -> str:
+    lines = raw_tex.splitlines()
+    label_pattern = re.compile(r"\\label\{" + re.escape(tex_label) + r"\}")
+    for label_index, line in enumerate(lines):
+        match = label_pattern.search(line)
+        if not match:
+            continue
+        start = _label_target_line(lines, label_index, match)
+        if start is None:
+            return ""
+        return _normalize_latex(_collect_latex_row(lines, start, label_pattern), "label_focus")
+    return ""
+
+
+def _label_target_line(lines: list[str], label_index: int, label_match: re.Match[str]) -> int | None:
+    line = lines[label_index]
+    before_label = _strip_environment_commands(line[: label_match.start()]).replace(r"\\", "").strip()
+    after_label = _strip_environment_commands(line[label_match.end() :]).strip()
+    if _has_latex_content(after_label):
+        return label_index
+    if _has_latex_content(before_label):
+        return _row_start_before(lines, label_index)
+    for index in range(label_index + 1, len(lines)):
+        if _has_latex_content(_strip_environment_commands(lines[index])):
+            return index
+    return None
+
+
+def _row_start_before(lines: list[str], index: int) -> int:
+    current = index
+    while current > 0 and not _has_row_separator(lines[current - 1]):
+        current -= 1
+    return current
+
+
+def _collect_latex_row(lines: list[str], start: int, label_pattern: re.Pattern[str]) -> str:
+    row: list[str] = []
+    for index in range(start, len(lines)):
+        line = label_pattern.sub("", lines[index])
+        if re.search(r"\\end\{[^{}]+\*?\}", line):
+            break
+        line = _strip_environment_commands(line)
+        if _has_latex_content(line):
+            row.append(line)
+        if _has_row_separator(line):
+            break
+    return "\n".join(row)
+
+
+def _strip_environment_commands(line: str) -> str:
+    line = re.sub(r"\\begin\{[^{}]+\*?\}", "", line)
+    line = re.sub(r"\\end\{[^{}]+\*?\}", "", line)
+    return line
+
+
+def _has_latex_content(line: str) -> bool:
+    stripped = _strip_comment(line).strip()
+    if not stripped:
+        return False
+    if re.fullmatch(r"\\label\{[^{}]+\}", stripped):
+        return False
+    if re.fullmatch(r"\\\\", stripped):
+        return False
+    return True
+
+
+def _has_row_separator(line: str) -> bool:
+    return bool(re.search(r"\\\\(?:\s|$|\[|%)", line))
 
 
 def _token_overlap_score(left: set[str], right: set[str]) -> int:
@@ -605,11 +819,13 @@ def _line_spans(text: str) -> list[tuple[int, int, str]]:
     return spans
 
 
-def _line_window_for_offset(line_spans: list[tuple[int, int, str]], offset: int) -> str:
+def _line_window_for_offset(
+    line_spans: list[tuple[int, int, str]], offset: int, *, before_lines: int = 2, after_lines: int = 2
+) -> str:
     for index, (start, end, _) in enumerate(line_spans):
         if start <= offset < end:
-            first = max(0, index - 2)
-            last = min(len(line_spans), index + 2)
+            first = max(0, index - before_lines)
+            last = min(len(line_spans), index + 1 + after_lines)
             return "\n".join(line for _, _, line in line_spans[first:last])
     return ""
 
