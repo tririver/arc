@@ -8,7 +8,9 @@ Write artifacts under:
 ```text
 <project-dir>/calculate/<run-id>/plan.json
 <project-dir>/calculate/<run-id>/initial-plan.md
+<project-dir>/calculate/<run-id>/latest-plan.md
 <project-dir>/initial-plan.md
+<project-dir>/latest-plan.md
 ```
 
 `plan.json` must use `schema_version: "arc.plan.v1"`.
@@ -125,15 +127,23 @@ do not disclose the target reference equation in `prompt`, `allowed_inputs`, or
 quantity from named dependencies, and the execute workflow supplies the target
 only as a reviewer-only reference claim.
 
-Step 5: Write `plan.json` and write the initial human-readable report directly
-to both `<project-dir>/calculate/<run-id>/initial-plan.md` and
-`<project-dir>/initial-plan.md`. The JSON is the source of truth for
-later workflow phases.
+Step 5: Write `plan.json` and render the complete detailed plan into
+`initial-plan.md`. The initial plan Markdown is not a status stub: it must be
+the full step-by-step human-readable plan, including the evidence summary,
+foundation boundary, validation-only results, every planned step, each step's
+quantity contract, allowed inputs, substeps, expected output, and verification
+method. Write this initial detailed plan directly to both
+`<project-dir>/calculate/<run-id>/initial-plan.md` and
+`<project-dir>/initial-plan.md`. Also write the current complete plan view to
+both `<project-dir>/calculate/<run-id>/latest-plan.md` and
+`<project-dir>/latest-plan.md`. The JSON is the source of truth for later
+workflow phases, but the Markdown must be complete enough for a human to review
+the plan without opening the JSON.
 
-After writing the project-level Markdown report, call
-MCP `md2pdf(input="<project-dir>/initial-plan.md")`. It starts a background
-PDF job; record the returned job id if present and do not wait before
-continuing.
+After writing the project-level Markdown reports, call MCP
+`md2pdf(input="<project-dir>/initial-plan.md")` and
+`md2pdf(input="<project-dir>/latest-plan.md")`. Each starts a background PDF
+job; record returned job ids if present and do not wait before continuing.
 
 ## Phase 4: Review The Plan
 
@@ -152,6 +162,8 @@ the first calculation step is clear
 difficult steps have enough substeps
 ```
 
-Step 3: If the review finds gaps, revise `plan.json` and
-`initial-plan.md`, then review the plan again. Proceed only when the
-review is recorded in both artifacts.
+Step 3: If the review finds gaps, revise `plan.json` and render the current
+plan to both latest-plan Markdown paths, then call
+`md2pdf(input="<project-dir>/latest-plan.md")` in the background. Do not rewrite
+`initial-plan.md` after the first snapshot. Proceed only when the review is
+recorded in `plan.json` and the latest-plan Markdown artifacts.

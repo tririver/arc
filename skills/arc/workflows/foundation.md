@@ -10,7 +10,9 @@ Write artifacts under:
 <project-dir>/calculate/<run-id>/foundation/foundation.v001.json
 <project-dir>/calculate/<run-id>/foundation/latest.json
 <project-dir>/calculate/<run-id>/foundation/initial-foundation.md
+<project-dir>/calculate/<run-id>/foundation/latest-foundation.md
 <project-dir>/initial-foundation.md
+<project-dir>/latest-foundation.md
 ```
 
 Each foundation file must use `schema_version: "arc.foundation.v1"`.
@@ -115,8 +117,16 @@ Step 4: Render `latest.json` into `initial-foundation.md` directly at
 both `<project-dir>/calculate/<run-id>/foundation/initial-foundation.md`
 and `<project-dir>/initial-foundation.md` with the chosen conventions,
 equations, confidence labels, source locations, and any version change notes.
+Also render the current foundation to
+`<project-dir>/calculate/<run-id>/foundation/latest-foundation.md` and
+`<project-dir>/latest-foundation.md`.
 
-After writing the project-level Markdown report, call
-MCP `md2pdf(input="<project-dir>/initial-foundation.md")`. It starts a
-background PDF job; record the returned job id if present and do not wait
-before continuing.
+After writing the project-level Markdown reports, call MCP
+`md2pdf(input="<project-dir>/initial-foundation.md")` and
+`md2pdf(input="<project-dir>/latest-foundation.md")`. Each starts a background
+PDF job; record returned job ids if present and do not wait before continuing.
+
+Step 5: Whenever the foundation changes later, create a new versioned JSON file,
+update `latest.json`, render both latest-foundation Markdown paths again, and
+call `md2pdf(input="<project-dir>/latest-foundation.md")` in the background.
+Do not rewrite `initial-foundation.md` after the first snapshot.

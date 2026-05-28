@@ -141,11 +141,15 @@ it does not affect correctness.
 For an accepted foundation check, write a new foundation version marking the
 target equation checked. Keep the original equation unchanged and add reviewer
 check history, method, relative error when numerical, and consensus artifact
-path. Do not rewrite `initial-foundation.md`; human-facing foundation
-changes belong in the final report appendix. When a new calculation result is
-accepted and useful later, write a new foundation version with a concise derived
-quantity record, keeping paper-sourced equations and derived quantities visibly
-separate in `latest.json`.
+path. Do not rewrite `initial-foundation.md`; instead render the updated
+`latest.json` to both
+`<project-dir>/calculate/<run-id>/foundation/latest-foundation.md` and
+`<project-dir>/latest-foundation.md`, then call
+`md2pdf(input="<project-dir>/latest-foundation.md")` in the background. When a
+new calculation result is accepted and useful later, write a new foundation
+version with a concise derived quantity record, keeping paper-sourced equations
+and derived quantities visibly separate in `latest.json`, and refresh the
+latest-foundation Markdown/PDF artifacts the same way.
 
 ## Phase 5: Run Consensus And Refine Blocks
 
@@ -167,7 +171,12 @@ replacement step must have one clear quantity, inputs, output, and check. The
 first replacement step should stop at the last calculation all proposers can
 agree on. If full expression splitting is hard, first use controlled limits or projections such as one branch, one contour choice, one contraction, leading
 power only, equal-mass/equal-scale limit, or coefficient-stripped form before returning to the full expression. Append each blocked_refinement event to the
-plan revision history inside `# Appendix 2: Calculation Status`.
+plan revision history inside `# Appendix 2: Calculation Status`. Whenever
+`plan.json` changes, render the current plan to both
+`<project-dir>/calculate/<run-id>/latest-plan.md` and
+`<project-dir>/latest-plan.md`, then call
+`md2pdf(input="<project-dir>/latest-plan.md")` in the background. Do not rewrite
+`initial-plan.md` after the first snapshot.
 
 If the block is caused by missing or wrong premises, classify it as
 `foundation_inadequate`, `foundation_conflict`, or `plan_wrong`. For

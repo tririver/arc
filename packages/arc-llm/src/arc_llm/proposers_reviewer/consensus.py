@@ -372,6 +372,7 @@ def _caller_context(
     foundation_context = _foundation_context_for_step(step)
     if foundation_context is not None:
         allowed_context.pop("foundation_file", None)
+        allowed_context.pop("allowed_foundation", None)
     context = {
         "step_id": step.step_id,
         "step_kind": step.kind,
@@ -1056,13 +1057,15 @@ def _validate_reference_disagrees_pairwise_checks(
 
 def _foundation_context_for_step(step: ConsensusStep) -> dict[str, Any] | None:
     foundation_path = step.allowed_context.get("foundation_file")
-    if not foundation_path or step.kind != "foundation_check":
+    if not foundation_path:
         return None
+    path = Path(str(foundation_path))
+    payload = _read_json(path)
+    if step.kind == "new_calculation":
+        return calculation_foundation_context(payload)
     target_equation_id = str(step.allowed_context.get("target_equation_id", "")).strip()
     if not target_equation_id:
         raise ValueError("target_equation_id is required for foundation_check steps")
-    path = Path(str(foundation_path))
-    payload = _read_json(path)
     return filter_foundation_context(
         payload,
         target_equation_id=target_equation_id,
@@ -1116,6 +1119,40 @@ def filter_foundation_context(
     }
 
 
+def calculation_foundation_context(payload: Mapping[str, Any]) -> dict[str, Any]:
+    equations = payload.get("equations", [])
+    if not isinstance(equations, list):
+        equations = []
+    allowed_equations = []
+    omitted_equation_ids = []
+    for item in equations:
+        if not isinstance(item, dict):
+            continue
+        equation_id = str(item.get("id", ""))
+        if _equation_is_axiom_or_checked(item):
+            allowed_equations.append(_sanitize_foundation_context_item(item))
+        elif equation_id:
+            omitted_equation_ids.append(equation_id)
+
+    conventions = payload.get("conventions", [])
+    if not isinstance(conventions, list):
+        conventions = []
+    allowed_conventions = [
+        _sanitize_foundation_context_item(item)
+        for item in conventions
+        if isinstance(item, dict) and _convention_available_for_calculation(item)
+    ]
+    return {
+        "schema_version": "arc.foundation_context.v1",
+        "target_equation_id": "",
+        "target_equation": None,
+        "allowed_equations": allowed_equations,
+        "allowed_conventions": allowed_conventions,
+        "omitted_equation_ids": omitted_equation_ids,
+        "filter_rule": "All axiom or checked foundation items are provided for this calculation step.",
+    }
+
+
 def _equation_is_axiom_or_checked(item: Mapping[str, Any]) -> bool:
     if item.get("axiom_status") == "axiom":
         return True
@@ -1125,6 +1162,13 @@ def _equation_is_axiom_or_checked(item: Mapping[str, Any]) -> bool:
 
 def _convention_is_checked(item: Mapping[str, Any]) -> bool:
     check_status = str(item.get("check_status", "")).strip().lower()
+    return check_status == "checked" or check_status.startswith("checked_")
+
+
+def _convention_available_for_calculation(item: Mapping[str, Any]) -> bool:
+    check_status = str(item.get("check_status", "")).strip().lower()
+    if not check_status:
+        return True
     return check_status == "checked" or check_status.startswith("checked_")
 
 

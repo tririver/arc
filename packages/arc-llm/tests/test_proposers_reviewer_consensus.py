@@ -481,6 +481,56 @@ def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path
     assert "arc-paper" not in json.dumps(allowed_context)
 
 
+def test_new_calculation_loads_latest_foundation_file_and_omits_stale_inline_foundation(tmp_path):
+    foundation = {
+        "schema_version": "arc.foundation.v1",
+        "run_id": "run_001",
+        "conventions": [{"id": "conv_current", "label": "current convention"}],
+        "equations": [
+            {"id": "eq_old", "label": "old", "latex": "x=1", "axiom_status": "axiom"},
+            {"id": "eq_new", "label": "new", "latex": "p=w\\rho", "axiom_status": "axiom"},
+            {"id": "eq_unchecked", "label": "unchecked", "latex": "z=3", "axiom_status": "not_axiom"},
+        ],
+    }
+    foundation_path = tmp_path / "foundation.json"
+    foundation_path.write_text(json.dumps(foundation), encoding="utf-8")
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                accepted={"result": "x"},
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        steps=[
+            {
+                "step_id": "derive_from_latest",
+                "kind": "new_calculation",
+                "prompt": "derive target",
+                "allowed_context": {
+                    "foundation_file": str(foundation_path),
+                    "allowed_foundation": [
+                        {"id": "eq_old", "label": "old", "latex": "x=1", "axiom_status": "axiom"}
+                    ],
+                },
+            }
+        ],
+    )
+
+    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    caller_context = fake.calls[0]["loops"][0]["caller_context"]
+    foundation_context = caller_context["foundation_context"]
+    assert [item["id"] for item in foundation_context["allowed_equations"]] == ["eq_old", "eq_new"]
+    assert [item["id"] for item in foundation_context["allowed_conventions"]] == ["conv_current"]
+    assert "eq_unchecked" in foundation_context["omitted_equation_ids"]
+    assert "foundation_file" not in caller_context["allowed_context"]
+    assert "allowed_foundation" not in caller_context["allowed_context"]
+
+
 def test_foundation_check_fails_when_target_equation_is_missing(tmp_path):
     foundation_path = tmp_path / "foundation.json"
     foundation_path.write_text(
