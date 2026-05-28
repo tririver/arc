@@ -165,6 +165,123 @@ def test_cli_search_full_text_defaults_to_one_context_line(monkeypatch, capsys):
     assert output["meta"]["context"] == 1
 
 
+def test_cli_parse_dispatches_html(monkeypatch, capsys):
+    def parse_source(
+        source_path=None,
+        *,
+        source="auto",
+        source_id=None,
+        paper_id=None,
+        html_path=None,
+        tex_path=None,
+        pdf_path=None,
+        refresh=False,
+    ):
+        return {
+            "ok": True,
+            "data": {
+                "paper_id": source_id,
+                "parser_version": 7,
+                "source_hash": "hash",
+                "toc": [],
+                "sections": [],
+                "equations": [],
+            },
+            "errors": [],
+            "meta": {"html_path": str(html_path), "source": source, "refresh": refresh},
+        }
+
+    monkeypatch.setattr(cli.service, "parse_source", parse_source)
+
+    assert cli.main(["parse", "--html", "paper.html", "--id", "local-html", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["paper_id"] == "local-html"
+    assert output["meta"]["html_path"] == "paper.html"
+
+
+def test_cli_parse_dispatches_tex_pdf(monkeypatch, capsys):
+    def parse_source(
+        source_path=None,
+        *,
+        source="auto",
+        source_id=None,
+        paper_id=None,
+        html_path=None,
+        tex_path=None,
+        pdf_path=None,
+        refresh=False,
+    ):
+        return {"ok": True, "data": {"paper_id": source_id, "tex_path": str(tex_path), "pdf_path": str(pdf_path)}, "errors": [], "meta": {}}
+
+    monkeypatch.setattr(cli.service, "parse_source", parse_source)
+
+    assert cli.main(["parse", "--tex", "note.tex", "--pdf", "book.pdf", "--id", "lecture-9", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"] == {"paper_id": "lecture-9", "tex_path": "note.tex", "pdf_path": "book.pdf"}
+
+
+def test_cli_parse_dispatches_ar5iv_paper(monkeypatch, capsys):
+    def parse_source(
+        source_path=None,
+        *,
+        source="auto",
+        source_id=None,
+        paper_id=None,
+        html_path=None,
+        tex_path=None,
+        pdf_path=None,
+        refresh=False,
+    ):
+        return {"ok": True, "data": {"paper_id": paper_id, "source": source, "refresh": refresh}, "errors": [], "meta": {}}
+
+    monkeypatch.setattr(cli.service, "parse_source", parse_source)
+
+    assert cli.main(["parse", "--paper-id", "0911.3380", "--source", "ar5iv", "--refresh", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"] == {"paper_id": "0911.3380", "source": "ar5iv", "refresh": True}
+
+
+def test_cli_parsed_lookup_commands(monkeypatch, capsys):
+    monkeypatch.setattr(cli.service, "get_parsed_source", lambda source_id: {"ok": True, "data": {"paper_id": source_id}})
+    monkeypatch.setattr(cli.service, "get_parsed_source_toc", lambda source_id: {"ok": True, "data": [{"id": source_id}]})
+    monkeypatch.setattr(
+        cli.service,
+        "get_parsed_source_equations",
+        lambda source_id: {"ok": True, "data": [{"id": "eq_00001", "paper_id": source_id}]},
+    )
+    monkeypatch.setattr(
+        cli.service,
+        "get_parsed_source_equation",
+        lambda source_id, equation_id: {"ok": True, "data": {"paper_id": source_id, "id": equation_id}},
+    )
+    monkeypatch.setattr(
+        cli.service,
+        "search_parsed_source",
+        lambda source_id, *, query, limit=20, case_sensitive=False: {
+            "ok": True,
+            "data": [{"paper_id": source_id, "query": query}],
+            "meta": {"limit": limit, "case_sensitive": case_sensitive},
+        },
+    )
+
+    assert cli.main(["get-parsed", "lecture-9", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["paper_id"] == "lecture-9"
+    assert cli.main(["get-parsed-toc", "lecture-9", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"][0]["id"] == "lecture-9"
+    assert cli.main(["get-parsed-equations", "lecture-9", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"][0]["id"] == "eq_00001"
+    assert cli.main(["get-parsed-equation", "lecture-9", "--equation-id", "eq_00001", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["id"] == "eq_00001"
+    assert cli.main(["search-parsed", "lecture-9", "--query", "Friedmann", "--limit", "3", "--case-sensitive", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"] == [{"paper_id": "lecture-9", "query": "Friedmann"}]
+    assert output["meta"]["limit"] == 3
+    assert output["meta"]["case_sensitive"] is True
+
+
 def test_cli_doctor_host(monkeypatch, capsys):
     monkeypatch.setattr(
         cli,

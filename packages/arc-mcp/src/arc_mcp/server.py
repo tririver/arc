@@ -80,6 +80,12 @@ TRANSLATE_PROJECT_DIR_DESCRIPTION = "Project directory to scan for same-folder M
 TRANSLATE_QUALITY_DESCRIPTION = "When true, run an additional LLM QA/revision pass after fast translation."
 TRANSLATE_OVERWRITE_DESCRIPTION = "When true, overwrite existing translated Markdown/PDF outputs."
 MODEL_TIER_DESCRIPTION = "LLM model tier for translation work. Defaults to low for speed and cost."
+PARSE_SOURCE_PATH_DESCRIPTION = "Optional local source path. Extension may be .html, .tex, or .pdf."
+PARSE_SOURCE_DESCRIPTION = "Source adapter: auto, ar5iv, html, tex, pdf, or tex-pdf."
+PARSE_ID_DESCRIPTION = "Parsed source id to store in paper_id and use for sources cache filename."
+PARSE_HTML_PATH_DESCRIPTION = "Optional local HTML source path."
+PARSE_TEX_PATH_DESCRIPTION = "Optional local TeX source path."
+PARSE_PDF_PATH_DESCRIPTION = "Optional local PDF source path."
 
 PaperId = Annotated[str | None, Field(description=PAPER_ID_DESCRIPTION)]
 PaperIds = Annotated[list[str] | None, Field(description=PAPER_IDS_DESCRIPTION)]
@@ -112,6 +118,12 @@ TranslateProjectDir = Annotated[str, Field(description=TRANSLATE_PROJECT_DIR_DES
 TranslateQuality = Annotated[bool, Field(description=TRANSLATE_QUALITY_DESCRIPTION)]
 TranslateOverwrite = Annotated[bool, Field(description=TRANSLATE_OVERWRITE_DESCRIPTION)]
 ModelTier = Annotated[str, Field(description=MODEL_TIER_DESCRIPTION)]
+ParseSourcePath = Annotated[str | None, Field(description=PARSE_SOURCE_PATH_DESCRIPTION)]
+ParseSource = Annotated[str, Field(description=PARSE_SOURCE_DESCRIPTION)]
+ParseId = Annotated[str | None, Field(description=PARSE_ID_DESCRIPTION)]
+ParseHtmlPath = Annotated[str | None, Field(description=PARSE_HTML_PATH_DESCRIPTION)]
+ParseTexPath = Annotated[str | None, Field(description=PARSE_TEX_PATH_DESCRIPTION)]
+ParsePdfPath = Annotated[str | None, Field(description=PARSE_PDF_PATH_DESCRIPTION)]
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -165,6 +177,16 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "get_equation_context": lambda args: service.get_equation_context(
         _paper_ids(args),
         str(args["query"]),
+        refresh=bool(args.get("refresh", False)),
+    ),
+    "parse": lambda args: service.parse_source(
+        args.get("source_path"),
+        source=str(args.get("source", "auto")),
+        source_id=args.get("source_id") or args.get("id"),
+        paper_id=args.get("paper_id"),
+        html_path=args.get("html_path"),
+        tex_path=args.get("tex_path"),
+        pdf_path=args.get("pdf_path"),
         refresh=bool(args.get("refresh", False)),
     ),
     "llm_get_summary": lambda args: _cached_or_start_summary_job(args),
@@ -1157,6 +1179,33 @@ def _register_tools(app: Any) -> None:
         refresh: Refresh = False,
     ) -> Any:
         return service.get_equation_context(_one_or_many(paper_id, paper_ids), query, refresh=refresh)
+
+    @app.tool(
+        name="parse",
+        description=(
+            "Parse ar5iv, local HTML, TeX, PDF, or TeX+PDF into ARC's canonical parsed JSON cache."
+        )
+    )
+    def parse_tool(
+        source_path: ParseSourcePath = None,
+        source: ParseSource = "auto",
+        source_id: ParseId = None,
+        paper_id: PaperId = None,
+        html_path: ParseHtmlPath = None,
+        tex_path: ParseTexPath = None,
+        pdf_path: ParsePdfPath = None,
+        refresh: Refresh = False,
+    ) -> Any:
+        return service.parse_source(
+            source_path,
+            source=source,
+            source_id=source_id,
+            paper_id=paper_id,
+            html_path=html_path,
+            tex_path=tex_path,
+            pdf_path=pdf_path,
+            refresh=refresh,
+        )
 
     @app.tool(
         name="llm_get_summary",

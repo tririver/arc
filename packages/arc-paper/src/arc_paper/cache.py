@@ -12,7 +12,7 @@ from threading import get_ident
 from typing import Any
 from urllib.parse import quote
 
-from .ids import normalize_paper_id
+from .ids import normalize_paper_id, paper_ids_safe_dir_name
 
 
 ONE_MONTH_SECONDS = 30 * 24 * 60 * 60
@@ -23,7 +23,6 @@ class CachePaths:
     paper_id: str
     paper_dir: Path
     ar5iv_html: Path
-    ar5iv_parsed: Path
     inspire_metadata: Path
     inspire_references: Path
     inspire_citers: Path
@@ -36,7 +35,6 @@ class CachePaths:
             paper_id=normalized,
             paper_dir=paper_dir,
             ar5iv_html=paper_dir / "ar5iv" / "fulltext.html",
-            ar5iv_parsed=paper_dir / "ar5iv" / "parsed.json",
             inspire_metadata=paper_dir / "inspire" / "metadata.json",
             inspire_references=paper_dir / "inspire" / "references.json",
             inspire_citers=paper_dir / "inspire" / "citers.json",
@@ -59,6 +57,11 @@ def cache_root() -> Path:
 def text_query_cache_path(namespace: str, text: str) -> Path:
     key = hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
     return cache_root() / "queries" / namespace / f"{key}.json"
+
+
+def parsed_source_cache_path(source_id: str) -> Path:
+    safe_name = paper_ids_safe_dir_name([source_id])
+    return cache_root() / "sources" / f"{safe_name}.json"
 
 
 def paper_alias_path(paper_id: str) -> Path:
@@ -98,13 +101,22 @@ def migrate_paper_cache_dir(source_id: str, target_id: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         shutil.copytree(source, target, dirs_exist_ok=True)
+        _remove_legacy_parsed_cache(target)
         shutil.rmtree(source)
     else:
         shutil.move(str(source), str(target))
+        _remove_legacy_parsed_cache(target)
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _remove_legacy_parsed_cache(paper_dir: Path) -> None:
+    try:
+        (paper_dir / "ar5iv" / "parsed.json").unlink(missing_ok=True)
+    except OSError:
+        return
 
 
 def read_json(path: Path, *, ttl_seconds: int | None = None) -> Any | None:

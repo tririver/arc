@@ -220,6 +220,36 @@ def test_call_tool_searches_full_text(monkeypatch):
     assert result["data"]["case_sensitive"] is True
 
 
+def test_call_tool_dispatches_unified_parse(monkeypatch):
+    monkeypatch.setattr(
+        server.service,
+        "parse_source",
+        lambda source_path=None, *, source="auto", source_id=None, paper_id=None, html_path=None, tex_path=None, pdf_path=None, refresh=False: {
+            "ok": True,
+            "data": {
+                "source_path": source_path,
+                "source": source,
+                "source_id": source_id,
+                "paper_id": paper_id,
+                "html_path": html_path,
+                "tex_path": tex_path,
+                "pdf_path": pdf_path,
+                "refresh": refresh,
+            },
+        },
+    )
+
+    result = server.call_tool(
+        "parse",
+        {"tex_path": "note.tex", "pdf_path": "book.pdf", "source_id": "lecture-9", "refresh": True},
+    )
+
+    assert result["data"]["tex_path"] == "note.tex"
+    assert result["data"]["pdf_path"] == "book.pdf"
+    assert result["data"]["source_id"] == "lecture-9"
+    assert result["data"]["refresh"] is True
+
+
 def test_call_tool_search_full_text_defaults_to_one_context_line(monkeypatch):
     def search_full_text(ids, *, query, refresh=False, limit=20, context=1, case_sensitive=False):
         return {"ok": True, "data": {"context": context}}
@@ -365,6 +395,10 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "natural-language text" in by_name["extract_paper_ids"].description
     assert "0911.3380" in by_name["paper_ids_safe_dir_name"].description
     assert "cached parsed ar5iv text" in by_name["search_full_text"].description
+    assert "parse" in by_name
+    assert "canonical parsed JSON" in by_name["parse"].description
+    assert "tex_path" in by_name["parse"].inputSchema["properties"]
+    assert "pdf_path" in by_name["parse"].inputSchema["properties"]
     assert "web search" in by_name["llm_infer_main_references"].description
     assert "arXiv papers" in by_name["get_title"].description
     assert "LLM summary" in by_name["llm_generate_summary"].description

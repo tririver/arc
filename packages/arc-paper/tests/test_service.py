@@ -1,6 +1,6 @@
 from arc_paper import reference_inference, service
-from arc_paper.cache import CachePaths, read_json, text_query_cache_path, write_json
-from arc_paper.parse.ar5iv_html import PARSER_VERSION
+from arc_paper.cache import CachePaths, parsed_source_cache_path, read_json, text_query_cache_path, write_json
+from arc_paper.parse.source import PARSER_VERSION
 from arc_paper.providers.base import ProviderError
 
 
@@ -217,11 +217,102 @@ def test_toc_section_and_equation_context(monkeypatch, tmp_path):
     assert service.get_equation_context("0911.3380", "x = y")["data"][0]["after"] == "After."
 
 
+def test_parse_source_writes_sources_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    html_path = tmp_path / "paper.html"
+    html_path.write_text(
+        "<html><body><section id='S1'><h2>Intro</h2><p>Text.</p></section></body></html>",
+        encoding="utf-8",
+    )
+
+    result = service.parse_source(html_path=html_path, source_id="lecture html")
+
+    assert result["ok"] is True
+    assert result["data"]["paper_id"] == "lecture html"
+    assert result["meta"]["cache"] == "write"
+    cache_path = tmp_path / "sources" / "lecture_html.json"
+    assert cache_path.exists()
+    assert read_json(cache_path)["paper_id"] == "lecture html"
+
+
+def test_parse_source_ar5iv_writes_sources_cache_not_old_parsed_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+
+    result = service.parse_source(paper_id="0911.3380", source="ar5iv")
+
+    assert result["ok"] is True
+    assert (tmp_path / "sources" / "0911.3380.json").exists()
+
+
+def test_parse_source_rejects_explicit_source_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    html_path = tmp_path / "paper.html"
+    html_path.write_text("<html><body><p>Text.</p></body></html>", encoding="utf-8")
+
+    result = service.parse_source(source="pdf", html_path=html_path, source_id="bad-source")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "parse_source_invalid"
+
+
+def test_parse_source_tex_pdf_requires_tex_and_pdf(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    tex_path = tmp_path / "note.tex"
+    tex_path.write_text(r"\section{Only TeX}", encoding="utf-8")
+
+    result = service.parse_source(source="tex-pdf", tex_path=tex_path, source_id="missing-pdf")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "parse_source_invalid"
+
+
+def test_get_parsed_source_reads_sources_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    write_json(
+        parsed_source_cache_path("lecture-9"),
+        {"paper_id": "lecture-9", "parser_version": 7, "source_hash": "hash", "toc": [], "sections": [], "equations": []},
+    )
+
+    result = service.get_parsed_source("lecture-9")
+
+    assert result["ok"] is True
+    assert result["data"]["paper_id"] == "lecture-9"
+
+
+def test_search_parsed_source_finds_equation(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    write_json(
+        parsed_source_cache_path("lecture-9"),
+        {
+            "paper_id": "lecture-9",
+            "parser_version": 7,
+            "source_hash": "hash",
+            "toc": [],
+            "sections": [{"section_id": "S1", "title": "Dynamics", "level": 1, "text": "Friedmann setup"}],
+            "equations": [
+                {
+                    "id": "eq_00001",
+                    "equation": "H^2 = rho",
+                    "before": "Before",
+                    "after": "After",
+                    "section_id": "S1",
+                    "section_title": "Dynamics",
+                }
+            ],
+        },
+    )
+
+    result = service.search_parsed_source("lecture-9", query="H^2")
+
+    assert result["ok"] is True
+    assert result["data"][0]["id"] == "eq_00001"
+
+
 def test_equation_context_uses_cached_parsed_json_without_fetch(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
-    paths = CachePaths.for_paper("arXiv:0911.3380")
     write_json(
-        paths.ar5iv_parsed,
+        parsed_source_cache_path("arXiv:0911.3380"),
         parsed_cache(
             "arXiv:0911.3380",
             [{"section_id": "S2", "title": "2 Model", "level": 2, "text": "A section."}],
@@ -264,9 +355,8 @@ def parsed_cache(paper_id: str, sections: list[dict], equations: list[dict] | No
 
 def test_search_full_text_uses_cached_parsed_json_without_fetch(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
-    paths = CachePaths.for_paper("arXiv:0911.3380")
     write_json(
-        paths.ar5iv_parsed,
+        parsed_source_cache_path("arXiv:0911.3380"),
         parsed_cache(
             "arXiv:0911.3380",
             [
@@ -326,7 +416,7 @@ def test_search_full_text_includes_cached_title_and_abbreviated_authors(monkeypa
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     paths = CachePaths.for_paper("arXiv:0911.3380")
     write_json(
-        paths.ar5iv_parsed,
+        parsed_source_cache_path("arXiv:0911.3380"),
         parsed_cache(
             "arXiv:0911.3380",
             [{"section_id": "S2", "title": "2 Model", "level": 2, "text": "collapsed-channel signal"}],
@@ -359,17 +449,15 @@ def test_search_full_text_includes_cached_title_and_abbreviated_authors(monkeypa
 
 def test_search_full_text_can_search_all_cached_papers(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
-    first = CachePaths.for_paper("arXiv:0911.3380")
-    second = CachePaths.for_paper("arXiv:astro-ph/0610514")
     write_json(
-        first.ar5iv_parsed,
+        parsed_source_cache_path("arXiv:0911.3380"),
         parsed_cache(
             "arXiv:0911.3380",
             [{"section_id": "S1", "title": "1 Intro", "level": 2, "text": "heavy scalar exchange"}],
         ),
     )
     write_json(
-        second.ar5iv_parsed,
+        parsed_source_cache_path("arXiv:astro-ph/0610514"),
         parsed_cache(
             "arXiv:astro-ph/0610514",
             [
@@ -393,10 +481,9 @@ def test_search_full_text_can_search_all_cached_papers(monkeypatch, tmp_path):
 
 def test_search_full_text_deduplicates_nested_section_snippets(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
-    paths = CachePaths.for_paper("arXiv:0911.3380")
     duplicated_text = "The squeezed limit contains a scalar exchange signal."
     write_json(
-        paths.ar5iv_parsed,
+        parsed_source_cache_path("arXiv:0911.3380"),
         parsed_cache(
             "arXiv:0911.3380",
             [
@@ -415,9 +502,8 @@ def test_search_full_text_deduplicates_nested_section_snippets(monkeypatch, tmp_
 
 def test_search_full_text_python_fallback(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
-    paths = CachePaths.for_paper("arXiv:0911.3380")
     write_json(
-        paths.ar5iv_parsed,
+        parsed_source_cache_path("arXiv:0911.3380"),
         parsed_cache(
             "arXiv:0911.3380",
             [{"section_id": "S1", "title": "1 Intro", "level": 2, "text": "Boostless contact terms."}],
@@ -434,8 +520,8 @@ def test_search_full_text_python_fallback(monkeypatch, tmp_path):
 
 def test_stale_parsed_cache_is_reparsed_from_ar5iv_fetch(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
-    paths = CachePaths.for_paper("arXiv:0911.3380")
-    write_json(paths.ar5iv_parsed, {"paper_id": "arXiv:0911.3380", "toc": [], "sections": []})
+    path = parsed_source_cache_path("arXiv:0911.3380")
+    write_json(path, {"paper_id": "arXiv:0911.3380", "toc": [], "sections": []})
 
     class ReparseAr5iv:
         def get_html(self, paper_id, *, refresh=False):
@@ -451,7 +537,7 @@ def test_stale_parsed_cache_is_reparsed_from_ar5iv_fetch(monkeypatch, tmp_path):
 
     assert result["ok"] is True
     assert result["data"]["section_id"] == "inline-discussion"
-    assert read_json(paths.ar5iv_parsed).get("parser_version")
+    assert read_json(path).get("parser_version") == PARSER_VERSION
 
 
 def test_full_text_resolves_doi_to_arxiv(monkeypatch, tmp_path):

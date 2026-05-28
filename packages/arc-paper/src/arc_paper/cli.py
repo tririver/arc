@@ -91,6 +91,39 @@ def main(argv: list[str] | None = None) -> int:
     equation.add_argument("--refresh", action="store_true")
     equation.add_argument("--json", action="store_true")
 
+    parse = sub.add_parser("parse")
+    parse.add_argument("source_path", nargs="?")
+    parse.add_argument("--source", default="auto", choices=["auto", "ar5iv", "html", "tex", "pdf", "tex-pdf"])
+    parse.add_argument("--id", dest="source_id", default=None)
+    parse.add_argument("--paper-id", default=None)
+    parse.add_argument("--html", default=None)
+    parse.add_argument("--tex", default=None)
+    parse.add_argument("--pdf", default=None)
+    parse.add_argument("--refresh", action="store_true")
+    parse.add_argument("--json", action="store_true")
+    get_parsed = sub.add_parser("get-parsed")
+    get_parsed.add_argument("source_id")
+    get_parsed.add_argument("--json", action="store_true")
+    get_parsed_toc = sub.add_parser("get-parsed-toc")
+    get_parsed_toc.add_argument("source_id")
+    get_parsed_toc.add_argument("--json", action="store_true")
+    get_parsed_equations = sub.add_parser("get-parsed-equations")
+    get_parsed_equations.add_argument("source_id")
+    get_parsed_equations.add_argument("--json", action="store_true")
+    get_parsed_equation = sub.add_parser("get-parsed-equation")
+    get_parsed_equation.add_argument("source_id")
+    get_parsed_equation.add_argument("--equation-id", required=True)
+    get_parsed_equation.add_argument("--json", action="store_true")
+    search_parsed = sub.add_parser("search-parsed")
+    search_parsed.add_argument("source_id")
+    search_parsed.add_argument("--query", required=True)
+    search_parsed.add_argument("--limit", type=int, default=20)
+    search_parsed.add_argument("--case-sensitive", action="store_true")
+    search_parsed.add_argument("--json", action="store_true")
+    validate_note_check = sub.add_parser("validate-note-check")
+    validate_note_check.add_argument("run_dir")
+    validate_note_check.add_argument("--json", action="store_true")
+
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
     for name in ("host", "provider"):
@@ -205,6 +238,34 @@ def _dispatch(args: argparse.Namespace) -> Any:
             model=args.model,
             refresh=args.refresh,
         )
+    if command == "parse":
+        return service.parse_source(
+            args.source_path,
+            source=args.source,
+            source_id=args.source_id,
+            paper_id=args.paper_id,
+            html_path=args.html,
+            tex_path=args.tex,
+            pdf_path=args.pdf,
+            refresh=args.refresh,
+        )
+    if command == "get-parsed":
+        return service.get_parsed_source(args.source_id)
+    if command == "get-parsed-toc":
+        return service.get_parsed_source_toc(args.source_id)
+    if command == "get-parsed-equations":
+        return service.get_parsed_source_equations(args.source_id)
+    if command == "get-parsed-equation":
+        return service.get_parsed_source_equation(args.source_id, args.equation_id)
+    if command == "search-parsed":
+        return service.search_parsed_source(
+            args.source_id,
+            query=args.query,
+            limit=args.limit,
+            case_sensitive=args.case_sensitive,
+        )
+    if command == "validate-note-check":
+        return service.validate_note_check(args.run_dir)
 
     paper_ids = args.paper_ids[0] if len(args.paper_ids) == 1 else args.paper_ids
     if command == "get-title":

@@ -4,17 +4,16 @@ import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
 
-from .cache import CachePaths, cache_root, now_iso, read_json, text_query_cache_path, write_json
+from .cache import CachePaths, cache_root, now_iso, parsed_source_cache_path, read_json, text_query_cache_path, write_json
 from .ids import arxiv_path_id
 from .ids import extract_paper_ids as _extract_paper_ids
 from .ids import normalize_paper_id
 from .ids import paper_ids_safe_dir_name as _paper_ids_safe_dir_name
-from .parse.ar5iv_html import PARSER_VERSION
 from .parse.ar5iv_html import get_section as parsed_get_section
-from .parse.ar5iv_html import parse_html
 from .parse.equations import find_equation_context
+from .parse.source import PARSER_VERSION as SOURCE_PARSER_VERSION
+from .parse.source import parse_source_input
 from .providers import Ar5ivProvider, InspireProvider
 from .providers.base import ProviderError
 from .reference_inference import ReferenceInferenceError, infer_main_references
@@ -224,6 +223,210 @@ def search_full_text(
     )
 
 
+def parse_source(
+    source_path: str | Path | None = None,
+    *,
+    source: str = "auto",
+    source_id: str | None = None,
+    paper_id: str | None = None,
+    html_path: str | Path | None = None,
+    tex_path: str | Path | None = None,
+    pdf_path: str | Path | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        resolved_id = _parse_source_id(source_id=source_id, paper_id=paper_id)
+        if source == "ar5iv" or paper_id:
+            if source not in {"auto", "ar5iv"}:
+                raise ValueError("--paper-id only supports source=auto or source=ar5iv")
+            parsed = _parse_ar5iv_source(resolved_id, refresh=refresh)
+        else:
+            parsed = _parse_local_source(
+                source=source,
+                source_path=source_path,
+                source_id=resolved_id,
+                html_path=html_path,
+                tex_path=tex_path,
+                pdf_path=pdf_path,
+            )
+        path = parsed_source_cache_path(str(parsed["paper_id"]))
+        write_json(path, parsed)
+        return ok(parsed, provider="local-cache", cache="write", cache_path=str(path))
+    except FileNotFoundError as exc:
+        return err("parse_source_not_found", str(exc))
+    except ValueError as exc:
+        return err("parse_source_invalid", str(exc))
+    except ProviderError as exc:
+        return err(exc.code, exc.message)
+    except Exception as exc:
+        return err("parse_source_failed", str(exc))
+
+
+def get_parsed_source(source_id: str) -> dict[str, Any]:
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    return ok(parsed, provider="local-cache", cache="hit", cache_path=str(parsed_source_cache_path(source_id)))
+
+
+def get_parsed_source_toc(source_id: str) -> dict[str, Any]:
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    return ok(parsed.get("toc") or [], provider="local-cache", cache="hit")
+
+
+def get_parsed_source_equations(source_id: str) -> dict[str, Any]:
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    return ok(parsed.get("equations") or [], provider="local-cache", cache="hit")
+
+
+def get_parsed_source_equation(source_id: str, equation_id: str) -> dict[str, Any]:
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    for equation in parsed.get("equations") or []:
+        if str(equation.get("id") or "") == equation_id:
+            return ok(equation, provider="local-cache", cache="hit")
+    return err("parsed_source_equation_not_found", f"No equation {equation_id} found in {source_id}")
+
+
+def search_parsed_source(
+    source_id: str,
+    *,
+    query: str,
+    limit: int = 20,
+    case_sensitive: bool = False,
+) -> dict[str, Any]:
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    if not (query or "").strip():
+        return err("parsed_source_search_query_required", "A non-empty parsed source search query is required.")
+    hits = _search_parsed_source_records(parsed, query, limit=max(1, min(int(limit), 200)), case_sensitive=case_sensitive)
+    return ok(hits, provider="local-cache", cache="hit", query=query, limit=limit, case_sensitive=case_sensitive)
+
+
+def validate_note_check(run_dir: str | Path) -> dict[str, Any]:
+    base = Path(run_dir)
+    missing = []
+    required = [
+        base / "note-check-triage.json",
+        base / "plan.json",
+        base / "foundation" / "latest.json",
+        base / "consensus" / "config.json",
+        base / "consensus" / "results.json",
+    ]
+    for path in required:
+        if not path.is_file():
+            missing.append(_display_run_path(base, path))
+    triage_path = base / "note-check-triage.json"
+    results_path = base / "consensus" / "results.json"
+    triage = read_json(triage_path) if triage_path.is_file() else None
+    consensus = read_json(results_path) if results_path.is_file() else None
+    violations = []
+    status_counts: dict[str, int] = {}
+    allowed = {"verified", "reference_disagrees", "unresolved", "context_only"}
+    if isinstance(triage, dict):
+        for note in triage.get("notes") or []:
+            parsed_path_raw = str(note.get("parsed_source_path") or "")
+            if not parsed_path_raw:
+                missing.append("parsed source JSON")
+                continue
+            parsed_path = Path(parsed_path_raw)
+            if not parsed_path.is_file():
+                missing.append(str(parsed_path) if str(parsed_path) else "parsed source JSON")
+        consensus_by_step = _consensus_steps(consensus)
+        for claim in triage.get("claims_to_check") or []:
+            claim_id = str(claim.get("id") or claim.get("equation_id") or "<unknown>")
+            status = str(claim.get("status") or "")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if status not in allowed:
+                violations.append(f"{claim_id}: invalid status {status!r}")
+            step_id = str(claim.get("consensus_step_id") or "")
+            if not step_id:
+                violations.append(f"{claim_id}: missing consensus_step_id")
+                continue
+            if step_id not in consensus_by_step:
+                violations.append(f"{claim_id}: missing consensus result for {step_id}")
+                continue
+            if status == "verified" and consensus_by_step[step_id] != "all_agree":
+                violations.append(f"{claim_id}: verified requires consensus all_agree for {step_id}")
+    elif triage_path.is_file():
+        violations.append("note-check-triage.json is not valid JSON")
+
+    if missing or violations:
+        result = err("note_check_validation_failed", "Note-check run is missing required artifacts or valid consensus statuses.")
+        result["missing"] = missing
+        result["violations"] = violations
+        return result
+    return ok(
+        {
+            "run_dir": str(base),
+            "claims_checked": sum(status_counts.values()),
+            "status_counts": status_counts,
+        },
+        provider="local-cache",
+    )
+
+
+def _read_parsed_source(source_id: str) -> dict[str, Any] | None:
+    parsed = read_json(parsed_source_cache_path(source_id))
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _search_parsed_source_records(
+    parsed: dict[str, Any],
+    query: str,
+    *,
+    limit: int,
+    case_sensitive: bool,
+) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for section in parsed.get("sections") or []:
+        haystack = " ".join(str(section.get(field) or "") for field in ("section_id", "title", "text"))
+        if _text_contains(haystack, query, case_sensitive=case_sensitive):
+            hits.append({"kind": "section", **section})
+        if len(hits) >= limit:
+            return hits[:limit]
+    for equation in parsed.get("equations") or []:
+        haystack = " ".join(
+            str(equation.get(field) or "")
+            for field in ("id", "equation", "before", "after", "section_title", "tex_label", "printed_equation_number")
+        )
+        if _text_contains(haystack, query, case_sensitive=case_sensitive):
+            hits.append({"kind": "equation", **equation})
+        if len(hits) >= limit:
+            break
+    return hits[:limit]
+
+
+def _text_contains(text: str, query: str, *, case_sensitive: bool) -> bool:
+    if case_sensitive:
+        return query in text
+    return query.lower() in text.lower()
+
+
+def _consensus_steps(consensus: Any) -> dict[str, str]:
+    if not isinstance(consensus, dict):
+        return {}
+    steps = consensus.get("steps") or consensus.get("results") or []
+    out = {}
+    for step in steps:
+        if isinstance(step, dict) and step.get("step_id"):
+            out[str(step["step_id"])] = str(step.get("status") or "")
+    return out
+
+
+def _display_run_path(base: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
 def _enrich_search_hits_with_cached_metadata(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     metadata_by_paper: dict[str, dict[str, str]] = {}
     enriched: list[dict[str, Any]] = []
@@ -400,15 +603,80 @@ def _equation_one(paper_id: str, query: str, *, refresh: bool) -> dict[str, Any]
         return err("paper_query_error", str(exc))
 
 
+def _parse_source_id(*, source_id: str | None, paper_id: str | None) -> str | None:
+    if source_id and paper_id:
+        raise ValueError("Use either --id or --paper-id, not both.")
+    if paper_id:
+        return normalize_paper_id(paper_id)
+    return source_id
+
+
+def _parse_local_source(
+    *,
+    source: str,
+    source_path: str | Path | None,
+    source_id: str | None,
+    html_path: str | Path | None,
+    tex_path: str | Path | None,
+    pdf_path: str | Path | None,
+) -> dict[str, Any]:
+    _validate_local_source(source, source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
+    return parse_source_input(
+        source_path=source_path,
+        source_id=source_id,
+        html_path=html_path,
+        tex_path=tex_path,
+        pdf_path=pdf_path,
+    )
+
+
+def _validate_local_source(
+    source: str,
+    *,
+    source_path: str | Path | None,
+    html_path: str | Path | None,
+    tex_path: str | Path | None,
+    pdf_path: str | Path | None,
+) -> None:
+    if source not in {"auto", "html", "tex", "pdf", "tex-pdf"}:
+        raise ValueError(f"Unsupported parse source: {source}")
+    if source == "auto":
+        return
+    source_suffix = Path(source_path).suffix.lower() if source_path else ""
+    has_html = bool(html_path) or source_suffix in {".html", ".htm"}
+    has_tex = bool(tex_path) or source_suffix == ".tex"
+    has_pdf = bool(pdf_path) or source_suffix == ".pdf"
+    if source == "html":
+        if not has_html or has_tex or has_pdf:
+            raise ValueError("source=html requires HTML input only")
+    elif source == "tex":
+        if not has_tex or has_html or source_suffix == ".pdf":
+            raise ValueError("source=tex requires TeX input")
+    elif source == "pdf":
+        if not has_pdf or has_html or has_tex:
+            raise ValueError("source=pdf requires PDF input only")
+    elif source == "tex-pdf":
+        if not has_tex or not pdf_path or has_html or source_suffix == ".pdf":
+            raise ValueError("source=tex-pdf requires TeX input plus --pdf")
+
+
+def _parse_ar5iv_source(paper_id: str | None, *, refresh: bool) -> dict[str, Any]:
+    if not paper_id:
+        raise ValueError("ar5iv parsing requires paper_id")
+    full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
+    html = _ar5iv.get_html(full_text_id, refresh=refresh)
+    return parse_source_input(html_text=html, source_id=normalize_paper_id(full_text_id))
+
+
 def _parsed(paper_id: str, *, refresh: bool) -> dict[str, Any]:
     full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
-    paths = CachePaths.for_paper(full_text_id)
-    if not refresh and (cached := read_json(paths.ar5iv_parsed)):
-        if cached.get("parser_version") == PARSER_VERSION:
+    normalized = normalize_paper_id(full_text_id)
+    path = parsed_source_cache_path(normalized)
+    if not refresh and (cached := read_json(path)):
+        if cached.get("parser_version") == SOURCE_PARSER_VERSION:
             return cached
-    html = _ar5iv.get_html(full_text_id, refresh=refresh)
-    parsed = parse_html(html, paper_id=normalize_paper_id(full_text_id))
-    write_json(paths.ar5iv_parsed, parsed)
+    parsed = _parse_ar5iv_source(normalized, refresh=refresh)
+    write_json(path, parsed)
     return parsed
 
 
@@ -424,10 +692,10 @@ def _full_text_search_files(
     missing: list[str] = []
     for raw in raw_ids:
         full_text_id = _full_text_paper_id(str(raw), refresh=refresh)
-        paths = CachePaths.for_paper(full_text_id)
+        path = parsed_source_cache_path(full_text_id)
         _parsed(full_text_id, refresh=refresh)
-        if paths.ar5iv_parsed.exists():
-            files_by_path[paths.ar5iv_parsed] = FullTextSearchFile(full_text_id, paths.ar5iv_parsed)
+        if path.exists():
+            files_by_path[path] = FullTextSearchFile(full_text_id, path)
         else:
             missing.append(full_text_id)
     return list(files_by_path.values()), missing
@@ -435,8 +703,10 @@ def _full_text_search_files(
 
 def _all_cached_full_text_files() -> list[FullTextSearchFile]:
     files = []
-    for path in sorted((cache_root() / "papers").glob("*/ar5iv/parsed.json")):
-        files.append(FullTextSearchFile(unquote(path.parent.parent.name), path))
+    for path in sorted((cache_root() / "sources").glob("*.json")):
+        parsed = read_json(path)
+        if isinstance(parsed, dict) and parsed.get("paper_id"):
+            files.append(FullTextSearchFile(str(parsed["paper_id"]), path))
     return files
 
 

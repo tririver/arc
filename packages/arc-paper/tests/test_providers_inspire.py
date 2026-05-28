@@ -3,7 +3,7 @@ import urllib.parse
 import httpx
 
 from arc_paper.providers.inspire import InspireProvider
-from arc_paper.cache import CachePaths, read_json, write_json
+from arc_paper.cache import CachePaths, write_json
 
 
 INSPIRE_RECORD = {
@@ -204,8 +204,6 @@ def test_inspire_metadata_migrates_existing_doi_cache_to_arxiv(monkeypatch, tmp_
     doi_paths = CachePaths.for_paper(doi)
     arxiv_paths = CachePaths.for_paper("arXiv:0911.3380")
     write_json(doi_paths.inspire_metadata, INSPIRE_RECORD)
-    write_json(doi_paths.ar5iv_parsed, {"paper_id": doi, "source": "doi"})
-    write_json(arxiv_paths.ar5iv_parsed, {"paper_id": "arXiv:0911.3380", "source": "old-arxiv"})
 
     provider = InspireProvider(
         client=httpx.Client(
@@ -218,7 +216,6 @@ def test_inspire_metadata_migrates_existing_doi_cache_to_arxiv(monkeypatch, tmp_
     assert metadata["paper_id"] == "arXiv:0911.3380"
     assert not doi_paths.paper_dir.exists()
     assert arxiv_paths.inspire_metadata.exists()
-    assert read_json(arxiv_paths.ar5iv_parsed)["source"] == "doi"
 
 
 def test_inspire_references_can_be_enriched_through_single_paper_cache(monkeypatch, tmp_path):
