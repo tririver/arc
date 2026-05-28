@@ -57,6 +57,10 @@ section's TeX. In that case, rely on `arc-paper parse --tex NOTE.tex --pdf
 BOOK.pdf --id NOTE_ID` to locate equation numbers and pages from nearby prose,
 equation tokens, and printed number candidates.
 
+If a PDF is provided but cannot be used, for example because `pdftotext` is not
+installed or returns no text, `arc-paper parse` prints a warning and reports it
+in `meta.warnings`.
+
 Step 2: Read Markdown files directly. Extract PDF-only notes with available
 host tools. Preserve source file names, page numbers, section headings, and
 nearby labels when available.

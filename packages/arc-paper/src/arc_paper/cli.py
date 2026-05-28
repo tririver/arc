@@ -174,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     result = _dispatch(args)
+    _print_warnings(result)
     _print_json(result)
     return 0
 
@@ -359,6 +360,23 @@ def _read_papers_file(path: str) -> list[str]:
 
 def _print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+
+def _print_warnings(data: Any) -> None:
+    if not isinstance(data, dict):
+        return
+    meta = data.get("meta")
+    if not isinstance(meta, dict):
+        return
+    for warning in meta.get("warnings") or []:
+        if not isinstance(warning, dict):
+            continue
+        message = str(warning.get("message") or warning.get("code") or "").strip()
+        if not message:
+            continue
+        pdf_path = str(warning.get("pdf_path") or "").strip()
+        suffix = f" ({pdf_path})" if pdf_path else ""
+        print(f"WARNING: {message}{suffix}", file=sys.stderr)
 
 
 if __name__ == "__main__":

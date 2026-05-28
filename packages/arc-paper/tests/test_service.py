@@ -1,4 +1,5 @@
 from arc_paper import reference_inference, service
+import arc_paper.parse.source as parse_source_module
 from arc_paper.cache import CachePaths, parsed_source_cache_path, read_json, text_query_cache_path, write_json
 from arc_paper.parse.source import PARSER_VERSION
 from arc_paper.providers.base import ProviderError
@@ -265,6 +266,30 @@ def test_parse_source_tex_pdf_requires_tex_and_pdf(monkeypatch, tmp_path):
 
     assert result["ok"] is False
     assert result["error"]["code"] == "parse_source_invalid"
+
+
+def test_parse_source_warns_when_given_pdf_is_not_used(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    tex_path = tmp_path / "note.tex"
+    tex_path.write_text(r"\section{Only TeX}", encoding="utf-8")
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+
+    def missing_pdftotext(*args, **kwargs):
+        raise FileNotFoundError("pdftotext")
+
+    monkeypatch.setattr(parse_source_module.subprocess, "run", missing_pdftotext)
+
+    result = service.parse_source(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
+
+    assert result["ok"] is True
+    assert result["meta"]["warnings"] == [
+        {
+            "code": "pdf_not_used",
+            "message": "PDF input was provided but pdftotext is not installed; PDF was not used.",
+            "pdf_path": str(pdf_path),
+        }
+    ]
 
 
 def test_get_parsed_source_reads_sources_cache(monkeypatch, tmp_path):

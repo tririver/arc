@@ -10,9 +10,32 @@ from typing import Any
 from .ar5iv_html import parse_html
 
 
-PARSER_VERSION = 7
+PARSER_VERSION = 8
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
+EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"
+GREEK_TOKEN_NAMES = {
+    "\u03b1": "alpha",
+    "\u03b2": "beta",
+    "\u03b3": "gamma",
+    "\u03b4": "delta",
+    "\u03b5": "epsilon",
+    "\u03b7": "eta",
+    "\u03b8": "theta",
+    "\u03bb": "lambda",
+    "\u03bc": "mu",
+    "\u03bd": "nu",
+    "\u03c0": "pi",
+    "\u03c1": "rho",
+    "\u03c3": "sigma",
+    "\u03c4": "tau",
+    "\u03c6": "phi",
+    "\u03c8": "psi",
+    "\u03c9": "omega",
+    "\u0394": "delta",
+    "\u039b": "lambda",
+    "\u03a9": "omega",
+}
 
 
 def parse_source_input(
@@ -41,27 +64,116 @@ def parse_source_input(
     raise ValueError("parse_source_input requires an HTML, TeX, PDF, or ar5iv source")
 
 
+def parse_source_input_with_warnings(
+    *,
+    source_path: str | Path | None = None,
+    source_id: str | None = None,
+    html_path: str | Path | None = None,
+    html_text: str | None = None,
+    tex_path: str | Path | None = None,
+    pdf_path: str | Path | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    resolved = _resolve_inputs(source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
+    paper_id = source_id or _generated_source_id()
+    if html_text is not None:
+        parsed = parse_html(html_text, paper_id=paper_id)
+        return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_text(html_text)), []
+    if resolved["html_path"]:
+        path = Path(resolved["html_path"])
+        data = path.read_bytes()
+        parsed = parse_html(data.decode("utf-8"), paper_id=paper_id)
+        return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_bytes(data)), []
+    if resolved["tex_path"]:
+        if resolved["pdf_path"]:
+            return parse_tex_document_with_warnings(
+                Path(resolved["tex_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]
+            )
+        return parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id), []
+    if resolved["pdf_path"]:
+        return parse_pdf_document_with_warnings(Path(resolved["pdf_path"]), paper_id=paper_id)
+    raise ValueError("parse_source_input requires an HTML, TeX, PDF, or ar5iv source")
+
+
 def extract_pdf_pages(path: str | Path) -> list[str]:
+    pages, _ = _extract_pdf_pages_with_warning(path)
+    return pages
+
+
+def _extract_pdf_pages_with_warning(path: str | Path) -> tuple[list[str], dict[str, Any] | None]:
     try:
         completed = subprocess.run(
             ["pdftotext", "-layout", "-enc", "UTF-8", str(path), "-"],
             check=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=30,
         )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return [page.strip() for page in completed.stdout.split("\f") if page.strip()]
+    except FileNotFoundError:
+        return [], {
+            "code": "pdf_not_used",
+            "message": "PDF input was provided but pdftotext is not installed; PDF was not used.",
+            "pdf_path": str(path),
+        }
+    except subprocess.TimeoutExpired:
+        return [], {
+            "code": "pdf_not_used",
+            "message": "PDF input was provided but pdftotext timed out; PDF was not used.",
+            "pdf_path": str(path),
+        }
+    except subprocess.SubprocessError:
+        return [], {
+            "code": "pdf_not_used",
+            "message": "PDF input was provided but pdftotext failed; PDF was not used.",
+            "pdf_path": str(path),
+        }
+    except OSError:
+        return [], {
+            "code": "pdf_not_used",
+            "message": "PDF input was provided but pdftotext could not run; PDF was not used.",
+            "pdf_path": str(path),
+        }
+    pages = [page.strip() for page in completed.stdout.split("\f") if page.strip()]
+    if not pages:
+        return [], {
+            "code": "pdf_not_used",
+            "message": "PDF input was provided but pdftotext returned no text; PDF was not used.",
+            "pdf_path": str(path),
+        }
+    return pages, None
 
 
 def parse_tex_document(path: Path, *, paper_id: str, pdf_path: str | Path | None = None) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
+    pdf_pages = extract_pdf_pages(pdf_path) if pdf_path else []
+    return _tex_document_from_pages(path, paper_id=paper_id, pdf_path=pdf_path, lines=lines, pdf_pages=pdf_pages)
+
+
+def parse_tex_document_with_warnings(
+    path: Path, *, paper_id: str, pdf_path: str | Path | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    pdf_pages: list[str] = []
+    warnings: list[dict[str, Any]] = []
+    if pdf_path:
+        pdf_pages, warning = _extract_pdf_pages_with_warning(pdf_path)
+        if warning:
+            warnings.append(warning)
+    return _tex_document_from_pages(path, paper_id=paper_id, pdf_path=pdf_path, lines=lines, pdf_pages=pdf_pages), warnings
+
+
+def _tex_document_from_pages(
+    path: Path,
+    *,
+    paper_id: str,
+    pdf_path: str | Path | None,
+    lines: list[str],
+    pdf_pages: list[str],
+) -> dict[str, Any]:
     sections = _tex_sections(path, lines)
     equations = _tex_equations(path, lines, sections)
-    pdf_pages = extract_pdf_pages(pdf_path) if pdf_path else []
     if pdf_pages:
         _enrich_equations_from_pdf(equations, pdf_pages)
         _fill_section_pdf_pages(sections, equations)
@@ -77,6 +189,16 @@ def parse_tex_document(path: Path, *, paper_id: str, pdf_path: str | Path | None
 
 def parse_pdf_document(path: Path, *, paper_id: str) -> dict[str, Any]:
     pages = extract_pdf_pages(path)
+    return _pdf_document_from_pages(path, paper_id=paper_id, pages=pages)
+
+
+def parse_pdf_document_with_warnings(path: Path, *, paper_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    pages, warning = _extract_pdf_pages_with_warning(path)
+    warnings = [warning] if warning else []
+    return _pdf_document_from_pages(path, paper_id=paper_id, pages=pages), warnings
+
+
+def _pdf_document_from_pages(path: Path, *, paper_id: str, pages: list[str]) -> dict[str, Any]:
     sections = _pdf_sections(path, pages)
     equations = _pdf_equations(path, pages, sections)
     return {
@@ -370,17 +492,17 @@ def _text_context_line(line: str) -> str:
 
 
 def _pdf_equation_candidate(line: str) -> str:
-    cleaned = re.sub(r"\(([A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?)\)\s*$", "", line).strip()
+    cleaned = re.sub(rf"\(({EQUATION_NUMBER_PATTERN})\)\s*$", "", line).strip()
     if "=" not in cleaned:
         return ""
-    tokens = re.findall(r"[A-Za-z0-9]+", cleaned)
+    tokens = _search_tokens(cleaned)
     if len(tokens) < 3:
         return ""
     return cleaned
 
 
 def _line_equation_number(line: str) -> str | None:
-    match = re.search(r"\(([A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?)\)\s*$", line)
+    match = re.search(rf"\(({EQUATION_NUMBER_PATTERN})\)\s*$", line)
     return match.group(1) if match else None
 
 
@@ -419,20 +541,69 @@ def _enrich_equations_from_pdf(equations: list[dict[str, Any]], pages: list[str]
 
 def _pdf_match_score(equation: dict[str, Any], page: str) -> int:
     haystack = _search_text(page)
+    page_tokens = set(_search_tokens(page))
     score = 0
     for field in ("before", "after"):
         needle = _search_text(str(equation.get(field) or ""))
         if needle and needle in haystack:
-            score += 5
-    page_tokens = set(_search_tokens(page))
+            score += 10
+        if needle_tokens := set(_search_tokens(str(equation.get(field) or ""))):
+            score += min(_token_overlap_score(needle_tokens, page_tokens), 20)
     eq_tokens = set(_search_tokens(str(equation.get("equation") or "")))
-    score += len(eq_tokens.intersection(page_tokens))
+    score += _token_overlap_score(eq_tokens, page_tokens)
     return score
 
 
 def _best_equation_number(page: str, equation: str) -> str | None:
-    candidates = re.findall(r"\(([A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?)\)", page)
-    return candidates[0] if candidates else None
+    candidates = [(match.group(1), match.start()) for match in re.finditer(rf"\(({EQUATION_NUMBER_PATTERN})\)", page)]
+    if not candidates:
+        return None
+    equation_tokens = set(_search_tokens(equation))
+    if not equation_tokens:
+        return candidates[0][0]
+    line_spans = _line_spans(page)
+    best_number = candidates[0][0]
+    best_score = 0
+    for number, offset in candidates:
+        window = _line_window_for_offset(line_spans, offset)
+        score = _token_overlap_score(equation_tokens, set(_search_tokens(window)))
+        if score > best_score:
+            best_score = score
+            best_number = number
+    return best_number
+
+
+def _token_overlap_score(left: set[str], right: set[str]) -> int:
+    return sum(_token_weight(token) for token in left.intersection(right))
+
+
+def _token_weight(token: str) -> int:
+    if token.isdigit():
+        return 0
+    if len(token) == 1:
+        return 1
+    return 3
+
+
+def _line_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        start = offset
+        offset += len(raw_line)
+        spans.append((start, offset, raw_line.strip()))
+    if text and (not spans or spans[-1][1] < len(text)):
+        spans.append((offset, len(text), text[offset:].strip()))
+    return spans
+
+
+def _line_window_for_offset(line_spans: list[tuple[int, int, str]], offset: int) -> str:
+    for index, (start, end, _) in enumerate(line_spans):
+        if start <= offset < end:
+            first = max(0, index - 2)
+            last = min(len(line_spans), index + 2)
+            return "\n".join(line for _, _, line in line_spans[first:last])
+    return ""
 
 
 def _search_text(text: str) -> str:
@@ -448,7 +619,9 @@ def _search_tokens(text: str) -> list[str]:
         .replace("{", " ")
         .replace("}", " ")
     )
-    return [token.lower() for token in re.findall(r"[A-Za-z0-9]+", normalized)]
+    for symbol, name in GREEK_TOKEN_NAMES.items():
+        normalized = normalized.replace(symbol, f" {name} ")
+    return [token.lower() for token in re.findall(r"\w+", normalized)]
 
 
 def _fill_section_pdf_pages(sections: list[dict[str, Any]], equations: list[dict[str, Any]]) -> None:

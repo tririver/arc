@@ -1,7 +1,7 @@
 import re
 
 import arc_paper.parse.source as source
-from arc_paper.parse.source import parse_source_input
+from arc_paper.parse.source import parse_source_input, parse_source_input_with_warnings
 
 
 def test_parse_local_html_returns_current_ar5iv_shape(tmp_path):
@@ -76,6 +76,123 @@ def test_parse_tex_pdf_returns_same_shape_with_optional_details(monkeypatch, tmp
     assert equation["tex_label"] == "eq:friedmann"
     assert equation["printed_equation_number"] == "9.12"
     assert equation["pdf_page"] == 2
+
+
+def test_parse_tex_pdf_uses_nearest_printed_equation_number(monkeypatch, tmp_path):
+    tex_path = tmp_path / "lecture9.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Inflation}",
+                "于是，暴胀场背景的作用量为：",
+                r"\begin{align}\label{eq:bg-action}",
+                r"S_\phi = \int d^4 x ~ a^3(t) \left[ \frac{1}{2} \dot \phi_0^2 - V(\phi_0) \right]~.",
+                r"\end{align}",
+                "暴胀场背景的能量密度为",
+                r"\begin{align}\label{eq:rho}",
+                r"\rho = \frac{1}{2} \dot\phi_0^2 + V(\phi_0)~.",
+                r"\end{align}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "\n".join(
+                [
+                    "前文引用 (9.28) 和 (9.30)。",
+                    "于是，暴胀场背景的作用量为：",
+                    "Sφ = d4x a3(t) 1/2 φ0^2 - V(φ0).        (9.29)",
+                    "暴胀场背景的能量密度为",
+                    "ρ = 1/2 φ0^2 + V(φ0).                    (9.30)",
+                ]
+            )
+        ],
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
+    by_label = {equation["tex_label"]: equation for equation in parsed["equations"]}
+
+    assert by_label["eq:bg-action"]["printed_equation_number"] == "9.29"
+    assert by_label["eq:rho"]["printed_equation_number"] == "9.30"
+
+
+def test_parse_tex_pdf_uses_nearby_prose_to_choose_pdf_page(monkeypatch, tmp_path):
+    tex_path = tmp_path / "lecture9.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Inflation}",
+                r"由于拉氏量是动能减势能，不难猜出 \note{严格地，可由$T_{00}$得到} ，暴胀场背景的能量密度为",
+                r"\begin{align}\label{eq:rho}",
+                r"\rho = \frac{1}{2} \dot\phi_0^2 + V(\phi_0)~.",
+                r"\end{align}",
+                r"对作用量 \eqref{eq:bg-action} 变分，得暴胀场的运动方程：",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "Unrelated page.\nρ = 1/2 φ0^2 + V(φ0).                    (1.12)",
+            "\n".join(
+                [
+                    "由于拉氏量是动能减势能，不难猜出（严格地，可由 T00 得到），",
+                    "暴胀场背景的能量密度为",
+                    "ρ = 1/2 φ0^2 + V(φ0).                    (9.30)",
+                    "对作用量 (9.29) 变分，得暴胀场的运动方程：",
+                ]
+            ),
+        ],
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
+    equation = parsed["equations"][0]
+
+    assert equation["pdf_page"] == 2
+    assert equation["printed_equation_number"] == "9.30"
+
+
+def test_parse_tex_pdf_reports_warning_when_pdf_text_is_unavailable(monkeypatch, tmp_path):
+    tex_path = tmp_path / "lecture9.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Dynamics}",
+                r"\begin{equation}",
+                r"x = y",
+                r"\end{equation}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+
+    def missing_pdftotext(*args, **kwargs):
+        raise FileNotFoundError("pdftotext")
+
+    monkeypatch.setattr(source.subprocess, "run", missing_pdftotext)
+
+    parsed, warnings = parse_source_input_with_warnings(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
+
+    assert set(parsed) == {"paper_id", "parser_version", "source_hash", "toc", "sections", "equations"}
+    assert "pdf_page" not in parsed["equations"][0]
+    assert warnings == [
+        {
+            "code": "pdf_not_used",
+            "message": "PDF input was provided but pdftotext is not installed; PDF was not used.",
+            "pdf_path": str(pdf_path),
+        }
+    ]
 
 
 def test_parse_pdf_only_returns_best_effort_shape(monkeypatch, tmp_path):

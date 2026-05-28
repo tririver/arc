@@ -23,6 +23,7 @@ from .parse.ar5iv_html import get_section as parsed_get_section
 from .parse.equations import find_equation_context
 from .parse.source import PARSER_VERSION as SOURCE_PARSER_VERSION
 from .parse.source import parse_source_input
+from .parse.source import parse_source_input_with_warnings
 from .providers import Ar5ivProvider, InspireProvider
 from .providers.base import ProviderError
 from .reference_inference import ReferenceInferenceError, infer_main_references
@@ -244,13 +245,14 @@ def parse_source(
     refresh: bool = False,
 ) -> dict[str, Any]:
     try:
+        warnings: list[dict[str, Any]] = []
         resolved_id = _parse_source_id(source_id=source_id, paper_id=paper_id)
         if source == "ar5iv" or paper_id:
             if source not in {"auto", "ar5iv"}:
                 raise ValueError("--paper-id only supports source=auto or source=ar5iv")
             parsed = _parse_ar5iv_source(resolved_id, refresh=refresh)
         else:
-            parsed = _parse_local_source(
+            parsed, warnings = _parse_local_source(
                 source=source,
                 source_path=source_path,
                 source_id=resolved_id,
@@ -260,7 +262,7 @@ def parse_source(
             )
         path = parsed_source_cache_path(str(parsed["paper_id"]))
         write_json(path, parsed)
-        return ok(parsed, provider="local-cache", cache="write", cache_path=str(path))
+        return ok(parsed, provider="local-cache", cache="write", cache_path=str(path), warnings=warnings or None)
     except FileNotFoundError as exc:
         return err("parse_source_not_found", str(exc))
     except ValueError as exc:
@@ -750,9 +752,9 @@ def _parse_local_source(
     html_path: str | Path | None,
     tex_path: str | Path | None,
     pdf_path: str | Path | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     _validate_local_source(source, source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
-    return parse_source_input(
+    return parse_source_input_with_warnings(
         source_path=source_path,
         source_id=source_id,
         html_path=html_path,

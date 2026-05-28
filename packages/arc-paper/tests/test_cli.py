@@ -222,6 +222,41 @@ def test_cli_parse_dispatches_tex_pdf(monkeypatch, capsys):
     assert output["data"] == {"paper_id": "lecture-9", "tex_path": "note.tex", "pdf_path": "book.pdf"}
 
 
+def test_cli_prints_parse_warnings_to_stderr(monkeypatch, capsys):
+    def parse_source(
+        source_path=None,
+        *,
+        source="auto",
+        source_id=None,
+        paper_id=None,
+        html_path=None,
+        tex_path=None,
+        pdf_path=None,
+        refresh=False,
+    ):
+        return {
+            "ok": True,
+            "data": {"paper_id": source_id},
+            "errors": [],
+            "meta": {
+                "warnings": [
+                    {
+                        "code": "pdf_not_used",
+                        "message": "PDF input was provided but pdftotext is not installed; PDF was not used.",
+                        "pdf_path": "book.pdf",
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(cli.service, "parse_source", parse_source)
+
+    assert cli.main(["parse", "--tex", "note.tex", "--pdf", "book.pdf", "--id", "lecture-9", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert "WARNING: PDF input was provided but pdftotext is not installed; PDF was not used. (book.pdf)" in captured.err
+
+
 def test_cli_parse_dispatches_ar5iv_paper(monkeypatch, capsys):
     def parse_source(
         source_path=None,
