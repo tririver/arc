@@ -10,7 +10,7 @@ from typing import Any
 from .ar5iv_html import parse_html
 
 
-PARSER_VERSION = 8
+PARSER_VERSION = 9
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
 EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"
@@ -535,7 +535,7 @@ def _enrich_equations_from_pdf(equations: list[dict[str, Any]], pages: list[str]
                 best_page = (page_index, page)
         if best_page and best_score >= 4:
             equation["pdf_page"] = best_page[0]
-            if number := _best_equation_number(best_page[1], str(equation.get("equation") or "")):
+            if number := _best_equation_number(best_page[1], equation):
                 equation["printed_equation_number"] = number
 
 
@@ -554,19 +554,27 @@ def _pdf_match_score(equation: dict[str, Any], page: str) -> int:
     return score
 
 
-def _best_equation_number(page: str, equation: str) -> str | None:
+def _best_equation_number(page: str, equation: dict[str, Any]) -> str | None:
     candidates = [(match.group(1), match.start()) for match in re.finditer(rf"\(({EQUATION_NUMBER_PATTERN})\)", page)]
     if not candidates:
         return None
-    equation_tokens = set(_search_tokens(equation))
+    equation_tokens = set(_search_tokens(str(equation.get("equation") or "")))
     if not equation_tokens:
         return candidates[0][0]
+    before_tokens = set(_search_tokens(str(equation.get("before") or "")))
+    after_tokens = set(_search_tokens(str(equation.get("after") or "")))
     line_spans = _line_spans(page)
     best_number = candidates[0][0]
-    best_score = 0
+    best_score = -1
     for number, offset in candidates:
-        window = _line_window_for_offset(line_spans, offset)
-        score = _token_overlap_score(equation_tokens, set(_search_tokens(window)))
+        equation_window = _line_window_for_offset(line_spans, offset)
+        before_window = _line_window_before_offset(line_spans, offset)
+        after_window = _line_window_after_offset(line_spans, offset)
+        before_score = _token_overlap_score(before_tokens, set(_search_tokens(before_window)))
+        after_score = _token_overlap_score(after_tokens, set(_search_tokens(after_window)))
+        equation_score = _token_overlap_score(equation_tokens, set(_search_tokens(equation_window)))
+        bracket_bonus = 50 if before_score and after_score else 0
+        score = bracket_bonus + (before_score * 4) + (after_score * 4) + equation_score
         if score > best_score:
             best_score = score
             best_number = number
@@ -603,6 +611,22 @@ def _line_window_for_offset(line_spans: list[tuple[int, int, str]], offset: int)
             first = max(0, index - 2)
             last = min(len(line_spans), index + 2)
             return "\n".join(line for _, _, line in line_spans[first:last])
+    return ""
+
+
+def _line_window_before_offset(line_spans: list[tuple[int, int, str]], offset: int, *, max_lines: int = 8) -> str:
+    for index, (start, end, _) in enumerate(line_spans):
+        if start <= offset < end:
+            first = max(0, index - max_lines)
+            return "\n".join(line for _, _, line in line_spans[first:index])
+    return ""
+
+
+def _line_window_after_offset(line_spans: list[tuple[int, int, str]], offset: int, *, max_lines: int = 8) -> str:
+    for index, (start, end, _) in enumerate(line_spans):
+        if start <= offset < end:
+            last = min(len(line_spans), index + 1 + max_lines)
+            return "\n".join(line for _, _, line in line_spans[index + 1 : last])
     return ""
 
 

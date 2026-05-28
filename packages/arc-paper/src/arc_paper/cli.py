@@ -10,7 +10,7 @@ from . import service
 from .batch.db import BatchDB
 from .batch.runner import export_batch, prefetch_batch, run_batch
 from .host import detect_host, select_llm_provider
-from .results import ok
+from .results import err, ok
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,6 +134,17 @@ def main(argv: list[str] | None = None) -> int:
     validate_note_check.add_argument("run_dir")
     validate_note_check.add_argument("--json", action="store_true")
 
+    cache_cmd = sub.add_parser("cache")
+    cache_sub = cache_cmd.add_subparsers(dest="cache_command", required=True)
+    cache_list = cache_sub.add_parser("list")
+    _cache_filter_args(cache_list, include_all=False)
+    cache_list.add_argument("--json", action="store_true")
+    cache_remove = cache_sub.add_parser("remove")
+    _cache_filter_args(cache_remove, include_all=True)
+    cache_remove.add_argument("--dry-run", action="store_true")
+    cache_remove.add_argument("--yes", action="store_true")
+    cache_remove.add_argument("--json", action="store_true")
+
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
     for name in ("host", "provider"):
@@ -187,8 +198,73 @@ def _paper_command(sub, name: str) -> argparse.ArgumentParser:
     return parser
 
 
+def _cache_filter_args(parser: argparse.ArgumentParser, *, include_all: bool) -> None:
+    parser.add_argument("--id", dest="ids", action="append", default=None)
+    parser.add_argument("--since", default=None)
+    parser.add_argument("--older-than", default=None)
+    parser.add_argument("--past-hour", dest="since", action="store_const", const="1h")
+    parser.add_argument("--past-day", dest="since", action="store_const", const="1d")
+    if include_all:
+        parser.add_argument("--all", dest="all_items", action="store_true")
+
+
 def _dispatch(args: argparse.Namespace) -> Any:
     command = args.command
+    if command == "cache":
+        if args.cache_command == "list":
+            return service.list_cached_papers(ids=args.ids, since=args.since, older_than=args.older_than)
+        if args.cache_command == "remove":
+            if args.dry_run:
+                result = service.remove_cached_papers(
+                    ids=args.ids,
+                    since=args.since,
+                    older_than=args.older_than,
+                    all_items=args.all_items,
+                    dry_run=True,
+                )
+                _print_cache_remove_preview(result)
+                return result
+            if args.yes:
+                result = service.remove_cached_papers(
+                    ids=args.ids,
+                    since=args.since,
+                    older_than=args.older_than,
+                    all_items=args.all_items,
+                    dry_run=False,
+                )
+                _print_cache_remove_preview(result)
+                return result
+            preview = service.remove_cached_papers(
+                ids=args.ids,
+                since=args.since,
+                older_than=args.older_than,
+                all_items=args.all_items,
+                dry_run=True,
+            )
+            _print_cache_remove_preview(preview)
+            if not preview.get("ok"):
+                return preview
+            if not (preview.get("data") or {}).get("items"):
+                return preview
+            if not _confirm_cache_remove():
+                return ok(
+                    {
+                        "cancelled": True,
+                        "items": (preview.get("data") or {}).get("items") or [],
+                        "removed_count": 0,
+                        "removed_paths": [],
+                    },
+                    provider="local-cache",
+                    confirmed=False,
+                )
+            return service.remove_cached_papers(
+                ids=args.ids,
+                since=args.since,
+                older_than=args.older_than,
+                all_items=args.all_items,
+                dry_run=False,
+            )
+        return err("cache_command_invalid", f"Unknown cache command {args.cache_command!r}")
     if command == "doctor":
         if args.doctor_command == "host":
             detected = detect_host()
@@ -360,6 +436,34 @@ def _read_papers_file(path: str) -> list[str]:
 
 def _print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+
+def _print_cache_remove_preview(result: Any) -> None:
+    if not isinstance(result, dict):
+        return
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return
+    items = data.get("items") or []
+    if not items:
+        print("No cached papers selected for removal.", file=sys.stderr)
+        return
+    print("Cached papers selected for removal:", file=sys.stderr)
+    for item in items:
+        paper_id = str(item.get("paper_id") or "<unknown>")
+        kinds = ", ".join(str(kind) for kind in item.get("kinds") or [])
+        print(f"- {paper_id} [{kinds}]", file=sys.stderr)
+        for path_info in item.get("paths") or []:
+            path = str(path_info.get("path") or "")
+            kind = str(path_info.get("kind") or "cache")
+            if path:
+                print(f"  - {kind}: {path}", file=sys.stderr)
+
+
+def _confirm_cache_remove() -> bool:
+    print("Remove cached papers? [y/N] ", end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline().strip().lower()
+    return answer == "y"
 
 
 def _print_warnings(data: Any) -> None:

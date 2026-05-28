@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import time
 from collections.abc import Callable, Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from .cache import (
     CachePaths,
@@ -700,6 +705,273 @@ def doctor_cache(paper_id: str | None = None) -> dict[str, Any]:
             ),
         }
     return ok(data)
+
+
+def list_cached_papers(
+    *,
+    ids: Iterable[str] | None = None,
+    since: str | None = None,
+    older_than: str | None = None,
+) -> dict[str, Any]:
+    try:
+        items = _select_cached_papers(ids=ids, since=since, older_than=older_than)
+    except ValueError as exc:
+        return err("cache_filter_invalid", str(exc))
+    return ok(
+        {"items": items, "count": len(items)},
+        provider="local-cache",
+        cache_root=str(cache_root()),
+        since=since,
+        older_than=older_than,
+    )
+
+
+def remove_cached_papers(
+    *,
+    ids: Iterable[str] | None = None,
+    since: str | None = None,
+    older_than: str | None = None,
+    all_items: bool = False,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    if not all_items and not ids and not since and not older_than:
+        return err("cache_remove_selector_required", "Use --id, --since, --older-than, or --all before removing cache entries.")
+    selected = list_cached_papers(ids=ids, since=since, older_than=older_than)
+    if not selected.get("ok"):
+        return selected
+    items = list((selected.get("data") or {}).get("items") or [])
+    removed_paths: list[str] = []
+    skipped_paths: list[dict[str, str]] = []
+    if not dry_run:
+        for path in _unique_selected_paths(items):
+            safe_path = _safe_cache_path(Path(path))
+            if safe_path is None:
+                skipped_paths.append({"path": str(path), "reason": "outside cache root"})
+                continue
+            if not safe_path.exists():
+                continue
+            try:
+                if safe_path.is_dir():
+                    shutil.rmtree(safe_path)
+                else:
+                    safe_path.unlink()
+                removed_paths.append(str(safe_path))
+            except OSError as exc:
+                skipped_paths.append({"path": str(safe_path), "reason": str(exc)})
+    return ok(
+        {
+            "items": items,
+            "count": len(items),
+            "dry_run": dry_run,
+            "removed_count": len(removed_paths),
+            "removed_paths": removed_paths,
+            "skipped_paths": skipped_paths,
+        },
+        provider="local-cache",
+        cache_root=str(cache_root()),
+        since=since,
+        older_than=older_than,
+    )
+
+
+def _select_cached_papers(
+    *,
+    ids: Iterable[str] | None,
+    since: str | None,
+    older_than: str | None,
+) -> list[dict[str, Any]]:
+    items = _cached_paper_items()
+    id_filter = _cache_id_filter(ids)
+    if id_filter:
+        items = [item for item in items if _cache_item_matches_id(item, id_filter)]
+    now = time.time()
+    if since:
+        threshold = now - _parse_duration_seconds(since)
+        items = [item for item in items if float(item.get("modified_time") or 0.0) >= threshold]
+    if older_than:
+        threshold = now - _parse_duration_seconds(older_than)
+        items = [item for item in items if float(item.get("modified_time") or 0.0) <= threshold]
+    return sorted(items, key=lambda item: (str(item.get("paper_id") or ""), str(item.get("modified_at") or "")))
+
+
+def _cached_paper_items() -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    root = cache_root()
+    for paper_dir in sorted((root / "papers").iterdir() if (root / "papers").is_dir() else []):
+        if paper_dir.is_dir():
+            _add_cache_path(grouped, unquote(paper_dir.name), "paper_dir", paper_dir)
+    for source_path in sorted((root / "sources").glob("*.json")):
+        paper_id = _paper_id_from_json(source_path, default=source_path.stem)
+        _add_cache_path(grouped, paper_id, "source", source_path)
+    for annotation_path in sorted((root / "source-annotations").glob("*.json")):
+        paper_id = _source_id_from_annotation_json(annotation_path, default=annotation_path.stem)
+        _add_cache_path(grouped, paper_id, "source_annotation", annotation_path)
+    for alias_path in sorted((root / "paper-aliases").glob("*.json")):
+        paper_id = _paper_id_from_json(alias_path, default=unquote(alias_path.stem))
+        _add_cache_path(grouped, paper_id, "paper_alias", alias_path)
+    return [_finalize_cache_item(item) for item in grouped.values()]
+
+
+def _add_cache_path(grouped: dict[str, dict[str, Any]], paper_id: str, kind: str, path: Path) -> None:
+    if not paper_id or not path.exists():
+        return
+    item = grouped.setdefault(
+        paper_id,
+        {
+            "paper_id": paper_id,
+            "kinds": [],
+            "paths": [],
+            "bytes": 0,
+            "modified_time": 0.0,
+        },
+    )
+    if kind not in item["kinds"]:
+        item["kinds"].append(kind)
+    modified_time = _path_modified_time(path)
+    item["modified_time"] = max(float(item["modified_time"]), modified_time)
+    item["bytes"] = int(item["bytes"]) + _path_size(path)
+    item["paths"].append(
+        {
+            "kind": kind,
+            "path": str(path),
+            "bytes": _path_size(path),
+            "modified_at": _iso_from_timestamp(modified_time),
+        }
+    )
+
+
+def _finalize_cache_item(item: dict[str, Any]) -> dict[str, Any]:
+    out = dict(item)
+    out["kinds"] = sorted(out.get("kinds") or [])
+    out["paths"] = sorted(out.get("paths") or [], key=lambda path: (path.get("kind", ""), path.get("path", "")))
+    out["modified_at"] = _iso_from_timestamp(float(out.get("modified_time") or 0.0))
+    return out
+
+
+def _paper_id_from_json(path: Path, *, default: str) -> str:
+    data = read_json(path)
+    if isinstance(data, dict):
+        for key in ("paper_id", "source_id", "canonical_id"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+    return default
+
+
+def _source_id_from_annotation_json(path: Path, *, default: str) -> str:
+    data = read_json(path)
+    if isinstance(data, dict):
+        value = str(data.get("source_id") or "").strip()
+        if value:
+            return value
+    return default
+
+
+def _cache_id_filter(ids: Iterable[str] | None) -> set[str]:
+    out: set[str] = set()
+    for paper_id in ids or []:
+        raw = str(paper_id or "").strip()
+        normalized = normalize_paper_id(raw)
+        if raw:
+            out.add(raw)
+        if normalized:
+            out.add(normalized)
+    return out
+
+
+def _cache_item_matches_id(item: dict[str, Any], id_filter: set[str]) -> bool:
+    paper_id = str(item.get("paper_id") or "")
+    return paper_id in id_filter or normalize_paper_id(paper_id) in id_filter
+
+
+def _parse_duration_seconds(value: str) -> float:
+    text = str(value or "").strip().lower().replace("_", " ").replace("-", " ")
+    if text.startswith("past "):
+        text = text[5:].strip()
+    units = {
+        "s": 1,
+        "sec": 1,
+        "second": 1,
+        "seconds": 1,
+        "m": 60,
+        "min": 60,
+        "minute": 60,
+        "minutes": 60,
+        "h": 3600,
+        "hr": 3600,
+        "hour": 3600,
+        "hours": 3600,
+        "d": 86400,
+        "day": 86400,
+        "days": 86400,
+        "w": 7 * 86400,
+        "week": 7 * 86400,
+        "weeks": 7 * 86400,
+    }
+    if text in units:
+        return float(units[text])
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*([a-z]+)$", text)
+    if not match:
+        raise ValueError(f"Invalid duration {value!r}; use values like 1h, 1d, or past hour.")
+    amount = float(match.group(1))
+    unit = match.group(2)
+    if unit not in units:
+        raise ValueError(f"Invalid duration unit {unit!r}; use h, d, or week.")
+    return amount * units[unit]
+
+
+def _path_modified_time(path: Path) -> float:
+    if path.is_dir():
+        latest = path.stat().st_mtime
+        for child in path.rglob("*"):
+            try:
+                latest = max(latest, child.stat().st_mtime)
+            except OSError:
+                continue
+        return latest
+    return path.stat().st_mtime
+
+
+def _path_size(path: Path) -> int:
+    if path.is_dir():
+        total = 0
+        for child in path.rglob("*"):
+            if child.is_file():
+                try:
+                    total += child.stat().st_size
+                except OSError:
+                    continue
+        return total
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _iso_from_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def _unique_selected_paths(items: list[dict[str, Any]]) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        for path_info in item.get("paths") or []:
+            path = str(path_info.get("path") or "")
+            if path and path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
+
+
+def _safe_cache_path(path: Path) -> Path | None:
+    root = cache_root().resolve()
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved
 
 
 def _metadata_field(paper_id: str, field: str, *, refresh: bool) -> dict[str, Any]:

@@ -1,6 +1,16 @@
-from arc_paper import reference_inference, service
+import os
+import time
+
 import arc_paper.parse.source as parse_source_module
-from arc_paper.cache import CachePaths, parsed_source_cache_path, read_json, text_query_cache_path, write_json
+from arc_paper import reference_inference, service
+from arc_paper.cache import (
+    CachePaths,
+    parsed_source_annotations_cache_path,
+    parsed_source_cache_path,
+    read_json,
+    text_query_cache_path,
+    write_json,
+)
 from arc_paper.parse.source import PARSER_VERSION
 from arc_paper.providers.base import ProviderError
 
@@ -17,6 +27,65 @@ def test_paper_ids_safe_dir_name_service():
 
     assert result["ok"] is True
     assert result["data"] == "0911.3380_x_astro-ph_0610514"
+
+
+def test_cache_list_includes_paper_dirs_sources_and_filters_since(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    write_json(CachePaths.for_paper("0911.3380").inspire_metadata, {"title": "Cached Paper"})
+    write_json(
+        parsed_source_cache_path("lecture-9"),
+        {"paper_id": "lecture-9", "parser_version": 7, "source_hash": "hash", "toc": [], "sections": [], "equations": []},
+    )
+    write_json(
+        parsed_source_annotations_cache_path("lecture-9"),
+        {"schema_version": "arc.parsed_source.annotations.v1", "source_id": "lecture-9", "annotations": []},
+    )
+    old_path = parsed_source_cache_path("old-note")
+    write_json(
+        old_path,
+        {"paper_id": "old-note", "parser_version": 7, "source_hash": "old", "toc": [], "sections": [], "equations": []},
+    )
+    old_time = time.time() - 3 * 3600
+    os.utime(old_path, (old_time, old_time))
+
+    result = service.list_cached_papers()
+    by_id = {item["paper_id"]: item for item in result["data"]["items"]}
+
+    assert result["ok"] is True
+    assert "arXiv:0911.3380" in by_id
+    assert "paper_dir" in by_id["arXiv:0911.3380"]["kinds"]
+    assert set(by_id["lecture-9"]["kinds"]) == {"source", "source_annotation"}
+
+    recent = service.list_cached_papers(since="1h")
+    recent_ids = {item["paper_id"] for item in recent["data"]["items"]}
+    assert "lecture-9" in recent_ids
+    assert "old-note" not in recent_ids
+
+    selected = service.list_cached_papers(ids=["lecture-9"])
+    assert [item["paper_id"] for item in selected["data"]["items"]] == ["lecture-9"]
+
+
+def test_cache_remove_dry_run_and_delete_by_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    write_json(
+        parsed_source_cache_path("lecture-9"),
+        {"paper_id": "lecture-9", "parser_version": 7, "source_hash": "hash", "toc": [], "sections": [], "equations": []},
+    )
+    write_json(
+        parsed_source_annotations_cache_path("lecture-9"),
+        {"schema_version": "arc.parsed_source.annotations.v1", "source_id": "lecture-9", "annotations": []},
+    )
+
+    preview = service.remove_cached_papers(ids=["lecture-9"], dry_run=True)
+    assert preview["ok"] is True
+    assert preview["data"]["removed_count"] == 0
+    assert parsed_source_cache_path("lecture-9").exists()
+
+    removed = service.remove_cached_papers(ids=["lecture-9"], dry_run=False)
+    assert removed["ok"] is True
+    assert removed["data"]["removed_count"] == 2
+    assert not parsed_source_cache_path("lecture-9").exists()
+    assert not parsed_source_annotations_cache_path("lecture-9").exists()
 
 
 def test_llm_infer_main_references_short_circuits_explicit_ids(monkeypatch, tmp_path):

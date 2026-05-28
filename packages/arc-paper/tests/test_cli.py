@@ -1,3 +1,4 @@
+import io
 import json
 
 from arc_paper import cli
@@ -355,3 +356,105 @@ def test_cli_doctor_cache(monkeypatch, capsys):
 
     output = json.loads(capsys.readouterr().out)
     assert output["data"]["paper"]["paper_id"] == "0911.3380"
+
+
+def test_cli_cache_list_dispatches(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.service,
+        "list_cached_papers",
+        lambda *, ids=None, since=None, older_than=None: {
+            "ok": True,
+            "data": {"items": [{"paper_id": ids[0], "kinds": ["paper_dir"]}]},
+            "errors": [],
+            "meta": {"since": since, "older_than": older_than},
+        },
+    )
+
+    assert cli.main(["cache", "list", "--id", "0911.3380", "--since", "1h", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["items"][0]["paper_id"] == "0911.3380"
+    assert output["meta"]["since"] == "1h"
+
+
+def test_cli_cache_remove_prompts_and_runs_after_y(monkeypatch, capsys):
+    calls = []
+
+    def remove_cached_papers(*, ids=None, since=None, older_than=None, all_items=False, dry_run=True):
+        calls.append(dry_run)
+        return {
+            "ok": True,
+            "data": {
+                "items": [{"paper_id": ids[0], "kinds": ["source"], "paths": [{"path": "/cache/sources/lecture.json"}]}],
+                "removed_count": 0 if dry_run else 1,
+                "removed_paths": [] if dry_run else ["/cache/sources/lecture.json"],
+            },
+            "errors": [],
+            "meta": {"dry_run": dry_run},
+        }
+
+    monkeypatch.setattr(cli.service, "remove_cached_papers", remove_cached_papers)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("y\n"))
+
+    assert cli.main(["cache", "remove", "--id", "lecture-9", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert "lecture-9" in captured.err
+    assert "Remove cached papers? [y/N]" in captured.err
+    assert calls == [True, False]
+    output = json.loads(captured.out)
+    assert output["data"]["removed_count"] == 1
+
+
+def test_cli_cache_remove_yes_skips_prompt(monkeypatch, capsys):
+    calls = []
+
+    def remove_cached_papers(*, ids=None, since=None, older_than=None, all_items=False, dry_run=True):
+        calls.append(dry_run)
+        return {
+            "ok": True,
+            "data": {
+                "items": [{"paper_id": ids[0], "kinds": ["source"], "paths": []}],
+                "removed_count": 1,
+                "removed_paths": ["/cache/sources/lecture.json"],
+            },
+            "errors": [],
+            "meta": {"dry_run": dry_run},
+        }
+
+    monkeypatch.setattr(cli.service, "remove_cached_papers", remove_cached_papers)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(""))
+
+    assert cli.main(["cache", "remove", "--id", "lecture-9", "--yes", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert "Remove cached papers? [y/N]" not in captured.err
+    assert calls == [False]
+
+
+def test_cli_cache_remove_decline_cancels_after_preview(monkeypatch, capsys):
+    calls = []
+
+    def remove_cached_papers(*, ids=None, since=None, older_than=None, all_items=False, dry_run=True):
+        calls.append(dry_run)
+        return {
+            "ok": True,
+            "data": {
+                "items": [{"paper_id": ids[0], "kinds": ["source"], "paths": []}],
+                "removed_count": 0,
+                "removed_paths": [],
+            },
+            "errors": [],
+            "meta": {"dry_run": dry_run},
+        }
+
+    monkeypatch.setattr(cli.service, "remove_cached_papers", remove_cached_papers)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("n\n"))
+
+    assert cli.main(["cache", "remove", "--id", "lecture-9", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert "lecture-9" in captured.err
+    assert calls == [True]
+    output = json.loads(captured.out)
+    assert output["data"]["cancelled"] is True

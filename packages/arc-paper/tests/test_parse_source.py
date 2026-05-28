@@ -161,6 +161,51 @@ def test_parse_tex_pdf_uses_nearby_prose_to_choose_pdf_page(monkeypatch, tmp_pat
     assert equation["printed_equation_number"] == "9.30"
 
 
+def test_parse_tex_pdf_brackets_number_between_before_and_after_text(monkeypatch, tmp_path):
+    tex_path = tmp_path / "lecture8.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Waves}",
+                r"考虑双星系统，其中每颗星质量都是$M$，运动速度都远小于光速，轨道半径为$R\ll r$。两颗星$A$, $B$的坐标可以写成",
+                r"\begin{align}",
+                r"\mathbf{y}_A & = (R \cos(\Omega t), R \sin(\Omega t), 0)~,",
+                r"\nonumber\\",
+                r"\mathbf{y}_B & = (-R \cos(\Omega t), -R \sin(\Omega t), 0)~.",
+                r"\end{align}",
+                r"所以，系统的能量密度为 \note{其中 $y_1, y_2, y_3$为$\mathbf{y}$坐标的三个分量}",
+                r"\begin{align}",
+                r"T_{00}(t,\mathbf{y}) = M \delta(y_3) [\delta(y_1-R\cos(\Omega t))\delta(y_2-R\sin(\Omega t))]~.",
+                r"\end{align}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "\n".join(
+                [
+                    "考虑双星系统，其中每颗星质量都是 M，运动速度都远小于光速，轨道",
+                    "半径为 R < r . 两颗星 A, B 的坐标可以写成",
+                    "yA=(Rcos(Ωt),Rsin(Ωt),0),",
+                    "yB=(-Rcos(Ωt),-Rsin(Ωt),0).             (8.34)",
+                    "所以，系统的能量密度为（其中 y1, y2, y3 为 y 坐标的三个分量）",
+                    "T00(t, y) = Mδ(y3)[δ(y1 − R cos(Ωt))δ(y2 − R sin(Ωt))] . (8.35)",
+                ]
+            )
+        ],
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-8")
+
+    assert parsed["equations"][0]["printed_equation_number"] == "8.34"
+    assert parsed["equations"][1]["printed_equation_number"] == "8.35"
+
+
 def test_parse_tex_pdf_reports_warning_when_pdf_text_is_unavailable(monkeypatch, tmp_path):
     tex_path = tmp_path / "lecture9.tex"
     tex_path.write_text(
