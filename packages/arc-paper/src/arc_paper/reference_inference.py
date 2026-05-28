@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_llm.runner import resolve_llm_config, run_json
 
 from .ids import arxiv_path_id, doi_value, extract_paper_ids, inspire_recid, normalize_paper_id
@@ -55,6 +56,7 @@ REFERENCE_INFERENCE_SCHEMA: dict[str, Any] = {
             },
         },
         "warnings": {"type": "array", "items": {"type": "string"}},
+        ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
     },
 }
 
@@ -89,6 +91,8 @@ def infer_main_references(
     verified["provider"] = config.provider
     verified["model"] = config.model
     verified["raw_llm_response"] = payload
+    if isinstance(payload.get(ARC_LLM_CALL_RECORD_FIELD), dict):
+        verified[ARC_LLM_CALL_RECORD_FIELD] = payload[ARC_LLM_CALL_RECORD_FIELD]
     return verified
 
 

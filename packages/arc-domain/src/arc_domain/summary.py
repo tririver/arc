@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from arc_llm import run_json
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA, strip_arc_llm_call_records
 
 from .cache import DomainPaths, now_iso, read_json, update_status, write_json, write_text
 
@@ -108,6 +109,7 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
             },
         },
         "warnings": {"type": "array", "items": {"type": "string"}},
+        ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
     },
 }
 
@@ -145,7 +147,7 @@ def summarize_domain(
 
 
 def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selection: dict[str, Any]) -> str:
-    compact_evidence = {
+    compact_evidence = strip_arc_llm_call_records({
         "foundation_selection": selection,
         "foundation_paper": selection.get("selected_foundation") or {},
         "best_reference_paper": selection.get("best_reference_paper") or selection.get("selected_foundation"),
@@ -176,7 +178,7 @@ def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selectio
             for item in evidence.get("papers", [])
         ],
         "warnings": evidence.get("warnings", []),
-    }
+    })
     return "\n\n".join(
         [
             "Write a compact field briefing for an LLM physicist and a human researcher.",

@@ -20,6 +20,10 @@ Read `plan.json` and `foundation/latest.json`. Create:
   "run_dir": "<project-dir>/calculate/<run-id>/execute",
   "proposer_count": 3,
   "max_recalculations": 2,
+  "human_gate": {
+    "enabled": false,
+    "mode": "standard"
+  },
   "defaults": {
     "integrity_reference_path": "skills/arc/rules/integrity.md"
   },
@@ -30,6 +34,27 @@ Read `plan.json` and `foundation/latest.json`. Create:
 Keep `proposer_count` and `max_recalculations` configurable. Defaults are 3
 proposers and 2 recalculations: 3 total attempts, meaning 1 initial attempt + 2 recalculations.
 Do not increase attempts unless the user asks.
+
+For note checks, set:
+
+```json
+"human_gate": {
+  "enabled": true,
+  "mode": "note_check",
+  "pause_on_statuses": [
+    "reference_disagrees",
+    "two_agree",
+    "all_disagree",
+    "unresolved",
+    "failed"
+  ]
+}
+```
+
+This gate stops at the first failed or non-agreeing step. It returns
+`blocked_for_user` when an expert decision is needed, or
+`blocked_for_revision` when all proposer assessments, the reviewer, and the
+main agent can agree on a foundation or plan revision without asking the user.
 
 ## Phase 2: Add Foundation Checks
 Skip equations with `axiom_status: "axiom"`. Foundation checks use the same 3-proposer reviewer consensus as new calculation steps, with the same acceptance standard and no single-proposer acceptance.
@@ -77,8 +102,12 @@ Add a `new_calculation` step with two proposers and reviewer-only C:
 For a blind reference check, proposers default to no paper tools and no internet
 search unless the user explicitly requests source access. The reviewer compares
 A and B from blind proposers with C from `reviewer_reference_claim`: `A=B=C`
-verifies the reference; `A=B!=C` accepts the blind derivation and marks
-`reference_disagrees`; `A!=B` means recalculate or split the step.
+verifies the reference. In standard calculation mode, `A=B!=C` accepts the
+blind derivation and marks `reference_disagrees`. In note-check mode with
+`human_gate.enabled=true`, `A=B!=C` stops immediately for expert resolution
+unless a shared plan/foundation revision fully explains the mismatch.
+`A!=B` means recalculate, split the step, or stop for human review depending on
+the active gate.
 
 ## Phase 3: Add New Calculation Steps
 
@@ -117,6 +146,15 @@ Proposers must strictly derive from the foundation context and accepted prior
 outputs. External sources may inspire methods, but do not directly use any result from papers or the internet unless that result is in the foundation file
 or already accepted. If an external identity or intermediate result is needed,
 derive it inside the current calculation. External sources may use different conventions; map notation back to foundation conventions before using it.
+
+Every proposer output must include `plan_foundation_assessment`: whether the
+foundation or plan needs revision, the issue type, proposed revision if any,
+rationale, and whether the step can continue without that revision.
+
+Every reviewer output must include `workflow_action`: `continue`,
+`pause_for_human`, `revise_foundation`, `revise_plan`, `split_step`, or
+`retry`; whether a human is required; the issue type; any proposed revision;
+and the expert question when pausing.
 
 Reviewers may use SymPy. For analytic checks, use `expand`, then `simplify`,
 then substitutions from checked equations in the foundation file. Do not modify
@@ -161,10 +199,16 @@ arc-llm proposers-reviewer-consensus \
   --json
 ```
 
-Inspect the returned JSON. If a step returns `blocked_for_user` after 3 total
-attempts, enter `blocked_refinement`: review plan.json, reviewer reports, and,
-if needed, proposer calculations. Treat the block as evidence the step is too
-difficult unless already atomic.
+Inspect the returned JSON. If a step returns `blocked_for_user`, ask the human
+expert the reported `expert_question` before continuing. If a step returns
+`blocked_for_revision`, inspect `workflow_action.proposed_revision`; apply it
+only when the proposer assessments, reviewer, and main agent agree. Otherwise
+ask the human expert.
+
+If a standard calculation step returns `blocked_for_user` after the configured
+attempt limit, enter `blocked_refinement`: review plan.json, reviewer reports,
+and, if needed, proposer calculations. Treat the block as evidence the step is
+too difficult unless already atomic.
 
 If the blocked step can be split, revise the plan into smaller steps. Each
 replacement step must have one clear quantity, inputs, output, and check. The
@@ -181,10 +225,13 @@ plan revision history inside `# Appendix 2: Calculation Status`. Whenever
 If the block is caused by missing or wrong premises, classify it as
 `foundation_inadequate`, `foundation_conflict`, or `plan_wrong`. For
 `foundation_inadequate` or `plan_wrong`, request two independent proposers to
-propose the expansion or revision; continue only if two proposers agree, the reviewer agrees, and the main agent agrees after inspection. For
+propose the expansion or revision; continue only if two proposers agree, the
+reviewer agrees, and the main agent agrees after inspection. For
 `foundation_conflict`, stop for the human expert unless that same agreement
 process resolves the conflict. In interactive mode ask approval before applying
-the revision; in auto mode apply it and continue. Report any revision in
+the revision. In auto mode apply it only for `blocked_for_revision`, where the
+returned `workflow_action.requires_human` is false and the main agent agrees
+after inspection; otherwise ask the human expert. Report any revision in
 `calculation-report.md` with a `**Caution**` paragraph explaining what changed,
 why, who agreed, approval mode, and dependent later results. If the step is
 already atomic and cannot be split, stop as blocked; do not choose a proposer

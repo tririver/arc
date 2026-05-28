@@ -166,6 +166,32 @@ equivalent host/MCP wrapper. Do not write the final `calculation-report.md`
 until proposer-reviewer execution has run, unless the report is explicitly a
 blocked or partial-status report that says consensus did not complete.
 
+For note checks, the consensus config must enable the human gate:
+
+```json
+"human_gate": {
+  "enabled": true,
+  "mode": "note_check",
+  "pause_on_statuses": [
+    "reference_disagrees",
+    "two_agree",
+    "all_disagree",
+    "unresolved",
+    "failed"
+  ]
+}
+```
+
+The gate applies in both `interactive` and `auto` modes. It stops at the first
+failed, unresolved, partially agreed, all-disagreed, or reference-disagreed
+claim. Do not accumulate a long list of disagreed equations. Ask the human
+expert using `blocked_output.expert_question`, unless the result is
+`blocked_for_revision` and the proposer assessments, reviewer, and main agent
+all agree on the same foundation or plan revision.
+
+`auto` mode only removes routine confirmations. It does not allow ARC to
+silently continue after disagreement with the note/reference claim.
+
 ### Phase 3a: Continue After Human Resolution
 
 If a human expert resolves a note claim, mark that claim `human_resolved`, not

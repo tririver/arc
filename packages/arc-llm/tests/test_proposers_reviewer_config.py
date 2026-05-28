@@ -5,8 +5,9 @@ import json
 
 import pytest
 
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.proposers_reviewer.config import ConfigError, load_batch_config, worker_env
-from arc_llm.proposers_reviewer.prompts import render_prompt, reviewer_context
+from arc_llm.proposers_reviewer.prompts import proposer_context, render_prompt, reviewer_context
 
 
 def minimal_config() -> dict:
@@ -73,6 +74,7 @@ def test_valid_config_parses_and_merges_defaults():
     assert proposer.model_tier == "high"
     assert proposer.runtime["allow_internet"] is True
     assert proposer.runtime["allow_mcp"] is False
+    assert ARC_LLM_CALL_RECORD_FIELD in proposer.output_schema["properties"]
     assert reviewer.runtime["allow_mcp"] is True
     assert reviewer.runtime["claude_effort"] == "high"
 
@@ -252,3 +254,51 @@ def test_worker_runtime_can_disable_appended_full_context():
     assert "domain_markdown_files" not in prompt
     assert "domain text" not in prompt
     assert "## ARC Worker Context" not in prompt
+
+
+def test_worker_prompt_context_strips_arc_llm_call_records():
+    payload = minimal_config()
+    payload["loops"][0]["caller_context"] = {
+        "accepted": {
+            "arc_llm_call_record": {"provider_used": "codex-cli"},
+            "result": "keep",
+        }
+    }
+    config = load_batch_config(payload)
+    loop = config.loops[0]
+    call_record = {"provider_used": "deepseek"}
+    correspondence = [
+        {
+            "type": "proposer_output",
+            "output": {
+                "title": "visible",
+                "arc_llm_call_record": call_record,
+            },
+        }
+    ]
+
+    proposer = proposer_context(
+        loop=loop,
+        worker=loop.proposers[0],
+        round_number=2,
+        correspondence=correspondence,
+    )
+    reviewer = reviewer_context(
+        loop=loop,
+        worker=loop.reviewers[0],
+        round_number=1,
+        correspondence=correspondence,
+        current_proposer_outputs={
+            "proposer_001": {
+                "title": "visible",
+                "arc_llm_call_record": call_record,
+            }
+        },
+    )
+
+    rendered = render_prompt(loop.reviewers[0], reviewer)
+
+    assert "arc_llm_call_record" not in json.dumps(proposer, ensure_ascii=False)
+    assert "arc_llm_call_record" not in rendered
+    assert "visible" in rendered
+    assert "keep" in json.dumps(proposer, ensure_ascii=False)

@@ -2,12 +2,17 @@ import json
 
 import pytest
 
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm import runner
 from arc_llm.runner import resolve_llm_config, run_json, run_text
 
 
 def no_provider_config(tmp_path):
     return {"ARC_LLM_PROVIDER_CONFIG": str(tmp_path / "missing.json")}
+
+
+def without_call_record(result):
+    return {key: value for key, value in result.items() if key != ARC_LLM_CALL_RECORD_FIELD}
 
 
 class FakeProvider:
@@ -69,6 +74,8 @@ def test_run_json_uses_selected_provider_and_model(tmp_path, monkeypatch):
     assert result["prompt"] == "prompt"
     assert result["schema"] == {"type": "object"}
     assert result["model"] == "fast"
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["provider_used"] == "codex-cli"
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["model_used"] == "fast"
 
 
 def test_auto_provider_rejects_exact_model():
@@ -142,6 +149,12 @@ def test_run_json_retries_selected_provider_twice_before_success(tmp_path, monke
     )
 
     assert result["provider"] == "codex-cli"
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["attempt"] == 3
+    assert [item["status"] for item in result[ARC_LLM_CALL_RECORD_FIELD]["attempts"]] == [
+        "failed",
+        "failed",
+        "success",
+    ]
     assert flaky.attempts == 3
 
 
@@ -175,7 +188,18 @@ def test_run_json_auto_falls_back_to_configured_provider_after_retries(tmp_path,
         process_chain=[],
     )
 
-    assert result == {"provider": "deepseek", "model": "deepseek-chat"}
+    assert without_call_record(result) == {"provider": "deepseek", "model": "deepseek-chat"}
+    call_record = result[ARC_LLM_CALL_RECORD_FIELD]
+    assert call_record["provider_requested"] == "auto"
+    assert call_record["provider_used"] == "deepseek"
+    assert call_record["model_used"] == "deepseek-chat"
+    assert call_record["fallback_index"] == 1
+    assert [item["provider"] for item in call_record["attempts"]] == [
+        "codex-cli",
+        "codex-cli",
+        "codex-cli",
+        "deepseek",
+    ]
     assert codex.attempts == 3
     assert deepseek.attempts == 1
 
@@ -211,7 +235,9 @@ def test_run_json_auto_fallback_uses_provider_specific_tier_models(tmp_path, mon
         process_chain=[],
     )
 
-    assert result == {"provider": "deepseek", "model": "deepseek-pro"}
+    assert without_call_record(result) == {"provider": "deepseek", "model": "deepseek-pro"}
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["model_tier_requested"] == "high"
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["model_used"] == "deepseek-pro"
 
 
 def test_run_json_explicit_provider_retries_without_fallback(tmp_path, monkeypatch):

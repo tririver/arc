@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record
 from .host import HostDetection, select_llm_provider
 from .model import resolve_model
 from .providers.config import ProviderConfigError, usable_configured_providers
@@ -114,6 +115,10 @@ def run_json(
     )
     return _run_with_retries(
         configs,
+        provider_requested=provider,
+        model_requested=model,
+        model_tier_requested=model_tier,
+        attach_call_record=True,
         env=env,
         process_chain=process_chain,
         call=lambda selected, config: selected.generate_json(prompt, schema=schema, model=config.model),
@@ -138,6 +143,10 @@ def run_text(
     )
     return _run_with_retries(
         configs,
+        provider_requested=provider,
+        model_requested=model,
+        model_tier_requested=model_tier,
+        attach_call_record=False,
         env=env,
         process_chain=process_chain,
         call=lambda selected, config: selected.generate_text(prompt, model=config.model),
@@ -147,19 +156,100 @@ def run_text(
 def _run_with_retries(
     configs: Sequence[LLMConfig],
     *,
+    provider_requested: str,
+    model_requested: str | None,
+    model_tier_requested: str | None,
+    attach_call_record: bool,
     env: Mapping[str, str] | None,
     process_chain: Sequence[str] | None,
     call: Callable[[Any, LLMConfig], Any],
 ) -> Any:
     failures: list[LLMAttemptFailure] = []
-    for config in configs:
+    attempt_records: list[dict[str, Any]] = []
+    for fallback_index, config in enumerate(configs):
         selected = select_provider(config.provider, env=env, process_chain=process_chain)
         for attempt in range(1, MAX_ATTEMPTS_PER_PROVIDER + 1):
             try:
-                return call(selected, config)
+                result = call(selected, config)
+                attempt_record = _attempt_record(
+                    config,
+                    fallback_index=fallback_index,
+                    attempt=attempt,
+                    status="success",
+                )
+                attempt_records.append(attempt_record)
+                if attach_call_record and isinstance(result, dict):
+                    return attach_arc_llm_call_record(
+                        result,
+                        _call_record(
+                            config,
+                            provider_requested=provider_requested,
+                            model_requested=model_requested,
+                            model_tier_requested=model_tier_requested,
+                            fallback_index=fallback_index,
+                            attempt=attempt,
+                            attempts=attempt_records,
+                        ),
+                    )
+                return result
             except Exception as exc:
                 failures.append(LLMAttemptFailure(provider=config.provider, attempt=attempt, error=str(exc)))
+                attempt_records.append(
+                    _attempt_record(
+                        config,
+                        fallback_index=fallback_index,
+                        attempt=attempt,
+                        status="failed",
+                        error=exc,
+                    )
+                )
     raise LLMTaskError(_failure_message(failures))
+
+
+def _call_record(
+    config: LLMConfig,
+    *,
+    provider_requested: str,
+    model_requested: str | None,
+    model_tier_requested: str | None,
+    fallback_index: int,
+    attempt: int,
+    attempts: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": ARC_LLM_CALL_RECORD_SCHEMA_VERSION,
+        "provider_requested": provider_requested,
+        "model_requested": model_requested,
+        "model_tier_requested": model_tier_requested,
+        "provider_used": config.provider,
+        "model_used": config.model,
+        "fallback_index": fallback_index,
+        "attempt": attempt,
+        "host": config.host.host,
+        "signals": list(config.signals),
+        "attempts": [dict(item) for item in attempts],
+    }
+
+
+def _attempt_record(
+    config: LLMConfig,
+    *,
+    fallback_index: int,
+    attempt: int,
+    status: str,
+    error: Exception | None = None,
+) -> dict[str, Any]:
+    record = {
+        "provider": config.provider,
+        "model": config.model,
+        "fallback_index": fallback_index,
+        "attempt": attempt,
+        "status": status,
+    }
+    if error is not None:
+        record["error_type"] = type(error).__name__
+        record["message"] = str(error)
+    return record
 
 
 def _failure_message(failures: Sequence[LLMAttemptFailure]) -> str:

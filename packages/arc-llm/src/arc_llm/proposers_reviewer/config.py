@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from arc_llm.call_record import allow_arc_llm_call_record
 from arc_llm.model import VALID_MODEL_TIERS
 
 
@@ -249,6 +250,8 @@ def _parse_worker(
     output_schema = worker_data.get("output_schema")
     if output_schema is not None and not isinstance(output_schema, dict):
         raise ConfigError(f"{field_name}.{worker_id}.output_schema must be an object")
+    if output_schema is not None:
+        output_schema = allow_arc_llm_call_record(output_schema)
 
     runtime = dict(default_runtime)
     runtime.update(_dict(worker_data.get("runtime", {}), f"{field_name}.{worker_id}.runtime"))

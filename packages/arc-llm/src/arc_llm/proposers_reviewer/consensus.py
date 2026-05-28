@@ -16,6 +16,14 @@ from .runner import JsonRunner, run_proposers_reviewer_batch
 CONSENSUS_CONFIG_SCHEMA = "arc.llm.proposers_reviewer_consensus.config.v1"
 CONSENSUS_RESULT_SCHEMA = "arc.llm.proposers_reviewer_consensus.result.v1"
 REVIEW_ENVELOPE_SCHEMA = "arc.llm.review_envelope.v1"
+DEFAULT_HUMAN_GATE_PAUSE_STATUSES = (
+    "reference_disagrees",
+    "two_agree",
+    "all_disagree",
+    "unresolved",
+    "failed",
+)
+REVISION_ACTIONS = {"revise_foundation", "revise_plan", "split_step"}
 
 BatchRunner = Callable[..., dict[str, Any]]
 
@@ -37,6 +45,7 @@ class ConsensusConfig:
     run_dir: Path
     proposer_count: int
     max_recalculations: int
+    human_gate: dict[str, Any]
     defaults: dict[str, Any]
     artifact_options: dict[str, Any]
     steps: list[ConsensusStep]
@@ -51,7 +60,8 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
     run_id = _safe_id(_required_text(data, "run_id"), "run_id")
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
     proposer_count = _positive_int(data.get("proposer_count", 3), "proposer_count")
-    max_recalculations = _positive_int(data.get("max_recalculations", 3), "max_recalculations")
+    max_recalculations = _nonnegative_int(data.get("max_recalculations", 3), "max_recalculations")
+    human_gate = _parse_human_gate(data.get("human_gate", {}))
     defaults = _dict(data.get("defaults", {}), "defaults")
     if defaults.get("model") is not None and str(defaults.get("provider", "auto") or "auto") == "auto":
         raise ConfigError("defaults.model requires explicit provider")
@@ -99,6 +109,7 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
         run_dir=run_dir,
         proposer_count=proposer_count,
         max_recalculations=max_recalculations,
+        human_gate=human_gate,
         defaults=defaults,
         artifact_options=artifact_options,
         steps=steps,
@@ -138,8 +149,8 @@ def run_proposers_reviewer_consensus(
             accepted_step_outputs=accepted_step_outputs,
         )
         step_results.append(step_result)
-        if step_result["status"] == "blocked_for_user":
-            overall_status = "blocked_for_user"
+        if step_result["status"] in {"blocked_for_user", "blocked_for_revision"}:
+            overall_status = step_result["status"]
             break
         if step_result["status"] == "failed":
             overall_status = "failed"
@@ -154,6 +165,7 @@ def run_proposers_reviewer_consensus(
         "run_root": str(paths.run_root),
         "proposer_count": consensus.proposer_count,
         "max_recalculations": consensus.max_recalculations,
+        "human_gate": copy.deepcopy(consensus.human_gate),
         "steps": step_results,
     }
     atomic_write_json(paths.state, result)
@@ -189,16 +201,7 @@ def _run_consensus_step(
                 accepted_step_outputs=accepted_step_outputs,
             )
         except Exception as exc:
-            return {
-                "step_id": step.step_id,
-                "kind": step.kind,
-                "status": "failed",
-                "attempts": attempts,
-                "accepted_output": None,
-                "blocked_output": None,
-                "reviewer_consensus": None,
-                "error": str(exc),
-            }
+            return _failed_step_result(config, step, attempts=attempts, error=str(exc))
         batch_result = runner(
             batch_config,
             json_runner=json_runner,
@@ -219,16 +222,12 @@ def _run_consensus_step(
         if batch_result.get("status") != "completed":
             attempt_record["batch_result"] = batch_result
             attempts.append(attempt_record)
-            return {
-                "step_id": step.step_id,
-                "kind": step.kind,
-                "status": "failed",
-                "attempts": attempts,
-                "accepted_output": None,
-                "blocked_output": None,
-                "reviewer_consensus": None,
-                "error": "attempt batch did not complete",
-            }
+            return _failed_step_result(
+                config,
+                step,
+                attempts=attempts,
+                error="attempt batch did not complete",
+            )
 
         try:
             review = _read_json(attempt_paths["review_path"])
@@ -245,16 +244,7 @@ def _run_consensus_step(
         except Exception as exc:
             attempt_record["error"] = str(exc)
             attempts.append(attempt_record)
-            return {
-                "step_id": step.step_id,
-                "kind": step.kind,
-                "status": "failed",
-                "attempts": attempts,
-                "accepted_output": None,
-                "blocked_output": None,
-                "reviewer_consensus": None,
-                "error": str(exc),
-            }
+            return _failed_step_result(config, step, attempts=attempts, error=str(exc))
         attempt_record["consensus"] = consensus
         attempt_record["proposer_output_paths"] = {
             proposer_id: str(attempt_paths["round_root"] / "proposer_outputs" / f"{proposer_id}.json")
@@ -263,6 +253,16 @@ def _run_consensus_step(
         attempts.append(attempt_record)
 
         status = str(consensus.get("status", "unresolved"))
+        gated_block = _human_gate_blocked_step_result(
+            config,
+            step,
+            attempts=attempts,
+            consensus=consensus,
+            trigger_status=status,
+        )
+        if gated_block is not None:
+            return gated_block
+
         if status in {"all_agree", "reference_disagrees"}:
             accepted_result = consensus.get("accepted_result")
             return {
@@ -305,6 +305,86 @@ def _run_consensus_step(
         locked_outputs = {}
 
     raise AssertionError("unreachable consensus loop exit")
+
+
+def _failed_step_result(
+    config: ConsensusConfig,
+    step: ConsensusStep,
+    *,
+    attempts: list[dict[str, Any]],
+    error: str,
+) -> dict[str, Any]:
+    gated_block = _human_gate_blocked_step_result(
+        config,
+        step,
+        attempts=attempts,
+        consensus={
+            "status": "failed",
+            "analysis": error,
+            "workflow_action": _default_workflow_action("failed", error),
+        },
+        trigger_status="failed",
+        error=error,
+    )
+    if gated_block is not None:
+        return gated_block
+    return {
+        "step_id": step.step_id,
+        "kind": step.kind,
+        "status": "failed",
+        "attempts": attempts,
+        "accepted_output": None,
+        "blocked_output": None,
+        "reviewer_consensus": None,
+        "error": error,
+    }
+
+
+def _human_gate_blocked_step_result(
+    config: ConsensusConfig,
+    step: ConsensusStep,
+    *,
+    attempts: list[dict[str, Any]],
+    consensus: Mapping[str, Any],
+    trigger_status: str,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    if not _human_gate_enabled(config):
+        return None
+    if trigger_status not in _human_gate_pause_statuses(config):
+        return None
+
+    workflow_action = _normalized_workflow_action(consensus.get("workflow_action"), trigger_status)
+    requires_human = _workflow_action_requires_human(workflow_action)
+    if requires_human:
+        workflow_action = copy.deepcopy(workflow_action)
+        workflow_action["action"] = "pause_for_human"
+        workflow_action["requires_human"] = True
+    step_status = "blocked_for_user" if requires_human else "blocked_for_revision"
+    expert_question = str(workflow_action.get("expert_question", "")).strip()
+    if not expert_question:
+        expert_question = _default_expert_question(trigger_status, workflow_action)
+    blocked_output = {
+        "reason": "human_gate",
+        "trigger_status": trigger_status,
+        "requires_human": requires_human,
+        "workflow_action": workflow_action,
+        "expert_question": expert_question,
+        "analysis": str(consensus.get("analysis", "")),
+        "last_consensus": copy.deepcopy(dict(consensus)),
+    }
+    if error:
+        blocked_output["error"] = error
+    return {
+        "step_id": step.step_id,
+        "kind": step.kind,
+        "status": step_status,
+        "attempts": attempts,
+        "accepted_output": None,
+        "blocked_output": blocked_output,
+        "reviewer_consensus": dict(consensus),
+        "error": error,
+    }
 
 
 def _attempt_batch_config(
@@ -354,6 +434,7 @@ def _attempt_batch_config(
                         active_proposer_ids,
                         selectable_proposer_ids,
                         reviewer_reference_claim=step.reviewer_reference_claim,
+                        human_gate=config.human_gate,
                     )
                 ],
             }
@@ -444,7 +525,12 @@ def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[st
                 "JSON fields; avoid ASCII-only math such as rho_2, eta_prime, or T_ab when a "
                 "LaTeX form such as \\rho_2, \\eta', or T_{ab} is intended for the report. "
                 "Return one JSON object with result_summary, derivation, assumptions, "
-                "validity_scope, and final_result. Use validity_scope for assumptions, "
+                "validity_scope, final_result, and plan_foundation_assessment. "
+                "In plan_foundation_assessment, state whether the supplied foundation or "
+                "plan must change before this step can be checked; include needs_revision "
+                "(boolean), issue_type, proposed_revision, rationale, and "
+                "can_continue_without_revision. Use issue_type=none when no revision is "
+                "needed. Use validity_scope for assumptions, "
                 "conventions, limits, and unresolved dependencies; do not use date-like "
                 "reliability fields. Put the final mathematical result in final_result using "
                 "explicit symbols so a reviewer can compare it with other proposers by "
@@ -452,8 +538,62 @@ def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[st
                 "{caller_context_json}"
             ),
         },
-        "output_schema": {"type": "object"},
+        "output_schema": _proposer_output_schema(),
         "runtime": dict(runtime),
+    }
+
+
+def _proposer_output_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": [
+            "result_summary",
+            "derivation",
+            "assumptions",
+            "validity_scope",
+            "final_result",
+            "plan_foundation_assessment",
+        ],
+        "properties": {
+            "result_summary": {"type": "string"},
+            "derivation": {"type": "string"},
+            "assumptions": {"type": ["string", "array", "object"]},
+            "validity_scope": {"type": "string"},
+            "final_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+            "plan_foundation_assessment": {
+                "type": "object",
+                "required": [
+                    "needs_revision",
+                    "issue_type",
+                    "proposed_revision",
+                    "rationale",
+                    "can_continue_without_revision",
+                ],
+                "properties": {
+                    "needs_revision": {"type": "boolean"},
+                    "issue_type": {
+                        "enum": [
+                            "none",
+                            "foundation_inadequate",
+                            "foundation_conflict",
+                            "plan_wrong",
+                            "step_too_coarse",
+                            "target_ambiguous",
+                            "source_mapping_error",
+                            "human_needed",
+                            "other",
+                        ]
+                    },
+                    "proposed_revision": {
+                        "type": ["object", "array", "string", "number", "boolean", "null"]
+                    },
+                    "rationale": {"type": "string"},
+                    "can_continue_without_revision": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+        "additionalProperties": True,
     }
 
 
@@ -490,11 +630,13 @@ def _reviewer_config(
     selectable_proposer_ids: list[str],
     *,
     reviewer_reference_claim: Mapping[str, Any] | None = None,
+    human_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     reference_instruction = _reviewer_reference_instruction(
         reviewer_reference_claim,
         active_proposer_ids=active_proposer_ids,
     )
+    workflow_instruction = _reviewer_workflow_instruction(human_gate or {})
     return {
         "id": "reviewer_001",
         "prompt": {
@@ -522,7 +664,7 @@ def _reviewer_config(
                 "details, and best readability; this copy will be used "
                 "for the full calculation appendix. When status is reference_disagrees, "
                 "choose best_written_proposer_id from the agreeing blind proposer ids by "
-                "the same clarity rule because the blind proposer result is accepted. "
+                "the same clarity rule for report evidence if the step is later accepted. "
                 "If the status is neither all_agree nor reference_disagrees, set "
                 "best_written_proposer_id to null and explain why. "
                 "Let A, B, and C be the final mathematical results "
@@ -544,7 +686,17 @@ def _reviewer_config(
                 "sample_count, numerical_relative_error as a relative error, and the sampled check history. "
                 "If exactly one proposer is likely wrong, name only that proposer for "
                 "recalculation; otherwise ask all proposers to recalculate. "
+                "Also inspect each proposer's plan_foundation_assessment. In "
+                "workflow_action, choose continue for all_agree. For any failure to "
+                "agree, target/source ambiguity, worker failure, or suspected bad "
+                "premise, choose pause_for_human unless the proposers and your review "
+                "agree on the same foundation or plan revision; then choose "
+                "revise_foundation, revise_plan, or split_step with "
+                "requires_human=false and include proposed_revision. For "
+                "reference_disagrees, follow the "
+                "human-gate instruction below. "
                 f"{reference_instruction}\n\n"
+                f"{workflow_instruction}\n\n"
                 "{current_proposer_outputs_json}"
             ),
         },
@@ -573,10 +725,29 @@ def _reviewer_reference_instruction(
         f"{first}, B as the final result from {second}, and C as reviewer_reference_claim. "
         "For A=B=C, set status=all_agree. For A=B but A-C and B-C are nonzero, "
         "set status=reference_disagrees, set agreed_proposer_ids to the agreeing proposer ids, "
-        "and put the blind proposer result in accepted_result with reference_claim_status='disagrees'. "
+        "put the blind proposer result in accepted_result with reference_claim_status='disagrees', "
+        "and set workflow_action according to the workflow instruction below. "
         "If A and B disagree, do not accept the reference claim merely because one proposer matches it; "
         "set status=unresolved or all_disagree and request recalculation.\n\n"
         f"reviewer_reference_claim:\n{claim_json}"
+    )
+
+
+def _reviewer_workflow_instruction(human_gate: Mapping[str, Any]) -> str:
+    if not bool(human_gate.get("enabled", False)):
+        return (
+            "workflow_action is still required. In normal mode, choose continue for "
+            "all_agree and reference_disagrees when legacy acceptance applies; for other "
+            "statuses, choose retry or pause_for_human with a concise expert_question."
+        )
+    pause_statuses = ", ".join(_human_gate_pause_statuses_from_mapping(human_gate))
+    return (
+        "Human gate is active. Statuses that trigger a stop: "
+        f"{pause_statuses}. When a stop is triggered, workflow_action decides whether "
+        "the main agent should ask the human expert or revise project artifacts. Use "
+        "pause_for_human with requires_human=true unless all proposers' assessments and "
+        "your review agree on the same foundation or plan revision. Only then use "
+        "revise_foundation, revise_plan, or split_step with requires_human=false."
     )
 
 
@@ -639,6 +810,7 @@ def _reviewer_output_schema(
                             "pairwise_symbolic_checks",
                             "best_written_proposer_id",
                             "best_written_selection_reason",
+                            "workflow_action",
                         ],
                         "properties": {
                             "status": {
@@ -666,6 +838,7 @@ def _reviewer_output_schema(
                                 ]
                             },
                             "best_written_selection_reason": {"type": "string"},
+                            "workflow_action": _workflow_action_schema(),
                             "pairwise_symbolic_checks": {
                                 "type": "object",
                                 "required": [
@@ -707,6 +880,47 @@ def _reviewer_output_schema(
                 },
                 "additionalProperties": True,
             },
+        },
+        "additionalProperties": True,
+    }
+
+
+def _workflow_action_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["action", "requires_human", "issue_type", "reason"],
+        "properties": {
+            "action": {
+                "enum": [
+                    "continue",
+                    "pause_for_human",
+                    "revise_foundation",
+                    "revise_plan",
+                    "split_step",
+                    "retry",
+                ]
+            },
+            "requires_human": {"type": "boolean"},
+            "issue_type": {
+                "enum": [
+                    "none",
+                    "foundation_inadequate",
+                    "foundation_conflict",
+                    "plan_wrong",
+                    "step_too_coarse",
+                    "target_ambiguous",
+                    "source_mapping_error",
+                    "calculation_disagreement",
+                    "reference_disagreement",
+                    "worker_failure",
+                    "other",
+                ]
+            },
+            "proposed_revision": {
+                "type": ["object", "array", "string", "number", "boolean", "null"]
+            },
+            "reason": {"type": "string"},
+            "expert_question": {"type": "string"},
         },
         "additionalProperties": True,
     }
@@ -757,6 +971,8 @@ def _review_consensus(
         if reviewer_reference_claim:
             message += ", or reference_disagrees"
         raise ValueError(message)
+    consensus = dict(consensus)
+    consensus["workflow_action"] = _normalized_workflow_action(consensus.get("workflow_action"), str(status))
     if status == "all_agree":
         _validate_best_written_selection(
             consensus,
@@ -793,7 +1009,7 @@ def _review_consensus(
             consensus,
             active_proposer_ids=active_proposer_ids,
         )
-    return dict(consensus)
+    return consensus
 
 
 def _validate_best_written_selection(
@@ -1248,6 +1464,111 @@ def _next_active_for_two_agree(consensus: Mapping[str, Any], all_proposer_ids: l
     return None
 
 
+def _human_gate_enabled(config: ConsensusConfig) -> bool:
+    return bool(config.human_gate.get("enabled", False))
+
+
+def _human_gate_pause_statuses(config: ConsensusConfig) -> tuple[str, ...]:
+    return _human_gate_pause_statuses_from_mapping(config.human_gate)
+
+
+def _human_gate_pause_statuses_from_mapping(human_gate: Mapping[str, Any]) -> tuple[str, ...]:
+    statuses = human_gate.get("pause_on_statuses", DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
+    if not isinstance(statuses, (list, tuple)):
+        return DEFAULT_HUMAN_GATE_PAUSE_STATUSES
+    return tuple(str(status) for status in statuses)
+
+
+def _normalized_workflow_action(raw: Any, trigger_status: str) -> dict[str, Any]:
+    default = _default_workflow_action(trigger_status)
+    if not isinstance(raw, dict):
+        return default
+
+    allowed_actions = {"continue", "pause_for_human", "revise_foundation", "revise_plan", "split_step", "retry"}
+    allowed_issue_types = {
+        "none",
+        "foundation_inadequate",
+        "foundation_conflict",
+        "plan_wrong",
+        "step_too_coarse",
+        "target_ambiguous",
+        "source_mapping_error",
+        "calculation_disagreement",
+        "reference_disagreement",
+        "worker_failure",
+        "other",
+    }
+    action = str(raw.get("action", default["action"])).strip()
+    if action not in allowed_actions:
+        action = default["action"]
+    issue_type = str(raw.get("issue_type", default["issue_type"])).strip()
+    if issue_type not in allowed_issue_types:
+        issue_type = default["issue_type"]
+    requires_human = raw.get("requires_human", default["requires_human"])
+    if not isinstance(requires_human, bool):
+        requires_human = bool(default["requires_human"])
+
+    normalized = copy.deepcopy(raw)
+    normalized["action"] = action
+    normalized["requires_human"] = requires_human
+    normalized["issue_type"] = issue_type
+    normalized["reason"] = str(raw.get("reason", default["reason"]) or default["reason"])
+    normalized.setdefault("proposed_revision", None)
+    normalized["expert_question"] = str(raw.get("expert_question", default["expert_question"]) or "")
+    return normalized
+
+
+def _default_workflow_action(trigger_status: str, reason: str | None = None) -> dict[str, Any]:
+    issue_type_by_status = {
+        "all_agree": "none",
+        "reference_disagrees": "reference_disagreement",
+        "two_agree": "calculation_disagreement",
+        "all_disagree": "calculation_disagreement",
+        "unresolved": "calculation_disagreement",
+        "failed": "worker_failure",
+    }
+    if trigger_status == "all_agree":
+        return {
+            "action": "continue",
+            "requires_human": False,
+            "issue_type": "none",
+            "proposed_revision": None,
+            "reason": reason or "reviewer accepted all_agree consensus",
+            "expert_question": "",
+        }
+    issue_type = issue_type_by_status.get(trigger_status, "other")
+    return {
+        "action": "pause_for_human",
+        "requires_human": True,
+        "issue_type": issue_type,
+        "proposed_revision": None,
+        "reason": reason or f"consensus status {trigger_status} requires expert decision",
+        "expert_question": _default_expert_question(
+            trigger_status,
+            {"issue_type": issue_type},
+        ),
+    }
+
+
+def _workflow_action_requires_human(workflow_action: Mapping[str, Any]) -> bool:
+    action = str(workflow_action.get("action", "")).strip()
+    if action in REVISION_ACTIONS and workflow_action.get("requires_human") is False:
+        return False
+    return True
+
+
+def _default_expert_question(trigger_status: str, workflow_action: Mapping[str, Any]) -> str:
+    issue_type = str(workflow_action.get("issue_type", "other")).strip() or "other"
+    if trigger_status == "reference_disagrees":
+        return "Blind derivation disagrees with the note/reference claim. Which formula or premise should ARC use next?"
+    if trigger_status == "failed":
+        return "A worker or validation failure stopped this step. Should ARC retry, revise the plan/foundation, or use a corrected premise?"
+    return (
+        "Proposers did not reach accepted consensus "
+        f"({trigger_status}, {issue_type}). What correction, premise, or plan/foundation revision should ARC use?"
+    )
+
+
 def _valid_ids(raw_ids: Any, all_proposer_ids: list[str]) -> list[str]:
     if not isinstance(raw_ids, list):
         return []
@@ -1267,6 +1588,7 @@ def _dry_run_result(config: ConsensusConfig, paths: RunPaths) -> dict[str, Any]:
         "run_root": str(paths.run_root),
         "proposer_count": config.proposer_count,
         "max_recalculations": config.max_recalculations,
+        "human_gate": copy.deepcopy(config.human_gate),
         "steps": [{"step_id": step.step_id, "kind": step.kind} for step in config.steps],
     }
 
@@ -1279,6 +1601,32 @@ def _required_text(data: Mapping[str, Any], key: str) -> str:
     if not text:
         raise ConfigError(f"{key} is required")
     return text
+
+
+def _parse_human_gate(value: Any) -> dict[str, Any]:
+    raw = _dict(value, "human_gate")
+    parsed = copy.deepcopy(raw)
+    parsed["enabled"] = _bool(raw.get("enabled", False), "human_gate.enabled")
+    parsed["mode"] = str(raw.get("mode", "standard") or "standard").strip() or "standard"
+
+    raw_statuses = raw.get("pause_on_statuses", list(DEFAULT_HUMAN_GATE_PAUSE_STATUSES))
+    if raw_statuses is None:
+        raw_statuses = list(DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
+    if not isinstance(raw_statuses, list):
+        raise ConfigError("human_gate.pause_on_statuses must be an array")
+    allowed_statuses = set(DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
+    statuses: list[str] = []
+    for item in raw_statuses:
+        status = str(item).strip()
+        if status not in allowed_statuses:
+            raise ConfigError(
+                "human_gate.pause_on_statuses values must be one of "
+                + ", ".join(sorted(allowed_statuses))
+            )
+        if status not in statuses:
+            statuses.append(status)
+    parsed["pause_on_statuses"] = statuses or list(DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
+    return parsed
 
 
 def _dict(value: Any, field_name: str) -> dict[str, Any]:
@@ -1298,6 +1646,12 @@ def _optional_dict(value: Any, field_name: str) -> dict[str, Any] | None:
     return parsed
 
 
+def _bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be a boolean")
+    return value
+
+
 def _positive_int(value: Any, field_name: str) -> int:
     try:
         parsed = int(value)
@@ -1305,6 +1659,16 @@ def _positive_int(value: Any, field_name: str) -> int:
         raise ConfigError(f"{field_name} must be a positive integer") from exc
     if parsed <= 0:
         raise ConfigError(f"{field_name} must be a positive integer")
+    return parsed
+
+
+def _nonnegative_int(value: Any, field_name: str) -> int:
+    try:
+        parsed = int(value)
+    except Exception as exc:
+        raise ConfigError(f"{field_name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ConfigError(f"{field_name} must be a non-negative integer")
     return parsed
 
 

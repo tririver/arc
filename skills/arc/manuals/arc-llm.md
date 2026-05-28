@@ -107,7 +107,10 @@ local endpoints that do not require a key. Provider config registers endpoints
 and tier mappings only; it does not select a provider/model for a run.
 With `--provider auto`, ARC uses native host providers first: Codex selects
 `codex-cli`, and Claude Code selects `claude-cli`. If no host-native provider is
-available, ARC falls back to usable configured providers.
+available, ARC selects a usable configured provider. For JSON calls, ARC may
+also retry usable configured providers after the host-native provider fails its
+retry budget. Inspect `arc_llm_call_record` in the returned JSON to see the
+actual provider/model and fallback attempt chain used for that interaction.
 
 ## Direct Prompt Tests
 
@@ -124,6 +127,12 @@ JSON output:
 ```bash
 arc-llm run-json --prompt "Return {\"ok\": true}" --schema schema.json --provider auto --json
 ```
+
+`run-json` appends an `arc_llm_call_record` object to the returned JSON. This
+records the requested provider/model tier, actual provider/model used,
+fallback index, successful attempt number, host signal, and all failed/successful
+attempts for that call. Treat this as runtime audit data, not model-generated
+scientific content.
 
 ## Proposers-Reviewer Loops
 
@@ -188,6 +197,29 @@ arc-llm proposers-reviewer-consensus --config consensus-config.json --dry-run --
 
 The wrapper owns the agreement policy, locked outputs, selective recalculation,
 and the forced `blocked_for_user` stop when the recalculation limit is reached.
+
+For note checks, enable the human gate in the consensus config:
+
+```json
+{
+  "human_gate": {
+    "enabled": true,
+    "mode": "note_check",
+    "pause_on_statuses": [
+      "reference_disagrees",
+      "two_agree",
+      "all_disagree",
+      "unresolved",
+      "failed"
+    ]
+  }
+}
+```
+
+With the gate enabled, the first failed or non-agreeing step stops the run.
+`blocked_for_user` means ask the human expert. `blocked_for_revision` means all
+LLM parties proposed a consistent foundation or plan revision; the main agent
+must still inspect it before applying and continuing.
 
 Optional true-LLM integration tests are skipped by default. To run them
 explicitly:

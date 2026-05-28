@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from arc_llm import run_json
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_paper.ids import arxiv_path_id, normalize_paper_id
 
 from . import paper
@@ -22,6 +23,7 @@ INTENT_RANKING_SCHEMA: dict[str, Any] = {
     "properties": {
         "ranked_paper_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
         "reasoning": {"type": "string"},
+        ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
     },
 }
 CITATION_RATE_WEIGHT = 0.1
@@ -240,12 +242,15 @@ def _rank_by_intent(
         result = run_json(prompt, schema=INTENT_RANKING_SCHEMA, provider=provider, model=model)
         ids = [normalize_paper_id(item) for item in result.get("ranked_paper_ids", []) if item]
         valid = {item["paper_id"] for item in citer_pool}
-        return {
+        ranking = {
             "schema_version": "arc.domain_intent_ranking.v1",
             "ranked_paper_ids": [item for item in ids if item in valid][:10],
             "reasoning": str(result.get("reasoning") or ""),
             "method": "llm",
         }
+        if isinstance(result.get(ARC_LLM_CALL_RECORD_FIELD), dict):
+            ranking[ARC_LLM_CALL_RECORD_FIELD] = result[ARC_LLM_CALL_RECORD_FIELD]
+        return ranking
     except Exception as exc:
         ranked = [
             item["paper_id"]

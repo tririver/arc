@@ -78,6 +78,66 @@ def test_parse_tex_pdf_returns_same_shape_with_optional_details(monkeypatch, tmp
     assert equation["pdf_page"] == 2
 
 
+def test_parse_tex_ignores_comment_environment_sections_and_equations(tmp_path):
+    tex_path = tmp_path / "notes.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Active}",
+                "Visible text.",
+                r"\begin{comment}",
+                r"\section{Hidden}",
+                r"\begin{equation}",
+                r"x = y",
+                r"\end{equation}",
+                r"\end{comment}",
+                "Still visible.",
+                r"\begin{equation}",
+                r"z = w",
+                r"\end{equation}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, source_id="notes")
+
+    assert [item["title"] for item in parsed["toc"]] == ["Active"]
+    assert len(parsed["equations"]) == 1
+    equation = parsed["equations"][0]
+    assert equation["equation"] == "z = w"
+    assert equation["before"] == "Still visible."
+    assert equation["tex_line_start"] == 10
+
+
+def test_parse_tex_ignores_percent_commented_sections_and_equations(tmp_path):
+    tex_path = tmp_path / "notes.tex"
+    tex_path.write_text(
+        "\n".join(
+            [
+                r"\section{Active}",
+                "Visible text.",
+                r"% \section{Hidden}",
+                r"% \begin{equation}",
+                r"% x = y",
+                r"% \end{equation}",
+                r"\begin{equation}",
+                r"z = w",
+                r"\end{equation}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parsed = parse_source_input(tex_path=tex_path, source_id="notes")
+
+    assert [item["title"] for item in parsed["toc"]] == ["Active"]
+    assert len(parsed["equations"]) == 1
+    equation = parsed["equations"][0]
+    assert equation["equation"] == "z = w"
+    assert equation["tex_line_start"] == 7
+
+
 def test_parse_tex_pdf_uses_nearest_printed_equation_number(monkeypatch, tmp_path):
     tex_path = tmp_path / "lecture9.tex"
     tex_path.write_text(

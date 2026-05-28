@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from arc_llm import run_json
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_paper.ids import normalize_paper_id
 
 from . import paper
@@ -92,6 +93,7 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
         },
         "reasoning": {"type": "string"},
         "warnings": {"type": "array", "items": {"type": "string"}},
+        ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
     },
 }
 

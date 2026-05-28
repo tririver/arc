@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from arc_llm.call_record import strip_arc_llm_call_records
+
 from .config import LoopConfig, WorkerConfig
 
 
@@ -19,8 +21,8 @@ def proposer_context(
         "loop_metadata": _loop_metadata(loop),
         "worker_id": worker.id,
         "round_number": round_number,
-        "caller_context": loop.caller_context,
-        "correspondence": correspondence,
+        "caller_context": strip_arc_llm_call_records(loop.caller_context),
+        "correspondence": strip_arc_llm_call_records(correspondence),
     }
 
 
@@ -38,9 +40,9 @@ def reviewer_context(
         "loop_metadata": _loop_metadata(loop),
         "worker_id": worker.id,
         "round_number": round_number,
-        "caller_context": loop.caller_context,
-        "correspondence": correspondence,
-        "current_proposer_outputs": current_proposer_outputs,
+        "caller_context": strip_arc_llm_call_records(loop.caller_context),
+        "correspondence": strip_arc_llm_call_records(correspondence),
+        "current_proposer_outputs": strip_arc_llm_call_records(current_proposer_outputs),
     }
 
 

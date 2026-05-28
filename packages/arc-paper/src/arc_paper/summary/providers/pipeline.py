@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA, strip_arc_llm_call_records
 from jsonschema import Draft202012Validator
 
 from ..store import read_section_summary, store_section_summary
@@ -22,6 +23,7 @@ SECTION_SUMMARY_SCHEMA: dict[str, Any] = {
         "title": {"type": "string"},
         "summary": {"type": "string", "minLength": 1},
         "warnings": {"type": "array", "items": {"type": "string"}},
+        ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
     },
 }
 
@@ -63,6 +65,7 @@ PAPER_SYNTHESIS_SCHEMA: dict[str, Any] = {
             },
         },
         "warnings": {"type": "array", "items": {"type": "string"}},
+        ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
     },
 }
 
@@ -250,12 +253,15 @@ def _summarize_section(
     )
     summary = run_json(prompt, SECTION_SUMMARY_SCHEMA, model)
     Draft202012Validator(SECTION_SUMMARY_SCHEMA).validate(summary)
-    return {
+    result = {
         "section_id": str(summary.get("section_id") or section.get("section_id") or ""),
         "title": str(summary.get("title") or section.get("title") or ""),
         "summary": str(summary.get("summary") or "").strip(),
         "warnings": list(summary.get("warnings") or []),
     }
+    if isinstance(summary.get(ARC_LLM_CALL_RECORD_FIELD), dict):
+        result[ARC_LLM_CALL_RECORD_FIELD] = summary[ARC_LLM_CALL_RECORD_FIELD]
+    return result
 
 
 def _metadata_for_section(input_pack: dict[str, Any]) -> dict[str, Any]:
@@ -274,7 +280,7 @@ def _final_task(task: dict[str, Any], section_summaries: list[dict[str, Any]]) -
         "paper_id": input_pack.get("paper_id", ""),
         "metadata": input_pack.get("metadata") or {},
         "toc": input_pack.get("toc") or [],
-        "section_summaries": section_summaries,
+        "section_summaries": strip_arc_llm_call_records(section_summaries),
         "source_hash": input_pack.get("source_hash", ""),
     }
     return {
@@ -298,7 +304,7 @@ def _assemble_summary(
 ) -> dict[str, Any]:
     input_pack = task.get("input_pack") or {}
     metadata = input_pack.get("metadata") or {}
-    return {
+    result = {
         "schema_version": "arc.paper_llm_summary.v1",
         "paper_id": str(input_pack.get("paper_id") or synthesis.get("paper_id") or ""),
         "title": str(synthesis.get("title") or metadata.get("title") or ""),
@@ -310,6 +316,9 @@ def _assemble_summary(
         "warnings": list(synthesis.get("warnings") or []),
         "provenance": {},
     }
+    if isinstance(synthesis.get(ARC_LLM_CALL_RECORD_FIELD), dict):
+        result[ARC_LLM_CALL_RECORD_FIELD] = synthesis[ARC_LLM_CALL_RECORD_FIELD]
+    return result
 
 
 def _canonical_toc(toc: list[dict[str, Any]]) -> list[dict[str, Any]]:

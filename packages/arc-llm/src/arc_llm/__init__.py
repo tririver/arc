@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA_VERSION, strip_arc_llm_call_records
 from .host import HostDetection, ProviderSelection, detect_host, select_llm_provider
 from .model import ModelTierError, resolve_model
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
@@ -11,6 +12,8 @@ __all__ = [
     "LLMConfig",
     "ModelTierError",
     "ProviderSelection",
+    "ARC_LLM_CALL_RECORD_FIELD",
+    "ARC_LLM_CALL_RECORD_SCHEMA_VERSION",
     "detect_host",
     "resolve_llm_config",
     "resolve_model",
@@ -19,4 +22,5 @@ __all__ = [
     "run_json",
     "run_text",
     "select_llm_provider",
+    "strip_arc_llm_call_records",
 ]

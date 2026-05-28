@@ -23,10 +23,24 @@
     },
     "max_recalculations": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 0
+    },
+    "human_gate": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "mode": {"type": "string"},
+        "pause_on_statuses": {
+          "type": "array",
+          "items": {
+            "enum": ["reference_disagrees", "two_agree", "all_disagree", "unresolved", "failed"]
+          }
+        }
+      },
+      "additionalProperties": true
     },
     "status": {
-      "enum": ["completed", "blocked_for_user", "failed"]
+      "enum": ["completed", "blocked_for_user", "blocked_for_revision", "failed"]
     },
     "steps": {
       "type": "array",
@@ -39,7 +53,7 @@
             "enum": ["foundation_check", "new_calculation"]
           },
           "status": {
-            "enum": ["accepted", "blocked_for_user", "failed"]
+            "enum": ["accepted", "blocked_for_user", "blocked_for_revision", "failed"]
           },
           "attempts": {"type": "array"},
           "accepted_output": {

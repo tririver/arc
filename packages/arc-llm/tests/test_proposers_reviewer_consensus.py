@@ -29,6 +29,13 @@ def test_consensus_config_defaults_to_three_proposers_and_three_recalculations(t
 
     assert config.proposer_count == 3
     assert config.max_recalculations == 3
+    assert config.human_gate["enabled"] is False
+
+
+def test_consensus_allows_zero_recalculations(tmp_path):
+    config = load_consensus_config(minimal_config(tmp_path, max_recalculations=0))
+
+    assert config.max_recalculations == 0
 
 
 def test_consensus_exact_model_requires_explicit_provider(tmp_path):
@@ -75,7 +82,9 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "never skip a step" in proposer_template
     assert "LaTeX" in proposer_template
     assert "validity_scope" in proposer_template
+    assert "plan_foundation_assessment" in proposer_template
     assert "reliable_until" not in proposer_template
+    assert "plan_foundation_assessment" in proposer["output_schema"]["required"]
     assert proposer["runtime"]["allow_internet"] is True
     assert proposer["runtime"]["allow_mcp"] is True
     assert proposer["runtime"]["mcp_mode"] == "arc-only"
@@ -106,6 +115,8 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "best_written_proposer_id" in consensus_properties
     assert "best_written_selection_reason" in consensus_properties
     assert "validity_scope" in consensus_properties
+    assert "workflow_action" in consensus_properties
+    assert "workflow_action" in reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["required"]
     assert "reliable_until" not in consensus_properties
     pairwise_properties = consensus_properties["pairwise_symbolic_checks"]["properties"]
     assert "used_sympy" in pairwise_properties
@@ -300,6 +311,123 @@ def test_reference_disagrees_accepts_when_two_blind_proposers_agree(tmp_path):
     assert result["steps"][0]["status"] == "accepted"
     assert result["steps"][0]["reviewer_consensus"]["status"] == "reference_disagrees"
     assert result["steps"][0]["accepted_output"]["reference_claim_status"] == "disagrees"
+
+
+def test_human_gate_blocks_reference_disagrees_in_note_check(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "reference_disagrees",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x = y - z", "reference_claim_status": "disagrees"},
+                workflow_action={
+                    "action": "pause_for_human",
+                    "requires_human": True,
+                    "issue_type": "reference_disagreement",
+                    "reason": "blind derivation differs from the note formula",
+                    "expert_question": "Which formula is intended?",
+                },
+                pairwise_check_overrides={
+                    "A_minus_B_zero": True,
+                    "B_minus_C_zero": False,
+                    "A_minus_C_zero": False,
+                    "true_count": 1,
+                    "sympy_code": (
+                        "simplify(expand(A-B)); "
+                        "simplify(expand(B-C)); "
+                        "simplify(expand(A-C))"
+                    ),
+                    "check_history": [
+                        "A-B reduces to 0.",
+                        "B-C reduces to 2*z.",
+                        "A-C reduces to 2*z.",
+                    ],
+                },
+            ),
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "later"},
+            ),
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        human_gate={"enabled": True, "mode": "note_check"},
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            },
+            {"step_id": "later_step", "prompt": "Derive later."},
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "blocked_for_user"
+    assert result["steps"][0]["status"] == "blocked_for_user"
+    assert result["steps"][0]["blocked_output"]["reason"] == "human_gate"
+    assert result["steps"][0]["blocked_output"]["trigger_status"] == "reference_disagrees"
+    assert result["steps"][0]["blocked_output"]["requires_human"] is True
+    assert result["steps"][0]["blocked_output"]["workflow_action"]["issue_type"] == "reference_disagreement"
+    assert len(result["steps"]) == 1
+    assert len(fake.calls) == 1
+
+
+def test_human_gate_stops_for_agreed_plan_revision_without_human(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_disagree",
+                workflow_action={
+                    "action": "revise_plan",
+                    "requires_human": False,
+                    "issue_type": "plan_wrong",
+                    "proposed_revision": {"split_step": "derive intermediate q first"},
+                    "reason": "all proposer assessments identify the same missing intermediate",
+                    "expert_question": "",
+                },
+            ),
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        human_gate={"enabled": True, "mode": "note_check"},
+        max_recalculations=2,
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "blocked_for_revision"
+    assert result["steps"][0]["status"] == "blocked_for_revision"
+    assert result["steps"][0]["blocked_output"]["requires_human"] is False
+    assert result["steps"][0]["blocked_output"]["workflow_action"]["action"] == "revise_plan"
+    assert len(result["steps"][0]["attempts"]) == 1
+    assert len(fake.calls) == 1
+
+
+def test_human_gate_blocks_worker_failure(tmp_path):
+    calls: list[dict[str, Any]] = []
+
+    def failing_batch_runner(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append(config)
+        return {"schema_version": "arc.llm.proposers_reviewer_batch.result.v1", "status": "failed"}
+
+    result = run_proposers_reviewer_consensus(
+        minimal_config(tmp_path, human_gate={"enabled": True, "mode": "note_check"}),
+        batch_runner=failing_batch_runner,
+        base_env={},
+    )
+
+    assert result["status"] == "blocked_for_user"
+    assert result["steps"][0]["status"] == "blocked_for_user"
+    assert result["steps"][0]["blocked_output"]["trigger_status"] == "failed"
+    assert result["steps"][0]["blocked_output"]["workflow_action"]["issue_type"] == "worker_failure"
+    assert result["steps"][0]["error"] == "attempt batch did not complete"
+    assert len(calls) == 1
 
 
 def test_reference_disagrees_requires_blind_proposer_agreement(tmp_path):
@@ -1064,6 +1192,7 @@ def test_consensus_dry_run_does_not_call_batch_runner(tmp_path):
     assert result["status"] == "dry_run"
     assert result["proposer_count"] == 3
     assert result["max_recalculations"] == 3
+    assert result["human_gate"]["enabled"] is False
     assert result["steps"] == [{"step_id": "step_001", "kind": "new_calculation"}]
 
 
@@ -1127,6 +1256,7 @@ def consensus_review(
     pairwise_check_overrides: dict[str, Any] | None = None,
     best_written: bool = True,
     best_written_proposer_id: str | None = "proposer_001",
+    workflow_action: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     consensus: dict[str, Any] = {
         "status": status,
@@ -1136,6 +1266,7 @@ def consensus_review(
         "recalculate_proposer_ids": recalculate or [],
         "validity_scope": "valid under stated assumptions and foundation conventions",
         "analysis": "review analysis",
+        "workflow_action": workflow_action or default_workflow_action_for_status(status),
     }
     if best_written:
         consensus["best_written_proposer_id"] = best_written_proposer_id
@@ -1162,4 +1293,25 @@ def consensus_review(
         "controller": {"message": "reviewed", "stop_requested": False},
         "proposer_messages": {},
         "review_payload": {"consensus": consensus},
+    }
+
+
+def default_workflow_action_for_status(status: str) -> dict[str, Any]:
+    if status == "all_agree":
+        return {
+            "action": "continue",
+            "requires_human": False,
+            "issue_type": "none",
+            "proposed_revision": None,
+            "reason": "all proposers agree",
+            "expert_question": "",
+        }
+    issue_type = "reference_disagreement" if status == "reference_disagrees" else "calculation_disagreement"
+    return {
+        "action": "retry",
+        "requires_human": False,
+        "issue_type": issue_type,
+        "proposed_revision": None,
+        "reason": "fake retry action",
+        "expert_question": "",
     }

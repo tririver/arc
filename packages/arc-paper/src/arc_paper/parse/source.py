@@ -10,7 +10,7 @@ from typing import Any
 from .ar5iv_html import parse_html
 
 
-PARSER_VERSION = 10
+PARSER_VERSION = 11
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
 EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"
@@ -173,8 +173,9 @@ def _tex_document_from_pages(
     lines: list[str],
     pdf_pages: list[str],
 ) -> dict[str, Any]:
-    sections = _tex_sections(path, lines)
-    equations = _tex_equations(path, lines, sections)
+    active_lines = _tex_active_lines(lines)
+    sections = _tex_sections(path, active_lines)
+    equations = _tex_equations(path, active_lines, sections)
     if pdf_pages:
         _enrich_equations_from_pdf(equations, pdf_pages)
         _fill_section_pdf_pages(sections, equations)
@@ -253,10 +254,32 @@ def _generated_source_id() -> str:
     return f"arc-{random.SystemRandom().randrange(100000000):08d}"
 
 
+def _tex_active_lines(lines: list[str]) -> list[str]:
+    active: list[str] = []
+    in_comment = False
+    begin_comment = re.compile(r"\\begin\{comment\*?\}")
+    end_comment = re.compile(r"\\end\{comment\*?\}")
+    for line in lines:
+        stripped = _strip_comment(line)
+        if in_comment:
+            active.append("")
+            if end_comment.search(stripped):
+                in_comment = False
+            continue
+        if begin_comment.search(stripped):
+            active.append("")
+            if not end_comment.search(stripped):
+                in_comment = True
+            continue
+        active.append(line)
+    return active
+
+
 def _tex_sections(path: Path, lines: list[str]) -> list[dict[str, Any]]:
     sections: list[dict[str, Any]] = []
     for index, line in enumerate(lines, start=1):
-        match = re.search(r"\\(section|subsection|subsubsection)\*?\s*\{([^{}]*)\}", line)
+        active_line = _strip_comment(line)
+        match = re.search(r"\\(section|subsection|subsubsection)\*?\s*\{([^{}]*)\}", active_line)
         if not match:
             continue
         command, title = match.groups()
@@ -383,20 +406,20 @@ def _pdf_equations(path: Path, pages: list[str], sections: list[dict[str, Any]])
 
 
 def _begin_environment(line: str) -> str:
-    match = re.search(r"\\begin\{(" + "|".join(DISPLAY_ENVIRONMENTS) + r")\*?\}", line)
+    match = re.search(r"\\begin\{(" + "|".join(DISPLAY_ENVIRONMENTS) + r")\*?\}", _strip_comment(line))
     return match.group(1) if match else ""
 
 
 def _find_environment_end(lines: list[str], start: int, env: str) -> int:
     pattern = re.compile(r"\\end\{" + re.escape(env) + r"\*?\}")
     for index in range(start, len(lines)):
-        if pattern.search(lines[index]):
+        if pattern.search(_strip_comment(lines[index])):
             return index
     return start
 
 
 def _display_math_span(lines: list[str], start: int) -> tuple[int, int, str] | None:
-    line = lines[start]
+    line = _strip_comment(lines[start])
     if r"\[" in line:
         return start, _find_display_end(lines, start, r"\]"), "display_math"
     if "$$" in line:
@@ -408,7 +431,7 @@ def _display_math_span(lines: list[str], start: int) -> tuple[int, int, str] | N
 
 def _find_display_end(lines: list[str], start: int, token: str) -> int:
     for index in range(start, len(lines)):
-        if token in lines[index]:
+        if token in _strip_comment(lines[index]):
             return index
     return start
 
@@ -425,7 +448,7 @@ def _equation_label(lines: list[str], start: int, end: int) -> str:
 
 
 def _line_label(line: str, default: str = "") -> str:
-    match = re.search(r"\\label\{([^{}]+)\}", line)
+    match = re.search(r"\\label\{([^{}]+)\}", _strip_comment(line))
     return match.group(1) if match else default
 
 

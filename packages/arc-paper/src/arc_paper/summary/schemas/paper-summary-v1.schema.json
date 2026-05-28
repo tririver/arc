@@ -63,6 +63,10 @@
           "section_id": {"type": "string"},
           "title": {"type": "string"},
           "summary": {"type": "string", "minLength": 1},
+          "arc_llm_call_record": {
+            "type": "object",
+            "additionalProperties": true
+          },
           "warnings": {
             "type": "array",
             "items": {"type": "string"}
@@ -107,6 +111,10 @@
           "pattern": "^[0-9a-f]{64}$"
         }
       }
+    },
+    "arc_llm_call_record": {
+      "type": "object",
+      "additionalProperties": true
     }
   }
 }
