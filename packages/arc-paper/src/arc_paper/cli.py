@@ -114,6 +114,16 @@ def main(argv: list[str] | None = None) -> int:
     get_parsed_equation.add_argument("source_id")
     get_parsed_equation.add_argument("--equation-id", required=True)
     get_parsed_equation.add_argument("--json", action="store_true")
+    mark_parsed_equation = sub.add_parser("mark-parsed-equation")
+    mark_parsed_equation.add_argument("source_id")
+    mark_parsed_equation.add_argument("--equation-id", required=True)
+    mark_parsed_equation.add_argument(
+        "--status",
+        default="problematic",
+        choices=["problematic", "needs_recache", "resolved"],
+    )
+    mark_parsed_equation.add_argument("--reason", required=True)
+    mark_parsed_equation.add_argument("--json", action="store_true")
     search_parsed = sub.add_parser("search-parsed")
     search_parsed.add_argument("source_id")
     search_parsed.add_argument("--query", required=True)
@@ -257,6 +267,13 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.get_parsed_source_equations(args.source_id)
     if command == "get-parsed-equation":
         return service.get_parsed_source_equation(args.source_id, args.equation_id)
+    if command == "mark-parsed-equation":
+        return service.mark_parsed_equation(
+            args.source_id,
+            args.equation_id,
+            status=args.status,
+            reason=args.reason,
+        )
     if command == "search-parsed":
         return service.search_parsed_source(
             args.source_id,

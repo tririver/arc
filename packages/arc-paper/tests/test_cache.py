@@ -5,6 +5,7 @@ from arc_paper.cache import (
     CachePaths,
     cache_root,
     migrate_paper_cache_dir,
+    parsed_source_annotations_cache_path,
     parsed_source_cache_path,
     read_json,
     read_text,
@@ -57,6 +58,12 @@ def test_parsed_source_cache_path_accepts_local_arc_id(monkeypatch, tmp_path):
 
     assert parsed_source_cache_path("arc-12345678") == tmp_path / "sources" / "arc-12345678.json"
     assert parsed_source_cache_path("lecture 9") == tmp_path / "sources" / "lecture_9.json"
+
+
+def test_parsed_source_annotations_cache_path_uses_sidecar_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+
+    assert parsed_source_annotations_cache_path("lecture 9") == tmp_path / "source-annotations" / "lecture_9.json"
 
 
 def test_migrate_paper_cache_dir_drops_legacy_parsed_json(monkeypatch, tmp_path):

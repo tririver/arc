@@ -64,6 +64,11 @@ def parsed_source_cache_path(source_id: str) -> Path:
     return cache_root() / "sources" / f"{safe_name}.json"
 
 
+def parsed_source_annotations_cache_path(source_id: str) -> Path:
+    safe_name = paper_ids_safe_dir_name([source_id])
+    return cache_root() / "source-annotations" / f"{safe_name}.json"
+
+
 def paper_alias_path(paper_id: str) -> Path:
     normalized = normalize_paper_id(paper_id)
     return cache_root() / "paper-aliases" / f"{quote(normalized, safe='')}.json"

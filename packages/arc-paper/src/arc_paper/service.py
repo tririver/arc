@@ -5,7 +5,16 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from .cache import CachePaths, cache_root, now_iso, parsed_source_cache_path, read_json, text_query_cache_path, write_json
+from .cache import (
+    CachePaths,
+    cache_root,
+    now_iso,
+    parsed_source_annotations_cache_path,
+    parsed_source_cache_path,
+    read_json,
+    text_query_cache_path,
+    write_json,
+)
 from .ids import arxiv_path_id
 from .ids import extract_paper_ids as _extract_paper_ids
 from .ids import normalize_paper_id
@@ -280,17 +289,81 @@ def get_parsed_source_equations(source_id: str) -> dict[str, Any]:
     parsed = _read_parsed_source(source_id)
     if parsed is None:
         return err("parsed_source_not_found", f"No parsed source found for {source_id}")
-    return ok(parsed.get("equations") or [], provider="local-cache", cache="hit")
+    annotations = _current_equation_annotations(source_id, parsed)
+    equations = [_with_equation_annotations(equation, annotations) for equation in parsed.get("equations") or []]
+    return ok(equations, provider="local-cache", cache="hit")
 
 
 def get_parsed_source_equation(source_id: str, equation_id: str) -> dict[str, Any]:
     parsed = _read_parsed_source(source_id)
     if parsed is None:
         return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    annotations = _current_equation_annotations(source_id, parsed)
     for equation in parsed.get("equations") or []:
         if str(equation.get("id") or "") == equation_id:
-            return ok(equation, provider="local-cache", cache="hit")
+            return ok(_with_equation_annotations(equation, annotations), provider="local-cache", cache="hit")
     return err("parsed_source_equation_not_found", f"No equation {equation_id} found in {source_id}")
+
+
+def mark_parsed_equation(
+    source_id: str,
+    equation_id: str,
+    *,
+    status: str = "problematic",
+    reason: str = "",
+) -> dict[str, Any]:
+    source_id = str(source_id or "").strip()
+    equation_id = str(equation_id or "").strip()
+    status = str(status or "problematic").strip()
+    reason = str(reason or "").strip()
+    if not source_id:
+        return err("parsed_source_id_required", "A parsed source id is required.")
+    if not equation_id:
+        return err("parsed_source_equation_id_required", "A parsed equation id is required.")
+    if status not in {"problematic", "needs_recache", "resolved"}:
+        return err("parsed_source_annotation_invalid", f"Unsupported parsed equation status {status!r}.")
+    if not reason:
+        return err("parsed_source_annotation_reason_required", "A reason is required when marking a parsed equation.")
+
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    if _find_parsed_equation(parsed, equation_id) is None:
+        return err("parsed_source_equation_not_found", f"No equation {equation_id} found in {source_id}")
+
+    path = parsed_source_annotations_cache_path(source_id)
+    sidecar = _read_parsed_source_annotations(source_id)
+    annotations = [
+        annotation
+        for annotation in sidecar.get("annotations", [])
+        if not (
+            isinstance(annotation, dict)
+            and annotation.get("target_kind") == "equation"
+            and str(annotation.get("target_id") or "") == equation_id
+        )
+    ]
+    existing = _annotation_for_target(sidecar.get("annotations", []), equation_id)
+    now = now_iso()
+    annotation = {
+        "source_id": source_id,
+        "target_kind": "equation",
+        "target_id": equation_id,
+        "status": status,
+        "reason": reason,
+        "source_hash": str(parsed.get("source_hash") or ""),
+        "created_at": str(existing.get("created_at") or now) if existing else now,
+        "updated_at": now,
+    }
+    annotations.append(annotation)
+    write_json(
+        path,
+        {
+            "schema_version": "arc.parsed_source.annotations.v1",
+            "source_id": source_id,
+            "annotations": annotations,
+        },
+    )
+    return ok(annotation, provider="local-cache", cache="write", cache_path=str(path))
 
 
 def search_parsed_source(
@@ -306,6 +379,8 @@ def search_parsed_source(
     if not (query or "").strip():
         return err("parsed_source_search_query_required", "A non-empty parsed source search query is required.")
     hits = _search_parsed_source_records(parsed, query, limit=max(1, min(int(limit), 200)), case_sensitive=case_sensitive)
+    annotations = _current_equation_annotations(source_id, parsed)
+    hits = [_with_equation_annotations(hit, annotations) if hit.get("kind") == "equation" else hit for hit in hits]
     return ok(hits, provider="local-cache", cache="hit", query=query, limit=limit, case_sensitive=case_sensitive)
 
 
@@ -375,6 +450,62 @@ def validate_note_check(run_dir: str | Path) -> dict[str, Any]:
 def _read_parsed_source(source_id: str) -> dict[str, Any] | None:
     parsed = read_json(parsed_source_cache_path(source_id))
     return parsed if isinstance(parsed, dict) else None
+
+
+def _read_parsed_source_annotations(source_id: str) -> dict[str, Any]:
+    data = read_json(parsed_source_annotations_cache_path(source_id))
+    if not isinstance(data, dict):
+        return {"schema_version": "arc.parsed_source.annotations.v1", "source_id": source_id, "annotations": []}
+    annotations = data.get("annotations")
+    if not isinstance(annotations, list):
+        annotations = []
+    return {
+        "schema_version": str(data.get("schema_version") or "arc.parsed_source.annotations.v1"),
+        "source_id": str(data.get("source_id") or source_id),
+        "annotations": [annotation for annotation in annotations if isinstance(annotation, dict)],
+    }
+
+
+def _find_parsed_equation(parsed: dict[str, Any], equation_id: str) -> dict[str, Any] | None:
+    for equation in parsed.get("equations") or []:
+        if isinstance(equation, dict) and str(equation.get("id") or "") == equation_id:
+            return equation
+    return None
+
+
+def _annotation_for_target(annotations: list[Any], equation_id: str) -> dict[str, Any]:
+    for annotation in annotations:
+        if (
+            isinstance(annotation, dict)
+            and annotation.get("target_kind") == "equation"
+            and str(annotation.get("target_id") or "") == equation_id
+        ):
+            return annotation
+    return {}
+
+
+def _current_equation_annotations(source_id: str, parsed: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    source_hash = str(parsed.get("source_hash") or "")
+    sidecar = _read_parsed_source_annotations(source_id)
+    current: dict[str, list[dict[str, Any]]] = {}
+    for annotation in sidecar.get("annotations", []):
+        if annotation.get("target_kind") != "equation":
+            continue
+        if str(annotation.get("source_hash") or "") != source_hash:
+            continue
+        target_id = str(annotation.get("target_id") or "")
+        if not target_id:
+            continue
+        current.setdefault(target_id, []).append(dict(annotation))
+    return current
+
+
+def _with_equation_annotations(equation: dict[str, Any], annotations: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    out = dict(equation)
+    target_annotations = annotations.get(str(equation.get("id") or ""))
+    if target_annotations:
+        out["annotations"] = target_annotations
+    return out
 
 
 def _search_parsed_source_records(

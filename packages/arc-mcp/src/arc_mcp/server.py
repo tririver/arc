@@ -86,6 +86,10 @@ PARSE_ID_DESCRIPTION = "Parsed source id to store in paper_id and use for source
 PARSE_HTML_PATH_DESCRIPTION = "Optional local HTML source path."
 PARSE_TEX_PATH_DESCRIPTION = "Optional local TeX source path."
 PARSE_PDF_PATH_DESCRIPTION = "Optional local PDF source path."
+PARSED_SOURCE_ID_DESCRIPTION = "Parsed source id whose cached equation should be annotated."
+PARSED_EQUATION_ID_DESCRIPTION = "Parsed equation id to annotate, for example eq_00042."
+PARSED_EQUATION_STATUS_DESCRIPTION = "Equation annotation status: problematic, needs_recache, or resolved."
+PARSED_EQUATION_REASON_DESCRIPTION = "Short reason explaining why this parsed equation annotation was added."
 
 PaperId = Annotated[str | None, Field(description=PAPER_ID_DESCRIPTION)]
 PaperIds = Annotated[list[str] | None, Field(description=PAPER_IDS_DESCRIPTION)]
@@ -124,6 +128,10 @@ ParseId = Annotated[str | None, Field(description=PARSE_ID_DESCRIPTION)]
 ParseHtmlPath = Annotated[str | None, Field(description=PARSE_HTML_PATH_DESCRIPTION)]
 ParseTexPath = Annotated[str | None, Field(description=PARSE_TEX_PATH_DESCRIPTION)]
 ParsePdfPath = Annotated[str | None, Field(description=PARSE_PDF_PATH_DESCRIPTION)]
+ParsedSourceId = Annotated[str, Field(description=PARSED_SOURCE_ID_DESCRIPTION)]
+ParsedEquationId = Annotated[str, Field(description=PARSED_EQUATION_ID_DESCRIPTION)]
+ParsedEquationStatus = Annotated[str, Field(description=PARSED_EQUATION_STATUS_DESCRIPTION)]
+ParsedEquationReason = Annotated[str, Field(description=PARSED_EQUATION_REASON_DESCRIPTION)]
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -188,6 +196,12 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         tex_path=args.get("tex_path"),
         pdf_path=args.get("pdf_path"),
         refresh=bool(args.get("refresh", False)),
+    ),
+    "mark_parsed_equation": lambda args: service.mark_parsed_equation(
+        str(args["source_id"]),
+        str(args["equation_id"]),
+        status=str(args.get("status", "problematic")),
+        reason=str(args.get("reason", "")),
     ),
     "llm_get_summary": lambda args: _cached_or_start_summary_job(args),
     "llm_generate_summary": lambda args: _start_summary_job_response(
@@ -1206,6 +1220,20 @@ def _register_tools(app: Any) -> None:
             pdf_path=pdf_path,
             refresh=refresh,
         )
+
+    @app.tool(
+        description=(
+            "Mark a cached parsed equation as problematic, needing re-cache, or resolved. "
+            "The marker is stored in a sidecar annotation cache and does not modify canonical parsed JSON."
+        )
+    )
+    def mark_parsed_equation(
+        source_id: ParsedSourceId,
+        equation_id: ParsedEquationId,
+        reason: ParsedEquationReason,
+        status: ParsedEquationStatus = "problematic",
+    ) -> Any:
+        return service.mark_parsed_equation(source_id, equation_id, status=status, reason=reason)
 
     @app.tool(
         name="llm_get_summary",

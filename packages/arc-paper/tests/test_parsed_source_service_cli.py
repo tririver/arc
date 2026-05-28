@@ -1,7 +1,7 @@
 import json
 
 from arc_paper import cli, service
-from arc_paper.cache import parsed_source_cache_path, read_json
+from arc_paper.cache import parsed_source_annotations_cache_path, parsed_source_cache_path, read_json
 
 
 def _write_tex(tmp_path):
@@ -57,6 +57,56 @@ def test_service_get_parsed_source_missing_returns_error(monkeypatch, tmp_path):
     assert result["error"]["code"] == "parsed_source_not_found"
 
 
+def test_service_mark_parsed_equation_writes_sidecar_and_overlays_current_source_hash(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    tex_path = _write_tex(tmp_path)
+    source_id = service.parse_source(tex_path=tex_path, source_id="lecture-9")["data"]["paper_id"]
+    parsed_path = parsed_source_cache_path(source_id)
+    original_parsed = read_json(parsed_path)
+
+    result = service.mark_parsed_equation(source_id, "eq_00001", reason="Sign differs from reference.")
+
+    assert result["ok"] is True
+    assert result["data"]["status"] == "problematic"
+    assert result["data"]["target_id"] == "eq_00001"
+    assert result["data"]["reason"] == "Sign differs from reference."
+    annotations_path = parsed_source_annotations_cache_path(source_id)
+    annotations = read_json(annotations_path)
+    assert annotations["schema_version"] == "arc.parsed_source.annotations.v1"
+    assert annotations["source_id"] == source_id
+    assert annotations["annotations"] == [result["data"]]
+    assert read_json(parsed_path) == original_parsed
+
+    equation = service.get_parsed_source_equation(source_id, "eq_00001")
+    equations = service.get_parsed_source_equations(source_id)
+    hits = service.search_parsed_source(source_id, query="eq:one")
+
+    assert equation["data"]["annotations"] == [result["data"]]
+    assert equations["data"][0]["annotations"] == [result["data"]]
+    assert hits["data"][0]["annotations"] == [result["data"]]
+
+    second_tex = tmp_path / "note2.tex"
+    second_tex.write_text(tex_path.read_text(encoding="utf-8") + "\nChanged prose.\n", encoding="utf-8")
+    service.parse_source(tex_path=second_tex, source_id=source_id)
+
+    reparsed = service.get_parsed_source_equation(source_id, "eq_00001")
+    assert "annotations" not in reparsed["data"]
+
+
+def test_service_mark_parsed_equation_validates_source_and_equation(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    tex_path = _write_tex(tmp_path)
+    service.parse_source(tex_path=tex_path, source_id="lecture-9")
+
+    missing_source = service.mark_parsed_equation("missing", "eq_00001", reason="bad")
+    missing_equation = service.mark_parsed_equation("lecture-9", "eq_missing", reason="bad")
+
+    assert missing_source["ok"] is False
+    assert missing_source["error"]["code"] == "parsed_source_not_found"
+    assert missing_equation["ok"] is False
+    assert missing_equation["error"]["code"] == "parsed_source_equation_not_found"
+
+
 def test_cli_parse_and_get_parsed_commands(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
     tex_path = _write_tex(tmp_path)
@@ -72,6 +122,11 @@ def test_cli_parse_and_get_parsed_commands(monkeypatch, tmp_path, capsys):
     assert cli.main(["get-parsed-equation", source_id, "--equation-id", "eq_00001", "--json"]) == 0
     equation_output = json.loads(capsys.readouterr().out)
     assert equation_output["data"]["normalized_latex"] == "x = y"
+
+    assert cli.main(["mark-parsed-equation", source_id, "--equation-id", "eq_00001", "--reason", "Bad sign", "--json"]) == 0
+    mark_output = json.loads(capsys.readouterr().out)
+    assert mark_output["data"]["status"] == "problematic"
+    assert mark_output["data"]["reason"] == "Bad sign"
 
 
 def test_cli_parsed_search_dispatches_to_service(monkeypatch, capsys):

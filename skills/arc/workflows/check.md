@@ -42,9 +42,15 @@ Parsed sources are cached at:
 <ARC_PAPER_CACHE>/sources/<paper_ids_safe_dir_name([paper_id])>.json
 ```
 
+Parsed equation annotations are cached separately at:
+
+```text
+<ARC_PAPER_CACHE>/source-annotations/<paper_ids_safe_dir_name([paper_id])>.json
+```
+
 Use the parsed JSON as the source of truth for sections, equations, labels,
 line ranges, printed equation numbers, and PDF pages. Do not reparse TeX or PDF
-inside this workflow.
+inside this workflow. Do not hand-edit parsed JSON to flag bad equations.
 
 The PDF may be larger than the TeX source, such as a whole book containing one
 section's TeX. In that case, rely on `arc-paper parse --tex NOTE.tex --pdf
@@ -167,6 +173,20 @@ arc-paper validate-note-check <project-dir>/calculate/<run-id> --json
 Step 2: Do not write final `calculation-report.md` unless validation passes.
 If validation fails but the run cannot be completed, write the report only with
 status `blocked_partial` and include the validation errors.
+
+Step 3: If checking shows that a cached parsed equation is problematic, ask the
+user to choose either a cache annotation or a re-cache.
+
+For annotation:
+
+```bash
+arc-paper mark-parsed-equation NOTE_ID --equation-id eq_00042 \
+  --status problematic --reason "Short reason from the check"
+```
+
+For re-cache, update the parse input and rerun `arc-paper parse` with the same
+`--id`. Existing annotations are keyed to the old `source_hash` and will not
+overlay the newly parsed equation view.
 
 ## Phase 5: Report
 

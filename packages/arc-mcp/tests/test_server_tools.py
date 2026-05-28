@@ -250,6 +250,37 @@ def test_call_tool_dispatches_unified_parse(monkeypatch):
     assert result["data"]["refresh"] is True
 
 
+def test_call_tool_dispatches_mark_parsed_equation(monkeypatch):
+    monkeypatch.setattr(
+        server.service,
+        "mark_parsed_equation",
+        lambda source_id, equation_id, *, status="problematic", reason="": {
+            "ok": True,
+            "data": {
+                "source_id": source_id,
+                "target_id": equation_id,
+                "status": status,
+                "reason": reason,
+            },
+        },
+    )
+
+    result = server.call_tool(
+        "mark_parsed_equation",
+        {
+            "source_id": "lecture-9",
+            "equation_id": "eq_00001",
+            "status": "problematic",
+            "reason": "Bad sign",
+        },
+    )
+
+    assert result["data"]["source_id"] == "lecture-9"
+    assert result["data"]["target_id"] == "eq_00001"
+    assert result["data"]["status"] == "problematic"
+    assert result["data"]["reason"] == "Bad sign"
+
+
 def test_call_tool_search_full_text_defaults_to_one_context_line(monkeypatch):
     def search_full_text(ids, *, query, refresh=False, limit=20, context=1, case_sensitive=False):
         return {"ok": True, "data": {"context": context}}
@@ -399,6 +430,9 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "canonical parsed JSON" in by_name["parse"].description
     assert "tex_path" in by_name["parse"].inputSchema["properties"]
     assert "pdf_path" in by_name["parse"].inputSchema["properties"]
+    assert "mark_parsed_equation" in by_name
+    assert "problematic" in by_name["mark_parsed_equation"].description
+    assert "equation_id" in by_name["mark_parsed_equation"].inputSchema["properties"]
     assert "web search" in by_name["llm_infer_main_references"].description
     assert "arXiv papers" in by_name["get_title"].description
     assert "LLM summary" in by_name["llm_generate_summary"].description
