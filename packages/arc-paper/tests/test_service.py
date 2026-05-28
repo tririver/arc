@@ -167,10 +167,9 @@ def test_llm_infer_main_references_enables_web_and_verifies_candidates(monkeypat
         }
 
     monkeypatch.setattr(reference_inference, "run_json", run_json)
-    monkeypatch.setenv("ARC_LLM_PROVIDER", "codex-cli")
     monkeypatch.setattr(service, "_inspire", FakeInspire())
 
-    result = service.llm_infer_main_references("Find the key paper on CMB trispectrum.")
+    result = service.llm_infer_main_references("Find the key paper on CMB trispectrum.", provider="codex-cli")
 
     assert result["ok"] is True
     assert result["data"] == ["arXiv:0911.3380"]
@@ -205,10 +204,9 @@ def test_llm_infer_main_references_rejects_unverified_candidates(monkeypatch, tm
         def get_metadata(self, paper_id, *, refresh=False):
             raise ProviderError("inspire_not_found", "missing")
 
-    monkeypatch.setenv("ARC_LLM_PROVIDER", "codex-cli")
     monkeypatch.setattr(service, "_inspire", MissingInspire())
 
-    result = service.llm_infer_main_references("Find the key paper.")
+    result = service.llm_infer_main_references("Find the key paper.", provider="codex-cli")
 
     assert result["ok"] is False
     assert result["error"]["code"] == "reference_inference_unverified"

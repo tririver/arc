@@ -166,7 +166,7 @@ arc-llm providers add openai-compatible \
   --id deepseek \
   --base-url https://api.deepseek.com/v1 \
   --api-key <key> \
-  --model deepseek-v4-flash \
+  --medium-model deepseek-v4-flash \
   --high-model deepseek-v4-pro \
   --json-mode json_object
 arc-llm providers list
@@ -184,9 +184,12 @@ Override the path with `ARC_LLM_PROVIDER_CONFIG` or `--provider-config`.
 Use `arc-llm providers init` to create the redacted starting file, then add
 providers with `arc-llm providers add openai-compatible`.
 
-With `--provider auto`, ARC uses native host providers first by default. Set
-`"auto_provider_priority": "configured-first"` in `llm-providers.json` if you
-want configured providers to win over Codex or Claude.
+Provider files register URL endpoints and model-tier mappings only. They do not
+select the provider or model for a run.
+
+With `--provider auto`, ARC uses native host providers first, then usable
+configured providers. Change run model through the run config/CLI:
+`provider` plus `model_tier`, or exact `model` with an explicit `provider`.
 
 ## Use ARC Through An Agent
 
@@ -217,8 +220,7 @@ packaging/codex/arc/scripts/arc-mcp-codex
 packaging/claude/arc/scripts/arc-mcp-claude
 ```
 
-The wrappers set `ARC_AGENT_HOST`, `ARC_LLM_PROVIDER`, and default model-tier
-environment variables before executing `arc-mcp`.
+The wrappers set `ARC_AGENT_HOST` before executing `arc-mcp`.
 
 When using the ARC skill, ask the agent in research terms. Examples:
 
@@ -538,14 +540,7 @@ Useful environment variables:
 
 ```text
 ARC_AGENT_HOST                    Force host detection, for example codex or claude-code.
-ARC_LLM_PROVIDER                  Force provider selection, for example codex-cli, claude-cli, deepseek, or manual.
 ARC_LLM_PROVIDER_CONFIG           Override the provider config file path.
-ARC_LLM_MODEL                     Override the exact model for any provider.
-ARC_LLM_MODEL_TIER                Select low, medium, or high model tier where supported; defaults to medium.
-ARC_CODEX_MODEL                   Override the Codex built-in provider model.
-ARC_CODEX_MODEL_TIER              Override the Codex model tier.
-ARC_CLAUDE_MODEL                  Override the Claude built-in provider model.
-ARC_CLAUDE_MODEL_TIER             Override the Claude model tier.
 ARC_PAPER_CACHE                   Override the arc-paper cache root.
 ARC_DOMAIN_CACHE                  Override the arc-domain cache root.
 ARC_MCP_CACHE                     Override the arc-mcp job/cache root.

@@ -378,6 +378,7 @@ def _call_json_runner(
             schema=worker.output_schema,
             provider=worker.provider,
             model=worker.model,
+            model_tier=worker.model_tier,
             env=env,
         )
     return run_json(

@@ -30,9 +30,9 @@ class BenchOptions:
     max_iterations: int = 10
     patience: int = 3
     max_concurrent_loops: int = 100
-    default_provider: str = "deepseek"
+    default_provider: str = "auto"
     sample_model_tier: str | None = "medium"
-    improver_provider: str = "deepseek"
+    improver_provider: str = "auto"
     improver_model: str | None = None
     improver_model_tier: str | None = "high"
     score_path: str = "review_payload.marks.total_score"
@@ -222,6 +222,11 @@ def _suggested_improvement_schema() -> dict[str, Any]:
 
 
 def _parse_options(raw: Mapping[str, Any]) -> BenchOptions:
+    default_provider = _nonempty_text(raw.get("default_provider", "auto"), "bench.default_provider")
+    improver_provider = _nonempty_text(raw.get("improver_provider", default_provider), "bench.improver_provider")
+    improver_model = _optional_text(raw.get("improver_model"), "bench.improver_model")
+    if improver_model is not None and improver_provider == "auto":
+        raise ConfigError("bench.improver_model requires explicit provider")
     return BenchOptions(
         samples=_positive_int(raw.get("samples", 10), "bench.samples"),
         sample_loop_id_prefix=_nonempty_text(raw.get("sample_loop_id_prefix", "idea"), "bench.sample_loop_id_prefix"),
@@ -230,10 +235,10 @@ def _parse_options(raw: Mapping[str, Any]) -> BenchOptions:
         max_iterations=_positive_int(raw.get("max_iterations", 10), "bench.max_iterations"),
         patience=_positive_int(raw.get("patience", 3), "bench.patience"),
         max_concurrent_loops=_positive_int(raw.get("max_concurrent_loops", 100), "bench.max_concurrent_loops"),
-        default_provider=_nonempty_text(raw.get("default_provider", "deepseek"), "bench.default_provider"),
+        default_provider=default_provider,
         sample_model_tier=_model_tier(raw.get("sample_model_tier", "medium"), "bench.sample_model_tier"),
-        improver_provider=_nonempty_text(raw.get("improver_provider", raw.get("default_provider", "deepseek")), "bench.improver_provider"),
-        improver_model=_optional_text(raw.get("improver_model"), "bench.improver_model"),
+        improver_provider=improver_provider,
+        improver_model=improver_model,
         improver_model_tier=_model_tier(raw.get("improver_model_tier", "high"), "bench.improver_model_tier"),
         score_path=_nonempty_text(raw.get("score_path", "review_payload.marks.total_score"), "bench.score_path"),
         min_delta=_float(raw.get("min_delta", 0.15), "bench.min_delta"),

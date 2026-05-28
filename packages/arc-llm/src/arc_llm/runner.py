@@ -39,6 +39,8 @@ def resolve_llm_config(
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
 ) -> LLMConfig:
+    if provider == "auto" and model:
+        raise ValueError("Exact model requires explicit provider; use provider=<provider> or model_tier=<low|medium|high>.")
     selected = select_llm_provider(
         env=env,
         process_chain=process_chain,
@@ -60,6 +62,8 @@ def resolve_llm_configs(
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
 ) -> list[LLMConfig]:
+    if provider == "auto" and model:
+        raise ValueError("Exact model requires explicit provider; use provider=<provider> or model_tier=<low|medium|high>.")
     primary = resolve_llm_config(
         provider=provider,
         model=model,

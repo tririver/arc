@@ -75,6 +75,7 @@ def _paper_summary(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
         payload.get("paper_ids"),
         provider=str(payload.get("provider") or "auto"),
         model=payload.get("model"),
+        model_tier=payload.get("model_tier"),
         refresh=bool(payload.get("refresh", False)),
         progress_callback=lambda event: record_progress(job_id, event),
     )
@@ -126,6 +127,7 @@ def _summary_batch_run(payload: dict[str, Any], *, job_id: str) -> dict[str, Any
         name,
         provider=str(payload.get("provider") or "auto"),
         model=payload.get("model"),
+        model_tier=payload.get("model_tier"),
         concurrency=int(payload.get("concurrency", 1)),
         max_items=payload.get("max_items"),
     )

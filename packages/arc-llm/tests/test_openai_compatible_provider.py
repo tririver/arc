@@ -67,7 +67,7 @@ def provider_config(**overrides) -> ConfiguredProvider:
         "base_url": "https://api.deepseek.example/v1",
         "api_key": "secret-key",
         "api_key_optional": False,
-        "models": {"default": "deepseek-chat"},
+        "models": {"medium": "deepseek-chat"},
         "json_mode": "json_schema",
     }
     values.update(overrides)

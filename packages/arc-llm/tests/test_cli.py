@@ -108,7 +108,7 @@ def test_providers_list_reports_builtins_and_configured_providers(tmp_path, monk
                             "type": "openai-compatible",
                             "base_url": "https://api.deepseek.example/v1",
                             "api_key": "secret-key",
-                            "models": {"default": "deepseek-chat"},
+                            "models": {"medium": "deepseek-chat"},
                         }
                 ],
             }
@@ -143,7 +143,7 @@ def test_providers_add_can_write_inline_api_key_to_local_config_without_echoing_
             "https://api.deepseek.example/v1",
             "--api-key",
             "secret-key",
-            "--model",
+            "--medium-model",
             "deepseek-chat",
             "--high-model",
             "deepseek-reasoner",
@@ -155,7 +155,7 @@ def test_providers_add_can_write_inline_api_key_to_local_config_without_echoing_
     assert result["status"] == "written"
     assert payload["providers"][0]["api_key"] == "secret-key"
     assert "secret-key" not in json.dumps(result)
-    assert payload["providers"][0]["models"]["default"] == "deepseek-chat"
+    assert payload["providers"][0]["models"]["medium"] == "deepseek-chat"
     assert payload["providers"][0]["models"]["high"] == "deepseek-reasoner"
 
 

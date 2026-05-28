@@ -3,18 +3,7 @@ from __future__ import annotations
 import os
 from typing import Mapping
 
-from .providers.config import ProviderConfigError, configured_provider
-
-
-PROVIDER_MODEL_ENV = {
-    "codex-cli": "ARC_CODEX_MODEL",
-    "claude-cli": "ARC_CLAUDE_MODEL",
-}
-
-PROVIDER_MODEL_TIER_ENV = {
-    "codex-cli": "ARC_CODEX_MODEL_TIER",
-    "claude-cli": "ARC_CLAUDE_MODEL_TIER",
-}
+from .providers.config import ConfiguredProvider, ProviderConfigError, configured_provider
 
 PROVIDER_MODEL_TIERS = {
     "codex-cli": {
@@ -53,37 +42,25 @@ def resolve_model(
     if explicit_model:
         return explicit_model
     env = env if env is not None else os.environ
-    if provider_env := PROVIDER_MODEL_ENV.get(provider_name):
-        if model := env.get(provider_env):
-            return model
-    if model := env.get("ARC_LLM_MODEL"):
-        return model
-    tier = _resolve_tier(provider_name, model_tier, env=env)
+    tier = _resolve_tier(model_tier)
     if configured := _configured_provider(provider_name, env=env):
         if tier:
             if model := configured.model_for_tier(tier):
                 return model
-        if model := configured.default_model():
-            return model
     if tier:
         return _model_for_tier(provider_name, tier)
     return DEFAULT_PROVIDER_MODELS.get(provider_name)
 
 
-def _configured_provider(provider_name: str, *, env: Mapping[str, str]) :
+def _configured_provider(provider_name: str, *, env: Mapping[str, str]) -> ConfiguredProvider | None:
     try:
         return configured_provider(provider_name, env=env)
     except ProviderConfigError:
         return None
 
 
-def _resolve_tier(provider_name: str, explicit_tier: str | None, *, env: Mapping[str, str]) -> str | None:
+def _resolve_tier(explicit_tier: str | None) -> str | None:
     tier = explicit_tier
-    if tier is None:
-        if provider_env := PROVIDER_MODEL_TIER_ENV.get(provider_name):
-            tier = env.get(provider_env)
-    if tier is None:
-        tier = env.get("ARC_LLM_MODEL_TIER")
     if tier is None or not str(tier).strip():
         return DEFAULT_MODEL_TIER
     normalized = str(tier).strip().lower()

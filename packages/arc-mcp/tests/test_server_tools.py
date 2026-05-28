@@ -459,6 +459,9 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "background" in by_name["llm_domain_get_summary"].inputSchema["properties"]
     assert "background" in by_name["llm_domain_get_graph"].inputSchema["properties"]
     assert "background" in by_name["llm_summary_batch_run"].inputSchema["properties"]
+    assert "model_tier" in by_name["llm_generate_summary"].inputSchema["properties"]
+    assert "model_tier" in by_name["llm_get_summary"].inputSchema["properties"]
+    assert "model_tier" in by_name["llm_summary_batch_run"].inputSchema["properties"]
     assert "summary_batch_create" in by_name
     assert "summary_batch_prefetch" in by_name
     assert "summary_batch_status" in by_name
@@ -518,7 +521,7 @@ def test_call_tool_dispatches_summary_batch_tools(monkeypatch, tmp_path):
 def test_get_llm_summary_starts_background_job_when_uncached(monkeypatch):
     monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0.001")
 
-    def generate_summary(paper_ids, provider="auto", model=None, refresh=False, progress_callback=None):
+    def generate_summary(paper_ids, provider="auto", model=None, model_tier=None, refresh=False, progress_callback=None):
         time.sleep(0.02)
         if progress_callback:
             progress_callback(
@@ -588,7 +591,7 @@ def test_llm_generate_summary_returns_inline_result_when_fast(monkeypatch):
     monkeypatch.setattr(
         server.service,
         "generate_llm_summary",
-        lambda paper_ids, provider="auto", model=None, refresh=False, progress_callback=None: {
+        lambda paper_ids, provider="auto", model=None, model_tier=None, refresh=False, progress_callback=None: {
             "ok": True,
             "data": {"paper_id": paper_ids},
             "errors": [],
@@ -606,7 +609,7 @@ def test_llm_generate_summary_returns_inline_result_when_fast(monkeypatch):
 def test_llm_generate_summary_background_true_returns_job_immediately(monkeypatch):
     monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "10")
 
-    def generate_summary(paper_ids, provider="auto", model=None, refresh=False, progress_callback=None):
+    def generate_summary(paper_ids, provider="auto", model=None, model_tier=None, refresh=False, progress_callback=None):
         time.sleep(0.05)
         return {
             "ok": True,
@@ -626,6 +629,19 @@ def test_llm_generate_summary_background_true_returns_job_immediately(monkeypatc
     status = _wait_for_job(started["job_id"])
     assert status["status"] == "done"
     assert server.job_result(started["job_id"])["result"]["data"]["paper_id"] == "arXiv:0911.3380"
+
+
+def test_llm_generate_summary_rejects_auto_provider_with_exact_model_before_background_job(monkeypatch):
+    monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0")
+
+    result = server.call_tool(
+        "llm_generate_summary",
+        {"paper_id": "0911.3380", "provider": "auto", "model": "gpt-5.5", "background": True},
+    )
+
+    assert result["ok"] is False
+    assert "Exact model requires explicit provider" in result["error"]["message"]
+    assert "job_id" not in result
 
 
 def test_domain_build_starts_background_job(monkeypatch):
@@ -788,7 +804,7 @@ def test_domain_get_summary_is_cache_only(monkeypatch):
 def test_cancel_job_requires_explicit_tool_call(monkeypatch):
     monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0.001")
 
-    def generate_summary(paper_ids, provider="auto", model=None, refresh=False, progress_callback=None):
+    def generate_summary(paper_ids, provider="auto", model=None, model_tier=None, refresh=False, progress_callback=None):
         time.sleep(0.05)
         return {"ok": True, "data": {}, "errors": [], "meta": {}}
 

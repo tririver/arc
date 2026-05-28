@@ -53,6 +53,8 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
     proposer_count = _positive_int(data.get("proposer_count", 3), "proposer_count")
     max_recalculations = _positive_int(data.get("max_recalculations", 3), "max_recalculations")
     defaults = _dict(data.get("defaults", {}), "defaults")
+    if defaults.get("model") is not None and str(defaults.get("provider", "auto") or "auto") == "auto":
+        raise ConfigError("defaults.model requires explicit provider")
     artifact_options = _dict(data.get("artifact_options", {"save_prompts": True}), "artifact_options")
     if "save_prompts" not in artifact_options:
         artifact_options["save_prompts"] = True

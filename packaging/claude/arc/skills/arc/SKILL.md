@@ -80,7 +80,7 @@ already exists, follow the automation policy in
 
 Step 5: Write `<project-dir>/context.json`.
 Include `automation_level`, `workflow`, `original_request`, `user_intent`,
-`project_dir`, `seed_paper_list`, `provider`, `model`, `workers`, and
+`project_dir`, `seed_paper_list`, `provider`, `model_tier`, `workers`, and
 `refresh`.
 
 ### Phase 2: Route Selection

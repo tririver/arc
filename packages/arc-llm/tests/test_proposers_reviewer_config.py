@@ -130,7 +130,7 @@ def test_worker_env_maps_runtime_without_mutating_base_env():
     assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
     assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
     assert "ARC_CODEX_ENABLE_MCP" not in env
-    assert env["ARC_LLM_MODEL_TIER"] == "high"
+    assert "ARC_LLM_MODEL_TIER" not in env
     assert env["ARC_CODEX_REASONING_EFFORT"] == "xhigh"
 
 
@@ -142,7 +142,7 @@ def test_worker_env_maps_mcp_model_and_provider_options():
 
     assert env["ARC_CODEX_ENABLE_MCP"] == "true"
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "true"
-    assert env["ARC_LLM_MODEL_TIER"] == "high"
+    assert "ARC_LLM_MODEL_TIER" not in env
     assert env["ARC_CODEX_REASONING_EFFORT"] == "xhigh"
     assert env["ARC_CLAUDE_EFFORT"] == "high"
 
@@ -203,6 +203,24 @@ def test_invalid_model_tier_fails():
     payload["defaults"]["model_tier"] = "strong"
 
     with pytest.raises(ConfigError, match="model_tier must be one of"):
+        load_batch_config(payload)
+
+
+def test_default_exact_model_requires_explicit_provider():
+    payload = minimal_config()
+    payload["defaults"]["provider"] = "auto"
+    payload["defaults"]["model"] = "gpt-5.5"
+
+    with pytest.raises(ConfigError, match="defaults.model requires explicit provider"):
+        load_batch_config(payload)
+
+
+def test_worker_exact_model_requires_explicit_provider():
+    payload = minimal_config()
+    payload["defaults"].pop("model_tier")
+    payload["loops"][0]["proposers"][0]["model"] = "gpt-5.5"
+
+    with pytest.raises(ConfigError, match=r"idea_001\.proposers\.proposer_001\.model requires explicit provider"):
         load_batch_config(payload)
 
 

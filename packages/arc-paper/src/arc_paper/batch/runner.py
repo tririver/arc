@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from arc_llm.runner import resolve_llm_config
+
 from .. import service
 from .db import BatchDB, BatchItem
 
@@ -24,16 +26,18 @@ def run_batch(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     concurrency: int = 1,
     max_items: int | None = None,
     db: BatchDB | None = None,
 ) -> dict[str, Any]:
+    resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
     db = db or BatchDB.default()
     limit = max_items or 1_000_000
     items = db.next_items(name, status="ready", limit=limit)
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
         futures = {
-            executor.submit(_run_one, item, db, provider=provider, model=model): item
+            executor.submit(_run_one, item, db, provider=provider, model=model, model_tier=model_tier): item
             for item in items
         }
         for future in as_completed(futures):
@@ -78,9 +82,9 @@ def _prefetch_one(item: BatchItem, db: BatchDB) -> None:
         db.mark_status(item.batch_name, item.paper_id, "ready")
 
 
-def _run_one(item: BatchItem, db: BatchDB, *, provider: str, model: str | None) -> None:
+def _run_one(item: BatchItem, db: BatchDB, *, provider: str, model: str | None, model_tier: str | None) -> None:
     db.mark_status(item.batch_name, item.paper_id, "running", attempts=item.attempts + 1)
-    result = service.generate_llm_summary(item.paper_id, provider=provider, model=model)
+    result = service.generate_llm_summary(item.paper_id, provider=provider, model=model, model_tier=model_tier)
     if result.get("ok"):
         summary_path = result.get("meta", {}).get("summary_path") or result.get("summary_path")
         db.mark_status(

@@ -36,7 +36,7 @@ def test_select_summary_provider_can_wrap_configured_arc_llm_provider(tmp_path, 
               "type": "openai-compatible",
               "base_url": "https://api.deepseek.example/v1",
               "api_key": "secret-value",
-              "models": {"default": "deepseek-chat"}
+              "models": {"medium": "deepseek-chat"}
             }
           ]
         }

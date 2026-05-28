@@ -145,7 +145,6 @@ def test_codex_arc_only_mcp_keeps_user_config_ignored_and_injects_arc_server(mon
     assert 'mcp_servers.arc.command="/tmp/arc-mcp"' in captured["cmd"]
     assert 'mcp_servers.arc.default_tools_approval_mode="approve"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_AGENT_HOST="codex"' in captured["cmd"]
-    assert 'mcp_servers.arc.env.ARC_LLM_PROVIDER="codex-cli"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_PAPER_CACHE="/tmp/cache/arc-paper"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_MCP_CACHE="/tmp/cache/arc-mcp"' in captured["cmd"]
 

@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from arc_llm.proposers_reviewer.config import ConfigError
 from arc_llm.proposers_reviewer_bench.config import (
     apply_improvement_edits,
     load_bench_config,
@@ -45,7 +48,7 @@ def base_payload(tmp_path: Path) -> dict[str, Any]:
     }
 
 
-def test_bench_config_defaults_materialize_ten_deepseek_loops(tmp_path):
+def test_bench_config_defaults_materialize_ten_auto_loops(tmp_path):
     config = load_bench_config(base_payload(tmp_path))
 
     payload = materialize_batch_payload(config, iteration_index=0, candidate_id="current")
@@ -53,7 +56,7 @@ def test_bench_config_defaults_materialize_ten_deepseek_loops(tmp_path):
     assert payload["schema_version"] == "arc.llm.proposers_reviewer_batch.config.v1"
     assert payload["run_id"] == "bench_seed_iter000_current"
     assert payload["max_concurrent_loops"] == 100
-    assert payload["defaults"]["provider"] == "deepseek"
+    assert payload["defaults"]["provider"] == "auto"
     assert len(payload["loops"]) == 10
     assert payload["loops"][0]["loop_id"] == "idea_001"
     assert payload["loops"][-1]["loop_id"] == "idea_010"
@@ -79,7 +82,7 @@ def test_bench_config_accepts_overrides_without_changing_batch_shape(tmp_path):
         "max_iterations": 7,
         "patience": 2,
         "max_concurrent_loops": 11,
-        "default_provider": "openrouter-deepseek",
+        "default_provider": "openrouter",
     }
 
     config = load_bench_config(raw)
@@ -89,9 +92,18 @@ def test_bench_config_accepts_overrides_without_changing_batch_shape(tmp_path):
     assert config.options.patience == 2
     assert payload["run_id"] == "bench_seed_iter002_candidate001"
     assert payload["max_concurrent_loops"] == 11
-    assert payload["defaults"]["provider"] == "openrouter-deepseek"
+    assert payload["defaults"]["provider"] == "openrouter"
     assert [loop["loop_id"] for loop in payload["loops"]] == ["idea_001", "idea_002", "idea_003"]
     assert {loop["max_rounds"] for loop in payload["loops"]} == {4}
+
+
+def test_bench_improver_exact_model_requires_explicit_provider(tmp_path):
+    raw = base_payload(tmp_path)
+    raw["schema_version"] = "arc.llm.proposers_reviewer_bench.config.v1"
+    raw["bench"] = {"improver_model": "gpt-5.5"}
+
+    with pytest.raises(ConfigError, match="bench.improver_model requires explicit provider"):
+        load_bench_config(raw)
 
 
 def test_bench_defaults_use_flash_tier_for_sample_workers_and_high_tier_for_improver(tmp_path):
@@ -254,6 +266,7 @@ def test_bench_runner_accepts_significant_prompt_improvement(tmp_path):
         "patience": 1,
         "min_delta": 0.3,
         "min_z": 0.0,
+        "improver_context_mode": "expanded",
     }
     batch_runner = FakeBenchBatchRunner(
         {

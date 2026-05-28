@@ -32,12 +32,12 @@ def test_parent_process_detects_claude_code():
     assert detected.confidence >= 0.8
 
 
-def test_provider_selection_prefers_env():
+def test_provider_selection_ignores_env_provider_override():
     provider = select_llm_provider(
         env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER": "openai"},
         process_chain=[],
     )
-    assert provider.provider == "openai"
+    assert provider.provider == "codex-cli"
     assert provider.host.host == "codex"
 
 

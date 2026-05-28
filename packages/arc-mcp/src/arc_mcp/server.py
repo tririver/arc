@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Annotated, Any, Callable
 
 from arc_domain import service as domain_service
+from arc_llm.runner import resolve_llm_config
 from arc_paper import service
 from arc_paper.batch.db import BatchDB
 from arc_paper.batch.runner import export_batch, prefetch_batch, run_batch
@@ -57,6 +58,7 @@ CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIR
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
 LLM_PROVIDER_DESCRIPTION = "LLM provider: auto, a built-in provider (codex-cli, claude-cli, manual), or a configured provider id."
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
+LLM_MODEL_TIER_DESCRIPTION = "Optional LLM model tier: low, medium, or high."
 BACKGROUND_DESCRIPTION = (
     "When true, start the job and return a background job id immediately instead of waiting inline."
 )
@@ -109,6 +111,7 @@ CiterLimit = Annotated[int, Field(description=CITER_LIMIT_DESCRIPTION)]
 CiterSort = Annotated[str, Field(description=CITER_SORT_DESCRIPTION)]
 LLMProvider = Annotated[str, Field(description=LLM_PROVIDER_DESCRIPTION)]
 LLMModel = Annotated[str | None, Field(description=LLM_MODEL_DESCRIPTION)]
+LLMModelTier = Annotated[str | None, Field(description=LLM_MODEL_TIER_DESCRIPTION)]
 Background = Annotated[bool, Field(description=BACKGROUND_DESCRIPTION)]
 Md2PdfInput = Annotated[str, Field(description=MD2PDF_INPUT_DESCRIPTION)]
 Md2PdfOutput = Annotated[str | None, Field(description=MD2PDF_OUTPUT_DESCRIPTION)]
@@ -208,6 +211,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         _paper_ids(args),
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
+        model_tier=args.get("model_tier"),
         refresh=bool(args.get("refresh", False)),
         background=bool(args.get("background", False)),
     ),
@@ -493,9 +497,20 @@ def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
         paper_ids,
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
+        model_tier=args.get("model_tier"),
         refresh=bool(args.get("refresh", False)),
         background=bool(args.get("background", False)),
     )
+
+
+def _error(code: str, message: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": None,
+        "error": {"code": code, "message": message},
+        "errors": [{"code": code, "message": message}],
+        "meta": {},
+    }
 
 
 def _start_summary_job_response(
@@ -503,9 +518,14 @@ def _start_summary_job_response(
     *,
     provider: str,
     model: str | None,
+    model_tier: str | None,
     refresh: bool,
     background: bool,
 ) -> dict[str, Any]:
+    try:
+        resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
+    except Exception as exc:
+        return _error("invalid_llm_config", str(exc))
     normalized = _normalize_ids(paper_ids)
     job_id = MCP_JOBS.start(
         job_type="paper_summary",
@@ -513,13 +533,16 @@ def _start_summary_job_response(
             "paper_ids": normalized,
             "provider": provider,
             "model": model,
+            "model_tier": model_tier,
             "refresh": refresh,
             "sections_total": None,
             "sections_completed": 0,
             "current_section": None,
             "background": background,
         },
-        runner=lambda progress, cancel: _run_summary_job(normalized, provider, model, refresh, progress, cancel),
+        runner=lambda progress, cancel: _run_summary_job(
+            normalized, provider, model, model_tier, refresh, progress, cancel
+        ),
         status_resolver=_arc_result_status,
     )
     return _wait_or_background(
@@ -697,6 +720,7 @@ def _run_summary_job(
     paper_ids: Any,
     provider: str,
     model: str | None,
+    model_tier: str | None,
     refresh: bool,
     progress: Callable[[dict[str, Any]], None],
     cancel: Callable[[], bool],
@@ -708,6 +732,7 @@ def _run_summary_job(
         paper_ids,
         provider=provider,
         model=model,
+        model_tier=model_tier,
         refresh=refresh,
         progress_callback=progress,
     )
@@ -734,6 +759,11 @@ def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
     name = str(args["name"])
     provider = str(args.get("provider", "auto"))
     model = args.get("model")
+    model_tier = args.get("model_tier")
+    try:
+        resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
+    except Exception as exc:
+        return _error("invalid_llm_config", str(exc))
     concurrency = int(args.get("concurrency", 1))
     max_items = args.get("max_items")
     max_items_int = int(max_items) if max_items is not None else None
@@ -744,12 +774,13 @@ def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
             "name": name,
             "provider": provider,
             "model": model,
+            "model_tier": model_tier,
             "concurrency": concurrency,
             "max_items": max_items_int,
             "background": background,
         },
         runner=lambda progress, cancel: _run_summary_batch_job(
-            name, provider, model, concurrency, max_items_int, progress, cancel
+            name, provider, model, model_tier, concurrency, max_items_int, progress, cancel
         ),
         status_resolver=_arc_result_status,
     )
@@ -765,6 +796,7 @@ def _run_summary_batch_job(
     name: str,
     provider: str,
     model: str | None,
+    model_tier: str | None,
     concurrency: int,
     max_items: int | None,
     progress: Callable[[dict[str, Any]], None],
@@ -773,7 +805,14 @@ def _run_summary_batch_job(
     if cancel():
         raise MCPJobCancelled("MCP job cancellation was requested.")
     progress({"event": "summary_batch_started", "name": name})
-    result = run_batch(name, provider=provider, model=model, concurrency=concurrency, max_items=max_items)
+    result = run_batch(
+        name,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        concurrency=concurrency,
+        max_items=max_items,
+    )
     progress({"event": "summary_batch_completed", "name": name})
     return {"ok": True, "data": result, "errors": [], "meta": {}}
 
@@ -1248,6 +1287,7 @@ def _register_tools(app: Any) -> None:
         paper_ids: PaperIds = None,
         provider: LLMProvider = "auto",
         model: LLMModel = None,
+        model_tier: LLMModelTier = None,
         refresh: Refresh = False,
         background: Background = False,
     ) -> Any:
@@ -1257,6 +1297,7 @@ def _register_tools(app: Any) -> None:
                 "paper_ids": paper_ids,
                 "provider": provider,
                 "model": model,
+                "model_tier": model_tier,
                 "refresh": refresh,
                 "background": background,
             }
@@ -1275,6 +1316,7 @@ def _register_tools(app: Any) -> None:
         paper_ids: PaperIds = None,
         provider: LLMProvider = "auto",
         model: LLMModel = None,
+        model_tier: LLMModelTier = None,
         refresh: Refresh = False,
         background: Background = False,
     ) -> Any:
@@ -1282,6 +1324,7 @@ def _register_tools(app: Any) -> None:
             _one_or_many(paper_id, paper_ids),
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             background=background,
         )
@@ -1389,6 +1432,7 @@ def _register_tools(app: Any) -> None:
         name: BatchName,
         provider: LLMProvider = "auto",
         model: LLMModel = None,
+        model_tier: LLMModelTier = None,
         concurrency: Annotated[int, Field(description="Number of concurrent LLM summary generation workers.")] = 1,
         max_items: Annotated[int | None, Field(description="Optional cap on items to process in this run.")] = None,
         background: Background = False,
@@ -1398,6 +1442,7 @@ def _register_tools(app: Any) -> None:
                 "name": name,
                 "provider": provider,
                 "model": model,
+                "model_tier": model_tier,
                 "concurrency": concurrency,
                 "max_items": max_items,
                 "background": background,

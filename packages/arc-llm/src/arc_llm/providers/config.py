@@ -13,11 +13,8 @@ LOCAL_PROVIDER_CONFIG_PATH = Path("llm-providers.json")
 DEFAULT_PROVIDER_CONFIG_PATH = Path("~/.config/arc/llm-providers.json")
 OPENAI_COMPATIBLE_TYPE = "openai-compatible"
 VALID_JSON_MODES = frozenset({"json_schema", "json_object", "none"})
-AUTO_PROVIDER_PRIORITY_HOST_FIRST = "host-first"
-AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST = "configured-first"
-VALID_AUTO_PROVIDER_PRIORITIES = frozenset(
-    {AUTO_PROVIDER_PRIORITY_HOST_FIRST, AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST}
-)
+VALID_MODEL_TIERS = frozenset({"low", "medium", "high"})
+LEGACY_SELECTION_FIELDS = frozenset({"default", "auto_provider_priority"})
 
 
 class ProviderConfigError(ValueError):
@@ -56,17 +53,11 @@ class ConfiguredProvider:
         models = self.models or {}
         return models.get(tier)
 
-    def default_model(self) -> str | None:
-        models = self.models or {}
-        return models.get("default")
-
 
 @dataclass(frozen=True)
 class ProviderConfig:
     path: str
-    default: str | None
     providers: list[ConfiguredProvider]
-    auto_provider_priority: str = AUTO_PROVIDER_PRIORITY_HOST_FIRST
 
     def provider(self, provider_id: str) -> ConfiguredProvider | None:
         for provider in self.providers:
@@ -96,7 +87,7 @@ def load_provider_config(*, env: Mapping[str, str] | None = None) -> ProviderCon
     if path is None:
         path = provider_config_path(env=env)
     if not path.exists():
-        return ProviderConfig(path=str(path), default=None, providers=[])
+        return ProviderConfig(path=str(path), providers=[])
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -110,14 +101,12 @@ def parse_provider_config(payload: Mapping[str, Any], *, path: str = "") -> Prov
     schema_version = str(payload.get("schema_version") or "").strip()
     if schema_version != PROVIDER_CONFIG_SCHEMA:
         raise ProviderConfigError(f"schema_version must be {PROVIDER_CONFIG_SCHEMA}")
-    default = payload.get("default")
-    if default is not None:
-        default = _safe_id(str(default).strip(), "default")
-    auto_provider_priority = str(payload.get("auto_provider_priority") or AUTO_PROVIDER_PRIORITY_HOST_FIRST).strip()
-    if auto_provider_priority not in VALID_AUTO_PROVIDER_PRIORITIES:
+    legacy_fields = sorted(LEGACY_SELECTION_FIELDS.intersection(payload))
+    if legacy_fields:
+        names = ", ".join(legacy_fields)
         raise ProviderConfigError(
-            "auto_provider_priority must be one of: "
-            + ", ".join(sorted(VALID_AUTO_PROVIDER_PRIORITIES))
+            f"Provider config must not set run selection fields: {names}; "
+            "choose provider/model_tier per run instead"
         )
     raw_providers = payload.get("providers")
     if raw_providers is None:
@@ -130,13 +119,9 @@ def parse_provider_config(payload: Mapping[str, Any], *, path: str = "") -> Prov
         if provider.id in seen:
             raise ProviderConfigError(f"duplicate provider id: {provider.id}")
         seen.add(provider.id)
-    if default and default not in seen:
-        raise ProviderConfigError(f"default provider is not defined: {default}")
     return ProviderConfig(
         path=path,
-        default=default,
         providers=providers,
-        auto_provider_priority=auto_provider_priority,
     )
 
 
@@ -149,18 +134,10 @@ def usable_configured_providers(*, env: Mapping[str, str] | None = None) -> list
     return [provider for provider in config.providers if provider.is_usable(env=env)]
 
 
-def select_default_configured_provider(*, env: Mapping[str, str] | None = None) -> ConfiguredProvider | None:
+def select_configured_provider(*, env: Mapping[str, str] | None = None) -> ConfiguredProvider | None:
     config = load_provider_config(env=env)
-    if config.default:
-        provider = config.provider(config.default)
-        if provider and provider.has_api_key(env=env):
-            return provider
     for provider in config.providers:
         if provider.has_api_key(env=env):
-            return provider
-    if config.default:
-        provider = config.provider(config.default)
-        if provider and provider.is_usable(env=env):
             return provider
     for provider in config.providers:
         if provider.api_key_optional and provider.is_usable(env=env):
@@ -219,10 +196,13 @@ def _models(value: Any, index: int) -> dict[str, str] | None:
     models: dict[str, str] = {}
     for key, model in value.items():
         text_key = str(key).strip()
+        if text_key not in VALID_MODEL_TIERS:
+            valid = ", ".join(sorted(VALID_MODEL_TIERS))
+            raise ProviderConfigError(f"providers[{index}].models keys must be one of: {valid}")
         text_model = str(model).strip()
-        if text_key and text_model:
+        if text_model:
             models[text_key] = text_model
-    return models
+    return models or None
 
 
 def _bool(value: Any, field_name: str) -> bool:

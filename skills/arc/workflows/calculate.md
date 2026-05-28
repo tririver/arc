@@ -212,6 +212,29 @@ human expert resolves a result, continue from that premise and mark it
 human-resolved. Do not claim a result absent from accepted consensus output or
 human-resolved input.
 
+When a human-resolved result is used to continue, write the resolution into the
+run artifacts before launching the next consensus config:
+
+```json
+{
+  "status": "human_resolved",
+  "resolution": {
+    "resolved_by": "user",
+    "resolved_at": "<ISO-8601 timestamp>",
+    "type": "corrected_formula | accepted_formula | premise | instruction",
+    "corrected_latex": "<LaTeX formula when applicable>",
+    "accepted_result": "<plain result when not LaTeX>",
+    "rationale": "<why this resolves the block>",
+    "use_as_later_premise": true
+  }
+}
+```
+
+Then create a continuation config starting from the next unresolved step. Add
+human-resolved premises to the continuation config as accepted prior results,
+with `status: "human_resolved"` and `source: "human_expert_resolution"`.
+Record the continuation config path and run id in `calculation-report.md`.
+
 After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/calculation-report.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait before

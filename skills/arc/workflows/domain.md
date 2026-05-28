@@ -6,7 +6,7 @@ more seed papers.
 ## Inputs
 
 Read `<project-dir>/context.json`. Use the exact values from that file for all
-ARC calls, especially `user_intent`, `seed_paper_list`, `provider`, `model`,
+ARC calls, especially `user_intent`, `seed_paper_list`, `provider`, `model_tier`,
 `workers`, and `refresh`.
 
 ### Phase 1: Prepare Project Artifacts
@@ -37,11 +37,14 @@ Step 2: For each distinct `<seed-paper>` in `seed_paper_list`, call the MCP tool
 seed_paper=<seed-paper>
 intent=<user-intent>
 provider=<provider>
-model=<model>
+model_tier=<model_tier>
 refresh=<refresh>
 workers=<workers>
 background=true
 ```
+
+Use exact `model=<model>` only when the context intentionally pins a
+non-`auto` provider.
 
 If there is more than one distinct domain, launch all `llm_domain_build`
 background jobs before watching any of them. This allows independent domains to

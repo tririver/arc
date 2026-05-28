@@ -85,6 +85,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     default_model = defaults.get("model")
     if default_model is not None:
         default_model = str(default_model)
+    _validate_exact_model_provider(default_model, default_provider, "defaults")
     default_model_tier = _model_tier(defaults.get("model_tier"), "defaults.model_tier")
 
     raw_loops = data.get("loops")
@@ -131,7 +132,6 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
         _put(env, "ARC_CODEX_MCP_MODE", mcp_mode)
         _put(env, "ARC_CLAUDE_MCP_MODE", mcp_mode)
     if worker.model_tier:
-        env["ARC_LLM_MODEL_TIER"] = worker.model_tier
         env.setdefault("ARC_CODEX_REASONING_EFFORT", _codex_effort_for_model_tier(worker.model_tier))
         env.setdefault("ARC_CLAUDE_EFFORT", _claude_effort_for_model_tier(worker.model_tier))
 
@@ -256,6 +256,7 @@ def _parse_worker(
     model = worker_data.get("model", default_model)
     if model is not None:
         model = str(model)
+    _validate_exact_model_provider(model, provider, f"{field_name}.{worker_id}")
     model_tier = _model_tier(worker_data.get("model_tier", default_model_tier), f"{field_name}.{worker_id}.model_tier")
     return WorkerConfig(
         id=worker_id,
@@ -353,6 +354,11 @@ def _model_tier(value: Any, field_name: str) -> str | None:
     if text not in VALID_MODEL_TIERS:
         raise ConfigError("model_tier must be one of: high, medium, low")
     return text
+
+
+def _validate_exact_model_provider(model: str | None, provider: str, field_name: str) -> None:
+    if model is not None and provider == "auto":
+        raise ConfigError(f"{field_name}.model requires explicit provider")
 
 
 def _mcp_mode(value: Any, field_name: str) -> str | None:

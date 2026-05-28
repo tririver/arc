@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from arc_llm.proposers_reviewer.config import ConfigError
 from arc_llm.proposers_reviewer.consensus import (
     load_consensus_config,
     run_proposers_reviewer_consensus,
@@ -26,6 +29,11 @@ def test_consensus_config_defaults_to_three_proposers_and_three_recalculations(t
 
     assert config.proposer_count == 3
     assert config.max_recalculations == 3
+
+
+def test_consensus_exact_model_requires_explicit_provider(tmp_path):
+    with pytest.raises(ConfigError, match="defaults.model requires explicit provider"):
+        load_consensus_config(minimal_config(tmp_path, defaults={"provider": "auto", "model": "gpt-5.5"}))
 
 
 def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):

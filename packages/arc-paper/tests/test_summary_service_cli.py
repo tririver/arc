@@ -72,6 +72,8 @@ class FakeSummaryProvider:
     def generate_summary(self, task, *, model=None, progress_callback=None):
         summary = valid_summary()
         summary["provenance"]["source_hash"] = task["input_pack"]["source_hash"]
+        if model:
+            summary["provenance"]["model"] = model
         return summary
 
 
@@ -147,6 +149,41 @@ def test_generate_llm_summary_uses_provider_and_caches(monkeypatch, tmp_path):
     assert service.get_cached_llm_summary("0911.3380")["meta"]["cache"] == "hit"
 
 
+def test_generate_llm_summary_rejects_auto_provider_with_exact_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+
+    result = service.generate_llm_summary("0911.3380", provider="auto", model="gpt-5.5")
+
+    assert result["ok"] is False
+    assert "Exact model requires explicit provider" in result["error"]["message"]
+
+
+def test_generate_llm_summary_resolves_model_tier_before_summary_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    monkeypatch.setenv("ARC_AGENT_HOST", "codex")
+    monkeypatch.setenv("ARC_LLM_PROVIDER_CONFIG", str(tmp_path / "missing-providers.json"))
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    captured = {}
+
+    def select_summary_provider(provider):
+        captured["provider"] = provider
+        fake = FakeSummaryProvider()
+        fake.name = provider
+        return fake
+
+    monkeypatch.setattr(service, "select_summary_provider", select_summary_provider)
+
+    result = service.generate_llm_summary("0911.3380", provider="auto", model_tier="high")
+
+    assert result["ok"] is True
+    assert result["meta"]["provider"] == "codex-cli"
+    assert captured["provider"] == "codex-cli"
+    assert result["data"]["provenance"]["model"] == "gpt-5.5"
+
+
 def test_cli_get_llm_summary_can_force_manual_provider(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     monkeypatch.setattr(service, "_inspire", FakeInspire())
@@ -157,6 +194,23 @@ def test_cli_get_llm_summary_can_force_manual_provider(monkeypatch, tmp_path, ca
 
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "needs_llm"
+
+
+def test_cli_generate_llm_summary_passes_model_tier(monkeypatch, capsys):
+    captured = {}
+
+    def fake_generate(paper_ids, **kwargs):
+        captured["paper_ids"] = paper_ids
+        captured.update(kwargs)
+        return {"ok": True, "data": {"paper_ids": paper_ids}}
+
+    monkeypatch.setattr(service, "generate_llm_summary", fake_generate)
+
+    assert cli.main(["llm-generate-summary", "0911.3380", "--model-tier", "high", "--json"]) == 0
+
+    assert captured["paper_ids"] == "0911.3380"
+    assert captured["model_tier"] == "high"
+    json.loads(capsys.readouterr().out)
 
 
 def test_cli_store_llm_summary(monkeypatch, tmp_path, capsys):

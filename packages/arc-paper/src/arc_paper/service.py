@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from arc_llm.runner import resolve_llm_config
+
 from .cache import (
     CachePaths,
     cache_root,
@@ -410,7 +412,7 @@ def validate_note_check(run_dir: str | Path) -> dict[str, Any]:
     consensus = read_json(results_path) if results_path.is_file() else None
     violations = []
     status_counts: dict[str, int] = {}
-    allowed = {"verified", "reference_disagrees", "unresolved", "context_only"}
+    allowed = {"verified", "reference_disagrees", "unresolved", "context_only", "human_resolved"}
     if isinstance(triage, dict):
         for note in triage.get("notes") or []:
             parsed_path_raw = str(note.get("parsed_source_path") or "")
@@ -427,6 +429,9 @@ def validate_note_check(run_dir: str | Path) -> dict[str, Any]:
             status_counts[status] = status_counts.get(status, 0) + 1
             if status not in allowed:
                 violations.append(f"{claim_id}: invalid status {status!r}")
+            if status == "human_resolved":
+                violations.extend(_human_resolution_violations(claim_id, claim))
+                continue
             step_id = str(claim.get("consensus_step_id") or "")
             if not step_id:
                 violations.append(f"{claim_id}: missing consensus_step_id")
@@ -452,6 +457,19 @@ def validate_note_check(run_dir: str | Path) -> dict[str, Any]:
         },
         provider="local-cache",
     )
+
+
+def _human_resolution_violations(claim_id: str, claim: Mapping[str, Any]) -> list[str]:
+    resolution = claim.get("resolution")
+    if not isinstance(resolution, dict):
+        return [f"{claim_id}: human_resolved requires resolution object"]
+    violations = []
+    for field in ("resolved_by", "resolved_at", "type", "rationale"):
+        if not str(resolution.get(field) or "").strip():
+            violations.append(f"{claim_id}: human_resolved resolution requires {field}")
+    if not str(resolution.get("corrected_latex") or resolution.get("accepted_result") or "").strip():
+        violations.append(f"{claim_id}: human_resolved resolution requires corrected_latex or accepted_result")
+    return violations
 
 
 def _read_parsed_source(source_id: str) -> dict[str, Any] | None:
@@ -641,6 +659,7 @@ def get_llm_summary(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     progress_callback: ProgressCallback | None = None,
 ):
@@ -650,6 +669,7 @@ def get_llm_summary(
             paper_id,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             progress_callback=progress_callback,
         ),
@@ -665,6 +685,7 @@ def generate_llm_summary(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     progress_callback: ProgressCallback | None = None,
 ):
@@ -674,6 +695,7 @@ def generate_llm_summary(
             paper_id,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             progress_callback=progress_callback,
         ),
@@ -1148,6 +1170,7 @@ def _get_or_generate_summary_one(
     *,
     provider: str,
     model: str | None,
+    model_tier: str | None,
     refresh: bool,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
@@ -1156,7 +1179,14 @@ def _get_or_generate_summary_one(
         return status
     if status.get("status") != "needs_llm":
         return status
-    return _generate_from_status(paper_id, status, provider=provider, model=model, progress_callback=progress_callback)
+    return _generate_from_status(
+        paper_id,
+        status,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        progress_callback=progress_callback,
+    )
 
 
 def _generate_summary_one(
@@ -1164,6 +1194,7 @@ def _generate_summary_one(
     *,
     provider: str,
     model: str | None,
+    model_tier: str | None,
     refresh: bool,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
@@ -1172,7 +1203,14 @@ def _generate_summary_one(
         return status
     if status.get("status") != "needs_llm":
         return status
-    return _generate_from_status(paper_id, status, provider=provider, model=model, progress_callback=progress_callback)
+    return _generate_from_status(
+        paper_id,
+        status,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        progress_callback=progress_callback,
+    )
 
 
 def _summary_status_or_error(paper_id: str, *, refresh: bool) -> dict[str, Any]:
@@ -1190,13 +1228,15 @@ def _generate_from_status(
     *,
     provider: str,
     model: str | None,
+    model_tier: str | None,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
-    selected = select_summary_provider(provider)
-    if selected.name == "manual":
-        return status
     try:
-        summary = selected.generate_summary(status["llm_task"], model=model, progress_callback=progress_callback)
+        config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
+        selected = select_summary_provider(config.provider)
+        if selected.name == "manual":
+            return status
+        summary = selected.generate_summary(status["llm_task"], model=config.model, progress_callback=progress_callback)
         summary_paper_id = str(status.get("paper_id") or paper_id)
         path = store_summary(summary_paper_id, summary)
     except Exception as exc:

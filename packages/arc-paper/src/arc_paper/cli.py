@@ -48,20 +48,24 @@ def main(argv: list[str] | None = None) -> int:
     llm_summary = _paper_command(sub, "get-llm-summary")
     llm_summary.add_argument("--provider", default="auto")
     llm_summary.add_argument("--model", default=None)
+    llm_summary.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
     llm_summary_prefixed = _paper_command(sub, "llm-summary")
     llm_summary_prefixed.add_argument("--provider", default="auto")
     llm_summary_prefixed.add_argument("--model", default=None)
+    llm_summary_prefixed.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
 
     generate = sub.add_parser("generate-llm-summary")
     generate.add_argument("paper_ids", nargs="+")
     generate.add_argument("--provider", default="auto")
     generate.add_argument("--model", default=None)
+    generate.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
     generate.add_argument("--refresh", action="store_true")
     generate.add_argument("--json", action="store_true")
     llm_generate = sub.add_parser("llm-generate-summary")
     llm_generate.add_argument("paper_ids", nargs="+")
     llm_generate.add_argument("--provider", default="auto")
     llm_generate.add_argument("--model", default=None)
+    llm_generate.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
     llm_generate.add_argument("--refresh", action="store_true")
     llm_generate.add_argument("--json", action="store_true")
 
@@ -174,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("name")
     run.add_argument("--provider", default="auto")
     run.add_argument("--model", default=None)
+    run.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
     run.add_argument("--concurrency", type=int, default=1)
     run.add_argument("--max-items", type=int, default=None)
     run.add_argument("--json", action="store_true")
@@ -305,6 +310,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
                     args.name,
                     provider=args.provider,
                     model=args.model,
+                    model_tier=args.model_tier,
                     concurrency=args.concurrency,
                     max_items=args.max_items,
                     db=db,
@@ -395,12 +401,19 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if command == "get-equation-context":
         return service.get_equation_context(paper_ids, args.query, refresh=args.refresh)
     if command in {"get-llm-summary", "llm-summary"}:
-        return service.get_llm_summary(paper_ids, provider=args.provider, model=args.model, refresh=args.refresh)
+        return service.get_llm_summary(
+            paper_ids,
+            provider=args.provider,
+            model=args.model,
+            model_tier=args.model_tier,
+            refresh=args.refresh,
+        )
     if command in {"generate-llm-summary", "llm-generate-summary"}:
         return service.generate_llm_summary(
             paper_ids,
             provider=args.provider,
             model=args.model,
+            model_tier=args.model_tier,
             refresh=args.refresh,
         )
     raise AssertionError(f"Unhandled command: {command}")

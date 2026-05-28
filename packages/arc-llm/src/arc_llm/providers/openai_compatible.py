@@ -90,9 +90,11 @@ class OpenAICompatibleProvider:
         return factory(api_key=api_key, base_url=self.config.base_url)
 
     def _require_model(self, model: str | None) -> str:
-        resolved = model or self.config.default_model()
+        resolved = model
         if not resolved:
-            raise LLMWorkerError(f"{self.name} requires a model from --model, ARC_LLM_MODEL, or provider config")
+            raise LLMWorkerError(
+                f"{self.name} requires --model or provider config models.<tier>"
+            )
         return resolved
 
     def _parse_with_retries(

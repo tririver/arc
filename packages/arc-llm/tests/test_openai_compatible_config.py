@@ -88,23 +88,24 @@ def test_load_provider_config_supports_file_api_key(tmp_path):
                 "type": "openai-compatible",
                 "base_url": "https://api.deepseek.example/v1",
                 "api_key": "secret-value",
-                "models": {"default": "deepseek-chat", "high": "deepseek-reasoner"},
+                "models": {"medium": "deepseek-chat", "high": "deepseek-reasoner"},
                 "json_mode": "json_schema",
             }
         ],
-        default="deepseek",
     )
 
     config = load_provider_config(env={"ARC_LLM_PROVIDER_CONFIG": path})
 
     assert config.path == path
-    assert config.default == "deepseek"
-    assert config.auto_provider_priority == "host-first"
+    assert not hasattr(config, "default")
+    assert not hasattr(config, "auto_provider_priority")
     assert config.providers[0].id == "deepseek"
     assert config.providers[0].api_key == "secret-value"
 
 
-def test_load_provider_config_supports_configured_first_auto_priority(tmp_path):
+@pytest.mark.parametrize("legacy_field", ["default", "auto_provider_priority"])
+def test_load_provider_config_rejects_legacy_selection_fields(tmp_path, legacy_field):
+    kwargs = {legacy_field: "deepseek" if legacy_field == "default" else "configured-first"}
     path = write_config(
         tmp_path,
         [
@@ -115,29 +116,10 @@ def test_load_provider_config_supports_configured_first_auto_priority(tmp_path):
                 "api_key": "secret-value",
             }
         ],
-        auto_provider_priority="configured-first",
+        **kwargs,
     )
 
-    config = load_provider_config(env={"ARC_LLM_PROVIDER_CONFIG": path})
-
-    assert config.auto_provider_priority == "configured-first"
-
-
-def test_load_provider_config_rejects_unknown_auto_priority(tmp_path):
-    path = write_config(
-        tmp_path,
-        [
-            {
-                "id": "deepseek",
-                "type": "openai-compatible",
-                "base_url": "https://api.deepseek.example/v1",
-                "api_key": "secret-value",
-            }
-        ],
-        auto_provider_priority="deepseek-first",
-    )
-
-    with pytest.raises(ProviderConfigError, match="auto_provider_priority"):
+    with pytest.raises(ProviderConfigError, match="run selection fields"):
         load_provider_config(env={"ARC_LLM_PROVIDER_CONFIG": path})
 
 
@@ -173,7 +155,7 @@ def test_usable_configured_providers_require_file_api_key_unless_optional(tmp_pa
                 "type": "openai-compatible",
                 "base_url": "http://127.0.0.1:11434/v1",
                 "api_key_optional": True,
-                "models": {"default": "llama3.1"},
+                "models": {"medium": "llama3.1"},
                 "json_mode": "json_object",
             },
         ],
@@ -219,7 +201,7 @@ def test_usable_configured_providers_treat_inline_api_key_as_key_present(tmp_pat
     assert [item.id for item in usable_configured_providers(env={"ARC_LLM_PROVIDER_CONFIG": path})] == ["deepseek"]
 
 
-def test_auto_provider_selection_prefers_native_host_before_config_default(tmp_path):
+def test_auto_provider_selection_prefers_native_host_before_configured_provider(tmp_path):
     path = write_config(
         tmp_path,
         [
@@ -236,7 +218,6 @@ def test_auto_provider_selection_prefers_native_host_before_config_default(tmp_p
                 "api_key": "secret-value",
             },
         ],
-        default="deepseek",
     )
 
     selected = select_llm_provider(
@@ -249,7 +230,7 @@ def test_auto_provider_selection_prefers_native_host_before_config_default(tmp_p
     assert selected.signals == ["parent:codex exec"]
 
 
-def test_auto_provider_selection_can_prefer_configured_default_before_host(tmp_path):
+def test_auto_provider_selection_rejects_configured_first_priority(tmp_path):
     path = write_config(
         tmp_path,
         [
@@ -270,17 +251,11 @@ def test_auto_provider_selection_can_prefer_configured_default_before_host(tmp_p
         auto_provider_priority="configured-first",
     )
 
-    selected = select_llm_provider(
-        env={"ARC_LLM_PROVIDER_CONFIG": path},
-        process_chain=["codex exec"],
-    )
-
-    assert selected.provider == "deepseek"
-    assert selected.host.host == "codex"
-    assert any("provider-config" in signal for signal in selected.signals)
+    with pytest.raises(ProviderConfigError, match="run selection fields"):
+        usable_configured_providers(env={"ARC_LLM_PROVIDER_CONFIG": path})
 
 
-def test_auto_provider_selection_uses_file_order_when_default_is_unusable(tmp_path):
+def test_auto_provider_selection_uses_usable_configured_provider_when_no_host(tmp_path):
     path = write_config(
         tmp_path,
         [
@@ -297,7 +272,6 @@ def test_auto_provider_selection_uses_file_order_when_default_is_unusable(tmp_pa
                 "api_key_optional": True,
             },
         ],
-        default="openrouter",
     )
 
     selected = select_llm_provider(env={"ARC_LLM_PROVIDER_CONFIG": path}, process_chain=[])
@@ -373,7 +347,7 @@ def test_explicit_provider_still_wins_over_configured_auto(tmp_path):
     assert selected.signals == ["explicit"]
 
 
-def test_configured_provider_model_resolution_uses_tiers_and_default(tmp_path):
+def test_configured_provider_model_resolution_uses_tiers_only(tmp_path):
     path = write_config(
         tmp_path,
         [
@@ -383,7 +357,6 @@ def test_configured_provider_model_resolution_uses_tiers_and_default(tmp_path):
                 "base_url": "https://api.deepseek.example/v1",
                 "api_key": "secret-value",
                 "models": {
-                    "default": "deepseek-chat",
                     "low": "deepseek-chat",
                     "medium": "deepseek-chat",
                     "high": "deepseek-reasoner",
@@ -398,7 +371,7 @@ def test_configured_provider_model_resolution_uses_tiers_and_default(tmp_path):
     assert resolve_model("deepseek", "explicit", env=env) == "explicit"
 
 
-def test_configured_provider_default_uses_medium_tier_when_available(tmp_path):
+def test_configured_provider_rejects_legacy_default_model(tmp_path):
     path = write_config(
         tmp_path,
         [
@@ -409,6 +382,25 @@ def test_configured_provider_default_uses_medium_tier_when_available(tmp_path):
                 "api_key": "secret-value",
                 "models": {
                     "default": "gpt-5.4-mini",
+                },
+            }
+        ],
+    )
+
+    with pytest.raises(ProviderConfigError, match="models keys"):
+        load_provider_config(env={"ARC_LLM_PROVIDER_CONFIG": path})
+
+
+def test_configured_provider_default_uses_medium_tier_when_available(tmp_path):
+    path = write_config(
+        tmp_path,
+        [
+            {
+                "id": "openaiish",
+                "type": "openai-compatible",
+                "base_url": "https://api.openaiish.example/v1",
+                "api_key": "secret-value",
+                "models": {
                     "low": "gpt-5.3-codex-spark",
                     "medium": "gpt-5.4",
                     "high": "gpt-5.5",

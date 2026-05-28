@@ -70,6 +70,7 @@ class FakeJsonRunner:
         schema: dict[str, Any] | None,
         provider: str,
         model: str | None,
+        model_tier: str | None = None,
         env: dict[str, str],
     ) -> dict[str, Any]:
         context = _context_from_prompt(prompt)
@@ -80,6 +81,7 @@ class FakeJsonRunner:
                 "round_number": context["round_number"],
                 "provider": provider,
                 "model": model,
+                "model_tier": model_tier,
                 "env": dict(env),
             }
         )
@@ -126,6 +128,7 @@ class TargetedArithmeticReviewRunner:
         schema: dict[str, Any] | None,
         provider: str,
         model: str | None,
+        model_tier: str | None = None,
         env: dict[str, str],
     ) -> dict[str, Any]:
         context = _context_from_prompt(prompt)
@@ -469,6 +472,19 @@ def test_worker_envs_are_isolated_and_os_environ_is_not_mutated(tmp_path, monkey
     assert reviewer_call["env"]["ARC_CODEX_ENABLE_MCP"] == "true"
     assert "ARC_CODEX_ALLOW_INTERNET" not in os.environ
     assert "ARC_CODEX_ENABLE_MCP" not in os.environ
+
+
+def test_worker_model_tier_is_passed_as_runner_argument(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["defaults"].pop("model")
+    config["defaults"]["provider"] = "auto"
+    config["defaults"]["model_tier"] = "high"
+    fake = FakeJsonRunner()
+
+    run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    assert {call["model_tier"] for call in fake.calls} == {"high"}
+    assert all("ARC_LLM_MODEL_TIER" not in call["env"] for call in fake.calls)
 
 
 def _context_from_prompt(prompt: str) -> dict[str, Any]:

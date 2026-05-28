@@ -60,13 +60,39 @@ def test_run_json_uses_selected_provider_and_model(tmp_path, monkeypatch):
     result = run_json(
         "prompt",
         schema={"type": "object"},
-        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex", "ARC_CODEX_MODEL": "fast"},
+        model="fast",
+        provider="codex-cli",
+        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"},
         process_chain=[],
     )
 
     assert result["prompt"] == "prompt"
     assert result["schema"] == {"type": "object"}
     assert result["model"] == "fast"
+
+
+def test_auto_provider_rejects_exact_model():
+    with pytest.raises(ValueError, match="Exact model requires explicit provider"):
+        run_json("prompt", provider="auto", model="gpt-5.5", env={}, process_chain=[])
+
+
+def test_resolve_llm_config_rejects_auto_provider_with_exact_model():
+    with pytest.raises(ValueError, match="Exact model requires explicit provider"):
+        resolve_llm_config(provider="auto", model="gpt-5.5", env={}, process_chain=[])
+
+
+def test_env_model_does_not_override_model_tier(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeProvider())
+
+    result = run_json(
+        "prompt",
+        schema={"type": "object"},
+        model_tier="high",
+        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex", "ARC_CODEX_MODEL": "fast"},
+        process_chain=[],
+    )
+
+    assert result["model"] == "gpt-5.5"
 
 
 def test_run_json_uses_model_tier_when_exact_model_is_not_set(tmp_path, monkeypatch):
@@ -131,7 +157,7 @@ def test_run_json_auto_falls_back_to_configured_provider_after_retries(tmp_path,
                         "type": "openai-compatible",
                         "base_url": "https://deepseek.example/v1",
                         "api_key": "secret-value",
-                        "models": {"default": "deepseek-chat"},
+                        "models": {"medium": "deepseek-chat"},
                     }
                 ],
             }
@@ -152,6 +178,40 @@ def test_run_json_auto_falls_back_to_configured_provider_after_retries(tmp_path,
     assert result == {"provider": "deepseek", "model": "deepseek-chat"}
     assert codex.attempts == 3
     assert deepseek.attempts == 1
+
+
+def test_run_json_auto_fallback_uses_provider_specific_tier_models(tmp_path, monkeypatch):
+    provider_config = tmp_path / "llm-providers.json"
+    provider_config.write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.llm.providers.v1",
+                "providers": [
+                    {
+                        "id": "deepseek",
+                        "type": "openai-compatible",
+                        "base_url": "https://deepseek.example/v1",
+                        "api_key": "secret-value",
+                        "models": {"medium": "deepseek-chat", "high": "deepseek-pro"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex = FlakyJsonProvider(name="codex-cli")
+    deepseek = FlakyJsonProvider(name="deepseek", failures_before_success=0, result={"provider": "deepseek"})
+    providers = {"codex-cli": codex, "deepseek": deepseek}
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: providers[provider])
+
+    result = run_json(
+        "prompt",
+        model_tier="high",
+        env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER_CONFIG": str(provider_config)},
+        process_chain=[],
+    )
+
+    assert result == {"provider": "deepseek", "model": "deepseek-pro"}
 
 
 def test_run_json_explicit_provider_retries_without_fallback(tmp_path, monkeypatch):

@@ -166,6 +166,48 @@ equivalent host/MCP wrapper. Do not write the final `calculation-report.md`
 until proposer-reviewer execution has run, unless the report is explicitly a
 blocked or partial-status report that says consensus did not complete.
 
+### Phase 3a: Continue After Human Resolution
+
+If a human expert resolves a note claim, mark that claim `human_resolved`, not
+`verified`. Update `note-check-triage.json` with a `resolution` object:
+
+```json
+{
+  "resolved_by": "user",
+  "resolved_at": "<ISO-8601 timestamp>",
+  "type": "corrected_formula | accepted_formula | premise | instruction",
+  "corrected_latex": "<LaTeX formula when applicable>",
+  "accepted_result": "<plain result when not LaTeX>",
+  "rationale": "<why this resolves the claim>",
+  "use_as_later_premise": true
+}
+```
+
+At least one of `corrected_latex` or `accepted_result` is required. Treat
+`human_resolved` as accepted prior context for later steps only when
+`use_as_later_premise` is true.
+
+To continue, create a new consensus continuation config that starts from the
+next unresolved or blocked step. Add each applicable human-resolved item to
+`allowed_context.accepted_prior_results_from_previous_consensus_run`:
+
+```json
+{
+  "step_id": "check_eq_00042",
+  "status": "human_resolved",
+  "accepted_result": "<resolved result>",
+  "source": "human_expert_resolution"
+}
+```
+
+Do not put human-resolved formulas into `reviewer_reference_claim` for later
+blind checks unless they are the later claim's source target. Proposers may use
+human-resolved prior context, but still must not see later target formulas.
+
+Promote a human-resolved item into `foundation/latest.json` only when the human
+explicitly resolves it as a definition, convention, axiom, or broadly needed
+premise. Otherwise keep it as accepted prior output.
+
 ## Phase 4: Validate
 
 Step 1: Before writing the final report, run:
@@ -200,6 +242,7 @@ inferred. For each note item, report one status:
 ```text
 foundation
 verified
+human_resolved
 reference_disagrees
 unresolved
 context_only

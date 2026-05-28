@@ -7,12 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .providers.config import (
-    AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST,
-    ProviderConfigError,
-    load_provider_config,
-    select_default_configured_provider,
-)
+from .providers.config import ProviderConfigError, load_provider_config, select_configured_provider
 
 
 @dataclass(frozen=True)
@@ -63,21 +58,11 @@ def select_llm_provider(
     host = detect_host(env=env, process_chain=process_chain)
     if explicit_provider:
         return ProviderSelection(provider=explicit_provider, host=host, signals=["explicit"])
-    if provider := env.get("ARC_LLM_PROVIDER"):
-        return ProviderSelection(provider=provider, host=host, signals=[f"env:ARC_LLM_PROVIDER={provider}"])
     try:
         config = load_provider_config(env=env)
-        if config.auto_provider_priority == AUTO_PROVIDER_PRIORITY_CONFIGURED_FIRST:
-            configured = select_default_configured_provider(env=env)
-            if configured:
-                return ProviderSelection(
-                    provider=configured.id,
-                    host=host,
-                    signals=[f"provider-config:{config.path}:{configured.id}"],
-                )
         if native := _host_native_provider(host):
             return ProviderSelection(provider=native, host=host, signals=host.signals)
-        configured = select_default_configured_provider(env=env)
+        configured = select_configured_provider(env=env)
         if configured:
             return ProviderSelection(
                 provider=configured.id,

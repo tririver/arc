@@ -490,17 +490,18 @@ def estimate_eta(status: Mapping[str, Any]) -> dict[str, Any]:
 def stats_key(job_type: str, payload: Mapping[str, Any]) -> str:
     provider = str(payload.get("provider") or "")
     model = str(payload.get("model") or "")
+    model_tier = str(payload.get("model_tier") or "")
     if job_type == "paper_summary":
         paper_ids = payload.get("paper_ids")
         count = len(paper_ids) if isinstance(paper_ids, list) else 1
-        return f"paper_summary:papers={_bucket(count)}:provider={provider}:model={model}"
+        return f"paper_summary:papers={_bucket(count)}:provider={provider}:model={model}:tier={model_tier}"
     if job_type == "domain_build":
         workers = payload.get("workers")
         return f"domain_build:workers={workers}:provider={provider}:model={model}"
     if job_type == "summary_batch_run":
         max_items = payload.get("max_items")
         count = int(max_items) if isinstance(max_items, int) and max_items > 0 else 0
-        return f"summary_batch_run:items={_bucket(count)}:provider={provider}:model={model}"
+        return f"summary_batch_run:items={_bucket(count)}:provider={provider}:model={model}:tier={model_tier}"
     return f"{job_type}:provider={provider}:model={model}"
 
 
