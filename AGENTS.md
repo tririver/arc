@@ -16,20 +16,17 @@ relevant workflow file directly and call the package CLI or MCP tools it names.
 - `skills/arc/workflows/ideas.md`: Use this workflow to run concurrent
   proposer-reviewer idea loops, rank completed ideas, and choose a calculation
   candidate.
-- `skills/arc/workflows/foundation.md`: Use this workflow after
-  `initial-plan.md` to create versioned foundation JSON and Markdown from
-  accepted definitions, conventions, axioms, and source-tracked starting
-  equations.
 - `skills/arc/workflows/plan.md`: Use this workflow when a task to be planned
   is available to gather evidence and write a source-aware, reviewable
-  calculation plan.
+  `<project-dir>/work-note.md` with foundations, accepted premises, ready
+  calculation steps, rough later steps, and archived work-note versions.
 - `skills/arc/workflows/calculate.md`: Use this workflow after
-  `initial-foundation.md` to check non-axiom foundation items, run blind
-  reference checks, execute consensus calculation steps, and write the
-  calculation report.
+  `plan.md` creates `<project-dir>/work-note.md` to check work-note premises,
+  run blind reference checks, execute ready consensus calculation steps, and
+  update calculation status in the work note.
 - `skills/arc/workflows/check.md`: Use this workflow when the user asks to
-  check Markdown or PDF research notes by separating foundation from claims and
-  verifying claims through the plan/foundation/calculate flow.
+  check Markdown or PDF research notes by preparing a planning handoff for
+  `plan.md` and reusing `calculate.md` for claim verification.
 - `packages/arc-domain`: Owns research-domain construction from seed papers,
   including foundation/domain-paper selection, graph artifacts, evidence packs,
   HTML rendering, domain summaries, and paper JSON pack exports.
@@ -168,7 +165,9 @@ relevant workflow file directly and call the package CLI or MCP tools it names.
   cross-package integration behavior.
 - Put generated ARC workflow/test-run project artifacts under `arc-tests/`; do
   not create ad hoc run directories at repository root or inside package
-  directories.
+  directories. Workflow runs that exercise planning should write
+  `<project-dir>/work-note.md` and archived work-note versions under the run
+  directory instead of separate foundation artifacts.
 
 ## Language Policy
 
