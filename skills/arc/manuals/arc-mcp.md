@@ -83,8 +83,8 @@ Step 2: Capture the returned `job_id`.
 Examples:
 
 ```text
-md2pdf(input="<project-dir>/calculation-report.md")
-translate(input="<project-dir>/calculation-report.md")
+md2pdf(input="<project-dir>/work-note.md")
+translate(input="<project-dir>/work-note.md")
 batch_translate(project_dir="<project-dir>")
 llm_infer_main_references(text="<user-intent>", background=true)
 llm_generate_summary(paper_id="<seed-paper>", provider="auto", background=true)

@@ -466,34 +466,32 @@ invent novelty claims or hide failed idea history.
 Input: one task to be planned, such as an explicit calculation idea or a
 source-extracted request.
 
-The calculation workflow starts with three phases, then may loop back from
+The calculation workflow starts with two phases, then may loop back from
 `calculate` to `plan` when a deferred macro block or blocked step needs
 expansion:
 
-1. `plan`: gather evidence, separate first principles from derived
-   claims, and write a rolling plan with current detailed steps plus deferred
-   macro blocks.
-2. `foundation`: build versioned foundation JSON with conventions,
-   equations, confidence labels, and source locations.
-3. `calculate`: check non-axiom foundation equations and execute current
-   detailed steps through proposers-reviewer consensus.
+1. `plan`: gather evidence, write or update `work-note.md`, promote accepted
+   premises, define ready-step boundaries, and maintain rough later steps.
+2. `calculate`: record current-step result/status, write planning requests
+   when plan or foundation material must change, and execute current detailed
+   steps through proposers-reviewer consensus.
 
 Primary outputs:
 
 ```text
-<project-dir>/calculate/<run-id>/task-to-be-planned.json
-<project-dir>/calculate/<run-id>/plan.json
-<project-dir>/calculate/<run-id>/initial-plan.md
-<project-dir>/calculate/<run-id>/latest-plan.md
-<project-dir>/initial-plan.md
-<project-dir>/latest-plan.md
-<project-dir>/calculate/<run-id>/foundation/latest.json
-<project-dir>/calculate/<run-id>/foundation/initial-foundation.md
-<project-dir>/initial-foundation.md
+<project-dir>/work-note.md
+<project-dir>/calculate/<run-id>/work-notes/work-note-v001.md
+<project-dir>/calculate/<run-id>/work-notes/work-note-v002.md
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
-<project-dir>/calculate/<run-id>/calculation-report.md
-<project-dir>/calculation-report.md
+<project-dir>/calculate/<run-id>/execute/<consensus-run-id>/
 ```
+
+`work-note.md` is the human and agent source of truth. It contains notation,
+axioms, accepted derived results, ready detailed steps, rough later steps,
+calculation status, open questions, revision history, journal, and source audit
+trail. Main text explains physics and equation logic; journal records execution
+events and human resolutions. Runtime JSON is generated only to drive CLI
+execution.
 
 The workflow is deliberately conservative: it requires source evidence,
 explicit quantity contracts, independent agreement checks, and recorded
