@@ -228,7 +228,7 @@ When using the ARC skill, ask the agent in research terms. Examples:
 Use ARC to summarize arXiv:0911.3380.
 Use ARC to build a domain for arXiv:0911.3380 focused on quasi-single-field inflation observables.
 Use ARC to develop ideas about cosmological collider scalar exchange.
-Use ARC to plan and execute the selected calculation idea.
+Use ARC to plan and execute the task to be planned.
 ```
 
 ARC workflows use two automation modes:
@@ -448,7 +448,7 @@ Input: a not-yet-explicit research request plus built domain context.
 
 The normal workflow feeds ARC-built domain Markdown to proposers. The no-info
 workflow intentionally withholds ARC domain context for comparison. Both use
-reviewer marks and write a ranked selected-ideas report:
+reviewer marks and write a ranked task-to-be-planned candidate report:
 
 ```text
 <project-dir>/ideas/<run-id>/
@@ -456,14 +456,15 @@ reviewer marks and write a ranked selected-ideas report:
 <project-dir>/ranked-ideas.md
 ```
 
-The report starts with a compact marked summary for each selected idea, then
+The report starts with a compact marked summary for each candidate, then
 appends one detail section per idea with all round-by-round referee marks and
 selected handoff text: title, idea summary, and calculation plan. It should not
 invent novelty claims or hide failed idea history.
 
 ### 3. Plan And Execute A Calculation
 
-Input: one explicit calculation idea.
+Input: one task to be planned, such as an explicit calculation idea or a
+source-extracted request.
 
 The calculation workflow has three phases:
 

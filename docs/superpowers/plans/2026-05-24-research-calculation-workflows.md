@@ -137,7 +137,7 @@ Delete `skills/arc/references/research-workflows/calculate.md` and remove packag
 - [ ] **Step 3: Write `research-plan.md`**
 
 It must instruct agents to:
-- read `context.json`, selected idea artifacts, domain Markdown/JSON, and domain summaries;
+- read `context.json`, task-to-be-planned artifacts, domain Markdown/JSON, and domain summaries;
 - use ARC MCP/CLI first: `get_metadata`, `get_references`, `get_citers`, `get_citer_count`, `get_toc`, `get_section`, `search_full_text`, `get_equation_context`, `domain_get_summary`, and `domain_get_graph`;
 - use internet search after ARC checks for uncached or recent literature;
 - identify reliable first principles separately from paper-specific derived results;

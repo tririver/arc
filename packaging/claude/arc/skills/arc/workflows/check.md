@@ -62,7 +62,7 @@ before continuing.
 
 ## Phase 3: Reuse Calculation Workflows
 
-Step 1: Treat the note check as an explicit calculation idea: verify the note
+Step 1: Treat the note check as a task to be planned: verify the note
 claims from the accepted foundation, with no new conjecture unless required to
 check a claim.
 

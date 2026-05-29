@@ -1,6 +1,6 @@
 # Plan Workflow
 
-Use this workflow after the user has selected one explicit calculation idea.
+Use this workflow when a task to be planned is available.
 The output is a careful, reviewable plan. Do not start deriving equations here.
 
 Write artifacts under:
@@ -17,11 +17,11 @@ Write artifacts under:
 
 ## Inputs
 
-Read `<project-dir>/context.json`, the selected idea artifact, domain
-Markdown/JSON, domain summaries, and available domain graph files. The selected
-idea artifact may be a user-written idea, generated idea, or source-extracted
-request artifact with source items, preflight findings, and locations. Keep the
-user's exact scientific intent visible in the plan.
+Read `<project-dir>/context.json`, the task-to-be-planned artifact, domain
+Markdown/JSON, domain summaries, and available domain graph files. The
+task-to-be-planned artifact may be a user-written task, generated idea, or
+source-extracted request artifact with source items, preflight findings, and
+locations. Keep the user's exact scientific intent visible in the plan.
 
 ## Phase 1: Gather Evidence
 
@@ -77,7 +77,7 @@ Step 3: Mark validation-only results separately. These are results useful for
 cross-checks, limits, benchmark cases, or sanity tests, but not allowed as
 inputs to the new derivation.
 
-Step 4: When the selected idea artifact contains source-extracted items, split
+Step 4: When the task-to-be-planned artifact contains source-extracted items, split
 those items into `foundation`, `claims_to_check`, and `context_only`. If an
 item could be either foundation or a derived claim, put it in
 `claims_to_check`. Do not accept a source-derived equation as foundation merely

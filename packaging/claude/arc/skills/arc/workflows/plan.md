@@ -1,6 +1,6 @@
 # Plan Workflow
 
-Use this workflow after the user has selected one explicit calculation idea.
+Use this workflow when a task to be planned is available.
 The output is a careful, reviewable plan. Do not start deriving equations here.
 
 Write artifacts under:
@@ -15,7 +15,7 @@ Write artifacts under:
 
 ## Inputs
 
-Read `<project-dir>/context.json`, the selected idea artifact, domain
+Read `<project-dir>/context.json`, the task-to-be-planned artifact, domain
 Markdown/JSON, domain summaries, and available domain graph files. Keep the
 user's exact scientific intent visible in the plan.
 

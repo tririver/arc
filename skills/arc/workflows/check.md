@@ -94,7 +94,7 @@ mode, do not pause; continue to Phase 3 after recording the findings.
 
 ## Phase 3: Prepare Source-Extracted Request
 
-Step 1: Write a short selected-idea artifact:
+Step 1: Write a short task-to-be-planned artifact:
 
 ```text
 <project-dir>/calculate/<run-id>/note-check-triage.json
@@ -119,7 +119,7 @@ before continuing.
 
 ## Phase 4: Reuse Calculation Workflows
 
-Step 1: Treat `note-check-triage.json` as the selected idea artifact and run
+Step 1: Treat `note-check-triage.json` as the task-to-be-planned artifact and run
 `plan.md`. `plan.md` owns the foundation boundary, claim/step granularity,
 blind-reference planning, and proposer-visible secrecy rules.
 

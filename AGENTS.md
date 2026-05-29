@@ -20,9 +20,9 @@ relevant workflow file directly and call the package CLI or MCP tools it names.
   `initial-plan.md` to create versioned foundation JSON and Markdown from
   accepted definitions, conventions, axioms, and source-tracked starting
   equations.
-- `skills/arc/workflows/plan.md`: Use this workflow after a user selects a
-  concrete calculation idea to gather evidence and write a source-aware,
-  reviewable calculation plan.
+- `skills/arc/workflows/plan.md`: Use this workflow when a task to be planned
+  is available to gather evidence and write a source-aware, reviewable
+  calculation plan.
 - `skills/arc/workflows/calculate.md`: Use this workflow after
   `initial-foundation.md` to check non-axiom foundation items, run blind
   reference checks, execute consensus calculation steps, and write the

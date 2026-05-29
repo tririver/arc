@@ -20,7 +20,7 @@ from ideas_marking import normalized_marks, rank_key_from_marks, report_columns 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Select each loop's highest-marked round and rank the selected ideas."
+        description="Select each loop's highest-marked round and rank task-to-be-planned candidates."
     )
     parser.add_argument("run_root", type=Path, help="ideas run artifact root")
     parser.add_argument("--format", choices=["json", "markdown"], default="markdown")
