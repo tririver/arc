@@ -214,3 +214,19 @@ arc-paper doctor cache <seed-paper> --json
 arc-paper doctor host --json
 arc-paper doctor provider --json
 ```
+
+List or remove cached paper entries:
+
+```bash
+arc-paper cache list --json
+arc-paper cache list --id 0911.3380 --json
+arc-paper cache list --since 1h --json
+arc-paper cache list --past-day --json
+arc-paper cache remove --id 0911.3380 --dry-run --json
+arc-paper cache remove --since 1h --json
+arc-paper cache remove --since 1h --yes --json
+```
+
+`cache remove` prints selected papers and asks for `y` confirmation unless
+`--yes` or `--dry-run` is used. Use `--all` to remove all cached paper entries
+explicitly.

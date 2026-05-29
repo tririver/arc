@@ -95,19 +95,19 @@ First complete Case 1. Then read and execute
 `workflows/ideas.md`.
 
 Case 3: Check note files or collaborator notes.
-Use when the request asks to check, verify, audit, or mark foundation items in
-one or more accessible `.md` or `.pdf` notes. Read and execute
+Use when the request asks to check, verify, audit, or mark work-note premises
+and claims in one or more accessible `.md` or `.pdf` notes. Read and execute
 `workflows/check.md`.
 
 Case 4: Calculate from an explicit idea.
 If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
 the user to select one concrete idea.
 If the idea is explicit enough:
-Step 1: Read and execute `workflows/plan.md`.
-Step 2: Read and execute `workflows/foundation.md`.
-Step 3: Read and execute `workflows/calculate.md`. If `calculate.md` writes a
-new `task-to-be-planned.json` for macro expansion or blocked-step refinement,
-return to Step 1 for that requested region.
+Step 1: Read and execute `workflows/plan.md`. It writes or updates
+`<project-dir>/work-note.md` and an immutable version under
+`<project-dir>/calculate/<run-id>/work-notes/`.
+Step 2: Read and execute `workflows/calculate.md`. If `calculate.md` requests
+macro expansion or blocked-step refinement, return to Step 1 for that region.
 
 ### Phase 3: Self-Reflection
 
