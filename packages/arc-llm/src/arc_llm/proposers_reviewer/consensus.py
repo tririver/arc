@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 import re
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -59,8 +58,8 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
 
     run_id = _safe_id(_required_text(data, "run_id"), "run_id")
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
-    proposer_count = _positive_int(data.get("proposer_count", 3), "proposer_count")
-    max_recalculations = _nonnegative_int(data.get("max_recalculations", 3), "max_recalculations")
+    proposer_count = _positive_int(data.get("proposer_count", 2), "proposer_count")
+    max_recalculations = _nonnegative_int(data.get("max_recalculations", 2), "max_recalculations")
     human_gate = _parse_human_gate(data.get("human_gate", {}))
     defaults = _dict(data.get("defaults", {}), "defaults")
     if defaults.get("model") is not None and str(defaults.get("provider", "auto") or "auto") == "auto":
@@ -238,7 +237,6 @@ def _run_consensus_step(
                 selectable_proposer_ids=list(
                     dict.fromkeys([*active_proposer_ids, *[proposer_id for proposer_id in locked_outputs]])
                 ),
-                proposer_outputs=proposer_outputs,
                 reviewer_reference_claim=step.reviewer_reference_claim,
             )
         except Exception as exc:
@@ -527,16 +525,16 @@ def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[st
                 "JSON fields; avoid ASCII-only math such as rho_2, eta_prime, or T_ab when a "
                 "LaTeX form such as \\rho_2, \\eta', or T_{ab} is intended for the report. "
                 "Return one JSON object with result_summary, derivation, assumptions, "
-                "validity_scope, final_result, and plan_foundation_assessment. "
-                "In plan_foundation_assessment, state whether the supplied foundation or "
-                "plan must change before this step can be checked; include needs_revision "
+                "validity_scope, final_result, and work_note_assessment. "
+                "In work_note_assessment, state whether the supplied work note, foundation, "
+                "or plan must change before this step can be checked; include needs_revision "
                 "(boolean), issue_type, proposed_revision, rationale, and "
                 "can_continue_without_revision. Use issue_type=none when no revision is "
                 "needed. Use validity_scope for assumptions, "
                 "conventions, limits, and unresolved dependencies; do not use date-like "
                 "reliability fields. Put the final mathematical result in final_result using "
-                "explicit symbols so a reviewer can compare it with other proposers by "
-                "evaluating A-B, B-C, and A-C. Do not coordinate with other proposers.\n\n"
+                "explicit symbols so a reviewer can compare it with other proposers. "
+                "Do not coordinate with other proposers.\n\n"
                 "{caller_context_json}"
             ),
         },
@@ -554,7 +552,7 @@ def _proposer_output_schema() -> dict[str, Any]:
             "assumptions",
             "validity_scope",
             "final_result",
-            "plan_foundation_assessment",
+            "work_note_assessment",
         ],
         "properties": {
             "result_summary": {"type": "string"},
@@ -562,7 +560,7 @@ def _proposer_output_schema() -> dict[str, Any]:
             "assumptions": {"type": ["string", "array", "object"]},
             "validity_scope": {"type": "string"},
             "final_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
-            "plan_foundation_assessment": {
+            "work_note_assessment": {
                 "type": "object",
                 "required": [
                     "needs_revision",
@@ -576,8 +574,8 @@ def _proposer_output_schema() -> dict[str, Any]:
                     "issue_type": {
                         "enum": [
                             "none",
-                            "foundation_inadequate",
-                            "foundation_conflict",
+                            "work_note_inadequate",
+                            "work_note_conflict",
                             "plan_wrong",
                             "step_too_coarse",
                             "target_ambiguous",
@@ -639,6 +637,9 @@ def _reviewer_config(
         active_proposer_ids=active_proposer_ids,
     )
     workflow_instruction = _reviewer_workflow_instruction(human_gate or {})
+    reviewer_status_instruction = _reviewer_status_instruction(
+        allow_reference_disagrees=bool(reviewer_reference_claim)
+    )
     return {
         "id": "reviewer_001",
         "prompt": {
@@ -648,18 +649,18 @@ def _reviewer_config(
                 "Compare current_proposer_outputs_json for the current calculation step. "
                 "Treat caller_context.accepted_prior_step_outputs as accepted context from "
                 "earlier steps, not as current proposer outputs. "
-                "Do not modify original equations. For analytic checks, first use expand, "
-                "then simplify, then substitutions from checked equations in "
-                "caller_context.foundation_context. Document the substitution/check history "
-                "in pairwise_symbolic_checks.check_history. "
+                "Acceptance is physics and mathematics judgment. SymPy, Wolfram, explicit "
+                "algebra, or numerical checks are optional tools when useful, not mandatory "
+                "gates. Special limits are sanity checks, not proof, unless the target itself "
+                "is limiting, asymptotic, or leading-order. "
                 "Return exactly one arc.llm.review_envelope.v1 JSON object. The top-level object "
                 "must contain schema_version, controller, proposer_messages, and review_payload. "
                 f"proposer_messages must contain these keys: {', '.join(active_proposer_ids)}. "
                 "In review_payload.consensus, "
-                "set status to all_agree, two_agree, all_disagree, or unresolved. Include "
+                f"{reviewer_status_instruction} Include "
                 "accepted_result, agreed_proposer_ids, likely_wrong_proposer_ids, "
                 "recalculate_proposer_ids, validity_scope, analysis, and "
-                "pairwise_symbolic_checks. Also include best_written_proposer_id and "
+                "agreement_assessment. Also include best_written_proposer_id and "
                 "best_written_selection_reason. When status is all_agree, choose "
                 "best_written_proposer_id from agreed_proposer_ids or accepted "
                 "caller_context.locked_outputs by clearest logic, most complete "
@@ -669,20 +670,11 @@ def _reviewer_config(
                 "the same clarity rule for report evidence if the step is later accepted. "
                 "If the status is neither all_agree nor reference_disagrees, set "
                 "best_written_proposer_id to null and explain why. "
-                "Let A, B, and C be the final mathematical results "
-                "from proposer_001, proposer_002, and proposer_003 when those proposer ids "
-                "are active. Use SymPy whenever available to simplify A-B, B-C, and A-C. "
-                "If used_sympy=true, pairwise_symbolic_checks.sympy_code must include "
-                "the actual code for A-B, B-C, and A-C using expand first and then "
-                "simplify, for example simplify(expand(A-B)). "
-                "Before marking all_agree, at least two of A-B=0, B-C=0, and A-C=0 must "
-                "be true. Never mark all_agree by visual inspection or because the results "
-                "seem to agree. If SymPy is unavailable, perform explicit algebraic checks "
-                "and set used_sympy=false with the reason in pairwise_symbolic_checks.notes. "
-                "Manual all_agree must show explicit A-B, B-C, and A-C algebraic "
-                "differences reducing to zero; never accept by string equality, spacing, "
-                "formatting, or visual comparison. If you cannot write those explicit "
-                "differences, use the numerical fallback instead. "
+                "Before marking all_agree, agreement_assessment must show target quantity, "
+                "conventions, declared scope, and full target coverage all match, with a "
+                "nonempty comparison_summary and accepted_by_reviewer_judgment=true. "
+                "Never mark all_agree by string equality, spacing, formatting, visual "
+                "similarity, or because outputs merely look identical. "
                 "For coordinate transformations or relabeling, first apply the "
                 "source-declared old/new variable definitions from caller_context "
                 "and the step prompt, then compare metric components or scalar "
@@ -690,14 +682,10 @@ def _reviewer_config(
                 "differences until the declared substitution has been checked. "
                 "For reference claims written as proportionalities, approximations, "
                 "or implicit relations, convert C into a testable relation such as "
-                "a constant quotient, residual, or stated limiting condition, then "
-                "document A-C and B-C relation checks. "
-                "If an analytic check cannot be done, perform numerical checks on at least "
-                "10 randomly selected data points and report check_method=numerical, "
-                "sample_count, numerical_relative_error as a relative error, and the sampled check history. "
+                "a constant quotient, residual, or stated limiting condition when useful. "
                 "If exactly one proposer is likely wrong, name only that proposer for "
                 "recalculation; otherwise ask all proposers to recalculate. "
-                "Also inspect each proposer's plan_foundation_assessment. In "
+                "Also inspect each proposer's work_note_assessment. In "
                 "workflow_action, choose continue for all_agree. For any failure to "
                 "agree, target/source ambiguity, worker failure, or suspected bad "
                 "premise, choose pause_for_human unless the proposers and your review "
@@ -732,16 +720,25 @@ def _reviewer_reference_instruction(
     second = active_proposer_ids[1] if len(active_proposer_ids) >= 2 else "proposer_002"
     return (
         "Reviewer-only blind reference check is active. Do not reveal the reference claim "
-        "to proposers through proposer_messages. Treat A as the final result from "
-        f"{first}, B as the final result from {second}, and C as reviewer_reference_claim. "
-        "For A=B=C, set status=all_agree. For A=B but A-C and B-C are nonzero, "
+        "to proposers through proposer_messages. Compare the final result from "
+        f"{first}, the final result from {second}, and reviewer_reference_claim. "
+        "When blind proposers and the reference agree, set status=all_agree. When blind "
+        "proposers agree with each other but disagree with the reference claim, "
         "set status=reference_disagrees, set agreed_proposer_ids to the agreeing proposer ids, "
         "put the blind proposer result in accepted_result with reference_claim_status='disagrees', "
         "and set workflow_action according to the workflow instruction below. "
-        "If A and B disagree, do not accept the reference claim merely because one proposer matches it; "
+        "If blind proposers disagree, do not accept the reference claim merely because one proposer matches it; "
         "set status=unresolved or all_disagree and request recalculation.\n\n"
         f"reviewer_reference_claim:\n{claim_json}"
     )
+
+
+def _reviewer_status_instruction(*, allow_reference_disagrees: bool) -> str:
+    statuses = ["all_agree", "two_agree", "all_disagree", "unresolved"]
+    if allow_reference_disagrees:
+        statuses.append("reference_disagrees")
+    status_text = ", ".join(statuses[:-1]) + f", or {statuses[-1]}"
+    return f"set status to {status_text}."
 
 
 def _reviewer_workflow_instruction(human_gate: Mapping[str, Any]) -> str:
@@ -818,7 +815,7 @@ def _reviewer_output_schema(
                             "recalculate_proposer_ids",
                             "validity_scope",
                             "analysis",
-                            "pairwise_symbolic_checks",
+                            "agreement_assessment",
                             "best_written_proposer_id",
                             "best_written_selection_reason",
                             "workflow_action",
@@ -850,38 +847,37 @@ def _reviewer_output_schema(
                             },
                             "best_written_selection_reason": {"type": "string"},
                             "workflow_action": _workflow_action_schema(),
-                            "pairwise_symbolic_checks": {
+                            "agreement_assessment": {
                                 "type": "object",
                                 "required": [
-                                    "used_sympy",
-                                    "A_minus_B_zero",
-                                    "B_minus_C_zero",
-                                    "A_minus_C_zero",
-                                    "true_count",
-                                    "notes",
-                                    "check_method",
-                                    "check_history",
+                                    "target_quantity_match",
+                                    "convention_match",
+                                    "declared_scope_match",
+                                    "agreement_covers_full_target",
+                                    "comparison_summary",
+                                    "accepted_by_reviewer_judgment",
                                 ],
                                 "properties": {
-                                    "used_sympy": {"type": "boolean"},
-                                    "A_minus_B_zero": {"type": "boolean"},
-                                    "B_minus_C_zero": {"type": "boolean"},
-                                    "A_minus_C_zero": {"type": "boolean"},
-                                    "true_count": {"type": "integer", "minimum": 0, "maximum": 3},
-                                    "sympy_code": {"type": "string"},
-                                    "notes": {"type": "string"},
-                                    "check_method": {
-                                        "enum": ["analytic", "numerical", "mixed"]
-                                    },
-                                    "sample_count": {"type": "integer", "minimum": 0},
-                                    "numerical_relative_error": {
-                                        "type": ["number", "null"],
-                                        "minimum": 0
-                                    },
-                                    "check_history": {
+                                    "target_quantity_match": {"type": "boolean"},
+                                    "convention_match": {"type": "boolean"},
+                                    "declared_scope_match": {"type": "boolean"},
+                                    "agreement_covers_full_target": {"type": "boolean"},
+                                    "comparison_summary": {"type": "string", "minLength": 1},
+                                    "accepted_by_reviewer_judgment": {"type": "boolean"},
+                                    "tool_checks": {
                                         "type": "array",
-                                        "items": {"type": "string"},
+                                        "items": {
+                                            "type": ["object", "string", "number", "boolean", "null"]
+                                        },
                                     },
+                                    "sanity_checks": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": ["object", "string", "number", "boolean", "null"]
+                                        },
+                                    },
+                                    "special_limit_only": {"type": "boolean"},
+                                    "notes": {"type": "string"},
                                 },
                                 "additionalProperties": True,
                             },
@@ -960,7 +956,6 @@ def _review_consensus(
     *,
     active_proposer_ids: list[str],
     selectable_proposer_ids: list[str] | None = None,
-    proposer_outputs: Mapping[str, Any] | None = None,
     reviewer_reference_claim: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if selectable_proposer_ids is None:
@@ -990,33 +985,14 @@ def _review_consensus(
             active_proposer_ids=active_proposer_ids,
             selectable_proposer_ids=selectable_proposer_ids,
         )
-    if status == "all_agree" and (len(active_proposer_ids) >= 3 or reviewer_reference_claim):
-        try:
-            _validate_all_agree_pairwise_checks(consensus)
-        except ValueError as exc:
-            if reviewer_reference_claim or len(active_proposer_ids) < 3:
-                raise
-            fallback_checks = _main_agent_sympy_agreement_check(
-                proposer_outputs or {},
-                active_proposer_ids=active_proposer_ids,
-                validation_error=str(exc),
-            )
-            if fallback_checks is None:
-                raise
-            consensus = dict(consensus)
-            consensus["pairwise_symbolic_checks"] = fallback_checks
-            consensus["main_agent_agreement_check"] = {
-                "status": "accepted_by_sympy_fallback",
-                "reason": str(exc),
-            }
-            _validate_all_agree_pairwise_checks(consensus)
+        _validate_all_agree_agreement_assessment(consensus)
     if status == "reference_disagrees":
         _validate_best_written_selection(
             consensus,
             active_proposer_ids=active_proposer_ids,
             selectable_proposer_ids=selectable_proposer_ids,
         )
-        _validate_reference_disagrees_pairwise_checks(
+        _validate_reference_disagrees_agreement_assessment(
             consensus,
             active_proposer_ids=active_proposer_ids,
         )
@@ -1042,293 +1018,73 @@ def _validate_best_written_selection(
         raise ValueError("best_written_selection_reason is required for all_agree consensus")
 
 
-def _main_agent_sympy_agreement_check(
-    proposer_outputs: Mapping[str, Any],
-    *,
-    active_proposer_ids: list[str],
-    validation_error: str,
-) -> dict[str, Any] | None:
-    try:
-        from sympy import Symbol, expand, simplify, sympify
-    except Exception:
-        return None
-
-    parsed_by_id: dict[str, dict[str, Any]] = {}
-    for proposer_id in active_proposer_ids[:3]:
-        payload = proposer_outputs.get(proposer_id)
-        if not isinstance(payload, dict):
-            return None
-        parsed = _extract_named_final_expressions(payload.get("final_result"))
-        if not parsed:
-            return None
-        parsed_by_id[proposer_id] = parsed
-
-    common_names = set.intersection(*(set(parsed) for parsed in parsed_by_id.values()))
-    if not common_names:
-        return None
-
-    pair_ids = [
-        ("A_minus_B_zero", active_proposer_ids[0], active_proposer_ids[1], "A-B"),
-        ("B_minus_C_zero", active_proposer_ids[1], active_proposer_ids[2], "B-C"),
-        ("A_minus_C_zero", active_proposer_ids[0], active_proposer_ids[2], "A-C"),
-    ]
-    pair_results: dict[str, bool] = {}
-    history: list[str] = [
-        f"Main-agent SymPy fallback used after reviewer validation failed: {validation_error}",
-        f"Parsed common named final_result expressions: {', '.join(sorted(common_names))}.",
-    ]
-    code_lines = ["from sympy import Symbol, expand, simplify, sympify"]
-
-    for result_key, left_id, right_id, label in pair_ids:
-        pair_zero = True
-        for expression_name in sorted(common_names):
-            locals_map: dict[str, Any] = {}
-            left_expr = _sympify_named_expression(
-                str(parsed_by_id[left_id][expression_name]),
-                Symbol=Symbol,
-                sympify=sympify,
-                locals_map=locals_map,
-            )
-            right_expr = _sympify_named_expression(
-                str(parsed_by_id[right_id][expression_name]),
-                Symbol=Symbol,
-                sympify=sympify,
-                locals_map=locals_map,
-            )
-            if left_expr is None or right_expr is None:
-                return None
-            difference = simplify(expand(left_expr - right_expr))
-            is_zero = bool(difference == 0)
-            pair_zero = pair_zero and is_zero
-            history.append(f"{label} for {expression_name}: simplify(expand(left-right)) -> {difference}.")
-            code_lines.append(
-                f"# {label} for {expression_name}: simplify(expand(({parsed_by_id[left_id][expression_name]}) - ({parsed_by_id[right_id][expression_name]})))"
-            )
-        pair_results[result_key] = pair_zero
-
-    true_count = sum(1 for value in pair_results.values() if value)
-    if true_count < 2:
-        return None
-    return {
-        "used_sympy": True,
-        "A_minus_B_zero": pair_results["A_minus_B_zero"],
-        "B_minus_C_zero": pair_results["B_minus_C_zero"],
-        "A_minus_C_zero": pair_results["A_minus_C_zero"],
-        "true_count": true_count,
-        "sympy_code": "\n".join(code_lines),
-        "notes": "Main agent fallback proved proposer agreement with SymPy after reviewer evidence was below standard.",
-        "check_method": "analytic",
-        "sample_count": 0,
-        "numerical_relative_error": None,
-        "check_history": history,
-        "fallback_source": "main_agent_sympy",
-    }
-
-
-def _extract_named_final_expressions(final_result: Any) -> dict[str, str]:
-    if isinstance(final_result, dict):
-        return {
-            str(key): str(value).strip()
-            for key, value in final_result.items()
-            if isinstance(value, str) and _looks_like_expression(value)
-        }
-    if not isinstance(final_result, str):
-        return {}
-    expressions: dict[str, str] = {}
-    for raw_line in final_result.splitlines():
-        line = raw_line.strip()
-        if "=" not in line:
-            continue
-        left, right = line.split("=", 1)
-        name_match = re.search(r"([A-Za-z][A-Za-z0-9_]*)\s*$", left.strip())
-        if not name_match:
-            continue
-        expression = _strip_expression_comment(right)
-        if expression and _looks_like_expression(expression):
-            expressions[name_match.group(1)] = expression
-    return expressions
-
-
-def _strip_expression_comment(value: str) -> str:
-    expression = value.strip()
-    expression = expression.split("#", 1)[0].strip()
-    expression = expression.split(",", 1)[0].strip()
-    expression = expression.split(";", 1)[0].strip()
-    expression = re.split(r"\s+\(", expression, maxsplit=1)[0].strip()
-    return expression.rstrip(".")
-
-
-def _looks_like_expression(value: str) -> bool:
-    if not value.strip():
-        return False
-    without_names = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", "", value.replace("^", "**"))
-    return re.fullmatch(r"[\d\s+\-*/().]*", without_names) is not None
-
-
-def _sympify_named_expression(value: str, *, Symbol: Any, sympify: Any, locals_map: dict[str, Any]) -> Any | None:
-    expression = value.replace("^", "**")
-    names = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", expression))
-    for name in names:
-        locals_map.setdefault(name, Symbol(name))
-    try:
-        return sympify(expression, locals=locals_map)
-    except Exception:
-        return None
-
-
-def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
-    checks = consensus.get("pairwise_symbolic_checks")
-    if not isinstance(checks, dict):
-        raise ValueError("all_agree requires review_payload.consensus.pairwise_symbolic_checks")
-    pairwise_keys = ["A_minus_B_zero", "B_minus_C_zero", "A_minus_C_zero"]
-    pairwise_true_count = sum(1 for key in pairwise_keys if checks.get(key) is True)
-    reported_true_count = checks.get("true_count")
-    if isinstance(reported_true_count, int):
-        pairwise_true_count = min(pairwise_true_count, reported_true_count)
-    relation_reference_evidence = _has_relation_reference_evidence(checks)
-    if pairwise_true_count < 2 and not relation_reference_evidence:
-        raise ValueError("all_agree requires at least two true pairwise symbolic checks")
-    method = str(checks.get("check_method", "")).strip().lower()
-    if method not in {"analytic", "numerical", "mixed"}:
-        raise ValueError("all_agree requires check_method to be analytic, numerical, or mixed")
-    used_sympy = checks.get("used_sympy")
-    if not isinstance(used_sympy, bool):
-        raise ValueError("all_agree requires used_sympy to be true or false")
-    if used_sympy:
-        sympy_code = str(checks.get("sympy_code", "")).lower()
-        if "expand" not in sympy_code or "simplify" not in sympy_code:
-            raise ValueError("SymPy all_agree requires sympy_code showing expand and simplify checks")
-    elif method in {"analytic", "mixed"}:
-        notes = str(checks.get("notes", "")).strip()
-        if not notes:
-            raise ValueError("analytic all_agree without SymPy requires explicit notes")
-        history_text = "\n".join(str(item) for item in checks.get("check_history", []))
-        lowered_evidence = f"{notes}\n{history_text}".lower()
-        has_explicit_differences = all(
-            any(marker in lowered_evidence for marker in markers)
-            for markers in [["a-b", "a - b"], ["b-c", "b - c"], ["a-c", "a - c"]]
+def _agreement_assessment(consensus: Mapping[str, Any], *, status: str) -> Mapping[str, Any]:
+    assessment = consensus.get("agreement_assessment")
+    if not isinstance(assessment, dict):
+        raise ValueError(f"{status} requires review_payload.consensus.agreement_assessment")
+    summary = assessment.get("comparison_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError(f"{status} requires agreement_assessment.comparison_summary")
+    lowered_summary = summary.lower()
+    if _has_weak_reliance_marker(lowered_summary):
+        raise ValueError(
+            f"{status} cannot rely on formatting, spacing, visual similarity, looks identical, or string equality"
         )
-        has_zero_results = lowered_evidence.count("=0") >= 2 or lowered_evidence.count("= 0") >= 2
-        says_differences_reduce_to_zero = (
-            "differences reduce to zero" in lowered_evidence
-            or "difference reduce to zero" in lowered_evidence
-            or "reduce to zero symbolically" in lowered_evidence
-            or "differences vanish analytically" in lowered_evidence
-            or "differences vanish identically" in lowered_evidence
-            or "components vanish analytically" in lowered_evidence
-            or "components vanish identically" in lowered_evidence
-        )
-        has_term_by_term_check = "term-by-term" in lowered_evidence and (
-            "overall factor" in lowered_evidence
-            or "every term matches" in lowered_evidence
-            or "all terms match" in lowered_evidence
-        )
-        weak_markers = ["spacing", "string", "formatting", "visual", "inspection", "identical"]
-        if any(marker in lowered_evidence for marker in weak_markers) and not (
-            (has_explicit_differences and has_zero_results)
-            or says_differences_reduce_to_zero
-            or has_term_by_term_check
-        ):
-            raise ValueError("manual all_agree cannot rely on string, spacing, formatting, or visual comparison")
-        if not (has_explicit_differences or says_differences_reduce_to_zero or has_term_by_term_check):
-            raise ValueError("manual all_agree requires explicit A-B, B-C, and A-C algebraic differences")
-    if method in {"numerical", "mixed"}:
-        sample_count = checks.get("sample_count")
-        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 10:
-            raise ValueError("numerical all_agree requires at least 10 randomly selected data points")
-        relative_error = checks.get("numerical_relative_error")
-        if (
-            not isinstance(relative_error, (int, float))
-            or isinstance(relative_error, bool)
-            or not math.isfinite(float(relative_error))
-        ):
-            raise ValueError("numerical all_agree requires numerical_relative_error")
-    history = checks.get("check_history")
-    if not isinstance(history, list) or not history:
-        raise ValueError("all_agree requires documented pairwise check history")
+    if assessment.get("special_limit_only") is True:
+        raise ValueError(f"{status} cannot accept agreement_assessment.special_limit_only=true")
+    return assessment
 
 
-def _has_relation_reference_evidence(checks: Mapping[str, Any]) -> bool:
-    if checks.get("A_minus_B_zero") is not True:
-        return False
-    method = str(checks.get("check_method", "")).strip().lower()
-    if method not in {"numerical", "mixed"}:
-        return False
-    sample_count = checks.get("sample_count")
-    relative_error = checks.get("numerical_relative_error")
-    if (
-        not isinstance(sample_count, int)
-        or isinstance(sample_count, bool)
-        or sample_count < 10
-        or not isinstance(relative_error, (int, float))
-        or isinstance(relative_error, bool)
-        or not math.isfinite(float(relative_error))
-    ):
-        return False
-    notes = str(checks.get("notes", ""))
-    history = checks.get("check_history")
-    history_text = "\n".join(str(item) for item in history) if isinstance(history, list) else ""
-    lowered_evidence = f"{notes}\n{history_text}".lower()
-    relation_markers = [
-        "proportionality",
-        "implicit relation",
-        "constraint relation",
-        "satisfy the relation",
-        "satisfies the relation",
+def _has_weak_reliance_marker(lowered_summary: str) -> bool:
+    weak_reliance_patterns = [
+        r"\bby\s+visual\s+inspection\b",
+        r"\bbased\s+on\s+visual\s+inspection\b",
+        r"\brel(?:y|ies|ied|ying)\s+on\s+visual\s+inspection\b",
+        r"\blooks?\s+identical\b",
+        r"\bvisually\s+identical\b",
+        r"\bstring[-\s]+equality\b",
+        r"\bonly\s+spacing\b",
+        r"\bonly\s+formatting\b",
+        r"\bformatting\s+differences\b",
     ]
-    has_relation_marker = any(marker in lowered_evidence for marker in relation_markers)
-    has_reference_checks = (
-        ("a-c" in lowered_evidence or "a - c" in lowered_evidence)
-        and ("b-c" in lowered_evidence or "b - c" in lowered_evidence)
-    )
-    has_satisfaction_evidence = (
-        "constant within" in lowered_evidence
-        or "relative error" in lowered_evidence
-        or "numerical error" in lowered_evidence
-        or "satisfy" in lowered_evidence
-    )
-    return has_relation_marker and has_reference_checks and has_satisfaction_evidence
+    for pattern in weak_reliance_patterns:
+        for match in re.finditer(pattern, lowered_summary):
+            if not _has_nearby_negation(lowered_summary, match.start()):
+                return True
+    return False
 
 
-def _validate_reference_disagrees_pairwise_checks(
+def _has_nearby_negation(lowered_summary: str, match_start: int) -> bool:
+    prefix = lowered_summary[max(0, match_start - 32) : match_start]
+    return re.search(r"\b(?:not|do\s+not|does\s+not|without|never)\b(?:\W+\w+){0,3}\W*$", prefix) is not None
+
+
+def _validate_all_agree_agreement_assessment(consensus: Mapping[str, Any]) -> None:
+    assessment = _agreement_assessment(consensus, status="all_agree")
+    true_fields = [
+        "target_quantity_match",
+        "convention_match",
+        "declared_scope_match",
+        "agreement_covers_full_target",
+        "accepted_by_reviewer_judgment",
+    ]
+    for field in true_fields:
+        if assessment.get(field) is not True:
+            raise ValueError(f"all_agree requires agreement_assessment.{field}=true")
+
+
+def _validate_reference_disagrees_agreement_assessment(
     consensus: Mapping[str, Any],
     *,
     active_proposer_ids: list[str],
 ) -> None:
-    checks = consensus.get("pairwise_symbolic_checks")
-    if not isinstance(checks, dict):
-        raise ValueError("reference_disagrees requires pairwise_symbolic_checks")
+    assessment = _agreement_assessment(consensus, status="reference_disagrees")
     agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), active_proposer_ids)
     if len(set(agreed_ids)) < 2:
         raise ValueError("reference_disagrees requires two agreeing blind proposer ids")
-    if checks.get("A_minus_B_zero") is not True:
-        raise ValueError("reference_disagrees requires A-B=0 for the blind proposers")
-    if checks.get("A_minus_C_zero") is not False or checks.get("B_minus_C_zero") is not False:
-        raise ValueError("reference_disagrees requires A-C and B-C to be nonzero")
-    method = str(checks.get("check_method", "")).strip().lower()
-    if method not in {"analytic", "numerical", "mixed"}:
-        raise ValueError("reference_disagrees requires check_method to be analytic, numerical, or mixed")
-    used_sympy = checks.get("used_sympy")
-    if not isinstance(used_sympy, bool):
-        raise ValueError("reference_disagrees requires used_sympy to be true or false")
-    if used_sympy:
-        sympy_code = str(checks.get("sympy_code", "")).lower()
-        if "expand" not in sympy_code or "simplify" not in sympy_code:
-            raise ValueError("SymPy reference_disagrees requires expand and simplify checks")
-    if method in {"numerical", "mixed"}:
-        sample_count = checks.get("sample_count")
-        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 10:
-            raise ValueError("numerical reference_disagrees requires at least 10 randomly selected data points")
-        relative_error = checks.get("numerical_relative_error")
-        if (
-            not isinstance(relative_error, (int, float))
-            or isinstance(relative_error, bool)
-            or not math.isfinite(float(relative_error))
-        ):
-            raise ValueError("numerical reference_disagrees requires numerical_relative_error")
-    history = checks.get("check_history")
-    if not isinstance(history, list) or not history:
-        raise ValueError("reference_disagrees requires documented check history")
+    for field in ["target_quantity_match", "convention_match"]:
+        if assessment.get(field) is not True:
+            raise ValueError(f"reference_disagrees requires agreement_assessment.{field}=true")
 
 
 def _foundation_context_for_step(step: ConsensusStep) -> dict[str, Any] | None:

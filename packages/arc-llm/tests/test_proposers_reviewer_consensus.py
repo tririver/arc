@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from arc_llm.proposers_reviewer.config import ConfigError
 from arc_llm.proposers_reviewer.consensus import (
@@ -24,11 +27,11 @@ def minimal_config(tmp_path: Path, **overrides: Any) -> dict[str, Any]:
     return config
 
 
-def test_consensus_config_defaults_to_three_proposers_and_three_recalculations(tmp_path):
+def test_consensus_config_defaults_to_two_proposers_and_two_recalculations(tmp_path):
     config = load_consensus_config(minimal_config(tmp_path))
 
-    assert config.proposer_count == 3
-    assert config.max_recalculations == 3
+    assert config.proposer_count == 2
+    assert config.max_recalculations == 2
     assert config.human_gate["enabled"] is False
 
 
@@ -48,7 +51,7 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
             )
         ]
@@ -59,7 +62,7 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert result["status"] == "completed"
     assert result["steps"][0]["status"] == "accepted"
     assert result["steps"][0]["accepted_output"] == {"result": "x"}
-    assert fake.active_proposers_by_call == [["proposer_001", "proposer_002", "proposer_003"]]
+    assert fake.active_proposers_by_call == [["proposer_001", "proposer_002"]]
     reviewer_schema = fake.calls[0]["loops"][0]["reviewers"][0]["output_schema"]
     assert "schema_version" in reviewer_schema["required"]
     assert "proposer_messages" in reviewer_schema["required"]
@@ -68,7 +71,6 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert reviewer_schema["properties"]["proposer_messages"]["required"] == [
         "proposer_001",
         "proposer_002",
-        "proposer_003",
     ]
     reviewer = fake.calls[0]["loops"][0]["reviewers"][0]
     reviewer_template = reviewer["prompt"]["template"]
@@ -82,9 +84,23 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "never skip a step" in proposer_template
     assert "LaTeX" in proposer_template
     assert "validity_scope" in proposer_template
-    assert "plan_foundation_assessment" in proposer_template
+    assert "work_note_assessment" in proposer_template
+    assert "plan_foundation_assessment" not in proposer_template
     assert "reliable_until" not in proposer_template
-    assert "plan_foundation_assessment" in proposer["output_schema"]["required"]
+    assert "work_note_assessment" in proposer["output_schema"]["required"]
+    assert "plan_foundation_assessment" not in proposer["output_schema"]["required"]
+    issue_types = proposer["output_schema"]["properties"]["work_note_assessment"]["properties"]["issue_type"]["enum"]
+    assert issue_types == [
+        "none",
+        "work_note_inadequate",
+        "work_note_conflict",
+        "plan_wrong",
+        "step_too_coarse",
+        "target_ambiguous",
+        "source_mapping_error",
+        "human_needed",
+        "other",
+    ]
     assert proposer["runtime"]["allow_internet"] is True
     assert proposer["runtime"]["allow_mcp"] is True
     assert proposer["runtime"]["mcp_mode"] == "arc-only"
@@ -99,33 +115,41 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "old coordinates" in lower_proposer_template
     assert "newly introduced symbols" in lower_proposer_template
     assert reviewer["runtime"]["allow_mcp"] is False
-    assert "SymPy" in reviewer_template
-    assert "expand" in reviewer_template
-    assert "simplify" in reviewer_template
-    assert "sympy_code" in reviewer_template
-    assert "substitutions" in reviewer_template
-    assert "A-B" in reviewer_template
-    assert "B-C" in reviewer_template
-    assert "A-C" in reviewer_template
-    assert "10 randomly selected data points" in reviewer_template
-    assert "relative error" in reviewer_template
-    assert "check history" in reviewer_template
-    assert "at least two" in reviewer_template
-    assert "Never mark all_agree" in reviewer_template
+    assert "physics and mathematics judgment" in reviewer_template
+    assert "optional tools when useful" in reviewer_template
+    assert "special limits are sanity checks" in reviewer_template.lower()
+    assert "pairwise_symbolic_checks" not in reviewer_template
+    assert "A-B" not in reviewer_template
+    assert "B-C" not in reviewer_template
+    assert "A-C" not in reviewer_template
     assert "source-declared old/new variable definitions" in reviewer_template
     assert "raw variable-name differences" in reviewer_template
     assert "proportionalities" in reviewer_template
     assert "constant quotient" in reviewer_template
     consensus_properties = reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["properties"]
-    assert "pairwise_symbolic_checks" in consensus_properties
+    assert "agreement_assessment" in consensus_properties
+    assert "pairwise_symbolic_checks" not in consensus_properties
     assert "best_written_proposer_id" in consensus_properties
     assert "best_written_selection_reason" in consensus_properties
     assert "validity_scope" in consensus_properties
     assert "workflow_action" in consensus_properties
     assert "workflow_action" in reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["required"]
     assert "reliable_until" not in consensus_properties
-    pairwise_properties = consensus_properties["pairwise_symbolic_checks"]["properties"]
-    assert "used_sympy" in pairwise_properties
+    agreement_schema = consensus_properties["agreement_assessment"]
+    assert agreement_schema["required"] == [
+        "target_quantity_match",
+        "convention_match",
+        "declared_scope_match",
+        "agreement_covers_full_target",
+        "comparison_summary",
+        "accepted_by_reviewer_judgment",
+    ]
+    assert set(agreement_schema["properties"]) >= {
+        "tool_checks",
+        "sanity_checks",
+        "special_limit_only",
+        "notes",
+    }
 
 
 def test_blind_reference_check_disables_proposer_source_access_by_default(tmp_path):
@@ -245,12 +269,6 @@ def test_reviewer_prompt_selects_best_written_for_reference_disagrees(tmp_path):
                 "reference_disagrees",
                 agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x = y - z", "reference_claim_status": "disagrees"},
-                pairwise_check_overrides={
-                    "A_minus_B_zero": True,
-                    "B_minus_C_zero": False,
-                    "A_minus_C_zero": False,
-                    "true_count": 1,
-                },
             )
         ]
     )
@@ -269,6 +287,7 @@ def test_reviewer_prompt_selects_best_written_for_reference_disagrees(tmp_path):
     run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
 
     reviewer_template = fake.calls[0]["loops"][0]["reviewers"][0]["prompt"]["template"]
+    assert "set status to all_agree, two_agree, all_disagree, unresolved, or reference_disagrees" in reviewer_template
     assert "When status is reference_disagrees" in reviewer_template
     assert "choose best_written_proposer_id from the agreeing blind proposer ids" in reviewer_template
 
@@ -280,22 +299,6 @@ def test_reference_disagrees_accepts_when_two_blind_proposers_agree(tmp_path):
                 "reference_disagrees",
                 agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x = y - z", "reference_claim_status": "disagrees"},
-                pairwise_check_overrides={
-                    "A_minus_B_zero": True,
-                    "B_minus_C_zero": False,
-                    "A_minus_C_zero": False,
-                    "true_count": 1,
-                    "sympy_code": (
-                        "simplify(expand(A-B)); "
-                        "simplify(expand(B-C)); "
-                        "simplify(expand(A-C))"
-                    ),
-                    "check_history": [
-                        "A-B reduces to 0.",
-                        "B-C reduces to 2*z.",
-                        "A-C reduces to 2*z.",
-                    ],
-                },
             )
         ]
     )
@@ -332,22 +335,6 @@ def test_human_gate_blocks_reference_disagrees(tmp_path):
                     "issue_type": "reference_disagreement",
                     "reason": "blind derivation differs from the note formula",
                     "expert_question": "Which formula is intended?",
-                },
-                pairwise_check_overrides={
-                    "A_minus_B_zero": True,
-                    "B_minus_C_zero": False,
-                    "A_minus_C_zero": False,
-                    "true_count": 1,
-                    "sympy_code": (
-                        "simplify(expand(A-B)); "
-                        "simplify(expand(B-C)); "
-                        "simplify(expand(A-C))"
-                    ),
-                    "check_history": [
-                        "A-B reduces to 0.",
-                        "B-C reduces to 2*z.",
-                        "A-C reduces to 2*z.",
-                    ],
                 },
             ),
             consensus_review(
@@ -436,24 +423,14 @@ def test_human_gate_blocks_worker_failure(tmp_path):
     assert len(calls) == 1
 
 
-def test_reference_disagrees_requires_blind_proposer_agreement(tmp_path):
+def test_reference_disagrees_requires_agreement_assessment(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "reference_disagrees",
                 agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "A_minus_B_zero": False,
-                    "B_minus_C_zero": False,
-                    "A_minus_C_zero": False,
-                    "true_count": 0,
-                    "sympy_code": (
-                        "simplify(expand(A-B)); "
-                        "simplify(expand(B-C)); "
-                        "simplify(expand(A-C))"
-                    ),
-                },
+                agreement=False,
             )
         ]
     )
@@ -472,7 +449,7 @@ def test_reference_disagrees_requires_blind_proposer_agreement(tmp_path):
     result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
 
     assert result["status"] == "failed"
-    assert "reference_disagrees requires A-B=0" in result["steps"][0]["error"]
+    assert "agreement_assessment" in result["steps"][0]["error"]
 
 
 def test_reference_disagrees_requires_two_agreeing_blind_proposer_ids(tmp_path):
@@ -482,17 +459,6 @@ def test_reference_disagrees_requires_two_agreeing_blind_proposer_ids(tmp_path):
                 "reference_disagrees",
                 agreed=["proposer_001"],
                 accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "A_minus_B_zero": True,
-                    "B_minus_C_zero": False,
-                    "A_minus_C_zero": False,
-                    "true_count": 1,
-                    "sympy_code": (
-                        "simplify(expand(A-B)); "
-                        "simplify(expand(B-C)); "
-                        "simplify(expand(A-C))"
-                    ),
-                },
             )
         ]
     )
@@ -514,14 +480,14 @@ def test_reference_disagrees_requires_two_agreeing_blind_proposer_ids(tmp_path):
     assert "reference_disagrees requires two agreeing blind proposer ids" in result["steps"][0]["error"]
 
 
-def test_blind_reference_all_agree_requires_pairwise_checks_with_reference_claim(tmp_path):
+def test_reference_disagrees_requires_target_and_convention_match(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
-                "all_agree",
+                "reference_disagrees",
                 agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_checks=False,
+                agreement_overrides={"convention_match": False},
             )
         ]
     )
@@ -540,7 +506,7 @@ def test_blind_reference_all_agree_requires_pairwise_checks_with_reference_claim
     result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
 
     assert result["status"] == "failed"
-    assert "pairwise_symbolic_checks" in result["steps"][0]["error"]
+    assert "convention_match" in result["steps"][0]["error"]
 
 
 def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path):
@@ -741,7 +707,11 @@ def test_consensus_two_agree_recalculates_only_likely_wrong_proposer(tmp_path):
         ]
     )
 
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+    result = run_proposers_reviewer_consensus(
+        minimal_config(tmp_path, proposer_count=3),
+        batch_runner=fake,
+        base_env={},
+    )
 
     assert result["status"] == "completed"
     assert result["steps"][0]["status"] == "accepted"
@@ -796,7 +766,11 @@ def test_consensus_two_agree_without_isolated_wrong_proposer_recalculates_all(tm
         ]
     )
 
-    run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+    run_proposers_reviewer_consensus(
+        minimal_config(tmp_path, proposer_count=3),
+        batch_runner=fake,
+        base_env={},
+    )
 
     assert fake.active_proposers_by_call == [
         ["proposer_001", "proposer_002", "proposer_003"],
@@ -817,7 +791,7 @@ def test_consensus_all_disagree_recalculates_all(tmp_path):
     )
 
     run_proposers_reviewer_consensus(
-        minimal_config(tmp_path, max_recalculations=1),
+        minimal_config(tmp_path, proposer_count=3, max_recalculations=1),
         batch_runner=fake,
         base_env={},
     )
@@ -843,14 +817,14 @@ def test_consensus_blocks_for_user_at_recalculation_limit(tmp_path):
     assert len(result["steps"][0]["attempts"]) == 2
 
 
-def test_consensus_rejects_all_agree_without_pairwise_symbolic_checks(tmp_path):
+def test_consensus_rejects_all_agree_without_agreement_assessment(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_checks=False,
+                agreement=False,
             )
         ]
     )
@@ -859,7 +833,7 @@ def test_consensus_rejects_all_agree_without_pairwise_symbolic_checks(tmp_path):
 
     assert result["status"] == "failed"
     assert result["steps"][0]["status"] == "failed"
-    assert "pairwise_symbolic_checks" in result["steps"][0]["error"]
+    assert "agreement_assessment" in result["steps"][0]["error"]
 
 
 def test_consensus_rejects_all_agree_without_best_written_selection(tmp_path):
@@ -867,7 +841,7 @@ def test_consensus_rejects_all_agree_without_best_written_selection(tmp_path):
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
                 best_written=False,
             )
@@ -892,272 +866,66 @@ def test_consensus_rejects_all_agree_with_best_written_outside_agreed_proposers(
         ]
     )
 
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+    result = run_proposers_reviewer_consensus(
+        minimal_config(tmp_path, proposer_count=3),
+        batch_runner=fake,
+        base_env={},
+    )
 
     assert result["status"] == "failed"
     assert "agreed_proposer_ids" in result["steps"][0]["error"]
 
 
-def test_consensus_rejects_numerical_all_agree_with_too_few_samples(tmp_path):
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "check_method": "numerical",
-                    "sample_count": 9,
-                    "numerical_relative_error": 1e-8,
-                },
-            )
-        ]
-    )
-
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
-
-    assert result["status"] == "failed"
-    assert "at least 10" in result["steps"][0]["error"]
-
-
-def test_consensus_rejects_all_agree_without_check_method(tmp_path):
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-                pairwise_check_overrides={"check_method": ""},
-            )
-        ]
-    )
-
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
-
-    assert result["status"] == "failed"
-    assert "check_method" in result["steps"][0]["error"]
-
-
-def test_consensus_rejects_mixed_all_agree_with_too_few_samples(tmp_path):
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "check_method": "mixed",
-                    "sample_count": 9,
-                    "numerical_relative_error": 1e-8,
-                },
-            )
-        ]
-    )
-
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
-
-    assert result["status"] == "failed"
-    assert "at least 10" in result["steps"][0]["error"]
-
-
-def test_consensus_rejects_sympy_all_agree_without_expand_and_simplify(tmp_path):
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-                pairwise_check_overrides={"sympy_code": "simplify(A-B)"},
-            )
-        ]
-    )
-
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
-
-    assert result["status"] == "failed"
-    assert "expand" in result["steps"][0]["error"]
-
-
-def test_consensus_rejects_manual_all_agree_by_string_or_spacing_comparison(tmp_path):
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": "Manual comparison found only spacing differences.",
-                    "check_method": "analytic",
-                    "check_history": [
-                        "Compared A and B: only difference is spacing.",
-                        "Compared B and C: identical.",
-                        "Compared A and C: identical.",
-                    ],
-                },
-            )
-        ]
-    )
-
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
-
-    assert result["status"] == "failed"
-    assert "manual all_agree" in result["steps"][0]["error"]
-
-
-def test_blind_reference_accepts_manual_component_history_that_vanishes(tmp_path):
+def test_consensus_rejects_all_agree_without_required_true_agreement_field(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
                 agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": (
-                        "SymPy unavailable; performed analytic component-wise comparison. "
-                        "A and B share identical metric components after coordinate relabeling. "
-                        "All pairwise component differences vanish analytically."
-                    ),
-                    "check_method": "analytic",
-                    "check_history": [
-                        "Extracted metric components from A, B, and reference C.",
-                        "Expanded A - B component-wise; all components vanish analytically.",
-                        "Substituted relabeled C into B - C and A - C; all components vanish identically.",
-                    ],
-                },
+                agreement_overrides={"agreement_covers_full_target": False},
             )
         ]
     )
-    config = minimal_config(
-        tmp_path,
-        proposer_count=2,
-        steps=[
-            {
-                "step_id": "blind_ref_eq_001",
-                "prompt": "Derive x.",
-                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
-            }
-        ],
-    )
 
-    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
 
-    assert result["status"] == "completed"
-    assert result["steps"][0]["status"] == "accepted"
+    assert result["status"] == "failed"
+    assert "agreement_covers_full_target" in result["steps"][0]["error"]
 
 
-def test_blind_reference_accepts_checked_proportionality_relation(tmp_path):
+def test_consensus_rejects_visual_or_string_similarity_summary(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
                 agreed=["proposer_001", "proposer_002"],
-                accepted={"result": "rho = rho0*(a0/a)**n"},
-                pairwise_check_overrides={
-                    "used_sympy": True,
-                    "A_minus_B_zero": True,
-                    "B_minus_C_zero": False,
-                    "A_minus_C_zero": False,
-                    "true_count": 1,
-                    "sympy_code": "from sympy import expand, simplify\nsimplify(expand(A-B))",
-                    "notes": (
-                        "A-C and B-C are not exact expression differences because the "
-                        "reference is a proportionality relation. Numerical checks confirm "
-                        "both proposer results satisfy the relation."
+                accepted={"result": "x"},
+                agreement_overrides={
+                    "comparison_summary": "The formulas look identical apart from spacing and formatting.",
+                },
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "formatting, spacing, visual similarity, looks identical, or string equality" in result["steps"][0]["error"]
+
+
+def test_consensus_accepts_negated_visual_comparison_summary(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                agreement_overrides={
+                    "comparison_summary": (
+                        "Equivalence follows from matching target quantity, conventions, "
+                        "and full derivation coverage, not by visual comparison."
                     ),
-                    "check_method": "mixed",
-                    "sample_count": 10,
-                    "numerical_relative_error": 1e-15,
-                    "check_history": [
-                        "A-B: symbolic simplification gives zero.",
-                        "A-C: checked invariant rho*a**n is constant within numerical error.",
-                        "B-C: checked invariant rho*a**n is constant within numerical error.",
-                    ],
-                },
-            )
-        ]
-    )
-    config = minimal_config(
-        tmp_path,
-        proposer_count=2,
-        steps=[
-            {
-                "step_id": "blind_ref_eq_001",
-                "prompt": "Derive rho proportionality.",
-                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "\\rho \\propto a^{-n}"},
-            }
-        ],
-    )
-
-    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
-
-    assert result["status"] == "completed"
-    assert result["steps"][0]["status"] == "accepted"
-
-
-def test_consensus_accepts_main_agent_sympy_fallback_for_bad_reviewer_evidence(tmp_path):
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": "Manual comparison found only spacing differences.",
-                    "check_method": "analytic",
-                    "check_history": [
-                        "Compared A and B as strings.",
-                        "Compared B and C by visual inspection.",
-                        "Compared A and C: identical.",
-                    ],
-                },
-            )
-        ],
-        proposer_outputs={
-            "proposer_001": {"final_result": "W_gt_kernel = f_eta*fstar_etap\nW_lt_kernel = g_eta*gstar_etap"},
-            "proposer_002": {
-                "final_result": {
-                    "W_gt_kernel": "f_eta * fstar_etap",
-                    "W_lt_kernel": "g_eta * gstar_etap",
-                }
-            },
-            "proposer_003": {
-                "final_result": "W_gt_kernel = f_eta*fstar_etap\nW_lt_kernel = g_eta*gstar_etap"
-            },
-        },
-    )
-
-    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
-
-    checks = result["steps"][0]["reviewer_consensus"]["pairwise_symbolic_checks"]
-    assert result["status"] == "completed"
-    assert result["steps"][0]["status"] == "accepted"
-    assert checks["used_sympy"] is True
-    assert checks["fallback_source"] == "main_agent_sympy"
-
-
-def test_consensus_accepts_manual_all_agree_with_explicit_differences(tmp_path):
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": "Expressions are identical after explicit differences: A-B=x-x=0; B-C=x-x=0; A-C=x-x=0.",
-                    "check_method": "analytic",
-                    "check_history": [
-                        "A-B=x-x=0",
-                        "B-C=x-x=0",
-                        "A-C=x-x=0",
-                    ],
                 },
             )
         ]
@@ -1169,23 +937,18 @@ def test_consensus_accepts_manual_all_agree_with_explicit_differences(tmp_path):
     assert result["steps"][0]["status"] == "accepted"
 
 
-def test_consensus_accepts_manual_all_agree_with_spaced_difference_labels(tmp_path):
+def test_consensus_accepts_negated_visual_inspection_summary(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": "Explicit differences are zero.",
-                    "check_method": "analytic",
-                    "check_history": [
-                        "A - B: x - x = 0",
-                        "B - C: x - x = 0",
-                        "A - C: x - x = 0",
-                    ],
+                agreement_overrides={
+                    "comparison_summary": (
+                        "Equivalence follows from matching target quantity, conventions, "
+                        "and full derivation coverage, not by visual inspection."
+                    ),
                 },
             )
         ]
@@ -1197,23 +960,18 @@ def test_consensus_accepts_manual_all_agree_with_spaced_difference_labels(tmp_pa
     assert result["steps"][0]["status"] == "accepted"
 
 
-def test_consensus_accepts_manual_all_agree_when_pairwise_differences_reduce_to_zero(tmp_path):
+def test_consensus_accepts_without_visual_inspection_summary(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": "Expressions differ only by notation; all pairwise differences reduce to zero symbolically.",
-                    "check_method": "analytic",
-                    "check_history": [
-                        "Compared proposer_001 and proposer_002: differences reduce to zero.",
-                        "Compared proposer_002 and proposer_003: differences reduce to zero.",
-                        "Compared proposer_001 and proposer_003: differences reduce to zero.",
-                    ],
+                agreement_overrides={
+                    "comparison_summary": (
+                        "Equivalence follows from matching target quantity and conventions "
+                        "without visual inspection."
+                    ),
                 },
             )
         ]
@@ -1225,23 +983,18 @@ def test_consensus_accepts_manual_all_agree_when_pairwise_differences_reduce_to_
     assert result["steps"][0]["status"] == "accepted"
 
 
-def test_consensus_accepts_manual_all_agree_with_term_by_term_check(tmp_path):
+def test_consensus_accepts_not_relying_on_visual_inspection_summary(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": "All expressions identical after notation changes. Explicit term-by-term comparison shows every term matches.",
-                    "check_method": "analytic",
-                    "check_history": [
-                        "Checked term 1 in all expressions.",
-                        "Checked term 2 in all expressions.",
-                        "Checked the overall factor.",
-                    ],
+                agreement_overrides={
+                    "comparison_summary": (
+                        "The reviewer matched the target and conventions, not relying on "
+                        "visual inspection."
+                    ),
                 },
             )
         ]
@@ -1253,19 +1006,89 @@ def test_consensus_accepts_manual_all_agree_with_term_by_term_check(tmp_path):
     assert result["steps"][0]["status"] == "accepted"
 
 
-def test_consensus_accepts_manual_all_agree_when_named_differences_are_zero(tmp_path):
+@pytest.mark.parametrize(
+    "comparison_summary",
+    [
+        "The formulas do not look identical; algebra matches.",
+        "Equivalence is established not by string equality but by matched derivation.",
+        "Never rely on visual inspection; algebra matches.",
+    ],
+)
+def test_consensus_accepts_negated_weak_marker_summary(tmp_path, comparison_summary):
     fake = FakeBatchRunner(
         [
             consensus_review(
                 "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
+                agreed=["proposer_001", "proposer_002"],
                 accepted={"result": "x"},
-                pairwise_check_overrides={
-                    "used_sympy": False,
-                    "sympy_code": "",
-                    "notes": "The differences A-B, B-C, A-C are zero because expressions match term-by-term.",
-                    "check_method": "analytic",
-                    "check_history": ["Concluded all differences zero."],
+                agreement_overrides={"comparison_summary": comparison_summary},
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
+@pytest.mark.parametrize(
+    "comparison_summary",
+    [
+        "Accepted by visual inspection of the displayed formulas.",
+        "Accepted based on visual inspection of the displayed formulas.",
+        "Accepted by string equality of the displayed formulas.",
+    ],
+)
+def test_consensus_rejects_visual_inspection_reliance_summary(tmp_path, comparison_summary):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                agreement_overrides={"comparison_summary": comparison_summary},
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "formatting, spacing, visual similarity, looks identical, or string equality" in result["steps"][0]["error"]
+
+
+def test_consensus_rejects_special_limit_only_acceptance(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                agreement_overrides={"special_limit_only": True},
+            )
+        ]
+    )
+
+    result = run_proposers_reviewer_consensus(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "special_limit_only" in result["steps"][0]["error"]
+
+
+def test_consensus_accepts_reviewer_judgment_without_sympy(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                agreement_overrides={
+                    "tool_checks": [],
+                    "comparison_summary": (
+                        "Both derivations compute the same target quantity with matching "
+                        "conventions and the full declared scope."
+                    ),
                 },
             )
         ]
@@ -1275,6 +1098,7 @@ def test_consensus_accepts_manual_all_agree_when_named_differences_are_zero(tmp_
 
     assert result["status"] == "completed"
     assert result["steps"][0]["status"] == "accepted"
+    assert "main_agent_agreement_check" not in result["steps"][0]["reviewer_consensus"]
 
 
 def test_consensus_dry_run_does_not_call_batch_runner(tmp_path):
@@ -1288,8 +1112,8 @@ def test_consensus_dry_run_does_not_call_batch_runner(tmp_path):
     )
 
     assert result["status"] == "dry_run"
-    assert result["proposer_count"] == 3
-    assert result["max_recalculations"] == 3
+    assert result["proposer_count"] == 2
+    assert result["max_recalculations"] == 2
     assert result["human_gate"]["enabled"] is False
     assert result["steps"] == [{"step_id": "step_001", "kind": "new_calculation"}]
 
@@ -1350,8 +1174,8 @@ def consensus_review(
     likely_wrong: list[str] | None = None,
     recalculate: list[str] | None = None,
     accepted: dict[str, Any] | None = None,
-    pairwise_checks: bool = True,
-    pairwise_check_overrides: dict[str, Any] | None = None,
+    agreement: bool = True,
+    agreement_overrides: dict[str, Any] | None = None,
     best_written: bool = True,
     best_written_proposer_id: str | None = "proposer_001",
     workflow_action: dict[str, Any] | None = None,
@@ -1369,23 +1193,22 @@ def consensus_review(
     if best_written:
         consensus["best_written_proposer_id"] = best_written_proposer_id
         consensus["best_written_selection_reason"] = "clearest logic and most complete derivation"
-    if pairwise_checks:
-        pairwise_payload = {
-            "used_sympy": True,
-            "A_minus_B_zero": True,
-            "B_minus_C_zero": True,
-            "A_minus_C_zero": True,
-            "true_count": 3,
-            "sympy_code": "simplify(expand(A-B)); simplify(expand(B-C)); simplify(expand(A-C))",
-            "notes": "fake pairwise checks",
-            "check_method": "analytic",
-            "numerical_relative_error": None,
-            "sample_count": 0,
-            "check_history": ["expanded and simplified"],
+    if agreement:
+        agreement_payload = {
+            "target_quantity_match": True,
+            "convention_match": True,
+            "declared_scope_match": True,
+            "agreement_covers_full_target": True,
+            "comparison_summary": "Reviewer judged the calculations equivalent across the full target.",
+            "accepted_by_reviewer_judgment": True,
+            "tool_checks": [],
+            "sanity_checks": [],
+            "special_limit_only": False,
+            "notes": "",
         }
-        if pairwise_check_overrides:
-            pairwise_payload.update(pairwise_check_overrides)
-        consensus["pairwise_symbolic_checks"] = pairwise_payload
+        if agreement_overrides:
+            agreement_payload.update(agreement_overrides)
+        consensus["agreement_assessment"] = agreement_payload
     return {
         "schema_version": "arc.llm.review_envelope.v1",
         "controller": {"message": "reviewed", "stop_requested": False},
