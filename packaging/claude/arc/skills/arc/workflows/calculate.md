@@ -35,8 +35,8 @@ packets:
 }
 ```
 
-`"max_recalculations": 2` means 3 total attempts: 1 initial attempt + 2
-recalculations. Do not increase attempts unless the user asks.
+`"max_recalculations": 2` means 3 total attempts: 1 initial attempt + 2 recalculations.
+Do not increase attempts unless the user asks.
 
 Remove foundation_check mechanics. Starting points are checked by ordinary ready
 steps when they are marked not accepted in the work note.

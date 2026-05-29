@@ -119,10 +119,9 @@ acceptance standard
 why follows
 ```
 
-At the end of every step, state calculate which quantity, in terms of which
-quantity, and what is forbidden as input. Do not disclose the exact expected
-expression or expected final formula. Ask proposers to derive the target
-quantity in terms of named dependencies and in a form precise enough for
+At the end of every step, state calculate which quantity, in terms of which quantity, and what is forbidden as input.
+Do not disclose the exact expected expression or expected final formula.
+Ask proposers to derive the target quantity in terms of named dependencies and in a form precise enough for
 reviewer comparison.
 
 Step 4: Write deferred work in `## Rough Steps For Later Planning`. Rough-step

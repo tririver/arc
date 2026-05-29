@@ -511,7 +511,7 @@ def test_reference_disagrees_requires_target_and_convention_match(tmp_path):
 
 def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path):
     foundation = {
-        "schema_version": "arc.foundation.v1",
+        "schema_version": "arc.work_note_context_fixture.v1",
         "run_id": "run_001",
         "version": 1,
         "conventions": [
@@ -591,7 +591,7 @@ def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path
 
 def test_new_calculation_loads_latest_foundation_file_and_omits_stale_inline_foundation(tmp_path):
     foundation = {
-        "schema_version": "arc.foundation.v1",
+        "schema_version": "arc.work_note_context_fixture.v1",
         "run_id": "run_001",
         "conventions": [{"id": "conv_current", "label": "current convention"}],
         "equations": [
@@ -644,7 +644,7 @@ def test_foundation_check_fails_when_target_equation_is_missing(tmp_path):
     foundation_path.write_text(
         json.dumps(
             {
-                "schema_version": "arc.foundation.v1",
+                "schema_version": "arc.work_note_context_fixture.v1",
                 "run_id": "run_001",
                 "version": 1,
                 "conventions": [],

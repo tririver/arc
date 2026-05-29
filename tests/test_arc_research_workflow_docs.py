@@ -107,7 +107,7 @@ def test_check_workflow_keeps_notes_out_of_proposer_context() -> None:
     assert "markdown or pdf research notes" in text
     assert "full note body" in text
     assert "proposer agents" in text
-    assert "claims_to_check" in text
+    assert "claims to check" in text
     assert "blind reference check" in text
     assert "reviewer_reference_claim" in text
     assert "user-specified" in text
@@ -120,9 +120,9 @@ def test_plan_requires_review_after_drafting() -> None:
     assert "review the plan" in text.lower()
     assert "independent reviewer" in text.lower()
     assert "main agent" in text.lower()
-    assert "<project-dir>/calculate/<run-id>/initial-plan.md" in text
-    assert "<project-dir>/initial-plan.md" in text
-    assert 'md2pdf(input="<project-dir>/initial-plan.md")' in text
+    assert "<project-dir>/calculate/<run-id>/work-notes/work-note-v001.md" in text
+    assert "<project-dir>/work-note.md" in text
+    assert 'md2pdf(input="<project-dir>/work-note.md")' in text
     assert "<project-dir>/plan.md" not in text
 
 
@@ -132,8 +132,9 @@ def test_plan_requires_explicit_step_quantity_contracts() -> None:
     assert "calculate which quantity" in text
     assert "in terms of which quantity" in text
     assert "end of every step" in text
-    assert "at least 20 steps" in text
-    assert "soft guidance" in text
+    assert "largest coherent chunks" in text
+    assert "do not split by raw equation count" in text
+    assert "at least 20 steps" not in text
     assert "do not disclose the exact expected expression" in text
     assert "derive the target quantity in terms of named dependencies" in text
     assert "expected final formula" in text
@@ -142,7 +143,7 @@ def test_plan_requires_explicit_step_quantity_contracts() -> None:
 def test_plan_routes_reference_equations_to_blind_checks() -> None:
     text = (WF / "plan.md").read_text(encoding="utf-8").lower()
 
-    assert "do not disclose the target reference equation" in text
+    assert "do not include the target equation or later text" in text
     assert "blind reference check" in text
     assert "reviewer-only reference claim" in text
 

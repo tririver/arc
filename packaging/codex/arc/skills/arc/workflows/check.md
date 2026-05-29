@@ -1,7 +1,7 @@
 # Check Workflow
 
-Use this workflow when the user asks ARC to check accessible Markdown or PDF
-research notes. `check.md owns note parsing`, preflight, the concise
+Use this workflow when the user asks ARC to check accessible Markdown or PDF research notes.
+`check.md owns note parsing`, preflight, the concise
 `planning-request.md` planning handoff, and note source audit handoff.
 
 This workflow reuses only:
@@ -95,8 +95,8 @@ equation and later text from proposers. Source claims that need blind reference
 checking should be represented for reviewers as `reviewer_reference_claim`.
 
 After writing `<project-dir>/initial-note-check.md`, call
-`md2pdf(input="<project-dir>/initial-note-check.md")` in the background. Do not
-wait for PDF completion. Record any returned job id in host/run logs or later
+`md2pdf(input="<project-dir>/initial-note-check.md")` in the background. Do not wait for PDF completion.
+Record any returned job id in host/run logs or later
 work-note journal entries.
 
 ## Phase 4: Execute Owning Workflows
