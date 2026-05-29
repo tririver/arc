@@ -735,8 +735,7 @@ def test_adapter_scripts_use_installed_arc_mcp_without_repo_local_defaults() -> 
         assert 'exec arc-mcp "$@"' in text
         assert "ARC_LLM_MODEL_TIER" not in text
         assert f"ARC_{host.upper()}_MODEL=" not in text
-        assert f"ARC_{host.upper()}_MODEL_TIER=" in text
-        assert ":-medium}" in text
+        assert f"ARC_{host.upper()}_MODEL_TIER=" not in text
 
 
 def test_interaction_reference_allows_portable_typed_fallback() -> None:

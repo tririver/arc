@@ -2,7 +2,6 @@
 set -euo pipefail
 
 export ARC_AGENT_HOST="${ARC_AGENT_HOST:-codex}"
-export ARC_CODEX_MODEL_TIER="${ARC_CODEX_MODEL_TIER:-medium}"
 
 if [[ -n "${ARC_MCP_COMMAND:-}" ]]; then
   exec "${ARC_MCP_COMMAND}" "$@"
