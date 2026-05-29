@@ -96,6 +96,8 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "external sources may inspire methods" in lower_proposer_template
     assert "do not directly use any result" in lower_proposer_template
     assert "different conventions" in lower_proposer_template
+    assert "old coordinates" in lower_proposer_template
+    assert "newly introduced symbols" in lower_proposer_template
     assert reviewer["runtime"]["allow_mcp"] is False
     assert "SymPy" in reviewer_template
     assert "expand" in reviewer_template
@@ -110,6 +112,10 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "check history" in reviewer_template
     assert "at least two" in reviewer_template
     assert "Never mark all_agree" in reviewer_template
+    assert "source-declared old/new variable definitions" in reviewer_template
+    assert "raw variable-name differences" in reviewer_template
+    assert "proportionalities" in reviewer_template
+    assert "constant quotient" in reviewer_template
     consensus_properties = reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["properties"]
     assert "pairwise_symbolic_checks" in consensus_properties
     assert "best_written_proposer_id" in consensus_properties
@@ -998,6 +1004,98 @@ def test_consensus_rejects_manual_all_agree_by_string_or_spacing_comparison(tmp_
 
     assert result["status"] == "failed"
     assert "manual all_agree" in result["steps"][0]["error"]
+
+
+def test_blind_reference_accepts_manual_component_history_that_vanishes(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "x"},
+                pairwise_check_overrides={
+                    "used_sympy": False,
+                    "sympy_code": "",
+                    "notes": (
+                        "SymPy unavailable; performed analytic component-wise comparison. "
+                        "A and B share identical metric components after coordinate relabeling. "
+                        "All pairwise component differences vanish analytically."
+                    ),
+                    "check_method": "analytic",
+                    "check_history": [
+                        "Extracted metric components from A, B, and reference C.",
+                        "Expanded A - B component-wise; all components vanish analytically.",
+                        "Substituted relabeled C into B - C and A - C; all components vanish identically.",
+                    ],
+                },
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive x.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "x = y + z"},
+            }
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
+def test_blind_reference_accepts_checked_proportionality_relation(tmp_path):
+    fake = FakeBatchRunner(
+        [
+            consensus_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                accepted={"result": "rho = rho0*(a0/a)**n"},
+                pairwise_check_overrides={
+                    "used_sympy": True,
+                    "A_minus_B_zero": True,
+                    "B_minus_C_zero": False,
+                    "A_minus_C_zero": False,
+                    "true_count": 1,
+                    "sympy_code": "from sympy import expand, simplify\nsimplify(expand(A-B))",
+                    "notes": (
+                        "A-C and B-C are not exact expression differences because the "
+                        "reference is a proportionality relation. Numerical checks confirm "
+                        "both proposer results satisfy the relation."
+                    ),
+                    "check_method": "mixed",
+                    "sample_count": 10,
+                    "numerical_relative_error": 1e-15,
+                    "check_history": [
+                        "A-B: symbolic simplification gives zero.",
+                        "A-C: checked invariant rho*a**n is constant within numerical error.",
+                        "B-C: checked invariant rho*a**n is constant within numerical error.",
+                    ],
+                },
+            )
+        ]
+    )
+    config = minimal_config(
+        tmp_path,
+        proposer_count=2,
+        steps=[
+            {
+                "step_id": "blind_ref_eq_001",
+                "prompt": "Derive rho proportionality.",
+                "reviewer_reference_claim": {"id": "ref_eq_001", "latex": "\\rho \\propto a^{-n}"},
+            }
+        ],
+    )
+
+    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
 
 
 def test_consensus_accepts_main_agent_sympy_fallback_for_bad_reviewer_evidence(tmp_path):

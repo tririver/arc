@@ -1,7 +1,8 @@
 # Plan Workflow
 
 Use this workflow when a task to be planned is available.
-The output is a careful, reviewable plan. Do not start deriving equations here.
+The output is a careful, reviewable rolling plan. Do not start deriving
+equations here.
 
 Write artifacts under:
 
@@ -19,43 +20,16 @@ Write artifacts under:
 
 Read `<project-dir>/context.json`, the task-to-be-planned artifact, domain
 Markdown/JSON, domain summaries, and available domain graph files. The
-task-to-be-planned artifact may be a user-written task, generated idea, or
+task-to-be-planned artifact may be a user-written task, generated idea,
 source-extracted request artifact with source items, preflight findings, and
-locations. Keep the user's exact scientific intent visible in the plan.
+locations, or a plan-expansion request written by `calculate.md`. Keep the
+user's exact scientific intent visible in the plan.
 
 ## Phase 1: Gather Evidence
 
-Step 1: Use ARC paper and domain tools before internet search.
-
-Useful MCP tools:
-
-```text
-get_metadata
-get_references
-get_citers
-get_citer_count
-get_toc
-get_section
-search_full_text
-get_equation_context
-domain_get_summary
-domain_get_graph
-```
-
-Useful CLI commands:
-
-```bash
-arc-paper get-metadata <paper-id> --json
-arc-paper get-references <paper-id> --enrich --json
-arc-paper get-citers <paper-id> --limit 1000 --sort mostcited --json
-arc-paper get-citer-count <paper-id> --json
-arc-paper get-toc <paper-id> --json
-arc-paper get-section <paper-id> --section <section> --json
-arc-paper search-full-text <paper-id> --query "<phrase>" --context 1 --json
-arc-paper get-equation-context <paper-id> --query "<symbol-or-label>" --json
-arc-domain get-summary --seed-paper <paper-id> --json
-arc-domain get-graph --seed-paper <paper-id> --json
-```
+Step 1: Use ARC paper and domain tools before internet search. Use the CLI and
+MCP surfaces documented in `manuals/arc-paper.md` and `manuals/arc-domain.md`;
+read `manuals/arc-mcp.md` before calling MCP tools.
 
 Step 2: Use internet search only after ARC checks when literature may be
 uncached, recent, outside arXiv/INSPIRE, or ambiguous.
@@ -83,33 +57,48 @@ item could be either foundation or a derived claim, put it in
 `claims_to_check`. Do not accept a source-derived equation as foundation merely
 because it appears early, is boxed, or is used later in the source.
 
-## Phase 3: Build The Calculation Plan
+## Phase 3: Build The Rolling Calculation Plan
 
 Step 1: Make the first calculation step the first nontrivial derivation after
 the accepted foundation setup.
 
-Step 2: Break difficult derivations into small steps that a not-strong agent
-can complete. As soft guidance, a typical research project should have at least 20 steps.
-Use fewer only when the calculation is genuinely smaller. If a
-step needs multiple identities, limits, field redefinitions, or approximations,
-split it into substeps.
+Step 2: Plan adaptively. Use the largest coherent semantic chunks that current
+agents can check reliably, then split only when the chunk is too hard or too
+ambiguous. Do not make one equation equal one step by default. Stronger agents
+should naturally receive larger chunks, and weaker agents should receive smaller
+chunks.
 
-For equation-heavy work, treat each new nontrivial equation, identity, limit,
-or claimed relation as its own check or derivation step by default. A step may
-contain multiple equations only when they form a short algebraic chain for the
-same target quantity and each equation follows immediately from the previous
-one. If a step contains more than one displayed target equation, state why those
-equations must be checked together. Do not group equations merely because they
-appear in the same section, topic, or source paragraph; section-level grouping
-is for reading order, not calculation-step boundaries.
+Use these target budgets as planning priors, not hard caps:
 
-Before execution, count the nontrivial equations or claims to derive/check, the
-planned calculation/check steps, and the largest number of target equations in
-one step. If the plan has far fewer steps than nontrivial equations or any step
-has an unjustified bundle of target equations, print `WARNING: plan too coarse`
-and revise the plan before running consensus.
+```text
+exam-style exercise: 3-5 detailed steps
+graduate take-home problem: 5-10 detailed steps
+simple research task: 10-20 detailed steps
+challenging research task: 20-50 detailed steps
+```
 
-Step 3: For every step, specify:
+For source-checking tasks with many equations, group equations by meaning and
+dependency, not by raw equation count. A step may contain several checkpoint
+equations when they are one derivation chain, one physical argument, one
+quantity family, one approximation regime, or one source-context unit. Each
+checkpoint must have its own target quantity and verification target. If one
+step contains multiple checkpoint equations, state why they belong together and
+how the reviewer should map checkpoint names to reviewer-only reference claims.
+
+Step 3: Split the plan into near-term detailed work and later macro work:
+
+```text
+detailed_steps: executable steps for the next coherent batch
+macro_plan: rough later blocks, not executable until expanded
+```
+
+Make only the first few steps detailed enough to run with high confidence. For
+later work, keep a macro-plan with the dependency order, source ranges, likely
+checkpoints, expected inputs, difficulty estimate, and expansion trigger. This
+lets later planning use accepted results, observed failure modes, and measured
+agent ability instead of guessing the entire project upfront.
+
+Step 4: For every `detailed_steps[]` entry, specify:
 
 ```text
 step_id
@@ -118,40 +107,92 @@ goal
 quantity_to_calculate
 quantity_dependencies
 allowed_inputs
+source_context_policy
+proposer_reference_packet
+checkpoints
 substeps
 expected_output
 verification
+expands_macro_block_id
 ```
 
-Step 4: At the end of every step, make the quantity contract explicit:
+`source_context_policy` must say what context is visible to proposers. For
+source-checking, provide full context up to the checkpoint being checked, but
+not the checkpoint equation itself and not later source text. If a step has
+multiple checkpoints, prepare separate redacted context slices for each
+checkpoint. If a reference paper is relevant, attach a `proposer_reference_packet`
+with the allowed paper sections, equations, or snippets the proposers may use.
+Validation-only target formulas remain reviewer-only.
+
+`checkpoints[]` may contain one or many items:
+
+```text
+checkpoint_id
+source_item_ids
+quantity_to_calculate
+dependencies
+proposer_context_slice
+reviewer_reference_claim_ids
+verification
+```
+
+Step 5: At the end of every detailed step, make the quantity contract explicit:
 calculate which quantity, in terms of which quantity, and what is not allowed
-as an input. Do not disclose the exact expected expression or expected final formula.
-Instead, say to derive the target quantity in terms of named dependencies.
-If this cannot be stated clearly, split the step again.
+as an input. Do not disclose the exact expected expression or expected final
+formula. Instead, say to derive the target quantity in terms of named
+dependencies. If this cannot be stated clearly, split the step again.
 
 For equations quoted from a reference or collaborator note that need checking,
 do not disclose the target reference equation in `prompt`, `allowed_inputs`, or
-`expected_output`. Make the step a blind reference check: proposers derive the
-quantity from named dependencies, and the execute workflow supplies the target
-only as a reviewer-only reference claim.
+`expected_output`. Make each checkpoint a blind reference check: proposers
+derive the quantity from named dependencies, and the execute workflow supplies
+targets only as reviewer-only reference claims.
 
-Step 5: Write `plan.json` and render the complete detailed plan into
-`initial-plan.md`. The initial plan Markdown is not a status stub: it must be
-the full step-by-step human-readable plan, including the evidence summary,
-foundation boundary, validation-only results, every planned step, each step's
-quantity contract, allowed inputs, substeps, expected output, and verification
-method. Write this initial detailed plan directly to both
+Step 6: For every `macro_plan[]` entry, specify:
+
+```text
+macro_block_id
+goal
+source_range
+dependency_boundary
+likely_checkpoints
+expected_inputs_from_detailed_steps
+difficulty_estimate: easy | moderate | hard | unknown
+suggested_step_budget
+expansion_trigger
+notes_for_later_planning
+```
+
+Macro blocks are not consensus steps. They are promises to replan later with
+more evidence.
+
+Step 7: When this workflow is called with a plan-expansion request, preserve
+accepted earlier detailed steps and expand only the requested macro block or
+blocked region. Use current evidence: accepted outputs, reviewer reports,
+retry counts, blocked reasons, useful context packets, and observed agent
+ability. If agents handled broad chunks well, expand larger chunks. If agents
+struggled, split more finely. Record why granularity changed.
+
+Step 8: Write `plan.json` and render the current rolling plan. On the first
+planning pass, write the initial snapshot directly to both
 `<project-dir>/calculate/<run-id>/initial-plan.md` and
-`<project-dir>/initial-plan.md`. Also write the current complete plan view to
-both `<project-dir>/calculate/<run-id>/latest-plan.md` and
-`<project-dir>/latest-plan.md`. The JSON is the source of truth for later
-workflow phases, but the Markdown must be complete enough for a human to review
-the plan without opening the JSON.
+`<project-dir>/initial-plan.md`. On plan-expansion passes, do not rewrite
+`initial-plan.md`; preserve it as the first snapshot. Always write the current
+complete plan view to both `<project-dir>/calculate/<run-id>/latest-plan.md`
+and `<project-dir>/latest-plan.md`. The Markdown is not a status stub: it must
+show the evidence summary, foundation boundary, validation-only results,
+`detailed_steps`, `macro_plan`, each detailed step's quantity contracts,
+context policy, checkpoints, allowed inputs, substeps, expected output,
+verification method, and plan-expansion history when present. The JSON is the
+source of truth for later workflow phases, but the Markdown must be complete
+enough for a human to review the current detailed work and macro-plan without
+opening the JSON.
 
 After writing the project-level Markdown reports, call MCP
-`md2pdf(input="<project-dir>/initial-plan.md")` and
-`md2pdf(input="<project-dir>/latest-plan.md")`. Each starts a background PDF
-job; record returned job ids if present and do not wait before continuing.
+`md2pdf(input="<project-dir>/latest-plan.md")`. On the first planning pass,
+also call `md2pdf(input="<project-dir>/initial-plan.md")`. Each starts a
+background PDF job; record returned job ids if present and do not wait before
+continuing.
 
 ## Phase 4: Review The Plan
 
@@ -165,7 +206,9 @@ Step 2: The review must check:
 first-principles are separated from derived results
 useful results are treated skeptically
 source coverage is sufficient
-steps are small enough for weaker agents
+detailed steps fit observed or expected agent ability
+macro-plan blocks are ordered by real dependencies
+checkpoint grouping preserves context and reviewer precision
 the first calculation step is clear
 difficult steps have enough substeps
 ```

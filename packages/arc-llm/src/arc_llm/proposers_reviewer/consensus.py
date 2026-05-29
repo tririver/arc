@@ -519,7 +519,9 @@ def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[st
                 "the foundation file, accepted prior step outputs, or accepted locked_outputs. If you need an external "
                 "identity or intermediate result, derive it here. External sources may use "
                 "different conventions; map notation back to foundation conventions before "
-                "using it. Do the calculation very clearly step by step; never skip a step. "
+                "using it. For coordinate transformations or relabeling, explicitly track "
+                "which symbols are old coordinates and which are newly introduced symbols "
+                "before substituting. Do the calculation very clearly step by step; never skip a step. "
                 "Write all mathematical expressions in derivation, assumptions, and final_result "
                 "as display-ready LaTeX inside Markdown math delimiters or as LaTeX strings in "
                 "JSON fields; avoid ASCII-only math such as rho_2, eta_prime, or T_ab when a "
@@ -681,6 +683,15 @@ def _reviewer_config(
                 "differences reducing to zero; never accept by string equality, spacing, "
                 "formatting, or visual comparison. If you cannot write those explicit "
                 "differences, use the numerical fallback instead. "
+                "For coordinate transformations or relabeling, first apply the "
+                "source-declared old/new variable definitions from caller_context "
+                "and the step prompt, then compare metric components or scalar "
+                "expressions. Do not infer a source typo from raw variable-name "
+                "differences until the declared substitution has been checked. "
+                "For reference claims written as proportionalities, approximations, "
+                "or implicit relations, convert C into a testable relation such as "
+                "a constant quotient, residual, or stated limiting condition, then "
+                "document A-C and B-C relation checks. "
                 "If an analytic check cannot be done, perform numerical checks on at least "
                 "10 randomly selected data points and report check_method=numerical, "
                 "sample_count, numerical_relative_error as a relative error, and the sampled check history. "
@@ -1174,7 +1185,8 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
     reported_true_count = checks.get("true_count")
     if isinstance(reported_true_count, int):
         pairwise_true_count = min(pairwise_true_count, reported_true_count)
-    if pairwise_true_count < 2:
+    relation_reference_evidence = _has_relation_reference_evidence(checks)
+    if pairwise_true_count < 2 and not relation_reference_evidence:
         raise ValueError("all_agree requires at least two true pairwise symbolic checks")
     method = str(checks.get("check_method", "")).strip().lower()
     if method not in {"analytic", "numerical", "mixed"}:
@@ -1201,6 +1213,10 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
             "differences reduce to zero" in lowered_evidence
             or "difference reduce to zero" in lowered_evidence
             or "reduce to zero symbolically" in lowered_evidence
+            or "differences vanish analytically" in lowered_evidence
+            or "differences vanish identically" in lowered_evidence
+            or "components vanish analytically" in lowered_evidence
+            or "components vanish identically" in lowered_evidence
         )
         has_term_by_term_check = "term-by-term" in lowered_evidence and (
             "overall factor" in lowered_evidence
@@ -1230,6 +1246,48 @@ def _validate_all_agree_pairwise_checks(consensus: Mapping[str, Any]) -> None:
     history = checks.get("check_history")
     if not isinstance(history, list) or not history:
         raise ValueError("all_agree requires documented pairwise check history")
+
+
+def _has_relation_reference_evidence(checks: Mapping[str, Any]) -> bool:
+    if checks.get("A_minus_B_zero") is not True:
+        return False
+    method = str(checks.get("check_method", "")).strip().lower()
+    if method not in {"numerical", "mixed"}:
+        return False
+    sample_count = checks.get("sample_count")
+    relative_error = checks.get("numerical_relative_error")
+    if (
+        not isinstance(sample_count, int)
+        or isinstance(sample_count, bool)
+        or sample_count < 10
+        or not isinstance(relative_error, (int, float))
+        or isinstance(relative_error, bool)
+        or not math.isfinite(float(relative_error))
+    ):
+        return False
+    notes = str(checks.get("notes", ""))
+    history = checks.get("check_history")
+    history_text = "\n".join(str(item) for item in history) if isinstance(history, list) else ""
+    lowered_evidence = f"{notes}\n{history_text}".lower()
+    relation_markers = [
+        "proportionality",
+        "implicit relation",
+        "constraint relation",
+        "satisfy the relation",
+        "satisfies the relation",
+    ]
+    has_relation_marker = any(marker in lowered_evidence for marker in relation_markers)
+    has_reference_checks = (
+        ("a-c" in lowered_evidence or "a - c" in lowered_evidence)
+        and ("b-c" in lowered_evidence or "b - c" in lowered_evidence)
+    )
+    has_satisfaction_evidence = (
+        "constant within" in lowered_evidence
+        or "relative error" in lowered_evidence
+        or "numerical error" in lowered_evidence
+        or "satisfy" in lowered_evidence
+    )
+    return has_relation_marker and has_reference_checks and has_satisfaction_evidence
 
 
 def _validate_reference_disagrees_pairwise_checks(

@@ -6,13 +6,17 @@ Write artifacts under:
 ```text
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
 <project-dir>/calculate/<run-id>/execute/<consensus-run-id>/
+<project-dir>/calculate/<run-id>/plan-expansion-requests/
 <project-dir>/calculate/<run-id>/calculation-report.md
 <project-dir>/calculation-report.md
 ```
 Execution reports must use `schema_version: "arc.calculate.v1"`.
 
 ## Phase 1: Build Consensus Config
-Read `plan.json` and `foundation/latest.json`. Create:
+Read `plan.json` and `foundation/latest.json`. Execute only the current
+`detailed_steps` (or legacy `steps` when older plans do not yet use rolling
+plan fields). Do not execute `macro_plan` entries until `plan.md` expands them
+into detailed steps. Create:
 ```json
 {
   "schema_version": "arc.llm.proposers_reviewer_consensus.config.v1",
@@ -109,10 +113,20 @@ the active gate.
 
 ## Phase 3: Add New Calculation Steps
 
-Append every `plan.json.steps[]` entry with `kind: "new_calculation"` after all
-checks. Each prompt must include exact allowed inputs, accepted prior step
-outputs, expected output, and verification target. Later steps must not use
-unaccepted or blocked outputs.
+Append every executable detailed step with `kind: "new_calculation"` after all
+checks. Prefer `plan.json.detailed_steps[]`; fall back to `plan.json.steps[]`
+only for legacy plans. Each prompt must include exact allowed inputs, accepted
+prior step outputs, expected output, verification target, source context
+policy, and checkpoint list. Later steps must not use unaccepted or blocked
+outputs.
+
+If a detailed step has multiple checkpoints, build one proposer prompt that
+names the checkpoint contracts without revealing the target formulas. Put all
+checkpoint target formulas in reviewer-only `reviewer_reference_claim` data,
+with stable checkpoint ids so the reviewer can report which checkpoints are
+verified, disagree, or unresolved. Use the plan's redacted context slices:
+proposers may see source context up to each checkpoint, but not the checkpoint
+equation itself or later source text.
 
 For each post-check new calculation that is not checking a reference formula,
 turn source access on by default unless the user requested otherwise:
@@ -187,6 +201,37 @@ version with a concise derived quantity record, keeping paper-sourced equations
 and derived quantities visibly separate in `latest.json`, and refresh the
 latest-foundation Markdown/PDF artifacts the same way.
 
+When all current detailed steps are accepted and `plan.json.macro_plan` still
+has unresolved blocks, create a plan-expansion request instead of inventing new
+steps inside this workflow. The request must include:
+
+```json
+{
+  "schema_version": "arc.plan_expansion_request.v1",
+  "request_type": "expand_macro_block",
+  "target_macro_block_id": "<macro_block_id>",
+  "current_plan_path": "<project-dir>/calculate/<run-id>/plan.json",
+  "foundation_path": "<project-dir>/calculate/<run-id>/foundation/latest.json",
+  "accepted_outputs": ["accepted step ids and artifact paths"],
+  "reviewer_reports": ["review artifact paths"],
+  "observed_agent_ability": {
+    "accepted_step_count": 0,
+    "retry_counts": {},
+    "blocked_or_failed_steps": [],
+    "useful_context_packets": [],
+    "failure_modes": []
+  },
+  "request": "Expand this macro block into detailed steps using current evidence."
+}
+```
+
+Write it under
+`<project-dir>/calculate/<run-id>/plan-expansion-requests/`, then run
+`plan.md` again with that request as the task-to-be-planned artifact. The
+planning workflow owns new step boundaries, checkpoint grouping, context
+packets, and revised `latest-plan.md`. After `plan.md` updates the plan,
+create a new consensus config for the next detailed batch.
+
 ## Phase 5: Run Consensus And Refine Blocks
 
 Run:
@@ -216,19 +261,23 @@ ask the human expert.
 If a standard calculation step returns `blocked_for_user` after the configured
 attempt limit, enter `blocked_refinement`: review plan.json, reviewer reports,
 and, if needed, proposer calculations. Treat the block as evidence the step is
-too difficult unless already atomic.
+too difficult unless already atomic. Do not write replacement plan logic inside
+`calculate.md`.
 
-If the blocked step can be split, revise the plan into smaller steps. Each
-replacement step must have one clear quantity, inputs, output, and check. The
-first replacement step should stop at the last calculation all proposers can
-agree on. If full expression splitting is hard, first use controlled limits or projections such as one branch, one contour choice, one contraction, leading
-power only, equal-mass/equal-scale limit, or coefficient-stripped form before returning to the full expression. Append each blocked_refinement event to the
-plan revision history inside `# Appendix 2: Calculation Status`. Whenever
-`plan.json` changes, render the current plan to both
-`<project-dir>/calculate/<run-id>/latest-plan.md` and
-`<project-dir>/latest-plan.md`, then call
-`md2pdf(input="<project-dir>/latest-plan.md")` in the background. Do not rewrite
-`initial-plan.md` after the first snapshot.
+For any split, refinement, or broader replanning need, write a
+`plan-expansion-request` artifact and call `plan.md` recursively. Use
+`request_type: "refine_blocked_step"` for blocked steps and include the blocked
+step, last agreed checkpoint, proposer reports, reviewer analysis, retry count,
+and suspected failure mode. Ask `plan.md` to produce a better detailed plan for
+that blocked region using current evidence. The replacement plan may split the
+step, add controlled limits or projections such as one branch, one contour
+choice, one contraction, leading power only, equal-mass/equal-scale limit, or
+coefficient-stripped form, or keep the step atomic and require human input.
+
+After `plan.md` updates `plan.json`, confirm that `latest-plan.md` was
+refreshed by the planning workflow. Do not rewrite `initial-plan.md` after the
+first snapshot. Append each blocked_refinement event to the plan revision
+history inside `# Appendix 2: Calculation Status`.
 
 If the block is caused by missing or wrong premises, classify it as
 `foundation_inadequate`, `foundation_conflict`, or `plan_wrong`. For
