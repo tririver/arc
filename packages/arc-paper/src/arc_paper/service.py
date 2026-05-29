@@ -403,85 +403,6 @@ def search_parsed_source(
     return ok(hits, provider="local-cache", cache="hit", query=query, limit=limit, case_sensitive=case_sensitive)
 
 
-def validate_note_check(run_dir: str | Path) -> dict[str, Any]:
-    base = Path(run_dir)
-    missing = []
-    required = [
-        base / "note-check-triage.json",
-        base / "plan.json",
-        base / "foundation" / "latest.json",
-        base / "consensus" / "config.json",
-        base / "consensus" / "results.json",
-    ]
-    for path in required:
-        if not path.is_file():
-            missing.append(_display_run_path(base, path))
-    triage_path = base / "note-check-triage.json"
-    results_path = base / "consensus" / "results.json"
-    triage = read_json(triage_path) if triage_path.is_file() else None
-    consensus = read_json(results_path) if results_path.is_file() else None
-    violations = []
-    status_counts: dict[str, int] = {}
-    allowed = {"verified", "reference_disagrees", "unresolved", "context_only", "human_resolved"}
-    if isinstance(triage, dict):
-        for note in triage.get("notes") or []:
-            parsed_path_raw = str(note.get("parsed_source_path") or "")
-            if not parsed_path_raw:
-                missing.append("parsed source JSON")
-                continue
-            parsed_path = Path(parsed_path_raw)
-            if not parsed_path.is_file():
-                missing.append(str(parsed_path) if str(parsed_path) else "parsed source JSON")
-        consensus_by_step = _consensus_steps(consensus)
-        for claim in triage.get("claims_to_check") or []:
-            claim_id = str(claim.get("id") or claim.get("equation_id") or "<unknown>")
-            status = str(claim.get("status") or "")
-            status_counts[status] = status_counts.get(status, 0) + 1
-            if status not in allowed:
-                violations.append(f"{claim_id}: invalid status {status!r}")
-            if status == "human_resolved":
-                violations.extend(_human_resolution_violations(claim_id, claim))
-                continue
-            step_id = str(claim.get("consensus_step_id") or "")
-            if not step_id:
-                violations.append(f"{claim_id}: missing consensus_step_id")
-                continue
-            if step_id not in consensus_by_step:
-                violations.append(f"{claim_id}: missing consensus result for {step_id}")
-                continue
-            if status == "verified" and consensus_by_step[step_id] != "all_agree":
-                violations.append(f"{claim_id}: verified requires consensus all_agree for {step_id}")
-    elif triage_path.is_file():
-        violations.append("note-check-triage.json is not valid JSON")
-
-    if missing or violations:
-        result = err("note_check_validation_failed", "Note-check run is missing required artifacts or valid consensus statuses.")
-        result["missing"] = missing
-        result["violations"] = violations
-        return result
-    return ok(
-        {
-            "run_dir": str(base),
-            "claims_checked": sum(status_counts.values()),
-            "status_counts": status_counts,
-        },
-        provider="local-cache",
-    )
-
-
-def _human_resolution_violations(claim_id: str, claim: Mapping[str, Any]) -> list[str]:
-    resolution = claim.get("resolution")
-    if not isinstance(resolution, dict):
-        return [f"{claim_id}: human_resolved requires resolution object"]
-    violations = []
-    for field in ("resolved_by", "resolved_at", "type", "rationale"):
-        if not str(resolution.get(field) or "").strip():
-            violations.append(f"{claim_id}: human_resolved resolution requires {field}")
-    if not str(resolution.get("corrected_latex") or resolution.get("accepted_result") or "").strip():
-        violations.append(f"{claim_id}: human_resolved resolution requires corrected_latex or accepted_result")
-    return violations
-
-
 def _read_parsed_source(source_id: str) -> dict[str, Any] | None:
     parsed = read_json(parsed_source_cache_path(source_id))
     return parsed if isinstance(parsed, dict) else None
@@ -582,24 +503,6 @@ def _text_contains(text: str, query: str, *, case_sensitive: bool) -> bool:
     if case_sensitive:
         return query in text
     return query.lower() in text.lower()
-
-
-def _consensus_steps(consensus: Any) -> dict[str, str]:
-    if not isinstance(consensus, dict):
-        return {}
-    steps = consensus.get("steps") or consensus.get("results") or []
-    out = {}
-    for step in steps:
-        if isinstance(step, dict) and step.get("step_id"):
-            out[str(step["step_id"])] = str(step.get("status") or "")
-    return out
-
-
-def _display_run_path(base: Path, path: Path) -> str:
-    try:
-        return str(path.relative_to(base))
-    except ValueError:
-        return str(path)
 
 
 def _enrich_search_hits_with_cached_metadata(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:

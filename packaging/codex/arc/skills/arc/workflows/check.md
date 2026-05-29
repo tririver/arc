@@ -121,23 +121,15 @@ handling, human-resolved continuation, and `calculation-report.md` generation.
 
 ## Phase 5: Validate
 
-Step 1: After `calculate.md` produces a report or blocked report, write or
-update `<project-dir>/calculate/<run-id>/note-check-triage.json` as the
-validation status map from the final plan, source items, consensus results, and
-human-resolved items. This is not input to `plan.md`; the planning input remains
-`task-to-be-planned.json`.
+Step 1: After `calculate.md` produces a report or blocked report, update
+`<project-dir>/work-note.md` with the final validation status for planned source
+items, consensus results, and human-resolved items.
 
-Step 2: Run:
+Step 2: Treat the report as final only after `work-note.md` records complete
+coverage. If coverage cannot be completed, keep the report as `blocked_partial`
+and include the remaining gaps.
 
-```bash
-arc-paper validate-note-check <project-dir>/calculate/<run-id> --json
-```
-
-Step 3: Treat the report as final only after validation passes. If validation
-fails and the run cannot be completed, keep the report as `blocked_partial` and
-include the validation errors.
-
-Step 4: If checking shows that a parsed equation is problematic, ask the user
+Step 3: If checking shows that a parsed equation is problematic, ask the user
 to choose either an ARC paper annotation or a re-parse.
 
 For annotation:

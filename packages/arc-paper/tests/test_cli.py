@@ -1,6 +1,8 @@
 import io
 import json
 
+import pytest
+
 from arc_paper import cli
 
 
@@ -25,6 +27,13 @@ def test_cli_safe_dir_name(capsys):
 
     output = json.loads(capsys.readouterr().out)
     assert output["data"] == "0911.3380_x_astro-ph_0610514"
+
+
+def test_cli_rejects_removed_validate_note_check_command(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["validate-note-check", "run-dir", "--json"])
+
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_cli_llm_infer_main_references(monkeypatch, capsys):

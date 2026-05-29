@@ -138,10 +138,6 @@ def main(argv: list[str] | None = None) -> int:
     search_parsed.add_argument("--limit", type=int, default=20)
     search_parsed.add_argument("--case-sensitive", action="store_true")
     search_parsed.add_argument("--json", action="store_true")
-    validate_note_check = sub.add_parser("validate-note-check")
-    validate_note_check.add_argument("run_dir")
-    validate_note_check.add_argument("--json", action="store_true")
-
     cache_cmd = sub.add_parser("cache")
     cache_sub = cache_cmd.add_subparsers(dest="cache_command", required=True)
     cache_list = cache_sub.add_parser("list")
@@ -370,9 +366,6 @@ def _dispatch(args: argparse.Namespace) -> Any:
             limit=args.limit,
             case_sensitive=args.case_sensitive,
         )
-    if command == "validate-note-check":
-        return service.validate_note_check(args.run_dir)
-
     paper_ids = args.paper_ids[0] if len(args.paper_ids) == 1 else args.paper_ids
     if command == "get-title":
         return service.get_title(paper_ids, refresh=args.refresh)
