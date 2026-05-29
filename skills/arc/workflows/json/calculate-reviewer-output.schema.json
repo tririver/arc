@@ -1,0 +1,230 @@
+{
+  "type": "object",
+  "required": [
+    "schema_version",
+    "controller",
+    "proposer_messages",
+    "review_payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "arc.llm.review_envelope.v1"
+    },
+    "controller": {
+      "type": "object",
+      "required": [
+        "message",
+        "stop_requested",
+        "stop_reason"
+      ],
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "stop_requested": {
+          "type": "boolean"
+        },
+        "stop_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "proposer_messages": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": false
+    },
+    "review_payload": {
+      "type": "object",
+      "required": [
+        "consensus"
+      ],
+      "properties": {
+        "consensus": {
+          "type": "object",
+          "required": [
+            "status",
+            "accepted_result",
+            "agreed_proposer_ids",
+            "likely_wrong_proposer_ids",
+            "recalculate_proposer_ids",
+            "validity_scope",
+            "analysis",
+            "agreement_assessment",
+            "best_written_proposer_id",
+            "best_written_selection_reason",
+            "workflow_action"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": []
+            },
+            "accepted_result": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agreed_proposer_ids": {
+              "type": "array",
+              "items": {
+                "enum": []
+              }
+            },
+            "likely_wrong_proposer_ids": {
+              "type": "array",
+              "items": {
+                "enum": []
+              }
+            },
+            "recalculate_proposer_ids": {
+              "type": "array",
+              "items": {
+                "enum": []
+              }
+            },
+            "validity_scope": {
+              "type": "string"
+            },
+            "analysis": {
+              "type": "string"
+            },
+            "best_written_proposer_id": {
+              "anyOf": [
+                {
+                  "enum": []
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "best_written_selection_reason": {
+              "type": "string"
+            },
+            "workflow_action": {
+              "type": "object",
+              "required": [
+                "action",
+                "requires_human",
+                "issue_type",
+                "proposed_revision",
+                "reason"
+                ,"expert_question"
+              ],
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "continue",
+                    "pause_for_human",
+                    "revise_plan",
+                    "split_step",
+                    "retry"
+                  ]
+                },
+                "requires_human": {
+                  "type": "boolean"
+                },
+                "issue_type": {
+                  "type": "string",
+                  "enum": [
+                    "none",
+                    "work_note_inadequate",
+                    "work_note_conflict",
+                    "plan_wrong",
+                    "step_too_coarse",
+                    "target_ambiguous",
+                    "source_mapping_error",
+                    "calculation_disagreement",
+                    "reference_disagreement",
+                    "worker_failure",
+                    "other"
+                  ]
+                },
+                "proposed_revision": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "expert_question": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "agreement_assessment": {
+              "type": "object",
+              "required": [
+                "target_quantity_match",
+                "convention_match",
+                "declared_scope_match",
+                "agreement_covers_full_target",
+                "comparison_summary",
+                "accepted_by_reviewer_judgment",
+                "tool_checks",
+                "sanity_checks",
+                "special_limit_only",
+                "notes"
+              ],
+              "properties": {
+                "target_quantity_match": {
+                  "type": "boolean"
+                },
+                "convention_match": {
+                  "type": "boolean"
+                },
+                "declared_scope_match": {
+                  "type": "boolean"
+                },
+                "agreement_covers_full_target": {
+                  "type": "boolean"
+                },
+                "comparison_summary": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "accepted_by_reviewer_judgment": {
+                  "type": "boolean"
+                },
+                "tool_checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "sanity_checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "special_limit_only": {
+                  "type": "boolean"
+                },
+                "notes": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

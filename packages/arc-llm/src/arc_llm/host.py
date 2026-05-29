@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .providers.config import ProviderConfigError, load_provider_config, select_configured_provider
-
 
 @dataclass(frozen=True)
 class HostDetection:
@@ -58,21 +56,8 @@ def select_llm_provider(
     host = detect_host(env=env, process_chain=process_chain)
     if explicit_provider:
         return ProviderSelection(provider=explicit_provider, host=host, signals=["explicit"])
-    try:
-        config = load_provider_config(env=env)
-        if native := _host_native_provider(host):
-            return ProviderSelection(provider=native, host=host, signals=host.signals)
-        configured = select_configured_provider(env=env)
-        if configured:
-            return ProviderSelection(
-                provider=configured.id,
-                host=host,
-                signals=[f"provider-config:{config.path}:{configured.id}"],
-            )
-    except ProviderConfigError as exc:
-        if native := _host_native_provider(host):
-            return ProviderSelection(provider=native, host=host, signals=[*host.signals, f"provider-config-error:{exc}"])
-        return ProviderSelection(provider="manual", host=host, signals=[f"provider-config-error:{exc}"])
+    if native := _host_native_provider(host):
+        return ProviderSelection(provider=native, host=host, signals=host.signals)
     return ProviderSelection(provider="manual", host=host, signals=host.signals)
 
 

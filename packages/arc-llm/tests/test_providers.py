@@ -53,6 +53,42 @@ def test_codex_generate_text_reads_last_message(monkeypatch):
     assert CodexCliProvider().generate_text("prompt") == "plain text"
 
 
+def test_codex_passes_provider_env_to_subprocess(monkeypatch):
+    captured = {}
+    provider_env = {"ARC_CODEX_SANDBOX": "read-only", "CUSTOM_SETTING": "value"}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        output_path = cmd[cmd.index("--output-last-message") + 1]
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("plain text")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert CodexCliProvider(env=provider_env).generate_text("prompt") == "plain text"
+    assert captured["env"] == provider_env
+    assert captured["env"] is not provider_env
+
+
+def test_codex_timeout_uses_provider_specific_env(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        output_path = cmd[cmd.index("--output-last-message") + 1]
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("plain text")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert CodexCliProvider(env={"ARC_LLM_TIMEOUT_SECONDS": "30", "ARC_CODEX_TIMEOUT_SECONDS": "12.5"}).generate_text(
+        "prompt"
+    ) == "plain text"
+    assert captured["timeout"] == 12.5
+
+
 def test_codex_options_can_be_overridden_by_env(monkeypatch):
     captured = {}
 
@@ -225,6 +261,34 @@ def test_claude_generate_text_returns_stdout(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert ClaudeCliProvider().generate_text("prompt") == "plain text"
+
+
+def test_claude_passes_provider_env_to_subprocess(monkeypatch):
+    captured = {}
+    provider_env = {"ARC_CLAUDE_EFFORT": "low", "CUSTOM_SETTING": "value"}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert ClaudeCliProvider(env=provider_env).generate_text("prompt") == "plain text"
+    assert captured["env"] == provider_env
+    assert captured["env"] is not provider_env
+
+
+def test_claude_timeout_uses_generic_env(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert ClaudeCliProvider(env={"ARC_LLM_TIMEOUT_SECONDS": "30"}).generate_text("prompt") == "plain text"
+    assert captured["timeout"] == 30.0
 
 
 def test_claude_options_can_be_overridden_by_env(monkeypatch):

@@ -6,7 +6,6 @@ import sys
 import time
 from typing import Any
 
-from . import server
 from .jobs import MCPJobManager, cache_root
 from .worker import run_job
 
@@ -22,7 +21,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("job_id")
         args = parser.parse_args(argv[1:])
         return run_job(args.job_id)
-    return server.run_mcp_server()
+    return _server().run_mcp_server()
+
+
+def _server():
+    from . import server
+
+    return server
 
 
 def _jobs(argv: list[str]) -> int:

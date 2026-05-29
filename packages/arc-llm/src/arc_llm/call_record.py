@@ -9,14 +9,18 @@ ARC_LLM_CALL_RECORD_SCHEMA_VERSION = "arc.llm.call_record.v1"
 
 ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "additionalProperties": True,
+    "additionalProperties": False,
     "required": [
         "schema_version",
         "provider_requested",
+        "model_requested",
+        "model_tier_requested",
         "provider_used",
         "model_used",
         "fallback_index",
         "attempt",
+        "host",
+        "signals",
         "attempts",
     ],
     "properties": {
@@ -34,16 +38,24 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "additionalProperties": True,
-                "required": ["provider", "model", "fallback_index", "attempt", "status"],
+                "additionalProperties": False,
+                "required": [
+                    "provider",
+                    "model",
+                    "fallback_index",
+                    "attempt",
+                    "status",
+                    "error_type",
+                    "message",
+                ],
                 "properties": {
                     "provider": {"type": "string"},
                     "model": {"type": ["string", "null"]},
                     "fallback_index": {"type": "integer", "minimum": 0},
                     "attempt": {"type": "integer", "minimum": 1},
                     "status": {"type": "string"},
-                    "error_type": {"type": "string"},
-                    "message": {"type": "string"},
+                    "error_type": {"type": ["string", "null"]},
+                    "message": {"type": ["string", "null"]},
                 },
             },
         },
@@ -52,12 +64,7 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
 
 
 def allow_arc_llm_call_record(schema: dict[str, Any]) -> dict[str, Any]:
-    result = deepcopy(schema)
-    if result.get("type") == "object":
-        properties = result.setdefault("properties", {})
-        if isinstance(properties, dict):
-            properties.setdefault(ARC_LLM_CALL_RECORD_FIELD, deepcopy(ARC_LLM_CALL_RECORD_SCHEMA))
-    return result
+    return deepcopy(schema)
 
 
 def attach_arc_llm_call_record(payload: dict[str, Any], call_record: dict[str, Any]) -> dict[str, Any]:

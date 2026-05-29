@@ -468,7 +468,8 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "summary_batch_export" in by_name
     assert "summary_batch_retry_failed" in by_name
     provider_description = by_name["llm_generate_summary"].inputSchema["properties"]["provider"]["description"]
-    assert "configured provider id" in provider_description
+    assert "built-in provider" in provider_description
+    assert "configured provider id" not in provider_description
 
 
 def test_call_tool_dispatches_summary_batch_tools(monkeypatch, tmp_path):

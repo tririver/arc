@@ -4,11 +4,11 @@ from pathlib import Path
 from typing import Annotated, Any, Callable
 
 from arc_domain import service as domain_service
+from arc_llm.host import detect_host, select_llm_provider
 from arc_llm.runner import resolve_llm_config
 from arc_paper import service
 from arc_paper.batch.db import BatchDB
 from arc_paper.batch.runner import export_batch, prefetch_batch, run_batch
-from arc_paper.host import detect_host, select_llm_provider
 from arc_paper.ids import normalize_paper_id
 from arc_typeset import md2pdf as typeset_md2pdf
 from arc_typeset import translate as typeset_translate
@@ -56,7 +56,7 @@ DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific inter
 DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by llm_domain_build or arc-domain init."
 CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIRE, clamped to 1..1000."
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
-LLM_PROVIDER_DESCRIPTION = "LLM provider: auto, a built-in provider (codex-cli, claude-cli, manual), or a configured provider id."
+LLM_PROVIDER_DESCRIPTION = "LLM provider: auto or a built-in provider (codex-cli, claude-cli, manual)."
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
 LLM_MODEL_TIER_DESCRIPTION = "Optional LLM model tier: low, medium, or high."
 BACKGROUND_DESCRIPTION = (

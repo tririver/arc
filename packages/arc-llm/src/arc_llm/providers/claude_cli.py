@@ -32,7 +32,18 @@ class ClaudeCliProvider:
         if model:
             cmd.extend(["--model", model])
 
-        result = subprocess.run(cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(self.env),
+                timeout=_timeout_seconds(self.env, "ARC_CLAUDE_TIMEOUT_SECONDS"),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
         if result.returncode != 0:
             raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
         return _extract_json(result.stdout)
@@ -42,7 +53,18 @@ class ClaudeCliProvider:
         if model:
             cmd.extend(["--model", model])
 
-        result = subprocess.run(cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(self.env),
+                timeout=_timeout_seconds(self.env, "ARC_CLAUDE_TIMEOUT_SECONDS"),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
         if result.returncode != 0:
             raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
         return result.stdout
@@ -133,3 +155,17 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _timeout_seconds(env: Mapping[str, str], provider_key: str) -> float | None:
+    key = provider_key if env.get(provider_key) not in {None, ""} else "ARC_LLM_TIMEOUT_SECONDS"
+    value = env.get(key)
+    if value is None or not value.strip():
+        return None
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise LLMWorkerError(f"{key} must be a positive number") from exc
+    if timeout <= 0:
+        raise LLMWorkerError(f"{key} must be a positive number")
+    return timeout

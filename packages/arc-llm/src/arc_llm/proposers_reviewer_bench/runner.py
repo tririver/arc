@@ -334,10 +334,7 @@ def _should_inline_artifacts(bench: BenchConfig) -> bool:
     mode = bench.options.improver_context_mode
     if mode == "expanded":
         return True
-    if mode == "paths":
-        return False
-    provider = f"{bench.options.improver_provider} {bench.options.default_provider}".lower()
-    return "deepseek" in provider
+    return False
 
 
 def _artifact_paths_for_inline_context(run_root: Path) -> list[Path]:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -520,14 +519,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _provider_config_env(provider_config: str | None) -> dict[str, str] | None:
-    if not provider_config:
-        return None
-    env = dict(os.environ)
-    env["ARC_LLM_PROVIDER_CONFIG"] = provider_config
-    return env
-
-
 def _read_config_file(path: str) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -540,7 +531,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--provider-config", default=None)
     return parser
 
 
@@ -549,7 +539,6 @@ def main(argv: list[str] | None = None) -> int:
     result = run_ideas(
         _read_config_file(args.config),
         dry_run=args.dry_run,
-        base_env=_provider_config_env(args.provider_config),
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

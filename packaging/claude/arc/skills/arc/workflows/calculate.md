@@ -7,33 +7,35 @@ human-readable result.
 
 `calculate.md owns consensus execution` and the `current-step result-status`.
 It does not change ready-step boundaries, does not change rough steps, and
-does not change future plan structure. Calculate does not own note parsing. When a
-different workflow owns the needed change, refer to the owning workflow.
+does not change future plan structure. Calculate does not own note parsing. When
+a different workflow owns the needed change, refer to the owning workflow.
 
 ## Phase 1: Prepare Runtime
 
-Consensus runtime artifacts:
+Runtime artifacts:
 
 ```text
-<project-dir>/calculate/<run-id>/execute/consensus.config.json
-<project-dir>/calculate/<run-id>/execute/<consensus-run-id>/
+<project-dir>/calculate/<run-id>/execute/calculate.config.json
+<project-dir>/calculate/<run-id>/execute/<calculate-run-id>/
+<project-dir>/calculate/<run-id>/execute/<calculate-run-id>/attempt_batches/
 ```
 
-Use this default consensus config, adjusting only documented run paths and step
-packets:
+Copy `workflows/json/calculate.config.template.json` to:
 
-```json
-{
-  "schema_version": "arc.llm.proposers_reviewer_consensus.config.v1",
-  "run_id": "<consensus-run-id>",
-  "run_dir": "<project-dir>/calculate/<run-id>/execute",
-  "proposer_count": 2,
-  "max_recalculations": 2,
-  "human_gate": {"enabled": false},
-  "artifact_options": {"save_prompts": true},
-  "steps": []
-}
+```text
+<project-dir>/calculate/<run-id>/execute/calculate.config.json
 ```
+
+Replace `<calculate-run-id>`, `<project-dir>`, `<run-id>`, and
+`<skill-workflow-json-dir>`. Keep `"proposer_count": 2`,
+`"max_recalculations": 2`, and `artifact_options.save_prompts` enabled unless
+the user asks otherwise.
+
+The runner reads worker prompt/schema templates from:
+
+- `workflows/json/calculate-proposer.template.json`
+- `workflows/json/calculate-reviewer.template.json`
+- `workflows/json/calculate-reviewer-output.schema.json`
 
 `"max_recalculations": 2` means 3 total attempts: 1 initial attempt + 2 recalculations.
 Do not increase attempts unless the user asks.
@@ -43,18 +45,18 @@ steps when they are marked not accepted in the work note.
 
 ## Phase 2: Build Step Packets
 
-For each current ready step, build one proposer packet from:
+For each current ready step, add one config step with:
 
 - current step prompt and quantity contract
 - relevant work-note sections: notation, axioms, accepted results, and the
   current ready step
-- clean proposer-facing source context
+- clean proposer-facing source context in `allowed_context`
 
 Do not expose reviewer-only targets, target equations, or later note text to
 proposers.
 
-For a blind reference check, include `reviewer_reference_claim` only for the
-reviewer and disable source tools:
+For a blind reference check, include `reviewer_reference_claim` only in the
+step object and disable source tools:
 
 ```json
 "proposer_runtime": {"allow_internet": false, "allow_mcp": false}
@@ -80,8 +82,8 @@ back to work-note conventions.
 Run:
 
 ```bash
-arc-llm proposers-reviewer-consensus \
-  --config <project-dir>/calculate/<run-id>/execute/consensus.config.json \
+python3 workflows/scripts/calculate_runner.py \
+  --config <project-dir>/calculate/<run-id>/execute/calculate.config.json \
   --json
 ```
 
@@ -104,6 +106,11 @@ weak evidence such as formatting agreement, visual similarity, or agreement in
 an undeclared special limit. Depending on the failure, retry, split, pause for
 the expert question, or write a planning request.
 
+When pausing for a human expert, do not merely say that the workflow paused.
+Write and ask one concrete question under the literal label
+`Human expert question:`. The question must name the step, the unresolved equation or claim, the competing options, and what answer is needed to proceed.
+Record the same question in `Open Questions` or `Calculation Status`.
+
 ## Phase 5: Update Work Note
 
 For an accepted step, update only the current ready-step slot:
@@ -116,7 +123,9 @@ For an accepted step, update only the current ready-step slot:
 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and
-proposed next action. Limits diagnose; they are not proof.
+proposed next action. If the block needs human input, ask the exact same
+`Human expert question:` in the user-facing response before ending the turn.
+Limits diagnose; they are not proof.
 
 When a result may help later steps, record it only as a candidate reusable
 result. Promotion to an accepted premise belongs to `plan.md`.
@@ -129,9 +138,9 @@ do not require any separate report.
 
 ## Phase 6: Planning Handoff
 
-If proposers, reviewer, or the main agent agree that plan content should change,
-or that a candidate reusable result should become a future premise, do not edit
-ready-step boundaries, rough steps, or future plan structure.
+If proposers, reviewer, or the main agent agree that plan content should
+change, or that a candidate reusable result should become a future premise, do
+not edit ready-step boundaries, rough steps, or future plan structure.
 
 Write `<project-dir>/calculate/<run-id>/planning-request.md` with:
 

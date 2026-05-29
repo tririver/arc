@@ -74,9 +74,28 @@ def test_valid_config_parses_and_merges_defaults():
     assert proposer.model_tier == "high"
     assert proposer.runtime["allow_internet"] is True
     assert proposer.runtime["allow_mcp"] is False
-    assert ARC_LLM_CALL_RECORD_FIELD in proposer.output_schema["properties"]
+    assert ARC_LLM_CALL_RECORD_FIELD not in proposer.output_schema.get("properties", {})
     assert reviewer.runtime["allow_mcp"] is True
     assert reviewer.runtime["claude_effort"] == "high"
+
+
+def test_string_booleans_parse_for_fail_fast_and_early_stop():
+    payload = minimal_config()
+    payload["fail_fast"] = "false"
+    payload["loops"][0]["early_stop"]["enabled"] = "false"
+
+    config = load_batch_config(payload)
+
+    assert config.fail_fast is False
+    assert config.loops[0].early_stop_enabled is False
+
+
+def test_invalid_string_boolean_fails():
+    payload = minimal_config()
+    payload["loops"][0]["early_stop"]["enabled"] = "nope"
+
+    with pytest.raises(ConfigError, match="early_stop.enabled"):
+        load_batch_config(payload)
 
 
 def test_duplicate_loop_ids_fail():
@@ -131,9 +150,34 @@ def test_worker_env_maps_runtime_without_mutating_base_env():
     assert env["KEEP"] == "value"
     assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
     assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
-    assert "ARC_CODEX_ENABLE_MCP" not in env
+    assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+    assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
     assert "ARC_LLM_MODEL_TIER" not in env
     assert env["ARC_CODEX_REASONING_EFFORT"] == "xhigh"
+
+
+def test_worker_env_false_runtime_clears_inherited_permission_flags():
+    payload = minimal_config()
+    payload["loops"][0]["proposers"][0]["runtime"] = {"allow_internet": False, "allow_mcp": False}
+    config = load_batch_config(payload)
+    worker = config.loops[0].proposers[0]
+    base_env = {
+        "ARC_CODEX_ALLOW_INTERNET": "true",
+        "ARC_CLAUDE_ALLOW_INTERNET": "true",
+        "ARC_CODEX_ENABLE_MCP": "true",
+        "ARC_CLAUDE_ALLOW_MCP": "true",
+        "ARC_CODEX_MCP_MODE": "arc-only",
+        "ARC_CLAUDE_MCP_MODE": "arc-only",
+    }
+
+    env = worker_env(worker, base_env=base_env)
+
+    assert env["ARC_CODEX_ALLOW_INTERNET"] == "false"
+    assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
+    assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+    assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+    assert "ARC_CODEX_MCP_MODE" not in env
+    assert "ARC_CLAUDE_MCP_MODE" not in env
 
 
 def test_worker_env_maps_mcp_model_and_provider_options():
@@ -266,7 +310,7 @@ def test_worker_prompt_context_strips_arc_llm_call_records():
     }
     config = load_batch_config(payload)
     loop = config.loops[0]
-    call_record = {"provider_used": "deepseek"}
+    call_record = {"provider_used": "codex-cli"}
     correspondence = [
         {
             "type": "proposer_output",

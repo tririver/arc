@@ -1,18 +1,37 @@
-import json
-
 import pytest
 
-from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, allow_arc_llm_call_record
 from arc_llm import runner
 from arc_llm.runner import resolve_llm_config, run_json, run_text
 
 
-def no_provider_config(tmp_path):
-    return {"ARC_LLM_PROVIDER_CONFIG": str(tmp_path / "missing.json")}
-
-
 def without_call_record(result):
     return {key: value for key, value in result.items() if key != ARC_LLM_CALL_RECORD_FIELD}
+
+
+def test_call_record_is_not_added_to_provider_schema():
+    schema = allow_arc_llm_call_record(
+        {
+            "type": "object",
+            "required": ["ok"],
+            "properties": {"ok": {"type": "boolean"}},
+            "additionalProperties": False,
+        }
+    )
+
+    assert_strict_objects(schema)
+    assert ARC_LLM_CALL_RECORD_FIELD not in schema["properties"]
+
+
+def assert_strict_objects(schema):
+    if isinstance(schema, dict):
+        if schema.get("type") == "object" or "object" in schema.get("type", []):
+            assert schema.get("additionalProperties") is False
+        for value in schema.values():
+            assert_strict_objects(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            assert_strict_objects(item)
 
 
 class FakeProvider:
@@ -53,7 +72,7 @@ class FlakyTextProvider:
 
 
 def test_resolve_llm_config_uses_host_and_default_model(tmp_path):
-    config = resolve_llm_config(env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"}, process_chain=[])
+    config = resolve_llm_config(env={"ARC_AGENT_HOST": "codex"}, process_chain=[])
     assert config.provider == "codex-cli"
     assert config.model == "gpt-5.4"
     assert config.host.host == "codex"
@@ -67,7 +86,7 @@ def test_run_json_uses_selected_provider_and_model(tmp_path, monkeypatch):
         schema={"type": "object"},
         model="fast",
         provider="codex-cli",
-        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"},
+        env={"ARC_AGENT_HOST": "codex"},
         process_chain=[],
     )
 
@@ -95,7 +114,7 @@ def test_env_model_does_not_override_model_tier(tmp_path, monkeypatch):
         "prompt",
         schema={"type": "object"},
         model_tier="high",
-        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex", "ARC_CODEX_MODEL": "fast"},
+        env={"ARC_AGENT_HOST": "codex", "ARC_CODEX_MODEL": "fast"},
         process_chain=[],
     )
 
@@ -109,7 +128,7 @@ def test_run_json_uses_model_tier_when_exact_model_is_not_set(tmp_path, monkeypa
         "prompt",
         schema={"type": "object"},
         model_tier="high",
-        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"},
+        env={"ARC_AGENT_HOST": "codex"},
         process_chain=[],
     )
 
@@ -119,7 +138,7 @@ def test_run_json_uses_model_tier_when_exact_model_is_not_set(tmp_path, monkeypa
 def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeProvider())
 
-    result = run_text("prompt", env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"}, process_chain=[])
+    result = run_text("prompt", env={"ARC_AGENT_HOST": "codex"}, process_chain=[])
 
     assert result == "gpt-5.4:prompt"
 
@@ -130,7 +149,7 @@ def test_run_text_retries_selected_provider_twice_before_success(tmp_path, monke
 
     result = run_text(
         "prompt",
-        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"},
+        env={"ARC_AGENT_HOST": "codex"},
         process_chain=[],
     )
 
@@ -144,7 +163,7 @@ def test_run_json_retries_selected_provider_twice_before_success(tmp_path, monke
 
     result = run_json(
         "prompt",
-        env={**no_provider_config(tmp_path), "ARC_AGENT_HOST": "codex"},
+        env={"ARC_AGENT_HOST": "codex"},
         process_chain=[],
     )
 
@@ -158,118 +177,30 @@ def test_run_json_retries_selected_provider_twice_before_success(tmp_path, monke
     assert flaky.attempts == 3
 
 
-def test_run_json_auto_falls_back_to_configured_provider_after_retries(tmp_path, monkeypatch):
-    provider_config = tmp_path / "llm-providers.json"
-    provider_config.write_text(
-        json.dumps(
-            {
-                "schema_version": "arc.llm.providers.v1",
-                "providers": [
-                    {
-                        "id": "deepseek",
-                        "type": "openai-compatible",
-                        "base_url": "https://deepseek.example/v1",
-                        "api_key": "secret-value",
-                        "models": {"medium": "deepseek-chat"},
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+def test_run_json_auto_retries_only_selected_provider(monkeypatch):
     codex = FlakyJsonProvider(name="codex-cli")
-    deepseek = FlakyJsonProvider(name="deepseek", failures_before_success=0, result={"provider": "deepseek"})
-    providers = {"codex-cli": codex, "deepseek": deepseek}
-    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: providers[provider])
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: codex)
 
-    result = run_json(
-        "prompt",
-        env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER_CONFIG": str(provider_config)},
-        process_chain=[],
-    )
+    with pytest.raises(RuntimeError, match="LLM task failed after 3 attempt\\(s\\) across 1 provider\\(s\\)"):
+        run_json(
+            "prompt",
+            env={"ARC_AGENT_HOST": "codex"},
+            process_chain=[],
+        )
 
-    assert without_call_record(result) == {"provider": "deepseek", "model": "deepseek-chat"}
-    call_record = result[ARC_LLM_CALL_RECORD_FIELD]
-    assert call_record["provider_requested"] == "auto"
-    assert call_record["provider_used"] == "deepseek"
-    assert call_record["model_used"] == "deepseek-chat"
-    assert call_record["fallback_index"] == 1
-    assert [item["provider"] for item in call_record["attempts"]] == [
-        "codex-cli",
-        "codex-cli",
-        "codex-cli",
-        "deepseek",
-    ]
     assert codex.attempts == 3
-    assert deepseek.attempts == 1
-
-
-def test_run_json_auto_fallback_uses_provider_specific_tier_models(tmp_path, monkeypatch):
-    provider_config = tmp_path / "llm-providers.json"
-    provider_config.write_text(
-        json.dumps(
-            {
-                "schema_version": "arc.llm.providers.v1",
-                "providers": [
-                    {
-                        "id": "deepseek",
-                        "type": "openai-compatible",
-                        "base_url": "https://deepseek.example/v1",
-                        "api_key": "secret-value",
-                        "models": {"medium": "deepseek-chat", "high": "deepseek-pro"},
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    codex = FlakyJsonProvider(name="codex-cli")
-    deepseek = FlakyJsonProvider(name="deepseek", failures_before_success=0, result={"provider": "deepseek"})
-    providers = {"codex-cli": codex, "deepseek": deepseek}
-    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: providers[provider])
-
-    result = run_json(
-        "prompt",
-        model_tier="high",
-        env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER_CONFIG": str(provider_config)},
-        process_chain=[],
-    )
-
-    assert without_call_record(result) == {"provider": "deepseek", "model": "deepseek-pro"}
-    assert result[ARC_LLM_CALL_RECORD_FIELD]["model_tier_requested"] == "high"
-    assert result[ARC_LLM_CALL_RECORD_FIELD]["model_used"] == "deepseek-pro"
 
 
 def test_run_json_explicit_provider_retries_without_fallback(tmp_path, monkeypatch):
-    provider_config = tmp_path / "llm-providers.json"
-    provider_config.write_text(
-        json.dumps(
-            {
-                "schema_version": "arc.llm.providers.v1",
-                "providers": [
-                    {
-                        "id": "deepseek",
-                        "type": "openai-compatible",
-                        "base_url": "https://deepseek.example/v1",
-                        "api_key": "secret-value",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
     codex = FlakyJsonProvider(name="codex-cli")
-    deepseek = FlakyJsonProvider(name="deepseek", failures_before_success=0, result={"provider": "deepseek"})
-    providers = {"codex-cli": codex, "deepseek": deepseek}
-    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: providers[provider])
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: codex)
 
     with pytest.raises(RuntimeError, match="LLM task failed after 3 attempt\\(s\\) across 1 provider\\(s\\)"):
         run_json(
             "prompt",
             provider="codex-cli",
-            env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER_CONFIG": str(provider_config)},
+            env={"ARC_AGENT_HOST": "codex"},
             process_chain=[],
         )
 
     assert codex.attempts == 3
-    assert deepseek.attempts == 0

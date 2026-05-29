@@ -34,16 +34,16 @@ def test_parent_process_detects_claude_code():
 
 def test_provider_selection_ignores_env_provider_override():
     provider = select_llm_provider(
-        env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER": "openai"},
+        env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER": "external"},
         process_chain=[],
     )
     assert provider.provider == "codex-cli"
     assert provider.host.host == "codex"
 
 
-def test_provider_selection_uses_detected_host(tmp_path):
+def test_provider_selection_uses_detected_host():
     provider = select_llm_provider(
-        env={"ARC_LLM_PROVIDER_CONFIG": str(tmp_path / "missing.json")},
+        env={},
         process_chain=["claude -p"],
     )
     assert provider.provider == "claude-cli"

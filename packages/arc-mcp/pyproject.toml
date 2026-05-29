@@ -9,6 +9,7 @@ description = "MCP tools for ARC research workflows."
 requires-python = ">=3.11"
 dependencies = [
   "arc-domain",
+  "arc-llm",
   "arc-paper",
   "arc-typeset",
   "mcp>=1.0",

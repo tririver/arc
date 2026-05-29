@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import traceback
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
@@ -302,15 +303,28 @@ def _call_reviewer_with_validation_retry(
         return review_output
     except Exception as exc:
         retry_prompt = _review_validation_retry_prompt(prompt, exc)
-        if save_prompt and prompt_path is not None:
-            atomic_write_text(prompt_path, retry_prompt)
+        retry_prompt_path = _retry_artifact_path(prompt_path, retry_number=1) if prompt_path is not None else None
+        if save_prompt and retry_prompt_path is not None:
+            atomic_write_text(retry_prompt_path, retry_prompt)
+        if prompt_path is not None:
+            atomic_write_json(
+                _validation_error_artifact_path(error_path, retry_number=1),
+                {
+                    "worker_id": worker.id,
+                    "round_number": round_number,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                    "original_prompt_path": str(prompt_path),
+                    "retry_prompt_path": str(retry_prompt_path) if retry_prompt_path is not None else "",
+                },
+            )
         review_output = _call_json_runner_with_error_artifact(
             json_runner,
             retry_prompt,
             worker=worker,
             round_number=round_number,
             error_path=error_path,
-            prompt_path=prompt_path,
+            prompt_path=retry_prompt_path,
             base_env=base_env,
             process_chain=process_chain,
         )
@@ -327,6 +341,14 @@ def _review_validation_retry_prompt(prompt: str, exc: Exception) -> str:
         f"{REVIEW_ENVELOPE_SCHEMA}, with controller, proposer_messages for every proposer, "
         "and review_payload. Do not return a proposer idea or any non-envelope object.\n"
     )
+
+
+def _retry_artifact_path(path: Path, *, retry_number: int) -> Path:
+    return path.with_name(f"{path.stem}.retry_{retry_number:03d}{path.suffix}")
+
+
+def _validation_error_artifact_path(path: Path, *, retry_number: int) -> Path:
+    return path.with_name(f"{path.stem}.validation_{retry_number:03d}.json")
 
 
 def _call_json_runner_with_error_artifact(
@@ -373,14 +395,16 @@ def _call_json_runner(
 ) -> dict[str, Any]:
     env = worker_env(worker, base_env=base_env)
     if json_runner is not None:
-        return json_runner(
-            prompt,
-            schema=worker.output_schema,
-            provider=worker.provider,
-            model=worker.model,
-            model_tier=worker.model_tier,
-            env=env,
-        )
+        kwargs = {
+            "schema": worker.output_schema,
+            "provider": worker.provider,
+            "model": worker.model,
+            "model_tier": worker.model_tier,
+            "env": env,
+        }
+        if _accepts_keyword(json_runner, "process_chain"):
+            kwargs["process_chain"] = process_chain
+        return json_runner(prompt, **kwargs)
     return run_json(
         prompt,
         schema=worker.output_schema,
@@ -390,6 +414,20 @@ def _call_json_runner(
         env=env,
         process_chain=process_chain,
     )
+
+
+def _accepts_keyword(callable_obj: JsonRunner, name: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.kind in {inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}:
+            if parameter.name == name:
+                return True
+    return False
 
 
 def _validate_review_envelope(review: dict[str, Any], loop: LoopConfig) -> None:

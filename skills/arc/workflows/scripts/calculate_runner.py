@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import re
@@ -7,13 +8,13 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .artifacts import RunPaths, atomic_write_json
-from .config import ConfigError, SAFE_ID_RE
-from .runner import JsonRunner, run_proposers_reviewer_batch
+from arc_llm.proposers_reviewer.artifacts import RunPaths, atomic_write_json
+from arc_llm.proposers_reviewer.config import ConfigError, SAFE_ID_RE
+from arc_llm.proposers_reviewer.runner import JsonRunner, run_proposers_reviewer_batch
 
 
-CONSENSUS_CONFIG_SCHEMA = "arc.llm.proposers_reviewer_consensus.config.v1"
-CONSENSUS_RESULT_SCHEMA = "arc.llm.proposers_reviewer_consensus.result.v1"
+CALCULATE_CONFIG_SCHEMA = "arc.workflow.calculate.config.v1"
+CALCULATE_RESULT_SCHEMA = "arc.workflow.calculate.result.v1"
 REVIEW_ENVELOPE_SCHEMA = "arc.llm.review_envelope.v1"
 DEFAULT_HUMAN_GATE_PAUSE_STATUSES = (
     "reference_disagrees",
@@ -24,12 +25,13 @@ DEFAULT_HUMAN_GATE_PAUSE_STATUSES = (
 )
 REVISION_ACTIONS = {"revise_plan", "split_step"}
 LEGACY_ALLOWED_CONTEXT_KEYS = {"foundation_file", "allowed_foundation", "target_equation_id"}
+CALLER_ALLOWED_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path", "source_commands"}
 
 BatchRunner = Callable[..., dict[str, Any]]
 
 
 @dataclass(frozen=True)
-class ConsensusStep:
+class CalculateStep:
     step_id: str
     prompt: str
     kind: str
@@ -39,26 +41,28 @@ class ConsensusStep:
 
 
 @dataclass(frozen=True)
-class ConsensusConfig:
+class CalculateConfig:
     schema_version: str
     run_id: str
     run_dir: Path
+    workflow_json_dir: Path
     proposer_count: int
     max_recalculations: int
     human_gate: dict[str, Any]
     defaults: dict[str, Any]
     artifact_options: dict[str, Any]
-    steps: list[ConsensusStep]
+    steps: list[CalculateStep]
 
 
-def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
+def load_calculation_config(payload: Mapping[str, Any]) -> CalculateConfig:
     data = copy.deepcopy(dict(payload))
     schema_version = _required_text(data, "schema_version")
-    if schema_version != CONSENSUS_CONFIG_SCHEMA:
-        raise ConfigError(f"schema_version must be {CONSENSUS_CONFIG_SCHEMA}")
+    if schema_version != CALCULATE_CONFIG_SCHEMA:
+        raise ConfigError(f"schema_version must be {CALCULATE_CONFIG_SCHEMA}")
 
     run_id = _safe_id(_required_text(data, "run_id"), "run_id")
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
+    workflow_json_dir = Path(str(data.get("workflow_json_dir") or _default_workflow_json_dir())).expanduser()
     proposer_count = _positive_int(data.get("proposer_count", 2), "proposer_count")
     max_recalculations = _nonnegative_int(data.get("max_recalculations", 2), "max_recalculations")
     human_gate = _parse_human_gate(data.get("human_gate", {}))
@@ -75,7 +79,7 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ConfigError("steps must be a non-empty list")
 
-    steps: list[ConsensusStep] = []
+    steps: list[CalculateStep] = []
     seen_step_ids: set[str] = set()
     for raw_step in raw_steps:
         step_data = _dict(raw_step, "steps[]")
@@ -91,7 +95,7 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
             if legacy_key in allowed_context:
                 raise ConfigError(f"allowed_context.{legacy_key} is no longer supported")
         steps.append(
-            ConsensusStep(
+            CalculateStep(
                 step_id=step_id,
                 prompt=_required_text(step_data, "prompt"),
                 kind=kind,
@@ -107,10 +111,11 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
             )
         )
 
-    return ConsensusConfig(
+    return CalculateConfig(
         schema_version=schema_version,
         run_id=run_id,
         run_dir=run_dir,
+        workflow_json_dir=workflow_json_dir,
         proposer_count=proposer_count,
         max_recalculations=max_recalculations,
         human_gate=human_gate,
@@ -120,8 +125,8 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
     )
 
 
-def run_proposers_reviewer_consensus(
-    config: ConsensusConfig | Mapping[str, Any],
+def run_calculation(
+    config: CalculateConfig | Mapping[str, Any],
     *,
     batch_runner: BatchRunner | None = None,
     json_runner: JsonRunner | None = None,
@@ -129,21 +134,21 @@ def run_proposers_reviewer_consensus(
     process_chain: list[str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    consensus = config if isinstance(config, ConsensusConfig) else load_consensus_config(config)
-    paths = RunPaths(run_dir=consensus.run_dir, run_id=consensus.run_id)
+    calculation = config if isinstance(config, CalculateConfig) else load_calculation_config(config)
+    paths = RunPaths(run_dir=calculation.run_dir, run_id=calculation.run_id)
     if dry_run:
-        return _dry_run_result(consensus, paths)
+        return _dry_run_result(calculation, paths)
 
     paths.run_root.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(paths.config, _jsonable(consensus))
+    atomic_write_json(paths.config, _jsonable(calculation))
 
     runner = batch_runner or run_proposers_reviewer_batch
     step_results: list[dict[str, Any]] = []
     accepted_step_outputs: dict[str, Any] = {}
     overall_status = "completed"
-    for step in consensus.steps:
-        step_result = _run_consensus_step(
-            consensus,
+    for step in calculation.steps:
+        step_result = _run_calculation_step(
+            calculation,
             step,
             runner=runner,
             json_runner=json_runner,
@@ -163,22 +168,22 @@ def run_proposers_reviewer_consensus(
             accepted_step_outputs[step.step_id] = copy.deepcopy(step_result["accepted_output"])
 
     result = {
-        "schema_version": CONSENSUS_RESULT_SCHEMA,
+        "schema_version": CALCULATE_RESULT_SCHEMA,
         "status": overall_status,
-        "run_id": consensus.run_id,
+        "run_id": calculation.run_id,
         "run_root": str(paths.run_root),
-        "proposer_count": consensus.proposer_count,
-        "max_recalculations": consensus.max_recalculations,
-        "human_gate": copy.deepcopy(consensus.human_gate),
+        "proposer_count": calculation.proposer_count,
+        "max_recalculations": calculation.max_recalculations,
+        "human_gate": copy.deepcopy(calculation.human_gate),
         "steps": step_results,
     }
     atomic_write_json(paths.state, result)
     return result
 
 
-def _run_consensus_step(
-    config: ConsensusConfig,
-    step: ConsensusStep,
+def _run_calculation_step(
+    config: CalculateConfig,
+    step: CalculateStep,
     *,
     runner: BatchRunner,
     json_runner: JsonRunner | None,
@@ -236,7 +241,7 @@ def _run_consensus_step(
         try:
             review = _read_json(attempt_paths["review_path"])
             proposer_outputs = _read_proposer_outputs(attempt_paths["round_root"], active_proposer_ids)
-            consensus = _review_consensus(
+            review_consensus = _review_consensus(
                 review,
                 active_proposer_ids=active_proposer_ids,
                 selectable_proposer_ids=list(
@@ -248,26 +253,33 @@ def _run_consensus_step(
             attempt_record["error"] = str(exc)
             attempts.append(attempt_record)
             return _failed_step_result(config, step, attempts=attempts, error=str(exc))
-        attempt_record["consensus"] = consensus
+        attempt_record["consensus"] = review_consensus
         attempt_record["proposer_output_paths"] = {
             proposer_id: str(attempt_paths["round_root"] / "proposer_outputs" / f"{proposer_id}.json")
             for proposer_id in active_proposer_ids
         }
         attempts.append(attempt_record)
 
-        status = str(consensus.get("status", "unresolved"))
+        status = str(review_consensus.get("status", "unresolved"))
         gated_block = _human_gate_blocked_step_result(
             config,
             step,
             attempts=attempts,
-            consensus=consensus,
+            consensus=review_consensus,
             trigger_status=status,
         )
         if gated_block is not None:
             return gated_block
 
-        if status in {"all_agree", "reference_disagrees"}:
-            accepted_result = consensus.get("accepted_result")
+        if status == "reference_disagrees":
+            return _reference_disagrees_step_result(
+                step,
+                attempts=attempts,
+                consensus=review_consensus,
+            )
+
+        if status == "all_agree":
+            accepted_result = review_consensus.get("accepted_result")
             return {
                 "step_id": step.step_id,
                 "kind": step.kind,
@@ -277,7 +289,7 @@ def _run_consensus_step(
                 if accepted_result is not None
                 else {"proposer_outputs": proposer_outputs},
                 "blocked_output": None,
-                "reviewer_consensus": consensus,
+                "reviewer_consensus": review_consensus,
             }
 
         if attempt_number >= max_attempts:
@@ -288,16 +300,16 @@ def _run_consensus_step(
                 "attempts": attempts,
                 "accepted_output": None,
                 "blocked_output": {
-                    "analysis": str(consensus.get("analysis", "")),
-                    "last_consensus": consensus,
+                    "analysis": str(review_consensus.get("analysis", "")),
+                    "last_consensus": review_consensus,
                 },
-                "reviewer_consensus": consensus,
+                "reviewer_consensus": review_consensus,
             }
 
         if status == "two_agree":
-            next_active = _next_active_for_two_agree(consensus, all_proposer_ids)
+            next_active = _next_active_for_two_agree(review_consensus, all_proposer_ids)
             if next_active is not None:
-                agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), all_proposer_ids)
+                agreed_ids = _valid_ids(review_consensus.get("agreed_proposer_ids", []), all_proposer_ids)
                 for proposer_id in agreed_ids:
                     if proposer_id in proposer_outputs:
                         locked_outputs[proposer_id] = proposer_outputs[proposer_id]
@@ -307,92 +319,12 @@ def _run_consensus_step(
         active_proposer_ids = list(all_proposer_ids)
         locked_outputs = {}
 
-    raise AssertionError("unreachable consensus loop exit")
-
-
-def _failed_step_result(
-    config: ConsensusConfig,
-    step: ConsensusStep,
-    *,
-    attempts: list[dict[str, Any]],
-    error: str,
-) -> dict[str, Any]:
-    gated_block = _human_gate_blocked_step_result(
-        config,
-        step,
-        attempts=attempts,
-        consensus={
-            "status": "failed",
-            "analysis": error,
-            "workflow_action": _default_workflow_action("failed", error),
-        },
-        trigger_status="failed",
-        error=error,
-    )
-    if gated_block is not None:
-        return gated_block
-    return {
-        "step_id": step.step_id,
-        "kind": step.kind,
-        "status": "failed",
-        "attempts": attempts,
-        "accepted_output": None,
-        "blocked_output": None,
-        "reviewer_consensus": None,
-        "error": error,
-    }
-
-
-def _human_gate_blocked_step_result(
-    config: ConsensusConfig,
-    step: ConsensusStep,
-    *,
-    attempts: list[dict[str, Any]],
-    consensus: Mapping[str, Any],
-    trigger_status: str,
-    error: str | None = None,
-) -> dict[str, Any] | None:
-    if not _human_gate_enabled(config):
-        return None
-    if trigger_status not in _human_gate_pause_statuses(config):
-        return None
-
-    workflow_action = _normalized_workflow_action(consensus.get("workflow_action"), trigger_status)
-    requires_human = _workflow_action_requires_human(workflow_action)
-    if requires_human:
-        workflow_action = copy.deepcopy(workflow_action)
-        workflow_action["action"] = "pause_for_human"
-        workflow_action["requires_human"] = True
-    step_status = "blocked_for_user" if requires_human else "blocked_for_revision"
-    expert_question = str(workflow_action.get("expert_question", "")).strip()
-    if not expert_question:
-        expert_question = _default_expert_question(trigger_status, workflow_action)
-    blocked_output = {
-        "reason": "human_gate",
-        "trigger_status": trigger_status,
-        "requires_human": requires_human,
-        "workflow_action": workflow_action,
-        "expert_question": expert_question,
-        "analysis": str(consensus.get("analysis", "")),
-        "last_consensus": copy.deepcopy(dict(consensus)),
-    }
-    if error:
-        blocked_output["error"] = error
-    return {
-        "step_id": step.step_id,
-        "kind": step.kind,
-        "status": step_status,
-        "attempts": attempts,
-        "accepted_output": None,
-        "blocked_output": blocked_output,
-        "reviewer_consensus": dict(consensus),
-        "error": error,
-    }
+    raise AssertionError("unreachable calculation loop exit")
 
 
 def _attempt_batch_config(
-    config: ConsensusConfig,
-    step: ConsensusStep,
+    config: CalculateConfig,
+    step: CalculateStep,
     *,
     attempt_number: int,
     active_proposer_ids: list[str],
@@ -427,6 +359,7 @@ def _attempt_batch_config(
                 "caller_context": caller_context,
                 "proposers": [
                     _proposer_config(
+                        config,
                         proposer_id,
                         runtime=_proposer_runtime(config, step),
                     )
@@ -434,6 +367,7 @@ def _attempt_batch_config(
                 ],
                 "reviewers": [
                     _reviewer_config(
+                        config,
                         active_proposer_ids,
                         selectable_proposer_ids,
                         reviewer_reference_claim=step.reviewer_reference_claim,
@@ -446,20 +380,19 @@ def _attempt_batch_config(
 
 
 def _caller_context(
-    config: ConsensusConfig,
-    step: ConsensusStep,
+    config: CalculateConfig,
+    step: CalculateStep,
     *,
     attempt_number: int,
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
     accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
-    allowed_context = _sanitize_caller_allowed_context(step.allowed_context)
-    context = {
+    return {
         "step_id": step.step_id,
         "step_kind": step.kind,
         "step_prompt": step.prompt,
-        "allowed_context": allowed_context,
+        "allowed_context": _sanitize_caller_allowed_context(step.allowed_context),
         "attempt_number": attempt_number,
         "active_proposer_ids": active_proposer_ids,
         "locked_outputs": copy.deepcopy(locked_outputs),
@@ -468,10 +401,54 @@ def _caller_context(
         "integrity_reference": _integrity_reference(config.defaults.get("integrity_reference_path")),
         "consensus_instruction": "Work only on this calculation step. Respect accepted_prior_step_outputs and locked_outputs as already accepted unless explicitly asked to check them.",
     }
-    return context
 
 
-def _proposer_runtime(config: ConsensusConfig, step: ConsensusStep) -> dict[str, Any]:
+def _proposer_config(config: CalculateConfig, proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _read_template(config.workflow_json_dir / "calculate-proposer.template.json")
+    payload["id"] = proposer_id
+    prompt = _dict(payload.get("prompt"), "calculate-proposer.template.prompt")
+    prompt["template"] = str(prompt.get("template", "")).replace("{source_policy}", _proposer_source_policy(runtime))
+    payload["prompt"] = prompt
+    payload["runtime"] = dict(runtime)
+    return payload
+
+
+def _reviewer_config(
+    config: CalculateConfig,
+    active_proposer_ids: list[str],
+    selectable_proposer_ids: list[str],
+    *,
+    reviewer_reference_claim: Mapping[str, Any] | None = None,
+    human_gate: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _read_template(config.workflow_json_dir / "calculate-reviewer.template.json")
+    prompt = _dict(payload.get("prompt"), "calculate-reviewer.template.prompt")
+    replacements = {
+        "{active_proposer_ids}": ", ".join(active_proposer_ids),
+        "{reviewer_status_instruction}": _reviewer_status_instruction(
+            allow_reference_disagrees=bool(reviewer_reference_claim)
+        ),
+        "{reference_instruction}": _reviewer_reference_instruction(
+            reviewer_reference_claim,
+            active_proposer_ids=active_proposer_ids,
+        ),
+        "{workflow_instruction}": _reviewer_workflow_instruction(human_gate or {}),
+    }
+    template = str(prompt.get("template", ""))
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+    prompt["template"] = template
+    payload["prompt"] = prompt
+    payload["output_schema"] = _reviewer_output_schema(
+        config,
+        active_proposer_ids,
+        selectable_proposer_ids,
+        allow_reference_disagrees=bool(reviewer_reference_claim),
+    )
+    return payload
+
+
+def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str, Any]:
     if step.reviewer_reference_claim:
         runtime = {
             "allow_internet": False,
@@ -496,104 +473,6 @@ def _proposer_runtime(config: ConsensusConfig, step: ConsensusStep) -> dict[str,
     if runtime.get("allow_mcp") and "mcp_mode" not in runtime:
         runtime["mcp_mode"] = "arc-only"
     return runtime
-
-
-def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[str, Any]:
-    source_policy = _proposer_source_policy(runtime)
-    return {
-        "id": proposer_id,
-        "prompt": {
-            "system": "You are an independent theoretical-physics calculation proposer.",
-            "template": (
-                "First read and follow caller_context.integrity_reference.content. "
-                "Use only caller_context.step_prompt, caller_context.allowed_context, "
-                "accepted locked_outputs, "
-                "caller_context.accepted_prior_step_outputs, and your own SymPy/local algebra. "
-                f"{source_policy} Wolfram may be used only for algebraic "
-                "verification. You must strictly derive from the supplied work note, allowed context, "
-                "accepted prior step outputs, and locked_outputs. External sources may inspire methods, but do not "
-                "directly use any result from papers or the internet unless it appears in "
-                "the supplied work note, allowed context, accepted prior step outputs, or accepted locked_outputs. If you need an external "
-                "identity or intermediate result, derive it here. External sources may use "
-                "different conventions; map notation back to work-note conventions before "
-                "using it. For coordinate transformations or relabeling, explicitly track "
-                "which symbols are old coordinates and which are newly introduced symbols "
-                "before substituting. Do the calculation very clearly step by step; never skip a step. "
-                "Write all mathematical expressions in derivation, assumptions, and final_result "
-                "as display-ready LaTeX inside Markdown math delimiters or as LaTeX strings in "
-                "JSON fields; avoid ASCII-only math such as rho_2, eta_prime, or T_ab when a "
-                "LaTeX form such as \\rho_2, \\eta', or T_{ab} is intended for the report. "
-                "Return one JSON object with result_summary, derivation, assumptions, "
-                "validity_scope, final_result, and work_note_assessment. "
-                "In work_note_assessment, state whether the supplied work note or plan must "
-                "change before this step can be checked; include needs_revision "
-                "(boolean), issue_type, proposed_revision, rationale, and "
-                "can_continue_without_revision. Use issue_type=none when no revision is "
-                "needed. Use validity_scope for assumptions, "
-                "conventions, limits, and unresolved dependencies; do not use date-like "
-                "reliability fields. Put the final mathematical result in final_result using "
-                "explicit symbols so a reviewer can compare it with other proposers. "
-                "Do not coordinate with other proposers.\n\n"
-                "{caller_context_json}"
-            ),
-        },
-        "output_schema": _proposer_output_schema(),
-        "runtime": dict(runtime),
-    }
-
-
-def _proposer_output_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "required": [
-            "result_summary",
-            "derivation",
-            "assumptions",
-            "validity_scope",
-            "final_result",
-            "work_note_assessment",
-        ],
-        "properties": {
-            "result_summary": {"type": "string"},
-            "derivation": {"type": "string"},
-            "assumptions": {"type": ["string", "array", "object"]},
-            "validity_scope": {"type": "string"},
-            "final_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
-            "work_note_assessment": {
-                "type": "object",
-                "required": [
-                    "needs_revision",
-                    "issue_type",
-                    "proposed_revision",
-                    "rationale",
-                    "can_continue_without_revision",
-                ],
-                "properties": {
-                    "needs_revision": {"type": "boolean"},
-                    "issue_type": {
-                        "enum": [
-                            "none",
-                            "work_note_inadequate",
-                            "work_note_conflict",
-                            "plan_wrong",
-                            "step_too_coarse",
-                            "target_ambiguous",
-                            "source_mapping_error",
-                            "human_needed",
-                            "other",
-                        ]
-                    },
-                    "proposed_revision": {
-                        "type": ["object", "array", "string", "number", "boolean", "null"]
-                    },
-                    "rationale": {"type": "string"},
-                    "can_continue_without_revision": {"type": "boolean"},
-                },
-                "additionalProperties": True,
-            },
-        },
-        "additionalProperties": True,
-    }
 
 
 def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
@@ -622,89 +501,6 @@ def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
     parts.append("Cite any paper tool or internet source you use.")
     parts.append("Do not use validation-only final formulas as derivation inputs.")
     return " ".join(parts)
-
-
-def _reviewer_config(
-    active_proposer_ids: list[str],
-    selectable_proposer_ids: list[str],
-    *,
-    reviewer_reference_claim: Mapping[str, Any] | None = None,
-    human_gate: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    reference_instruction = _reviewer_reference_instruction(
-        reviewer_reference_claim,
-        active_proposer_ids=active_proposer_ids,
-    )
-    workflow_instruction = _reviewer_workflow_instruction(human_gate or {})
-    reviewer_status_instruction = _reviewer_status_instruction(
-        allow_reference_disagrees=bool(reviewer_reference_claim)
-    )
-    return {
-        "id": "reviewer_001",
-        "prompt": {
-            "system": "You are a skeptical theoretical-physics consensus reviewer.",
-            "template": (
-                "First read and follow caller_context.integrity_reference.content. "
-                "Compare current_proposer_outputs_json for the current calculation step. "
-                "Treat caller_context.accepted_prior_step_outputs as accepted context from "
-                "earlier steps, not as current proposer outputs. "
-                "Acceptance is physics and mathematics judgment. SymPy, Wolfram, explicit "
-                "algebra, or numerical checks are optional tools when useful, not mandatory "
-                "gates. Special limits are sanity checks, not proof, unless the target itself "
-                "is limiting, asymptotic, or leading-order. "
-                "Return exactly one arc.llm.review_envelope.v1 JSON object. The top-level object "
-                "must contain schema_version, controller, proposer_messages, and review_payload. "
-                f"proposer_messages must contain these keys: {', '.join(active_proposer_ids)}. "
-                "In review_payload.consensus, "
-                f"{reviewer_status_instruction} Include "
-                "accepted_result, agreed_proposer_ids, likely_wrong_proposer_ids, "
-                "recalculate_proposer_ids, validity_scope, analysis, and "
-                "agreement_assessment. Also include best_written_proposer_id and "
-                "best_written_selection_reason. When status is all_agree, choose "
-                "best_written_proposer_id from agreed_proposer_ids or accepted "
-                "caller_context.locked_outputs by clearest logic, most complete "
-                "details, and best readability; this copy will be used "
-                "for the full calculation appendix. When status is reference_disagrees, "
-                "choose best_written_proposer_id from the agreeing blind proposer ids by "
-                "the same clarity rule for report evidence if the step is later accepted. "
-                "If the status is neither all_agree nor reference_disagrees, set "
-                "best_written_proposer_id to null and explain why. "
-                "Before marking all_agree, agreement_assessment must show target quantity, "
-                "conventions, declared scope, and full target coverage all match, with a "
-                "nonempty comparison_summary and accepted_by_reviewer_judgment=true. "
-                "Never mark all_agree by string equality, spacing, formatting, visual "
-                "similarity, or because outputs merely look identical. "
-                "For coordinate transformations or relabeling, first apply the "
-                "source-declared old/new variable definitions from caller_context "
-                "and the step prompt, then compare metric components or scalar "
-                "expressions. Do not infer a source typo from raw variable-name "
-                "differences until the declared substitution has been checked. "
-                "For reference claims written as proportionalities, approximations, "
-                "or implicit relations, convert C into a testable relation such as "
-                "a constant quotient, residual, or stated limiting condition when useful. "
-                "If exactly one proposer is likely wrong, name only that proposer for "
-                "recalculation; otherwise ask all proposers to recalculate. "
-                "Also inspect each proposer's work_note_assessment. In "
-                "workflow_action, choose continue for all_agree. For any failure to "
-                "agree, target/source ambiguity, worker failure, or suspected bad "
-                "premise, choose pause_for_human unless the proposers and your review "
-                "agree on the same work-note or plan revision; then choose "
-                "revise_plan or split_step with "
-                "requires_human=false and include proposed_revision. For "
-                "reference_disagrees, follow the "
-                "human-gate instruction below. "
-                f"{reference_instruction}\n\n"
-                f"{workflow_instruction}\n\n"
-                "{current_proposer_outputs_json}"
-            ),
-        },
-        "output_schema": _reviewer_output_schema(
-            active_proposer_ids,
-            selectable_proposer_ids,
-            allow_reference_disagrees=bool(reviewer_reference_claim),
-        ),
-        "runtime": {"allow_mcp": False, "codex_sandbox": "read-only"},
-    }
 
 
 def _reviewer_reference_instruction(
@@ -759,6 +555,7 @@ def _reviewer_workflow_instruction(human_gate: Mapping[str, Any]) -> str:
 
 
 def _reviewer_output_schema(
+    config: CalculateConfig,
     active_proposer_ids: list[str],
     selectable_proposer_ids: list[str] | None = None,
     *,
@@ -766,168 +563,110 @@ def _reviewer_output_schema(
 ) -> dict[str, Any]:
     if selectable_proposer_ids is None:
         selectable_proposer_ids = active_proposer_ids
+    schema = _read_template(config.workflow_json_dir / "calculate-reviewer-output.schema.json")
     status_values = ["all_agree", "two_agree", "all_disagree", "unresolved"]
     if allow_reference_disagrees:
         status_values.append("reference_disagrees")
     proposer_message_properties = {
         proposer_id: {
             "type": "object",
-            "properties": {
-                "message": {"type": "string"},
-            },
-            "additionalProperties": True,
+            "required": ["message"],
+            "properties": {"message": {"type": "string"}},
+            "additionalProperties": False,
         }
         for proposer_id in active_proposer_ids
     }
-    return {
-        "type": "object",
-        "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
-        "properties": {
-            "schema_version": {"const": REVIEW_ENVELOPE_SCHEMA},
-            "controller": {
-                "type": "object",
-                "required": ["message", "stop_requested"],
-                "properties": {
-                    "message": {"type": "string"},
-                    "stop_requested": {"type": "boolean"},
-                    "stop_reason": {"type": "string"},
-                },
-                "additionalProperties": True,
-            },
-            "proposer_messages": {
-                "type": "object",
-                "required": active_proposer_ids,
-                "properties": proposer_message_properties,
-                "additionalProperties": True,
-            },
-            "review_payload": {
-                "type": "object",
-                "required": ["consensus"],
-                "properties": {
-                    "consensus": {
-                        "type": "object",
-                        "required": [
-                            "status",
-                            "accepted_result",
-                            "agreed_proposer_ids",
-                            "likely_wrong_proposer_ids",
-                            "recalculate_proposer_ids",
-                            "validity_scope",
-                            "analysis",
-                            "agreement_assessment",
-                            "best_written_proposer_id",
-                            "best_written_selection_reason",
-                            "workflow_action",
-                        ],
-                        "properties": {
-                            "status": {
-                                "enum": status_values
-                            },
-                            "accepted_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
-                            "agreed_proposer_ids": {
-                                "type": "array",
-                                "items": {"enum": active_proposer_ids},
-                            },
-                            "likely_wrong_proposer_ids": {
-                                "type": "array",
-                                "items": {"enum": active_proposer_ids},
-                            },
-                            "recalculate_proposer_ids": {
-                                "type": "array",
-                                "items": {"enum": active_proposer_ids},
-                            },
-                            "validity_scope": {"type": "string"},
-                            "analysis": {"type": "string"},
-                            "best_written_proposer_id": {
-                                "anyOf": [
-                                    {"enum": selectable_proposer_ids},
-                                    {"type": "null"},
-                                ]
-                            },
-                            "best_written_selection_reason": {"type": "string"},
-                            "workflow_action": _workflow_action_schema(),
-                            "agreement_assessment": {
-                                "type": "object",
-                                "required": [
-                                    "target_quantity_match",
-                                    "convention_match",
-                                    "declared_scope_match",
-                                    "agreement_covers_full_target",
-                                    "comparison_summary",
-                                    "accepted_by_reviewer_judgment",
-                                ],
-                                "properties": {
-                                    "target_quantity_match": {"type": "boolean"},
-                                    "convention_match": {"type": "boolean"},
-                                    "declared_scope_match": {"type": "boolean"},
-                                    "agreement_covers_full_target": {"type": "boolean"},
-                                    "comparison_summary": {"type": "string", "minLength": 1},
-                                    "accepted_by_reviewer_judgment": {"type": "boolean"},
-                                    "tool_checks": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": ["object", "string", "number", "boolean", "null"]
-                                        },
-                                    },
-                                    "sanity_checks": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": ["object", "string", "number", "boolean", "null"]
-                                        },
-                                    },
-                                    "special_limit_only": {"type": "boolean"},
-                                    "notes": {"type": "string"},
-                                },
-                                "additionalProperties": True,
-                            },
-                        },
-                        "additionalProperties": True,
-                    }
-                },
-                "additionalProperties": True,
-            },
+    schema["properties"]["proposer_messages"]["required"] = active_proposer_ids
+    schema["properties"]["proposer_messages"]["properties"] = proposer_message_properties
+    consensus_properties = schema["properties"]["review_payload"]["properties"]["consensus"]["properties"]
+    consensus_properties["status"]["enum"] = status_values
+    for field in ["agreed_proposer_ids", "likely_wrong_proposer_ids", "recalculate_proposer_ids"]:
+        consensus_properties[field]["items"]["type"] = "string"
+        consensus_properties[field]["items"]["enum"] = active_proposer_ids
+    consensus_properties["best_written_proposer_id"]["anyOf"] = [
+        {"type": "string", "enum": selectable_proposer_ids},
+        {"type": "null"},
+    ]
+    return schema
+
+
+def _failed_step_result(
+    config: CalculateConfig,
+    step: CalculateStep,
+    *,
+    attempts: list[dict[str, Any]],
+    error: str,
+) -> dict[str, Any]:
+    gated_block = _human_gate_blocked_step_result(
+        config,
+        step,
+        attempts=attempts,
+        consensus={
+            "status": "failed",
+            "analysis": error,
+            "workflow_action": _default_workflow_action("failed", error),
         },
-        "additionalProperties": True,
+        trigger_status="failed",
+        error=error,
+    )
+    if gated_block is not None:
+        return gated_block
+    return {
+        "step_id": step.step_id,
+        "kind": step.kind,
+        "status": "failed",
+        "attempts": attempts,
+        "accepted_output": None,
+        "blocked_output": None,
+        "reviewer_consensus": None,
+        "error": error,
     }
 
 
-def _workflow_action_schema() -> dict[str, Any]:
+def _human_gate_blocked_step_result(
+    config: CalculateConfig,
+    step: CalculateStep,
+    *,
+    attempts: list[dict[str, Any]],
+    consensus: Mapping[str, Any],
+    trigger_status: str,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    if not _human_gate_enabled(config):
+        return None
+    if trigger_status not in _human_gate_pause_statuses(config):
+        return None
+
+    workflow_action = _normalized_workflow_action(consensus.get("workflow_action"), trigger_status)
+    requires_human = _workflow_action_requires_human(workflow_action)
+    if requires_human:
+        workflow_action = copy.deepcopy(workflow_action)
+        workflow_action["action"] = "pause_for_human"
+        workflow_action["requires_human"] = True
+    step_status = "blocked_for_user" if requires_human else "blocked_for_revision"
+    expert_question = str(workflow_action.get("expert_question", "")).strip()
+    if not expert_question:
+        expert_question = _default_expert_question(trigger_status, workflow_action)
+    blocked_output = {
+        "reason": "human_gate",
+        "trigger_status": trigger_status,
+        "requires_human": requires_human,
+        "workflow_action": workflow_action,
+        "expert_question": expert_question,
+        "analysis": str(consensus.get("analysis", "")),
+        "last_consensus": copy.deepcopy(dict(consensus)),
+    }
+    if error:
+        blocked_output["error"] = error
     return {
-        "type": "object",
-        "required": ["action", "requires_human", "issue_type", "reason"],
-        "properties": {
-            "action": {
-                "enum": [
-                    "continue",
-                    "pause_for_human",
-                    "revise_plan",
-                    "split_step",
-                    "retry",
-                ]
-            },
-            "requires_human": {"type": "boolean"},
-            "issue_type": {
-                "enum": [
-                    "none",
-                    "work_note_inadequate",
-                    "work_note_conflict",
-                    "plan_wrong",
-                    "step_too_coarse",
-                    "target_ambiguous",
-                    "source_mapping_error",
-                    "calculation_disagreement",
-                    "reference_disagreement",
-                    "worker_failure",
-                    "other",
-                ]
-            },
-            "proposed_revision": {
-                "type": ["object", "array", "string", "number", "boolean", "null"]
-            },
-            "reason": {"type": "string"},
-            "expert_question": {"type": "string"},
-        },
-        "additionalProperties": True,
+        "step_id": step.step_id,
+        "kind": step.kind,
+        "status": step_status,
+        "attempts": attempts,
+        "accepted_output": None,
+        "blocked_output": blocked_output,
+        "reviewer_consensus": dict(consensus),
+        "error": error,
     }
 
 
@@ -940,13 +679,6 @@ def _attempt_paths(batch_config: Mapping[str, Any]) -> dict[str, Path]:
         "round_root": round_root,
         "review_path": round_root / "reviews" / "reviewer_001.json",
     }
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected JSON object at {path}")
-    return payload
 
 
 def _review_consensus(
@@ -1016,7 +748,43 @@ def _validate_best_written_selection(
         raise ValueError("best_written_selection_reason is required for all_agree consensus")
 
 
-def _agreement_assessment(consensus: Mapping[str, Any], *, status: str) -> Mapping[str, Any]:
+def _reference_disagrees_step_result(
+    step: CalculateStep,
+    *,
+    attempts: list[dict[str, Any]],
+    consensus: Mapping[str, Any],
+) -> dict[str, Any]:
+    workflow_action = _normalized_workflow_action(consensus.get("workflow_action"), "reference_disagrees")
+    requires_human = _workflow_action_requires_human(workflow_action)
+    step_status = "blocked_for_user" if requires_human else "blocked_for_revision"
+    expert_question = str(workflow_action.get("expert_question", "")).strip()
+    if not expert_question:
+        expert_question = _default_expert_question("reference_disagrees", workflow_action)
+    return {
+        "step_id": step.step_id,
+        "kind": step.kind,
+        "status": step_status,
+        "attempts": attempts,
+        "accepted_output": None,
+        "blocked_output": {
+            "reason": "reference_disagrees",
+            "trigger_status": "reference_disagrees",
+            "requires_human": requires_human,
+            "workflow_action": workflow_action,
+            "expert_question": expert_question,
+            "analysis": str(consensus.get("analysis", "")),
+            "last_consensus": copy.deepcopy(dict(consensus)),
+        },
+        "reviewer_consensus": dict(consensus),
+    }
+
+
+def _agreement_assessment(
+    consensus: Mapping[str, Any],
+    *,
+    status: str,
+    reject_special_limit_only: bool = True,
+) -> Mapping[str, Any]:
     assessment = consensus.get("agreement_assessment")
     if not isinstance(assessment, dict):
         raise ValueError(f"{status} requires review_payload.consensus.agreement_assessment")
@@ -1028,7 +796,7 @@ def _agreement_assessment(consensus: Mapping[str, Any], *, status: str) -> Mappi
         raise ValueError(
             f"{status} cannot rely on formatting, spacing, visual similarity, looks identical, or string equality"
         )
-    if assessment.get("special_limit_only") is True:
+    if reject_special_limit_only and assessment.get("special_limit_only") is True:
         raise ValueError(f"{status} cannot accept agreement_assessment.special_limit_only=true")
     return assessment
 
@@ -1059,14 +827,13 @@ def _has_nearby_negation(lowered_summary: str, match_start: int) -> bool:
 
 def _validate_all_agree_agreement_assessment(consensus: Mapping[str, Any]) -> None:
     assessment = _agreement_assessment(consensus, status="all_agree")
-    true_fields = [
+    for field in [
         "target_quantity_match",
         "convention_match",
         "declared_scope_match",
         "agreement_covers_full_target",
         "accepted_by_reviewer_judgment",
-    ]
-    for field in true_fields:
+    ]:
         if assessment.get(field) is not True:
             raise ValueError(f"all_agree requires agreement_assessment.{field}=true")
 
@@ -1076,16 +843,17 @@ def _validate_reference_disagrees_agreement_assessment(
     *,
     active_proposer_ids: list[str],
 ) -> None:
-    assessment = _agreement_assessment(consensus, status="reference_disagrees")
+    assessment = _agreement_assessment(
+        consensus,
+        status="reference_disagrees",
+        reject_special_limit_only=False,
+    )
     agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), active_proposer_ids)
     if len(set(agreed_ids)) < 2:
         raise ValueError("reference_disagrees requires two agreeing blind proposer ids")
-    for field in ["target_quantity_match", "convention_match"]:
+    for field in ["target_quantity_match"]:
         if assessment.get(field) is not True:
             raise ValueError(f"reference_disagrees requires agreement_assessment.{field}=true")
-
-
-_CALLER_ALLOWED_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path", "source_commands"}
 
 
 def _sanitize_caller_allowed_context(value: Any) -> Any:
@@ -1093,7 +861,7 @@ def _sanitize_caller_allowed_context(value: Any) -> Any:
         return {
             str(key): _sanitize_caller_allowed_context(item)
             for key, item in value.items()
-            if str(key) not in _CALLER_ALLOWED_CONTEXT_OMIT_KEYS
+            if str(key) not in CALLER_ALLOWED_CONTEXT_OMIT_KEYS
         }
     if isinstance(value, list):
         return [_sanitize_caller_allowed_context(item) for item in value]
@@ -1117,15 +885,8 @@ def _resolve_integrity_path(path_value: Any = None) -> Path | None:
             if candidate.exists():
                 return candidate.resolve()
         return None
-    return _default_integrity_path()
-
-
-def _default_integrity_path() -> Path | None:
-    for root in [Path.cwd(), *Path.cwd().parents]:
-        candidate = root / "skills/arc/rules/integrity.md"
-        if candidate.exists():
-            return candidate
-    return None
+    path = Path(__file__).resolve().parents[2] / "rules/integrity.md"
+    return path if path.exists() else None
 
 
 def _read_proposer_outputs(round_root: Path, proposer_ids: list[str]) -> dict[str, Any]:
@@ -1146,11 +907,11 @@ def _next_active_for_two_agree(consensus: Mapping[str, Any], all_proposer_ids: l
     return None
 
 
-def _human_gate_enabled(config: ConsensusConfig) -> bool:
+def _human_gate_enabled(config: CalculateConfig) -> bool:
     return bool(config.human_gate.get("enabled", False))
 
 
-def _human_gate_pause_statuses(config: ConsensusConfig) -> tuple[str, ...]:
+def _human_gate_pause_statuses(config: CalculateConfig) -> tuple[str, ...]:
     return _human_gate_pause_statuses_from_mapping(config.human_gate)
 
 
@@ -1262,9 +1023,9 @@ def _proposer_ids(count: int) -> list[str]:
     return [f"proposer_{index:03d}" for index in range(1, count + 1)]
 
 
-def _dry_run_result(config: ConsensusConfig, paths: RunPaths) -> dict[str, Any]:
+def _dry_run_result(config: CalculateConfig, paths: RunPaths) -> dict[str, Any]:
     return {
-        "schema_version": CONSENSUS_RESULT_SCHEMA,
+        "schema_version": CALCULATE_RESULT_SCHEMA,
         "status": "dry_run",
         "run_id": config.run_id,
         "run_root": str(paths.run_root),
@@ -1273,6 +1034,22 @@ def _dry_run_result(config: ConsensusConfig, paths: RunPaths) -> dict[str, Any]:
         "human_gate": copy.deepcopy(config.human_gate),
         "steps": [{"step_id": step.step_id, "kind": step.kind} for step in config.steps],
     }
+
+
+def _read_template(path: Path) -> dict[str, Any]:
+    payload = _read_json(path)
+    return copy.deepcopy(payload)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object at {path}")
+    return payload
+
+
+def _default_workflow_json_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "json"
 
 
 def _required_text(data: Mapping[str, Any], key: str) -> str:
@@ -1285,50 +1062,9 @@ def _required_text(data: Mapping[str, Any], key: str) -> str:
     return text
 
 
-def _parse_human_gate(value: Any) -> dict[str, Any]:
-    raw = _dict(value, "human_gate")
-    parsed: dict[str, Any] = {"enabled": _bool(raw.get("enabled", False), "human_gate.enabled")}
-
-    raw_statuses = raw.get("pause_on_statuses", list(DEFAULT_HUMAN_GATE_PAUSE_STATUSES))
-    if raw_statuses is None:
-        raw_statuses = list(DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
-    if not isinstance(raw_statuses, list):
-        raise ConfigError("human_gate.pause_on_statuses must be an array")
-    allowed_statuses = set(DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
-    statuses: list[str] = []
-    for item in raw_statuses:
-        status = str(item).strip()
-        if status not in allowed_statuses:
-            raise ConfigError(
-                "human_gate.pause_on_statuses values must be one of "
-                + ", ".join(sorted(allowed_statuses))
-            )
-        if status not in statuses:
-            statuses.append(status)
-    parsed["pause_on_statuses"] = statuses or list(DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
-    return parsed
-
-
-def _dict(value: Any, field_name: str) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ConfigError(f"{field_name} must be an object")
-    return copy.deepcopy(value)
-
-
-def _optional_dict(value: Any, field_name: str) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    parsed = _dict(value, field_name)
-    if not parsed:
-        raise ConfigError(f"{field_name} must not be empty when provided")
-    return parsed
-
-
-def _bool(value: Any, field_name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ConfigError(f"{field_name} must be a boolean")
+def _safe_id(value: str, field_name: str) -> str:
+    if not SAFE_ID_RE.match(value):
+        raise ConfigError(f"{field_name} must match {SAFE_ID_RE.pattern}")
     return value
 
 
@@ -1346,25 +1082,64 @@ def _nonnegative_int(value: Any, field_name: str) -> int:
     try:
         parsed = int(value)
     except Exception as exc:
-        raise ConfigError(f"{field_name} must be a non-negative integer") from exc
+        raise ConfigError(f"{field_name} must be a nonnegative integer") from exc
     if parsed < 0:
-        raise ConfigError(f"{field_name} must be a non-negative integer")
+        raise ConfigError(f"{field_name} must be a nonnegative integer")
     return parsed
 
 
-def _safe_id(value: str, field_name: str) -> str:
-    if not SAFE_ID_RE.fullmatch(value):
-        raise ConfigError(f"{field_name} must contain only letters, numbers, dot, underscore, or dash")
-    return value
+def _dict(value: Any, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"{field_name} must be an object")
+    return copy.deepcopy(value)
+
+
+def _optional_dict(value: Any, field_name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return _dict(value, field_name)
+
+
+def _parse_human_gate(value: Any) -> dict[str, Any]:
+    data = _dict(value, "human_gate")
+    enabled = bool(data.get("enabled", False))
+    pause_statuses = data.get("pause_on_statuses", DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
+    if not isinstance(pause_statuses, (list, tuple)):
+        raise ConfigError("human_gate.pause_on_statuses must be a list")
+    return {
+        "enabled": enabled,
+        "pause_on_statuses": [str(item) for item in pause_statuses],
+    }
 
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if is_dataclass(value):
-        return {key: _jsonable(item) for key, item in asdict(value).items()}
+        return _jsonable(asdict(value))
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
     return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="ARC calculate workflow runner")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    result = run_calculation(
+        _read_json(Path(args.config)),
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

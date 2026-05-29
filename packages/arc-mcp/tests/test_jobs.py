@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from arc_mcp import cli
 from arc_mcp import worker
 from arc_mcp.jobs import MCPJobCancelled, MCPJobManager, resolve_inline_wait_seconds
@@ -22,7 +24,16 @@ def test_job_manager_runs_and_records_progress(tmp_path, monkeypatch):
     assert status["status"] == "done"
     assert status["phase"] == "done"
     assert status["step"] == 1
+    assert status["payload"] == {"paper_id": "arXiv:1"}
     assert manager.result(job_id)["result"]["data"]["value"] == 3
+
+
+def test_job_manager_rejects_reserved_payload_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_MCP_CACHE", str(tmp_path))
+    manager = MCPJobManager(max_workers=1, worker_mode="thread")
+
+    with pytest.raises(ValueError, match="reserved job status keys"):
+        manager.start(job_type="test", payload={"status": "done"}, runner=lambda progress, cancel: {})
 
 
 def test_job_manager_returns_not_ready_before_deadline(tmp_path, monkeypatch):
@@ -141,6 +152,23 @@ def test_process_worker_persists_failed_status(tmp_path, monkeypatch):
     status = manager.status(job_id)
     assert status["status"] == "failed"
     assert status["error"]["code"] == "job_failed"
+
+
+def test_process_worker_launch_failure_marks_job_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_MCP_CACHE", str(tmp_path))
+
+    def fail_popen(*args, **kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr("subprocess.Popen", fail_popen)
+    manager = MCPJobManager(max_workers=1)
+
+    job_id = manager.start(job_type="unsupported_test_job", payload={})
+    status = manager.status(job_id)
+
+    assert status["status"] == "failed"
+    assert status["error"]["code"] == "job_worker_launch_failed"
+    assert "spawn failed" in status["error"]["message"]
 
 
 def test_cli_accepts_flat_job_commands(tmp_path, monkeypatch, capsys):

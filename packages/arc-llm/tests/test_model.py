@@ -30,6 +30,16 @@ def test_model_tier_resolves_provider_specific_model_when_no_exact_model_is_set(
     assert resolve_model("claude-cli", model_tier="high", env={}) == "opus"
 
 
+def test_model_tier_aliases_can_be_overridden_by_env():
+    env = {
+        "ARC_LLM_CODEX_HIGH_MODEL": "codex-high-custom",
+        "ARC_LLM_CLAUDE_LOW_MODEL": "claude-low-custom",
+    }
+
+    assert resolve_model("codex-cli", model_tier="high", env=env) == "codex-high-custom"
+    assert resolve_model("claude-cli", model_tier="low", env=env) == "claude-low-custom"
+
+
 def test_explicit_model_tier_is_only_tier_selector():
     assert resolve_model("codex-cli", model_tier="high", env={"ARC_LLM_MODEL_TIER": "low"}) == "gpt-5.5"
 

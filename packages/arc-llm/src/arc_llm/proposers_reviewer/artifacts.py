@@ -134,6 +134,7 @@ def atomic_write_text(path: Path, text: str) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     tmp.replace(path)
+    _fsync_parent(path)
 
 
 @contextmanager
@@ -176,6 +177,19 @@ def append_jsonl(path: Path, item: Any) -> None:
 
 def _tmp_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{os.getpid()}.{get_ident()}.{time.time_ns()}.tmp")
+
+
+def _fsync_parent(path: Path) -> None:
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _hostname() -> str:

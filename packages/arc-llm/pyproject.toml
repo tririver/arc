@@ -7,7 +7,6 @@ name = "arc-llm"
 version = "0.1.0"
 description = "Reusable host LLM execution helpers for ARC tools."
 requires-python = ">=3.11"
-dependencies = ["openai>=1.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0", "sympy>=1.12"]

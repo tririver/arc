@@ -77,7 +77,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     existing_run_policy = str(data.get("existing_run_policy", "fail")).strip() or "fail"
     if existing_run_policy not in {"fail", "append_new_loops"}:
         raise ConfigError("existing_run_policy must be fail or append_new_loops")
-    fail_fast = bool(data.get("fail_fast", False))
+    fail_fast = _bool(data.get("fail_fast", False), "fail_fast")
     artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
 
     defaults = _dict(data.get("defaults", {}), "defaults")
@@ -123,15 +123,30 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
 def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     runtime = worker.runtime
-    if runtime.get("allow_internet"):
+    allow_internet = _bool(runtime.get("allow_internet", False), "runtime.allow_internet")
+    allow_mcp = _bool(runtime.get("allow_mcp", False), "runtime.allow_mcp")
+    if allow_internet:
         env["ARC_CODEX_ALLOW_INTERNET"] = "true"
         env["ARC_CLAUDE_ALLOW_INTERNET"] = "true"
-    if runtime.get("allow_mcp"):
+    else:
+        env["ARC_CODEX_ALLOW_INTERNET"] = "false"
+        env["ARC_CLAUDE_ALLOW_INTERNET"] = "false"
+        env["ARC_CODEX_WEB_SEARCH"] = "disabled"
+        env["ARC_CODEX_NETWORK_ACCESS"] = "false"
+        env.pop("ARC_CLAUDE_TOOLS", None)
+    if allow_mcp:
         mcp_mode = _mcp_mode(runtime.get("mcp_mode"), "runtime.mcp_mode")
         env["ARC_CODEX_ENABLE_MCP"] = "true"
         env["ARC_CLAUDE_ALLOW_MCP"] = "true"
         _put(env, "ARC_CODEX_MCP_MODE", mcp_mode)
         _put(env, "ARC_CLAUDE_MCP_MODE", mcp_mode)
+    else:
+        env["ARC_CODEX_ENABLE_MCP"] = "false"
+        env["ARC_CLAUDE_ALLOW_MCP"] = "false"
+        env.pop("ARC_CODEX_MCP_MODE", None)
+        env.pop("ARC_CLAUDE_MCP_MODE", None)
+        env.pop("ARC_CLAUDE_MCP_CONFIG", None)
+        env.pop("ARC_CLAUDE_MCP_CONFIG_JSON", None)
     if worker.model_tier:
         env.setdefault("ARC_CODEX_REASONING_EFFORT", _codex_effort_for_model_tier(worker.model_tier))
         env.setdefault("ARC_CLAUDE_EFFORT", _claude_effort_for_model_tier(worker.model_tier))
@@ -167,7 +182,7 @@ def _parse_loop(
     loop_id = _safe_id(_required_text(loop_data, "loop_id"), "loop_id")
     max_rounds = _positive_int(loop_data.get("max_rounds"), f"{loop_id}.max_rounds")
     early_stop = _dict(loop_data.get("early_stop", {}), f"{loop_id}.early_stop")
-    early_stop_enabled = bool(early_stop.get("enabled", False))
+    early_stop_enabled = _bool(early_stop.get("enabled", False), f"{loop_id}.early_stop.enabled")
     proposers = _parse_workers(
         loop_data.get("proposers"),
         field_name=f"{loop_id}.proposers",

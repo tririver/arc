@@ -43,7 +43,18 @@ class CodexCliProvider:
                 cmd.extend(["-m", model])
             cmd.append("-")
 
-            result = subprocess.run(cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=dict(self.env),
+                    timeout=_timeout_seconds(self.env, "ARC_CODEX_TIMEOUT_SECONDS"),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
             try:
@@ -66,7 +77,18 @@ class CodexCliProvider:
                 cmd.extend(["-m", model])
             cmd.append("-")
 
-            result = subprocess.run(cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=dict(self.env),
+                    timeout=_timeout_seconds(self.env, "ARC_CODEX_TIMEOUT_SECONDS"),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
             try:
@@ -205,6 +227,20 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _timeout_seconds(env: Mapping[str, str], provider_key: str) -> float | None:
+    key = provider_key if env.get(provider_key) not in {None, ""} else "ARC_LLM_TIMEOUT_SECONDS"
+    value = env.get(key)
+    if value is None or not value.strip():
+        return None
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise LLMWorkerError(f"{key} must be a positive number") from exc
+    if timeout <= 0:
+        raise LLMWorkerError(f"{key} must be a positive number")
+    return timeout
 
 
 def _env_list(env: Mapping[str, str], key: str) -> list[str]:

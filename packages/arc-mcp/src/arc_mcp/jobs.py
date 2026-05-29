@@ -21,6 +21,23 @@ CancelCheck = Callable[[], bool]
 JobRunner = Callable[[ProgressCallback, CancelCheck], Any]
 StatusResolver = Callable[[Any], str]
 TERMINAL_STATUSES = {"done", "failed", "cancelled", "needs_llm"}
+RESERVED_STATUS_PAYLOAD_KEYS = {
+    "schema_version",
+    "job_id",
+    "job_type",
+    "status",
+    "phase",
+    "progress",
+    "payload",
+    "cancel_requested",
+    "started_at",
+    "updated_at",
+    "finished_at",
+    "worker",
+    "error",
+    "error_path",
+    "result_path",
+}
 
 
 class MCPJobCancelled(RuntimeError):
@@ -86,11 +103,13 @@ class MCPJobManager:
         job_id = uuid4().hex
         paths = JobPaths.for_job(job_id)
         now = now_iso()
+        payload_dict = dict(payload or {})
+        _validate_status_payload(payload_dict)
         job = {
             "schema_version": "arc.mcp_job.v1",
             "job_id": job_id,
             "job_type": job_type,
-            "payload": dict(payload or {}),
+            "payload": payload_dict,
             "created_at": now,
         }
         paths.job_dir.mkdir(parents=True, exist_ok=True)
@@ -104,11 +123,12 @@ class MCPJobManager:
                 "status": "queued",
                 "phase": "queued",
                 "progress": {},
+                "payload": payload_dict,
                 "cancel_requested": False,
                 "started_at": now,
                 "updated_at": now,
                 "finished_at": None,
-                **dict(payload or {}),
+                **payload_dict,
             },
         )
         if self._use_thread_worker() and runner is not None:
@@ -234,14 +254,18 @@ class MCPJobManager:
         stdout = paths.stdout.open("ab")
         stderr = paths.stderr.open("ab")
         try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                start_new_session=True,
-                close_fds=True,
-            )
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except Exception as exc:
+                set_error(job_id, "job_worker_launch_failed", f"Could not launch MCP job worker: {exc}")
+                return
         finally:
             stdout.close()
             stderr.close()
@@ -282,6 +306,13 @@ def cache_root() -> Path:
     if project_root := _project_root():
         return project_root / "cache" / "arc-mcp"
     return Path.home() / ".cache" / "arc" / "arc-mcp"
+
+
+def _validate_status_payload(payload: Mapping[str, Any]) -> None:
+    conflicts = sorted(set(payload) & RESERVED_STATUS_PAYLOAD_KEYS)
+    if conflicts:
+        joined = ", ".join(conflicts)
+        raise ValueError(f"payload contains reserved job status keys: {joined}")
 
 
 def jobs_root() -> Path:

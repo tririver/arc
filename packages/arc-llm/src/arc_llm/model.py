@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import os
 from typing import Mapping
-
-from .providers.config import ConfiguredProvider, ProviderConfigError, configured_provider
 
 PROVIDER_MODEL_TIERS = {
     "codex-cli": {
@@ -16,6 +13,11 @@ PROVIDER_MODEL_TIERS = {
         "medium": "sonnet",
         "high": "opus",
     },
+}
+
+PROVIDER_MODEL_TIER_ENV_PREFIXES = {
+    "codex-cli": "ARC_LLM_CODEX",
+    "claude-cli": "ARC_LLM_CLAUDE",
 }
 
 DEFAULT_MODEL_TIER = "medium"
@@ -41,22 +43,10 @@ def resolve_model(
 ) -> str | None:
     if explicit_model:
         return explicit_model
-    env = env if env is not None else os.environ
     tier = _resolve_tier(model_tier)
-    if configured := _configured_provider(provider_name, env=env):
-        if tier:
-            if model := configured.model_for_tier(tier):
-                return model
     if tier:
-        return _model_for_tier(provider_name, tier)
+        return _model_for_tier(provider_name, tier, env=env)
     return DEFAULT_PROVIDER_MODELS.get(provider_name)
-
-
-def _configured_provider(provider_name: str, *, env: Mapping[str, str]) -> ConfiguredProvider | None:
-    try:
-        return configured_provider(provider_name, env=env)
-    except ProviderConfigError:
-        return None
 
 
 def _resolve_tier(explicit_tier: str | None) -> str | None:
@@ -69,8 +59,23 @@ def _resolve_tier(explicit_tier: str | None) -> str | None:
     return normalized
 
 
-def _model_for_tier(provider_name: str, tier: str) -> str | None:
+def _model_for_tier(provider_name: str, tier: str, *, env: Mapping[str, str] | None = None) -> str | None:
+    override = _model_tier_env_override(provider_name, tier, env=env)
+    if override:
+        return override
     models = PROVIDER_MODEL_TIERS.get(provider_name)
     if not models:
         return DEFAULT_PROVIDER_MODELS.get(provider_name)
     return models[tier]
+
+
+def _model_tier_env_override(provider_name: str, tier: str, *, env: Mapping[str, str] | None) -> str | None:
+    if env is None:
+        return None
+    prefix = PROVIDER_MODEL_TIER_ENV_PREFIXES.get(provider_name)
+    if not prefix:
+        return None
+    value = env.get(f"{prefix}_{tier.upper()}_MODEL")
+    if value is None or not value.strip():
+        return None
+    return value.strip()

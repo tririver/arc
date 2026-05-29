@@ -6,7 +6,6 @@ from typing import Any, Callable, Mapping, Sequence
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record
 from .host import HostDetection, select_llm_provider
 from .model import resolve_model
-from .providers.config import ProviderConfigError, usable_configured_providers
 from .providers.select import select_provider
 
 
@@ -63,37 +62,15 @@ def resolve_llm_configs(
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
 ) -> list[LLMConfig]:
-    if provider == "auto" and model:
-        raise ValueError("Exact model requires explicit provider; use provider=<provider> or model_tier=<low|medium|high>.")
-    primary = resolve_llm_config(
-        provider=provider,
-        model=model,
-        model_tier=model_tier,
-        env=env,
-        process_chain=process_chain,
-    )
-    if provider != "auto":
-        return [primary]
-
-    configs = [primary]
-    seen = {primary.provider}
-    try:
-        configured = usable_configured_providers(env=env)
-    except ProviderConfigError:
-        configured = []
-    for candidate in configured:
-        if candidate.id in seen:
-            continue
-        seen.add(candidate.id)
-        configs.append(
-            LLMConfig(
-                provider=candidate.id,
-                model=resolve_model(candidate.id, model, model_tier=model_tier, env=env),
-                host=primary.host,
-                signals=[*primary.signals, f"provider-fallback:{candidate.id}"],
-            )
+    return [
+        resolve_llm_config(
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            env=env,
+            process_chain=process_chain,
         )
-    return configs
+    ]
 
 
 def run_json(
@@ -245,6 +222,8 @@ def _attempt_record(
         "fallback_index": fallback_index,
         "attempt": attempt,
         "status": status,
+        "error_type": None,
+        "message": None,
     }
     if error is not None:
         record["error_type"] = type(error).__name__

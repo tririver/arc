@@ -98,7 +98,10 @@ def test_workflow_docs_stay_human_readable() -> None:
         text = (WF / name).read_text(encoding="utf-8")
         assert len(text.splitlines()) <= 220
         assert "0_ref/" not in text
-        assert "/scripts/" not in text
+        if name != "calculate.md":
+            assert "/scripts/" not in text
+        else:
+            assert "workflows/scripts/calculate_runner.py" in text
 
 
 def test_check_workflow_keeps_notes_out_of_proposer_context() -> None:
@@ -163,8 +166,9 @@ def test_calculate_workflow_uses_work_note_runtime_artifacts() -> None:
     calculate = (WF / "calculate.md").read_text(encoding="utf-8")
 
     assert "<project-dir>/work-note.md" in calculate
-    assert "<project-dir>/calculate/<run-id>/execute/consensus.config.json" in calculate
-    assert "<project-dir>/calculate/<run-id>/execute/<consensus-run-id>/" in calculate
+    assert "<project-dir>/calculate/<run-id>/execute/calculate.config.json" in calculate
+    assert "<project-dir>/calculate/<run-id>/execute/<calculate-run-id>/" in calculate
+    assert "calculate.config.template.json" in calculate
     assert "calculation-report.md" not in calculate
     assert "foundation/latest.json" not in calculate
     assert "latest-plan.md" not in calculate
@@ -308,6 +312,16 @@ def test_calculate_uses_reviewer_judgment_not_mandatory_sympy_gate() -> None:
     assert "before `all_agree`, at least two" not in text
     assert "special limits are sanity checks" in text
     assert "not proof of full agreement" in text
+
+
+def test_calculate_pause_requires_explicit_human_expert_question() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
+
+    assert "human expert question:" in text
+    assert "do not merely say that the workflow paused" in text
+    assert "name the step" in text
+    assert "unresolved equation or claim" in text
+    assert "user-facing response" in text
 
 
 def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
@@ -639,6 +653,12 @@ def test_packaged_skill_references_include_required_workflow_inputs() -> None:
         Path("workflows/check.md"),
         Path("workflows/domain.md"),
         Path("workflows/ideas.md"),
+        Path("workflows/calculate.md"),
+        Path("workflows/json/calculate.config.template.json"),
+        Path("workflows/json/calculate-proposer.template.json"),
+        Path("workflows/json/calculate-reviewer.template.json"),
+        Path("workflows/json/calculate-reviewer-output.schema.json"),
+        Path("workflows/scripts/calculate_runner.py"),
         Path("workflows/json/ideas.config.template.json"),
         Path("workflows/scripts/ideas_config.py"),
         Path("workflows/scripts/ideas_marking.py"),
@@ -689,6 +709,11 @@ def test_packaged_skill_references_stay_synced_with_source() -> None:
         Path("workflows/domain.md"),
         Path("workflows/calculate.md"),
         Path("workflows/ideas.md"),
+        Path("workflows/json/calculate.config.template.json"),
+        Path("workflows/json/calculate-proposer.template.json"),
+        Path("workflows/json/calculate-reviewer.template.json"),
+        Path("workflows/json/calculate-reviewer-output.schema.json"),
+        Path("workflows/scripts/calculate_runner.py"),
         Path("workflows/json/ideas.config.template.json"),
         Path("workflows/plan.md"),
         Path("workflows/scripts/ideas_config.py"),

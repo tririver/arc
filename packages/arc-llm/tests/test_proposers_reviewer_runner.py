@@ -450,12 +450,20 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
             encoding="utf-8"
         )
     )
+    original_prompt = (
+        tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/prompts/reviewer_001.md"
+    ).read_text(encoding="utf-8")
+    retry_prompt = (
+        tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/prompts/reviewer_001.retry_001.md"
+    ).read_text(encoding="utf-8")
 
     assert result["status"] == "completed"
     assert len(reviewer_prompts) == 2
     assert "Previous reviewer response failed validation" in reviewer_prompts[1]
     assert "review schema_version must be arc.llm.review_envelope.v1" in reviewer_prompts[1]
     assert review["controller"]["message"] == "valid after retry"
+    assert "Previous reviewer response failed validation" not in original_prompt
+    assert "Previous reviewer response failed validation" in retry_prompt
 
 
 def test_worker_envs_are_isolated_and_os_environ_is_not_mutated(tmp_path, monkeypatch):
@@ -468,7 +476,7 @@ def test_worker_envs_are_isolated_and_os_environ_is_not_mutated(tmp_path, monkey
     proposer_call = next(call for call in fake.calls if call["worker_id"] == "proposer_001")
     reviewer_call = next(call for call in fake.calls if call["worker_id"] == "reviewer_001")
     assert proposer_call["env"]["ARC_CODEX_ALLOW_INTERNET"] == "true"
-    assert "ARC_CODEX_ENABLE_MCP" not in proposer_call["env"]
+    assert proposer_call["env"]["ARC_CODEX_ENABLE_MCP"] == "false"
     assert reviewer_call["env"]["ARC_CODEX_ENABLE_MCP"] == "true"
     assert "ARC_CODEX_ALLOW_INTERNET" not in os.environ
     assert "ARC_CODEX_ENABLE_MCP" not in os.environ
@@ -485,6 +493,35 @@ def test_worker_model_tier_is_passed_as_runner_argument(tmp_path):
 
     assert {call["model_tier"] for call in fake.calls} == {"high"}
     assert all("ARC_LLM_MODEL_TIER" not in call["env"] for call in fake.calls)
+
+
+def test_custom_json_runner_receives_process_chain_when_supported(tmp_path):
+    calls = []
+
+    def fake(prompt, *, schema, provider, model, model_tier=None, env, process_chain):
+        context = _context_from_prompt(prompt)
+        calls.append({"worker_id": context["worker_id"], "process_chain": process_chain})
+        if context["worker_id"].startswith("reviewer"):
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    run_proposers_reviewer_batch(
+        base_config(tmp_path, max_rounds=1),
+        json_runner=fake,
+        base_env={},
+        process_chain=["codex", "bash"],
+    )
+
+    assert calls
+    assert {tuple(call["process_chain"]) for call in calls} == {("codex", "bash")}
 
 
 def _context_from_prompt(prompt: str) -> dict[str, Any]:

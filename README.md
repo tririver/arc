@@ -13,7 +13,7 @@ optional MCP server:
   context, full-text search, LLM paper summaries, and paper-summary batches.
 - `arc-domain`: builds a cached research-domain package from a seed paper and
   optional scientific intent.
-- `arc-llm`: reusable host LLM execution, provider configuration, and
+- `arc-llm`: reusable host LLM execution, provider selection, and
   proposers-reviewer workflows.
 - `arc-typeset`: deterministic typesetting utilities, including Markdown to PDF
   conversion through Pandoc and XeLaTeX.
@@ -33,7 +33,7 @@ Use ARC when you want to:
   explicit provenance and checks.
 
 Deterministic paper queries do not need an LLM. Paper summaries, domain
-briefings, idea loops, and calculation consensus workflows need a host LLM
+briefings, idea loops, and calculation workflow runners need a host LLM
 provider.
 
 ## Install
@@ -42,7 +42,8 @@ Requirements:
 
 - Python 3.11 or newer.
 - Network access for first-time INSPIRE/ar5iv fetches.
-- Codex, Claude Code, or an OpenAI-compatible provider for LLM work.
+- Codex or Claude Code for host LLM work; unknown hosts fall back to manual
+  prompt handoff.
 - Optional for `arc-typeset md2pdf`: `pandoc`, `xelatex`, and a CJK-capable
   font such as `Noto Sans CJK SC`.
 
@@ -138,7 +139,7 @@ or `arc-mcp watch <job_id> --json` to inspect completion.
 
 ## Configure LLM Providers
 
-ARC can use built-in host providers or configured OpenAI-compatible providers.
+ARC uses built-in host providers.
 
 Built-in host providers:
 
@@ -156,40 +157,12 @@ arc-paper doctor host --json
 arc-paper doctor provider --json
 ```
 
-For URL-based providers such as DeepSeek, Ollama, LM Studio, vLLM, or
-OpenRouter, create a local provider file. The file may contain API keys, so do
-not commit it.
-
-```bash
-arc-llm providers init
-arc-llm providers add openai-compatible \
-  --id deepseek \
-  --base-url https://api.deepseek.com/v1 \
-  --api-key <key> \
-  --medium-model deepseek-v4-flash \
-  --high-model deepseek-v4-pro \
-  --json-mode json_object
-arc-llm providers list
-arc-llm providers doctor
-```
-
-Provider config discovery checks:
-
-```text
-./llm-providers.json
-~/.config/arc/llm-providers.json
-```
-
-Override the path with `ARC_LLM_PROVIDER_CONFIG` or `--provider-config`.
-Use `arc-llm providers init` to create the redacted starting file, then add
-providers with `arc-llm providers add openai-compatible`.
-
-Provider files register URL endpoints and model-tier mappings only. They do not
-select the provider or model for a run.
-
-With `--provider auto`, ARC uses native host providers first, then usable
-configured providers. Change run model through the run config/CLI:
-`provider` plus `model_tier`, or exact `model` with an explicit `provider`.
+With `--provider auto`, ARC uses only host-native providers: Codex selects
+`codex-cli`, Claude Code selects `claude-cli`, and unknown hosts select
+`manual`. `arc-llm` does not read provider config files, API-key files, or
+URL-based provider definitions. Change run model through the run config/CLI:
+`provider` plus `model_tier`, or exact `model` with an explicit built-in
+provider.
 
 ## Use ARC Through An Agent
 
@@ -282,7 +255,6 @@ provider/model:
 
 ```bash
 arc-paper llm-generate-summary arXiv:0911.3380 --provider auto --json
-arc-paper llm-generate-summary arXiv:0911.3380 --provider deepseek --model deepseek-v4-pro --json
 ```
 
 If no runnable LLM provider is available, ARC returns a `needs_llm` task with
@@ -474,7 +446,7 @@ expansion:
    premises, define ready-step boundaries, and maintain rough later steps.
 2. `calculate`: record current-step result/status, write planning requests
    when plan or foundation material must change, and execute current detailed
-   steps through proposers-reviewer consensus.
+   steps through the calculate workflow runner and proposer-reviewer loops.
 
 Primary outputs:
 
@@ -482,8 +454,8 @@ Primary outputs:
 <project-dir>/work-note.md
 <project-dir>/calculate/<run-id>/work-notes/work-note-v001.md
 <project-dir>/calculate/<run-id>/work-notes/work-note-v002.md
-<project-dir>/calculate/<run-id>/execute/consensus.config.json
-<project-dir>/calculate/<run-id>/execute/<consensus-run-id>/
+<project-dir>/calculate/<run-id>/execute/calculate.config.json
+<project-dir>/calculate/<run-id>/execute/<calculate-run-id>/
 ```
 
 `work-note.md` is the human and agent source of truth. It contains notation,
@@ -545,7 +517,6 @@ Useful environment variables:
 
 ```text
 ARC_AGENT_HOST                    Force host detection, for example codex or claude-code.
-ARC_LLM_PROVIDER_CONFIG           Override the provider config file path.
 ARC_PAPER_CACHE                   Override the arc-paper cache root.
 ARC_DOMAIN_CACHE                  Override the arc-domain cache root.
 ARC_MCP_CACHE                     Override the arc-mcp job/cache root.
@@ -570,7 +541,6 @@ If LLM generation is unavailable:
 ```bash
 arc-llm doctor host
 arc-llm doctor provider
-arc-llm providers doctor
 ```
 
 If an MCP call returns a job ID:
@@ -608,8 +578,8 @@ This repository is organized as Python packages plus thin agent adapters.
 Package boundaries:
 
 - `packages/arc-llm` owns reusable host LLM execution: host detection,
-  provider selection, model defaults, direct prompt calls, configured
-  OpenAI-compatible providers, and proposers-reviewer runners.
+  provider selection, model defaults, direct prompt calls, and
+  proposers-reviewer runners.
 - `packages/arc-paper` owns deterministic paper data access, ID normalization,
   cache layout, ar5iv parsing, INSPIRE access, paper-summary contracts,
   paper-summary orchestration, full-text search, and summary batches.

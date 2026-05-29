@@ -163,7 +163,6 @@ def test_generate_llm_summary_rejects_auto_provider_with_exact_model(monkeypatch
 def test_generate_llm_summary_resolves_model_tier_before_summary_provider(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     monkeypatch.setenv("ARC_AGENT_HOST", "codex")
-    monkeypatch.setenv("ARC_LLM_PROVIDER_CONFIG", str(tmp_path / "missing-providers.json"))
     monkeypatch.setattr(service, "_inspire", FakeInspire())
     monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
     captured = {}
