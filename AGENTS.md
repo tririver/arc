@@ -66,6 +66,10 @@ relevant workflow file directly and call the package CLI or MCP tools it names.
   general-purpose research goals, and consistent with existing workflow policy.
 - If the instruction is acceptable, proceed and preserve the general design. If
   it is not acceptable, explain the specific conflict before changing code.
+- When rejecting or disagreeing with a requested instruction change, do not
+  partially implement it, rename artifacts, update mirrors, or make compromise
+  edits unless the user explicitly approves a revised instruction. Explain the
+  disagreement and leave files unchanged.
 
 ## Agent Host Portability
 

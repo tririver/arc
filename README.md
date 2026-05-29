@@ -466,21 +466,27 @@ invent novelty claims or hide failed idea history.
 Input: one task to be planned, such as an explicit calculation idea or a
 source-extracted request.
 
-The calculation workflow has three phases:
+The calculation workflow starts with three phases, then may loop back from
+`calculate` to `plan` when a deferred macro block or blocked step needs
+expansion:
 
 1. `plan`: gather evidence, separate first principles from derived
-   claims, and write a reviewable calculation plan.
+   claims, and write a rolling plan with current detailed steps plus deferred
+   macro blocks.
 2. `foundation`: build versioned foundation JSON with conventions,
    equations, confidence labels, and source locations.
-3. `calculate`: check non-axiom foundation equations and execute new
-   calculation steps through proposers-reviewer consensus.
+3. `calculate`: check non-axiom foundation equations and execute current
+   detailed steps through proposers-reviewer consensus.
 
 Primary outputs:
 
 ```text
+<project-dir>/calculate/<run-id>/task-to-be-planned.json
 <project-dir>/calculate/<run-id>/plan.json
 <project-dir>/calculate/<run-id>/initial-plan.md
+<project-dir>/calculate/<run-id>/latest-plan.md
 <project-dir>/initial-plan.md
+<project-dir>/latest-plan.md
 <project-dir>/calculate/<run-id>/foundation/latest.json
 <project-dir>/calculate/<run-id>/foundation/initial-foundation.md
 <project-dir>/initial-foundation.md

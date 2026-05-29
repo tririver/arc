@@ -97,13 +97,13 @@ mode, do not pause; continue to Phase 3 after recording the findings.
 Step 1: Write a short task-to-be-planned artifact:
 
 ```text
-<project-dir>/calculate/<run-id>/note-check-triage.json
+<project-dir>/calculate/<run-id>/task-to-be-planned.json
 <project-dir>/calculate/<run-id>/initial-note-check.md
 <project-dir>/initial-note-check.md
 ```
 
 Include parsed source locations, note items, and Phase 2 preflight findings.
-For parsed TeX notes, build `note-check-triage.json` from `sections[]` and
+For parsed TeX notes, build `task-to-be-planned.json` from `sections[]` and
 `equations[]`. Each note item should carry `source_id`, the parsed equation
 `id`, TeX line range, section, printed equation number when available, and PDF
 page when available.
@@ -119,9 +119,10 @@ before continuing.
 
 ## Phase 4: Reuse Calculation Workflows
 
-Step 1: Treat `note-check-triage.json` as the task-to-be-planned artifact and run
-`plan.md`. `plan.md` owns the foundation boundary, claim/step granularity,
-blind-reference planning, and proposer-visible secrecy rules.
+Step 1: Run `plan.md`. It reads
+`<project-dir>/calculate/<run-id>/task-to-be-planned.json`. `plan.md` owns the
+foundation boundary, claim/step granularity, blind-reference planning, and
+proposer-visible secrecy rules.
 
 Step 2: Execute `foundation.md` from `plan.json`. It owns foundation JSON,
 source, confidence, convention, and versioning rules.
@@ -132,17 +133,23 @@ handling, human-resolved continuation, and `calculation-report.md` generation.
 
 ## Phase 5: Validate
 
-Step 1: After `calculate.md` produces a report or blocked report, run:
+Step 1: After `calculate.md` produces a report or blocked report, write or
+update `<project-dir>/calculate/<run-id>/note-check-triage.json` as the
+validation status map from the final plan, source items, consensus results, and
+human-resolved items. This is not input to `plan.md`; the planning input remains
+`task-to-be-planned.json`.
+
+Step 2: Run:
 
 ```bash
 arc-paper validate-note-check <project-dir>/calculate/<run-id> --json
 ```
 
-Step 2: Treat the report as final only after validation passes. If validation
+Step 3: Treat the report as final only after validation passes. If validation
 fails and the run cannot be completed, keep the report as `blocked_partial` and
 include the validation errors.
 
-Step 3: If checking shows that a cached parsed equation is problematic, ask the
+Step 4: If checking shows that a cached parsed equation is problematic, ask the
 user to choose either a cache annotation or a re-cache.
 
 For annotation:

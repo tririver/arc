@@ -1,8 +1,15 @@
 # Plan Workflow
 
-Use this workflow when a task to be planned is available.
-The output is a careful, reviewable rolling plan. Do not start deriving
-equations here.
+Use this workflow when a task to be planned is available. It writes a rolling
+plan with executable `detailed_steps` and deferred `macro_plan` blocks.
+`calculate.md` executes only detailed steps; later blocks return here for
+expansion before execution.
+
+At any step, if more information would improve the plan, gather it. Use ARC
+paper/domain tools for paper and domain evidence, and use internet search when
+it helps resolve missing, recent, or ambiguous context. Record every useful
+source in `literature_checks` with the tool, command or URL, paper id or
+section when available, and why it matters.
 
 Write artifacts under:
 
@@ -18,26 +25,22 @@ Write artifacts under:
 
 ## Inputs
 
-Read `<project-dir>/context.json`, the task-to-be-planned artifact, domain
-Markdown/JSON, domain summaries, and available domain graph files. The
-task-to-be-planned artifact may be a user-written task, generated idea,
-source-extracted request artifact with source items, preflight findings, and
-locations, or a plan-expansion request written by `calculate.md`. Keep the
-user's exact scientific intent visible in the plan.
+Read `<project-dir>/context.json` as project routing metadata, not as the
+task itself. First check
+`<project-dir>/calculate/<run-id>/task-to-be-planned.json`. If it does not
+exist, use the user's intent passed to this workflow. Do not infer the
+scientific task from `context.json` alone.
 
-## Phase 1: Gather Evidence
+This workflow must produce a plan ready for `foundation.md` and `calculate.md`;
+use that goal to decide what evidence to gather.
 
-Step 1: Use ARC paper and domain tools before internet search. Use the CLI and
-MCP surfaces documented in `manuals/arc-paper.md` and `manuals/arc-domain.md`;
-read `manuals/arc-mcp.md` before calling MCP tools.
+Before planning, make sure the task is clear enough to identify the quantity,
+claim, source items, or research goal being planned. If automation is not
+`auto`, ask the user about any ambiguity before writing `plan.json`. In `auto`
+mode, use the safest explicit interpretation, record assumptions in `plan.json`,
+and preserve warnings in `latest-plan.md`.
 
-Step 2: Use internet search only after ARC checks when literature may be
-uncached, recent, outside arXiv/INSPIRE, or ambiguous.
-
-Step 3: Record every useful source in `literature_checks` with the tool,
-command, paper id, section, and reason it matters.
-
-## Phase 2: Separate What Can Be Trusted
+## Phase 1: Separate What Can Be Trusted
 
 Step 1: Identify first principles. These may be axioms, definitions, symmetry
 requirements, standard variational principles, conserved quantities, or other
@@ -51,24 +54,29 @@ Step 3: Mark validation-only results separately. These are results useful for
 cross-checks, limits, benchmark cases, or sanity tests, but not allowed as
 inputs to the new derivation.
 
-Step 4: When the task-to-be-planned artifact contains source-extracted items, split
-those items into `foundation`, `claims_to_check`, and `context_only`. If an
-item could be either foundation or a derived claim, put it in
+Step 4: When the task-to-be-planned artifact contains source-extracted items,
+split those items into `foundation`, `claims_to_check`, and `context_only`. If
+an item could be either foundation or a derived claim, put it in
 `claims_to_check`. Do not accept a source-derived equation as foundation merely
 because it appears early, is boxed, or is used later in the source.
 
-## Phase 3: Build The Rolling Calculation Plan
+## Phase 2: Build The Rolling Calculation Plan
 
-Step 1: Make the first calculation step the first nontrivial derivation after
-the accepted foundation setup.
+Step 1: Choose the planning horizon. Write near-term executable
+`detailed_steps` and rough later `macro_plan` blocks:
 
-Step 2: Plan adaptively. Use the largest coherent semantic chunks that current
-agents can check reliably, then split only when the chunk is too hard or too
-ambiguous. Do not make one equation equal one step by default. Stronger agents
-should naturally receive larger chunks, and weaker agents should receive smaller
-chunks.
+```text
+detailed_steps: executable semantic chunks for the next coherent batch
+macro_plan: later dependency-ordered blocks, not executable until expanded
+```
 
-Use these target budgets as planning priors, not hard caps:
+The first detailed step starts at the first nontrivial derivation after the
+accepted foundation setup. Make the current executable batch detailed enough to
+run with high confidence. Leave later work in `macro_plan` so future planning
+can use accepted results, observed failure modes, and measured agent ability.
+
+Use these target budgets as priors for the total expanded plan, not hard caps
+for the first executable batch:
 
 ```text
 exam-style exercise: 3-5 detailed steps
@@ -77,28 +85,15 @@ simple research task: 10-20 detailed steps
 challenging research task: 20-50 detailed steps
 ```
 
-For source-checking tasks with many equations, group equations by meaning and
-dependency, not by raw equation count. A step may contain several checkpoint
-equations when they are one derivation chain, one physical argument, one
-quantity family, one approximation regime, or one source-context unit. Each
-checkpoint must have its own target quantity and verification target. If one
-step contains multiple checkpoint equations, state why they belong together and
-how the reviewer should map checkpoint names to reviewer-only reference claims.
+Step 2: Choose step granularity by meaning and difficulty. Use the largest
+coherent chunks current agents can check reliably, then split only when the
+chunk is too hard or ambiguous. Do not split by raw equation count. A detailed
+step may contain several checkpoint equations when they are one derivation
+chain, physical argument, quantity family, approximation regime, or
+source-context unit. Each checkpoint must have its own target quantity and
+verification target.
 
-Step 3: Split the plan into near-term detailed work and later macro work:
-
-```text
-detailed_steps: executable steps for the next coherent batch
-macro_plan: rough later blocks, not executable until expanded
-```
-
-Make only the first few steps detailed enough to run with high confidence. For
-later work, keep a macro-plan with the dependency order, source ranges, likely
-checkpoints, expected inputs, difficulty estimate, and expansion trigger. This
-lets later planning use accepted results, observed failure modes, and measured
-agent ability instead of guessing the entire project upfront.
-
-Step 4: For every `detailed_steps[]` entry, specify:
+Step 3: For every `detailed_steps[]` entry, specify:
 
 ```text
 step_id
@@ -136,7 +131,7 @@ reviewer_reference_claim_ids
 verification
 ```
 
-Step 5: At the end of every detailed step, make the quantity contract explicit:
+At the end of every detailed step, make the quantity contract explicit:
 calculate which quantity, in terms of which quantity, and what is not allowed
 as an input. Do not disclose the exact expected expression or expected final
 formula. Instead, say to derive the target quantity in terms of named
@@ -148,7 +143,7 @@ do not disclose the target reference equation in `prompt`, `allowed_inputs`, or
 derive the quantity from named dependencies, and the execute workflow supplies
 targets only as reviewer-only reference claims.
 
-Step 6: For every `macro_plan[]` entry, specify:
+Step 4: For every `macro_plan[]` entry, specify:
 
 ```text
 macro_block_id
@@ -166,24 +161,24 @@ notes_for_later_planning
 Macro blocks are not consensus steps. They are promises to replan later with
 more evidence.
 
-Step 7: When this workflow is called with a plan-expansion request, preserve
-accepted earlier detailed steps and expand only the requested macro block or
-blocked region. Use current evidence: accepted outputs, reviewer reports,
-retry counts, blocked reasons, useful context packets, and observed agent
-ability. If agents handled broad chunks well, expand larger chunks. If agents
-struggled, split more finely. Record why granularity changed.
+Step 5: When `task-to-be-planned.json` requests expansion or refinement of an
+existing plan, preserve accepted earlier detailed steps and expand only the
+requested macro block or blocked region. Use current evidence: accepted outputs,
+reviewer reports, retry counts, blocked reasons, useful context packets, and
+observed agent ability. If agents handled broad chunks well, expand larger
+chunks. If agents struggled, split more finely. Record why granularity changed.
 
-Step 8: Write `plan.json` and render the current rolling plan. On the first
+Step 6: Write `plan.json` and render the current rolling plan. On the first
 planning pass, write the initial snapshot directly to both
 `<project-dir>/calculate/<run-id>/initial-plan.md` and
-`<project-dir>/initial-plan.md`. On plan-expansion passes, do not rewrite
+`<project-dir>/initial-plan.md`. On replanning passes, do not rewrite
 `initial-plan.md`; preserve it as the first snapshot. Always write the current
 complete plan view to both `<project-dir>/calculate/<run-id>/latest-plan.md`
 and `<project-dir>/latest-plan.md`. The Markdown is not a status stub: it must
 show the evidence summary, foundation boundary, validation-only results,
 `detailed_steps`, `macro_plan`, each detailed step's quantity contracts,
 context policy, checkpoints, allowed inputs, substeps, expected output,
-verification method, and plan-expansion history when present. The JSON is the
+verification method, and plan revision history when present. The JSON is the
 source of truth for later workflow phases, but the Markdown must be complete
 enough for a human to review the current detailed work and macro-plan without
 opening the JSON.
@@ -194,7 +189,7 @@ also call `md2pdf(input="<project-dir>/initial-plan.md")`. Each starts a
 background PDF job; record returned job ids if present and do not wait before
 continuing.
 
-## Phase 4: Review The Plan
+## Phase 3: Review The Plan
 
 Step 1: Review the plan before building the foundation. If the host and
 workflow permissions allow delegation, use an independent reviewer agent or

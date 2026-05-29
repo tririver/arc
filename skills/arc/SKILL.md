@@ -105,7 +105,9 @@ the user to select one concrete idea.
 If the idea is explicit enough:
 Step 1: Read and execute `workflows/plan.md`.
 Step 2: Read and execute `workflows/foundation.md`.
-Step 3: Read and execute `workflows/calculate.md`.
+Step 3: Read and execute `workflows/calculate.md`. If `calculate.md` writes a
+new `task-to-be-planned.json` for macro expansion or blocked-step refinement,
+return to Step 1 for that requested region.
 
 ### Phase 3: Self-Reflection
 

@@ -6,7 +6,6 @@ Write artifacts under:
 ```text
 <project-dir>/calculate/<run-id>/execute/consensus.config.json
 <project-dir>/calculate/<run-id>/execute/<consensus-run-id>/
-<project-dir>/calculate/<run-id>/plan-expansion-requests/
 <project-dir>/calculate/<run-id>/calculation-report.md
 <project-dir>/calculation-report.md
 ```
@@ -202,13 +201,13 @@ and derived quantities visibly separate in `latest.json`, and refresh the
 latest-foundation Markdown/PDF artifacts the same way.
 
 When all current detailed steps are accepted and `plan.json.macro_plan` still
-has unresolved blocks, create a plan-expansion request instead of inventing new
-steps inside this workflow. The request must include:
+has unresolved blocks, write a replanning task for `plan.md` instead of
+inventing new steps inside this workflow. The task must include:
 
 ```json
 {
-  "schema_version": "arc.plan_expansion_request.v1",
-  "request_type": "expand_macro_block",
+  "schema_version": "arc.task_to_be_planned.v1",
+  "task_type": "expand_macro_block",
   "target_macro_block_id": "<macro_block_id>",
   "current_plan_path": "<project-dir>/calculate/<run-id>/plan.json",
   "foundation_path": "<project-dir>/calculate/<run-id>/foundation/latest.json",
@@ -225,12 +224,11 @@ steps inside this workflow. The request must include:
 }
 ```
 
-Write it under
-`<project-dir>/calculate/<run-id>/plan-expansion-requests/`, then run
-`plan.md` again with that request as the task-to-be-planned artifact. The
-planning workflow owns new step boundaries, checkpoint grouping, context
-packets, and revised `latest-plan.md`. After `plan.md` updates the plan,
-create a new consensus config for the next detailed batch.
+Write it to `<project-dir>/calculate/<run-id>/task-to-be-planned.json`, then
+run `plan.md` again. The planning workflow owns new step boundaries,
+checkpoint grouping, context packets, and revised `latest-plan.md`. After
+`plan.md` updates the plan, create a new consensus config for the next detailed
+batch.
 
 ## Phase 5: Run Consensus And Refine Blocks
 
@@ -264,15 +262,16 @@ and, if needed, proposer calculations. Treat the block as evidence the step is
 too difficult unless already atomic. Do not write replacement plan logic inside
 `calculate.md`.
 
-For any split, refinement, or broader replanning need, write a
-`plan-expansion-request` artifact and call `plan.md` recursively. Use
-`request_type: "refine_blocked_step"` for blocked steps and include the blocked
-step, last agreed checkpoint, proposer reports, reviewer analysis, retry count,
-and suspected failure mode. Ask `plan.md` to produce a better detailed plan for
-that blocked region using current evidence. The replacement plan may split the
-step, add controlled limits or projections such as one branch, one contour
-choice, one contraction, leading power only, equal-mass/equal-scale limit, or
-coefficient-stripped form, or keep the step atomic and require human input.
+For any split, refinement, or broader replanning need, write
+`<project-dir>/calculate/<run-id>/task-to-be-planned.json` and call `plan.md`
+recursively. Use `task_type: "refine_blocked_step"` for blocked steps and
+include the blocked step, last agreed checkpoint, proposer reports, reviewer
+analysis, retry count, and suspected failure mode. Ask `plan.md` to produce a
+better detailed plan for that blocked region using current evidence. The
+replacement plan may split the step, add controlled limits or projections such
+as one branch, one contour choice, one contraction, leading power only,
+equal-mass/equal-scale limit, or coefficient-stripped form, or keep the step
+atomic and require human input.
 
 After `plan.md` updates `plan.json`, confirm that `latest-plan.md` was
 refreshed by the planning workflow. Do not rewrite `initial-plan.md` after the

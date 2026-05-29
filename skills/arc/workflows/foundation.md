@@ -1,8 +1,8 @@
 # Foundation Workflow
 
-Use this workflow after `initial-plan.md`. The output is versioned
-foundation JSON. Do not verify equations here; checking belongs to
-`calculate.md`.
+Use this workflow after `plan.md` writes the current `plan.json` and
+`latest-plan.md`. The output is versioned foundation JSON. Do not verify
+equations here; checking belongs to `calculate.md`.
 
 Write artifacts under:
 
