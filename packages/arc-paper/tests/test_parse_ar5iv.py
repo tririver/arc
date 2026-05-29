@@ -19,6 +19,25 @@ def test_toc_and_sections():
     assert "Intro text." in section["data"]["text"]
 
 
+def test_nested_section_text_is_not_duplicated_in_parent():
+    html = """
+    <html><body>
+      <section id="S1"><h2>1 Parent</h2>
+        <p>Parent-only text.</p>
+        <section id="S1.SS1"><h3>1.1 Child</h3><p>Child-only text.</p></section>
+      </section>
+    </body></html>
+    """
+
+    parsed = parse_html(html, paper_id="arXiv:0000.0000")
+    parent = get_section(parsed, "S1")["data"]
+    child = get_section(parsed, "S1.SS1")["data"]
+
+    assert "Parent-only text." in parent["text"]
+    assert "Child-only text." not in parent["text"]
+    assert "Child-only text." in child["text"]
+
+
 def test_parse_html_includes_equation_contexts():
     parsed = parse_html(sample_html(), paper_id="arXiv:0000.0000")
 
@@ -32,6 +51,38 @@ def test_parse_html_includes_equation_contexts():
             "section_title": "2 Model",
         }
     ]
+
+
+def test_equation_context_does_not_cross_section_boundaries():
+    html = """
+    <html><body>
+      <section id="S1"><h2>1 Previous</h2><p>Previous section text.</p></section>
+      <section id="S2"><h2>2 Current</h2>
+        <table class="ltx_equation" id="E1"><tr><td>x = y</td></tr></table>
+      </section>
+      <section id="S3"><h2>3 Next</h2><p>Next section text.</p></section>
+    </body></html>
+    """
+
+    parsed = parse_html(html, paper_id="arXiv:0000.0000")
+
+    assert parsed["equations"][0]["before"] == ""
+    assert parsed["equations"][0]["after"] == ""
+
+
+def test_math_inside_equation_container_is_not_duplicated():
+    html = """
+    <html><body>
+      <section id="S1"><h2>1 Model</h2>
+        <table class="ltx_equation" id="E1"><tr><td><math><mi>x</mi><mo>=</mo><mi>y</mi></math></td></tr></table>
+      </section>
+    </body></html>
+    """
+
+    parsed = parse_html(html, paper_id="arXiv:0000.0000")
+
+    assert len(parsed["equations"]) == 1
+    assert parsed["equations"][0]["id"] == "E1"
 
 
 def test_section_can_be_selected_by_title_fragment():

@@ -18,3 +18,19 @@ def test_select_summary_provider_auto_uses_agent_host_env():
 def test_select_summary_provider_auto_falls_back_to_manual():
     provider = select_summary_provider("auto", env={}, process_chain=[])
     assert provider.name == "manual"
+
+
+def test_select_summary_provider_passes_env_to_codex_native_provider():
+    env = {"ARC_CODEX_SANDBOX": "workspace-write", "CUSTOM_SETTING": "value"}
+
+    provider = select_summary_provider("codex-cli", env=env, process_chain=[])
+
+    assert provider.prompt_provider.env is env
+
+
+def test_select_summary_provider_passes_env_to_claude_native_provider():
+    env = {"ARC_CLAUDE_EFFORT": "medium", "CUSTOM_SETTING": "value"}
+
+    provider = select_summary_provider("claude-cli", env=env, process_chain=[])
+
+    assert provider.prompt_provider.env is env

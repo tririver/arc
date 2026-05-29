@@ -335,6 +335,20 @@ def test_parse_source_tex_pdf_requires_tex_and_pdf(monkeypatch, tmp_path):
     assert result["error"]["code"] == "parse_source_invalid"
 
 
+def test_parse_source_tex_rejects_pdf_companion(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    tex_path = tmp_path / "note.tex"
+    tex_path.write_text(r"\section{Only TeX}", encoding="utf-8")
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+
+    result = service.parse_source(source="tex", tex_path=tex_path, pdf_path=pdf_path, source_id="tex-only")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "parse_source_invalid"
+    assert "source=tex" in result["error"]["message"]
+
+
 def test_parse_source_warns_when_given_pdf_is_not_used(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
     tex_path = tmp_path / "note.tex"
@@ -571,6 +585,28 @@ def test_search_full_text_can_search_all_cached_papers(monkeypatch, tmp_path):
     assert result["meta"]["searched_files"] == 2
 
 
+def test_search_full_text_can_search_explicit_local_source_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    write_json(
+        parsed_source_cache_path("lecture-9"),
+        parsed_cache(
+            "lecture-9",
+            [{"section_id": "S1", "title": "1 Intro", "level": 2, "text": "local lecture heavy scalar"}],
+        ),
+    )
+
+    class FailingInspire:
+        def get_metadata(self, paper_id, *, refresh=False):
+            raise AssertionError("local parsed source search must not resolve INSPIRE metadata")
+
+    monkeypatch.setattr(service, "_inspire", FailingInspire())
+
+    result = service.search_full_text("lecture-9", query="heavy scalar")
+
+    assert result["ok"] is True
+    assert result["data"][0]["paper_id"] == "lecture-9"
+
+
 def test_search_full_text_deduplicates_nested_section_snippets(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     duplicated_text = "The squeezed limit contains a scalar exchange signal."
@@ -613,7 +649,7 @@ def test_search_full_text_python_fallback(monkeypatch, tmp_path):
 def test_stale_parsed_cache_is_reparsed_from_ar5iv_fetch(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     path = parsed_source_cache_path("arXiv:0911.3380")
-    write_json(path, {"paper_id": "arXiv:0911.3380", "toc": [], "sections": []})
+    write_json(path, {"paper_id": "arXiv:0911.3380", "parser_version": 11, "toc": [], "sections": []})
 
     class ReparseAr5iv:
         def get_html(self, paper_id, *, refresh=False):

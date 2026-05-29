@@ -16,6 +16,9 @@ def test_normalize_new_arxiv_id():
 
 def test_normalize_old_arxiv_id():
     assert normalize_paper_id("hep-th/0601001") == "arXiv:hep-th/0601001"
+    assert normalize_paper_id("HEP-TH/0601001") == "arXiv:hep-th/0601001"
+    assert normalize_paper_id("arXiv:HEP-TH/0601001") == "arXiv:hep-th/0601001"
+    assert normalize_paper_id("HTTPS://ARXIV.ORG/ABS/HEP-TH/0601001") == "arXiv:hep-th/0601001"
     assert arxiv_path_id("arXiv:hep-th/0601001") == "hep-th/0601001"
 
 

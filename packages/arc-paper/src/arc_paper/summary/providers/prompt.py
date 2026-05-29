@@ -24,6 +24,7 @@ class PromptProviderSummaryAdapter:
         summary = generate_summary_with_section_pipeline(
             task,
             model=resolved_model,
+            provider=self.name,
             run_json=self._run_json,
             progress_callback=progress_callback,
         )

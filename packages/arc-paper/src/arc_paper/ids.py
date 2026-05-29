@@ -133,12 +133,19 @@ def _normalized_arxiv_id(identifier: str) -> str:
     if not text:
         return ""
     if match := ARXIV_URL_RE.search(text):
-        return match.group(1)
+        return _canonical_arxiv_id(match.group(1))
     if match := NEW_STYLE_ARXIV_RE.match(text):
         return match.group(1)
     if match := OLD_STYLE_ARXIV_RE.match(text):
-        return match.group(1)
+        return _canonical_arxiv_id(match.group(1))
     return ""
+
+
+def _canonical_arxiv_id(arxiv_id: str) -> str:
+    if "/" not in arxiv_id:
+        return arxiv_id
+    archive, number = arxiv_id.split("/", 1)
+    return f"{archive.lower()}/{number}"
 
 
 def _normalize_doi(value: str) -> str:

@@ -86,6 +86,20 @@ class RecordingSummaryProvider(FakeSummaryProvider):
         return super().generate_summary(task, model=model, progress_callback=progress_callback)
 
 
+class ModelRecordingSummaryProvider(FakeSummaryProvider):
+    name = "codex-cli"
+
+    def __init__(self):
+        self.models = []
+
+    def generate_summary(self, task, *, model=None, progress_callback=None):
+        self.models.append(model)
+        summary = super().generate_summary(task, model=model, progress_callback=progress_callback)
+        summary["provenance"]["method"] = self.name
+        summary["provenance"]["model"] = model or "default-model"
+        return summary
+
+
 class ManualSummaryProvider:
     name = "manual"
 
@@ -147,6 +161,22 @@ def test_generate_llm_summary_uses_provider_and_caches(monkeypatch, tmp_path):
     assert result["data"]["title"] == "A Test Paper"
     assert service.get_llm_summary("0911.3380")["meta"]["cache"] == "hit"
     assert service.get_cached_llm_summary("0911.3380")["meta"]["cache"] == "hit"
+
+
+def test_generate_llm_summary_keeps_generation_cache_model_specific(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    provider = ModelRecordingSummaryProvider()
+    monkeypatch.setattr(service, "select_summary_provider", lambda provider_name: provider)
+
+    first = service.generate_llm_summary("0911.3380", provider="codex-cli", model="cheap-model")
+    second = service.generate_llm_summary("0911.3380", provider="codex-cli", model="quality-model")
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert provider.models == ["cheap-model", "quality-model"]
+    assert second["data"]["provenance"]["model"] == "quality-model"
 
 
 def test_generate_llm_summary_rejects_auto_provider_with_exact_model(monkeypatch, tmp_path):

@@ -10,7 +10,7 @@ from typing import Any
 from .ar5iv_html import parse_html
 
 
-PARSER_VERSION = 11
+PARSER_VERSION = 12
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
 EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"

@@ -75,6 +75,7 @@ def generate_summary_with_section_pipeline(
     *,
     model: str | None,
     run_json: RunJson,
+    provider: str | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if task.get("pipeline") != "section_then_paper":
@@ -86,6 +87,7 @@ def generate_summary_with_section_pipeline(
         input_pack,
         sections,
         prompt_version=str(task.get("prompt_version") or "paper-summary-v1"),
+        provider=provider,
         model=model,
         run_json=run_json,
         use_cache=not bool(task.get("refresh")),
@@ -142,6 +144,7 @@ def summarize_sections(
     prompt_version: str,
     model: str | None,
     run_json: RunJson,
+    provider: str | None = None,
     use_cache: bool = True,
     progress_callback: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
@@ -175,6 +178,8 @@ def summarize_sections(
                 paper_id,
                 prompt_version=prompt_version,
                 source_hash=source_hash,
+                provider=provider,
+                model=model,
                 section_index=index,
                 section_id=section_id,
             )
@@ -206,6 +211,8 @@ def summarize_sections(
                     paper_id,
                     prompt_version=prompt_version,
                     source_hash=source_hash,
+                    provider=provider,
+                    model=model,
                     section_index=index,
                     section_id=section_id,
                     summary=summary,
@@ -357,6 +364,8 @@ def _read_cached_section_summary(
     *,
     prompt_version: str,
     source_hash: str,
+    provider: str | None,
+    model: str | None,
     section_index: int,
     section_id: str,
 ) -> dict[str, Any] | None:
@@ -364,6 +373,8 @@ def _read_cached_section_summary(
         paper_id,
         prompt_version=prompt_version,
         source_hash=source_hash,
+        provider=provider,
+        model=model,
         section_index=section_index,
         section_id=section_id,
     )

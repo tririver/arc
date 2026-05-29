@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from arc_llm.providers.codex_cli import CodexCliProvider as CodexPromptProvider
 
@@ -12,8 +12,13 @@ from .pipeline import apply_provider_provenance, generate_summary_with_section_p
 class CodexCliProvider:
     name = "codex-cli"
 
-    def __init__(self, prompt_provider: CodexPromptProvider | None = None):
-        self.prompt_provider = prompt_provider or CodexPromptProvider()
+    def __init__(
+        self,
+        prompt_provider: CodexPromptProvider | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+    ):
+        self.prompt_provider = prompt_provider or CodexPromptProvider(env=env)
 
     def generate_summary(
         self,
@@ -26,6 +31,7 @@ class CodexCliProvider:
         summary = generate_summary_with_section_pipeline(
             task,
             model=resolved_model,
+            provider=self.name,
             run_json=self._run_json,
             progress_callback=progress_callback,
         )

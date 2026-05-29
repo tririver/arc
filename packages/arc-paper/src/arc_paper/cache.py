@@ -40,7 +40,26 @@ class CachePaths:
             inspire_citers=paper_dir / "inspire" / "citers.json",
         )
 
-    def summary_path(self, prompt_version: str, source_hash: str) -> Path:
+    def summary_path(
+        self,
+        prompt_version: str,
+        source_hash: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> Path:
+        if provider or model:
+            provider_dir = quote(provider or "unknown", safe="")
+            model_dir = quote(model or "default", safe="")
+            return (
+                self.paper_dir
+                / "summaries"
+                / prompt_version
+                / "providers"
+                / provider_dir
+                / model_dir
+                / f"{source_hash}.json"
+            )
         return self.paper_dir / "summaries" / prompt_version / f"{source_hash}.json"
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from arc_llm.providers.claude_cli import ClaudeCliProvider as ClaudePromptProvider
 
@@ -12,8 +12,13 @@ from .pipeline import apply_provider_provenance, generate_summary_with_section_p
 class ClaudeCliProvider:
     name = "claude-cli"
 
-    def __init__(self, prompt_provider: ClaudePromptProvider | None = None):
-        self.prompt_provider = prompt_provider or ClaudePromptProvider()
+    def __init__(
+        self,
+        prompt_provider: ClaudePromptProvider | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+    ):
+        self.prompt_provider = prompt_provider or ClaudePromptProvider(env=env)
 
     def generate_summary(
         self,
@@ -26,6 +31,7 @@ class ClaudeCliProvider:
         summary = generate_summary_with_section_pipeline(
             task,
             model=resolved_model,
+            provider=self.name,
             run_json=self._run_json,
             progress_callback=progress_callback,
         )

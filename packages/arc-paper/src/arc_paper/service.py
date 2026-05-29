@@ -999,8 +999,8 @@ def _validate_local_source(
         if not has_html or has_tex or has_pdf:
             raise ValueError("source=html requires HTML input only")
     elif source == "tex":
-        if not has_tex or has_html or source_suffix == ".pdf":
-            raise ValueError("source=tex requires TeX input")
+        if not has_tex or has_html or has_pdf:
+            raise ValueError("source=tex requires TeX input only; use source=tex-pdf with --pdf")
     elif source == "pdf":
         if not has_pdf or has_html or has_tex:
             raise ValueError("source=pdf requires PDF input only")
@@ -1040,6 +1040,11 @@ def _full_text_search_files(
     files_by_path: dict[Path, FullTextSearchFile] = {}
     missing: list[str] = []
     for raw in raw_ids:
+        normalized_raw = normalize_paper_id(str(raw))
+        local_path = parsed_source_cache_path(normalized_raw)
+        if not refresh and not arxiv_path_id(normalized_raw) and local_path.exists():
+            files_by_path[local_path] = FullTextSearchFile(normalized_raw, local_path)
+            continue
         full_text_id = _full_text_paper_id(str(raw), refresh=refresh)
         path = parsed_source_cache_path(full_text_id)
         _parsed(full_text_id, refresh=refresh)
@@ -1078,6 +1083,23 @@ def _summary_status(paper_id: str, *, refresh: bool) -> dict[str, Any]:
     return _needs_llm(summary_paper_id, task)
 
 
+def _summary_status_for_generation(
+    paper_id: str,
+    *,
+    refresh: bool,
+    provider: str,
+    model: str | None,
+) -> dict[str, Any]:
+    task = _build_summary_task(paper_id, refresh=refresh)
+    summary_paper_id = str(task["input_pack"]["paper_id"])
+    source_hash = task["input_pack"]["source_hash"]
+    if not refresh and (
+        cached := read_summary(summary_paper_id, source_hash=source_hash, provider=provider, model=model)
+    ):
+        return ok(cached, provider="local-cache", cache="hit")
+    return _needs_llm(summary_paper_id, task)
+
+
 def _get_or_generate_summary_one(
     paper_id: str,
     *,
@@ -1087,7 +1109,20 @@ def _get_or_generate_summary_one(
     refresh: bool,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
-    status = _summary_status_or_error(paper_id, refresh=refresh)
+    config = None
+    if provider != "auto" or model or model_tier:
+        try:
+            config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
+        except Exception as exc:
+            return err("summary_generation_failed", str(exc))
+        status = _summary_status_for_generation_or_error(
+            paper_id,
+            refresh=refresh,
+            provider=config.provider,
+            model=config.model,
+        )
+    else:
+        status = _summary_status_or_error(paper_id, refresh=refresh)
     if status["ok"]:
         return status
     if status.get("status") != "needs_llm":
@@ -1095,6 +1130,7 @@ def _get_or_generate_summary_one(
     return _generate_from_status(
         paper_id,
         status,
+        config=config,
         provider=provider,
         model=model,
         model_tier=model_tier,
@@ -1111,7 +1147,16 @@ def _generate_summary_one(
     refresh: bool,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
-    status = _summary_status_or_error(paper_id, refresh=refresh)
+    try:
+        config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
+    except Exception as exc:
+        return err("summary_generation_failed", str(exc))
+    status = _summary_status_for_generation_or_error(
+        paper_id,
+        refresh=refresh,
+        provider=config.provider,
+        model=config.model,
+    )
     if status["ok"]:
         return status
     if status.get("status") != "needs_llm":
@@ -1119,9 +1164,7 @@ def _generate_summary_one(
     return _generate_from_status(
         paper_id,
         status,
-        provider=provider,
-        model=model,
-        model_tier=model_tier,
+        config=config,
         progress_callback=progress_callback,
     )
 
@@ -1135,17 +1178,34 @@ def _summary_status_or_error(paper_id: str, *, refresh: bool) -> dict[str, Any]:
         return err("paper_query_error", str(exc))
 
 
+def _summary_status_for_generation_or_error(
+    paper_id: str,
+    *,
+    refresh: bool,
+    provider: str,
+    model: str | None,
+) -> dict[str, Any]:
+    try:
+        return _summary_status_for_generation(paper_id, refresh=refresh, provider=provider, model=model)
+    except ProviderError as exc:
+        return err(exc.code, exc.message)
+    except Exception as exc:
+        return err("paper_query_error", str(exc))
+
+
 def _generate_from_status(
     paper_id: str,
     status: dict[str, Any],
     *,
-    provider: str,
-    model: str | None,
-    model_tier: str | None,
     progress_callback: ProgressCallback | None,
+    config: Any | None = None,
+    provider: str = "auto",
+    model: str | None = None,
+    model_tier: str | None = None,
 ) -> dict[str, Any]:
     try:
-        config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
+        if config is None:
+            config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
         selected = select_summary_provider(config.provider)
         if selected.name == "manual":
             return status

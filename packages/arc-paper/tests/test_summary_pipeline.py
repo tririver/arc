@@ -103,6 +103,52 @@ def test_section_pipeline_summarizes_sections_sequentially_and_uses_compact_fina
     ]
 
 
+def test_section_pipeline_keeps_section_cache_model_specific(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    section_models = []
+
+    def run_json(prompt, schema, model):
+        if schema.get("$id") == "arc.section-summary-v1":
+            section_models.append(model)
+            return {
+                "section_id": "S1",
+                "title": "S1 title",
+                "summary": f"{model} section summary.",
+                "warnings": [],
+            }
+
+        return {
+            "schema_version": "arc.paper_summary_synthesis.v1",
+            "paper_id": "arXiv:0911.3380",
+            "title": "A Test Paper",
+            "authors_short": "Alice and Bob",
+            "high_value_summary": ["The final summary uses compact section summaries."],
+            "reading_guide": [],
+            "warnings": [],
+        }
+
+    task = {
+        "pipeline": "section_then_paper",
+        "prompt_version": "paper-summary-v1",
+        "system_prompt": "system",
+        "user_prompt": "user",
+        "input_pack": {
+            "paper_id": "arXiv:0911.3380",
+            "metadata": {"title": "A Test Paper", "abstract": "A useful abstract."},
+            "toc": [{"id": "S1", "title": "S1 title", "level": 2}],
+            "sections": [{"section_id": "S1", "title": "S1 title", "text": "raw S1 text"}],
+            "source_hash": "c" * 64,
+        },
+        "output_schema": {"$id": "arc.paper-summary-v1"},
+    }
+
+    generate_summary_with_section_pipeline(task, model="cheap-model", run_json=run_json)
+    result = generate_summary_with_section_pipeline(task, model="quality-model", run_json=run_json)
+
+    assert section_models == ["cheap-model", "quality-model"]
+    assert result["section_summaries"][0]["summary"] == "quality-model section summary."
+
+
 def _extract_final_input_pack(prompt):
     marker = "Input pack:\n"
     start = prompt.index(marker) + len(marker)

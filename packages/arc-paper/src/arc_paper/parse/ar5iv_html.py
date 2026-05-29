@@ -39,7 +39,7 @@ def parse_html(html: str, *, paper_id: str = "") -> dict[str, Any]:
         title = _clean_text(heading.get_text(" ", strip=True)) if heading else f"Section {index}"
         section_id = str(section.get("id") or f"section-{index}")
         level = _heading_level(heading)
-        text = _clean_text(section.get_text("\n", strip=True))
+        text = _section_text(section)
         toc.append({"id": section_id, "title": title, "level": level})
         sections.append({"section_id": section_id, "title": title, "level": level, "text": text})
 
@@ -86,6 +86,27 @@ def _heading_level(heading: Tag | None) -> int:
 
 def _clean_text(text: str) -> str:
     return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _section_text(section: Tag) -> str:
+    parts: list[str] = []
+
+    def visit(tag: Tag) -> None:
+        for child in tag.children:
+            if isinstance(child, NavigableString):
+                text = str(child).strip()
+                if text:
+                    parts.append(text)
+            elif isinstance(child, Tag):
+                if child.name == "section":
+                    continue
+                if child.name == "br":
+                    parts.append("\n")
+                    continue
+                visit(child)
+
+    visit(section)
+    return _clean_text("\n".join(parts))
 
 
 def _inline_labeled_sections(soup: BeautifulSoup) -> list[dict[str, Any]]:

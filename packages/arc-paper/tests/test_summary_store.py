@@ -66,6 +66,21 @@ def test_store_summary_validates_and_writes(monkeypatch, tmp_path):
     assert read_latest_summary("arXiv:0911.3380")["title"] == "A Test Paper"
 
 
+def test_read_summary_with_provider_and_no_model_can_use_matching_latest(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    summary = valid_summary()
+    store_summary("arXiv:0911.3380", summary)
+
+    cached = read_summary(
+        "arXiv:0911.3380",
+        prompt_version="paper-summary-v1",
+        source_hash="a" * 64,
+        provider="manual",
+    )
+
+    assert cached["title"] == "A Test Paper"
+
+
 def test_store_summary_rejects_mismatched_paper_id(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     summary = valid_summary()

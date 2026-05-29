@@ -13,6 +13,8 @@ def extract_equation_contexts(html_or_soup: str | BeautifulSoup, *, window_parag
     soup = html_or_soup if isinstance(html_or_soup, BeautifulSoup) else BeautifulSoup(html_or_soup, "lxml")
     contexts = []
     for element in soup.select(EQUATION_SELECTORS):
+        if element.name == "math" and element.find_parent(class_="ltx_equation"):
+            continue
         text = element.get_text(" ", strip=True)
         section_id, section_title = _section_info(element)
         contexts.append(
@@ -30,7 +32,7 @@ def extract_equation_contexts(html_or_soup: str | BeautifulSoup, *, window_parag
 
 def find_equation_context(equations: Iterable[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     needle = _normalize(query)
-    return [dict(item) for item in equations if needle and needle in _normalize(str(item.get("equation") or ""))]
+    return [dict(item) for item in equations if needle and needle in _equation_search_text(item)]
 
 
 def _section_info(element: Tag) -> tuple[str, str]:
@@ -45,13 +47,15 @@ def _section_info(element: Tag) -> tuple[str, str]:
 def _previous_paragraphs(element: Tag, limit: int) -> list[str]:
     paragraphs: list[str] = []
     current = element
+    section = current.find_parent("section")
     while len(paragraphs) < limit:
         previous = current.find_previous("p")
         if previous is None:
             break
-        text = previous.get_text(" ", strip=True)
-        if text:
-            paragraphs.append(text)
+        if previous.find_parent("section") is section:
+            text = previous.get_text(" ", strip=True)
+            if text:
+                paragraphs.append(text)
         current = previous
     paragraphs.reverse()
     return paragraphs
@@ -60,15 +64,36 @@ def _previous_paragraphs(element: Tag, limit: int) -> list[str]:
 def _next_paragraphs(element: Tag, limit: int) -> list[str]:
     paragraphs: list[str] = []
     current = element
+    section = current.find_parent("section")
     while len(paragraphs) < limit:
         following = current.find_next("p")
         if following is None:
             break
-        text = following.get_text(" ", strip=True)
-        if text:
-            paragraphs.append(text)
+        if following.find_parent("section") is section:
+            text = following.get_text(" ", strip=True)
+            if text:
+                paragraphs.append(text)
         current = following
     return paragraphs
+
+
+def _equation_search_text(item: dict[str, Any]) -> str:
+    values: list[str] = []
+    for key in (
+        "equation",
+        "id",
+        "tex_label",
+        "printed_equation_number",
+        "before",
+        "after",
+        "section_id",
+        "section_title",
+    ):
+        value = item.get(key)
+        if value:
+            values.append(str(value))
+    values.extend(str(value) for value in item.get("printed_equation_numbers") or [] if value)
+    return _normalize(" ".join(values))
 
 
 def _normalize(text: str) -> str:

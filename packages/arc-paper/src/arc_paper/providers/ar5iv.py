@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 
+from ..cache import CachePaths, read_text, write_text
 from ..ids import arxiv_path_id
 from .base import ProviderError
 
@@ -19,7 +20,14 @@ class Ar5ivProvider:
         self.timeout = timeout
 
     def get_html(self, paper_id: str, *, refresh: bool = False) -> str:
-        response = self.client.get(ar5iv_url(paper_id), timeout=self.timeout)
+        url = ar5iv_url(paper_id)
+        paths = CachePaths.for_paper(paper_id)
+        if not refresh:
+            cached = read_text(paths.ar5iv_html)
+            if cached is not None:
+                return cached
+
+        response = self.client.get(url, timeout=self.timeout)
         if response.status_code == 404:
             raise ProviderError("ar5iv_not_found", f"ar5iv HTML not found for {paper_id}")
         try:
@@ -27,4 +35,5 @@ class Ar5ivProvider:
         except httpx.HTTPStatusError as exc:
             raise ProviderError("ar5iv_fetch_failed", str(exc)) from exc
 
+        write_text(paths.ar5iv_html, response.text)
         return response.text
