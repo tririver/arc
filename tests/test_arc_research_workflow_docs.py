@@ -253,6 +253,18 @@ def test_plan_workflow_owns_work_note_planning_only() -> None:
     assert "refer to the owning workflow" in plan
 
 
+def test_plan_workflow_orders_blocks_by_dependency_then_source_anchor() -> None:
+    plan = (WF / "plan.md").read_text(encoding="utf-8").lower()
+
+    assert "dependency/topological order" in plan
+    assert "same dependency priority" in plan
+    assert "earliest source anchor" in plan
+    assert "source line number" in plan
+    assert "accepted results" in plan
+    assert "journal and revision history" in plan
+    assert "chronological" in plan
+
+
 def test_calculate_workflow_owns_consensus_results_only() -> None:
     calculate = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 

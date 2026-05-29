@@ -104,6 +104,13 @@ Use the largest coherent chunks current agents can calculate and reviewers can
 check reliably. Split only when context, algebra, ambiguity, or target secrecy
 requires it. Do not split by raw equation count.
 
+Ordering rule: arrange derivation blocks by dependency/topological order. When
+multiple blocks have the same dependency priority, put the block with the
+earliest source anchor first: source line number if known, otherwise first
+target equation, page, or stable block id. Use this order for accepted results,
+detailed steps, and rough steps. Keep Journal and Revision History
+chronological.
+
 Step 3: For each detailed step, include this contract:
 
 ```text
