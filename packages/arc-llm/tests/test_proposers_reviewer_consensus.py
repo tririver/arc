@@ -46,6 +46,39 @@ def test_consensus_exact_model_requires_explicit_provider(tmp_path):
         load_consensus_config(minimal_config(tmp_path, defaults={"provider": "auto", "model": "gpt-5.5"}))
 
 
+def test_consensus_rejects_foundation_check_kind(tmp_path):
+    with pytest.raises(ConfigError, match="step.kind must be new_calculation"):
+        load_consensus_config(
+            minimal_config(
+                tmp_path,
+                steps=[
+                    {
+                        "step_id": "check_eq_target",
+                        "kind": "foundation_check",
+                        "prompt": "check target",
+                    }
+                ],
+            )
+        )
+
+
+@pytest.mark.parametrize("legacy_key", ["foundation_file", "allowed_foundation", "target_equation_id"])
+def test_consensus_rejects_legacy_allowed_context_keys(tmp_path, legacy_key):
+    with pytest.raises(ConfigError, match=f"allowed_context.{legacy_key} is no longer supported"):
+        load_consensus_config(
+            minimal_config(
+                tmp_path,
+                steps=[
+                    {
+                        "step_id": "derive_target",
+                        "prompt": "derive target",
+                        "allowed_context": {legacy_key: "legacy"},
+                    }
+                ],
+            )
+        )
+
+
 def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     fake = FakeBatchRunner(
         [
@@ -108,7 +141,7 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "Internet search is allowed" in proposer_template
     assert "validation-only final formulas" in proposer_template
     lower_proposer_template = proposer_template.lower()
-    assert "strictly derive from the foundation" in lower_proposer_template
+    assert "strictly derive from the supplied work note" in lower_proposer_template
     assert "external sources may inspire methods" in lower_proposer_template
     assert "do not directly use any result" in lower_proposer_template
     assert "different conventions" in lower_proposer_template
@@ -134,6 +167,27 @@ def test_consensus_accepts_all_agree_on_first_attempt(tmp_path):
     assert "validity_scope" in consensus_properties
     assert "workflow_action" in consensus_properties
     assert "workflow_action" in reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["required"]
+    workflow_schema = consensus_properties["workflow_action"]
+    assert workflow_schema["properties"]["action"]["enum"] == [
+        "continue",
+        "pause_for_human",
+        "revise_plan",
+        "split_step",
+        "retry",
+    ]
+    assert workflow_schema["properties"]["issue_type"]["enum"] == [
+        "none",
+        "work_note_inadequate",
+        "work_note_conflict",
+        "plan_wrong",
+        "step_too_coarse",
+        "target_ambiguous",
+        "source_mapping_error",
+        "calculation_disagreement",
+        "reference_disagreement",
+        "worker_failure",
+        "other",
+    ]
     assert "reliable_until" not in consensus_properties
     agreement_schema = consensus_properties["agreement_assessment"]
     assert agreement_schema["required"] == [
@@ -507,173 +561,6 @@ def test_reference_disagrees_requires_target_and_convention_match(tmp_path):
 
     assert result["status"] == "failed"
     assert "convention_match" in result["steps"][0]["error"]
-
-
-def test_foundation_check_context_exposes_only_axiom_checked_and_target(tmp_path):
-    foundation = {
-        "schema_version": "arc.work_note_context_fixture.v1",
-        "run_id": "run_001",
-        "version": 1,
-        "conventions": [
-            {"id": "conv_checked", "check_status": "checked", "consistency_status": "normalized"},
-            {"id": "conv_unchecked", "check_status": "not_checked", "consistency_status": "normalized"},
-        ],
-        "equations": [
-            {
-                "id": "eq_axiom",
-                "axiom_status": "axiom",
-                "check_status": "not_checked",
-                "sources": [{"paper_id": "arXiv:1", "mcp": "get_section(...)", "cli": "arc-paper ..."}],
-            },
-            {
-                "id": "eq_checked",
-                "axiom_status": "not_axiom",
-                "check_status": "checked_analytic",
-                "sources": [{"paper_id": "arXiv:2", "mcp": "get_section(...)", "cli": "arc-paper ..."}],
-            },
-            {
-                "id": "eq_target",
-                "axiom_status": "not_axiom",
-                "check_status": "not_checked",
-                "sources": [{"paper_id": "arXiv:3", "mcp": "get_section(...)", "cli": "arc-paper ..."}],
-            },
-            {"id": "eq_unchecked", "axiom_status": "not_axiom", "check_status": "not_checked"},
-        ],
-    }
-    foundation_path = tmp_path / "foundation.json"
-    foundation_path.write_text(json.dumps(foundation), encoding="utf-8")
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-            )
-        ]
-    )
-    config = minimal_config(
-        tmp_path,
-        steps=[
-            {
-                "step_id": "check_eq_target",
-                "kind": "foundation_check",
-                "prompt": "check target",
-                "allowed_context": {
-                    "foundation_file": str(foundation_path),
-                    "target_equation_id": "eq_target",
-                    "source_commands": [
-                        "get_section(paper_id=\"arXiv:1\", section=\"S1\")",
-                        "arc-paper get-section arXiv:1 --section S1 --json",
-                    ],
-                },
-            }
-        ],
-    )
-
-    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
-
-    foundation_context = fake.calls[0]["loops"][0]["caller_context"]["foundation_context"]
-    assert foundation_context["target_equation"]["id"] == "eq_target"
-    assert [item["id"] for item in foundation_context["allowed_equations"]] == [
-        "eq_axiom",
-        "eq_checked",
-    ]
-    assert [item["id"] for item in foundation_context["allowed_conventions"]] == ["conv_checked"]
-    assert "eq_unchecked" in foundation_context["omitted_equation_ids"]
-    assert "source_path" not in foundation_context
-    assert "sources" not in json.dumps(foundation_context)
-    assert "arc-paper" not in json.dumps(foundation_context)
-    allowed_context = fake.calls[0]["loops"][0]["caller_context"]["allowed_context"]
-    assert "foundation_file" not in allowed_context
-    assert "source_commands" not in allowed_context
-    assert "arc-paper" not in json.dumps(allowed_context)
-
-
-def test_new_calculation_loads_latest_foundation_file_and_omits_stale_inline_foundation(tmp_path):
-    foundation = {
-        "schema_version": "arc.work_note_context_fixture.v1",
-        "run_id": "run_001",
-        "conventions": [{"id": "conv_current", "label": "current convention"}],
-        "equations": [
-            {"id": "eq_old", "label": "old", "latex": "x=1", "axiom_status": "axiom"},
-            {"id": "eq_new", "label": "new", "latex": "p=w\\rho", "axiom_status": "axiom"},
-            {"id": "eq_unchecked", "label": "unchecked", "latex": "z=3", "axiom_status": "not_axiom"},
-        ],
-    }
-    foundation_path = tmp_path / "foundation.json"
-    foundation_path.write_text(json.dumps(foundation), encoding="utf-8")
-    fake = FakeBatchRunner(
-        [
-            consensus_review(
-                "all_agree",
-                agreed=["proposer_001", "proposer_002", "proposer_003"],
-                accepted={"result": "x"},
-            )
-        ]
-    )
-    config = minimal_config(
-        tmp_path,
-        steps=[
-            {
-                "step_id": "derive_from_latest",
-                "kind": "new_calculation",
-                "prompt": "derive target",
-                "allowed_context": {
-                    "foundation_file": str(foundation_path),
-                    "allowed_foundation": [
-                        {"id": "eq_old", "label": "old", "latex": "x=1", "axiom_status": "axiom"}
-                    ],
-                },
-            }
-        ],
-    )
-
-    run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
-
-    caller_context = fake.calls[0]["loops"][0]["caller_context"]
-    foundation_context = caller_context["foundation_context"]
-    assert [item["id"] for item in foundation_context["allowed_equations"]] == ["eq_old", "eq_new"]
-    assert [item["id"] for item in foundation_context["allowed_conventions"]] == ["conv_current"]
-    assert "eq_unchecked" in foundation_context["omitted_equation_ids"]
-    assert "foundation_file" not in caller_context["allowed_context"]
-    assert "allowed_foundation" not in caller_context["allowed_context"]
-
-
-def test_foundation_check_fails_when_target_equation_is_missing(tmp_path):
-    foundation_path = tmp_path / "foundation.json"
-    foundation_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "arc.work_note_context_fixture.v1",
-                "run_id": "run_001",
-                "version": 1,
-                "conventions": [],
-                "equations": [{"id": "eq_other", "axiom_status": "axiom", "check_status": "not_checked"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-    fake = FakeBatchRunner([])
-    config = minimal_config(
-        tmp_path,
-        steps=[
-            {
-                "step_id": "check_missing",
-                "kind": "foundation_check",
-                "prompt": "check target",
-                "allowed_context": {
-                    "foundation_file": str(foundation_path),
-                    "target_equation_id": "eq_missing",
-                },
-            }
-        ],
-    )
-
-    result = run_proposers_reviewer_consensus(config, batch_runner=fake, base_env={})
-
-    assert result["status"] == "failed"
-    assert "target_equation_id eq_missing was not found" in result["steps"][0]["error"]
-    assert fake.calls == []
 
 
 def test_consensus_fails_when_integrity_reference_is_missing(tmp_path):

@@ -22,7 +22,8 @@ DEFAULT_HUMAN_GATE_PAUSE_STATUSES = (
     "unresolved",
     "failed",
 )
-REVISION_ACTIONS = {"revise_foundation", "revise_plan", "split_step"}
+REVISION_ACTIONS = {"revise_plan", "split_step"}
+LEGACY_ALLOWED_CONTEXT_KEYS = {"foundation_file", "allowed_foundation", "target_equation_id"}
 
 BatchRunner = Callable[..., dict[str, Any]]
 
@@ -83,14 +84,18 @@ def load_consensus_config(payload: Mapping[str, Any]) -> ConsensusConfig:
             raise ConfigError(f"duplicate step_id: {step_id}")
         seen_step_ids.add(step_id)
         kind = str(step_data.get("kind", "new_calculation") or "new_calculation")
-        if kind not in {"foundation_check", "new_calculation"}:
-            raise ConfigError("step.kind must be foundation_check or new_calculation")
+        if kind != "new_calculation":
+            raise ConfigError("step.kind must be new_calculation")
+        allowed_context = _dict(step_data.get("allowed_context", {}), f"{step_id}.allowed_context")
+        for legacy_key in sorted(LEGACY_ALLOWED_CONTEXT_KEYS):
+            if legacy_key in allowed_context:
+                raise ConfigError(f"allowed_context.{legacy_key} is no longer supported")
         steps.append(
             ConsensusStep(
                 step_id=step_id,
                 prompt=_required_text(step_data, "prompt"),
                 kind=kind,
-                allowed_context=_dict(step_data.get("allowed_context", {}), f"{step_id}.allowed_context"),
+                allowed_context=allowed_context,
                 proposer_runtime=_dict(
                     step_data.get("proposer_runtime", {}),
                     f"{step_id}.proposer_runtime",
@@ -450,10 +455,6 @@ def _caller_context(
     accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     allowed_context = _sanitize_caller_allowed_context(step.allowed_context)
-    foundation_context = _foundation_context_for_step(step)
-    if foundation_context is not None:
-        allowed_context.pop("foundation_file", None)
-        allowed_context.pop("allowed_foundation", None)
     context = {
         "step_id": step.step_id,
         "step_kind": step.kind,
@@ -467,8 +468,6 @@ def _caller_context(
         "integrity_reference": _integrity_reference(config.defaults.get("integrity_reference_path")),
         "consensus_instruction": "Work only on this calculation step. Respect accepted_prior_step_outputs and locked_outputs as already accepted unless explicitly asked to check them.",
     }
-    if foundation_context is not None:
-        context["foundation_context"] = foundation_context
     return context
 
 
@@ -508,15 +507,15 @@ def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[st
             "template": (
                 "First read and follow caller_context.integrity_reference.content. "
                 "Use only caller_context.step_prompt, caller_context.allowed_context, "
-                "caller_context.foundation_context when present, accepted locked_outputs, "
+                "accepted locked_outputs, "
                 "caller_context.accepted_prior_step_outputs, and your own SymPy/local algebra. "
                 f"{source_policy} Wolfram may be used only for algebraic "
-                "verification. You must strictly derive from the foundation context and "
-                "accepted prior step outputs and locked_outputs. External sources may inspire methods, but do not "
+                "verification. You must strictly derive from the supplied work note, allowed context, "
+                "accepted prior step outputs, and locked_outputs. External sources may inspire methods, but do not "
                 "directly use any result from papers or the internet unless it appears in "
-                "the foundation file, accepted prior step outputs, or accepted locked_outputs. If you need an external "
+                "the supplied work note, allowed context, accepted prior step outputs, or accepted locked_outputs. If you need an external "
                 "identity or intermediate result, derive it here. External sources may use "
-                "different conventions; map notation back to foundation conventions before "
+                "different conventions; map notation back to work-note conventions before "
                 "using it. For coordinate transformations or relabeling, explicitly track "
                 "which symbols are old coordinates and which are newly introduced symbols "
                 "before substituting. Do the calculation very clearly step by step; never skip a step. "
@@ -526,8 +525,8 @@ def _proposer_config(proposer_id: str, *, runtime: Mapping[str, Any]) -> dict[st
                 "LaTeX form such as \\rho_2, \\eta', or T_{ab} is intended for the report. "
                 "Return one JSON object with result_summary, derivation, assumptions, "
                 "validity_scope, final_result, and work_note_assessment. "
-                "In work_note_assessment, state whether the supplied work note, foundation, "
-                "or plan must change before this step can be checked; include needs_revision "
+                "In work_note_assessment, state whether the supplied work note or plan must "
+                "change before this step can be checked; include needs_revision "
                 "(boolean), issue_type, proposed_revision, rationale, and "
                 "can_continue_without_revision. Use issue_type=none when no revision is "
                 "needed. Use validity_scope for assumptions, "
@@ -689,8 +688,8 @@ def _reviewer_config(
                 "workflow_action, choose continue for all_agree. For any failure to "
                 "agree, target/source ambiguity, worker failure, or suspected bad "
                 "premise, choose pause_for_human unless the proposers and your review "
-                "agree on the same foundation or plan revision; then choose "
-                "revise_foundation, revise_plan, or split_step with "
+                "agree on the same work-note or plan revision; then choose "
+                "revise_plan or split_step with "
                 "requires_human=false and include proposed_revision. For "
                 "reference_disagrees, follow the "
                 "human-gate instruction below. "
@@ -754,8 +753,8 @@ def _reviewer_workflow_instruction(human_gate: Mapping[str, Any]) -> str:
         f"{pause_statuses}. When a stop is triggered, workflow_action decides whether "
         "the main agent should ask the human expert or revise project artifacts. Use "
         "pause_for_human with requires_human=true unless all proposers' assessments and "
-        "your review agree on the same foundation or plan revision. Only then use "
-        "revise_foundation, revise_plan, or split_step with requires_human=false."
+        "your review agree on the same work-note or plan revision. Only then use "
+        "revise_plan or split_step with requires_human=false."
     )
 
 
@@ -901,7 +900,6 @@ def _workflow_action_schema() -> dict[str, Any]:
                 "enum": [
                     "continue",
                     "pause_for_human",
-                    "revise_foundation",
                     "revise_plan",
                     "split_step",
                     "retry",
@@ -911,8 +909,8 @@ def _workflow_action_schema() -> dict[str, Any]:
             "issue_type": {
                 "enum": [
                     "none",
-                    "foundation_inadequate",
-                    "foundation_conflict",
+                    "work_note_inadequate",
+                    "work_note_conflict",
                     "plan_wrong",
                     "step_too_coarse",
                     "target_ambiguous",
@@ -1087,125 +1085,7 @@ def _validate_reference_disagrees_agreement_assessment(
             raise ValueError(f"reference_disagrees requires agreement_assessment.{field}=true")
 
 
-def _foundation_context_for_step(step: ConsensusStep) -> dict[str, Any] | None:
-    foundation_path = step.allowed_context.get("foundation_file")
-    if not foundation_path:
-        return None
-    path = Path(str(foundation_path))
-    payload = _read_json(path)
-    if step.kind == "new_calculation":
-        return calculation_foundation_context(payload)
-    target_equation_id = str(step.allowed_context.get("target_equation_id", "")).strip()
-    if not target_equation_id:
-        raise ValueError("target_equation_id is required for foundation_check steps")
-    return filter_foundation_context(
-        payload,
-        target_equation_id=target_equation_id,
-    )
-
-
-def filter_foundation_context(
-    payload: Mapping[str, Any],
-    *,
-    target_equation_id: str = "",
-) -> dict[str, Any]:
-    equations = payload.get("equations", [])
-    if not isinstance(equations, list):
-        equations = []
-    allowed_equations = []
-    omitted_equation_ids = []
-    target_equation = None
-    target_equation_id = target_equation_id.strip()
-    if not target_equation_id:
-        raise ValueError("target_equation_id is required")
-    for item in equations:
-        if not isinstance(item, dict):
-            continue
-        equation_id = str(item.get("id", ""))
-        if target_equation_id and equation_id == target_equation_id:
-            target_equation = _sanitize_foundation_context_item(item)
-            continue
-        if _equation_is_axiom_or_checked(item):
-            allowed_equations.append(_sanitize_foundation_context_item(item))
-        elif equation_id:
-            omitted_equation_ids.append(equation_id)
-    if target_equation is None:
-        raise ValueError(f"target_equation_id {target_equation_id} was not found in foundation equations")
-
-    conventions = payload.get("conventions", [])
-    if not isinstance(conventions, list):
-        conventions = []
-    allowed_conventions = [
-        _sanitize_foundation_context_item(item)
-        for item in conventions
-        if isinstance(item, dict) and _convention_is_checked(item)
-    ]
-    return {
-        "schema_version": "arc.foundation_context.v1",
-        "target_equation_id": target_equation_id,
-        "target_equation": target_equation,
-        "allowed_equations": allowed_equations,
-        "allowed_conventions": allowed_conventions,
-        "omitted_equation_ids": omitted_equation_ids,
-        "filter_rule": "Only the target equation plus axiom or checked foundation items are provided.",
-    }
-
-
-def calculation_foundation_context(payload: Mapping[str, Any]) -> dict[str, Any]:
-    equations = payload.get("equations", [])
-    if not isinstance(equations, list):
-        equations = []
-    allowed_equations = []
-    omitted_equation_ids = []
-    for item in equations:
-        if not isinstance(item, dict):
-            continue
-        equation_id = str(item.get("id", ""))
-        if _equation_is_axiom_or_checked(item):
-            allowed_equations.append(_sanitize_foundation_context_item(item))
-        elif equation_id:
-            omitted_equation_ids.append(equation_id)
-
-    conventions = payload.get("conventions", [])
-    if not isinstance(conventions, list):
-        conventions = []
-    allowed_conventions = [
-        _sanitize_foundation_context_item(item)
-        for item in conventions
-        if isinstance(item, dict) and _convention_available_for_calculation(item)
-    ]
-    return {
-        "schema_version": "arc.foundation_context.v1",
-        "target_equation_id": "",
-        "target_equation": None,
-        "allowed_equations": allowed_equations,
-        "allowed_conventions": allowed_conventions,
-        "omitted_equation_ids": omitted_equation_ids,
-        "filter_rule": "All axiom or checked foundation items are provided for this calculation step.",
-    }
-
-
-def _equation_is_axiom_or_checked(item: Mapping[str, Any]) -> bool:
-    if item.get("axiom_status") == "axiom":
-        return True
-    check_status = str(item.get("check_status", "")).strip().lower()
-    return check_status == "checked" or check_status.startswith("checked_")
-
-
-def _convention_is_checked(item: Mapping[str, Any]) -> bool:
-    check_status = str(item.get("check_status", "")).strip().lower()
-    return check_status == "checked" or check_status.startswith("checked_")
-
-
-def _convention_available_for_calculation(item: Mapping[str, Any]) -> bool:
-    check_status = str(item.get("check_status", "")).strip().lower()
-    if not check_status:
-        return True
-    return check_status == "checked" or check_status.startswith("checked_")
-
-
-_FOUNDATION_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path"}
-_CALLER_ALLOWED_CONTEXT_OMIT_KEYS = _FOUNDATION_CONTEXT_OMIT_KEYS | {"source_commands"}
+_CALLER_ALLOWED_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path", "source_commands"}
 
 
 def _sanitize_caller_allowed_context(value: Any) -> Any:
@@ -1217,18 +1097,6 @@ def _sanitize_caller_allowed_context(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [_sanitize_caller_allowed_context(item) for item in value]
-    return copy.deepcopy(value)
-
-
-def _sanitize_foundation_context_item(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _sanitize_foundation_context_item(item)
-            for key, item in value.items()
-            if str(key) not in _FOUNDATION_CONTEXT_OMIT_KEYS
-        }
-    if isinstance(value, list):
-        return [_sanitize_foundation_context_item(item) for item in value]
     return copy.deepcopy(value)
 
 
@@ -1298,11 +1166,11 @@ def _normalized_workflow_action(raw: Any, trigger_status: str) -> dict[str, Any]
     if not isinstance(raw, dict):
         return default
 
-    allowed_actions = {"continue", "pause_for_human", "revise_foundation", "revise_plan", "split_step", "retry"}
+    allowed_actions = {"continue", "pause_for_human", "revise_plan", "split_step", "retry"}
     allowed_issue_types = {
         "none",
-        "foundation_inadequate",
-        "foundation_conflict",
+        "work_note_inadequate",
+        "work_note_conflict",
         "plan_wrong",
         "step_too_coarse",
         "target_ambiguous",
@@ -1376,10 +1244,10 @@ def _default_expert_question(trigger_status: str, workflow_action: Mapping[str, 
     if trigger_status == "reference_disagrees":
         return "Blind derivation disagrees with the note/reference claim. Which formula or premise should ARC use next?"
     if trigger_status == "failed":
-        return "A worker or validation failure stopped this step. Should ARC retry, revise the plan/foundation, or use a corrected premise?"
+        return "A worker or validation failure stopped this step. Should ARC retry, revise the work note or plan, or use a corrected premise?"
     return (
         "Proposers did not reach accepted consensus "
-        f"({trigger_status}, {issue_type}). What correction, premise, or plan/foundation revision should ARC use?"
+        f"({trigger_status}, {issue_type}). What correction, premise, work-note revision, or plan revision should ARC use?"
     )
 
 
