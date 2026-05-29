@@ -111,6 +111,10 @@ def main(argv: list[str] | None = None) -> int:
     get_parsed_toc = sub.add_parser("get-parsed-toc")
     get_parsed_toc.add_argument("source_id")
     get_parsed_toc.add_argument("--json", action="store_true")
+    get_parsed_section = sub.add_parser("get-parsed-section")
+    get_parsed_section.add_argument("source_id")
+    get_parsed_section.add_argument("--section", required=True)
+    get_parsed_section.add_argument("--json", action="store_true")
     get_parsed_equations = sub.add_parser("get-parsed-equations")
     get_parsed_equations.add_argument("source_id")
     get_parsed_equations.add_argument("--json", action="store_true")
@@ -346,6 +350,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.get_parsed_source(args.source_id)
     if command == "get-parsed-toc":
         return service.get_parsed_source_toc(args.source_id)
+    if command == "get-parsed-section":
+        return service.get_parsed_source_section(args.source_id, args.section)
     if command == "get-parsed-equations":
         return service.get_parsed_source_equations(args.source_id)
     if command == "get-parsed-equation":

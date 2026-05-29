@@ -294,6 +294,16 @@ def get_parsed_source_toc(source_id: str) -> dict[str, Any]:
     return ok(parsed.get("toc") or [], provider="local-cache", cache="hit")
 
 
+def get_parsed_source_section(source_id: str, section: str) -> dict[str, Any]:
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err("parsed_source_not_found", f"No parsed source found for {source_id}")
+    result = parsed_get_section(parsed, section)
+    if result.get("ok"):
+        result["meta"] = {"provider": "local-cache", "cache": "hit"}
+    return result
+
+
 def get_parsed_source_equations(source_id: str) -> dict[str, Any]:
     parsed = _read_parsed_source(source_id)
     if parsed is None:

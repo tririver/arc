@@ -37,12 +37,15 @@ def test_service_parse_source_caches_and_lookup_apis(monkeypatch, tmp_path):
 
     parsed_source = service.get_parsed_source(source_id)
     toc = service.get_parsed_source_toc(source_id)
+    section = service.get_parsed_source_section(source_id, "sec_0001")
     equations = service.get_parsed_source_equations(source_id)
     equation = service.get_parsed_source_equation(source_id, "eq_00001")
     hits = service.search_parsed_source(source_id, query="eq:one")
 
     assert parsed_source["data"]["paper_id"] == source_id
     assert toc["data"][0]["title"] == "Dynamics"
+    assert section["data"]["title"] == "Dynamics"
+    assert "Intro text" in section["data"]["text"]
     assert equations["data"][0]["id"] == "eq_00001"
     assert equation["data"]["tex_label"] == "eq:one"
     assert hits["data"][0]["id"] == "eq_00001"
@@ -118,6 +121,11 @@ def test_cli_parse_and_get_parsed_commands(monkeypatch, tmp_path, capsys):
     assert cli.main(["get-parsed", source_id, "--json"]) == 0
     parsed_source_output = json.loads(capsys.readouterr().out)
     assert parsed_source_output["data"]["paper_id"] == source_id
+
+    assert cli.main(["get-parsed-section", source_id, "--section", "sec_0001", "--json"]) == 0
+    section_output = json.loads(capsys.readouterr().out)
+    assert section_output["data"]["title"] == "Dynamics"
+    assert "Intro text" in section_output["data"]["text"]
 
     assert cli.main(["get-parsed-equation", source_id, "--equation-id", "eq_00001", "--json"]) == 0
     equation_output = json.loads(capsys.readouterr().out)

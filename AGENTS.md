@@ -56,6 +56,24 @@ relevant workflow file directly and call the package CLI or MCP tools it names.
 - Treat example papers as regression cases only. They should validate general
   behavior, not define special-case behavior.
 
+## Workflow Design Principles
+
+- Design ARC workflows to support agent reasoning, not to replace it with
+  exhaustive mechanical micro-steps. Avoid artifact shapes or instructions that
+  force unnatural reasoning order, such as treating every extracted equation as
+  an executable plan step.
+- Handoff artifacts should provide the relevant source context, user intent,
+  constraints, locations, and coverage requirements. The downstream workflow
+  that owns planning should decide classification, granularity, dependency
+  order, and execution strategy.
+- Prefer context-rich, reviewable prompts and rolling plans over one-item-per-step
+  expansion. Use structured inventories for traceability, but do not make
+  inventory items imply plan steps.
+- When a workflow must eventually cover many claims, equations, or source
+  items, state the coverage requirement explicitly while preserving freedom for
+  the planner to group checks by logical derivation flow, physical argument,
+  dependencies, approximation regime, or risk.
+
 ## Instruction Review
 
 - Apply this review gate to development work that changes ARC instructions,
