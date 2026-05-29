@@ -18,6 +18,12 @@ workflows/foundation.md
 workflows/calculate.md
 ```
 
+Keep this file note-specific. It owns note parsing, preflight, note-check
+intake artifacts, note-output validation, and the note status map. Do not
+duplicate plan granularity rules, foundation boundary/schema/version rules,
+consensus config details, prompt contracts, human-gate policy, or
+calculation-report structure here; update the owning workflow instead.
+
 ## Phase 1: Parse And Read Notes
 
 Step 1: For local notes or papers, parse accessible sources before checking
@@ -72,28 +78,23 @@ foundation context, task contracts, and accepted prior outputs.
 Step 4: If the notes cite arXiv IDs, DOI, INSPIRE records, or paper titles, use
 ARC paper tools to resolve them before checking claims.
 
-## Phase 2: Mark The Foundation
+## Phase 2: Main-Agent Preflight
 
-Step 1: If the user specifies the foundation, use that as the candidate
-foundation and record that it was user-specified.
+Step 1: Before foundation classification or proposer-reviewer checks, the main
+agent must inspect the notes directly and list any obvious typos, inconsistent
+conventions, missing factors, sign mistakes, malformed equations, or
+target/source mapping problems it immediately spots.
 
-Step 2: Otherwise infer the candidate foundation from note items that are
-definitions, conventions, axioms, standard starting principles, or equations
-explicitly allowed as assumptions.
+Step 2: Mark these as preflight findings, not verified proposer-reviewer
+results.
 
-Step 3: Split note items into:
+Step 3: In `interactive` mode, pause after preflight and ask the user to review
+the obvious issues before launching proposer-reviewer execution. In `auto`
+mode, do not pause; continue to Phase 3 after recording the findings.
 
-```text
-foundation
-claims_to_check
-context_only
-```
+## Phase 3: Prepare Note-Check Intake
 
-If an item could be either foundation or a derived claim, put it in
-`claims_to_check`. Do not make note-derived equations foundation merely because
-they appear early, are boxed, or are used later in the note.
-
-Step 4: Write a short triage artifact:
+Step 1: Write a short triage artifact:
 
 ```text
 <project-dir>/calculate/<run-id>/note-check-triage.json
@@ -101,150 +102,57 @@ Step 4: Write a short triage artifact:
 <project-dir>/initial-note-check.md
 ```
 
+Include parsed source locations, note items, and Phase 2 preflight findings.
 For parsed TeX notes, build `note-check-triage.json` from `sections[]` and
-`equations[]`. Each `claims_to_check` item should carry `source_id`, the parsed
-equation `id`, TeX line range, section, printed equation number when available,
-and PDF page when available.
+`equations[]`. Each note item should carry `source_id`, the parsed equation
+`id`, TeX line range, section, printed equation number when available, and PDF
+page when available.
+
+Step 2: If the user specifies the foundation, record that instruction in the
+triage artifact as input for `plan.md`. Do not classify final foundation,
+claims, or context-only items here; `plan.md` owns that separation.
 
 After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/initial-note-check.md")`. It starts a
 background PDF job; record the returned job id if present and do not wait
 before continuing.
 
-### Phase 2a: Main-Agent Preflight
-
-Step 1: Before running proposer-reviewer checks, the main agent must inspect
-the notes directly and list any obvious typos, inconsistent conventions,
-missing factors, sign mistakes, malformed equations, or target/source mapping
-problems it immediately spots.
-
-Step 2: Record these preflight findings in `initial-note-check.md` and
-`note-check-triage.json`. Mark them as preflight findings, not verified
-proposer-reviewer results.
-
-Step 3: In `interactive` mode, pause after preflight and ask the user to review
-the obvious issues before launching proposer-reviewer execution. In `auto`
-mode, do not pause; continue to Phase 3 after recording the findings.
-
-## Phase 3: Reuse Calculation Workflows
+## Phase 4: Reuse Calculation Workflows
 
 Step 1: Treat the note check as an explicit calculation idea: verify the note
 claims from the accepted foundation, with no new conjecture unless required to
 check a claim.
 
-Step 2: Execute `plan.md`. For each item in `claims_to_check`, create a blind
-reference check. Prefer one equation per step, or a tightly coupled equation
-pair when the derivation cannot be separated. The proposer prompt must name the
-quantity to derive, its dependencies, and allowed checked inputs, but must not
-disclose the note's target formula or result.
+Step 2: Execute `plan.md` with `note-check-triage.json` as the selected idea
+artifact. `plan.md` owns the foundation boundary, claim/step granularity,
+blind-reference planning, and proposer-visible secrecy rules.
 
-For parsed TeX notes, identify the target by stable location:
+Step 3: Execute `foundation.md` from `plan.json`. It owns foundation JSON,
+source, confidence, convention, and versioning rules.
 
-```text
-Target equation: eq_00042
-Location: NOTE.tex lines 360-362, PDF page 14, printed equation (9.12)
-Task: derive the named quantity from the allowed inputs.
-Allowed inputs: accepted foundation items only.
-Do not use the note formula.
-```
+Step 4: Execute `calculate.md` in note-check mode. It owns blind reference
+config shape, proposer/reviewer prompt contracts, human-gate behavior,
+blocked/refinement handling, human-resolved continuation, and
+`calculation-report.md` generation.
 
-Step 3: Execute `foundation.md`. The foundation contains only accepted
-definitions, axioms, conventions, and truly foundational equations.
+## Phase 5: Mirror Human Resolution To Note Triage
 
-Step 4: Execute `calculate.md`. Put each note claim into
-`reviewer_reference_claim` only. The reviewer may compare proposer derivations
-against the note claim; proposers must not see the note claim unless the user
-explicitly requests non-blind checking.
+When `calculate.md` records a human-resolved result, mirror the same resolution
+object into `note-check-triage.json`. Mark the note claim `human_resolved`, not
+`verified`. Keep later-use and foundation-promotion decisions governed by
+`calculate.md` and `foundation.md`.
 
-For parsed TeX notes, reviewer-only reference claims should include
-the parsed equation `id`, raw TeX, normalized LaTeX, printed equation number, PDF/line
-location, section, and nearby text.
+## Phase 6: Validate
 
-Step 5: Directly trigger proposer-reviewer execution through
-`arc-llm proposers-reviewer-consensus --config <config> --json` or the
-equivalent host/MCP wrapper. Do not write the final `calculation-report.md`
-until proposer-reviewer execution has run, unless the report is explicitly a
-blocked or partial-status report that says consensus did not complete.
-
-For note checks, the consensus config must enable the human gate:
-
-```json
-"human_gate": {
-  "enabled": true,
-  "mode": "note_check",
-  "pause_on_statuses": [
-    "reference_disagrees",
-    "two_agree",
-    "all_disagree",
-    "unresolved",
-    "failed"
-  ]
-}
-```
-
-The gate applies in both `interactive` and `auto` modes. It stops at the first
-failed, unresolved, partially agreed, all-disagreed, or reference-disagreed
-claim. Do not accumulate a long list of disagreed equations. Ask the human
-expert using `blocked_output.expert_question`, unless the result is
-`blocked_for_revision` and the proposer assessments, reviewer, and main agent
-all agree on the same foundation or plan revision.
-
-`auto` mode only removes routine confirmations. It does not allow ARC to
-silently continue after disagreement with the note/reference claim.
-
-### Phase 3a: Continue After Human Resolution
-
-If a human expert resolves a note claim, mark that claim `human_resolved`, not
-`verified`. Update `note-check-triage.json` with a `resolution` object:
-
-```json
-{
-  "resolved_by": "user",
-  "resolved_at": "<ISO-8601 timestamp>",
-  "type": "corrected_formula | accepted_formula | premise | instruction",
-  "corrected_latex": "<LaTeX formula when applicable>",
-  "accepted_result": "<plain result when not LaTeX>",
-  "rationale": "<why this resolves the claim>",
-  "use_as_later_premise": true
-}
-```
-
-At least one of `corrected_latex` or `accepted_result` is required. Treat
-`human_resolved` as accepted prior context for later steps only when
-`use_as_later_premise` is true.
-
-To continue, create a new consensus continuation config that starts from the
-next unresolved or blocked step. Add each applicable human-resolved item to
-`allowed_context.accepted_prior_results_from_previous_consensus_run`:
-
-```json
-{
-  "step_id": "check_eq_00042",
-  "status": "human_resolved",
-  "accepted_result": "<resolved result>",
-  "source": "human_expert_resolution"
-}
-```
-
-Do not put human-resolved formulas into `reviewer_reference_claim` for later
-blind checks unless they are the later claim's source target. Proposers may use
-human-resolved prior context, but still must not see later target formulas.
-
-Promote a human-resolved item into `foundation/latest.json` only when the human
-explicitly resolves it as a definition, convention, axiom, or broadly needed
-premise. Otherwise keep it as accepted prior output.
-
-## Phase 4: Validate
-
-Step 1: Before writing the final report, run:
+Step 1: After `calculate.md` produces a report or blocked report, run:
 
 ```bash
 arc-paper validate-note-check <project-dir>/calculate/<run-id> --json
 ```
 
-Step 2: Do not write final `calculation-report.md` unless validation passes.
-If validation fails but the run cannot be completed, write the report only with
-status `blocked_partial` and include the validation errors.
+Step 2: Treat the report as final only after validation passes. If validation
+fails and the run cannot be completed, keep the report as `blocked_partial` and
+include the validation errors.
 
 Step 3: If checking shows that a cached parsed equation is problematic, ask the
 user to choose either a cache annotation or a re-cache.
@@ -260,10 +168,10 @@ For re-cache, update the parse input and rerun `arc-paper parse` with the same
 `--id`. Existing annotations are keyed to the old `source_hash` and will not
 overlay the newly parsed equation view.
 
-## Phase 5: Report
+## Phase 7: Note Status Map
 
-The final report must identify whether the foundation was user-specified or
-inferred. For each note item, report one status:
+The note status map in the final report must identify whether the foundation
+was user-specified or inferred. For each note item, report one status:
 
 ```text
 foundation
