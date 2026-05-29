@@ -87,11 +87,18 @@ Build `task-to-be-planned.json` as a compact planning handoff, not as a plan
 or a source copy. Include the user's check request, parsed source IDs, original
 source paths when local, the ARC paper commands `plan.md` should use to read
 the parsed source, the coverage scope, Phase 2 preflight findings, and any
-user-specified foundation instruction.
+user-specified foundation instruction. Preserve user-specified foundation as
+input, not inferred classification.
+Include enough scope metadata for `plan.md` to create complete
+`claims_to_check` coverage.
+Source claims should later become blind reference check targets when they are
+not foundation or context-only, with targets stored as `reviewer_reference_claim`.
 
 Do not copy note prose, equation bodies, or derived source maps into this
 artifact. Do not write one task item per equation. Do not classify final
 foundation, claims, or context-only items here; `plan.md` owns that separation.
+Do not pass the full note body to proposer agents; later workflows use redacted
+checkpoint context.
 
 After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/initial-note-check.md")`. It starts a

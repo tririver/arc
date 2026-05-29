@@ -75,15 +75,7 @@ accepted foundation setup. Make the current executable batch detailed enough to
 run with high confidence. Leave later work in `macro_plan` so future planning
 can use accepted results, observed failure modes, and measured agent ability.
 
-Use these target budgets as priors for the total expanded plan, not hard caps
-for the first executable batch:
-
-```text
-exam-style exercise: 3-5 detailed steps
-graduate take-home problem: 5-10 detailed steps
-simple research task: 10-20 detailed steps
-challenging research task: 20-50 detailed steps
-```
+Use target budgets as soft guidance for the total expanded plan, not hard caps or a demand for at least 20 steps: exam-style 3-5; graduate take-home 5-10; simple research 10-20; challenging research 20-50.
 
 Step 2: Choose step granularity by meaning and difficulty. Use the largest
 coherent chunks current agents can check reliably, then split only when the
@@ -92,6 +84,15 @@ step may contain several checkpoint equations when they are one derivation
 chain, physical argument, quantity family, approximation regime, or
 source-context unit. Each checkpoint must have its own target quantity and
 verification target.
+
+For every checkpoint, set `canonical_output` and `comparison_rule` so two
+correct proposers calculate the same object and the reviewer can form `A-B`
+after declared rewrites. Include variables, coordinates/basis, index positions,
+gauge, normalization, approximation order, dropped constants, and final form
+when they affect equality. Do not ask for "the metric" or "the power spectrum"
+without comparison form; for a metric, require `ds^2` in a specified basis and
+symbols such as `dt`, `dr`, `dΩ^2`, `a(t)`, and `k`, or `g_{\mu\nu}` components.
+If this would reveal the answer, split or add prerequisites.
 
 Step 3: For every `detailed_steps[]` entry, specify:
 
@@ -126,16 +127,19 @@ checkpoint_id
 source_item_ids
 quantity_to_calculate
 dependencies
+canonical_output
+comparison_rule
 proposer_context_slice
 reviewer_reference_claim_ids
 verification
 ```
 
-At the end of every detailed step, make the quantity contract explicit:
+At the end of every step, make the quantity contract explicit:
 calculate which quantity, in terms of which quantity, and what is not allowed
 as an input. Do not disclose the exact expected expression or expected final
 formula. Instead, say to derive the target quantity in terms of named
-dependencies. If this cannot be stated clearly, split the step again.
+dependencies and in the checkpoint's canonical output form. If this cannot be
+stated clearly enough for `A-B` comparison, split the step again.
 
 For equations quoted from a reference or collaborator note that need checking,
 do not disclose the target reference equation in `prompt`, `allowed_inputs`, or
@@ -158,8 +162,7 @@ expansion_trigger
 notes_for_later_planning
 ```
 
-Macro blocks are not consensus steps. They are promises to replan later with
-more evidence.
+Macro blocks are not consensus steps; they are promises to replan later with more evidence.
 
 Step 5: When `task-to-be-planned.json` requests expansion or refinement of an
 existing plan, preserve accepted earlier detailed steps and expand only the
@@ -177,11 +180,11 @@ complete plan view to both `<project-dir>/calculate/<run-id>/latest-plan.md`
 and `<project-dir>/latest-plan.md`. The Markdown is not a status stub: it must
 show the evidence summary, foundation boundary, validation-only results,
 `detailed_steps`, `macro_plan`, each detailed step's quantity contracts,
-context policy, checkpoints, allowed inputs, substeps, expected output,
-verification method, and plan revision history when present. The JSON is the
-source of truth for later workflow phases, but the Markdown must be complete
-enough for a human to review the current detailed work and macro-plan without
-opening the JSON.
+context policy, checkpoints, canonical output contracts, comparison rules,
+allowed inputs, substeps, expected output, verification method, and plan
+revision history when present. The JSON is the source of truth for later
+workflow phases, but the Markdown must be complete enough for a human to review
+the current detailed work and macro-plan without opening the JSON.
 
 After writing the project-level Markdown reports, call MCP
 `md2pdf(input="<project-dir>/latest-plan.md")`. On the first planning pass,
@@ -204,6 +207,7 @@ source coverage is sufficient
 detailed steps fit observed or expected agent ability
 macro-plan blocks are ordered by real dependencies
 checkpoint grouping preserves context and reviewer precision
+checkpoint canonical outputs make A-B comparison well-defined
 the first calculation step is clear
 difficult steps have enough substeps
 ```
