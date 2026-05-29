@@ -1605,9 +1605,7 @@ def _required_text(data: Mapping[str, Any], key: str) -> str:
 
 def _parse_human_gate(value: Any) -> dict[str, Any]:
     raw = _dict(value, "human_gate")
-    parsed = copy.deepcopy(raw)
-    parsed["enabled"] = _bool(raw.get("enabled", False), "human_gate.enabled")
-    parsed["mode"] = str(raw.get("mode", "standard") or "standard").strip() or "standard"
+    parsed: dict[str, Any] = {"enabled": _bool(raw.get("enabled", False), "human_gate.enabled")}
 
     raw_statuses = raw.get("pause_on_statuses", list(DEFAULT_HUMAN_GATE_PAUSE_STATUSES))
     if raw_statuses is None:

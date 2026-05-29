@@ -21,8 +21,7 @@ Read `plan.json` and `foundation/latest.json`. Create:
   "proposer_count": 3,
   "max_recalculations": 2,
   "human_gate": {
-    "enabled": false,
-    "mode": "standard"
+    "enabled": false
   },
   "defaults": {
     "integrity_reference_path": "skills/arc/rules/integrity.md"
@@ -35,12 +34,11 @@ Keep `proposer_count` and `max_recalculations` configurable. Defaults are 3
 proposers and 2 recalculations: 3 total attempts, meaning 1 initial attempt + 2 recalculations.
 Do not increase attempts unless the user asks.
 
-For note checks, set:
+For runs that should pause on failed or non-agreeing steps, set:
 
 ```json
 "human_gate": {
   "enabled": true,
-  "mode": "note_check",
   "pause_on_statuses": [
     "reference_disagrees",
     "two_agree",
@@ -76,8 +74,8 @@ foundation/latest.json --target-equation-id eq_001` from this workflow
 directory.
 
 ## Phase 2a: Add Blind Reference Checks
-For paper or note equations that need checking, prefer a blind reference check
-over `foundation_check`. Do not put the target equation in
+For source, reference, or collaborator equations that need checking, prefer a
+blind reference check over `foundation_check`. Do not put the target equation in
 `foundation/latest.json`, `prompt`, or `allowed_context`.
 Add a `new_calculation` step with two proposers and reviewer-only C:
 ```json
@@ -103,7 +101,7 @@ For a blind reference check, proposers default to no paper tools and no internet
 search unless the user explicitly requests source access. The reviewer compares
 A and B from blind proposers with C from `reviewer_reference_claim`: `A=B=C`
 verifies the reference. In standard calculation mode, `A=B!=C` accepts the
-blind derivation and marks `reference_disagrees`. In note-check mode with
+blind derivation and marks `reference_disagrees`. With
 `human_gate.enabled=true`, `A=B!=C` stops immediately for expert resolution
 unless a shared plan/foundation revision fully explains the mismatch.
 `A!=B` means recalculate, split the step, or stop for human review depending on
@@ -258,6 +256,11 @@ paths. If no selected proposer exists, say why and point to artifacts. If a
 human expert resolves a result, continue from that premise and mark it
 human-resolved. Do not claim a result absent from accepted consensus output or
 human-resolved input.
+
+If `plan.json` includes source items or reference-only targets, include a
+status map for those items in the report. Use `foundation`, `verified`,
+`human_resolved`, `reference_disagrees`, `unresolved`, or `context_only`, and
+include source path, page, section, heading, or label when available.
 
 When a human-resolved result is used to continue, write the resolution into the
 run artifacts before launching the next consensus config:

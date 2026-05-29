@@ -198,13 +198,13 @@ arc-llm proposers-reviewer-consensus --config consensus-config.json --dry-run --
 The wrapper owns the agreement policy, locked outputs, selective recalculation,
 and the forced `blocked_for_user` stop when the recalculation limit is reached.
 
-For note checks, enable the human gate in the consensus config:
+For runs that should stop at the first failed or non-agreeing step, enable the
+human gate in the consensus config:
 
 ```json
 {
   "human_gate": {
     "enabled": true,
-    "mode": "note_check",
     "pause_on_statuses": [
       "reference_disagrees",
       "two_agree",

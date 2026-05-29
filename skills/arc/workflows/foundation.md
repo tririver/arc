@@ -19,9 +19,8 @@ Each foundation file must use `schema_version: "arc.foundation.v1"`.
 
 ## Phase 1: Prepare Versioned Foundation JSON
 
-Step 1: Read `<project-dir>/calculate/<run-id>/plan.json`. For note checks,
-use the foundation boundary and source evidence recorded by `plan.md`; do not
-redo note parsing or rebuild note triage here.
+Step 1: Read `<project-dir>/calculate/<run-id>/plan.json`. Use the foundation
+boundary and source evidence recorded by `plan.md`.
 
 Step 2: Create `foundation.v001.json`. If the foundation later changes, create
 `foundation.v002.json`, update `latest.json`, and record why the version

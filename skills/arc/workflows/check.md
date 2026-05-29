@@ -1,9 +1,9 @@
 # Check Workflow
 
 Use this workflow when the user asks ARC to check one or more accessible
-Markdown or PDF research notes. The goal is to identify the foundation and then
-verify every non-foundation technical claim without exposing the full note body
-to proposer agents.
+Markdown or PDF research notes. The goal is to turn note content into a
+source-extracted calculation request that can be handled by the standard
+plan/foundation/calculate workflow.
 
 If the user explicitly asks to use `check.md`, treat that as a request to run
 this workflow, not merely to discuss or summarize it. Do not stop after a
@@ -18,11 +18,11 @@ workflows/foundation.md
 workflows/calculate.md
 ```
 
-Keep this file note-specific. It owns note parsing, preflight, note-check
-intake artifacts, note-output validation, and the note status map. Do not
-duplicate plan granularity rules, foundation boundary/schema/version rules,
-consensus config details, prompt contracts, human-gate policy, or
-calculation-report structure here; update the owning workflow instead.
+Keep this file note-specific. It owns note parsing, preflight, source-extracted
+request artifact creation, and optional note-output validation. Do not duplicate
+plan granularity rules, foundation boundary/schema/version rules, consensus
+config details, prompt contracts, human-gate policy, human-resolution policy,
+or calculation-report structure here; update the owning workflow instead.
 
 ## Phase 1: Parse And Read Notes
 
@@ -92,9 +92,9 @@ Step 3: In `interactive` mode, pause after preflight and ask the user to review
 the obvious issues before launching proposer-reviewer execution. In `auto`
 mode, do not pause; continue to Phase 3 after recording the findings.
 
-## Phase 3: Prepare Note-Check Intake
+## Phase 3: Prepare Source-Extracted Request
 
-Step 1: Write a short triage artifact:
+Step 1: Write a short selected-idea artifact:
 
 ```text
 <project-dir>/calculate/<run-id>/note-check-triage.json
@@ -109,8 +109,8 @@ For parsed TeX notes, build `note-check-triage.json` from `sections[]` and
 page when available.
 
 Step 2: If the user specifies the foundation, record that instruction in the
-triage artifact as input for `plan.md`. Do not classify final foundation,
-claims, or context-only items here; `plan.md` owns that separation.
+artifact as user input. Do not classify final foundation, claims, or
+context-only items here; `plan.md` owns that separation.
 
 After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/initial-note-check.md")`. It starts a
@@ -119,30 +119,18 @@ before continuing.
 
 ## Phase 4: Reuse Calculation Workflows
 
-Step 1: Treat the note check as an explicit calculation idea: verify the note
-claims from the accepted foundation, with no new conjecture unless required to
-check a claim.
-
-Step 2: Execute `plan.md` with `note-check-triage.json` as the selected idea
-artifact. `plan.md` owns the foundation boundary, claim/step granularity,
+Step 1: Treat `note-check-triage.json` as the selected idea artifact and run
+`plan.md`. `plan.md` owns the foundation boundary, claim/step granularity,
 blind-reference planning, and proposer-visible secrecy rules.
 
-Step 3: Execute `foundation.md` from `plan.json`. It owns foundation JSON,
+Step 2: Execute `foundation.md` from `plan.json`. It owns foundation JSON,
 source, confidence, convention, and versioning rules.
 
-Step 4: Execute `calculate.md` in note-check mode. It owns blind reference
-config shape, proposer/reviewer prompt contracts, human-gate behavior,
-blocked/refinement handling, human-resolved continuation, and
-`calculation-report.md` generation.
+Step 3: Execute `calculate.md`. It owns blind reference config shape,
+proposer/reviewer prompt contracts, human-gate behavior, blocked/refinement
+handling, human-resolved continuation, and `calculation-report.md` generation.
 
-## Phase 5: Mirror Human Resolution To Note Triage
-
-When `calculate.md` records a human-resolved result, mirror the same resolution
-object into `note-check-triage.json`. Mark the note claim `human_resolved`, not
-`verified`. Keep later-use and foundation-promotion decisions governed by
-`calculate.md` and `foundation.md`.
-
-## Phase 6: Validate
+## Phase 5: Validate
 
 Step 1: After `calculate.md` produces a report or blocked report, run:
 
@@ -167,22 +155,3 @@ arc-paper mark-parsed-equation NOTE_ID --equation-id eq_00042 \
 For re-cache, update the parse input and rerun `arc-paper parse` with the same
 `--id`. Existing annotations are keyed to the old `source_hash` and will not
 overlay the newly parsed equation view.
-
-## Phase 7: Note Status Map
-
-The note status map in the final report must identify whether the foundation
-was user-specified or inferred. For each note item, report one status:
-
-```text
-foundation
-verified
-human_resolved
-reference_disagrees
-unresolved
-context_only
-```
-
-For each status, include the source note path and page, section, heading, or
-label when available. Do not claim a note detail is verified unless
-`calculate.md` accepted it by consensus or the user explicitly resolved
-it.

@@ -313,7 +313,7 @@ def test_reference_disagrees_accepts_when_two_blind_proposers_agree(tmp_path):
     assert result["steps"][0]["accepted_output"]["reference_claim_status"] == "disagrees"
 
 
-def test_human_gate_blocks_reference_disagrees_in_note_check(tmp_path):
+def test_human_gate_blocks_reference_disagrees(tmp_path):
     fake = FakeBatchRunner(
         [
             consensus_review(
@@ -354,7 +354,7 @@ def test_human_gate_blocks_reference_disagrees_in_note_check(tmp_path):
     config = minimal_config(
         tmp_path,
         proposer_count=2,
-        human_gate={"enabled": True, "mode": "note_check"},
+        human_gate={"enabled": True},
         steps=[
             {
                 "step_id": "blind_ref_eq_001",
@@ -395,7 +395,7 @@ def test_human_gate_stops_for_agreed_plan_revision_without_human(tmp_path):
     )
     config = minimal_config(
         tmp_path,
-        human_gate={"enabled": True, "mode": "note_check"},
+        human_gate={"enabled": True},
         max_recalculations=2,
     )
 
@@ -417,7 +417,7 @@ def test_human_gate_blocks_worker_failure(tmp_path):
         return {"schema_version": "arc.llm.proposers_reviewer_batch.result.v1", "status": "failed"}
 
     result = run_proposers_reviewer_consensus(
-        minimal_config(tmp_path, human_gate={"enabled": True, "mode": "note_check"}),
+        minimal_config(tmp_path, human_gate={"enabled": True}),
         batch_runner=failing_batch_runner,
         base_env={},
     )
