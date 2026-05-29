@@ -197,6 +197,16 @@ arc-llm proposers-reviewer-consensus \
   --json
 ```
 
+Do not mark the workflow blocked merely because the consensus config has many
+steps, the run is expected to require many LLM calls, or execution is likely to
+be slow, expensive, or serial. Large workload is an execution/runtime property,
+not a scientific or workflow block. In `auto` mode, start or continue the
+configured consensus run and use the available watcher, background-job
+procedure, or package status command rather than stopping for size alone. Only
+mark blocked for an actual consensus status, failed execution, missing required
+input, instruction conflict, unavailable runtime, or a human decision required
+by the workflow.
+
 Inspect the returned JSON. If a step returns `blocked_for_user`, ask the human
 expert the reported `expert_question` before continuing. If a step returns
 `blocked_for_revision`, inspect `workflow_action.proposed_revision`; apply it
