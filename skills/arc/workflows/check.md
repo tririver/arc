@@ -111,12 +111,19 @@ Step 2: Run `calculate.md`. It executes ready steps from the current work note
 and writes the next work-note version. `calculate.md` owns runtime execution,
 reviewer judgment, accepted/blocked current-step status, and result recording.
 
+Step 3: Repeat Steps 1 and 2 until the requested note-check coverage is
+complete or a workflow stop condition applies. Do not stop only because one
+ready step was accepted; if rough or pending coverage remains, return to
+`plan.md` to promote the next coherent chunk before the next `calculate.md`
+run.
+
 ## Phase 5: Note-Check Status
 
 Do not create separate note-check triage JSON. Note-check status is recorded in
 the work note by the owning workflows. When `calculate.md` or `plan.md` records
 note status, it should do so inline near the checked or human-resolved item in
-the work note.
+the work note. Human-resolved accepted content must follow the owning
+workflow's visible blue plus literal `[Human-resolved]` marker rule.
 
 If checking shows that a parsed equation is problematic, ask the user to choose
 either an ARC paper annotation or a re-parse.

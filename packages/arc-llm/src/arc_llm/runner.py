@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -14,6 +15,7 @@ from .providers.select import select_provider
 
 
 MAX_ATTEMPTS_PER_PROVIDER = 3
+RETRY_INTERVAL_SECONDS = 10
 
 
 class LLMTaskError(RuntimeError):
@@ -195,7 +197,18 @@ def _run_with_retries(
                         error=exc,
                     )
                 )
+                if _has_remaining_attempt(configs, fallback_index=fallback_index, attempt=attempt):
+                    time.sleep(RETRY_INTERVAL_SECONDS)
     raise LLMTaskError(_failure_message(failures))
+
+
+def _has_remaining_attempt(
+    configs: Sequence[LLMConfig],
+    *,
+    fallback_index: int,
+    attempt: int,
+) -> bool:
+    return attempt < MAX_ATTEMPTS_PER_PROVIDER or fallback_index < len(configs) - 1
 
 
 def _generate_json(

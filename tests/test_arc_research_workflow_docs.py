@@ -401,6 +401,40 @@ def test_calculate_human_resolution_continues_until_stop_condition() -> None:
     assert "the user explicitly asks to pause or stop" in text
 
 
+def test_check_workflow_repeats_until_requested_coverage_complete() -> None:
+    text = " ".join((WF / "check.md").read_text(encoding="utf-8").lower().split())
+
+    assert "repeat steps 1 and 2" in text
+    assert "requested note-check coverage is complete" in text
+    assert "do not stop only because one ready step was accepted" in text
+    assert "rough or pending coverage remains" in text
+    assert "return to `plan.md`" in text
+
+
+def test_human_resolved_content_requires_blue_work_note_marking() -> None:
+    calculate = " ".join((WF / "calculate.md").read_text(encoding="utf-8").lower().split())
+    plan = " ".join((WF / "plan.md").read_text(encoding="utf-8").lower().split())
+    check = " ".join((WF / "check.md").read_text(encoding="utf-8").lower().split())
+
+    for text in [calculate, plan]:
+        assert "specific human" in text
+        assert "expert answer" in text
+        assert "unresolved scientific acceptance" in text
+        assert "question" in text
+        assert "ordinary user task" in text
+        assert "visible blue" in text
+        assert "whole" in text
+        assert "affected prose/equation block" in text
+        assert "not only the" in text
+        assert "journal note" in text
+        assert "literal marker" in text
+        assert "`[human-resolved]`" in text
+        assert "color is stripped" in text or "color is unavailable" in text
+        assert "marker remains authoritative" in text
+
+    assert "visible blue plus literal `[human-resolved]` marker rule" in check
+
+
 def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
     run_root = tmp_path / "ideas" / "run_001"
     _write_idea_round(run_root, "idea_001", 1, "first", total=10, novelty=4)

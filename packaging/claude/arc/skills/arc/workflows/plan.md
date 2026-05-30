@@ -167,12 +167,15 @@ Step 4: Use `## Source Audit Trail` for every source that shaped the work note:
 paper ids, note paths, sections, equations, commands, MCP tools, URLs, and why
 each source matters.
 
-Step 5: When a previously blocked item is resolved by explicit human expert
-input and promoted into the work note, visually mark the human-resolved prose
-and equations in blue in user-facing Markdown/PDF output. Use renderer-portable
-fallback text such as `Human-resolved` so the meaning remains clear if a host
-does not render color. For PDF-oriented Markdown, raw LaTeX color commands such
-as `\textcolor{blue}{...}` and `{\color{blue} ...}` are acceptable.
+Step 5: Any accepted or promoted work-note content whose acceptance depends on
+a specific human expert answer resolving an unresolved scientific acceptance
+question is human-resolved content. This does not include ordinary user task
+instructions, source excerpts, or constraints. Mark the whole affected
+prose/equation block in visible blue when the renderer supports color, not only
+the Journal note. Always keep the literal marker `[Human-resolved]` inside or
+beside the block. If color is stripped or unavailable, the marker remains
+authoritative. For PDF-oriented Markdown, raw LaTeX color commands such as
+`\textcolor{blue}{...}` and `{\color{blue} ...}` are acceptable.
 
 ## Phase 4: Version And Export
 

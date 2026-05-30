@@ -5,6 +5,11 @@ from arc_llm import runner
 from arc_llm.runner import resolve_llm_config, run_json, run_text
 
 
+@pytest.fixture(autouse=True)
+def no_retry_sleep(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+
 def without_call_record(result):
     return {key: value for key, value in result.items() if key != ARC_LLM_CALL_RECORD_FIELD}
 
@@ -187,6 +192,18 @@ def test_run_text_retries_selected_provider_twice_before_success(tmp_path, monke
 
     assert result == "codex-cli:gpt-5.4:prompt"
     assert flaky.attempts == 3
+
+
+def test_run_text_waits_ten_seconds_between_retry_attempts(monkeypatch):
+    flaky = FlakyTextProvider(name="codex-cli", failures_before_success=2)
+    sleep_calls = []
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: flaky)
+    monkeypatch.setattr("time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    result = run_text("prompt", provider="codex-cli", env={}, process_chain=[])
+
+    assert result == "codex-cli:gpt-5.4:prompt"
+    assert sleep_calls == [10, 10]
 
 
 def test_run_json_retries_selected_provider_twice_before_success(tmp_path, monkeypatch):

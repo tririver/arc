@@ -132,10 +132,16 @@ proposed next action. If the block needs human input, ask the exact same
 `Human expert question:` in the user-facing response before ending the turn.
 Limits diagnose; they are not proof.
 
-When a human expert later resolves a blocked calculation item, record the
-resolved prose and equations with a visible blue highlight in user-facing
-Markdown/PDF output. Keep a textual marker such as `Human-resolved` beside the
-colored text so hosts that do not render color still preserve the status.
+Any accepted work-note content whose acceptance depends on a specific human
+expert answer resolving an unresolved scientific acceptance question is
+human-resolved content. This includes a blocked step that the expert resolves,
+a source convention the expert chooses, or a main-agent verification that is
+accepted only because the expert allowed that acceptance standard. This does
+not include ordinary user task instructions, source excerpts, or constraints.
+Mark the whole affected prose/equation block in visible blue when the renderer
+supports color, not only the Journal note. Always keep the literal marker
+`[Human-resolved]` inside or beside the block. If color is stripped or
+unavailable, the marker remains authoritative.
 
 A human expert later resolves a block and thereby unblocks the workflow; this
 is not by itself a completion condition. After recording the human-resolved
