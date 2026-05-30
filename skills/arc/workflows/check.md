@@ -4,7 +4,14 @@ Use this workflow when the user asks ARC to check accessible Markdown or PDF res
 `check.md owns note parsing`, preflight, the concise
 `planning-request.md` planning handoff, and note source audit handoff.
 
-This workflow reuses only:
+In broad requests such as "check this content", "check the paper", or
+"verify the note", default requested coverage is the whole accessible note.
+Do not silently narrow broad note-check coverage to a few targeted checks.
+If the run intentionally samples or prioritizes only part of the note, record
+that as partial coverage in `planning-request.md` and keep remaining coverage
+pending unless the user explicitly approves a narrower scope.
+
+This workflow reuses:
 
 ```text
 workflows/plan.md
