@@ -136,6 +136,20 @@ resolved prose and equations with a visible blue highlight in user-facing
 Markdown/PDF output. Keep a textual marker such as `Human-resolved` beside the
 colored text so hosts that do not render color still preserve the status.
 
+A human expert later resolves a block and thereby unblocks the workflow; this
+is not by itself a completion condition. After recording the human-resolved
+result, continue unless the user explicitly asks to pause or stop, a new
+`Human expert question:` is outstanding, a tool/runtime blocker prevents
+progress, or `interactive` mode requires confirmation:
+
+- If another ready detailed step exists, continue with the next ready detailed step
+  using this workflow.
+- If no ready detailed step exists but rough/pending coverage remains from the
+  original request, write a planning request and return to `plan.md` to promote
+  the next coherent chunk.
+- End the turn only when requested coverage is complete or one of the stop
+  conditions above applies.
+
 When a result may help later steps, record it only as a candidate reusable
 result. Promotion to an accepted premise belongs to `plan.md`.
 

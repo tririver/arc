@@ -345,6 +345,16 @@ def test_calculate_pause_requires_explicit_human_expert_question() -> None:
     assert "user-facing response" in text
 
 
+def test_calculate_human_resolution_continues_until_stop_condition() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
+
+    assert "human expert later resolves" in text
+    assert "unblocks the workflow" in text
+    assert "continue with the next ready detailed step" in text
+    assert "return to `plan.md`" in text
+    assert "the user explicitly asks to pause or stop" in text
+
+
 def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
     run_root = tmp_path / "ideas" / "run_001"
     _write_idea_round(run_root, "idea_001", 1, "first", total=10, novelty=4)
