@@ -137,6 +137,11 @@ Rough steps are not executable consensus steps. Future planning may refine them
 after accepted results, blocked reasons, reviewer reports, or observed agent
 ability are known.
 
+Rough steps are only for deferred/pending work. When `plan.md` promotes a rough
+step into `## Detailed Steps Ready To Calculate`, remove that step from
+`## Rough Steps For Later Planning` in the same work-note version. Accepted,
+ready, or blocked detailed steps must not remain in the rough-step list.
+
 Step 5: Put hidden source answers in `## Reviewer-Only Targets`. For note-check
 tasks, write clean proposer-facing explanation using only context up to the
 target. Do not include the target equation or later text in proposer-visible
@@ -191,7 +196,8 @@ perform the same review.
 Step 2: Check that foundations are separated from derived results, accepted
 derived results were actually accepted, validation-only references are not
 premises, ready steps have complete contracts, rough steps are not executable,
-target secrecy is preserved, and source coverage is enough for the task.
+target secrecy is preserved, no accepted/ready/blocked step is duplicated in
+`## Rough Steps For Later Planning`, and source coverage is enough for the task.
 
 Step 3: If review finds gaps, build final content with the planned PDF export
 noted in the Journal, write a new immutable work-note version, mirror it to

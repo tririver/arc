@@ -265,6 +265,15 @@ def test_plan_workflow_orders_blocks_by_dependency_then_source_anchor() -> None:
     assert "chronological" in plan
 
 
+def test_plan_workflow_removes_promoted_steps_from_rough_list() -> None:
+    plan = (WF / "plan.md").read_text(encoding="utf-8").lower()
+
+    assert "remove that step from" in plan
+    assert "accepted," in plan
+    assert "ready, or blocked detailed steps must not remain" in plan
+    assert "no accepted/ready/blocked step is duplicated" in plan
+
+
 def test_calculate_workflow_owns_consensus_results_only() -> None:
     calculate = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
