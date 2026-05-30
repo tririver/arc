@@ -411,7 +411,7 @@ def test_check_workflow_repeats_until_requested_coverage_complete() -> None:
     assert "return to `plan.md`" in text
 
 
-def test_human_resolved_content_requires_blue_work_note_marking() -> None:
+def test_work_note_color_marking_only_colors_literal_markers() -> None:
     calculate = " ".join((WF / "calculate.md").read_text(encoding="utf-8").lower().split())
     plan = " ".join((WF / "plan.md").read_text(encoding="utf-8").lower().split())
     check = " ".join((WF / "check.md").read_text(encoding="utf-8").lower().split())
@@ -422,17 +422,18 @@ def test_human_resolved_content_requires_blue_work_note_marking() -> None:
         assert "unresolved scientific acceptance" in text
         assert "question" in text
         assert "ordinary user task" in text
-        assert "visible blue" in text
-        assert "whole" in text
-        assert "affected prose/equation block" in text
-        assert "not only the" in text
-        assert "journal note" in text
+        assert "only color" in text
         assert "literal marker" in text
-        assert "`[human-resolved]`" in text
+        assert "`[confirmed source issue]`" in text
+        assert "`human-resolved`" in text
+        assert "do not color the surrounding prose" in text
+        assert "do not color the surrounding equations" in text
         assert "color is stripped" in text or "color is unavailable" in text
         assert "marker remains authoritative" in text
+        assert "whole affected prose/equation block" not in text
+        assert "affected visible block in red" not in text
 
-    assert "visible blue plus literal `[human-resolved]` marker rule" in check
+    assert "marker-only color rule" in check
 
 
 def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:

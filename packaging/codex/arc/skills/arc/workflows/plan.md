@@ -177,17 +177,17 @@ each source matters.
 Step 5: Any accepted or promoted work-note content whose acceptance depends on
 a specific human expert answer resolving an unresolved scientific acceptance
 question is human-resolved content. This does not include ordinary user task
-instructions, source excerpts, or constraints. Mark the whole affected
-prose/equation block in visible blue when the renderer supports color, not only
-the Journal note. Always keep the literal marker `[Human-resolved]` inside or
-beside the block. If color is stripped or unavailable, the marker remains
-authoritative. For PDF-oriented Markdown, raw LaTeX color commands such as
-`\textcolor{blue}{...}` and `{\color{blue} ...}` are acceptable.
+instructions, source excerpts, or constraints. Add marker `[human-resolved]`
+beside the content, but only color the string `human-resolved` blue. Do not
+color the surrounding prose. Do not color the surrounding equations. If color is
+stripped or unavailable, the marker remains authoritative. For PDF-oriented
+Markdown, `[\textcolor{blue}{human-resolved}]` is acceptable.
 
 Step 6: For note-check content classified as `confirmed_source_error`, mark the
-affected visible block in red with `[Confirmed source issue]`. Use raw LaTeX
-color when useful. Do not use red for `likely_source_error` or
-`ambiguous_convention`; ask a human expert question before acceptance.
+source issue with `[confirmed source issue]`, but only color that literal marker
+red. Do not color the surrounding prose or equations. Use raw LaTeX color when
+useful. Do not use red for `likely_source_error` or `ambiguous_convention`; ask
+a human expert question before acceptance.
 
 ## Phase 4: Version And Export
 Step 1: Find the highest existing immutable version under

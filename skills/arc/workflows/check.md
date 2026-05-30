@@ -130,7 +130,7 @@ Do not create separate note-check triage JSON. Note-check status is recorded in
 the work note by the owning workflows. When `calculate.md` or `plan.md` records
 note status, it should do so inline near the checked or human-resolved item in
 the work note. Human-resolved accepted content must follow the owning
-workflow's visible blue plus literal `[Human-resolved]` marker rule.
+workflow's marker-only color rule for `human-resolved`.
 
 If checking shows that a parsed equation is problematic, ask the user to choose
 either an ARC paper annotation or a re-parse.

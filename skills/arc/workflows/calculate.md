@@ -143,12 +143,13 @@ For an accepted step, update only the current ready-step slot:
 - use `Journal` for execution facts, consensus paths, attempts, and reviewer
   judgment
 
-For `confirmed_source_error`, mark the affected accepted-result prose and any
-source-disagreement statement in visible red and include the literal marker
-`[Confirmed source issue]`. For PDF-oriented Markdown, raw LaTeX color commands
-such as `\textcolor{red}{...}` and `{\color{red} ...}` are acceptable. Do not
-use the red marker for likely or convention-dependent source mismatches; those
-must remain blocked until the human expert question is answered.
+For `confirmed_source_error`, put the literal marker `[confirmed source issue]`
+beside the source-disagreement statement, but only color that literal marker
+red. Do not color the surrounding prose. Do not color the surrounding equations.
+For PDF-oriented Markdown, `\textcolor{red}{[confirmed source issue]}` is
+acceptable. Do not use the red marker for likely or convention-dependent source
+mismatches; those must remain blocked until the human expert question is
+answered.
 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and
@@ -162,10 +163,11 @@ human-resolved content. This includes a blocked step that the expert resolves,
 a source convention the expert chooses, or a main-agent verification that is
 accepted only because the expert allowed that acceptance standard. This does
 not include ordinary user task instructions, source excerpts, or constraints.
-Mark the whole affected prose/equation block in visible blue when the renderer
-supports color, not only the Journal note. Always keep the literal marker
-`[Human-resolved]` inside or beside the block. If color is stripped or
-unavailable, the marker remains authoritative.
+Add marker `[human-resolved]` beside the accepted content, but only color the
+string `human-resolved` blue. Do not color the surrounding prose. Do not color
+the surrounding equations. If color is stripped or unavailable, the marker
+remains authoritative. For PDF-oriented Markdown,
+`[\textcolor{blue}{human-resolved}]` is acceptable.
 
 A human expert later resolves a block and thereby unblocks the workflow; this
 is not by itself a completion condition. After recording the human-resolved
