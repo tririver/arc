@@ -31,6 +31,7 @@ from .parse.equations import find_equation_context
 from .parse.source import PARSER_VERSION as SOURCE_PARSER_VERSION
 from .parse.source import parse_source_input
 from .parse.source import parse_source_input_with_warnings
+from .parse.source import source_input_hash
 from .providers import Ar5ivProvider, InspireProvider
 from .providers.base import ProviderError
 from .reference_inference import ReferenceInferenceError, infer_main_references
@@ -261,6 +262,29 @@ def parse_source(
                 raise ValueError("--paper-id only supports source=auto or source=ar5iv")
             parsed = _parse_ar5iv_source(resolved_id, refresh=refresh)
         else:
+            _validate_local_source(
+                source,
+                source_path=source_path,
+                html_path=html_path,
+                tex_path=tex_path,
+                pdf_path=pdf_path,
+            )
+            if not refresh and resolved_id:
+                current_hash = source_input_hash(
+                    source_path=source_path,
+                    html_path=html_path,
+                    tex_path=tex_path,
+                    pdf_path=pdf_path,
+                )
+                path = parsed_source_cache_path(resolved_id)
+                cached = read_json(path)
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("paper_id") == resolved_id
+                    and cached.get("parser_version") == SOURCE_PARSER_VERSION
+                    and cached.get("source_hash") == current_hash
+                ):
+                    return ok(cached, provider="local-cache", cache="hit", cache_path=str(path))
             parsed, warnings = _parse_local_source(
                 source=source,
                 source_path=source_path,

@@ -1,7 +1,7 @@
 import json
 
 from arc_paper import cli, service
-from arc_paper.cache import parsed_source_annotations_cache_path, parsed_source_cache_path, read_json
+from arc_paper.cache import parsed_source_annotations_cache_path, parsed_source_cache_path, read_json, write_json
 
 
 def _write_tex(tmp_path):
@@ -49,6 +49,39 @@ def test_service_parse_source_caches_and_lookup_apis(monkeypatch, tmp_path):
     assert equations["data"][0]["id"] == "eq_00001"
     assert equation["data"]["tex_label"] == "eq:one"
     assert hits["data"][0]["id"] == "eq_00001"
+
+
+def test_service_parse_source_reuses_cached_parse_when_source_hash_matches(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    tex_path = _write_tex(tmp_path)
+    first = service.parse_source(tex_path=tex_path, source_id="lecture-9")
+
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("source parser should not run for matching cached input")
+
+    monkeypatch.setattr(service, "parse_source_input_with_warnings", fail_parse)
+
+    second = service.parse_source(tex_path=tex_path, source_id="lecture-9")
+
+    assert second["ok"] is True
+    assert second["meta"]["cache"] == "hit"
+    assert second["data"] == first["data"]
+
+
+def test_service_parse_source_ignores_cached_parse_with_wrong_source_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    tex_path = _write_tex(tmp_path)
+    first = service.parse_source(tex_path=tex_path, source_id="lecture-9")
+    cache_path = parsed_source_cache_path("lecture-9")
+    cached = dict(first["data"])
+    cached["paper_id"] = "different-source"
+    write_json(cache_path, cached)
+
+    second = service.parse_source(tex_path=tex_path, source_id="lecture-9")
+
+    assert second["ok"] is True
+    assert second["meta"]["cache"] == "write"
+    assert second["data"]["paper_id"] == "lecture-9"
 
 
 def test_service_get_parsed_source_missing_returns_error(monkeypatch, tmp_path):

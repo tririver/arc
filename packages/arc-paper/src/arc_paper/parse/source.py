@@ -95,6 +95,26 @@ def parse_source_input_with_warnings(
     raise ValueError("parse_source_input requires an HTML, TeX, PDF, or ar5iv source")
 
 
+def source_input_hash(
+    *,
+    source_path: str | Path | None = None,
+    html_path: str | Path | None = None,
+    tex_path: str | Path | None = None,
+    pdf_path: str | Path | None = None,
+) -> str:
+    resolved = _resolve_inputs(source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
+    if resolved["html_path"]:
+        return _sha256_bytes(Path(resolved["html_path"]).read_bytes())
+    if resolved["tex_path"]:
+        paths = [Path(resolved["tex_path"])]
+        if resolved["pdf_path"]:
+            paths.append(Path(resolved["pdf_path"]))
+        return _combined_hash(paths)
+    if resolved["pdf_path"]:
+        return _sha256_bytes(Path(resolved["pdf_path"]).read_bytes())
+    raise ValueError("parse_source_input requires an HTML, TeX, PDF, or ar5iv source")
+
+
 def extract_pdf_pages(path: str | Path) -> list[str]:
     pages, _ = _extract_pdf_pages_with_warning(path)
     return pages
