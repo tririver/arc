@@ -647,6 +647,7 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
     domain_id = args.get("domain_id")
     provider = str(args.get("provider", "auto"))
     model = args.get("model")
+    model_tier = args.get("model_tier")
     refresh = bool(args.get("refresh", False))
     workers = int(args.get("workers", 8))
     background = bool(args.get("background", False))
@@ -658,6 +659,7 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
             "domain_id": domain_id,
             "provider": provider,
             "model": model,
+            "model_tier": model_tier,
             "refresh": refresh,
             "workers": workers,
             "background": background,
@@ -668,6 +670,7 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
             domain_id,
             provider,
             model,
+            model_tier,
             refresh,
             workers,
             progress,
@@ -742,6 +745,7 @@ def _run_domain_job(
     domain_id: str | None,
     provider: str,
     model: str | None,
+    model_tier: str | None,
     refresh: bool,
     workers: int,
     progress: Callable[[dict[str, Any]], None],
@@ -750,15 +754,17 @@ def _run_domain_job(
     if cancel():
         raise MCPJobCancelled("MCP job cancellation was requested.")
     progress({"event": "domain_started", "seed_paper": normalize_paper_id(seed_paper), "intent": intent})
-    result = domain_service.build_domain(
-        seed_paper,
-        intent=intent,
-        domain_id=domain_id,
-        provider=provider,
-        model=model,
-        refresh=refresh,
-        workers=workers,
-    )
+    build_kwargs: dict[str, Any] = {
+        "intent": intent,
+        "domain_id": domain_id,
+        "provider": provider,
+        "model": model,
+        "refresh": refresh,
+        "workers": workers,
+    }
+    if model_tier is not None:
+        build_kwargs["model_tier"] = model_tier
+    result = domain_service.build_domain(seed_paper, **build_kwargs)
     progress({"event": "domain_completed" if _all_ok(result) else "domain_failed"})
     return result
 
@@ -1573,6 +1579,7 @@ def _register_tools(app: Any) -> None:
         domain_id: DomainId = None,
         provider: LLMProvider = "auto",
         model: LLMModel = None,
+        model_tier: LLMModelTier = None,
         refresh: Refresh = False,
         workers: Annotated[int, Field(description="Number of parallel arc-paper workers.")] = 8,
         background: Background = False,
@@ -1584,6 +1591,7 @@ def _register_tools(app: Any) -> None:
                 "domain_id": domain_id,
                 "provider": provider,
                 "model": model,
+                "model_tier": model_tier,
                 "refresh": refresh,
                 "workers": workers,
                 "background": background,

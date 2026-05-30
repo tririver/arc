@@ -45,7 +45,6 @@ class IdeasConfig:
     variant_config_dir: Path
     variant_glob: str
     loops_per_variant: int
-    existing_run_policy: str
     save_prompts: bool
     variants: list[VariantConfig]
 
@@ -65,9 +64,6 @@ def load_ideas_config(payload: Mapping[str, Any]) -> IdeasConfig:
     if not variant_glob:
         raise ConfigError("variant_glob is required")
     loops_per_variant = _positive_int(data.get("loops_per_variant", 5), "loops_per_variant")
-    existing_run_policy = str(data.get("existing_run_policy", "fail")).strip() or "fail"
-    if existing_run_policy != "fail":
-        raise ConfigError("existing_run_policy must be fail")
     artifact_options = _dict(data.get("artifact_options", {}), "artifact_options")
     variants = _discover_variants(variant_config_dir, variant_glob)
     if not variants:
@@ -82,7 +78,6 @@ def load_ideas_config(payload: Mapping[str, Any]) -> IdeasConfig:
         variant_config_dir=variant_config_dir,
         variant_glob=variant_glob,
         loops_per_variant=loops_per_variant,
-        existing_run_policy=existing_run_policy,
         save_prompts=bool(artifact_options.get("save_prompts", True)),
         variants=variants,
     )

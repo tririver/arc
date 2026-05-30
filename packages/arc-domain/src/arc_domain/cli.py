@@ -66,6 +66,7 @@ def _seed_command(sub, name: str) -> argparse.ArgumentParser:
 def _llm_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", default="auto")
     parser.add_argument("--model", default=None)
+    parser.add_argument("--model-tier", default=None)
 
 
 def _dispatch(args: argparse.Namespace) -> Any:
@@ -78,6 +79,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             domain_id=args.domain_id,
             provider=args.provider,
             model=args.model,
+            model_tier=args.model_tier,
             refresh=args.refresh,
             workers=args.workers,
         )
@@ -88,6 +90,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             domain_id=args.domain_id,
             provider=args.provider,
             model=args.model,
+            model_tier=args.model_tier,
             refresh=args.refresh,
             workers=args.workers,
         )
@@ -114,6 +117,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             domain_id=args.domain_id,
             provider=args.provider,
             model=args.model,
+            model_tier=args.model_tier,
         )
     if args.command in {"build", "llm-build"}:
         return service.build_domain(
@@ -122,6 +126,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             domain_id=args.domain_id,
             provider=args.provider,
             model=args.model,
+            model_tier=args.model_tier,
             refresh=args.refresh,
             workers=args.workers,
         )

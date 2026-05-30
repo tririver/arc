@@ -303,3 +303,28 @@ def test_worker_dispatches_batch_translate_job(monkeypatch, tmp_path):
     assert calls["target_language"] == "Chinese"
     assert calls["model_tier"] == "low"
     assert [event["event"] for event in events] == ["batch_translate_started", "batch_translate_completed"]
+
+
+def test_worker_dispatches_domain_build_model_tier(monkeypatch):
+    calls = {}
+    events = []
+
+    def build_domain(seed_paper, **kwargs):
+        kwargs["seed_paper"] = seed_paper
+        calls.update(kwargs)
+        return {"ok": True, "data": {"domain_id": "domain-test"}, "errors": [], "meta": {}}
+
+    monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
+    monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
+    monkeypatch.setattr(worker.domain_service, "build_domain", build_domain)
+
+    result = worker._dispatch(
+        "domain_build",
+        {"seed_paper": "arXiv:0911.3380", "intent": "inflation", "provider": "auto", "model_tier": "high"},
+        job_id="job-test",
+    )
+
+    assert result["ok"] is True
+    assert calls["seed_paper"] == "arXiv:0911.3380"
+    assert calls["model_tier"] == "high"
+    assert [event["event"] for event in events] == ["domain_started", "domain_completed"]

@@ -197,10 +197,10 @@ launches and then follow `manuals/arc-mcp.md`.
 
 ## Cache Notes
 
-Default checkout cache:
+Discover the active cache path:
 
-```text
-/arc-dev/cache/arc-paper/
+```bash
+arc-paper doctor-cache --json
 ```
 
 INSPIRE citer lists are cached for one month. Cached citer records include

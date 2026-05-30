@@ -159,8 +159,10 @@ Questions`, `## Reading Guide`, `## Research Guidance`,
 `## Research Directions and Questions`, or `## Idea Examples` sections.
 
 Do not render `warnings` in the domain summary Markdown. If the domain summary
-JSON has warnings, append them to `<project-dir>/self-reflect.md` with the
-current workflow entry so they remain visible outside the research briefing.
+JSON has warnings, print `WARNING:` immediately, append them to
+`<project-dir>/context/domain/warnings.md`, and append them to
+`<project-dir>/self-reflect.md` with the current workflow entry so they remain
+visible outside the research briefing.
 
 After these deliverables are generated, export the domain HTML file and the
 domain summary Markdown file to `<project-dir>/` with the same file names so

@@ -170,6 +170,7 @@ def identify_foundation(
     paths: DomainPaths,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
     newest_citer_count: int = 50,
@@ -218,6 +219,7 @@ def identify_foundation(
         intent=intent,
         provider=provider,
         model=model,
+        model_tier=model_tier,
         min_citation_count=min_citation_count,
     )
     candidates, expansion_report = _expand_candidates_from_audit(
@@ -226,6 +228,7 @@ def identify_foundation(
         intent=intent,
         provider=provider,
         model=model,
+        model_tier=model_tier,
         refresh=refresh,
         workers=workers,
     )
@@ -252,6 +255,7 @@ def identify_foundation(
         intent=intent,
         provider=provider,
         model=model,
+        model_tier=model_tier,
         min_citation_count=min_citation_count,
     )
     selection["seed_paper"] = seed_id
@@ -362,6 +366,7 @@ def _llm_audit_candidates(
     intent: str,
     provider: str,
     model: str | None,
+    model_tier: str | None = None,
     min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
 ) -> dict[str, Any]:
     prompt = _candidate_audit_prompt(
@@ -371,7 +376,13 @@ def _llm_audit_candidates(
         min_citation_count=min_citation_count,
     )
     try:
-        audit = run_json(prompt, schema=FOUNDATION_CANDIDATE_AUDIT_SCHEMA, provider=provider, model=model)
+        audit = run_json(
+            prompt,
+            schema=FOUNDATION_CANDIDATE_AUDIT_SCHEMA,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+        )
         return _repair_candidate_audit(audit, method="llm")
     except Exception as exc:
         audit = _default_candidate_audit()
@@ -484,6 +495,7 @@ def _expand_candidates_from_audit(
     intent: str,
     provider: str,
     model: str | None,
+    model_tier: str | None = None,
     refresh: bool,
     workers: int,
     min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
@@ -542,6 +554,7 @@ def _expand_candidates_from_audit(
             intent=intent,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
         )
         paper_ids = search.get("paper_ids", [])
@@ -603,14 +616,20 @@ def _run_reference_inference_query(
     intent: str,
     provider: str,
     model: str | None,
+    model_tier: str | None = None,
     refresh: bool,
 ) -> dict[str, Any]:
+    inference_kwargs: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+        "refresh": refresh,
+    }
+    if model_tier is not None:
+        inference_kwargs["model_tier"] = model_tier
     try:
         result = paper.infer_main_references(
             _reference_inference_request(query, intent=intent),
-            provider=provider,
-            model=model,
-            refresh=refresh,
+            **inference_kwargs,
         )
     except Exception as exc:
         return {"status": "reference_inference_failed", "paper_ids": [], "warnings": [], "error": str(exc), "result": {}}
@@ -786,6 +805,7 @@ def _llm_select_foundation(
     intent: str,
     provider: str,
     model: str | None,
+    model_tier: str | None = None,
     min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
 ) -> dict[str, Any]:
     prompt = _foundation_prompt(
@@ -795,7 +815,13 @@ def _llm_select_foundation(
         min_citation_count=min_citation_count,
     )
     try:
-        selection = run_json(prompt, schema=FOUNDATION_SELECTION_SCHEMA, provider=provider, model=model)
+        selection = run_json(
+            prompt,
+            schema=FOUNDATION_SELECTION_SCHEMA,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+        )
         return _repair_selection(selection, candidates, method="llm", intent=intent)
     except Exception as exc:
         selection = _deterministic_selection(

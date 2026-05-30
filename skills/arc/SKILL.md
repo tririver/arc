@@ -80,8 +80,14 @@ already exists, follow the automation policy in
 
 Step 5: Write `<project-dir>/context.json`.
 Include `automation_level`, `workflow`, `original_request`, `user_intent`,
-`project_dir`, `seed_paper_list`, `provider`, `model_tier`, `workers`, and
-`refresh`.
+`project_dir`, `run_id`, `created_at`, `skill_version`, `skill_dir`,
+`skill_workflow_json_dir`, `seed_paper_list`, `provider`, `model_tier`,
+`workers`, and `refresh`.
+
+Use a stable safe `run_id`: lowercase ASCII letters, digits, and underscores,
+for example a short intent slug plus UTC timestamp. Set `skill_dir` to the ARC
+skill directory and `skill_workflow_json_dir` to
+`<skill-dir>/workflows/json`.
 
 ### Phase 2: Route Selection
 

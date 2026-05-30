@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ class BatchItem:
     source_hash: str | None = None
     summary_path: str | None = None
     last_error: str | None = None
+    worker_id: str | None = None
+    lease_until: str | None = None
     updated_at: str = ""
 
 
@@ -65,10 +68,84 @@ class BatchDB:
             ).fetchall()
         return [_item_from_row(row) for row in rows]
 
+    def claim_ready_items(
+        self,
+        name: str,
+        *,
+        limit: int,
+        worker_id: str,
+        lease_seconds: int = 3600,
+    ) -> list[BatchItem]:
+        if limit <= 0:
+            return []
+        now = now_iso()
+        lease_until = (datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM batch_items
+                WHERE batch_name = ?
+                  AND (
+                    status = 'ready'
+                    OR (status = 'running' AND lease_until IS NOT NULL AND lease_until < ?)
+                  )
+                ORDER BY rowid
+                LIMIT ?
+                """,
+                (name, now, limit),
+            ).fetchall()
+            paper_ids = [str(row["paper_id"]) for row in rows]
+            for paper_id in paper_ids:
+                conn.execute(
+                    """
+                    UPDATE batch_items
+                    SET status = 'running',
+                        attempts = attempts + 1,
+                        worker_id = ?,
+                        lease_until = ?,
+                        updated_at = ?
+                    WHERE batch_name = ?
+                      AND paper_id = ?
+                      AND (
+                        status = 'ready'
+                        OR (status = 'running' AND lease_until IS NOT NULL AND lease_until < ?)
+                      )
+                    """,
+                    (worker_id, lease_until, now, name, paper_id, now),
+                )
+            if not paper_ids:
+                return []
+            placeholders = ", ".join("?" for _ in paper_ids)
+            claimed = conn.execute(
+                f"""
+                SELECT * FROM batch_items
+                WHERE batch_name = ?
+                  AND paper_id IN ({placeholders})
+                  AND status = 'running'
+                  AND worker_id = ?
+                ORDER BY rowid
+                """,
+                [name, *paper_ids, worker_id],
+            ).fetchall()
+        return [_item_from_row(row) for row in claimed]
+
     def mark_status(self, name: str, paper_id: str, status: str, **fields: Any) -> None:
-        allowed = {"attempts", "provider", "model", "source_hash", "summary_path", "last_error"}
+        allowed = {
+            "attempts",
+            "provider",
+            "model",
+            "source_hash",
+            "summary_path",
+            "last_error",
+            "worker_id",
+            "lease_until",
+        }
         updates = {key: value for key, value in fields.items() if key in allowed}
         updates["status"] = status
+        if status not in {"running", "prefetching"}:
+            updates.setdefault("worker_id", None)
+            updates.setdefault("lease_until", None)
         updates["updated_at"] = now_iso()
         assignments = ", ".join(f"{key} = ?" for key in updates)
         values = list(updates.values())
@@ -123,11 +200,18 @@ class BatchDB:
                   source_hash TEXT,
                   summary_path TEXT,
                   last_error TEXT,
+                  worker_id TEXT,
+                  lease_until TEXT,
                   updated_at TEXT NOT NULL,
                   PRIMARY KEY (batch_name, paper_id)
                 );
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(batch_items)").fetchall()}
+            if "worker_id" not in columns:
+                conn.execute("ALTER TABLE batch_items ADD COLUMN worker_id TEXT")
+            if "lease_until" not in columns:
+                conn.execute("ALTER TABLE batch_items ADD COLUMN lease_until TEXT")
 
 
 def _item_from_row(row: sqlite3.Row) -> BatchItem:

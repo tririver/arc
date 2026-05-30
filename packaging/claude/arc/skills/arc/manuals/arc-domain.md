@@ -113,13 +113,12 @@ The domain cache contains:
 - `domain_summary.md`: Markdown rendering of the compact field briefing. It
   starts with task-focus guidance, brief foundation and best-reference paper
   mentions, methodology, known solved cases, and open axes for new work. It
-  omits warnings; workflows should append summary warnings to project
-  `self-reflect.md`.
+  omits warnings; workflows should append summary warnings to project `self-reflect.md` and `context/domain/warnings.md`, and print visible `WARNING:` messages immediately.
 
-Default checkout cache:
+Discover the active cache path:
 
-```text
-/arc-dev/cache/arc-domain/
+```bash
+arc-domain status <seed-paper> --intent "<user-intent>" --json
 ```
 
 ## Package Boundary

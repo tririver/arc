@@ -64,6 +64,7 @@ def llm_infer_main_references(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
 ) -> dict[str, Any]:
     query_text = (text or "").strip()
@@ -101,6 +102,7 @@ def llm_infer_main_references(
             query_text,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             metadata_lookup=_inspire.get_metadata,
         )

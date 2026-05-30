@@ -139,10 +139,10 @@ With `background=true`, the inline wait is zero.
 
 ## Job Cache
 
-Default checkout cache:
+Discover the active MCP job cache path:
 
 ```text
-/arc-dev/cache/arc-mcp/
+doctor_cache
 ```
 
 Job state is persisted under:

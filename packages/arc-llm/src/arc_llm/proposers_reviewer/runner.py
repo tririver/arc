@@ -3,15 +3,17 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import os
+import time
 import traceback
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from arc_llm.runner import run_json
 
-from .artifacts import RunPaths, acquire_lock, append_jsonl, atomic_write_json, atomic_write_text
+from .artifacts import LockConflictError, RunPaths, acquire_lock, append_jsonl, atomic_write_json, atomic_write_text
 from .config import (
     ArtifactOptions,
     REVIEW_ENVELOPE_SCHEMA,
@@ -46,37 +48,44 @@ def run_proposers_reviewer_batch(
         return _dry_run_result(batch, paths)
     _prepare_run(paths, batch)
 
+    loops = list(batch.loops)
+    next_loop_index = 0
+    stop_scheduling = False
     loop_results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        future_by_loop = {
-            executor.submit(
-                _run_loop,
-                copy.deepcopy(loop),
-                paths.loop(loop.loop_id),
-                batch.run_id,
-                batch.artifact_options,
-                json_runner,
-                base_env,
-                process_chain,
-            ): loop.loop_id
-            for loop in batch.loops
-        }
-        for future in as_completed(future_by_loop):
-            try:
-                result = future.result()
-            except CancelledError:
-                result = {
-                    "loop_id": future_by_loop[future],
-                    "status": "skipped",
-                    "rounds_completed": 0,
-                    "error": "cancelled by fail_fast",
-                    "loop_root": str(paths.loop(future_by_loop[future]).loop_root),
-                }
-            loop_results.append(result)
-            if batch.fail_fast and result["status"] == "failed":
-                for pending in future_by_loop:
-                    if pending is not future:
-                        pending.cancel()
+        future_by_loop = {}
+        while True:
+            while not stop_scheduling and len(future_by_loop) < concurrency and next_loop_index < len(loops):
+                loop = loops[next_loop_index]
+                next_loop_index += 1
+                future = executor.submit(
+                    _run_loop,
+                    copy.deepcopy(loop),
+                    paths.loop(loop.loop_id),
+                    batch.run_id,
+                    batch.artifact_options,
+                    json_runner,
+                    base_env,
+                    process_chain,
+                )
+                future_by_loop[future] = loop.loop_id
+            if not future_by_loop:
+                break
+            done, _pending = wait(future_by_loop, return_when=FIRST_COMPLETED)
+            for future in done:
+                loop_id = future_by_loop.pop(future)
+                try:
+                    result = future.result()
+                except CancelledError:
+                    result = _skipped_loop_result(paths, loop_id, "cancelled by fail_fast")
+                loop_results.append(result)
+                if batch.fail_fast and result["status"] == "failed":
+                    stop_scheduling = True
+            if stop_scheduling and not future_by_loop:
+                break
+        if stop_scheduling:
+            for loop in loops[next_loop_index:]:
+                loop_results.append(_skipped_loop_result(paths, loop.loop_id, "skipped by fail_fast"))
 
     loop_results.sort(key=lambda item: item["loop_id"])
     status = _batch_status(loop_results)
@@ -92,7 +101,7 @@ def run_proposers_reviewer_batch(
 
 
 def _prepare_run(paths: RunPaths, batch: BatchConfig) -> None:
-    if paths.run_root.exists() and batch.existing_run_policy == "fail":
+    if paths.run_root.exists():
         raise ConfigError(f"run directory already exists: {paths.run_root}")
     paths.run_root.mkdir(parents=True, exist_ok=True)
     with acquire_lock(paths.lock, run_id=batch.run_id):
@@ -139,7 +148,7 @@ def _run_loop(
             return result
     except Exception as exc:
         result = _loop_failure(loop.loop_id, paths, str(exc), exc=exc)
-        atomic_write_json(paths.state, result)
+        _write_loop_failure_state(paths, run_id=run_id, result=result)
         return result
 
 
@@ -510,6 +519,36 @@ def _loop_failure(loop_id: str, paths, message: str, *, exc: BaseException | Non
     if exc is not None:
         result["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return result
+
+
+def _write_loop_failure_state(paths, *, run_id: str, result: dict[str, Any]) -> None:
+    try:
+        with acquire_lock(paths.lock, run_id=run_id, loop_id=str(result.get("loop_id") or "")):
+            atomic_write_json(paths.state, result)
+    except LockConflictError as exc:
+        atomic_write_json(
+            _loop_failure_diagnostic_path(paths),
+            {
+                "schema_version": "arc.llm.loop_failure_diagnostic.v1",
+                "reason": "failed_to_reacquire_loop_lock",
+                "lock_error": str(exc),
+                "failure_result": result,
+            },
+        )
+
+
+def _loop_failure_diagnostic_path(paths) -> Path:
+    return paths.loop_root / "errors" / f"failure_after_lock_lost.{os.getpid()}.{time.time_ns()}.json"
+
+
+def _skipped_loop_result(paths: RunPaths, loop_id: str, error: str) -> dict[str, Any]:
+    return {
+        "loop_id": loop_id,
+        "status": "skipped",
+        "rounds_completed": 0,
+        "error": error,
+        "loop_root": str(paths.loop(loop_id).loop_root),
+    }
 
 
 def _batch_status(loop_results: list[dict[str, Any]]) -> str:

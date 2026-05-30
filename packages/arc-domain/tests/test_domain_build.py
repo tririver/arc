@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from arc_domain import foundation
+from arc_domain import network
 from arc_domain import service
 from arc_domain import summary as domain_summary
 from arc_domain.cache import DomainPaths, domain_id_for, read_json
@@ -94,6 +95,142 @@ def test_status_and_cached_summary(monkeypatch, tmp_path):
     assert status["data"]["artifacts"]["paper_json_pack"]["exists"] is True
     assert summary["ok"] is True
     assert graph["ok"] is True
+
+
+def test_build_domain_passes_model_tier_to_all_llm_domain_steps(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    calls = []
+
+    def identify_foundation(**kwargs):
+        calls.append(("foundation", kwargs.get("model_tier")))
+        return {"selection": {"selected_foundation": {"paper_id": FOUNDATION}}}
+
+    def build_network(**kwargs):
+        calls.append(("network", kwargs.get("model_tier")))
+        return {"node_count": 1, "edge_count": 0, "graph_path": "graph.json"}
+
+    def summarize_domain(**kwargs):
+        calls.append(("summary", kwargs.get("model_tier")))
+        return {"domain_summary_path": "summary.json", "summary": {}}
+
+    monkeypatch.setattr(service, "_identify_foundation", identify_foundation)
+    monkeypatch.setattr(service, "_build_network", build_network)
+    monkeypatch.setattr(service, "render_network_html", lambda **kwargs: {"network_html_path": "network.html"})
+    monkeypatch.setattr(service, "_build_paper_json_pack", lambda **kwargs: {"paper_json_pack_path": "pack.json"})
+    monkeypatch.setattr(service, "_build_evidence_pack", lambda **kwargs: {"evidence_pack_path": "evidence.json"})
+    monkeypatch.setattr(service, "_summarize_domain", summarize_domain)
+
+    result = service.build_domain(SEED, intent="intent", provider="auto", model_tier="high", workers=1)
+
+    assert result["ok"] is True
+    assert calls == [("foundation", "high"), ("network", "high"), ("summary", "high")]
+
+
+def test_domain_rejects_reused_domain_id_with_changed_seed_or_intent(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = "shared-domain"
+
+    first = service.init_domain(SEED, intent="first intent", domain_id=domain_id)
+    second = service.build_domain(SEED, intent="second intent", domain_id=domain_id, provider="manual", workers=1)
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["error"]["code"] == "domain_build_failed"
+    assert "domain_id input mismatch" in second["error"]["message"]
+    config = read_json(DomainPaths.for_domain(domain_id).config)
+    assert config["input_fingerprint"]["identity"]["intent"] == "first intent"
+    assert config["input_fingerprint"]["identity_hash"]
+
+
+def test_domain_rejects_reused_domain_id_with_changed_llm_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = "shared-domain"
+
+    monkeypatch.setattr(service, "_identify_foundation", lambda **kwargs: {"selection": {"selected_foundation": {}}})
+    monkeypatch.setattr(
+        service,
+        "_build_network",
+        lambda **kwargs: {"node_count": 0, "edge_count": 0, "graph_path": "graph.json"},
+    )
+    monkeypatch.setattr(service, "render_network_html", lambda **kwargs: {"network_html_path": "network.html"})
+    monkeypatch.setattr(service, "_build_paper_json_pack", lambda **kwargs: {"paper_json_pack_path": "pack.json"})
+    monkeypatch.setattr(service, "_build_evidence_pack", lambda **kwargs: {"evidence_pack_path": "evidence.json"})
+    monkeypatch.setattr(service, "_summarize_domain", lambda **kwargs: {"domain_summary_path": "summary.json", "summary": {}})
+
+    first = service.build_domain(SEED, intent="intent", domain_id=domain_id, provider="manual", workers=1)
+    second = service.identify_foundation(SEED, intent="intent", domain_id=domain_id, provider="auto")
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["error"]["code"] == "foundation_identification_failed"
+    assert "LLM configuration mismatch" in second["error"]["message"]
+
+
+def test_domain_llm_helpers_pass_model_tier_to_run_json(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    captured = []
+
+    def fake_run_json(prompt, *, schema, provider, model=None, model_tier=None):
+        captured.append((schema["$id"], provider, model, model_tier))
+        if schema["$id"] == "arc.domain-foundation-candidate-audit-v1":
+            return {
+                "schema_version": "arc.domain_foundation_candidate_audit.v1",
+                "candidate_set_sufficient": True,
+                "confidence": "high",
+                "search_queries": [],
+                "citation_directions": [],
+                "reasoning": "ok",
+                "warnings": [],
+            }
+        if schema["$id"] == "arc.domain-intent-ranking-v1":
+            return {"ranked_paper_ids": [FOUNDATION], "reasoning": "ok"}
+        return {
+            "schema_version": "arc.domain_summary.v4",
+            "domain_title": "Domain",
+            "brief_introduction": "Brief",
+            "task_focus": {"user_intent": "intent", "research_scope": "scope", "priority_rules": []},
+            "foundation_paper": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "test"},
+            "best_reference_paper": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "test"},
+            "methodology": [],
+            "known_solved_cases": [],
+            "open_axes_for_new_work": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(foundation, "run_json", fake_run_json)
+    monkeypatch.setattr(network, "run_json", fake_run_json)
+    monkeypatch.setattr(domain_summary, "run_json", fake_run_json)
+
+    foundation._llm_audit_candidates(
+        seed_metadata={"paper_id": SEED, "title": "Seed"},
+        candidates=[],
+        intent="intent",
+        provider="auto",
+        model=None,
+        model_tier="high",
+    )
+    network._rank_by_intent(
+        [{"paper_id": FOUNDATION, "title": "Foundation", "abstract": "intent", "citation_count": 1}],
+        intent="intent",
+        provider="auto",
+        model=None,
+        model_tier="high",
+    )
+    paths = DomainPaths.for_domain(domain_id_for(SEED, "intent"))
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    paths.domain_graph.write_text('{"nodes": []}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers": []}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        '{"selected_foundation": {"paper_id": "arXiv:2301.00001", "title": "Foundation", "reason": "test"}}',
+        encoding="utf-8",
+    )
+    domain_summary.summarize_domain(paths=paths, provider="auto", model=None, model_tier="high")
+
+    assert captured == [
+        ("arc.domain-foundation-candidate-audit-v1", "auto", None, "high"),
+        ("arc.domain-intent-ranking-v1", "auto", None, "high"),
+        ("arc.domain-summary-v4", "auto", None, "high"),
+    ]
 
 
 def test_summarize_domain_reports_llm_failure_without_fallback(monkeypatch, tmp_path):

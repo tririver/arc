@@ -138,30 +138,13 @@ def _rank_key(entry: dict[str, Any]) -> tuple[float, ...]:
 
 def markdown_table(payload: dict[str, Any]) -> str:
     lines = [
-        _intent_section(payload.get("user_intent", "")),
-        "",
         _summary_table(payload),
         "",
-        "# Ranked Ideas and Details",
+        "# Appendix: Idea Details",
     ]
     for entry in payload["ranking"]:
         lines.extend(["", *_appendix_section(entry)])
     return "\n".join(lines)
-
-
-def _intent_section(intent: Any) -> str:
-    text = _intent_summary(str(intent or ""))
-    return "\n".join(["# Intent of the User", "", text])
-
-
-def _intent_summary(intent: str) -> str:
-    text = re.sub(r"\s+", " ", intent).strip()
-    if not text:
-        return "Not recorded in run config."
-    text = text[0].upper() + text[1:]
-    if text[-1] not in ".!?":
-        text += "."
-    return text
 
 
 def _summary_table(payload: dict[str, Any]) -> str:

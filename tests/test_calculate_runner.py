@@ -368,6 +368,10 @@ def test_calculate_worker_schemas_are_codex_strict(tmp_path) -> None:
 
     assert_codex_strict_objects(proposer_schema)
     assert_codex_strict_objects(reviewer_schema)
+    accepted_result_schema = reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]["properties"][
+        "accepted_result"
+    ]
+    assert "object" in accepted_result_schema["type"]
 
 
 def assert_codex_strict_objects(schema: Any) -> None:
@@ -383,6 +387,54 @@ def assert_codex_strict_objects(schema: Any) -> None:
     elif isinstance(schema, list):
         for item in schema:
             assert_codex_strict_objects(item)
+
+
+def test_allowed_context_preserves_inert_source_provenance() -> None:
+    runner = load_calculate_runner()
+    context = runner._sanitize_caller_allowed_context(  # noqa: SLF001
+        {
+            "sources": [{"paper_id": "arXiv:0911.3380", "source_path": "cache/source.json"}],
+            "cache_path": "cache/paper.json",
+            "source_path": "source.tex",
+            "source_commands": ["curl example"],
+            "shell_commands": ["python script.py"],
+            "nested": {"cli_invocations": ["arc-paper get"], "section": "2"},
+        }
+    )
+
+    assert context["sources"][0]["source_path"] == "cache/source.json"
+    assert context["cache_path"] == "cache/paper.json"
+    assert context["source_path"] == "source.tex"
+    assert "source_commands" not in context
+    assert "shell_commands" not in context
+    assert "cli_invocations" not in context["nested"]
+
+
+def test_human_gate_respects_nonhuman_continue_action(tmp_path: Path) -> None:
+    runner = load_calculate_runner()
+    config = minimal_config(
+        tmp_path,
+        human_gate={"enabled": True, "pause_statuses": ["reference_disagrees"]},
+        max_recalculations=0,
+    )
+    config["steps"][0]["reviewer_reference_claim"] = {"id": "target", "latex": "x"}
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "reference_disagrees",
+                agreed=["proposer_001", "proposer_002"],
+                target_quantity_match=False,
+                accepted_by_reviewer_judgment=False,
+                action="continue",
+                requires_human=False,
+            )
+        ]
+    )
+
+    result = runner.run_calculation(config, batch_runner=fake, base_env={})
+
+    assert result["status"] == "blocked_for_revision"
+    assert result["steps"][0]["blocked_output"]["requires_human"] is False
 
 
 class FakeBatchRunner:

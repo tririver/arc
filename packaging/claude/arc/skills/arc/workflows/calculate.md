@@ -27,7 +27,8 @@ Copy `workflows/json/calculate.config.template.json` to:
 ```
 
 Replace `<calculate-run-id>`, `<project-dir>`, `<run-id>`, and
-`<skill-workflow-json-dir>`. Keep `"proposer_count": 2`,
+`<skill-workflow-json-dir>`. Use `skill_dir` from context as `<skill-dir>` in
+commands below. Keep `"proposer_count": 2`,
 `"max_recalculations": 2`, and `artifact_options.save_prompts` enabled unless
 the user asks otherwise.
 
@@ -86,7 +87,7 @@ back to work-note conventions.
 Run:
 
 ```bash
-python3 workflows/scripts/calculate_runner.py \
+python3 <skill-dir>/workflows/scripts/calculate_runner.py \
   --config <project-dir>/calculate/<run-id>/execute/calculate.config.json \
   --json
 ```
