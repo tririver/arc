@@ -23,6 +23,7 @@ DEFAULT_HUMAN_GATE_PAUSE_STATUSES = (
     "unresolved",
     "failed",
 )
+RETRYABLE_CONSENSUS_STATUSES = {"two_agree", "all_disagree", "unresolved"}
 REVISION_ACTIONS = {"revise_plan", "split_step"}
 LEGACY_ALLOWED_CONTEXT_KEYS = {"foundation_file", "allowed_foundation", "target_equation_id"}
 CALLER_ALLOWED_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path", "source_commands"}
@@ -195,6 +196,7 @@ def _run_calculation_step(
     all_proposer_ids = _proposer_ids(config.proposer_count)
     active_proposer_ids = list(all_proposer_ids)
     locked_outputs: dict[str, Any] = {}
+    retry_feedback: list[dict[str, Any]] = []
     attempts: list[dict[str, Any]] = []
     max_attempts = config.max_recalculations + 1
 
@@ -206,6 +208,7 @@ def _run_calculation_step(
                 attempt_number=attempt_number,
                 active_proposer_ids=active_proposer_ids,
                 locked_outputs=locked_outputs,
+                retry_feedback=retry_feedback,
                 run_root=run_root,
                 accepted_step_outputs=accepted_step_outputs,
             )
@@ -261,6 +264,45 @@ def _run_calculation_step(
         attempts.append(attempt_record)
 
         status = str(review_consensus.get("status", "unresolved"))
+        retryable_status = status in RETRYABLE_CONSENSUS_STATUSES
+        retry_budget_available = attempt_number < max_attempts
+
+        if status == "all_agree":
+            accepted_result = review_consensus.get("accepted_result")
+            return {
+                "step_id": step.step_id,
+                "kind": step.kind,
+                "status": "accepted",
+                "attempts": attempts,
+                "accepted_output": accepted_result
+                if accepted_result is not None
+                else {"proposer_outputs": proposer_outputs},
+                "blocked_output": None,
+                "reviewer_consensus": review_consensus,
+            }
+
+        if retryable_status and retry_budget_available:
+            retry_feedback.append(
+                _retry_feedback_record(
+                    review,
+                    review_consensus,
+                    attempt_number=attempt_number,
+                )
+            )
+            if status == "two_agree":
+                next_active = _next_active_for_two_agree(review_consensus, all_proposer_ids)
+                if next_active is not None:
+                    agreed_ids = _valid_ids(review_consensus.get("agreed_proposer_ids", []), all_proposer_ids)
+                    for proposer_id in agreed_ids:
+                        if proposer_id in proposer_outputs:
+                            locked_outputs[proposer_id] = proposer_outputs[proposer_id]
+                    active_proposer_ids = next_active
+                    continue
+
+            active_proposer_ids = list(all_proposer_ids)
+            locked_outputs = {}
+            continue
+
         gated_block = _human_gate_blocked_step_result(
             config,
             step,
@@ -278,21 +320,7 @@ def _run_calculation_step(
                 consensus=review_consensus,
             )
 
-        if status == "all_agree":
-            accepted_result = review_consensus.get("accepted_result")
-            return {
-                "step_id": step.step_id,
-                "kind": step.kind,
-                "status": "accepted",
-                "attempts": attempts,
-                "accepted_output": accepted_result
-                if accepted_result is not None
-                else {"proposer_outputs": proposer_outputs},
-                "blocked_output": None,
-                "reviewer_consensus": review_consensus,
-            }
-
-        if attempt_number >= max_attempts:
+        if retryable_status and attempt_number >= max_attempts:
             return {
                 "step_id": step.step_id,
                 "kind": step.kind,
@@ -329,6 +357,7 @@ def _attempt_batch_config(
     attempt_number: int,
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
+    retry_feedback: list[dict[str, Any]],
     run_root: Path,
     accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -342,6 +371,7 @@ def _attempt_batch_config(
         attempt_number=attempt_number,
         active_proposer_ids=active_proposer_ids,
         locked_outputs=locked_outputs,
+        retry_feedback=retry_feedback,
         accepted_step_outputs=accepted_step_outputs,
     )
     return {
@@ -386,6 +416,7 @@ def _caller_context(
     attempt_number: int,
     active_proposer_ids: list[str],
     locked_outputs: dict[str, Any],
+    retry_feedback: list[dict[str, Any]],
     accepted_step_outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
@@ -396,6 +427,7 @@ def _caller_context(
         "attempt_number": attempt_number,
         "active_proposer_ids": active_proposer_ids,
         "locked_outputs": copy.deepcopy(locked_outputs),
+        "retry_feedback": copy.deepcopy(retry_feedback),
         "accepted_prior_step_outputs": copy.deepcopy(dict(accepted_step_outputs)),
         "max_recalculations": config.max_recalculations,
         "integrity_reference": _integrity_reference(config.defaults.get("integrity_reference_path")),
@@ -896,6 +928,25 @@ def _read_proposer_outputs(round_root: Path, proposer_ids: list[str]) -> dict[st
         if path.exists():
             outputs[proposer_id] = _read_json(path)
     return outputs
+
+
+def _retry_feedback_record(
+    review: Mapping[str, Any],
+    consensus: Mapping[str, Any],
+    *,
+    attempt_number: int,
+) -> dict[str, Any]:
+    proposer_messages = review.get("proposer_messages", {})
+    if not isinstance(proposer_messages, dict):
+        proposer_messages = {}
+    return {
+        "attempt_number": attempt_number,
+        "status": str(consensus.get("status", "")),
+        "analysis": str(consensus.get("analysis", "")),
+        "likely_wrong_proposer_ids": copy.deepcopy(list(consensus.get("likely_wrong_proposer_ids", []))),
+        "recalculate_proposer_ids": copy.deepcopy(list(consensus.get("recalculate_proposer_ids", []))),
+        "proposer_messages": copy.deepcopy(proposer_messages),
+    }
 
 
 def _next_active_for_two_agree(consensus: Mapping[str, Any], all_proposer_ids: list[str]) -> list[str] | None:

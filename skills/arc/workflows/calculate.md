@@ -39,6 +39,8 @@ The runner reads worker prompt/schema templates from:
 
 `"max_recalculations": 2` means 3 total attempts: 1 initial attempt + 2 recalculations.
 Do not increase attempts unless the user asks.
+For retryable proposer disagreement statuses, use the recalculation budget
+before pausing for human input.
 
 Remove foundation_check mechanics. Starting points are checked by ordinary ready
 steps when they are marked not accepted in the work note.
