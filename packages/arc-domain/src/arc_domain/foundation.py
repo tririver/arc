@@ -6,7 +6,7 @@ from typing import Any
 
 from arc_llm import run_json
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
-from arc_paper.ids import normalize_paper_id
+from arc_paper.ids import extract_paper_ids, normalize_paper_id
 
 from . import paper
 from .cache import DomainPaths, now_iso, update_status, write_json
@@ -27,6 +27,17 @@ class FoundationHeuristics:
 
 DEFAULT_FOUNDATION_HEURISTICS = FoundationHeuristics()
 MIN_FOUNDATION_CITATION_COUNT = DEFAULT_FOUNDATION_HEURISTICS.min_citation_count
+MAX_AUDIT_SEARCH_QUERIES = 3
+LLM_CANDIDATE_SOURCE_ROLE = "llm_added_foundation_candidate"
+LLM_SELECTION_MARK_FIELDS = (
+    "source_role",
+    "llm_added",
+    "llm_recommended",
+    "llm_addition_reason",
+    "llm_reference_query",
+    "llm_verified_evidence_urls",
+    "llm_reference_inference",
+)
 
 
 FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
@@ -53,6 +64,13 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
                 "paper_id": {"type": "string"},
                 "title": {"type": "string"},
                 "reason": {"type": "string"},
+                "source_role": {"type": "string"},
+                "llm_added": {"type": "boolean"},
+                "llm_recommended": {"type": "boolean"},
+                "llm_addition_reason": {"type": "string"},
+                "llm_reference_query": {"type": "string"},
+                "llm_verified_evidence_urls": {"type": "array", "items": {"type": "string"}},
+                "llm_reference_inference": {"type": "object"},
             },
         },
         "best_reference_paper": {
@@ -63,6 +81,13 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
                 "paper_id": {"type": "string"},
                 "title": {"type": "string"},
                 "reason": {"type": "string"},
+                "source_role": {"type": "string"},
+                "llm_added": {"type": "boolean"},
+                "llm_recommended": {"type": "boolean"},
+                "llm_addition_reason": {"type": "string"},
+                "llm_reference_query": {"type": "string"},
+                "llm_verified_evidence_urls": {"type": "array", "items": {"type": "string"}},
+                "llm_reference_inference": {"type": "object"},
             },
         },
         "parent_foundations": {
@@ -91,6 +116,46 @@ FOUNDATION_SELECTION_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "reasoning": {"type": "string"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
+    },
+}
+
+
+FOUNDATION_CANDIDATE_AUDIT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "arc.domain-foundation-candidate-audit-v1",
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "schema_version",
+        "candidate_set_sufficient",
+        "confidence",
+        "search_queries",
+        "citation_directions",
+        "reasoning",
+        "warnings",
+    ],
+    "properties": {
+        "schema_version": {"type": "string", "const": "arc.domain_foundation_candidate_audit.v1"},
+        "candidate_set_sufficient": {"type": "boolean"},
+        "confidence": {"type": "string", "enum": ["complete", "high", "medium", "low"]},
+        "search_queries": {
+            "type": "array",
+            "maxItems": MAX_AUDIT_SEARCH_QUERIES,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["query", "reason", "confidence"],
+                "properties": {
+                    "query": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["complete", "high", "medium", "low"]},
+                },
+            },
+        },
+        "citation_directions": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
         "reasoning": {"type": "string"},
         "warnings": {"type": "array", "items": {"type": "string"}},
         ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
@@ -146,6 +211,24 @@ def identify_foundation(
         workers=workers,
         min_citation_count=min_citation_count,
     )
+    initial_candidate_count = len(candidates)
+    candidate_audit = _llm_audit_candidates(
+        seed_metadata=seed_metadata,
+        candidates=candidates,
+        intent=intent,
+        provider=provider,
+        model=model,
+        min_citation_count=min_citation_count,
+    )
+    candidates, expansion_report = _expand_candidates_from_audit(
+        candidates=candidates,
+        audit=candidate_audit,
+        intent=intent,
+        provider=provider,
+        model=model,
+        refresh=refresh,
+        workers=workers,
+    )
     pool = {
         "schema_version": "arc.domain_foundation_pool.v1",
         "seed_paper": seed_id,
@@ -156,6 +239,8 @@ def identify_foundation(
         "sampled_references": sampled_references,
         "witness_papers": witness_papers,
         "reference_lists_fetched": len(refs_by_citer),
+        "candidate_audit": candidate_audit,
+        "candidate_expansion": expansion_report,
         "created_at": now_iso(),
     }
     write_json(paths.foundation_pool, pool)
@@ -171,7 +256,10 @@ def identify_foundation(
     )
     selection["seed_paper"] = seed_id
     selection["intent"] = intent
+    selection["initial_candidate_count"] = initial_candidate_count
     selection["candidate_count"] = len(candidates)
+    selection["candidate_audit"] = candidate_audit
+    selection["candidate_expansion"] = expansion_report
     selection["created_at"] = now_iso()
     write_json(paths.foundation_selection, selection)
     update_status(
@@ -246,37 +334,449 @@ def _candidate_records(
         meta = metadata_by_id.get(candidate_id)
         if not isinstance(meta, dict) or meta.get("error"):
             meta = embedded.get(candidate_id, {})
-        title = str(meta.get("title") or embedded.get(candidate_id, {}).get("title") or "")
-        abstract = str(meta.get("abstract") or "")
-        citation_count = int(meta.get("citation_count") or meta.get("cited_by_count") or 0)
-        year = meta.get("year") or embedded.get(candidate_id, {}).get("year")
-        record = {
-            "paper_id": normalize_paper_id(meta.get("paper_id") or candidate_id),
-            "rank": rank,
-            "title": title,
-            "abstract": abstract,
-            "authors": list(meta.get("authors") or []),
-            "authors_short": normalize_authors(meta.get("authors") or []),
-            "year": year,
-            "citation_count": citation_count,
-            "witness_citation_overlap": int(overlap[candidate_id]),
-            "supported_by": support.get(candidate_id, [])[:50],
-            "intent_overlap": round(token_overlap_score(f"{title} {abstract}", intent), 4),
-            "identifiers": meta.get("identifiers") or {},
-            "warnings": [],
-        }
         if candidate_id == seed_id:
-            record["source_role"] = "seed"
+            source_role = "seed"
         elif candidate_id in {normalize_paper_id(paper_key(item)) for item in seed_references}:
-            record["source_role"] = "seed_reference"
+            source_role = "seed_reference"
         else:
-            record["source_role"] = "common_reference"
-        if citation_count < min_citation_count:
-            record["warnings"].append("low_citation_foundation_priority")
-        if citation_count >= 1000:
-            record["warnings"].append("high_citation_parent_domain_risk")
+            source_role = "common_reference"
+        record = _metadata_candidate_record(
+            candidate_id=candidate_id,
+            meta=meta,
+            fallback=embedded.get(candidate_id, {}),
+            rank=rank,
+            intent=intent,
+            source_role=source_role,
+            witness_citation_overlap=int(overlap[candidate_id]),
+            supported_by=support.get(candidate_id, []),
+            min_citation_count=min_citation_count,
+        )
         records.append(record)
     return records[:10]
+
+
+def _llm_audit_candidates(
+    *,
+    seed_metadata: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    intent: str,
+    provider: str,
+    model: str | None,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
+) -> dict[str, Any]:
+    prompt = _candidate_audit_prompt(
+        seed_metadata=seed_metadata,
+        candidates=candidates,
+        intent=intent,
+        min_citation_count=min_citation_count,
+    )
+    try:
+        audit = run_json(prompt, schema=FOUNDATION_CANDIDATE_AUDIT_SCHEMA, provider=provider, model=model)
+        return _repair_candidate_audit(audit, method="llm")
+    except Exception as exc:
+        audit = _default_candidate_audit()
+        audit["warnings"].append(f"llm_candidate_audit_failed:{exc}")
+        audit["audit_method"] = "llm_failed"
+        return audit
+
+
+def _candidate_audit_prompt(
+    *,
+    seed_metadata: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    intent: str,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
+) -> str:
+    return "\n\n".join(
+        [
+            "You audit a theoretical-physics foundation-paper candidate set before selection.",
+            "Decide whether the supplied candidates are sufficient for choosing the same-scope foundation paper.",
+            "You may propose search_queries only if you are completely sure a likely foundational or canonical same-scope paper is missing from the candidates.",
+            "If you have any doubt, leave search_queries empty and let the later selector use the heavily data-suggested candidates.",
+            "Do not invent papers. Do not return paper IDs from memory. Return search terms that a separate web-search verifier can check.",
+            "Citation directions are optional hints such as references/citers to inspect; they are not selected papers.",
+            f"Low-citation heuristic: fewer than {min_citation_count} citations normally means low priority as selected foundation unless no better-supported same-scope foundation is available.",
+            f"User intent:\n{intent or '(none)'}",
+            f"Seed paper:\n{seed_metadata}",
+            f"Candidate papers:\n{candidates}",
+            "Return JSON only.",
+        ]
+    )
+
+
+def _default_candidate_audit() -> dict[str, Any]:
+    return {
+        "schema_version": "arc.domain_foundation_candidate_audit.v1",
+        "candidate_set_sufficient": True,
+        "confidence": "low",
+        "search_queries": [],
+        "citation_directions": [],
+        "reasoning": "No reliable audit expansion; use deterministic candidates.",
+        "warnings": [],
+        "audit_method": "deterministic_no_expansion",
+    }
+
+
+def _repair_candidate_audit(audit: dict[str, Any], *, method: str) -> dict[str, Any]:
+    repaired = dict(audit or {})
+    repaired["schema_version"] = "arc.domain_foundation_candidate_audit.v1"
+    repaired["candidate_set_sufficient"] = bool(repaired.get("candidate_set_sufficient", True))
+    repaired["confidence"] = _confidence(repaired.get("confidence"))
+    search_queries, skipped = _complete_audit_search_queries(repaired.get("search_queries"))
+    repaired["search_queries"] = search_queries
+    repaired["citation_directions"] = [
+        str(item).strip()
+        for item in repaired.get("citation_directions", [])
+        if str(item).strip()
+    ][:5]
+    repaired["reasoning"] = str(repaired.get("reasoning") or "")
+    repaired["warnings"] = [str(item) for item in repaired.get("warnings", [])]
+    repaired["warnings"].extend(skipped)
+    repaired["audit_method"] = method
+    return repaired
+
+
+def _complete_audit_search_queries(raw_queries: Any) -> tuple[list[dict[str, str]], list[str]]:
+    queries: list[dict[str, str]] = []
+    warnings: list[str] = []
+    for query in _audit_search_queries(raw_queries):
+        if query["confidence"] == "complete":
+            queries.append(query)
+        else:
+            warnings.append(
+                "Dropped non-complete audit search query: "
+                f"{query['query']} ({query['confidence']})."
+            )
+    return queries, warnings
+
+
+def _audit_search_queries(raw_queries: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_queries, list):
+        return []
+    queries: list[dict[str, str]] = []
+    for item in raw_queries[:MAX_AUDIT_SEARCH_QUERIES]:
+        if not isinstance(item, dict):
+            continue
+        query = str(item.get("query") or "").strip()
+        if not query:
+            continue
+        queries.append(
+            {
+                "query": query,
+                "reason": str(item.get("reason") or "").strip(),
+                "confidence": _confidence(item.get("confidence")),
+            }
+        )
+    return queries
+
+
+def _confidence(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"complete", "high", "medium", "low"}:
+        return normalized
+    return "low"
+
+
+def _expand_candidates_from_audit(
+    *,
+    candidates: list[dict[str, Any]],
+    audit: dict[str, Any],
+    intent: str,
+    provider: str,
+    model: str | None,
+    refresh: bool,
+    workers: int,
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    expanded = [dict(item) for item in candidates]
+    candidate_by_id = {
+        normalize_paper_id(str(item.get("paper_id") or "")): item
+        for item in expanded
+        if item.get("paper_id")
+    }
+    report: dict[str, Any] = {
+        "schema_version": "arc.domain_foundation_candidate_expansion.v1",
+        "initial_candidate_count": len(candidates),
+        "expanded_candidate_count": len(expanded),
+        "added_candidate_count": 0,
+        "added_papers": [],
+        "searches": [],
+        "warnings": [],
+    }
+    queries = _audit_search_queries(audit.get("search_queries"))
+    if not queries:
+        return expanded, report
+    if audit.get("candidate_set_sufficient") is not False or _confidence(audit.get("confidence")) != "complete":
+        for query in queries:
+            report["searches"].append(
+                {
+                    "query": query["query"],
+                    "reason": query.get("reason", ""),
+                    "status": "skipped_uncertain_audit",
+                }
+            )
+        return expanded, report
+
+    for query in queries:
+        if extract_paper_ids(query["query"]):
+            report["searches"].append(
+                {
+                    "query": query["query"],
+                    "reason": query.get("reason", ""),
+                    "status": "skipped_explicit_id_query",
+                    "warnings": ["audit search query contained a paper identifier; web-search verifier requires search terms"],
+                }
+            )
+            continue
+        if query["confidence"] != "complete":
+            report["searches"].append(
+                {
+                    "query": query["query"],
+                    "reason": query.get("reason", ""),
+                    "status": "skipped_uncertain_query",
+                }
+            )
+            continue
+        search = _run_reference_inference_query(
+            query,
+            intent=intent,
+            provider=provider,
+            model=model,
+            refresh=refresh,
+        )
+        paper_ids = search.get("paper_ids", [])
+        metadata_by_id = paper.fetch_many(
+            paper_ids,
+            lambda paper_id: paper.metadata(paper_id, refresh=refresh),
+            workers=workers,
+        )
+        verified_by_id = _verified_references_by_id(search.get("result", {}))
+        added_ids: list[str] = []
+        already_present: list[str] = []
+        metadata_failed: list[str] = []
+        for paper_id in paper_ids:
+            if paper_id in candidate_by_id:
+                _mark_existing_llm_recommended(candidate_by_id[paper_id], query=query, verified=verified_by_id.get(paper_id))
+                already_present.append(paper_id)
+                continue
+            meta = metadata_by_id.get(paper_id)
+            if not isinstance(meta, dict) or meta.get("error"):
+                metadata_failed.append(paper_id)
+                continue
+            record = _llm_added_candidate_record(
+                paper_id=paper_id,
+                metadata=meta,
+                rank=len(expanded) + 1,
+                intent=intent,
+                query=query,
+                verified=verified_by_id.get(paper_id),
+                result=search.get("result", {}),
+                min_citation_count=min_citation_count,
+            )
+            expanded.append(record)
+            candidate_by_id[record["paper_id"]] = record
+            added_ids.append(record["paper_id"])
+        status = "added" if added_ids else ("already_candidate" if already_present else search["status"])
+        search_report = {
+            "query": query["query"],
+            "reason": query.get("reason", ""),
+            "status": status,
+            "paper_ids": paper_ids,
+            "added_papers": added_ids,
+            "already_present": already_present,
+            "metadata_failed": metadata_failed,
+            "warnings": search.get("warnings", []),
+        }
+        if search.get("error"):
+            search_report["error"] = search["error"]
+        report["searches"].append(search_report)
+
+    report["expanded_candidate_count"] = len(expanded)
+    report["added_papers"] = [item["paper_id"] for item in expanded if item.get("llm_added")]
+    report["added_candidate_count"] = len(report["added_papers"])
+    return expanded, report
+
+
+def _run_reference_inference_query(
+    query: dict[str, str],
+    *,
+    intent: str,
+    provider: str,
+    model: str | None,
+    refresh: bool,
+) -> dict[str, Any]:
+    try:
+        result = paper.infer_main_references(
+            _reference_inference_request(query, intent=intent),
+            provider=provider,
+            model=model,
+            refresh=refresh,
+        )
+    except Exception as exc:
+        return {"status": "reference_inference_failed", "paper_ids": [], "warnings": [], "error": str(exc), "result": {}}
+    if not result.get("ok"):
+        error = result.get("error") or {}
+        return {
+            "status": "reference_inference_failed",
+            "paper_ids": [],
+            "warnings": [],
+            "error": error.get("message") or error.get("code") or "reference inference failed",
+            "result": result,
+        }
+    meta = result.get("meta") or {}
+    verified_by_id = _verified_references_by_id(result)
+    if meta.get("llm_used") is not True or not verified_by_id:
+        return {
+            "status": "reference_inference_unverified",
+            "paper_ids": [],
+            "warnings": list(meta.get("warnings", [])),
+            "result": result,
+        }
+    paper_ids = [
+        paper_id
+        for item in result.get("data", [])
+        if (paper_id := normalize_paper_id(str(item))) in verified_by_id
+    ]
+    if not paper_ids:
+        return {
+            "status": "reference_inference_unverified",
+            "paper_ids": [],
+            "warnings": list(meta.get("warnings", [])),
+            "result": result,
+        }
+    return {
+        "status": "verified" if paper_ids else "no_verified_papers",
+        "paper_ids": list(dict.fromkeys(paper_ids)),
+        "warnings": list(meta.get("warnings", [])),
+        "result": result,
+        "intent": intent,
+    }
+
+
+def _reference_inference_request(query: dict[str, str], *, intent: str) -> str:
+    parts = [
+        "Find and verify the single strongest missing foundational or canonical same-scope paper.",
+        f"Search hint: {query['query']}",
+    ]
+    if (reason := query.get("reason")) and not extract_paper_ids(reason):
+        parts.append(f"Reason this may be missing: {reason}")
+    if intent and not extract_paper_ids(intent):
+        parts.append(f"User intent: {intent}")
+    return "\n".join(parts)
+
+
+def _verified_references_by_id(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    verified = (result.get("meta") or {}).get("verified_references", [])
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(verified, list):
+        return out
+    for item in verified:
+        if not isinstance(item, dict):
+            continue
+        paper_id = normalize_paper_id(str(item.get("paper_id") or item.get("input_paper_id") or ""))
+        if paper_id:
+            out[paper_id] = item
+    return out
+
+
+def _mark_existing_llm_recommended(
+    record: dict[str, Any],
+    *,
+    query: dict[str, str],
+    verified: dict[str, Any] | None,
+) -> None:
+    record["llm_recommended"] = True
+    record.setdefault("llm_reference_query", query["query"])
+    record.setdefault("llm_addition_reason", query.get("reason", ""))
+    if verified:
+        urls = [str(item) for item in verified.get("evidence_urls", []) if str(item).strip()]
+        if urls:
+            record.setdefault("llm_verified_evidence_urls", urls)
+
+
+def _llm_added_candidate_record(
+    *,
+    paper_id: str,
+    metadata: dict[str, Any],
+    rank: int,
+    intent: str,
+    query: dict[str, str],
+    verified: dict[str, Any] | None,
+    result: dict[str, Any],
+    min_citation_count: int,
+) -> dict[str, Any]:
+    record = _metadata_candidate_record(
+        candidate_id=paper_id,
+        meta=metadata,
+        fallback={},
+        rank=rank,
+        intent=intent,
+        source_role=LLM_CANDIDATE_SOURCE_ROLE,
+        witness_citation_overlap=0,
+        supported_by=[],
+        min_citation_count=min_citation_count,
+    )
+    record["llm_added"] = True
+    record["llm_addition_reason"] = query.get("reason", "")
+    record["llm_reference_query"] = query["query"]
+    if verified:
+        urls = [str(item) for item in verified.get("evidence_urls", []) if str(item).strip()]
+        if urls:
+            record["llm_verified_evidence_urls"] = urls
+        if reasoning := str(verified.get("reasoning") or "").strip():
+            record["llm_reference_reasoning"] = reasoning
+    record["llm_reference_inference"] = _reference_inference_summary(result)
+    return record
+
+
+def _metadata_candidate_record(
+    *,
+    candidate_id: str,
+    meta: dict[str, Any],
+    fallback: dict[str, Any],
+    rank: int,
+    intent: str,
+    source_role: str,
+    witness_citation_overlap: int,
+    supported_by: list[str],
+    min_citation_count: int,
+) -> dict[str, Any]:
+    title = str(meta.get("title") or fallback.get("title") or "")
+    abstract = str(meta.get("abstract") or "")
+    citation_count = int(meta.get("citation_count") or meta.get("cited_by_count") or 0)
+    record = {
+        "paper_id": normalize_paper_id(meta.get("paper_id") or candidate_id),
+        "rank": rank,
+        "title": title,
+        "abstract": abstract,
+        "authors": list(meta.get("authors") or []),
+        "authors_short": normalize_authors(meta.get("authors") or []),
+        "year": meta.get("year") or fallback.get("year"),
+        "citation_count": citation_count,
+        "witness_citation_overlap": witness_citation_overlap,
+        "supported_by": supported_by[:50],
+        "intent_overlap": round(token_overlap_score(f"{title} {abstract}", intent), 4),
+        "identifiers": meta.get("identifiers") or {},
+        "warnings": [],
+        "source_role": source_role,
+    }
+    if citation_count < min_citation_count:
+        record["warnings"].append("low_citation_foundation_priority")
+    if citation_count >= 1000:
+        record["warnings"].append("high_citation_parent_domain_risk")
+    return record
+
+
+def _reference_inference_summary(result: dict[str, Any]) -> dict[str, Any]:
+    meta = result.get("meta") or {}
+    return {
+        "provider": meta.get("provider"),
+        "model": meta.get("model"),
+        "focus_scope": meta.get("focus_scope"),
+        "warnings": meta.get("warnings", []),
+        "verified_references": meta.get("verified_references", []),
+        "rejected_candidates": meta.get("rejected_candidates", []),
+    }
 
 
 def _llm_select_foundation(
@@ -296,7 +796,7 @@ def _llm_select_foundation(
     )
     try:
         selection = run_json(prompt, schema=FOUNDATION_SELECTION_SCHEMA, provider=provider, model=model)
-        return _repair_selection(selection, candidates, method="llm")
+        return _repair_selection(selection, candidates, method="llm", intent=intent)
     except Exception as exc:
         selection = _deterministic_selection(
             candidates,
@@ -324,6 +824,7 @@ def _foundation_prompt(
             "A parent foundation must be earlier than, or at the latest from the same year as, the selected foundation. A later paper can be a child, extension, or successful descendant, but never a parent foundation.",
             f"Citation support heuristic: candidates with fewer than {min_citation_count} citations should normally have low priority as the selected foundation, because there is usually not enough literature built on top of them to define a research field. Select such a candidate only if the supplied candidates contain no better-supported same-scope foundation.",
             "Use only the supplied candidates. Prefer a candidate that defines the domain represented by the seed paper and its newest citers.",
+            "Candidates marked llm_added were added only after a separate web-search verifier returned INSPIRE-verified metadata; they may be selected when the evidence is stronger than the original candidate set.",
             f"User intent:\n{intent or '(none)'}",
             f"Seed paper:\n{seed_metadata}",
             f"Candidate papers:\n{candidates}",
@@ -358,6 +859,7 @@ def _deterministic_selection(
             "year": best.get("year"),
             "reason": "highest deterministic combination of witness citation overlap, intent overlap, and citation count",
         }
+        _copy_candidate_marks(selected, best)
     best_reference = _deterministic_best_reference(candidates, selected)
     parent_foundations = [
         {
@@ -380,21 +882,39 @@ def _deterministic_selection(
     }
 
 
-def _repair_selection(selection: dict[str, Any], candidates: list[dict[str, Any]], *, method: str) -> dict[str, Any]:
-    candidate_by_id = {item.get("paper_id"): item for item in candidates}
+def _repair_selection(
+    selection: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    method: str,
+    intent: str = "",
+    min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
+) -> dict[str, Any]:
+    candidate_by_id = {
+        normalize_paper_id(str(item.get("paper_id") or "")): item
+        for item in candidates
+        if item.get("paper_id")
+    }
     selected = dict(selection.get("selected_foundation") or {})
     selected_id = normalize_paper_id(str(selected.get("paper_id") or ""))
     if selected_id not in candidate_by_id and candidates:
-        selected_id = candidates[0]["paper_id"]
-        selected = {
-            "paper_id": selected_id,
-            "title": candidates[0].get("title", ""),
-            "reason": "LLM selected an unknown id; repaired to the top candidate",
-        }
+        unknown_id = selected_id or str(selected.get("paper_id") or "")
+        fallback = _deterministic_selection(
+            candidates,
+            intent=intent,
+            min_citation_count=min_citation_count,
+        )["selected_foundation"]
+        selected_id = normalize_paper_id(str(fallback.get("paper_id") or ""))
+        selected = dict(fallback)
+        selected["reason"] = "LLM selected an unknown id; repaired via deterministic fallback ranking"
+        selection.setdefault("warnings", [])
+        selection["warnings"].append(f"llm_selected_unknown_id:{unknown_id}")
     else:
         selected["paper_id"] = selected_id
         if selected_id in candidate_by_id:
             selected.setdefault("title", candidate_by_id[selected_id].get("title", ""))
+    if selected_id in candidate_by_id:
+        _copy_candidate_marks(selected, candidate_by_id[selected_id])
     selection["selected_foundation"] = selected
     selection["best_reference_paper"] = _repair_best_reference(
         selection.get("best_reference_paper"),
@@ -434,7 +954,7 @@ def _deterministic_best_reference(
         reverse=True,
     )
     best = ranked[0]
-    return {
+    selected = {
         "paper_id": best.get("paper_id", ""),
         "title": best.get("title", ""),
         "reason": (
@@ -442,6 +962,8 @@ def _deterministic_best_reference(
             "citation count, and witness support for a readable methodology reference"
         ),
     }
+    _copy_candidate_marks(selected, best)
+    return selected
 
 
 def _repair_best_reference(
@@ -461,11 +983,19 @@ def _repair_best_reference(
             "reason": "Best-reference LLM selected an unknown id; repaired to the selected foundation",
         }
     source = candidate_by_id[candidate_id]
-    return {
+    repaired = {
         "paper_id": candidate_id,
         "title": candidate.get("title") or source.get("title", ""),
         "reason": candidate.get("reason") or "selected as the best methodology reference",
     }
+    _copy_candidate_marks(repaired, source)
+    return repaired
+
+
+def _copy_candidate_marks(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for field in LLM_SELECTION_MARK_FIELDS:
+        if field in source:
+            target[field] = source[field]
 
 
 def _valid_parent_foundations(

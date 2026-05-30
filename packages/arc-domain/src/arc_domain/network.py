@@ -52,6 +52,7 @@ def build_network(
     selected_foundation = selection.get("selected_foundation") or {}
     foundation_id = normalize_paper_id(selected_foundation.get("paper_id") or seed_paper)
     foundation_meta = paper.metadata(foundation_id, refresh=refresh)
+    _copy_selection_metadata(foundation_meta, selected_foundation)
 
     citer_pool = _merged_citers(foundation_id, refresh=refresh, limit=max_citers)
     write_json(
@@ -602,7 +603,7 @@ def _build_graph(
 
 def _node(paper_record: dict[str, Any], *, role: str) -> dict[str, Any]:
     paper_id = normalize_paper_id(paper_record.get("paper_id") or paper_record.get("upi") or "")
-    return {
+    node = {
         "id": paper_id,
         "paper_id": paper_id,
         "role": role,
@@ -627,6 +628,34 @@ def _node(paper_record: dict[str, Any], *, role: str) -> dict[str, Any]:
         "support_count": paper_record.get("support_count"),
         "identifiers": paper_record.get("identifiers") or {},
     }
+    for field in (
+        "source_role",
+        "llm_added",
+        "llm_recommended",
+        "llm_addition_reason",
+        "llm_reference_query",
+        "llm_verified_evidence_urls",
+        "llm_reference_inference",
+    ):
+        if field in paper_record:
+            node[field] = paper_record[field]
+    return node
+
+
+def _copy_selection_metadata(target: dict[str, Any], source: dict[str, Any]) -> None:
+    if reason := source.get("reason"):
+        target["reason"] = reason
+    for field in (
+        "source_role",
+        "llm_added",
+        "llm_recommended",
+        "llm_addition_reason",
+        "llm_reference_query",
+        "llm_verified_evidence_urls",
+        "llm_reference_inference",
+    ):
+        if field in source:
+            target[field] = source[field]
 
 
 def _add_edge(edges: list[dict[str, Any]], seen: set[tuple[str, str, str]], source: str, target: str, *, relation: str) -> None:

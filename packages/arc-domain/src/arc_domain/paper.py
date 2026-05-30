@@ -29,6 +29,16 @@ def citers(
     return list(_data(paper_service.get_citers(paper_id, refresh=refresh, limit=limit, sort=sort)) or [])
 
 
+def infer_main_references(
+    text: str,
+    *,
+    provider: str = "auto",
+    model: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    return paper_service.llm_infer_main_references(text, provider=provider, model=model, refresh=refresh)
+
+
 def section(paper_id: str, selector: str, *, refresh: bool = False) -> dict[str, Any]:
     result = paper_service.get_section(paper_id, selector, refresh=refresh)
     if result.get("ok"):

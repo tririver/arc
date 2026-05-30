@@ -227,6 +227,292 @@ def test_foundation_selection_contract_includes_best_reference_paper():
     assert selection["best_reference_paper"]["paper_id"] == "arXiv:2401.00002"
 
 
+def test_foundation_audit_adds_verified_llm_candidate(monkeypatch):
+    calls = []
+
+    def fake_infer(text, *, provider="auto", model=None, refresh=False):
+        calls.append(text)
+        return {
+            "ok": True,
+            "data": ["arXiv:2101.00001"],
+            "meta": {
+                "llm_used": True,
+                "verified_references": [
+                    {
+                        "paper_id": "arXiv:2101.00001",
+                        "verified_title": "Missing Foundation",
+                        "evidence_urls": ["https://arxiv.org/abs/2101.00001"],
+                        "reasoning": "verified by web search",
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(foundation.paper, "infer_main_references", fake_infer)
+    monkeypatch.setattr(foundation.paper, "metadata", _metadata)
+
+    expanded, report = foundation._expand_candidates_from_audit(
+        candidates=[
+            {
+                "paper_id": "arXiv:2301.00001",
+                "title": "Existing Candidate",
+                "citation_count": 120,
+                "witness_citation_overlap": 3,
+                "intent_overlap": 0.4,
+            }
+        ],
+        audit={
+            "candidate_set_sufficient": False,
+            "confidence": "complete",
+            "search_queries": [
+                {
+                    "query": "missing foundation exact title",
+                    "reason": "canonical paper is absent",
+                    "confidence": "complete",
+                }
+            ],
+            "citation_directions": ["check references of the missing foundation"],
+            "warnings": [],
+        },
+        intent="missing foundation",
+        provider="auto",
+        model=None,
+        refresh=False,
+        workers=1,
+    )
+
+    assert len(calls) == 1
+    assert "missing foundation exact title" in calls[0]
+    assert "missing foundation" in calls[0]
+    added = next(item for item in expanded if item["paper_id"] == "arXiv:2101.00001")
+    assert added["llm_added"] is True
+    assert added["source_role"] == "llm_added_foundation_candidate"
+    assert added["llm_verified_evidence_urls"] == ["https://arxiv.org/abs/2101.00001"]
+    assert report["added_candidate_count"] == 1
+    assert report["searches"][0]["status"] == "added"
+
+
+def test_foundation_audit_skips_uncertain_expansion(monkeypatch):
+    calls = []
+
+    def fake_infer(*args, **kwargs):
+        calls.append(args)
+        return {"ok": True, "data": ["arXiv:2101.00001"], "meta": {}}
+
+    monkeypatch.setattr(foundation.paper, "infer_main_references", fake_infer)
+    candidates = [{"paper_id": "arXiv:2301.00001", "title": "Existing Candidate"}]
+
+    expanded, report = foundation._expand_candidates_from_audit(
+        candidates=candidates,
+        audit={
+            "candidate_set_sufficient": False,
+            "confidence": "medium",
+            "search_queries": [
+                {
+                    "query": "maybe missing foundation",
+                    "reason": "uncertain",
+                    "confidence": "complete",
+                }
+            ],
+            "citation_directions": [],
+            "warnings": [],
+        },
+        intent="maybe",
+        provider="auto",
+        model=None,
+        refresh=False,
+        workers=1,
+    )
+
+    assert expanded == candidates
+    assert calls == []
+    assert report["added_candidate_count"] == 0
+    assert report["searches"][0]["status"] == "skipped_uncertain_audit"
+
+
+def test_foundation_expansion_requires_web_verified_references(monkeypatch):
+    def fake_infer(text, *, provider="auto", model=None, refresh=False):
+        return {
+            "ok": True,
+            "data": ["arXiv:2101.00001"],
+            "meta": {"llm_used": False},
+        }
+
+    monkeypatch.setattr(foundation.paper, "infer_main_references", fake_infer)
+    monkeypatch.setattr(foundation.paper, "metadata", _metadata)
+
+    expanded, report = foundation._expand_candidates_from_audit(
+        candidates=[{"paper_id": "arXiv:2301.00001", "title": "Existing Candidate"}],
+        audit={
+            "candidate_set_sufficient": False,
+            "confidence": "complete",
+            "search_queries": [
+                {
+                    "query": "missing foundation terms",
+                    "reason": "canonical paper likely absent",
+                    "confidence": "complete",
+                }
+            ],
+            "citation_directions": [],
+            "warnings": [],
+        },
+        intent="missing foundation",
+        provider="auto",
+        model=None,
+        refresh=False,
+        workers=1,
+    )
+
+    assert [item["paper_id"] for item in expanded] == ["arXiv:2301.00001"]
+    assert report["added_candidate_count"] == 0
+    assert report["searches"][0]["status"] == "reference_inference_unverified"
+
+
+def test_foundation_verifier_request_omits_explicit_ids_from_reason_and_intent(monkeypatch):
+    calls = []
+
+    def fake_infer(text, *, provider="auto", model=None, refresh=False):
+        calls.append(text)
+        return {
+            "ok": True,
+            "data": ["arXiv:2101.00001"],
+            "meta": {
+                "llm_used": True,
+                "verified_references": [
+                    {
+                        "paper_id": "arXiv:2101.00001",
+                        "verified_title": "Missing Foundation",
+                        "evidence_urls": ["https://arxiv.org/abs/2101.00001"],
+                        "reasoning": "verified by web search",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(foundation.paper, "infer_main_references", fake_infer)
+    monkeypatch.setattr(foundation.paper, "metadata", _metadata)
+
+    expanded, report = foundation._expand_candidates_from_audit(
+        candidates=[{"paper_id": "arXiv:2301.00001", "title": "Existing Candidate"}],
+        audit={
+            "candidate_set_sufficient": False,
+            "confidence": "complete",
+            "search_queries": [
+                {
+                    "query": "missing foundation terms",
+                    "reason": "maybe arXiv:2101.00001",
+                    "confidence": "complete",
+                }
+            ],
+            "citation_directions": [],
+            "warnings": [],
+        },
+        intent="compare with arXiv:2201.00001",
+        provider="auto",
+        model=None,
+        refresh=False,
+        workers=1,
+    )
+
+    assert "arXiv:2101.00001" not in calls[0]
+    assert "arXiv:2201.00001" not in calls[0]
+    assert next(item for item in expanded if item["paper_id"] == "arXiv:2101.00001")["llm_added"] is True
+    assert report["searches"][0]["status"] == "added"
+
+
+def test_deterministic_fallback_preserves_llm_added_markers(monkeypatch):
+    def fail_selection(*args, **kwargs):
+        raise RuntimeError("selection failed")
+
+    monkeypatch.setattr(foundation, "run_json", fail_selection)
+
+    selection = foundation._llm_select_foundation(
+        seed_metadata={"paper_id": SEED, "title": "Seed Paper"},
+        candidates=[
+            {
+                "paper_id": "arXiv:2101.00001",
+                "title": "Missing Foundation",
+                "citation_count": 200,
+                "witness_citation_overlap": 8,
+                "intent_overlap": 0.9,
+                "source_role": "llm_added_foundation_candidate",
+                "llm_added": True,
+                "llm_reference_query": "missing foundation terms",
+            }
+        ],
+        intent="missing foundation",
+        provider="auto",
+        model=None,
+    )
+
+    selected = selection["selected_foundation"]
+    assert selected["paper_id"] == "arXiv:2101.00001"
+    assert selected["llm_added"] is True
+    assert selected["source_role"] == "llm_added_foundation_candidate"
+    assert selected["llm_reference_query"] == "missing foundation terms"
+
+
+def test_candidate_audit_moves_uncertain_queries_to_warnings():
+    audit = foundation._repair_candidate_audit(
+        {
+            "candidate_set_sufficient": False,
+            "confidence": "complete",
+            "search_queries": [
+                {
+                    "query": "confident missing foundation",
+                    "reason": "complete certainty",
+                    "confidence": "complete",
+                },
+                {
+                    "query": "maybe missing foundation",
+                    "reason": "not certain",
+                    "confidence": "medium",
+                },
+            ],
+            "citation_directions": [],
+            "warnings": [],
+        },
+        method="llm",
+    )
+
+    assert [item["query"] for item in audit["search_queries"]] == ["confident missing foundation"]
+    assert any("maybe missing foundation" in warning for warning in audit["warnings"])
+
+
+def test_network_marks_llm_added_foundation(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    _install_fake_paper_query(monkeypatch)
+    paths = DomainPaths.for_domain(domain_id_for(SEED, "intent"))
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    paths.foundation_selection.write_text(
+        """
+        {
+          "selected_foundation": {
+            "paper_id": "arXiv:2101.00001",
+            "title": "Missing Foundation",
+            "reason": "LLM verified missing canonical paper",
+            "source_role": "llm_added_foundation_candidate",
+            "llm_added": true,
+            "llm_reference_query": "missing foundation exact title",
+            "llm_verified_evidence_urls": ["https://arxiv.org/abs/2101.00001"]
+          },
+          "parent_foundations": []
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    result = service.build_network(SEED, intent="intent", domain_id=paths.domain_id, provider="manual", workers=1)
+
+    assert result["ok"] is True
+    graph = read_json(paths.domain_graph)
+    node = next(item for item in graph["nodes"] if item["role"] == "selected_foundation")
+    assert node["paper_id"] == "arXiv:2101.00001"
+    assert node["llm_added"] is True
+    assert node["source_role"] == "llm_added_foundation_candidate"
+    assert node["llm_reference_query"] == "missing foundation exact title"
+
+
 def test_foundation_repair_repairs_unknown_best_reference_to_selected_foundation():
     selection = foundation._repair_selection(
         {
@@ -250,6 +536,51 @@ def test_foundation_repair_repairs_unknown_best_reference_to_selected_foundation
 
     assert selection["best_reference_paper"]["paper_id"] == "arXiv:0911.3380"
     assert "unknown id" in selection["best_reference_paper"]["reason"]
+
+
+def test_foundation_repair_unknown_selected_foundation_uses_deterministic_ranking_without_removing_candidates():
+    candidates = [
+        {
+            "paper_id": "arXiv:2401.00001",
+            "title": "First Low Support Candidate",
+            "citation_count": 10,
+            "witness_citation_overlap": 1,
+            "intent_overlap": 0.1,
+        },
+        {
+            "paper_id": "arXiv:2301.00001",
+            "title": "Deterministic Foundation",
+            "citation_count": 200,
+            "witness_citation_overlap": 6,
+            "intent_overlap": 0.8,
+        },
+    ]
+
+    selection = foundation._repair_selection(
+        {
+            "selected_foundation": {
+                "paper_id": "arXiv:9999.99999",
+                "title": "Unknown Paper",
+                "reason": "not in candidates",
+            },
+            "best_reference_paper": {
+                "paper_id": "arXiv:2301.00001",
+                "title": "Deterministic Foundation",
+                "reason": "readable",
+            },
+            "parent_foundations": [],
+            "rejected_candidates": [],
+            "warnings": [],
+        },
+        candidates,
+        method="llm",
+        intent="deterministic foundation",
+    )
+
+    assert [item["paper_id"] for item in candidates] == ["arXiv:2401.00001", "arXiv:2301.00001"]
+    assert selection["selected_foundation"]["paper_id"] == "arXiv:2301.00001"
+    assert "deterministic fallback" in selection["selected_foundation"]["reason"]
+    assert "llm_selected_unknown_id:arXiv:9999.99999" in selection["warnings"]
 
 
 def test_foundation_repair_rejects_later_parent_foundations():
