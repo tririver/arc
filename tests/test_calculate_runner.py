@@ -284,6 +284,45 @@ def test_reference_disagreement_can_be_convention_mismatch(tmp_path):
     assert "error" not in step
 
 
+def test_reference_disagreement_can_be_scope_or_coverage_mismatch(tmp_path):
+    runner = load_calculate_runner()
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "reference_disagrees",
+                agreed=["proposer_001", "proposer_002"],
+                best_written="proposer_001",
+                target_quantity_match=True,
+                convention_match=True,
+                declared_scope_match=False,
+                agreement_covers_full_target=False,
+                accepted_by_reviewer_judgment=False,
+            )
+        ]
+    )
+
+    result = runner.run_calculation(
+        minimal_config(
+            tmp_path,
+            max_recalculations=0,
+            steps=[
+                {
+                    "step_id": "blind_ref_eq_001",
+                    "prompt": "derive x",
+                    "reviewer_reference_claim": {"id": "target", "latex": "x"},
+                }
+            ],
+        ),
+        batch_runner=fake,
+        base_env={},
+    )
+
+    assert result["status"] == "blocked_for_user"
+    step = result["steps"][0]
+    assert step["blocked_output"]["trigger_status"] == "reference_disagrees"
+    assert "error" not in step
+
+
 def test_calculate_runner_dry_run_does_not_call_batch_runner(tmp_path):
     runner = load_calculate_runner()
     fake = FakeBatchRunner([])
@@ -399,6 +438,8 @@ def calculate_review(
     special_limit_only: bool = False,
     target_quantity_match: bool = True,
     convention_match: bool = True,
+    declared_scope_match: bool = True,
+    agreement_covers_full_target: bool = True,
     accepted_by_reviewer_judgment: bool | None = None,
     action: str | None = None,
     requires_human: bool | None = None,
@@ -422,8 +463,8 @@ def calculate_review(
         "agreement_assessment": {
             "target_quantity_match": target_quantity_match,
             "convention_match": convention_match,
-            "declared_scope_match": True,
-            "agreement_covers_full_target": True,
+            "declared_scope_match": declared_scope_match,
+            "agreement_covers_full_target": agreement_covers_full_target,
             "comparison_summary": "explicit algebraic comparison",
             "accepted_by_reviewer_judgment": bool(
                 status == "all_agree" if accepted_by_reviewer_judgment is None else accepted_by_reviewer_judgment

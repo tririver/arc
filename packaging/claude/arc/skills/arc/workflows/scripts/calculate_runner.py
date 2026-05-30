@@ -554,8 +554,7 @@ def _reviewer_reference_instruction(
         "set status=reference_disagrees, set agreed_proposer_ids to the agreeing proposer ids, "
         "put the blind proposer result in accepted_result with reference_claim_status='disagrees', "
         "set agreement_assessment.accepted_by_reviewer_judgment=false, and set "
-        "agreement_assessment.target_quantity_match=false or "
-        "agreement_assessment.convention_match=false according to the mismatch. "
+        "one or more agreement_assessment match fields false according to the mismatch. "
         "Then set workflow_action according to the workflow instruction below. "
         "If blind proposers disagree, do not accept the reference claim merely because one proposer matches it; "
         "set status=unresolved or all_disagree and request recalculation.\n\n"
@@ -886,15 +885,17 @@ def _validate_reference_disagrees_agreement_assessment(
     agreed_ids = _valid_ids(consensus.get("agreed_proposer_ids", []), active_proposer_ids)
     if len(set(agreed_ids)) < 2:
         raise ValueError("reference_disagrees requires two agreeing blind proposer ids")
-    for field in ["declared_scope_match", "agreement_covers_full_target"]:
-        if assessment.get(field) is not True:
-            raise ValueError(f"reference_disagrees requires agreement_assessment.{field}=true")
     if assessment.get("accepted_by_reviewer_judgment") is not False:
         raise ValueError("reference_disagrees requires agreement_assessment.accepted_by_reviewer_judgment=false")
-    if assessment.get("target_quantity_match") is not False and assessment.get("convention_match") is not False:
+    mismatch_fields = [
+        "target_quantity_match",
+        "convention_match",
+        "declared_scope_match",
+        "agreement_covers_full_target",
+    ]
+    if not any(assessment.get(field) is False for field in mismatch_fields):
         raise ValueError(
-            "reference_disagrees requires agreement_assessment.target_quantity_match=false "
-            "or agreement_assessment.convention_match=false"
+            "reference_disagrees requires at least one agreement_assessment match field=false"
         )
 
 
