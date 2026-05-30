@@ -380,8 +380,12 @@ def assert_codex_strict_objects(schema: Any) -> None:
             assert "type" in schema
         if schema.get("type") == "object":
             assert schema.get("additionalProperties") is False
+            if "properties" in schema:
+                assert set(schema.get("required", [])) == set(schema["properties"])
         if "object" in schema.get("type", []):
             assert schema.get("additionalProperties") is False
+            if "properties" in schema:
+                assert set(schema.get("required", [])) == set(schema["properties"])
         for value in schema.values():
             assert_codex_strict_objects(value)
     elif isinstance(schema, list):

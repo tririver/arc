@@ -72,6 +72,15 @@
                 "string",
                 "null"
               ],
+              "required": [
+                "summary",
+                "final_result",
+                "derivation",
+                "validity_scope",
+                "selected_proposer_id",
+                "reference_claim_status",
+                "source_proposer_output_path"
+              ],
               "properties": {
                 "summary": {"type": "string"},
                 "final_result": {"type": "string"},
