@@ -91,8 +91,6 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
     first_section = markdown.split("# Appendix: Idea Details", 1)[0]
 
     assert first_section.startswith(
-        "# Intent of the User\n\n"
-        "Suggest research directions about decoherence and Bell inequality test in cosmology.\n\n"
         "# Ideas\n\n"
         "Abbreviations:\n\n"
         "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
@@ -114,11 +112,11 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
         "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         "| 1 | 25 | 10 | 8 | 12 | 14 | 14 | 84 |"
     )
-    assert "\n# Ideas\n" in markdown
+    assert markdown.startswith("# Ideas\n")
     assert "Higher scoring idea (Mark: 83)" not in first_section
-    assert "\n# Ranked Ideas and Details\n" in markdown
-    assert "\n# Appendix: Idea Details\n" not in markdown
-    details_section = markdown.split("# Ranked Ideas and Details", 1)[1]
+    assert "\n# Ranked Ideas and Details\n" not in markdown
+    assert "\n# Appendix: Idea Details\n" in markdown
+    details_section = markdown.split("# Appendix: Idea Details", 1)[1]
     assert details_section.index("### 1. Intent-bearing idea") < details_section.index("### 2. Higher scoring idea")
     assert details_section.index("### 2. Higher scoring idea") < details_section.index("### 3. Lower scoring idea")
     assert "#### Full Idea Verbatim" in markdown

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
+from arc_llm.proposers_reviewer import artifacts
 from arc_llm.proposers_reviewer.artifacts import (
     LockConflictError,
     RunPaths,
@@ -48,6 +50,35 @@ def test_acquiring_same_lock_twice_fails(tmp_path):
         with pytest.raises(LockConflictError, match="lock already exists"):
             with acquire_lock(lock_path, run_id="run_001", loop_id="loop_001"):
                 pass
+
+
+def test_same_host_dead_pid_lock_is_recovered(monkeypatch, tmp_path):
+    lock_path = tmp_path / "run_001" / "loops" / "loop_001" / "lock.json"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(
+        json.dumps({"run_id": "run_001", "loop_id": "loop_001", "host": artifacts._hostname(), "pid": 999999}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(artifacts, "_pid_exists", lambda pid: False)
+
+    with acquire_lock(lock_path, run_id="run_001", loop_id="loop_001"):
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+
+    assert payload["pid"] == os.getpid()
+    assert not lock_path.exists()
+
+
+def test_different_host_lock_is_not_recovered(tmp_path):
+    lock_path = tmp_path / "run_001" / "loops" / "loop_001" / "lock.json"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(
+        json.dumps({"run_id": "run_001", "loop_id": "loop_001", "host": "other-host", "pid": 999999}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockConflictError, match="lock already exists"):
+        with acquire_lock(lock_path, run_id="run_001", loop_id="loop_001"):
+            pass
 
 
 def test_lock_file_records_run_and_loop_id(tmp_path):

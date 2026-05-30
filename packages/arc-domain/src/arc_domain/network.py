@@ -41,6 +41,7 @@ def build_network(
     paths: DomainPaths,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
     max_citers: int = 1000,
@@ -65,7 +66,7 @@ def build_network(
         },
     )
 
-    intent_ranking = _rank_by_intent(citer_pool, intent=intent, provider=provider, model=model)
+    intent_ranking = _rank_by_intent(citer_pool, intent=intent, provider=provider, model=model, model_tier=model_tier)
     write_json(paths.intent_rankings, intent_ranking)
 
     selected = _select_domain_papers(
@@ -209,6 +210,7 @@ def _rank_by_intent(
     intent: str,
     provider: str,
     model: str | None,
+    model_tier: str | None = None,
 ) -> dict[str, Any]:
     if not intent.strip():
         return {"schema_version": "arc.domain_intent_ranking.v1", "ranked_paper_ids": [], "reasoning": "no intent supplied"}
@@ -240,7 +242,7 @@ def _rank_by_intent(
         ]
     )
     try:
-        result = run_json(prompt, schema=INTENT_RANKING_SCHEMA, provider=provider, model=model)
+        result = run_json(prompt, schema=INTENT_RANKING_SCHEMA, provider=provider, model=model, model_tier=model_tier)
         ids = [normalize_paper_id(item) for item in result.get("ranked_paper_ids", []) if item]
         valid = {item["paper_id"] for item in citer_pool}
         ranking = {

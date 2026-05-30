@@ -112,6 +112,7 @@ def _result(
 ) -> dict[str, Any]:
     batch_run_root = Path(str(batch_result.get("run_root", run_root / "idea_loops")))
     round_score_table = _round_score_table(ideas, batch_run_root=batch_run_root)
+    loop_reviewer_call_count = _loop_reviewer_call_count(batch_result, ideas)
     return {
         "schema_version": "arc.workflow.ideas.result.v1",
         "status": str(batch_result.get("status", "failed")),
@@ -119,8 +120,8 @@ def _result(
         "run_root": str(run_root),
         "warnings": warnings,
         "proposal_count": len(ideas),
-        "reviewer_call_count": 0,
-        "loop_reviewer_call_count": _loop_reviewer_call_count(batch_result, ideas),
+        "reviewer_call_count": loop_reviewer_call_count,
+        "loop_reviewer_call_count": loop_reviewer_call_count,
         "max_concurrent_loops": len(ideas),
         "max_concurrent_proposal_calls": len(ideas),
         "batch_config_path": str(batch_config_path),
@@ -177,7 +178,6 @@ def _loop_batch_config(config: IdeasConfig, ideas: list[IdeaPlan], *, run_root: 
         "run_id": "idea_loops",
         "run_dir": str(run_root),
         "max_concurrent_loops": len(ideas),
-        "existing_run_policy": "fail",
         "artifact_options": {"save_prompts": config.save_prompts},
         "loops": [_idea_loop_payload(idea) for idea in ideas],
     }

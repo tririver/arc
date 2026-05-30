@@ -77,6 +77,26 @@ def test_run_batch_passes_model_tier(monkeypatch, tmp_path):
     }
 
 
+def test_run_batch_claims_only_available_executor_slots(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    db = BatchDB.default()
+    db.create_batch("qft", ["0911.3380", "hep-th/0601001"], "paper-summary-v1")
+    db.mark_status("qft", "arXiv:0911.3380", "ready")
+    db.mark_status("qft", "arXiv:hep-th/0601001", "ready")
+    counts_seen = []
+
+    def generate_llm_summary(paper_id, *, provider="auto", model=None, model_tier=None, refresh=False):
+        counts_seen.append(db.status_counts("qft"))
+        return {"ok": True, "data": {"title": "Done"}, "meta": {"summary_path": str(tmp_path / "summary.json")}}
+
+    monkeypatch.setattr(runner.service, "generate_llm_summary", generate_llm_summary)
+
+    run_result = runner.run_batch("qft", provider="auto", concurrency=1, max_items=2, db=db)
+
+    assert counts_seen[0] == {"ready": 1, "running": 1}
+    assert run_result["counts"] == {"done": 2}
+
+
 def test_run_batch_rejects_auto_provider_with_exact_model_before_status_mutation(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
     db = BatchDB.default()

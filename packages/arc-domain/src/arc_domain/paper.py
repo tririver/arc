@@ -34,9 +34,16 @@ def infer_main_references(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    return paper_service.llm_infer_main_references(text, provider=provider, model=model, refresh=refresh)
+    return paper_service.llm_infer_main_references(
+        text,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        refresh=refresh,
+    )
 
 
 def section(paper_id: str, selector: str, *, refresh: bool = False) -> dict[str, Any]:

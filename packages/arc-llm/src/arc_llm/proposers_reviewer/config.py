@@ -59,7 +59,6 @@ class BatchConfig:
     run_id: str
     run_dir: Path
     max_concurrent_loops: int
-    existing_run_policy: str
     fail_fast: bool
     artifact_options: ArtifactOptions
     loops: list[LoopConfig]
@@ -74,9 +73,6 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     run_id = _safe_id(_required_text(data, "run_id"), "run_id")
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
     max_concurrent_loops = _positive_int(data.get("max_concurrent_loops", 1), "max_concurrent_loops")
-    existing_run_policy = str(data.get("existing_run_policy", "fail")).strip() or "fail"
-    if existing_run_policy not in {"fail", "append_new_loops"}:
-        raise ConfigError("existing_run_policy must be fail or append_new_loops")
     fail_fast = _bool(data.get("fail_fast", False), "fail_fast")
     artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
 
@@ -113,7 +109,6 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
         run_id=run_id,
         run_dir=run_dir,
         max_concurrent_loops=max_concurrent_loops,
-        existing_run_policy=existing_run_policy,
         fail_fast=fail_fast,
         artifact_options=artifact_options,
         loops=loops,

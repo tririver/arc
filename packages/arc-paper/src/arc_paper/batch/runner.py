@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
+from threading import get_ident
 from typing import Any
 
 from arc_llm.runner import resolve_llm_config
@@ -34,14 +36,29 @@ def run_batch(
     resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
     db = db or BatchDB.default()
     limit = max_items or 1_000_000
-    items = db.next_items(name, status="ready", limit=limit)
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
-        futures = {
-            executor.submit(_run_one, item, db, provider=provider, model=model, model_tier=model_tier): item
-            for item in items
-        }
-        for future in as_completed(futures):
-            future.result()
+    workers = max(1, concurrency)
+    submitted = 0
+    worker_id = _worker_id()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        while True:
+            while len(futures) < workers and submitted < limit:
+                claim_limit = min(workers - len(futures), limit - submitted)
+                items = db.claim_ready_items(name, limit=claim_limit, worker_id=worker_id)
+                if not items:
+                    break
+                for item in items:
+                    future = executor.submit(_run_one, item, db, provider=provider, model=model, model_tier=model_tier)
+                    futures[future] = item
+                submitted += len(items)
+                if len(items) < claim_limit:
+                    break
+            if not futures:
+                break
+            done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                futures.pop(future)
+                future.result()
     return {"batch": name, "counts": db.status_counts(name)}
 
 
@@ -83,7 +100,6 @@ def _prefetch_one(item: BatchItem, db: BatchDB) -> None:
 
 
 def _run_one(item: BatchItem, db: BatchDB, *, provider: str, model: str | None, model_tier: str | None) -> None:
-    db.mark_status(item.batch_name, item.paper_id, "running", attempts=item.attempts + 1)
     result = service.generate_llm_summary(item.paper_id, provider=provider, model=model, model_tier=model_tier)
     if result.get("ok"):
         summary_path = result.get("meta", {}).get("summary_path") or result.get("summary_path")
@@ -104,3 +120,7 @@ def _run_one(item: BatchItem, db: BatchDB, *, provider: str, model: str | None, 
             model=model,
             last_error=json.dumps(result.get("error", result), ensure_ascii=False),
         )
+
+
+def _worker_id() -> str:
+    return f"pid:{os.getpid()}:thread:{get_ident()}"

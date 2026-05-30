@@ -75,7 +75,53 @@ def test_ideas_phase_5_uses_clean_selection_prompt() -> None:
     assert "`Let's discuss`" in text
     assert "Do not render numbered-list prefixes inside option labels" in text
     assert "If no discrete selection tool is available, ask only for the idea number" in text
-    assert "`other`. Do not print `quit` or `Let's discuss` in the typed fallback" in text
+    assert "Keep `Let's discuss` as the final typed fallback option" in text
+
+
+def test_arc_context_json_defines_run_identity_and_skill_paths() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "`run_id`" in text
+    assert "`created_at`" in text
+    assert "`skill_version`" in text
+    assert "`skill_dir`" in text
+    assert "`skill_workflow_json_dir`" in text
+
+
+def test_workflow_script_commands_use_skill_dir_placeholder() -> None:
+    ideas = (WF / "ideas.md").read_text(encoding="utf-8")
+    calculate = (WF / "calculate.md").read_text(encoding="utf-8")
+
+    assert "python3 <skill-dir>/workflows/scripts/ideas_runner.py" in ideas
+    assert "python3 <skill-dir>/workflows/scripts/rank-ideas.py" in ideas
+    assert "python3 <skill-dir>/workflows/scripts/calculate_runner.py" in calculate
+    assert "python3 workflows/scripts/" not in ideas
+    assert "python3 workflows/scripts/" not in calculate
+
+
+def test_domain_summary_warnings_are_visible_and_recorded() -> None:
+    domain = (WF / "domain.md").read_text(encoding="utf-8")
+    manual = (SKILL / "manuals/arc-domain.md").read_text(encoding="utf-8")
+
+    assert "print `WARNING:` immediately" in domain
+    assert "`<project-dir>/context/domain/warnings.md`" in domain
+    assert "summary warnings to project `self-reflect.md` and `context/domain/warnings.md`" in manual
+
+
+def test_manuals_do_not_hardcode_checkout_cache_paths() -> None:
+    for manual in ["arc-paper.md", "arc-domain.md", "arc-mcp.md"]:
+        text = (SKILL / "manuals" / manual).read_text(encoding="utf-8")
+        assert "/arc-dev/cache/" not in text
+    assert "doctor-cache" in (SKILL / "manuals/arc-paper.md").read_text(encoding="utf-8")
+    assert "doctor_cache" in (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8")
+
+
+def test_self_reflection_allows_missing_git_metadata() -> None:
+    text = (SKILL / "rules/self-reflection.md").read_text(encoding="utf-8")
+
+    assert "Git: unavailable" in text
+    assert "Archive:" in text
+    assert "Run: <run_id>" in text
 
 
 def test_interaction_rules_name_codex_discrete_choice_tool() -> None:
@@ -388,14 +434,14 @@ def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
     ).stdout
     assert "# Ideas\n\n" in markdown
     assert "Abbreviations:\n\nIR=intent relevance" in markdown
-    summary = markdown.split("# Ranked Ideas and Details", 1)[0]
-    details = markdown.split("# Ranked Ideas and Details", 1)[1]
+    summary = markdown.split("# Appendix: Idea Details", 1)[0]
+    details = markdown.split("# Appendix: Idea Details", 1)[1]
     assert summary.index("## `idea_001`\n\nbetter") < summary.index("## `idea_002`\n\nhigh novelty")
     assert "| Round | IR | N | CN | SV | PL | WD | T |" in markdown
     assert "| Title | Total Mark | Rank |" not in markdown
     assert "| Loop | Round | Total | Intent Relevance | Novelty | Confidence | Value | Planning | Well-definedness |" in markdown
-    assert "# Ranked Ideas and Details" in markdown
-    assert "# Appendix: Idea Details" not in markdown
+    assert "# Ranked Ideas and Details" not in markdown
+    assert "# Appendix: Idea Details" in markdown
     assert details.index("### 1. high novelty") < details.index("### 2. better")
     assert "#### Referee Marks by Round" in markdown
     assert "#### Full Idea Verbatim" in markdown

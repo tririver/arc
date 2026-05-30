@@ -88,7 +88,7 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
 
     assert result["status"] == "completed"
     assert result["proposal_count"] == 2
-    assert result["reviewer_call_count"] == 0
+    assert result["reviewer_call_count"] == 10
     assert result["loop_reviewer_call_count"] == 10
     assert "global_review" not in result
     assert "ideas" not in result

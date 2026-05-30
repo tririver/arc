@@ -66,6 +66,7 @@ def infer_main_references(
     *,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     metadata_lookup: MetadataLookup,
 ) -> dict[str, Any]:
@@ -74,7 +75,7 @@ def infer_main_references(
         raise ReferenceInferenceError("empty_reference_request", "Reference inference requires non-empty text.")
 
     env = _internet_enabled_env()
-    config = resolve_llm_config(provider=provider, model=model, env=env)
+    config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier, env=env)
     payload = run_json(
         _build_prompt(request),
         schema=REFERENCE_INFERENCE_SCHEMA,

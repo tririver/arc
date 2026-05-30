@@ -88,6 +88,7 @@ def _main_reference_inference(payload: dict[str, Any], *, job_id: str) -> dict[s
         str(payload.get("text") or ""),
         provider=str(payload.get("provider") or "auto"),
         model=payload.get("model"),
+        model_tier=payload.get("model_tier"),
         refresh=bool(payload.get("refresh", False)),
     )
     event = "reference_inference_completed" if _result_ok(result) else "reference_inference_failed"
@@ -106,15 +107,17 @@ def _domain_build(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
             "intent": str(payload.get("intent", "")),
         },
     )
-    result = domain_service.build_domain(
-        seed_paper,
-        intent=str(payload.get("intent", "")),
-        domain_id=payload.get("domain_id"),
-        provider=str(payload.get("provider") or "auto"),
-        model=payload.get("model"),
-        refresh=bool(payload.get("refresh", False)),
-        workers=int(payload.get("workers", 8)),
-    )
+    build_kwargs: dict[str, Any] = {
+        "intent": str(payload.get("intent", "")),
+        "domain_id": payload.get("domain_id"),
+        "provider": str(payload.get("provider") or "auto"),
+        "model": payload.get("model"),
+        "refresh": bool(payload.get("refresh", False)),
+        "workers": int(payload.get("workers", 8)),
+    }
+    if payload.get("model_tier") is not None:
+        build_kwargs["model_tier"] = payload.get("model_tier")
+    result = domain_service.build_domain(seed_paper, **build_kwargs)
     record_progress(job_id, {"event": "domain_completed" if _result_ok(result) else "domain_failed"})
     return result
 

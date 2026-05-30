@@ -119,13 +119,14 @@ def summarize_domain(
     paths: DomainPaths,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
 ) -> dict[str, Any]:
     update_status(paths, stage="summary_started")
     graph = read_json(paths.domain_graph, {})
     evidence = read_json(paths.evidence_pack, {})
     selection = read_json(paths.foundation_selection, {})
     prompt = _summary_prompt(graph=graph, evidence=evidence, selection=selection)
-    summary = run_json(prompt, schema=DOMAIN_SUMMARY_SCHEMA, provider=provider, model=model)
+    summary = run_json(prompt, schema=DOMAIN_SUMMARY_SCHEMA, provider=provider, model=model, model_tier=model_tier)
     summary["summary_method"] = "llm"
     summary["schema_version"] = "arc.domain_summary.v4"
     summary["domain_id"] = paths.domain_id

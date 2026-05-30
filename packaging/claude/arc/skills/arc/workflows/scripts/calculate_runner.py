@@ -26,7 +26,12 @@ DEFAULT_HUMAN_GATE_PAUSE_STATUSES = (
 RETRYABLE_CONSENSUS_STATUSES = {"reference_disagrees", "two_agree", "all_disagree", "unresolved"}
 REVISION_ACTIONS = {"revise_plan", "split_step"}
 LEGACY_ALLOWED_CONTEXT_KEYS = {"foundation_file", "allowed_foundation", "target_equation_id"}
-CALLER_ALLOWED_CONTEXT_OMIT_KEYS = {"sources", "mcp", "cli", "cache_path", "source_path", "source_commands"}
+CALLER_ALLOWED_CONTEXT_OMIT_KEYS = {
+    "source_commands",
+    "shell_commands",
+    "mcp_call_instructions",
+    "cli_invocations",
+}
 
 BatchRunner = Callable[..., dict[str, Any]]
 
@@ -672,7 +677,7 @@ def _human_gate_blocked_step_result(
         return None
 
     workflow_action = _normalized_workflow_action(consensus.get("workflow_action"), trigger_status)
-    requires_human = _workflow_action_requires_human(workflow_action)
+    requires_human = _workflow_action_requires_human(workflow_action, allow_nonhuman_control=True)
     if requires_human:
         workflow_action = copy.deepcopy(workflow_action)
         workflow_action["action"] = "pause_for_human"
@@ -1055,9 +1060,16 @@ def _default_workflow_action(trigger_status: str, reason: str | None = None) -> 
     }
 
 
-def _workflow_action_requires_human(workflow_action: Mapping[str, Any]) -> bool:
+def _workflow_action_requires_human(
+    workflow_action: Mapping[str, Any],
+    *,
+    allow_nonhuman_control: bool = False,
+) -> bool:
     action = str(workflow_action.get("action", "")).strip()
-    if action in REVISION_ACTIONS and workflow_action.get("requires_human") is False:
+    nonhuman_actions = set(REVISION_ACTIONS)
+    if allow_nonhuman_control:
+        nonhuman_actions.update({"continue", "retry"})
+    if action in nonhuman_actions and workflow_action.get("requires_human") is False:
         return False
     return True
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from arc_paper.ids import normalize_paper_id
@@ -14,18 +16,16 @@ from .results import err, ok
 from .summary import summarize_domain as _summarize_domain
 
 
+CONFIG_SCHEMA_VERSION = "arc.domain_config.v1"
+INPUT_FINGERPRINT_SCHEMA_VERSION = "arc.domain_input_fingerprint.v1"
+
+
 def init_domain(seed_paper: str, *, intent: str = "", domain_id: str | None = None) -> dict[str, Any]:
     try:
         seed_id = normalize_paper_id(seed_paper)
         resolved = domain_id or domain_id_for(seed_id, intent)
         paths = DomainPaths.for_domain(resolved)
-        config = {
-            "schema_version": "arc.domain_config.v1",
-            "domain_id": paths.domain_id,
-            "seed_paper": seed_id,
-            "intent": intent,
-            "created_at": now_iso(),
-        }
+        config = _domain_config(paths, seed_id=seed_id, intent=intent)
         write_json(paths.config, config)
         update_status(paths, stage="initialized", seed_paper=seed_id, intent=intent)
         return ok({"domain_id": paths.domain_id, "domain_dir": str(paths.domain_dir), "config": config})
@@ -40,17 +40,26 @@ def identify_foundation(
     domain_id: str | None = None,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
 ) -> dict[str, Any]:
     try:
-        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id)
+        paths = _ensure_domain(
+            seed_paper,
+            intent=intent,
+            domain_id=domain_id,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+        )
         data = _identify_foundation(
             seed_paper=seed_paper,
             intent=intent,
             paths=paths,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             workers=workers,
         )
@@ -66,11 +75,19 @@ def build_network(
     domain_id: str | None = None,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
 ) -> dict[str, Any]:
     try:
-        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id)
+        paths = _ensure_domain(
+            seed_paper,
+            intent=intent,
+            domain_id=domain_id,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+        )
         if not paths.foundation_selection.exists():
             _identify_foundation(
                 seed_paper=seed_paper,
@@ -78,6 +95,7 @@ def build_network(
                 paths=paths,
                 provider=provider,
                 model=model,
+                model_tier=model_tier,
                 refresh=refresh,
                 workers=workers,
             )
@@ -87,6 +105,7 @@ def build_network(
             paths=paths,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             workers=workers,
         )
@@ -138,12 +157,20 @@ def summarize_domain(
     domain_id: str | None = None,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
 ) -> dict[str, Any]:
     try:
-        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id)
+        paths = _ensure_domain(
+            seed_paper,
+            intent=intent,
+            domain_id=domain_id,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+        )
         if not paths.evidence_pack.exists():
             raise FileNotFoundError("evidence_pack.json missing; run build-evidence first")
-        return ok(_summarize_domain(paths=paths, provider=provider, model=model))
+        return ok(_summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier))
     except Exception as exc:
         return err("domain_summary_failed", str(exc))
 
@@ -155,17 +182,26 @@ def build_domain(
     domain_id: str | None = None,
     provider: str = "auto",
     model: str | None = None,
+    model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
 ) -> dict[str, Any]:
     try:
-        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id)
+        paths = _ensure_domain(
+            seed_paper,
+            intent=intent,
+            domain_id=domain_id,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+        )
         foundation = _identify_foundation(
             seed_paper=seed_paper,
             intent=intent,
             paths=paths,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             workers=workers,
         )
@@ -175,13 +211,14 @@ def build_domain(
             paths=paths,
             provider=provider,
             model=model,
+            model_tier=model_tier,
             refresh=refresh,
             workers=workers,
         )
         html = render_network_html(paths=paths)
         paper_pack = _build_paper_json_pack(paths=paths, refresh=refresh, workers=workers)
         evidence = _build_evidence_pack(paths=paths, refresh=refresh, workers=workers)
-        summary = _summarize_domain(paths=paths, provider=provider, model=model)
+        summary = _summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier)
         return ok(
             {
                 "domain_id": paths.domain_id,
@@ -266,19 +303,125 @@ def get_domain_graph(seed_paper: str | None = None, *, intent: str = "", domain_
         return err("domain_graph_read_failed", str(exc))
 
 
-def _ensure_domain(seed_paper: str, *, intent: str, domain_id: str | None) -> DomainPaths:
+def _ensure_domain(
+    seed_paper: str,
+    *,
+    intent: str,
+    domain_id: str | None,
+    provider: str | None = None,
+    model: str | None = None,
+    model_tier: str | None = None,
+) -> DomainPaths:
     seed_id = normalize_paper_id(seed_paper)
     paths = DomainPaths.for_domain(domain_id or domain_id_for(seed_id, intent))
-    if not paths.config.exists():
-        config = {
-            "schema_version": "arc.domain_config.v1",
-            "domain_id": paths.domain_id,
-            "seed_paper": seed_id,
-            "intent": intent,
-            "created_at": now_iso(),
-        }
+    config = read_json(paths.config, {}) or {}
+    if not config:
+        config = _domain_config(
+            paths,
+            seed_id=seed_id,
+            intent=intent,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+        )
         write_json(paths.config, config)
+        return paths
+    _validate_domain_config(config, paths=paths, seed_id=seed_id, intent=intent)
+    updated = _with_llm_fingerprint(config, provider=provider, model=model, model_tier=model_tier)
+    if updated != config:
+        write_json(paths.config, updated)
     return paths
+
+
+def _domain_config(
+    paths: DomainPaths,
+    *,
+    seed_id: str,
+    intent: str,
+    provider: str | None = None,
+    model: str | None = None,
+    model_tier: str | None = None,
+) -> dict[str, Any]:
+    config = {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "domain_id": paths.domain_id,
+        "seed_paper": seed_id,
+        "intent": intent,
+        "created_at": now_iso(),
+        "input_fingerprint": _input_fingerprint(seed_id=seed_id, intent=intent),
+    }
+    return _with_llm_fingerprint(config, provider=provider, model=model, model_tier=model_tier)
+
+
+def _validate_domain_config(config: dict[str, Any], *, paths: DomainPaths, seed_id: str, intent: str) -> None:
+    existing_seed = str(config.get("seed_paper") or "")
+    existing_intent = str(config.get("intent") or "")
+    if existing_seed != seed_id or existing_intent != intent:
+        raise ValueError(
+            "domain_id input mismatch: "
+            f"{paths.domain_id} was created for seed_paper={existing_seed!r}, intent={existing_intent!r}; "
+            f"requested seed_paper={seed_id!r}, intent={intent!r}"
+        )
+    expected = _input_fingerprint(seed_id=seed_id, intent=intent)
+    stored = config.get("input_fingerprint")
+    if isinstance(stored, dict) and stored.get("identity_hash") not in {None, expected["identity_hash"]}:
+        raise ValueError(f"domain_id input hash mismatch for {paths.domain_id}")
+
+
+def _with_llm_fingerprint(
+    config: dict[str, Any],
+    *,
+    provider: str | None,
+    model: str | None,
+    model_tier: str | None,
+) -> dict[str, Any]:
+    if provider is None and model is None and model_tier is None:
+        return config
+    current = _llm_fingerprint(provider=provider, model=model, model_tier=model_tier)
+    stored = config.get("input_fingerprint")
+    if not isinstance(stored, dict):
+        stored = _input_fingerprint(seed_id=str(config.get("seed_paper") or ""), intent=str(config.get("intent") or ""))
+    existing_hash = stored.get("llm_hash")
+    if existing_hash not in {None, current["llm_hash"]}:
+        existing = stored.get("llm", {})
+        raise ValueError(
+            "domain_id LLM configuration mismatch: "
+            f"created with {existing}; requested {current['llm']}"
+        )
+    if existing_hash == current["llm_hash"]:
+        return config
+    updated = dict(config)
+    fingerprint = dict(stored)
+    fingerprint.update(current)
+    updated["input_fingerprint"] = fingerprint
+    return updated
+
+
+def _input_fingerprint(*, seed_id: str, intent: str) -> dict[str, Any]:
+    identity = {
+        "schema_version": INPUT_FINGERPRINT_SCHEMA_VERSION,
+        "seed_paper": seed_id,
+        "intent": intent,
+    }
+    return {
+        "schema_version": INPUT_FINGERPRINT_SCHEMA_VERSION,
+        "identity": identity,
+        "identity_hash": _stable_hash(identity),
+    }
+
+
+def _llm_fingerprint(*, provider: str | None, model: str | None, model_tier: str | None) -> dict[str, Any]:
+    llm = {
+        "provider": provider or "auto",
+        "model": model,
+        "model_tier": model_tier,
+    }
+    return {"llm": llm, "llm_hash": _stable_hash(llm)}
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _paths(seed_paper: str | None, *, intent: str, domain_id: str | None) -> DomainPaths:

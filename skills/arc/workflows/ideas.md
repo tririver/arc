@@ -8,6 +8,7 @@ sends five reviewer reports per loop by default.
 ## Inputs
 
 Read `<project-dir>/context.json`. Use the exact `user_intent`.
+Use `skill_dir` from context as `<skill-dir>` in commands below.
 
 ### Phase 1: Prepare Config
 
@@ -35,7 +36,7 @@ number of concurrent instances for each setup.
 Step 1: Run:
 
 ```bash
-python3 workflows/scripts/ideas_runner.py \
+python3 <skill-dir>/workflows/scripts/ideas_runner.py \
   --config <project-dir>/ideas/<run-id>.config.json \
   --dry-run \
   --json
@@ -50,7 +51,7 @@ does not create run artifacts.
 Step 1: Run:
 
 ```bash
-python3 workflows/scripts/ideas_runner.py \
+python3 <skill-dir>/workflows/scripts/ideas_runner.py \
   --config <project-dir>/ideas/<run-id>.config.json \
   --json
 ```
@@ -87,12 +88,12 @@ Step 1: After the run completes, use the read-only ranking helper to write the
 deterministic ranked ideas report directly to both readable destinations:
 
 ```bash
-python3 workflows/scripts/rank-ideas.py \
+python3 <skill-dir>/workflows/scripts/rank-ideas.py \
   <project-dir>/ideas/<run-id>/idea_loops \
   --format markdown \
   > <project-dir>/ideas/<run-id>/ranked-ideas.md
 
-python3 workflows/scripts/rank-ideas.py \
+python3 <skill-dir>/workflows/scripts/rank-ideas.py \
   <project-dir>/ideas/<run-id>/idea_loops \
   --format markdown \
   > <project-dir>/ranked-ideas.md
@@ -137,9 +138,8 @@ Do not render numbered-list prefixes inside option labels; for example, use
 label `1`, not `1. 1`, and label `2`, not `2:`.
 The option labels must be the raw labels listed above.
 
-If no discrete selection tool is available, ask only for the idea number or
-`other`. Do not print `quit` or `Let's discuss` in the typed fallback because
-not selecting an idea already leaves the workflow in discussion mode.
+If no discrete selection tool is available, ask only for the idea number,
+`other`, or `Let's discuss`. Keep `Let's discuss` as the final typed fallback option.
 
 If the workflow is running in interactive mode, stop after printing the top
 three ideas.

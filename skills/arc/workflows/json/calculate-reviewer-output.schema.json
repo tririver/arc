@@ -68,9 +68,23 @@
             },
             "accepted_result": {
               "type": [
+                "object",
                 "string",
                 "null"
-              ]
+              ],
+              "properties": {
+                "summary": {"type": "string"},
+                "final_result": {"type": "string"},
+                "derivation": {"type": "string"},
+                "validity_scope": {"type": "string"},
+                "selected_proposer_id": {"type": "string"},
+                "reference_claim_status": {
+                  "type": "string",
+                  "enum": ["agrees", "disagrees", "not_applicable"]
+                },
+                "source_proposer_output_path": {"type": "string"}
+              },
+              "additionalProperties": false
             },
             "agreed_proposer_ids": {
               "type": "array",

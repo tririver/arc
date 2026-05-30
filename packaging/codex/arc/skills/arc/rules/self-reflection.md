@@ -9,7 +9,20 @@ tool/runtime limits, or an instruction conflict.
 Append the outcome check and self-reflection entry to
 `<project-dir>/self-reflect.md`.
 
-Start each suggestion with `Git: <commit-hash>`.
+Start each suggestion with available provenance:
+
+```text
+Git: <commit-hash>
+Run: <run_id>
+```
+
+If Git metadata is unavailable, use:
+
+```text
+Git: unavailable
+Archive: <checksum or extracted-dir name>
+Run: <run_id>
+```
 
 Include concrete, portable improvement suggestions when the run reveals a
 workflow, prompt, package, documentation, cache, or test weakness.

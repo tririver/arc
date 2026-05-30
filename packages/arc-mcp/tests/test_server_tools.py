@@ -487,6 +487,7 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "background" in by_name["llm_summary_batch_run"].inputSchema["properties"]
     assert "model_tier" in by_name["llm_generate_summary"].inputSchema["properties"]
     assert "model_tier" in by_name["llm_get_summary"].inputSchema["properties"]
+    assert "model_tier" in by_name["llm_domain_build"].inputSchema["properties"]
     assert "model_tier" in by_name["llm_summary_batch_run"].inputSchema["properties"]
     assert "summary_batch_create" in by_name
     assert "summary_batch_prefetch" in by_name
@@ -674,7 +675,16 @@ def test_llm_generate_summary_rejects_auto_provider_with_exact_model_before_back
 def test_domain_build_starts_background_job(monkeypatch):
     monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0.001")
 
-    def build_domain(seed_paper, intent="", domain_id=None, provider="auto", model=None, refresh=False, workers=8):
+    def build_domain(
+        seed_paper,
+        intent="",
+        domain_id=None,
+        provider="auto",
+        model=None,
+        model_tier=None,
+        refresh=False,
+        workers=8,
+    ):
         time.sleep(0.02)
         return {
             "ok": True,
@@ -683,6 +693,7 @@ def test_domain_build_starts_background_job(monkeypatch):
                 "intent": intent,
                 "domain_id": domain_id or "domain-test",
                 "provider": provider,
+                "model_tier": model_tier,
                 "workers": workers,
             },
             "errors": [],
@@ -691,15 +702,20 @@ def test_domain_build_starts_background_job(monkeypatch):
 
     monkeypatch.setattr(server.domain_service, "build_domain", build_domain)
 
-    started = server.call_tool("llm_domain_build", {"seed_paper": "0911.3380", "intent": "inflation", "workers": 2})
+    started = server.call_tool(
+        "llm_domain_build",
+        {"seed_paper": "0911.3380", "intent": "inflation", "model_tier": "high", "workers": 2},
+    )
 
     assert started["status"] == "job_running"
+    assert started["job"]["model_tier"] == "high"
     status = _wait_for_domain_job(started["job_id"])
     assert status["status"] == "done"
     assert status["seed_paper"] == "arXiv:0911.3380"
     assert "domain_status" in status
     result = server.job_result(started["job_id"])["result"]
     assert result["data"]["intent"] == "inflation"
+    assert result["data"]["model_tier"] == "high"
     assert result["data"]["workers"] == 2
 
 

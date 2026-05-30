@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from arc_llm.proposers_reviewer import runner as runner_module
+from arc_llm.proposers_reviewer.artifacts import RunPaths, acquire_lock, atomic_write_json
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 
 
@@ -386,6 +388,65 @@ def test_failed_loop_does_not_corrupt_successful_loop(tmp_path):
     assert statuses["loop_001"] == "completed"
     assert statuses["loop_bad"] == "failed"
     assert (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").exists()
+
+
+def test_loop_failure_state_is_not_written_after_lock_loss(tmp_path):
+    paths = RunPaths(run_dir=tmp_path / "ideas", run_id="run_001").loop("loop_001")
+    atomic_write_json(paths.state, {"status": "running", "loop_id": "loop_001"})
+    failure = {
+        "loop_id": "loop_001",
+        "status": "failed",
+        "rounds_completed": 0,
+        "error": "boom",
+        "loop_root": str(paths.loop_root),
+    }
+
+    with acquire_lock(paths.lock, run_id="run_001", loop_id="loop_001"):
+        runner_module._write_loop_failure_state(paths, run_id="run_001", result=failure)
+
+    assert json.loads(paths.state.read_text(encoding="utf-8"))["status"] == "running"
+    diagnostics = list((paths.loop_root / "errors").glob("failure_after_lock_lost.*.json"))
+    assert len(diagnostics) == 1
+    payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+    assert payload["reason"] == "failed_to_reacquire_loop_lock"
+    assert payload["failure_result"]["error"] == "boom"
+
+
+def test_fail_fast_stops_scheduling_new_loops(monkeypatch, tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["fail_fast"] = True
+    config["max_concurrent_loops"] = 1
+    for loop_id in ["loop_002", "loop_003"]:
+        loop = json.loads(json.dumps(config["loops"][0]))
+        loop["loop_id"] = loop_id
+        config["loops"].append(loop)
+    started = []
+
+    def fake_run_loop(loop, paths, run_id, artifact_options, json_runner, base_env, process_chain):
+        started.append(loop.loop_id)
+        if loop.loop_id == "loop_001":
+            return {
+                "loop_id": loop.loop_id,
+                "status": "failed",
+                "rounds_completed": 0,
+                "error": "boom",
+                "loop_root": str(paths.loop_root),
+            }
+        return {
+            "loop_id": loop.loop_id,
+            "status": "completed",
+            "rounds_completed": 1,
+            "stop_reason": "",
+            "loop_root": str(paths.loop_root),
+        }
+
+    monkeypatch.setattr(runner_module, "_run_loop", fake_run_loop)
+
+    result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(), base_env={})
+
+    assert started == ["loop_001"]
+    statuses = {loop["loop_id"]: loop["status"] for loop in result["loops"]}
+    assert statuses == {"loop_001": "failed", "loop_002": "skipped", "loop_003": "skipped"}
 
 
 def test_review_envelope_requires_review_payload(tmp_path):

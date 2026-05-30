@@ -152,7 +152,13 @@ def acquire_lock(lock_path: Path, *, run_id: str, loop_id: str | None = None) ->
     try:
         fd = os.open(lock_path, flags, 0o644)
     except FileExistsError as exc:
-        raise LockConflictError(f"lock already exists: {lock_path}") from exc
+        if _recover_dead_process_lock(lock_path):
+            try:
+                fd = os.open(lock_path, flags, 0o644)
+            except FileExistsError as retry_exc:
+                raise LockConflictError(f"lock already exists: {lock_path}") from retry_exc
+        else:
+            raise LockConflictError(f"lock already exists: {lock_path}") from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -197,3 +203,41 @@ def _hostname() -> str:
         return socket.gethostname()
     except OSError:
         return ""
+
+
+def _recover_dead_process_lock(lock_path: Path) -> bool:
+    payload = _read_lock_payload(lock_path)
+    if payload.get("host") != _hostname():
+        return False
+    pid = payload.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if _pid_exists(pid):
+        return False
+    try:
+        lock_path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _read_lock_payload(lock_path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
