@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema import validate as validate_json_schema
+from jsonschema.exceptions import SchemaError as JsonSchemaError
+
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record
 from .host import HostDetection, select_llm_provider
 from .model import resolve_model
@@ -13,6 +17,10 @@ MAX_ATTEMPTS_PER_PROVIDER = 3
 
 
 class LLMTaskError(RuntimeError):
+    pass
+
+
+class LLMOutputValidationError(RuntimeError):
     pass
 
 
@@ -80,6 +88,7 @@ def run_json(
     provider: str = "auto",
     model: str | None = None,
     model_tier: str | None = None,
+    validate_schema: bool = True,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
 ) -> dict[str, Any]:
@@ -98,7 +107,13 @@ def run_json(
         attach_call_record=True,
         env=env,
         process_chain=process_chain,
-        call=lambda selected, config: selected.generate_json(prompt, schema=schema, model=config.model),
+        call=lambda selected, config: _generate_json(
+            selected,
+            prompt,
+            schema=schema,
+            model=config.model,
+            validate_schema=validate_schema,
+        ),
     )
 
 
@@ -181,6 +196,29 @@ def _run_with_retries(
                     )
                 )
     raise LLMTaskError(_failure_message(failures))
+
+
+def _generate_json(
+    selected: Any,
+    prompt: str,
+    *,
+    schema: dict[str, Any] | None,
+    model: str | None,
+    validate_schema: bool,
+) -> dict[str, Any]:
+    result = selected.generate_json(prompt, schema=schema, model=model)
+    if schema is not None and validate_schema:
+        _validate_json_output(result, schema)
+    return result
+
+
+def _validate_json_output(result: dict[str, Any], schema: dict[str, Any]) -> None:
+    try:
+        validate_json_schema(instance=result, schema=schema)
+    except JsonSchemaValidationError as exc:
+        raise LLMOutputValidationError(f"JSON output failed schema validation: {exc.message}") from exc
+    except JsonSchemaError as exc:
+        raise LLMOutputValidationError(f"JSON schema is invalid: {exc.message}") from exc
 
 
 def _call_record(

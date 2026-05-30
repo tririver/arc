@@ -21,6 +21,20 @@ def test_call_tool_dispatches_to_service(monkeypatch):
     assert result == {"ok": True, "data": "arXiv:0911.3380"}
 
 
+def test_call_tool_rejects_missing_paper_id():
+    result = server.call_tool("get_title", {})
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "paper_ids_required"
+
+
+def test_call_tool_rejects_both_paper_id_forms():
+    result = server.call_tool("get_title", {"paper_id": "0911.3380", "paper_ids": ["astro-ph/0610514"]})
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "paper_ids_ambiguous"
+
+
 def test_call_tool_md2pdf_starts_background_job_without_waiting(monkeypatch, tmp_path):
     source = tmp_path / "report.md"
     output = tmp_path / "report.pdf"
@@ -290,6 +304,18 @@ def test_call_tool_search_full_text_defaults_to_one_context_line(monkeypatch):
     result = server.call_tool("search_full_text", {"paper_id": "0911.3380", "query": "scalar exchange"})
 
     assert result["data"]["context"] == 1
+
+
+def test_call_tool_search_full_text_allows_missing_paper_id(monkeypatch):
+    def search_full_text(ids, *, query, refresh=False, limit=20, context=1, case_sensitive=False):
+        return {"ok": True, "data": {"ids": ids, "query": query}}
+
+    monkeypatch.setattr(server.service, "search_full_text", search_full_text)
+
+    result = server.call_tool("search_full_text", {"query": "scalar exchange"})
+
+    assert result["ok"] is True
+    assert result["data"] == {"ids": None, "query": "scalar exchange"}
 
 
 def test_call_tool_paper_ids_safe_dir_name():

@@ -11,6 +11,7 @@ DEFAULT_TEXLIVE_BIN = Path("/usr/local/texlive/2026/bin/x86_64-linux")
 DEFAULT_MARGIN = "1.5cm"
 DEFAULT_MAINFONT = "Noto Sans CJK SC"
 DEFAULT_CJK_MAINFONT = "Noto Sans CJK SC"
+DEFAULT_TIMEOUT_SECONDS = 600.0
 
 
 def default_output_path(input_path: Path) -> Path:
@@ -68,6 +69,7 @@ def convert_markdown_to_pdf(
     mainfont: str = DEFAULT_MAINFONT,
     cjk_mainfont: str = DEFAULT_CJK_MAINFONT,
     resource_paths: list[str | Path] | None = None,
+    timeout_seconds: float | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     source = Path(input_path)
     if not source.exists():
@@ -96,7 +98,25 @@ def convert_markdown_to_pdf(
         cjk_mainfont=cjk_mainfont,
         resource_paths=resources,
     )
-    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    try:
+        timeout = _timeout_seconds(timeout_seconds)
+    except ValueError as exc:
+        return _error("invalid_timeout", str(exc))
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": {
+                "code": "conversion_timeout",
+                "message": "PDF conversion timed out",
+                "timeout_seconds": timeout,
+                "stdout": _timeout_output(exc.output),
+                "stderr": _timeout_output(exc.stderr),
+            },
+            "errors": [],
+            "meta": {"command": command},
+        }
     if result.returncode != 0:
         return {
             "ok": False,
@@ -135,3 +155,20 @@ def convert_markdown_to_pdf(
 
 def _error(code: str, message: str) -> dict[str, Any]:
     return {"ok": False, "error": {"code": code, "message": message}, "errors": [], "meta": {}}
+
+
+def _timeout_seconds(value: float | None) -> float | None:
+    if value is None:
+        return None
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("timeout_seconds must be positive or None")
+    return timeout
+
+
+def _timeout_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)

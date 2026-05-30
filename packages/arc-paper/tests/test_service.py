@@ -29,6 +29,13 @@ def test_paper_ids_safe_dir_name_service():
     assert result["data"] == "0911.3380_x_astro-ph_0610514"
 
 
+def test_paper_query_services_reject_missing_ids():
+    result = service.get_title(None)  # type: ignore[arg-type]
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "paper_ids_required"
+
+
 def test_cache_list_includes_paper_dirs_sources_and_filters_since(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
     write_json(CachePaths.for_paper("0911.3380").inspire_metadata, {"title": "Cached Paper"})

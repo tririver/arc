@@ -12,7 +12,7 @@ from arc_llm.proposers_reviewer_bench.config import (
     load_bench_config,
     materialize_batch_payload,
 )
-from arc_llm.proposers_reviewer_bench.runner import run_proposers_reviewer_bench
+from arc_llm.proposers_reviewer_bench.runner import _score_run, run_proposers_reviewer_bench
 
 
 def base_payload(tmp_path: Path) -> dict[str, Any]:
@@ -73,6 +73,16 @@ def test_bench_config_defaults_materialize_ten_auto_loops(tmp_path):
     assert "suggested_improvement" in reviewer["output_schema"]["properties"]
 
 
+def test_bench_config_rejects_multiple_loop_templates(tmp_path):
+    raw = base_payload(tmp_path)
+    second = json.loads(json.dumps(raw["loops"][0]))
+    second["loop_id"] = "second_seed_loop"
+    raw["loops"].append(second)
+
+    with pytest.raises(ConfigError, match="benchmark configs support exactly one loop template"):
+        load_bench_config(raw)
+
+
 def test_bench_config_accepts_overrides_without_changing_batch_shape(tmp_path):
     raw = base_payload(tmp_path)
     raw["schema_version"] = "arc.llm.proposers_reviewer_bench.config.v1"
@@ -127,6 +137,34 @@ def test_bench_defaults_use_soft_prompt_optimizer_acceptance_thresholds(tmp_path
 
     assert config.options.min_delta == 0.15
     assert config.options.min_z == 0.5
+
+
+def test_score_run_uses_final_round_scores_only(tmp_path):
+    run_root = tmp_path / "bench" / "run_001"
+    review_dir_1 = run_root / "loops" / "idea_001" / "rounds" / "round_001" / "reviews"
+    review_dir_2 = run_root / "loops" / "idea_001" / "rounds" / "round_002" / "reviews"
+    review_dir_1.mkdir(parents=True)
+    review_dir_2.mkdir(parents=True)
+    (review_dir_1 / "reviewer_001.json").write_text(
+        json.dumps({"review_payload": {"marks": {"total_score": 1}}}),
+        encoding="utf-8",
+    )
+    (review_dir_2 / "reviewer_001.json").write_text(
+        json.dumps({"review_payload": {"marks": {"total_score": 10}}}),
+        encoding="utf-8",
+    )
+
+    stats = _score_run(
+        {
+            "run_root": str(run_root),
+            "loops": [{"loop_id": "idea_001", "status": "completed", "rounds_completed": 2}],
+        },
+        score_path="review_payload.marks.total_score",
+    )
+
+    assert stats["n"] == 1
+    assert stats["mean"] == 10.0
+    assert stats["files"] == [str(review_dir_2 / "reviewer_001.json")]
 
 
 def test_apply_improvement_edits_restricts_reviewer_changes_by_default(tmp_path):

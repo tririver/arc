@@ -58,6 +58,9 @@ def load_bench_config(payload: Mapping[str, Any]) -> BenchConfig:
     raw_options = _dict(data.pop("bench", {}), "bench")
     data["schema_version"] = BATCH_CONFIG_SCHEMA
     load_batch_config(data)
+    raw_loops = data.get("loops")
+    if isinstance(raw_loops, list) and len(raw_loops) != 1:
+        raise ConfigError(f"benchmark configs support exactly one loop template; found {len(raw_loops)}")
     return BenchConfig(batch_payload=data, options=_parse_options(raw_options))
 
 

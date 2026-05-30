@@ -40,6 +40,12 @@ def test_model_tier_aliases_can_be_overridden_by_env():
     assert resolve_model("claude-cli", model_tier="low", env=env) == "claude-low-custom"
 
 
+def test_model_tier_aliases_use_process_env_when_env_not_passed(monkeypatch):
+    monkeypatch.setenv("ARC_LLM_CODEX_HIGH_MODEL", "codex-high-from-process-env")
+
+    assert resolve_model("codex-cli", model_tier="high") == "codex-high-from-process-env"
+
+
 def test_explicit_model_tier_is_only_tier_selector():
     assert resolve_model("codex-cli", model_tier="high", env={"ARC_LLM_MODEL_TIER": "low"}) == "gpt-5.5"
 

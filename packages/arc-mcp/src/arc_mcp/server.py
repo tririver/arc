@@ -74,6 +74,7 @@ MD2PDF_TEXLIVE_BIN_DESCRIPTION = (
 MD2PDF_RESOURCE_PATH_DESCRIPTION = (
     "Optional Pandoc resource path entries for resolving relative images and assets."
 )
+MD2PDF_TIMEOUT_DESCRIPTION = "Pandoc/XeLaTeX timeout in seconds. Defaults to 600."
 TRANSLATE_INPUT_DESCRIPTION = "Markdown file to translate."
 TRANSLATE_OUTPUT_DESCRIPTION = "Optional translated Markdown output path. Defaults to input.<target_locale>.md."
 TRANSLATE_TARGET_LANGUAGE_DESCRIPTION = "Target natural language for translation. Defaults to Chinese."
@@ -117,6 +118,7 @@ Md2PdfInput = Annotated[str, Field(description=MD2PDF_INPUT_DESCRIPTION)]
 Md2PdfOutput = Annotated[str | None, Field(description=MD2PDF_OUTPUT_DESCRIPTION)]
 Md2PdfTexliveBin = Annotated[str | None, Field(description=MD2PDF_TEXLIVE_BIN_DESCRIPTION)]
 Md2PdfResourcePath = Annotated[list[str] | None, Field(description=MD2PDF_RESOURCE_PATH_DESCRIPTION)]
+Md2PdfTimeout = Annotated[float, Field(description=MD2PDF_TIMEOUT_DESCRIPTION)]
 TranslateInput = Annotated[str, Field(description=TRANSLATE_INPUT_DESCRIPTION)]
 TranslateOutput = Annotated[str | None, Field(description=TRANSLATE_OUTPUT_DESCRIPTION)]
 TranslateTargetLanguage = Annotated[str, Field(description=TRANSLATE_TARGET_LANGUAGE_DESCRIPTION)]
@@ -137,16 +139,44 @@ ParsedEquationStatus = Annotated[str, Field(description=PARSED_EQUATION_STATUS_D
 ParsedEquationReason = Annotated[str, Field(description=PARSED_EQUATION_REASON_DESCRIPTION)]
 
 
+class ToolInputError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
     try:
         handler = TOOL_HANDLERS[name]
     except KeyError as exc:
         raise ValueError(f"Unknown ARC MCP tool: {name}") from exc
-    return handler(arguments)
+    try:
+        return handler(arguments)
+    except ToolInputError as exc:
+        return _error(exc.code, str(exc))
 
 
 def _paper_ids(args: dict[str, Any]):
-    return args.get("paper_ids") or args.get("paper_id")
+    return _select_paper_ids(args.get("paper_id"), args.get("paper_ids"), required=True)
+
+
+def _optional_paper_ids(args: dict[str, Any]):
+    return _select_paper_ids(args.get("paper_id"), args.get("paper_ids"), required=False)
+
+
+def _select_paper_ids(paper_id: Any = None, paper_ids: Any = None, *, required: bool):
+    has_one = paper_id is not None and str(paper_id).strip() != ""
+    if isinstance(paper_ids, list):
+        has_many = any(str(item).strip() for item in paper_ids)
+    else:
+        has_many = paper_ids is not None
+    if has_one and has_many:
+        raise ToolInputError("paper_ids_ambiguous", "Exactly one of paper_id or paper_ids must be provided.")
+    if not has_one and not has_many:
+        if not required:
+            return None
+        raise ToolInputError("paper_ids_required", "Exactly one of paper_id or paper_ids must be provided.")
+    return paper_ids if has_many else paper_id
 
 
 TOOL_HANDLERS: dict[str, ToolHandler] = {
@@ -178,7 +208,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         refresh=bool(args.get("refresh", False)),
     ),
     "search_full_text": lambda args: service.search_full_text(
-        _paper_ids(args),
+        _optional_paper_ids(args),
         query=str(args.get("query", "")),
         refresh=bool(args.get("refresh", False)),
         limit=int(args.get("limit", 20)),
@@ -262,6 +292,10 @@ def _start_md2pdf_job_response(args: dict[str, Any]) -> dict[str, Any]:
     mainfont = str(args.get("mainfont", typeset_md2pdf.DEFAULT_MAINFONT))
     cjk_mainfont = str(args.get("cjk_mainfont", typeset_md2pdf.DEFAULT_CJK_MAINFONT))
     resource_paths = [Path(str(path)) for path in args.get("resource_path") or []] or None
+    try:
+        timeout_seconds = _optional_float(args.get("timeout_seconds", typeset_md2pdf.DEFAULT_TIMEOUT_SECONDS))
+    except ValueError as exc:
+        return _error("invalid_timeout", str(exc))
 
     payload = {
         "input": str(input_path),
@@ -271,6 +305,7 @@ def _start_md2pdf_job_response(args: dict[str, Any]) -> dict[str, Any]:
         "mainfont": mainfont,
         "cjk_mainfont": cjk_mainfont,
         "resource_path": [str(path) for path in resource_paths or []],
+        "timeout_seconds": timeout_seconds,
         "background": True,
     }
     job_id = MCP_JOBS.start(
@@ -284,6 +319,7 @@ def _start_md2pdf_job_response(args: dict[str, Any]) -> dict[str, Any]:
             mainfont=mainfont,
             cjk_mainfont=cjk_mainfont,
             resource_paths=resource_paths,
+            timeout_seconds=timeout_seconds,
             progress=progress,
             cancel=cancel,
         ),
@@ -306,6 +342,7 @@ def _run_md2pdf_job(
     mainfont: str,
     cjk_mainfont: str,
     resource_paths: list[Path] | None,
+    timeout_seconds: float | None,
     progress: Callable[[dict[str, Any]], None],
     cancel: Callable[[], bool],
 ) -> dict[str, Any]:
@@ -326,6 +363,7 @@ def _run_md2pdf_job(
         mainfont=mainfont,
         cjk_mainfont=cjk_mainfont,
         resource_paths=resource_paths,
+        timeout_seconds=timeout_seconds,
     )
     progress({"event": "md2pdf_completed" if _all_ok(result) else "md2pdf_failed"})
     return result
@@ -488,7 +526,10 @@ def _run_batch_translate_job(
 
 
 def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
-    paper_ids = _paper_ids(args)
+    try:
+        paper_ids = _paper_ids(args)
+    except ToolInputError as exc:
+        return _error(exc.code, str(exc))
     if not bool(args.get("refresh", False)):
         cached = service.get_cached_llm_summary(paper_ids)
         if _all_ok(cached):
@@ -511,6 +552,12 @@ def _error(code: str, message: str) -> dict[str, Any]:
         "errors": [{"code": code, "message": message}],
         "meta": {},
     }
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 def _start_summary_job_response(
@@ -983,7 +1030,18 @@ def main() -> None:
 
 
 def _one_or_many(paper_id: str | None = None, paper_ids: list[str] | None = None):
-    return paper_ids if paper_ids is not None else paper_id
+    return _select_paper_ids(paper_id, paper_ids, required=True)
+
+
+def _optional_one_or_many(paper_id: str | None = None, paper_ids: list[str] | None = None):
+    return _select_paper_ids(paper_id, paper_ids, required=False)
+
+
+def _tool_input_result(call: Callable[[], Any]) -> Any:
+    try:
+        return call()
+    except ToolInputError as exc:
+        return _error(exc.code, str(exc))
 
 
 def _register_tools(app: Any) -> None:
@@ -1006,6 +1064,7 @@ def _register_tools(app: Any) -> None:
             typeset_md2pdf.DEFAULT_CJK_MAINFONT
         ),
         resource_path: Md2PdfResourcePath = None,
+        timeout_seconds: Md2PdfTimeout = typeset_md2pdf.DEFAULT_TIMEOUT_SECONDS,
     ) -> Any:
         return _start_md2pdf_job_response(
             {
@@ -1016,6 +1075,7 @@ def _register_tools(app: Any) -> None:
                 "mainfont": mainfont,
                 "cjk_mainfont": cjk_mainfont,
                 "resource_path": resource_path,
+                "timeout_seconds": timeout_seconds,
             }
         )
 
@@ -1095,7 +1155,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def paper_ids_safe_dir_name(paper_id: PaperId = None, paper_ids: PaperIds = None) -> Any:
-        return service.paper_ids_safe_dir_name(_one_or_many(paper_id, paper_ids))
+        return _tool_input_result(lambda: service.paper_ids_safe_dir_name(_one_or_many(paper_id, paper_ids)))
 
     @app.tool(
         description=(
@@ -1104,7 +1164,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def get_title(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_title(_one_or_many(paper_id, paper_ids), refresh=refresh)
+        return _tool_input_result(lambda: service.get_title(_one_or_many(paper_id, paper_ids), refresh=refresh))
 
     @app.tool(
         description=(
@@ -1113,7 +1173,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def get_abstract(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_abstract(_one_or_many(paper_id, paper_ids), refresh=refresh)
+        return _tool_input_result(lambda: service.get_abstract(_one_or_many(paper_id, paper_ids), refresh=refresh))
 
     @app.tool(
         description=(
@@ -1122,7 +1182,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def get_authors(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_authors(_one_or_many(paper_id, paper_ids), refresh=refresh)
+        return _tool_input_result(lambda: service.get_authors(_one_or_many(paper_id, paper_ids), refresh=refresh))
 
     @app.tool(
         description=(
@@ -1131,7 +1191,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def get_metadata(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_metadata(_one_or_many(paper_id, paper_ids), refresh=refresh)
+        return _tool_input_result(lambda: service.get_metadata(_one_or_many(paper_id, paper_ids), refresh=refresh))
 
     @app.tool(
         description=(
@@ -1146,7 +1206,9 @@ def _register_tools(app: Any) -> None:
         limit: CiterLimit = 1000,
         sort: CiterSort = "mostrecent",
     ) -> Any:
-        return service.get_citers(_one_or_many(paper_id, paper_ids), refresh=refresh, limit=limit, sort=sort)
+        return _tool_input_result(
+            lambda: service.get_citers(_one_or_many(paper_id, paper_ids), refresh=refresh, limit=limit, sort=sort)
+        )
 
     @app.tool(
         description=(
@@ -1155,7 +1217,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def get_citer_count(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_citer_count(_one_or_many(paper_id, paper_ids), refresh=refresh)
+        return _tool_input_result(lambda: service.get_citer_count(_one_or_many(paper_id, paper_ids), refresh=refresh))
 
     @app.tool(
         description=(
@@ -1170,7 +1232,9 @@ def _register_tools(app: Any) -> None:
         refresh: Refresh = False,
         enrich: EnrichReferences = False,
     ) -> Any:
-        return service.get_references(_one_or_many(paper_id, paper_ids), refresh=refresh, enrich=enrich)
+        return _tool_input_result(
+            lambda: service.get_references(_one_or_many(paper_id, paper_ids), refresh=refresh, enrich=enrich)
+        )
 
     @app.tool(
         description=(
@@ -1179,7 +1243,7 @@ def _register_tools(app: Any) -> None:
         )
     )
     def get_toc(paper_id: PaperId = None, paper_ids: PaperIds = None, refresh: Refresh = False) -> Any:
-        return service.get_toc(_one_or_many(paper_id, paper_ids), refresh=refresh)
+        return _tool_input_result(lambda: service.get_toc(_one_or_many(paper_id, paper_ids), refresh=refresh))
 
     @app.tool(
         description=(
@@ -1193,7 +1257,9 @@ def _register_tools(app: Any) -> None:
         paper_ids: PaperIds = None,
         refresh: Refresh = False,
     ) -> Any:
-        return service.get_section(_one_or_many(paper_id, paper_ids), section, refresh=refresh)
+        return _tool_input_result(
+            lambda: service.get_section(_one_or_many(paper_id, paper_ids), section, refresh=refresh)
+        )
 
     @app.tool(
         description=(
@@ -1210,13 +1276,15 @@ def _register_tools(app: Any) -> None:
         context: SearchContext = 1,
         case_sensitive: CaseSensitive = False,
     ) -> Any:
-        return service.search_full_text(
-            _one_or_many(paper_id, paper_ids),
-            query=query,
-            refresh=refresh,
-            limit=limit,
-            context=context,
-            case_sensitive=case_sensitive,
+        return _tool_input_result(
+            lambda: service.search_full_text(
+                _optional_one_or_many(paper_id, paper_ids),
+                query=query,
+                refresh=refresh,
+                limit=limit,
+                context=context,
+                case_sensitive=case_sensitive,
+            )
         )
 
     @app.tool(
@@ -1231,7 +1299,9 @@ def _register_tools(app: Any) -> None:
         paper_ids: PaperIds = None,
         refresh: Refresh = False,
     ) -> Any:
-        return service.get_equation_context(_one_or_many(paper_id, paper_ids), query, refresh=refresh)
+        return _tool_input_result(
+            lambda: service.get_equation_context(_one_or_many(paper_id, paper_ids), query, refresh=refresh)
+        )
 
     @app.tool(
         name="parse",
@@ -1320,13 +1390,15 @@ def _register_tools(app: Any) -> None:
         refresh: Refresh = False,
         background: Background = False,
     ) -> Any:
-        return _start_summary_job_response(
-            _one_or_many(paper_id, paper_ids),
-            provider=provider,
-            model=model,
-            model_tier=model_tier,
-            refresh=refresh,
-            background=background,
+        return _tool_input_result(
+            lambda: _start_summary_job_response(
+                _one_or_many(paper_id, paper_ids),
+                provider=provider,
+                model=model,
+                model_tier=model_tier,
+                refresh=refresh,
+                background=background,
+            )
         )
 
     @app.tool(

@@ -306,18 +306,17 @@ def _call_reviewer_with_validation_retry(
         retry_prompt_path = _retry_artifact_path(prompt_path, retry_number=1) if prompt_path is not None else None
         if save_prompt and retry_prompt_path is not None:
             atomic_write_text(retry_prompt_path, retry_prompt)
-        if prompt_path is not None:
-            atomic_write_json(
-                _validation_error_artifact_path(error_path, retry_number=1),
-                {
-                    "worker_id": worker.id,
-                    "round_number": round_number,
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                    "original_prompt_path": str(prompt_path),
-                    "retry_prompt_path": str(retry_prompt_path) if retry_prompt_path is not None else "",
-                },
-            )
+        atomic_write_json(
+            _validation_error_artifact_path(error_path, retry_number=1),
+            {
+                "worker_id": worker.id,
+                "round_number": round_number,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "original_prompt_path": str(prompt_path) if prompt_path is not None else "",
+                "retry_prompt_path": str(retry_prompt_path) if retry_prompt_path is not None else "",
+            },
+        )
         review_output = _call_json_runner_with_error_artifact(
             json_runner,
             retry_prompt,
@@ -441,9 +440,21 @@ def _validate_review_envelope(review: dict[str, Any], loop: LoopConfig) -> None:
     proposer_messages = review.get("proposer_messages")
     if not isinstance(proposer_messages, dict):
         raise ValueError("review.proposer_messages must be an object")
-    missing = [proposer.id for proposer in loop.proposers if proposer.id not in proposer_messages]
+    expected_ids = {proposer.id for proposer in loop.proposers}
+    actual_ids = {str(proposer_id) for proposer_id in proposer_messages}
+    missing = [proposer.id for proposer in loop.proposers if proposer.id not in actual_ids]
     if missing:
         raise ValueError(f"review.proposer_messages missing: {', '.join(missing)}")
+    extra = sorted(actual_ids - expected_ids)
+    if extra:
+        raise ValueError(f"review.proposer_messages unexpected: {', '.join(extra)}")
+    invalid_messages = sorted(
+        str(proposer_id)
+        for proposer_id, message in proposer_messages.items()
+        if not isinstance(message, dict)
+    )
+    if invalid_messages:
+        raise ValueError(f"review.proposer_messages entries must be objects: {', '.join(invalid_messages)}")
     if not isinstance(review.get("review_payload"), dict):
         raise ValueError("review.review_payload must be an object")
 

@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     md2pdf_parser.add_argument("--margin", default=md2pdf.DEFAULT_MARGIN)
     md2pdf_parser.add_argument("--mainfont", default=md2pdf.DEFAULT_MAINFONT)
     md2pdf_parser.add_argument("--cjk-mainfont", default=md2pdf.DEFAULT_CJK_MAINFONT)
+    md2pdf_parser.add_argument("--timeout-seconds", type=float, default=md2pdf.DEFAULT_TIMEOUT_SECONDS)
     md2pdf_parser.add_argument(
         "--resource-path",
         action="append",
@@ -67,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             mainfont=args.mainfont,
             cjk_mainfont=args.cjk_mainfont,
             resource_paths=[Path(path) for path in args.resource_path] if args.resource_path else None,
+            timeout_seconds=args.timeout_seconds,
         )
         _emit(result, json_output=args.json)
         return 0 if result.get("ok") else 1

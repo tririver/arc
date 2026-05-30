@@ -58,6 +58,17 @@ class FlakyJsonProvider:
         return {**self.result, "model": model}
 
 
+class InvalidJsonProvider:
+    name = "codex-cli"
+
+    def __init__(self):
+        self.attempts = 0
+
+    def generate_json(self, prompt, *, schema=None, model=None):
+        self.attempts += 1
+        return {"ok": "not-a-boolean"}
+
+
 class FlakyTextProvider:
     def __init__(self, *, name, failures_before_success=None):
         self.name = name
@@ -133,6 +144,27 @@ def test_run_json_uses_model_tier_when_exact_model_is_not_set(tmp_path, monkeypa
     )
 
     assert result["model"] == "gpt-5.5"
+
+
+def test_run_json_validates_provider_output_against_schema(monkeypatch):
+    invalid = InvalidJsonProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: invalid)
+
+    with pytest.raises(runner.LLMTaskError, match="JSON output failed schema validation"):
+        run_json(
+            "prompt",
+            provider="codex-cli",
+            schema={
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": False,
+            },
+            env={},
+            process_chain=[],
+        )
+
+    assert invalid.attempts == runner.MAX_ATTEMPTS_PER_PROVIDER
 
 
 def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):

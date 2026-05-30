@@ -29,7 +29,10 @@ def test_arxiv_path_id_rejects_non_arxiv():
 def test_arxiv_path_id_rejects_invalid_arxiv_like_ids():
     assert arxiv_path_id("arXiv:not-a-paper") == ""
     assert arxiv_path_id("https://arxiv.org/abs/foo/1234567") == ""
+    assert arxiv_path_id("1234.5678") == ""
+    assert arxiv_path_id("arXiv:2513.00001") == ""
     assert normalize_paper_id("https://arxiv.org/abs/foo/1234567") == "https://arxiv.org/abs/foo/1234567"
+    assert normalize_paper_id("1234.5678") == "1234.5678"
 
 
 def test_normalize_inspire_recid():
@@ -69,6 +72,10 @@ def test_extract_paper_ids_deduplicates_and_accepts_urls():
     )
 
     assert extract_paper_ids(text) == ["arXiv:hep-th/0601001", "inspire:12345"]
+
+
+def test_extract_paper_ids_rejects_invalid_new_style_months():
+    assert extract_paper_ids("Do not treat 1234.5678 or arXiv:2513.00001 as papers.") == []
 
 
 def test_paper_ids_safe_dir_name():

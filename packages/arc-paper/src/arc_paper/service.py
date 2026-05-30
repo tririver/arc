@@ -1259,7 +1259,9 @@ def _summary_paper_id(requested_id: str, metadata: dict[str, Any]) -> str:
     return normalize_paper_id(requested_id)
 
 
-def _map(ids: str | Iterable[str], func: Callable[[str], dict[str, Any]]):
+def _map(ids: str | Iterable[str] | None, func: Callable[[str], dict[str, Any]]):
+    if ids is None:
+        return err("paper_ids_required", "At least one paper id is required.")
     if isinstance(ids, str):
         return func(normalize_paper_id(ids))
     out: dict[str, dict[str, Any]] = {}

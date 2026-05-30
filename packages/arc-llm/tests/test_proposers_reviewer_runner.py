@@ -413,6 +413,28 @@ def test_review_envelope_requires_review_payload(tmp_path):
     assert "review.review_payload must be an object" in result["loops"][0]["error"]
 
 
+def test_review_envelope_rejects_unexpected_proposer_ids(tmp_path):
+    def reviewer_with_extra_target(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "extra target", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                    "proposer_999": {"message": "not in this loop"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(base_config(tmp_path, max_rounds=1), json_runner=reviewer_with_extra_target, base_env={})
+
+    assert result["status"] == "failed"
+    assert "review.proposer_messages unexpected: proposer_999" in result["loops"][0]["error"]
+
+
 def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_path):
     calls = []
 
@@ -464,6 +486,40 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
     assert review["controller"]["message"] == "valid after retry"
     assert "Previous reviewer response failed validation" not in original_prompt
     assert "Previous reviewer response failed validation" in retry_prompt
+
+
+def test_reviewer_validation_artifact_is_saved_when_prompts_are_disabled(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["artifact_options"] = {"save_prompts": False}
+    calls = 0
+
+    def invalid_then_valid_reviewer(prompt, **kwargs):
+        nonlocal calls
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls += 1
+            if calls == 1:
+                return {"message": "not an envelope"}
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "valid after retry", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid_reviewer, base_env={})
+
+    validation_error = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/errors/reviewer_001.validation_001.json"
+    assert result["status"] == "completed"
+    assert validation_error.exists()
+    payload = json.loads(validation_error.read_text(encoding="utf-8"))
+    assert payload["message"] == "review schema_version must be arc.llm.review_envelope.v1"
+    assert payload["original_prompt_path"] == ""
+    assert payload["retry_prompt_path"] == ""
 
 
 def test_worker_envs_are_isolated_and_os_environ_is_not_mutated(tmp_path, monkeypatch):

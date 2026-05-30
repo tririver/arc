@@ -97,6 +97,53 @@ def test_translate_markdown_preserves_block_newlines_when_llm_drops_them(tmp_pat
     assert text == "# 报告\n\n段落。\n\n## 下一节\n\n- 条目\n"
 
 
+def test_translate_markdown_fails_when_translation_ids_do_not_match(tmp_path: Path) -> None:
+    source = tmp_path / "report.md"
+    source.write_text("First paragraph.\n\nSecond paragraph.\n", encoding="utf-8")
+
+    def fake_json_runner(prompt, *, schema=None, provider="auto", model=None, model_tier=None):
+        if "technical glossary" in prompt:
+            return {"glossary": []}
+        payload = json.loads(prompt.split("BLOCKS_JSON:\n", 1)[1])
+        return {"translations": [{"id": payload["blocks"][0]["id"], "text": "Only first"}]}
+
+    result = translate.translate_markdown(source, convert_pdf=False, json_runner=fake_json_runner)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "translation_output_invalid"
+    assert "missing translation ids" in result["error"]["message"]
+    assert not (tmp_path / "report.zh_CN.md").exists()
+
+
+def test_translate_markdown_preserves_single_line_display_math_and_latex_environments(tmp_path: Path) -> None:
+    source = tmp_path / "report.md"
+    source.write_text(
+        "Intro sentence.\n\n"
+        "$$ E = mc^2 $$\n\n"
+        "\\begin{align}\n"
+        "a &= b \\\\\n"
+        "\\end{align}\n\n"
+        "Done sentence.\n",
+        encoding="utf-8",
+    )
+
+    def fake_json_runner(prompt, *, schema=None, provider="auto", model=None, model_tier=None):
+        if "technical glossary" in prompt:
+            return {"glossary": []}
+        payload = json.loads(prompt.split("BLOCKS_JSON:\n", 1)[1])
+        return {"translations": [{"id": item["id"], "text": f"ZH:{item['text']}"} for item in payload["blocks"]]}
+
+    result = translate.translate_markdown(source, convert_pdf=False, json_runner=fake_json_runner)
+
+    assert result["ok"] is True
+    text = Path(result["data"]["output_markdown_path"]).read_text(encoding="utf-8")
+    assert "ZH:Intro sentence." in text
+    assert "$$ E = mc^2 $$" in text
+    assert "\\begin{align}\na &= b \\\\\n\\end{align}" in text
+    assert "ZH:$$ E = mc^2 $$" not in text
+    assert "ZH:\\begin{align}" not in text
+
+
 def test_normalize_pipe_table_widths_gives_long_text_columns_more_pdf_width() -> None:
     markdown = (
         "| 排名 | 循环 | 标题 |\n"
@@ -146,6 +193,37 @@ def test_translate_markdown_runs_quality_pass_only_when_requested(tmp_path: Path
     assert call_count == 3
     assert Path(result["data"]["output_markdown_path"]).read_text(encoding="utf-8") == "精修\n"
     assert result["data"]["quality_pass"] is True
+
+
+def test_translate_quality_scope_marks_prefix_limited_review(tmp_path: Path) -> None:
+    source = tmp_path / "report.md"
+    source.write_text("A" * 31000 + "\n", encoding="utf-8")
+    call_count = 0
+
+    def fake_json_runner(prompt, *, schema=None, provider="auto", model=None, model_tier=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {"glossary": []}
+        if call_count == 2:
+            payload = json.loads(prompt.split("BLOCKS_JSON:\n", 1)[1])
+            return {"translations": [{"id": item["id"], "text": item["text"]} for item in payload["blocks"]]}
+        return {"revised_markdown": "reviewed\n", "issues": []}
+
+    result = translate.translate_markdown(
+        source,
+        quality=True,
+        convert_pdf=False,
+        json_runner=fake_json_runner,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["quality_scope"] == {
+        "quality_scope": "first_30000_chars_only",
+        "source_chars_checked": 30000,
+        "draft_chars_checked": 30000,
+        "full_document_checked": False,
+    }
 
 
 def test_discover_batch_translation_candidates_requires_matching_md_pdf_and_skips_locale_outputs(tmp_path: Path) -> None:

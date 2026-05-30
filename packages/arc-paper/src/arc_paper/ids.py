@@ -100,9 +100,11 @@ def extract_paper_ids(text: str) -> list[str]:
     for match in DOI_EXTRACT_RE.finditer(source):
         add(match, f"doi:{_normalize_doi(match.group(1))}")
     for match in ARXIV_URL_EXTRACT_RE.finditer(source):
-        add(match, normalize_paper_id(f"arXiv:{match.group(1)}"))
+        if arxiv_id := _normalized_arxiv_id(f"arXiv:{match.group(1)}"):
+            add(match, f"arXiv:{arxiv_id}")
     for match in ARXIV_PREFIX_EXTRACT_RE.finditer(source):
-        add(match, normalize_paper_id(f"arXiv:{match.group(1)}"))
+        if arxiv_id := _normalized_arxiv_id(f"arXiv:{match.group(1)}"):
+            add(match, f"arXiv:{arxiv_id}")
     for match in INSPIRE_URL_EXTRACT_RE.finditer(source):
         add(match, f"inspire:{match.group(1)}")
     for match in INSPIRE_EXTRACT_RE.finditer(source):
@@ -113,13 +115,11 @@ def extract_paper_ids(text: str) -> list[str]:
 
     ambiguous: list[tuple[int, int, str]] = []
     for match in BARE_NEW_STYLE_ARXIV_RE.finditer(remaining):
-        add_ambiguous = normalize_paper_id(match.group(1))
-        if add_ambiguous:
-            ambiguous.append((match.start(), match.end(), add_ambiguous))
+        if arxiv_id := _normalized_arxiv_id(match.group(1)):
+            ambiguous.append((match.start(), match.end(), f"arXiv:{arxiv_id}"))
     for match in BARE_OLD_STYLE_ARXIV_RE.finditer(remaining):
-        add_ambiguous = normalize_paper_id(match.group(1).lower())
-        if add_ambiguous:
-            ambiguous.append((match.start(), match.end(), add_ambiguous))
+        if arxiv_id := _normalized_arxiv_id(match.group(1).lower()):
+            ambiguous.append((match.start(), match.end(), f"arXiv:{arxiv_id}"))
 
     return _dedupe_ids([identifier for _, _, identifier in sorted(clear + _dedupe_matches(ambiguous))])
 
@@ -135,7 +135,7 @@ def _normalized_arxiv_id(identifier: str) -> str:
     if match := ARXIV_URL_RE.search(text):
         return _canonical_arxiv_id(match.group(1))
     if match := NEW_STYLE_ARXIV_RE.match(text):
-        return match.group(1)
+        return match.group(1) if _valid_new_style_arxiv_id(match.group(1)) else ""
     if match := OLD_STYLE_ARXIV_RE.match(text):
         return _canonical_arxiv_id(match.group(1))
     return ""
@@ -143,9 +143,24 @@ def _normalized_arxiv_id(identifier: str) -> str:
 
 def _canonical_arxiv_id(arxiv_id: str) -> str:
     if "/" not in arxiv_id:
-        return arxiv_id
+        return arxiv_id if _valid_new_style_arxiv_id(arxiv_id) else ""
     archive, number = arxiv_id.split("/", 1)
     return f"{archive.lower()}/{number}"
+
+
+def _valid_new_style_arxiv_id(arxiv_id: str) -> bool:
+    match = re.fullmatch(r"(\d{2})(\d{2})\.\d{4,5}", _strip_version(arxiv_id))
+    if not match:
+        return False
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if month < 1 or month > 12:
+        return False
+    if year < 7:
+        return False
+    if year == 7 and month < 4:
+        return False
+    return True
 
 
 def _normalize_doi(value: str) -> str:

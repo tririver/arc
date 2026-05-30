@@ -14,6 +14,18 @@ DEFAULT_TARGET_LANGUAGE = "Chinese"
 DEFAULT_TARGET_LOCALE = "zh_CN"
 DEFAULT_MODEL_TIER = "low"
 DEFAULT_CHUNK_CHARS = 8000
+GLOSSARY_SOURCE_MAX_CHARS = 20000
+QUALITY_MAX_CHARS = 30000
+PROTECTED_LATEX_ENVIRONMENTS = {
+    "equation",
+    "equation*",
+    "align",
+    "align*",
+    "gather",
+    "gather*",
+    "multline",
+    "multline*",
+}
 
 JsonRunner = Callable[..., dict[str, Any]]
 PdfConverter = Callable[..., dict[str, Any]]
@@ -25,6 +37,10 @@ class MarkdownBlock:
     id: str
     text: str
     translatable: bool
+
+
+class TranslationOutputError(ValueError):
+    pass
 
 
 def default_translated_markdown_path(input_path: str | Path, target_locale: str = DEFAULT_TARGET_LOCALE) -> Path:
@@ -75,23 +91,29 @@ def translate_markdown(
         model_tier=model_tier,
         runner=runner,
     )
-    translations = _translate_blocks(
-        blocks,
-        glossary=glossary,
-        target_language=target_language,
-        provider=provider,
-        model=model,
-        model_tier=model_tier,
-        runner=runner,
-        chunk_chars=chunk_chars,
-    )
+    try:
+        translations = _translate_blocks(
+            blocks,
+            glossary=glossary,
+            target_language=target_language,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            runner=runner,
+            chunk_chars=chunk_chars,
+        )
+    except TranslationOutputError as exc:
+        return _error("translation_output_invalid", str(exc))
     translated = render_translated_markdown(blocks, translations)
     quality_issues: list[Any] = []
+    quality_scope: dict[str, Any] | None = None
     if quality:
+        draft_for_quality = translated
+        quality_scope = _quality_scope(markdown, draft_for_quality)
         quality_result = runner(
             _quality_prompt(
                 source_markdown=markdown,
-                draft_markdown=translated,
+                draft_markdown=draft_for_quality,
                 glossary=glossary,
                 target_language=target_language,
             ),
@@ -118,14 +140,32 @@ def translate_markdown(
                     "code": "pdf_conversion_failed",
                     "message": "Markdown was translated, but PDF conversion failed.",
                 },
-                "data": _translation_data(source, output, pdf_output, glossary, quality, quality_issues, pdf_result),
+                "data": _translation_data(
+                    source,
+                    output,
+                    pdf_output,
+                    glossary,
+                    quality,
+                    quality_issues,
+                    pdf_result,
+                    quality_scope=quality_scope,
+                ),
                 "errors": [],
                 "meta": {},
             }
 
     return {
         "ok": True,
-        "data": _translation_data(source, output, pdf_output if convert_pdf else None, glossary, quality, quality_issues, pdf_result),
+        "data": _translation_data(
+            source,
+            output,
+            pdf_output if convert_pdf else None,
+            glossary,
+            quality,
+            quality_issues,
+            pdf_result,
+            quality_scope=quality_scope,
+        ),
         "errors": [],
         "meta": {
             "target_language": target_language,
@@ -285,6 +325,24 @@ def split_markdown_blocks(markdown: str) -> list[MarkdownBlock]:
                 index += 1
             add_block("".join(protected), translatable=False)
             continue
+        if _is_single_line_display_math(stripped):
+            flush_current()
+            add_block(line, translatable=False)
+            index += 1
+            continue
+        if latex_env := _latex_environment_start(stripped):
+            flush_current()
+            protected = [line]
+            index += 1
+            if not _latex_environment_end(stripped, latex_env):
+                while index < len(lines):
+                    protected.append(lines[index])
+                    if _latex_environment_end(lines[index].strip(), latex_env):
+                        index += 1
+                        break
+                    index += 1
+            add_block("".join(protected), translatable=False)
+            continue
         if not stripped:
             flush_current()
             add_block(line, translatable=False)
@@ -396,9 +454,14 @@ def _translate_chunk(
         model_tier=model_tier,
     )
     output: dict[str, str] = {}
+    duplicates: list[str] = []
     for item in result.get("translations") or []:
         if isinstance(item, dict) and "id" in item and "text" in item:
-            output[str(item["id"])] = str(item["text"])
+            item_id = str(item["id"])
+            if item_id in output:
+                duplicates.append(item_id)
+            output[item_id] = str(item["text"])
+    _validate_translation_ids([block.id for block in blocks], output, duplicates=duplicates)
     return output
 
 
@@ -414,7 +477,7 @@ def _glossary_prompt(source_text: str, *, target_language: str) -> str:
         "Preserve symbols, citation keys, equation labels, URLs, code identifiers, paper identifiers, and file paths. "
         "Return only JSON matching the schema.\n\n"
         "SOURCE_MARKDOWN_EXCERPT:\n"
-        f"{source_text[:20000]}"
+        f"{source_text[:GLOSSARY_SOURCE_MAX_CHARS]}"
     )
 
 
@@ -441,8 +504,8 @@ def _quality_prompt(
         "Preserve all Markdown structure, LaTeX math, citations, URLs, code, equation labels, and file paths. "
         "Return the full revised Markdown and a short issue list as JSON.\n\n"
         f"GLOSSARY_JSON:\n{json.dumps({'glossary': glossary}, ensure_ascii=False)}\n\n"
-        f"SOURCE_MARKDOWN:\n{source_markdown[:30000]}\n\n"
-        f"DRAFT_MARKDOWN:\n{draft_markdown[:30000]}"
+        f"SOURCE_MARKDOWN:\n{source_markdown[:QUALITY_MAX_CHARS]}\n\n"
+        f"DRAFT_MARKDOWN:\n{draft_markdown[:QUALITY_MAX_CHARS]}"
     )
 
 
@@ -508,6 +571,7 @@ def _translation_data(
     quality: bool,
     quality_issues: list[Any],
     pdf_result: dict[str, Any] | None,
+    quality_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {
         "input_markdown_path": str(source),
@@ -517,14 +581,64 @@ def _translation_data(
         "quality_issues": quality_issues,
         "glossary": glossary,
     }
+    if quality_scope is not None:
+        data["quality_scope"] = quality_scope
     if pdf_output is not None:
         data["output_pdf_path"] = str(pdf_output)
         data["pdf_result"] = pdf_result
     return data
 
 
+def _quality_scope(source_markdown: str, draft_markdown: str) -> dict[str, Any]:
+    source_checked = min(len(source_markdown), QUALITY_MAX_CHARS)
+    draft_checked = min(len(draft_markdown), QUALITY_MAX_CHARS)
+    full_document_checked = len(source_markdown) <= QUALITY_MAX_CHARS and len(draft_markdown) <= QUALITY_MAX_CHARS
+    return {
+        "quality_scope": "full_document" if full_document_checked else f"first_{QUALITY_MAX_CHARS}_chars_only",
+        "source_chars_checked": source_checked,
+        "draft_chars_checked": draft_checked,
+        "full_document_checked": full_document_checked,
+    }
+
+
 def _is_fence_start(stripped: str) -> bool:
     return stripped.startswith("```") or stripped.startswith("~~~")
+
+
+def _is_single_line_display_math(stripped: str) -> bool:
+    if stripped.startswith("$$") and stripped.endswith("$$") and stripped != "$$":
+        return True
+    return stripped.startswith("\\[") and stripped.endswith("\\]") and stripped != "\\["
+
+
+def _latex_environment_start(stripped: str) -> str:
+    match = re.match(r"^\\begin\{([^}]+)\}", stripped)
+    if not match:
+        return ""
+    env = match.group(1)
+    return env if env in PROTECTED_LATEX_ENVIRONMENTS else ""
+
+
+def _latex_environment_end(stripped: str, env: str) -> bool:
+    return re.search(rf"\\end\{{{re.escape(env)}\}}", stripped) is not None
+
+
+def _validate_translation_ids(expected_ids: list[str], translations: dict[str, str], *, duplicates: list[str]) -> None:
+    expected = set(expected_ids)
+    returned = set(translations)
+    missing = [item for item in expected_ids if item not in returned]
+    extra = sorted(returned - expected)
+    duplicate_ids = sorted(set(duplicates))
+    if not missing and not extra and not duplicate_ids:
+        return
+    parts = []
+    if missing:
+        parts.append(f"missing translation ids: {', '.join(missing)}")
+    if extra:
+        parts.append(f"unexpected translation ids: {', '.join(extra)}")
+    if duplicate_ids:
+        parts.append(f"duplicate translation ids: {', '.join(duplicate_ids)}")
+    raise TranslationOutputError("; ".join(parts))
 
 
 def _preserve_block_boundary(source: str, translated: str) -> str:

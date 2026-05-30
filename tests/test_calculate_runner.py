@@ -97,6 +97,72 @@ def test_calculate_runner_recalculates_only_isolated_wrong_proposer(tmp_path):
     ]
 
 
+def test_human_gate_does_not_preempt_retry_budget_for_retryable_status(tmp_path):
+    runner = load_calculate_runner()
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "unresolved",
+                likely_wrong=["proposer_002"],
+                recalculate=["proposer_002"],
+                action="pause_for_human",
+                requires_human=True,
+            ),
+            calculate_review("all_agree", agreed=["proposer_001", "proposer_002"]),
+        ]
+    )
+
+    result = runner.run_calculation(
+        minimal_config(
+            tmp_path,
+            human_gate={
+                "enabled": True,
+                "pause_on_statuses": ["unresolved"],
+            },
+        ),
+        batch_runner=fake,
+        base_env={},
+    )
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+    assert len(fake.calls) == 2
+
+
+def test_reviewer_feedback_is_available_to_retry_attempt(tmp_path):
+    runner = load_calculate_runner()
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "unresolved",
+                proposer_messages={
+                    "proposer_001": "State the source notation explicitly.",
+                    "proposer_002": "Map the coefficient labels back before final answer.",
+                },
+            ),
+            calculate_review("all_agree", agreed=["proposer_001", "proposer_002"]),
+        ]
+    )
+
+    result = runner.run_calculation(
+        minimal_config(tmp_path),
+        batch_runner=fake,
+        base_env={},
+    )
+
+    assert result["status"] == "completed"
+    retry_context = fake.calls[1]["loops"][0]["caller_context"]["retry_feedback"]
+    assert retry_context[0]["status"] == "unresolved"
+    assert (
+        retry_context[0]["proposer_messages"]["proposer_001"]["message"]
+        == "State the source notation explicitly."
+    )
+    assert (
+        retry_context[0]["proposer_messages"]["proposer_002"]["message"]
+        == "Map the coefficient labels back before final answer."
+    )
+
+
 def test_calculate_runner_blocks_on_reference_disagreement_without_failing_validation(tmp_path):
     runner = load_calculate_runner()
     fake = FakeBatchRunner(
@@ -280,7 +346,11 @@ def calculate_review(
     best_written: str | None = None,
     special_limit_only: bool = False,
     convention_match: bool = True,
+    action: str | None = None,
+    requires_human: bool | None = None,
+    proposer_messages: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    workflow_action = action or ("continue" if status == "all_agree" else "retry")
     consensus = {
         "status": status,
         "accepted_result": {"result": "x"} if status == "all_agree" else None,
@@ -305,17 +375,21 @@ def calculate_review(
             "special_limit_only": special_limit_only,
         },
         "workflow_action": {
-            "action": "continue" if status == "all_agree" else "retry",
-            "requires_human": False,
+            "action": workflow_action,
+            "requires_human": bool(requires_human) if requires_human is not None else False,
             "issue_type": "none" if status == "all_agree" else "calculation_disagreement",
             "reason": "test",
         },
+    }
+    messages = {
+        proposer_id: {"message": message}
+        for proposer_id, message in (proposer_messages or {}).items()
     }
     return {
         "schema_version": "arc.llm.review_envelope.v1",
         "controller": {"message": "done", "stop_requested": False},
         "proposer_messages": {
-            proposer_id: {"message": ""}
+            proposer_id: messages.get(proposer_id, {"message": ""})
             for proposer_id in ["proposer_001", "proposer_002", "proposer_003"]
         },
         "review_payload": {"consensus": consensus},

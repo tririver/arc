@@ -149,7 +149,7 @@ def _score_run(batch_result: Mapping[str, Any], *, score_path: str) -> dict[str,
     scores: list[float] = []
     files: list[str] = []
     if run_root:
-        for path in sorted(run_root.glob("loops/*/rounds/round_*/reviews/*.json")):
+        for path in _score_review_paths(batch_result, run_root):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -171,6 +171,26 @@ def _score_run(batch_result: Mapping[str, Any], *, score_path: str) -> dict[str,
         "se": se,
         "files": files,
     }
+
+
+def _score_review_paths(batch_result: Mapping[str, Any], run_root: Path) -> list[Path]:
+    loops = batch_result.get("loops")
+    if not isinstance(loops, list) or not loops:
+        return sorted(run_root.glob("loops/*/rounds/round_*/reviews/*.json"))
+    paths: list[Path] = []
+    for loop in loops:
+        if not isinstance(loop, Mapping):
+            continue
+        loop_id = str(loop.get("loop_id") or "")
+        try:
+            rounds_completed = int(loop.get("rounds_completed") or 0)
+        except (TypeError, ValueError):
+            rounds_completed = 0
+        if not loop_id or rounds_completed <= 0:
+            continue
+        review_dir = run_root / "loops" / loop_id / "rounds" / f"round_{rounds_completed:03d}" / "reviews"
+        paths.extend(sorted(review_dir.glob("*.json")))
+    return paths
 
 
 def _decision(current: Mapping[str, Any], candidate: Mapping[str, Any], *, min_delta: float, min_z: float) -> dict[str, Any]:

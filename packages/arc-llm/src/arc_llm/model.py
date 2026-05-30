@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Mapping
 
 PROVIDER_MODEL_TIERS = {
@@ -70,8 +71,7 @@ def _model_for_tier(provider_name: str, tier: str, *, env: Mapping[str, str] | N
 
 
 def _model_tier_env_override(provider_name: str, tier: str, *, env: Mapping[str, str] | None) -> str | None:
-    if env is None:
-        return None
+    env = os.environ if env is None else env
     prefix = PROVIDER_MODEL_TIER_ENV_PREFIXES.get(provider_name)
     if not prefix:
         return None

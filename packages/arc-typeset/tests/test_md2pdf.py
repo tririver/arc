@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 
 from arc_typeset import md2pdf
 
@@ -71,9 +72,10 @@ def test_convert_markdown_to_pdf_runs_pandoc_and_returns_output_metadata(monkeyp
 
     monkeypatch.setattr(md2pdf.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
 
-    def fake_run(command, env=None, capture_output=False, text=False):
+    def fake_run(command, env=None, capture_output=False, text=False, timeout=None):
         calls["command"] = command
         calls["env"] = env
+        calls["timeout"] = timeout
         output.write_bytes(b"%PDF test")
         return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
@@ -87,6 +89,7 @@ def test_convert_markdown_to_pdf_runs_pandoc_and_returns_output_metadata(monkeyp
     assert calls["command"][0] == "pandoc"
     assert "--pdf-engine=xelatex" in calls["command"]
     assert calls["env"]["PATH"]
+    assert calls["timeout"] == md2pdf.DEFAULT_TIMEOUT_SECONDS
 
 
 def test_convert_markdown_to_pdf_returns_pandoc_failure(monkeypatch, tmp_path: Path) -> None:
@@ -97,7 +100,7 @@ def test_convert_markdown_to_pdf_returns_pandoc_failure(monkeypatch, tmp_path: P
     monkeypatch.setattr(
         md2pdf.subprocess,
         "run",
-        lambda command, env=None, capture_output=False, text=False: type(
+        lambda command, env=None, capture_output=False, text=False, timeout=None: type(
             "Completed",
             (),
             {"returncode": 43, "stdout": "out", "stderr": "bad math"},
@@ -110,3 +113,26 @@ def test_convert_markdown_to_pdf_returns_pandoc_failure(monkeypatch, tmp_path: P
     assert result["error"]["code"] == "conversion_failed"
     assert result["error"]["returncode"] == 43
     assert result["error"]["stderr"] == "bad math"
+
+
+def test_convert_markdown_to_pdf_times_out_pandoc(monkeypatch, tmp_path: Path) -> None:
+    source = tmp_path / "report.md"
+    source.write_text("# Report\n", encoding="utf-8")
+    calls = {}
+
+    monkeypatch.setattr(md2pdf.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
+
+    def fake_run(command, env=None, capture_output=False, text=False, timeout=None):
+        calls["timeout"] = timeout
+        raise subprocess.TimeoutExpired(command, timeout, output="out", stderr="still running")
+
+    monkeypatch.setattr(md2pdf.subprocess, "run", fake_run)
+
+    result = md2pdf.convert_markdown_to_pdf(source, timeout_seconds=12)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "conversion_timeout"
+    assert result["error"]["timeout_seconds"] == 12
+    assert result["error"]["stdout"] == "out"
+    assert result["error"]["stderr"] == "still running"
+    assert calls["timeout"] == 12
