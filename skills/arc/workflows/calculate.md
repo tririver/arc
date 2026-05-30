@@ -131,6 +131,11 @@ proposed next action. If the block needs human input, ask the exact same
 `Human expert question:` in the user-facing response before ending the turn.
 Limits diagnose; they are not proof.
 
+When a human expert later resolves a blocked calculation item, record the
+resolved prose and equations with a visible blue highlight in user-facing
+Markdown/PDF output. Keep a textual marker such as `Human-resolved` beside the
+colored text so hosts that do not render color still preserve the status.
+
 When a result may help later steps, record it only as a candidate reusable
 result. Promotion to an accepted premise belongs to `plan.md`.
 

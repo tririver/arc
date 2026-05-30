@@ -167,6 +167,13 @@ Step 4: Use `## Source Audit Trail` for every source that shaped the work note:
 paper ids, note paths, sections, equations, commands, MCP tools, URLs, and why
 each source matters.
 
+Step 5: When a previously blocked item is resolved by explicit human expert
+input and promoted into the work note, visually mark the human-resolved prose
+and equations in blue in user-facing Markdown/PDF output. Use renderer-portable
+fallback text such as `Human-resolved` so the meaning remains clear if a host
+does not render color. For PDF-oriented Markdown, raw LaTeX color commands such
+as `\textcolor{blue}{...}` and `{\color{blue} ...}` are acceptable.
+
 ## Phase 4: Version And Export
 
 Step 1: Find the highest existing immutable version:
