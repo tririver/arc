@@ -111,6 +111,23 @@ weak evidence such as formatting agreement, visual similarity, or agreement in
 an undeclared special limit. Depending on the failure, retry, split, pause for
 the expert question, or write a planning request.
 
+If an accepted derivation contradicts a source or reviewer-only reference claim,
+classify the discrepancy before updating the work note:
+
+- `confirmed_source_error`: blind proposers agree, the reviewer agrees, the
+  main agent agrees with the reviewer, the derivation uses only accepted
+  premises, the mismatch is not convention-dependent, and the reviewer says no
+  human convention choice is needed.
+- `likely_source_error`: the derivation probably identifies a source problem,
+  but one of the confirmation requirements is missing or weak.
+- `ambiguous_convention`: the mismatch may be due to convention, normalization,
+  notation, source mapping, or interpretation.
+
+Only `confirmed_source_error` may continue without human interaction. For
+`likely_source_error` or `ambiguous_convention`, pause and ask a
+`Human expert question:` before accepting the result as a premise or updating
+the affected source claim as resolved.
+
 When pausing for a human expert, do not merely say that the workflow paused.
 Write and ask one concrete question under the literal label
 `Human expert question:`. The question must name the step, the unresolved equation or claim, the competing options, and what answer is needed to proceed.
@@ -125,6 +142,13 @@ For an accepted step, update only the current ready-step slot:
 - use main prose for the physics argument
 - use `Journal` for execution facts, consensus paths, attempts, and reviewer
   judgment
+
+For `confirmed_source_error`, mark the affected accepted-result prose and any
+source-disagreement statement in visible red and include the literal marker
+`[Confirmed source issue]`. For PDF-oriented Markdown, raw LaTeX color commands
+such as `\textcolor{red}{...}` and `{\color{red} ...}` are acceptable. Do not
+use the red marker for likely or convention-dependent source mismatches; those
+must remain blocked until the human expert question is answered.
 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and

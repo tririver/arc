@@ -123,13 +123,20 @@ proposer-visible context
 reviewer-only target ids
 expected form without target formula
 acceptance standard
+source-discrepancy handling
 why follows
 ```
 
-At the end of every step, state calculate which quantity, in terms of which quantity, and what is forbidden as input.
-Do not disclose the exact expected expression or expected final formula.
-Ask proposers to derive the target quantity in terms of named dependencies and in a form precise enough for
-reviewer comparison.
+At the end of every step, state calculate which quantity, in terms of which quantity,
+and what is forbidden as input. Do not disclose the exact expected expression
+or expected final formula; ask proposers to derive the target quantity in terms of named dependencies.
+
+For note-check steps that may contradict the source, add
+`source-discrepancy handling`: define `confirmed_source_error` versus
+`likely_source_error` or `ambiguous_convention`. Automatic acceptance requires
+blind proposer, reviewer, and main-agent agreement; accepted premises only; no
+convention dependence; and reviewer judgment that no human convention choice is
+needed.
 
 Step 4: Write deferred work in `## Rough Steps For Later Planning`. Rough-step
 planning records dependency order, likely inputs, risk, and expansion triggers.
@@ -177,28 +184,24 @@ beside the block. If color is stripped or unavailable, the marker remains
 authoritative. For PDF-oriented Markdown, raw LaTeX color commands such as
 `\textcolor{blue}{...}` and `{\color{blue} ...}` are acceptable.
 
+Step 6: For note-check content classified as `confirmed_source_error`, mark the
+affected visible block in red with `[Confirmed source issue]`. Use raw LaTeX
+color when useful. Do not use red for `likely_source_error` or
+`ambiguous_convention`; ask a human expert question before acceptance.
+
 ## Phase 4: Version And Export
-
-Step 1: Find the highest existing immutable version:
+Step 1: Find the highest existing immutable version under
 `<project-dir>/calculate/<run-id>/work-notes/work-note-vNNN.md`.
-
-Step 2: Build final work-note content before writing files. In `## Journal`,
-include a note that background PDF export will be started after mirroring the
-root work note.
-
-Step 3: Write the next version number, starting with
-`work-note-v001.md`. Never overwrite an older version.
-
-Step 4: Replace root `<project-dir>/work-note.md` with the new version content
-as the latest mirror.
-
-Step 5: Call `md2pdf(input="<project-dir>/work-note.md")` in the background.
-Do not wait for PDF completion. If a job id is returned after the immutable
-version was written, record it in host/run logs or the next work-note version;
-do not edit an old `work-note-vNNN.md` solely to add the job id.
+Step 2: Build final content before writing files and note planned PDF export in
+`## Journal`.
+Step 3: Write the next immutable version, starting with `work-note-v001.md`;
+never overwrite an old version.
+Step 4: Mirror it to `<project-dir>/work-note.md`.
+Step 5: Call `md2pdf(input="<project-dir>/work-note.md")` in the background; do not wait.
+Record any job id in host logs or the next work-note version, not by editing an
+old immutable version.
 
 ## Phase 5: Review
-
 Step 1: Review the plan before execution. If the host and workflow permissions
 allow delegation, use an independent reviewer. Otherwise the main agent must
 perform the same review.

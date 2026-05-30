@@ -105,6 +105,14 @@ Use when the request asks to check, verify, audit, or mark work-note premises
 and claims in one or more accessible `.md` or `.pdf` notes. Read and execute
 `workflows/check.md`.
 
+Before leaving Case 3 or sending a final response, read
+`<project-dir>/work-note.md`. If any ready detailed step exists, execute
+`workflows/calculate.md`. If no ready detailed step exists but rough or pending
+coverage remains from the original note-check request, return to
+`workflows/plan.md`. Only stop when requested coverage is complete or a
+workflow stop condition is recorded in `Open Questions` or
+`Calculation Status`.
+
 Case 4: Calculate from an explicit idea.
 If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
 the user to select one concrete idea.

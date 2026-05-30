@@ -323,6 +323,53 @@ def test_reference_disagreement_can_be_scope_or_coverage_mismatch(tmp_path):
     assert "error" not in step
 
 
+def test_all_agree_likely_source_error_blocks_for_human(tmp_path):
+    runner = load_calculate_runner()
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                source_discrepancy_status="likely_source_error",
+                source_discrepancy_confidence_reason="derivation disagrees with source but convention may differ",
+                reviewer_says_no_human_convention_choice_needed=False,
+            )
+        ]
+    )
+
+    result = runner.run_calculation(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "blocked_for_user"
+    step = result["steps"][0]
+    assert step["status"] == "blocked_for_user"
+    assert step["blocked_output"]["trigger_status"] == "all_agree"
+    assert step["blocked_output"]["reason"] == "source_discrepancy_requires_human"
+    assert "Human expert" not in step["blocked_output"]["expert_question"]
+
+
+def test_all_agree_confirmed_source_error_can_continue(tmp_path):
+    runner = load_calculate_runner()
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                source_discrepancy_status="confirmed_source_error",
+                source_discrepancy_confidence_reason=(
+                    "blind proposers agree, reviewer agrees, accepted premises only, "
+                    "not convention-dependent, no human convention choice needed"
+                ),
+                reviewer_says_no_human_convention_choice_needed=True,
+            )
+        ]
+    )
+
+    result = runner.run_calculation(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert result["steps"][0]["status"] == "accepted"
+
+
 def test_calculate_runner_dry_run_does_not_call_batch_runner(tmp_path):
     runner = load_calculate_runner()
     fake = FakeBatchRunner([])
@@ -500,6 +547,9 @@ def calculate_review(
     action: str | None = None,
     requires_human: bool | None = None,
     proposer_messages: dict[str, str] | None = None,
+    source_discrepancy_status: str = "none",
+    source_discrepancy_confidence_reason: str = "no source discrepancy",
+    reviewer_says_no_human_convention_choice_needed: bool = False,
 ) -> dict[str, Any]:
     workflow_action = action or ("continue" if status == "all_agree" else "retry")
     consensus = {
@@ -532,6 +582,13 @@ def calculate_review(
             "requires_human": bool(requires_human) if requires_human is not None else False,
             "issue_type": "none" if status == "all_agree" else "calculation_disagreement",
             "reason": "test",
+        },
+        "source_discrepancy": {
+            "status": source_discrepancy_status,
+            "source_claim": "source claim",
+            "derived_result": "derived result",
+            "confidence_reason": source_discrepancy_confidence_reason,
+            "reviewer_says_no_human_convention_choice_needed": reviewer_says_no_human_convention_choice_needed,
         },
     }
     messages = {
