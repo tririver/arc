@@ -163,6 +163,53 @@ def test_reviewer_feedback_is_available_to_retry_attempt(tmp_path):
     )
 
 
+def test_reference_disagreement_retries_before_human_gate(tmp_path):
+    runner = load_calculate_runner()
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "reference_disagrees",
+                agreed=["proposer_001", "proposer_002"],
+                target_quantity_match=False,
+                accepted_by_reviewer_judgment=False,
+                proposer_messages={
+                    "proposer_001": "Recheck the source momentum label.",
+                    "proposer_002": "Recheck the source momentum label.",
+                },
+            ),
+            calculate_review("all_agree", agreed=["proposer_001", "proposer_002"]),
+        ]
+    )
+
+    result = runner.run_calculation(
+        minimal_config(
+            tmp_path,
+            human_gate={
+                "enabled": True,
+                "pause_on_statuses": ["reference_disagrees"],
+            },
+            steps=[
+                {
+                    "step_id": "blind_ref_eq_001",
+                    "prompt": "derive x",
+                    "reviewer_reference_claim": {"id": "target", "latex": "x"},
+                }
+            ],
+        ),
+        batch_runner=fake,
+        base_env={},
+    )
+
+    assert result["status"] == "completed"
+    assert len(fake.calls) == 2
+    retry_context = fake.calls[1]["loops"][0]["caller_context"]["retry_feedback"]
+    assert retry_context[0]["status"] == "reference_disagrees"
+    assert (
+        retry_context[0]["proposer_messages"]["proposer_001"]["message"]
+        == "Recheck the source momentum label."
+    )
+
+
 def test_calculate_runner_blocks_on_reference_disagreement_without_failing_validation(tmp_path):
     runner = load_calculate_runner()
     fake = FakeBatchRunner(
@@ -171,6 +218,8 @@ def test_calculate_runner_blocks_on_reference_disagreement_without_failing_valid
                 "reference_disagrees",
                 agreed=["proposer_001", "proposer_002"],
                 best_written="proposer_001",
+                target_quantity_match=False,
+                accepted_by_reviewer_judgment=False,
                 special_limit_only=True,
             )
         ]
@@ -179,6 +228,7 @@ def test_calculate_runner_blocks_on_reference_disagreement_without_failing_valid
     result = runner.run_calculation(
         minimal_config(
             tmp_path,
+            max_recalculations=0,
             steps=[
                 {
                     "step_id": "blind_ref_eq_001",
@@ -206,6 +256,7 @@ def test_reference_disagreement_can_be_convention_mismatch(tmp_path):
                 "reference_disagrees",
                 agreed=["proposer_001", "proposer_002"],
                 best_written="proposer_001",
+                accepted_by_reviewer_judgment=False,
                 convention_match=False,
             )
         ]
@@ -214,6 +265,7 @@ def test_reference_disagreement_can_be_convention_mismatch(tmp_path):
     result = runner.run_calculation(
         minimal_config(
             tmp_path,
+            max_recalculations=0,
             steps=[
                 {
                     "step_id": "blind_ref_eq_001",
@@ -345,7 +397,9 @@ def calculate_review(
     recalculate: list[str] | None = None,
     best_written: str | None = None,
     special_limit_only: bool = False,
+    target_quantity_match: bool = True,
     convention_match: bool = True,
+    accepted_by_reviewer_judgment: bool | None = None,
     action: str | None = None,
     requires_human: bool | None = None,
     proposer_messages: dict[str, str] | None = None,
@@ -366,12 +420,14 @@ def calculate_review(
         if status in {"all_agree", "reference_disagrees"}
         else "",
         "agreement_assessment": {
-            "target_quantity_match": True,
+            "target_quantity_match": target_quantity_match,
             "convention_match": convention_match,
             "declared_scope_match": True,
             "agreement_covers_full_target": True,
             "comparison_summary": "explicit algebraic comparison",
-            "accepted_by_reviewer_judgment": True,
+            "accepted_by_reviewer_judgment": bool(
+                status == "all_agree" if accepted_by_reviewer_judgment is None else accepted_by_reviewer_judgment
+            ),
             "special_limit_only": special_limit_only,
         },
         "workflow_action": {

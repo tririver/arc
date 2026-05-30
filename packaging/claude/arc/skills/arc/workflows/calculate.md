@@ -41,6 +41,8 @@ The runner reads worker prompt/schema templates from:
 Do not increase attempts unless the user asks.
 For retryable proposer disagreement statuses, use the recalculation budget
 before pausing for human input.
+Also retry `reference_disagrees` while budget remains when reviewer feedback can
+tell proposers what to recheck without revealing reviewer-only target formulas.
 
 Remove foundation_check mechanics. Starting points are checked by ordinary ready
 steps when they are marked not accepted in the work note.
@@ -65,8 +67,8 @@ step object and disable source tools:
 ```
 
 If blind proposers agree with each other but not with the reviewer reference,
-record `reference_disagrees` and pause unless the mismatch only asks for a
-planning request.
+record `reference_disagrees`; use remaining recalculation budget with
+non-revealing reviewer feedback before pausing for a human decision.
 
 For a post-check new calculation, enable source access by default unless the
 user requested otherwise:
