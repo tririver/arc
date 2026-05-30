@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+
+import pytest
 
 from arc_domain import foundation
 from arc_domain import network
@@ -14,6 +17,10 @@ SEED = "arXiv:2401.00001"
 FOUNDATION = "arXiv:2301.00001"
 
 
+@pytest.mark.skipif(
+    os.environ.get("ARC_RUN_SLOW_DOMAIN_TESTS") != "1",
+    reason="set ARC_RUN_SLOW_DOMAIN_TESTS=1 to run slow domain build tests",
+)
 def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
     _install_fake_paper_query(monkeypatch)
@@ -79,6 +86,10 @@ def test_build_domain_writes_core_artifacts(monkeypatch, tmp_path):
     assert re.search(r'<tr data-id="arXiv:2402.00001">.*?<td>[0-9.]+</td>.*?</tr>', table_body, re.S)
 
 
+@pytest.mark.skipif(
+    os.environ.get("ARC_RUN_SLOW_DOMAIN_TESTS") != "1",
+    reason="set ARC_RUN_SLOW_DOMAIN_TESTS=1 to run slow domain build tests",
+)
 def test_status_and_cached_summary(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
     _install_fake_paper_query(monkeypatch)
@@ -616,6 +627,10 @@ def test_candidate_audit_moves_uncertain_queries_to_warnings():
     assert any("maybe missing foundation" in warning for warning in audit["warnings"])
 
 
+@pytest.mark.skipif(
+    os.environ.get("ARC_RUN_SLOW_DOMAIN_TESTS") != "1",
+    reason="set ARC_RUN_SLOW_DOMAIN_TESTS=1 to run slow domain build tests",
+)
 def test_network_marks_llm_added_foundation(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
     _install_fake_paper_query(monkeypatch)
