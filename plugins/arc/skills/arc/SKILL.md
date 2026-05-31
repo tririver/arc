@@ -84,6 +84,10 @@ Include `automation_level`, `workflow`, `original_request`, `user_intent`,
 `skill_workflow_json_dir`, `seed_paper_list`, `provider`, `model_tier`,
 `workers`, and `refresh`.
 
+Set `provider` to `auto` unless the user pins a provider. Set `model_tier` to
+`medium` unless the user explicitly asks for `low` or `high`. Do not write
+`model_tier: "auto"`; valid tiers are only `low`, `medium`, and `high`.
+
 Use a stable safe `run_id`: lowercase ASCII letters, digits, and underscores,
 for example a short intent slug plus UTC timestamp. Set `skill_dir` to the ARC
 skill directory and `skill_workflow_json_dir` to

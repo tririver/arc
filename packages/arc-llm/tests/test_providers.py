@@ -1,6 +1,8 @@
 import json
 import subprocess
+from pathlib import Path
 
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.providers.base import LLMWorkerError
 from arc_llm.providers.claude_cli import ClaudeCliProvider
 from arc_llm.providers.codex_cli import CodexCliProvider
@@ -41,6 +43,64 @@ def test_codex_generate_json_writes_prompt_to_stdin_and_reads_output(monkeypatch
     assert captured["cmd"][-1] == "-"
     assert captured["input"] == "prompt text"
     assert "prompt text" not in captured["cmd"]
+
+
+def test_codex_provider_writes_provider_safe_schema(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_write_schema_cache_file(schema, *, cache_dir):
+        captured["schema"] = schema
+        path = tmp_path / "schema.json"
+        path.write_text(json.dumps(schema), encoding="utf-8")
+        return path
+
+    def fake_run(cmd, input=None, text=None, stdout=None, stderr=None, env=None, timeout=None):
+        output_index = cmd.index("--output-last-message") + 1
+        Path(cmd[output_index]).write_text('{"ok": true}', encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("arc_llm.providers.codex_cli.write_schema_cache_file", fake_write_schema_cache_file)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    schema = {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {
+            "ok": {"type": "boolean"},
+            ARC_LLM_CALL_RECORD_FIELD: {"type": "object"},
+        },
+    }
+
+    result = CodexCliProvider(env={}).generate_json("prompt", schema=schema, model="m")
+
+    assert result == {"ok": True}
+    assert ARC_LLM_CALL_RECORD_FIELD not in captured["schema"]["properties"]
+    assert captured["schema"]["additionalProperties"] is False
+
+
+def test_codex_generate_json_without_schema_omits_output_schema(monkeypatch):
+    captured = {}
+
+    def fake_write_schema_cache_file(schema, *, cache_dir):
+        raise AssertionError("schema cache should not be used without caller schema")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        output_path = cmd[cmd.index("--output-last-message") + 1]
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump({"ok": True}, handle)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("arc_llm.providers.codex_cli.write_schema_cache_file", fake_write_schema_cache_file)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = CodexCliProvider(env={}).generate_json("prompt text", schema=None, model="test-model")
+
+    assert result == {"ok": True}
+    assert "--output-schema" not in captured["cmd"]
+    assert captured["input"].startswith("prompt text")
+    assert "Return exactly one JSON object" in captured["input"]
 
 
 def test_codex_generate_text_reads_last_message(monkeypatch):

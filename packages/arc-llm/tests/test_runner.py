@@ -1,8 +1,10 @@
 import json
+from copy import deepcopy
 
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, allow_arc_llm_call_record
+from arc_llm.json_schema import to_provider_json_schema
 from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionManager
 from arc_llm.usage import LLMProviderResponse, LLMUsage
@@ -31,6 +33,156 @@ def test_call_record_is_not_added_to_provider_schema():
 
     assert_strict_objects(schema)
     assert ARC_LLM_CALL_RECORD_FIELD not in schema["properties"]
+
+
+def test_provider_schema_strips_arc_llm_call_record_and_required_entry():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["ok", ARC_LLM_CALL_RECORD_FIELD],
+        "properties": {
+            "ok": {"type": "boolean"},
+            ARC_LLM_CALL_RECORD_FIELD: {"type": "object"},
+        },
+    }
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["required"] == ["ok"]
+    assert ARC_LLM_CALL_RECORD_FIELD not in provider_schema["properties"]
+
+
+def test_provider_schema_makes_nested_objects_strict():
+    schema = {
+        "type": "object",
+        "required": ["payload"],
+        "properties": {
+            "payload": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "object", "properties": {"name": {"type": "string"}}},
+                    }
+                },
+            }
+        },
+    }
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["additionalProperties"] is False
+    assert provider_schema["properties"]["payload"]["additionalProperties"] is False
+    item_schema = provider_schema["properties"]["payload"]["properties"]["items"]["items"]
+    assert item_schema["additionalProperties"] is False
+
+
+def test_provider_schema_preserves_explicit_empty_schema():
+    assert to_provider_json_schema({}) == {}
+
+
+def test_provider_schema_overrides_additional_properties_true():
+    schema = {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {"ok": {"type": "boolean"}},
+    }
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["additionalProperties"] is False
+
+
+def test_provider_schema_strips_call_record_from_required_without_properties():
+    schema = {
+        "type": "object",
+        "required": ["ok", ARC_LLM_CALL_RECORD_FIELD],
+    }
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["required"] == ["ok"]
+
+
+def test_provider_schema_preserves_absent_schema():
+    assert to_provider_json_schema(None) is None
+
+
+def test_provider_schema_does_not_mutate_input_schema():
+    schema = {
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["ok", ARC_LLM_CALL_RECORD_FIELD],
+        "properties": {
+            "ok": {"type": "boolean"},
+            ARC_LLM_CALL_RECORD_FIELD: {"type": "object"},
+            "payload": {"type": "object", "properties": {"name": {"type": "string"}}},
+        },
+    }
+    original = deepcopy(schema)
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert schema == original
+    assert provider_schema != schema
+
+
+def test_provider_schema_treats_properties_without_type_as_strict_object():
+    schema = {"properties": {"ok": {"type": "boolean"}}}
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["additionalProperties"] is False
+
+
+def test_provider_schema_does_not_normalize_default_annotation_payloads():
+    default_payload = {
+        "properties": {"x": 1},
+        "nested": {"type": "object", "properties": {"y": 2}},
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "payload": {
+                "type": "object",
+                "default": default_payload,
+                "properties": {"name": {"type": "string"}},
+            }
+        },
+    }
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["properties"]["payload"]["default"] == default_payload
+    assert "additionalProperties" not in provider_schema["properties"]["payload"]["default"]
+    assert "additionalProperties" not in provider_schema["properties"]["payload"]["default"]["nested"]
+
+
+def test_provider_schema_makes_list_valued_items_strict():
+    schema = {
+        "type": "array",
+        "items": [
+            {"type": "object", "properties": {"name": {"type": "string"}}},
+            {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+        ],
+    }
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["items"][0]["additionalProperties"] is False
+    assert provider_schema["items"][1]["additionalProperties"] is False
+
+
+def test_provider_schema_makes_additional_items_schema_strict():
+    schema = {
+        "type": "array",
+        "items": [{"type": "string"}],
+        "additionalItems": {"type": "object", "properties": {"name": {"type": "string"}}},
+    }
+
+    provider_schema = to_provider_json_schema(schema)
+
+    assert provider_schema["additionalItems"]["additionalProperties"] is False
 
 
 def assert_strict_objects(schema):
@@ -76,6 +228,27 @@ class FakeResultProvider:
 
     def generate_json(self, prompt, *, schema=None, model=None):
         return self.generate_json_result(prompt, schema=schema, model=model).value
+
+
+class CapturingSchemaResultProvider:
+    name = "codex-cli"
+
+    def __init__(self):
+        self.schema = None
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        self.schema = deepcopy(schema)
+        return LLMProviderResponse({"ok": True})
 
 
 class FakeTextResultProvider:
@@ -201,10 +374,58 @@ def test_run_json_uses_selected_provider_and_model(tmp_path, monkeypatch):
     )
 
     assert result["prompt"] == "prompt"
-    assert result["schema"] == {"type": "object"}
+    assert result["schema"] == {"type": "object", "additionalProperties": False}
     assert result["model"] == "fast"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["provider_used"] == "codex-cli"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["model_used"] == "fast"
+
+
+def test_run_json_passes_provider_safe_schema_but_preserves_local_validation(monkeypatch):
+    provider = CapturingSchemaResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+    schema = {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {
+            "ok": {"type": "boolean"},
+            ARC_LLM_CALL_RECORD_FIELD: {"type": "object"},
+        },
+        "additionalProperties": False,
+    }
+    original = deepcopy(schema)
+
+    result = run_json(
+        "prompt",
+        schema=schema,
+        provider="codex-cli",
+        model="m",
+        env={},
+        process_chain=[],
+    )
+
+    assert result["ok"] is True
+    assert ARC_LLM_CALL_RECORD_FIELD in result
+    assert provider.schema["properties"] == {"ok": {"type": "boolean"}}
+    assert provider.schema["additionalProperties"] is False
+    assert schema == original
+
+
+def test_run_json_without_schema_passes_none_and_adds_call_record(monkeypatch):
+    provider = CapturingSchemaResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    result = run_json(
+        "prompt",
+        schema=None,
+        provider="codex-cli",
+        model="m",
+        env={},
+        process_chain=[],
+    )
+
+    assert result["ok"] is True
+    assert provider.schema is None
+    assert ARC_LLM_CALL_RECORD_FIELD in result
 
 
 def test_run_json_stateful_records_session_usage_and_call_record(tmp_path, monkeypatch):

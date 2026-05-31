@@ -11,6 +11,7 @@ from jsonschema.exceptions import SchemaError as JsonSchemaError
 
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record
 from .host import HostDetection, select_llm_provider
+from .json_schema import to_provider_json_schema
 from .model import resolve_model
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
@@ -354,19 +355,20 @@ def _generate_json(
     )
     if session_policy == "stateful" and not hasattr(selected, "generate_json_result"):
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
+    provider_schema = to_provider_json_schema(schema)
 
     def call_provider(session: LLMSessionRef | None) -> LLMProviderResponse[dict[str, Any]]:
         if hasattr(selected, "generate_json_result"):
             return selected.generate_json_result(
                 prompt,
-                schema=schema,
+                schema=provider_schema,
                 model=model,
                 session=session,
                 session_policy=session_policy,
                 schema_cache_dir=_schema_cache_dir(artifact_dir),
                 artifact_dir=artifact_dir,
             )
-        return LLMProviderResponse(selected.generate_json(prompt, schema=schema, model=model))
+        return LLMProviderResponse(selected.generate_json(prompt, schema=provider_schema, model=model))
 
     if session_policy == "stateful":
         assert session_manager is not None

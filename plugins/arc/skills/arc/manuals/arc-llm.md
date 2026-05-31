@@ -60,6 +60,10 @@ native session id when available, prompt/schema hashes, and provider usage
 telemetry. Treat this as runtime audit data, not model-generated scientific
 content.
 
+ARC normalizes provider-facing JSON schemas to strict object schemas so they
+stay compatible with Codex structured output. Do not ask workers to generate
+`arc_llm_call_record`; ARC attaches that audit field after provider output.
+
 Direct calls are stateless by default. For a debugging session that should
 reuse host conversation state, pass all session fields explicitly:
 
@@ -195,7 +199,7 @@ global prompt templates.
 
 ## Model Tiers
 
-Prefer `model_tier` for reusable workflows and package configs:
+Prefer `model_tier` for reusable workflows and package configs. Valid values:
 
 ```text
 low
@@ -204,8 +208,10 @@ high
 ```
 
 `arc-llm` maps these tiers to provider-specific model and reasoning defaults.
-When no exact model or tier is set, `arc-llm` defaults to the `medium` tier
-(`gpt-5.4` for the Codex/GPT provider).
+Python API calls with no exact model or tier resolve to `medium`. Workflow
+`context.json` files should write the explicit string `"medium"` so CLI and MCP
+calls never pass an invalid `"auto"` tier.
+`auto` is valid for `provider`, not for `model_tier`.
 Exact model names are advanced overrides for project contexts that intentionally
 pin a provider model. Exact `model` requires explicit `provider`; with
 `provider: auto`, use `model_tier`.

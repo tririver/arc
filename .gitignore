@@ -6,6 +6,7 @@ arc-tests/
 .understandignore
 .understand-anything/
 .claude/
+superpowers/
 
 # Local secrets and provider credentials
 .env

@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
+from arc_llm.json_schema import to_provider_json_schema
 from arc_llm.schema_cache import canonical_json, sha256_text, write_schema_cache_file
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.usage import LLMProviderResponse, LLMUsage
@@ -42,21 +43,23 @@ class CodexCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
     ) -> LLMProviderResponse[dict[str, Any]]:
-        schema = schema or {"type": "object"}
+        provider_schema = to_provider_json_schema(schema)
         stateful = session_policy == "stateful" and session is not None
         with tempfile.TemporaryDirectory(prefix="arc-llm-") as tmp:
             tmpdir = Path(tmp)
             output_path = tmpdir / "output.json"
-            schema_path: Path | None = write_schema_cache_file(
-                schema,
-                cache_dir=schema_cache_dir or _default_schema_cache_dir(self.env),
-            )
+            schema_path: Path | None = None
+            if provider_schema is not None:
+                schema_path = write_schema_cache_file(
+                    provider_schema,
+                    cache_dir=schema_cache_dir or _default_schema_cache_dir(self.env),
+                )
             resume_id = session.native_session_id if stateful else None
-            use_schema = True
-            effective_prompt = prompt
-            if resume_id and not _codex_resume_supports_output_schema(self.env):
+            use_schema = provider_schema is not None
+            effective_prompt = _with_json_object_contract(prompt) if provider_schema is None else prompt
+            if provider_schema is not None and resume_id and not _codex_resume_supports_output_schema(self.env):
                 use_schema = False
-                effective_prompt = _with_json_schema_contract(prompt, schema)
+                effective_prompt = _with_json_schema_contract(prompt, provider_schema)
 
             cmd = _codex_exec_cmd(
                 self.env,
@@ -272,6 +275,14 @@ def _with_json_schema_contract(prompt: str, schema: dict[str, Any]) -> str:
         + "Return exactly one JSON object. Do not wrap it in Markdown. It must conform to this JSON Schema:\n"
         + canonical_json(schema)
         + "\n"
+    )
+
+
+def _with_json_object_contract(prompt: str) -> str:
+    return (
+        prompt.rstrip()
+        + "\n\n## JSON output contract for this turn\n"
+        + "Return exactly one JSON object. Do not wrap it in Markdown.\n"
     )
 
 

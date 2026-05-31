@@ -60,3 +60,30 @@ def test_cli_dispatches_incremental_commands(monkeypatch, capsys):
         "get-graph",
     ]
     assert all(item[1] == "0911.3380" for item in calls)
+
+
+def test_cli_llm_commands_default_model_tier_to_medium(monkeypatch, capsys):
+    calls = []
+
+    def record(seed_paper=None, **kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "data": {}}
+
+    monkeypatch.setattr(cli.service, "build_domain", record)
+
+    assert cli.main(["llm-build", "0911.3380", "--intent", "intent", "--json"]) == 0
+
+    capsys.readouterr()
+    assert calls[0]["model_tier"] == "medium"
+
+
+def test_cli_rejects_auto_model_tier(capsys):
+    try:
+        cli.main(["llm-build", "0911.3380", "--model-tier", "auto", "--json"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected argparse to reject --model-tier auto")
+
+    err = capsys.readouterr().err
+    assert "invalid choice: 'auto'" in err
