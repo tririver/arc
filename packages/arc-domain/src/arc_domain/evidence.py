@@ -35,7 +35,7 @@ def build_evidence_pack(
         }
         for future in as_completed(futures):
             papers.append(future.result())
-    papers.sort(key=lambda item: _role_order(item.get("role", "")))
+    papers.sort(key=lambda item: (_role_order(item.get("role", "")), item.get("paper_id", "")))
     pack = {
         "schema_version": "arc.domain_evidence_pack.v1",
         "domain_id": paths.domain_id,
@@ -94,14 +94,14 @@ def _compact(text: str, limit: int) -> str:
     return text[:limit].rstrip() + "\n[truncated]"
 
 
-def _role_order(role: str) -> tuple[int, str]:
+def _role_order(role: str) -> int:
     order = {
         "selected_foundation": 0,
         "parent_foundation": 1,
         "domain_paper": 2,
         "common_reference": 3,
     }
-    return (order.get(role, 9), role)
+    return order.get(role, 9)
 
 
 def _pack_warnings(papers: list[dict[str, Any]]) -> list[str]:

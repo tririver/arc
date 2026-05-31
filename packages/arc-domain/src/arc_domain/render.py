@@ -326,7 +326,8 @@ def _ranked_row(node: dict[str, Any]) -> str:
 
 def _node_rank_key(node: dict[str, Any]) -> tuple[int, float, int]:
     role_order = {"selected_foundation": 0, "parent_foundation": 1, "common_reference": 2, "domain_paper": 3}
-    score = float(node.get("domain_score") or node.get("support_count") or 0)
+    score_raw = node.get("domain_score")
+    score = float(score_raw if score_raw is not None else (node.get("support_count") or 0))
     citations = int(node.get("citation_count") or 0)
     return (role_order.get(node.get("role"), 9), -score, -citations)
 

@@ -15,6 +15,7 @@ from .schema_cache import sha256_text
 
 
 SessionPolicy = str
+DEFAULT_SESSION_LOCK_TIMEOUT_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -458,12 +459,21 @@ def _file_lock(lock_path: Path) -> Iterator[None]:
         "host": _hostname(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    timeout = _lock_timeout_seconds()
+    started = time.monotonic()
     while True:
         try:
             fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
             break
         except FileExistsError:
-            if not _recover_dead_process_lock(lock_path):
+            if _recover_dead_process_lock(lock_path):
+                continue
+            if timeout is not None:
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout:
+                    raise TimeoutError(_lock_timeout_message(lock_path, timeout))
+                time.sleep(min(0.01, max(timeout - elapsed, 0.001)))
+            else:
                 time.sleep(0.01)
     try:
         with _HELD_FILE_LOCKS_GUARD:
@@ -511,6 +521,32 @@ def _recover_dead_process_lock(lock_path: Path) -> bool:
             return False
     except PermissionError:
         return False
+
+
+def _lock_timeout_seconds() -> float | None:
+    raw = os.environ.get("ARC_LLM_SESSION_LOCK_TIMEOUT_SECONDS")
+    if raw is None:
+        return DEFAULT_SESSION_LOCK_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SESSION_LOCK_TIMEOUT_SECONDS
+    if value <= 0:
+        return None
+    return value
+
+
+def _lock_timeout_message(lock_path: Path, timeout: float) -> str:
+    try:
+        owner = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        owner = {}
+    owner_bits = []
+    for key in ("host", "pid", "thread_id", "created_at"):
+        if owner.get(key) is not None:
+            owner_bits.append(f"{key}={owner[key]}")
+    owner_text = ", ".join(owner_bits) if owner_bits else "owner=unknown"
+    return f"timed out after {timeout:g}s waiting for LLM session lock {lock_path} ({owner_text})"
 
 
 def _append_jsonl(path: Path, item: Any) -> None:

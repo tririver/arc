@@ -6,7 +6,9 @@ import re
 import pytest
 
 from arc_domain import foundation
+from arc_domain import evidence
 from arc_domain import network
+from arc_domain import render
 from arc_domain import service
 from arc_domain import summary as domain_summary
 from arc_domain.cache import DomainPaths, domain_id_for, read_json
@@ -625,6 +627,58 @@ def test_candidate_audit_moves_uncertain_queries_to_warnings():
 
     assert [item["query"] for item in audit["search_queries"]] == ["confident missing foundation"]
     assert any("maybe missing foundation" in warning for warning in audit["warnings"])
+
+
+def test_evidence_pack_sorts_same_role_by_paper_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("sort_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text(
+        """
+        {
+          "foundation_paper": "arXiv:2301.00001",
+          "nodes": [
+            {"paper_id": "arXiv:2301.00003", "role": "domain_paper"},
+            {"paper_id": "arXiv:2301.00001", "role": "selected_foundation"},
+            {"paper_id": "arXiv:2301.00002", "role": "domain_paper"}
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        evidence.paper,
+        "metadata",
+        lambda paper_id, refresh=False: {"paper_id": paper_id, "title": paper_id, "authors": [], "citation_count": 0},
+    )
+    monkeypatch.setattr(
+        evidence.paper,
+        "section",
+        lambda paper_id, selector, refresh=False: {"section_id": selector, "title": selector, "text": "done"},
+    )
+
+    result = evidence.build_evidence_pack(paths=paths, workers=1)
+
+    assert [item["paper_id"] for item in result["evidence_pack"]["papers"]] == [
+        "arXiv:2301.00001",
+        "arXiv:2301.00002",
+        "arXiv:2301.00003",
+    ]
+
+
+def test_render_node_rank_uses_zero_domain_score_not_support_count():
+    high_score = {"role": "domain_paper", "domain_score": 1.0, "support_count": 0, "citation_count": 0}
+    zero_score_with_support = {
+        "role": "domain_paper",
+        "domain_score": 0.0,
+        "support_count": 100,
+        "citation_count": 0,
+    }
+
+    ranked = sorted([zero_score_with_support, high_score], key=render._node_rank_key)  # noqa: SLF001
+
+    assert ranked == [high_score, zero_score_with_support]
 
 
 @pytest.mark.skipif(

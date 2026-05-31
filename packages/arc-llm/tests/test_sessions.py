@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from arc_llm import sessions as sessions_module
 from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
 
 
@@ -49,6 +50,21 @@ def _record_turn_for_process(args):
         native_session_id=None,
     )
     return key
+
+
+def _attempt_lock_for_process(root_text, key, timeout, queue):
+    import os
+    from pathlib import Path
+
+    from arc_llm.sessions import LLMSessionManager
+
+    os.environ["ARC_LLM_SESSION_LOCK_TIMEOUT_SECONDS"] = str(timeout)
+    manager = LLMSessionManager(Path(root_text))
+    try:
+        with manager.lock(key):
+            queue.put("acquired")
+    except TimeoutError as exc:
+        queue.put(f"timeout:{exc}")
 
 
 def test_session_manager_persists_native_id_and_turns(tmp_path):
@@ -143,6 +159,33 @@ def test_session_lock_serializes_threads(tmp_path):
     second.join()
 
     assert events in (["a:enter", "a:exit", "b:enter", "b:exit"], ["b:enter", "b:exit", "a:enter", "a:exit"])
+
+
+def test_session_lock_times_out_on_unrecoverable_foreign_lock(tmp_path):
+    from multiprocessing import get_context
+
+    root = tmp_path / "sessions"
+    key = "blocked"
+    lock_path = root / "locks" / f"{sessions_module._safe_lock_name(key)}.lock"  # noqa: SLF001
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(
+        json.dumps({"pid": 1, "thread_id": 1, "host": "other-host", "created_at": "2026-01-01T00:00:00+00:00"})
+        + "\n",
+        encoding="utf-8",
+    )
+    ctx = get_context()
+    queue = ctx.Queue()
+    process = ctx.Process(target=_attempt_lock_for_process, args=(str(root), key, 0.05, queue))
+
+    process.start()
+    process.join(1)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        pytest.fail("lock acquisition hung instead of timing out")
+
+    assert process.exitcode == 0
+    assert str(queue.get()).startswith("timeout:")
 
 
 def test_locked_turn_serializes_turn_count_across_manager_instances(tmp_path):
