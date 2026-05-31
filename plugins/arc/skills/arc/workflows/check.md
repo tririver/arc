@@ -29,6 +29,13 @@ phase needs behavior outside note parsing and handoff, refer to the owning workf
 Step 1: For local notes or papers, parse accessible sources before checking
 claims:
 
+This phase is a parsing workflow, not a TeX build workflow. Do not run
+`pdflatex`, `latexmk`, `chktex`, or other TeX compilers/linters as part of
+content checking unless the user explicitly asks for build/typesetting QA.
+For TeX/PDF notes, `arc-paper parse` is the required source-ingestion step;
+parsed ARC paper output is the source of truth for sections, equations, line
+anchors, and PDF page anchors.
+
 ```bash
 arc-paper parse --tex NOTE.tex --pdf NOTE.pdf --id NOTE_ID --json
 arc-paper parse --tex NOTE.tex --id NOTE_ID --json
@@ -103,6 +110,8 @@ checking should be represented for reviewers as `reviewer_reference_claim`.
 
 After writing `<project-dir>/initial-note-check.md`, call
 `md2pdf(input="<project-dir>/initial-note-check.md")` in the background. Do not wait for PDF completion.
+This `md2pdf` call applies only to ARC-generated Markdown reports, not to the
+original TeX/PDF note being checked.
 Record any returned job id in host/run logs or later
 work-note journal entries.
 
