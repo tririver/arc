@@ -821,6 +821,17 @@ def test_readme_documents_marketplace_first_install() -> None:
     assert "packaging/claude/arc" not in text
 
 
+def test_readme_does_not_reference_non_repository_local_artifacts() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    unavailable_artifacts = [
+        "0_ref/",
+        "arc-tests/",
+    ]
+
+    for artifact in unavailable_artifacts:
+        assert artifact not in text
+
+
 def test_interaction_reference_allows_portable_typed_fallback() -> None:
     text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8").lower()
 

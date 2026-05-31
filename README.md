@@ -90,8 +90,8 @@ install every package in editable mode:
 git clone <repo-url> arc
 cd arc
 
-python3 -m venv packages/arc-paper/.venv
-. packages/arc-paper/.venv/bin/activate
+python3 -m venv "$HOME/.virtualenvs/arc-dev"
+. "$HOME/.virtualenvs/arc-dev/bin/activate"
 python -m pip install --upgrade pip
 
 python -m pip install -e packages/arc-llm[test]
@@ -469,7 +469,7 @@ validation history before accepting results.
 ARC is cache-first. Repeated calls usually read local JSON/HTML artifacts
 instead of refetching data or rerunning LLM work.
 
-Default checkout cache paths:
+Inside a source checkout, ARC writes generated cache files under:
 
 ```text
 cache/arc-paper/
@@ -477,7 +477,7 @@ cache/arc-domain/
 cache/arc-mcp/
 ```
 
-Outside this checkout, ARC uses:
+Outside a source checkout, ARC uses the user cache directory:
 
 ```text
 ~/.cache/arc/arc-paper/
@@ -554,21 +554,20 @@ arc-domain llm-build <seed-paper> --intent "<same-intent>" --json
 Network integration tests are opt-in because they call external services:
 
 ```bash
-ARC_RUN_NET_TESTS=1 packages/arc-paper/.venv/bin/python -m pytest tests/integration -q
+ARC_RUN_NET_TESTS=1 python -m pytest tests/integration -q
 ```
 
 True LLM integration tests are also opt-in:
 
 ```bash
 ARC_RUN_LLM_TESTS=1 ARC_RUN_NET_TESTS=1 \
-  packages/arc-paper/.venv/bin/python -m pytest \
+  python -m pytest \
   packages/arc-llm/tests/test_proposers_reviewer_llm_integration.py -q
 ```
 
 ## Developer Notes
 
 This repository is organized as Python packages plus thin agent adapters.
-`0_ref/` is read-only reference material and must not be modified.
 
 Package boundaries:
 
@@ -602,8 +601,6 @@ Development rules:
   files.
 - Unit tests must not require network access. Use `ARC_RUN_NET_TESTS=1` only
   for explicit network integration runs.
-- Keep `0_ref/` read-only. Treat `cache/` and `arc-tests/` as generated,
-  reference, or local-test material rather than normal source edits.
 - Durable docs, skills, prompts, schemas, comments, package metadata, and
   workflow files should be written in English unless there is a specific reason
   to do otherwise.
@@ -611,7 +608,7 @@ Development rules:
 Focused test command:
 
 ```bash
-packages/arc-paper/.venv/bin/python -m pytest \
+python -m pytest \
   packages/arc-llm/tests \
   packages/arc-paper/tests \
   packages/arc-domain/tests \
@@ -621,7 +618,7 @@ packages/arc-paper/.venv/bin/python -m pytest \
 Full local suite used by this checkout:
 
 ```bash
-packages/arc-paper/.venv/bin/python -m pytest \
+python -m pytest \
   packages/arc-llm/tests \
   packages/arc-paper/tests \
   packages/arc-domain/tests \
@@ -636,5 +633,5 @@ there are no packaged skill copies to synchronize.
 Useful docs/packaging check:
 
 ```bash
-packages/arc-paper/.venv/bin/python -m pytest tests/test_arc_research_workflow_docs.py -q
+python -m pytest tests/test_arc_research_workflow_docs.py -q
 ```
