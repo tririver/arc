@@ -304,6 +304,7 @@ def runtime_fingerprint(
                 "ARC_CLAUDE_STRICT_MCP_CONFIG",
                 "ARC_CLAUDE_ARC_MCP_COMMAND",
                 "ARC_CLAUDE_ARC_MCP_ARGS_JSON",
+                "ARC_CLAUDE_ARC_MCP_ENV_JSON",
                 "ARC_CLAUDE_ARC_MCP_CONFIG_PATH",
                 "ARC_CLAUDE_TEXT_OUTPUT_FORMAT_JSON",
                 "ARC_CLAUDE_EFFORT",
@@ -319,9 +320,57 @@ def runtime_fingerprint(
         "model": model,
         "model_tier": model_tier,
         "env": interesting,
+        "file_hashes": _runtime_file_hashes(env),
         "process_chain": list(process_chain or []),
     }
     return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _runtime_file_hashes(env: Mapping[str, str]) -> dict[str, list[dict[str, str | None]]]:
+    paths_by_key = {
+        "ARC_CLAUDE_MCP_CONFIG": _newline_paths(env.get("ARC_CLAUDE_MCP_CONFIG")),
+        "ARC_CLAUDE_MCP_CONFIG_JSON": _json_paths(env.get("ARC_CLAUDE_MCP_CONFIG_JSON")),
+        "ARC_CLAUDE_ARC_MCP_CONFIG_PATH": _single_path(env.get("ARC_CLAUDE_ARC_MCP_CONFIG_PATH")),
+    }
+    result: dict[str, list[dict[str, str | None]]] = {}
+    for key, paths in paths_by_key.items():
+        if not paths:
+            continue
+        result[key] = [_file_hash_entry(path) for path in paths]
+    return result
+
+
+def _single_path(value: str | None) -> list[str]:
+    return [value.strip()] if value and value.strip() else []
+
+
+def _newline_paths(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    return [line.strip() for line in value.splitlines() if line.strip()]
+
+
+def _json_paths(value: str | None) -> list[str]:
+    if value is None or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, str) and item.strip()]
+    if isinstance(parsed, str) and parsed.strip():
+        return [parsed.strip()]
+    return []
+
+
+def _file_hash_entry(path_text: str) -> dict[str, str | None]:
+    path = Path(path_text).expanduser()
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"path": str(path), "sha256": None, "error": type(exc).__name__}
+    return {"path": str(path), "sha256": sha256_text(content), "error": None}
 
 
 def _safe_lock_name(key: str) -> str:

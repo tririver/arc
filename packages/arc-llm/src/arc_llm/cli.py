@@ -235,8 +235,11 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
     if args.codex_add_dir:
         overrides["ARC_CODEX_ADD_DIRS"] = json.dumps(args.codex_add_dir, ensure_ascii=False)
     _put(overrides, "ARC_CODEX_ARC_MCP_COMMAND", args.arc_mcp_command)
+    _put(overrides, "ARC_CLAUDE_ARC_MCP_COMMAND", args.arc_mcp_command)
     if args.arc_mcp_env:
-        overrides["ARC_CODEX_ARC_MCP_ENV_JSON"] = json.dumps(_parse_key_value_items(args.arc_mcp_env), ensure_ascii=False)
+        parsed_arc_mcp_env = _parse_key_value_items(args.arc_mcp_env)
+        overrides["ARC_CODEX_ARC_MCP_ENV_JSON"] = json.dumps(parsed_arc_mcp_env, ensure_ascii=False)
+        overrides["ARC_CLAUDE_ARC_MCP_ENV_JSON"] = json.dumps(parsed_arc_mcp_env, ensure_ascii=False)
     if args.codex_config:
         overrides["ARC_CODEX_CONFIG"] = "\n".join(args.codex_config)
     _put(overrides, "ARC_CODEX_REASONING_EFFORT", args.codex_reasoning_effort)

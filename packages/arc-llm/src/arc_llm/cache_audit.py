@@ -185,17 +185,29 @@ def _schema_change_warnings(calls: list[dict[str, Any]]) -> list[dict[str, Any]]
 def _input_tokens_from_usage(usage: Any) -> int:
     if not isinstance(usage, dict):
         return 0
+    if usage.get("total_input_tokens") is not None:
+        return _int(usage.get("total_input_tokens"))
+    if usage.get("cache_creation_input_tokens") is not None or usage.get("cache_read_input_tokens") is not None:
+        return (
+            _int(usage.get("input_tokens"))
+            + _int(usage.get("cache_creation_input_tokens"))
+            + _int(usage.get("cache_read_input_tokens"))
+        )
     if usage.get("input_tokens") is not None:
         return _int(usage.get("input_tokens"))
-    return _int(usage.get("cache_creation_input_tokens")) + _int(usage.get("cache_read_input_tokens"))
+    return 0
 
 
 def _cached_tokens_from_usage(usage: Any) -> int:
     if not isinstance(usage, dict):
         return 0
+    if usage.get("effective_cached_input_tokens") is not None:
+        return _int(usage.get("effective_cached_input_tokens"))
+    if usage.get("cache_creation_input_tokens") is not None or usage.get("cache_read_input_tokens") is not None:
+        return _int(usage.get("cache_read_input_tokens"))
     if usage.get("cached_input_tokens") is not None:
         return _int(usage.get("cached_input_tokens"))
-    return _int(usage.get("cache_read_input_tokens"))
+    return 0
 
 
 def _int(value: Any) -> int:

@@ -1091,8 +1091,23 @@ def _cached_input_ratio(result: dict[str, Any]) -> float | None:
             return float(raw_ratio)
         except (TypeError, ValueError):
             return None
-    input_tokens = usage.get("input_tokens")
-    cached_input_tokens = usage.get("cached_input_tokens")
+    if usage.get("total_input_tokens") is not None:
+        input_tokens = usage.get("total_input_tokens")
+    elif usage.get("cache_creation_input_tokens") is not None or usage.get("cache_read_input_tokens") is not None:
+        input_tokens = (
+            _int(usage.get("input_tokens"))
+            + _int(usage.get("cache_creation_input_tokens"))
+            + _int(usage.get("cache_read_input_tokens"))
+        )
+    else:
+        input_tokens = usage.get("input_tokens")
+
+    if usage.get("effective_cached_input_tokens") is not None:
+        cached_input_tokens = usage.get("effective_cached_input_tokens")
+    elif usage.get("cache_creation_input_tokens") is not None or usage.get("cache_read_input_tokens") is not None:
+        cached_input_tokens = _int(usage.get("cache_read_input_tokens"))
+    else:
+        cached_input_tokens = usage.get("cached_input_tokens")
     if input_tokens is None or cached_input_tokens is None:
         return None
     try:
@@ -1103,6 +1118,13 @@ def _cached_input_ratio(result: dict[str, Any]) -> float | None:
     if input_count <= 0:
         return None
     return cached_count / input_count
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _validate_review_envelope(review: dict[str, Any], loop: LoopConfig) -> None:

@@ -318,6 +318,11 @@ is paired with a session root and session key. Proposers-reviewer workflows use
 stateful delta sessions by default and write cache/session audit data under the
 run artifacts.
 
+Custom `json_runner` wrappers must explicitly declare `session_policy`,
+`session_manager`, `session_key`, `artifact_dir`, `call_label`, and
+`static_prefix` to receive stateful session reuse. A bare `**kwargs` wrapper is
+treated as legacy/stateless by design.
+
 ## MCP Tools And Background Jobs
 
 ARC MCP exposes paper tools, domain tools, job tools, and doctor tools. Tools

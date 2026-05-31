@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
-from arc_llm.schema_cache import canonical_json, write_schema_cache_file
+from arc_llm.schema_cache import canonical_json, sha256_text, write_schema_cache_file
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
@@ -94,6 +94,7 @@ class CodexCliProvider:
                 native_session_id=native_session_id or (session.native_session_id if session else None),
                 raw_events=raw_events,
                 raw_output=result.stdout,
+                prompt_sent_sha256=sha256_text(effective_prompt),
             )
 
     def generate_text(self, prompt: str, *, model: str | None = None) -> str:
@@ -148,6 +149,7 @@ class CodexCliProvider:
                 native_session_id=native_session_id or (session.native_session_id if session else None),
                 raw_events=raw_events,
                 raw_output=result.stdout,
+                prompt_sent_sha256=sha256_text(prompt),
             )
 
 
@@ -373,6 +375,7 @@ def _arc_only_mcp_config_overrides(env: Mapping[str, str]) -> list[tuple[str, st
 
     overrides = [
         ("mcp_servers.arc.command", _toml_string(_arc_mcp_command(env))),
+        ("mcp_servers.arc.required", _toml_bool(True)),
         ("mcp_servers.arc.default_tools_approval_mode", _toml_string("approve")),
     ]
     overrides.extend((f"mcp_servers.arc.env.{key}", _toml_string(value)) for key, value in sorted(mcp_env.items()))

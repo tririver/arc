@@ -118,6 +118,10 @@ turns send the static task context and worker instructions; later turns send
 only current deltas while reusing the same provider session. If a custom
 `json_runner` does not accept session kwargs, the runner falls back to stateless
 full prompts.
+Custom `json_runner` wrappers must explicitly declare `session_policy`,
+`session_manager`, `session_key`, `artifact_dir`, `call_label`, and
+`static_prefix` to receive stateful session reuse. A bare `**kwargs` wrapper is
+treated as legacy/stateless by design.
 
 `artifact_options.save_prompts` defaults to `true`. When enabled, full rendered
 worker prompts, or initial/delta prompt artifacts for stateful runs, are stored

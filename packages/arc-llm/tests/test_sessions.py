@@ -186,3 +186,26 @@ def test_runtime_fingerprint_includes_provider_config_env():
 
     assert codex_config != base
     assert claude_mcp != base
+
+
+def test_runtime_fingerprint_includes_claude_mcp_config_file_contents(tmp_path):
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text('{"mcpServers":{"a":{"command":"a"}}}', encoding="utf-8")
+    first = runtime_fingerprint(
+        provider="claude-cli",
+        model="m",
+        model_tier=None,
+        env={"ARC_CLAUDE_MCP_CONFIG": str(config_path)},
+        process_chain=[],
+    )
+
+    config_path.write_text('{"mcpServers":{"b":{"command":"b"}}}', encoding="utf-8")
+    second = runtime_fingerprint(
+        provider="claude-cli",
+        model="m",
+        model_tier=None,
+        env={"ARC_CLAUDE_MCP_CONFIG": str(config_path)},
+        process_chain=[],
+    )
+
+    assert first != second

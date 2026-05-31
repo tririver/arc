@@ -4,6 +4,7 @@ import subprocess
 from arc_llm.providers.base import LLMWorkerError
 from arc_llm.providers.claude_cli import ClaudeCliProvider
 from arc_llm.providers.codex_cli import CodexCliProvider
+from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionRef
 
 
@@ -172,6 +173,7 @@ def test_codex_stateful_resume_keeps_session_when_schema_probe_fails(monkeypatch
 
     resume_index = captured["cmd"].index("resume")
     assert response.value == {"ok": True}
+    assert response.prompt_sent_sha256 == sha256_text(captured["input"])
     assert captured["cmd"][resume_index + 1] == "thread-123"
     assert "--output-schema" not in captured["cmd"]
     assert "JSON output contract for this turn" in captured["input"]
@@ -304,6 +306,7 @@ def test_codex_arc_only_mcp_keeps_user_config_ignored_and_injects_arc_server(mon
     assert "/tmp/project/skills" in captured["cmd"]
     assert "/tmp/arc-skills" in captured["cmd"]
     assert 'mcp_servers.arc.command="/tmp/arc-mcp"' in captured["cmd"]
+    assert "mcp_servers.arc.required=true" in captured["cmd"]
     assert 'mcp_servers.arc.default_tools_approval_mode="approve"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_AGENT_HOST="codex"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_PAPER_CACHE="/tmp/cache/arc-paper"' in captured["cmd"]
@@ -579,6 +582,8 @@ def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
         env={
             "ARC_CLAUDE_ALLOW_MCP": "true",
             "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "ARC_CLAUDE_ARC_MCP_COMMAND": "/tmp/custom-arc-mcp",
+            "ARC_CLAUDE_ARC_MCP_ENV_JSON": json.dumps({"EXTRA": "value"}),
             "XDG_CACHE_HOME": str(tmp_path / "cache"),
             "ARC_PAPER_CACHE": str(tmp_path / "paper-cache"),
         }
@@ -589,7 +594,8 @@ def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
     payload = json.loads(open(config_path, encoding="utf-8").read())
 
     assert "--strict-mcp-config" in captured["cmd"]
-    assert payload["mcpServers"]["arc"]["command"] == "/tmp/arc-mcp"
+    assert payload["mcpServers"]["arc"]["command"] == "/tmp/custom-arc-mcp"
     assert payload["mcpServers"]["arc"]["args"] == []
     assert payload["mcpServers"]["arc"]["env"]["ARC_AGENT_HOST"] == "claude"
     assert payload["mcpServers"]["arc"]["env"]["ARC_PAPER_CACHE"] == str(tmp_path / "paper-cache")
+    assert payload["mcpServers"]["arc"]["env"]["EXTRA"] == "value"

@@ -49,7 +49,9 @@ def test_runtime_env_merges_cli_llm_options(monkeypatch):
     assert env["ARC_CODEX_WORK_DIR"] == "/tmp/project"
     assert json.loads(env["ARC_CODEX_ADD_DIRS"]) == ["/tmp/project/skills"]
     assert env["ARC_CODEX_ARC_MCP_COMMAND"] == "/tmp/arc-mcp"
+    assert env["ARC_CLAUDE_ARC_MCP_COMMAND"] == "/tmp/arc-mcp"
     assert json.loads(env["ARC_CODEX_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
+    assert json.loads(env["ARC_CLAUDE_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
     assert env["ARC_CODEX_CONFIG"] == 'mcp_servers.arc.command="arc-mcp"'
     assert env["ARC_CLAUDE_EFFORT"] == "medium"
     assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/arc-mcp.json"

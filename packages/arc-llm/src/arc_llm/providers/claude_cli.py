@@ -276,6 +276,14 @@ def _write_arc_only_mcp_config(env: Mapping[str, str]) -> Path:
     for key in ("ARC_PAPER_CACHE", "ARC_DOMAIN_CACHE", "ARC_MCP_CACHE"):
         if value := env.get(key):
             mcp_env[key] = value
+    if raw := env.get("ARC_CLAUDE_ARC_MCP_ENV_JSON"):
+        try:
+            extra_env = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise LLMWorkerError(f"ARC_CLAUDE_ARC_MCP_ENV_JSON was not valid JSON: {exc}") from exc
+        if not isinstance(extra_env, dict) or not all(isinstance(key, str) for key in extra_env):
+            raise LLMWorkerError("ARC_CLAUDE_ARC_MCP_ENV_JSON must be a JSON object with string keys")
+        mcp_env.update({key: str(value) for key, value in extra_env.items()})
     payload = {"mcpServers": {"arc": {"command": command, "args": args, "env": mcp_env}}}
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)

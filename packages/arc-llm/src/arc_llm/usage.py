@@ -18,20 +18,39 @@ class LLMUsage:
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def has_claude_cache_fields(self) -> bool:
+        return self.cache_creation_input_tokens is not None or self.cache_read_input_tokens is not None
+
+    @property
+    def total_input_tokens(self) -> int | None:
+        if self.has_claude_cache_fields:
+            return (
+                (self.input_tokens or 0)
+                + (self.cache_creation_input_tokens or 0)
+                + (self.cache_read_input_tokens or 0)
+            )
+        return self.input_tokens
+
+    @property
+    def effective_cached_input_tokens(self) -> int | None:
+        if self.has_claude_cache_fields:
+            return self.cache_read_input_tokens or 0
+        return self.cached_input_tokens
+
+    @property
     def cached_input_ratio(self) -> float | None:
-        if self.input_tokens and self.cached_input_tokens is not None:
-            return self.cached_input_tokens / max(1, self.input_tokens)
-        total = None
-        if self.cache_creation_input_tokens is not None or self.cache_read_input_tokens is not None:
-            total = (self.cache_creation_input_tokens or 0) + (self.cache_read_input_tokens or 0)
-        if total:
-            return (self.cache_read_input_tokens or 0) / max(1, total)
-        return None
+        total = self.total_input_tokens
+        cached = self.effective_cached_input_tokens
+        if total is None or cached is None or total <= 0:
+            return None
+        return cached / max(1, total)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "input_tokens": self.input_tokens,
+            "total_input_tokens": self.total_input_tokens,
             "cached_input_tokens": self.cached_input_tokens,
+            "effective_cached_input_tokens": self.effective_cached_input_tokens,
             "output_tokens": self.output_tokens,
             "reasoning_output_tokens": self.reasoning_output_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
@@ -48,3 +67,4 @@ class LLMProviderResponse(Generic[T]):
     native_session_id: str | None = None
     raw_events: tuple[dict[str, Any], ...] = ()
     raw_output: str = ""
+    prompt_sent_sha256: str | None = None

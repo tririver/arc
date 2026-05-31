@@ -150,6 +150,32 @@ def test_cache_audit_counts_claude_cache_read_tokens(tmp_path):
     assert result["overall_cached_input_ratio"] == 0.9
 
 
+def test_cache_audit_counts_claude_uncached_input_with_cache_fields(tmp_path):
+    run_root = tmp_path / "run"
+    sessions = run_root / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "calls.jsonl").write_text(
+        json.dumps(
+            {
+                "provider_used": "claude-cli",
+                "usage": {
+                    "input_tokens": 11,
+                    "cache_creation_input_tokens": 1,
+                    "cache_read_input_tokens": 8,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = audit_run(run_root)
+
+    assert result["total_input_tokens"] == 20
+    assert result["total_cached_input_tokens"] == 8
+    assert result["overall_cached_input_ratio"] == 0.4
+
+
 def test_cache_audit_reports_schema_changes_inside_session(tmp_path):
     run_root = tmp_path / "run"
     sessions = run_root / "sessions"

@@ -264,8 +264,11 @@ def test_worker_env_maps_arc_only_mcp_and_codex_filesystem_options():
 
     assert env["ARC_CODEX_ENABLE_MCP"] == "true"
     assert env["ARC_CODEX_MCP_MODE"] == "arc-only"
+    assert env["ARC_CLAUDE_MCP_MODE"] == "arc-only"
     assert env["ARC_CODEX_ARC_MCP_COMMAND"] == "/tmp/arc-mcp"
+    assert env["ARC_CLAUDE_ARC_MCP_COMMAND"] == "/tmp/arc-mcp"
     assert json.loads(env["ARC_CODEX_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
+    assert json.loads(env["ARC_CLAUDE_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
     assert env["ARC_CODEX_WORK_DIR"] == "/tmp/project"
     assert json.loads(env["ARC_CODEX_ADD_DIRS"]) == ["/tmp/project/skills", "/tmp/arc-skills"]
 

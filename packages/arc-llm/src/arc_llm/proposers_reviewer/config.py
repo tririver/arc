@@ -184,6 +184,8 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
     _put_path_list(env, "ARC_CODEX_ADD_DIRS", runtime.get("codex_add_dirs"))
     _put(env, "ARC_CODEX_ARC_MCP_COMMAND", runtime.get("arc_mcp_command"))
     _put_json_object(env, "ARC_CODEX_ARC_MCP_ENV_JSON", runtime.get("arc_mcp_env"))
+    _put(env, "ARC_CLAUDE_ARC_MCP_COMMAND", runtime.get("arc_mcp_command"))
+    _put_json_object(env, "ARC_CLAUDE_ARC_MCP_ENV_JSON", runtime.get("arc_mcp_env"))
     _put(env, "ARC_CODEX_REASONING_EFFORT", runtime.get("codex_reasoning_effort"))
     _put(env, "ARC_CODEX_REASONING_SUMMARY", runtime.get("codex_reasoning_summary"))
     _put(env, "ARC_CODEX_MODEL_VERBOSITY", runtime.get("codex_model_verbosity"))

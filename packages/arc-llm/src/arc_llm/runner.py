@@ -381,6 +381,7 @@ def _generate_json(
         ) as (session, _turn_count):
             response = call_provider(session)
             result = response.value
+            prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
             native_session_id = response.native_session_id
             if native_session_id:
                 session_manager.update_native_session_id(session.key, native_session_id)
@@ -388,7 +389,7 @@ def _generate_json(
             session_manager.record_turn(
                 session.key,
                 call_label=call_label or "",
-                prompt_sha256=sha256_text(prompt),
+                prompt_sha256=prompt_sha,
                 static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
                 schema_sha256=schema_hash(schema),
                 usage=response.usage.to_json(),
@@ -406,6 +407,7 @@ def _generate_json(
         if schema is not None and validate_schema:
             _validate_json_output(result, schema)
         native_session_id = response.native_session_id
+        prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
     return LLMCallOutcome(
         value=result,
         usage=response.usage,
@@ -413,7 +415,7 @@ def _generate_json(
         session_policy=session_policy,
         session_key=session.key if session else None,
         call_label=call_label,
-        prompt_sha256=sha256_text(prompt),
+        prompt_sha256=prompt_sha,
         static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
         schema_sha256=schema_hash(schema),
         runtime_fingerprint=runtime_fp,
@@ -471,13 +473,14 @@ def _generate_text(
             metadata=session_metadata,
         ) as (session, _turn_count):
             response = call_provider(session)
+            prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
             if response.native_session_id:
                 session_manager.update_native_session_id(session.key, response.native_session_id)
             recorded_native_session_id = response.native_session_id or session.native_session_id
             session_manager.record_turn(
                 session.key,
                 call_label=call_label or "",
-                prompt_sha256=sha256_text(prompt),
+                prompt_sha256=prompt_sha,
                 static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
                 schema_sha256=None,
                 usage=response.usage.to_json(),
@@ -489,6 +492,7 @@ def _generate_text(
     else:
         session = None
         response = call_provider(None)
+        prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
     return LLMCallOutcome(
         value=response.value,
         usage=response.usage,
@@ -496,7 +500,7 @@ def _generate_text(
         session_policy=session_policy,
         session_key=session.key if session else None,
         call_label=call_label,
-        prompt_sha256=sha256_text(prompt),
+        prompt_sha256=prompt_sha,
         static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
         schema_sha256=None,
         runtime_fingerprint=runtime_fp,

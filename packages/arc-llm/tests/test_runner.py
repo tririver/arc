@@ -97,6 +97,27 @@ class FakeTextResultProvider:
         )
 
 
+class PromptHashResultProvider:
+    name = "codex-cli"
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        return LLMProviderResponse(
+            {"ok": True},
+            native_session_id="native-123" if session_policy == "stateful" else None,
+            prompt_sent_sha256=sha256_text(f"{prompt}\nprovider contract"),
+        )
+
+
 class InvalidThenValidResultProvider:
     name = "codex-cli"
 
@@ -237,6 +258,30 @@ def test_run_json_stateful_records_static_prefix(tmp_path, monkeypatch):
 
     assert result[ARC_LLM_CALL_RECORD_FIELD]["static_prefix_sha256"] == sha256_text("stable prefix")
     assert call["static_prefix_sha256"] == sha256_text("stable prefix")
+
+
+def test_run_json_records_provider_prompt_hash_when_prompt_is_rewritten(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: PromptHashResultProvider())
+    manager = LLMSessionManager(tmp_path / "sessions")
+
+    result = run_json(
+        "prompt",
+        schema={"type": "object"},
+        model="fast",
+        provider="codex-cli",
+        env={},
+        process_chain=[],
+        session_policy="stateful",
+        session_manager=manager,
+        session_key="scope/proposer/proposer_001",
+        call_label="round_001/proposer_001",
+    )
+
+    expected = sha256_text("prompt\nprovider contract")
+    call = json.loads((tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8"))
+
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["prompt_sha256"] == expected
+    assert call["prompt_sha256"] == expected
 
 
 def test_run_json_stateful_does_not_retry_after_invalid_output(tmp_path, monkeypatch):
