@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,13 @@ from typing import Any, Callable, Mapping
 
 from arc_llm.proposers_reviewer.artifacts import atomic_write_json, atomic_write_text
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
+from arc_llm.proposers_reviewer.template_materializer import (
+    deep_merge,
+    materialize_batch,
+    materialize_loop,
+    materialize_worker,
+    replace_placeholders,
+)
 
 from ideas_config import ConfigError, IdeasConfig, VariantConfig, load_ideas_config
 from ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema, normalized_marks
@@ -76,7 +84,7 @@ def run_ideas(
             base_env=base_env,
             process_chain=process_chain,
             dry_run=False,
-            max_concurrent_loops=len(ideas),
+            max_concurrent_loops=min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12"))),
         )
     except Exception as exc:
         batch_result = {
@@ -122,8 +130,8 @@ def _result(
         "proposal_count": len(ideas),
         "reviewer_call_count": loop_reviewer_call_count,
         "loop_reviewer_call_count": loop_reviewer_call_count,
-        "max_concurrent_loops": len(ideas),
-        "max_concurrent_proposal_calls": len(ideas),
+        "max_concurrent_loops": min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12"))),
+        "max_concurrent_proposal_calls": min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12"))),
         "batch_config_path": str(batch_config_path),
         "warnings_path": str(warnings_path),
         "loops": [_loop_summary(idea, batch_run_root=batch_run_root) for idea in ideas],
@@ -155,7 +163,7 @@ def _caller_context(config: IdeasConfig, *, variant: VariantConfig, idea_id: str
     caller_context = copy.deepcopy(loop_template.get("caller_context", {}))
     if not isinstance(caller_context, dict):
         raise ConfigError(f"{variant.loop_template}.caller_context must be an object")
-    caller_context = _replace_placeholders(caller_context, {"<user_intent>": config.user_intent})
+    caller_context = replace_placeholders(caller_context, {"<user_intent>": config.user_intent})
     caller_context["user_intent"] = config.user_intent
     caller_context["variant_id"] = variant.variant_id
     caller_context["idea_id"] = idea_id
@@ -173,41 +181,52 @@ def _caller_context(config: IdeasConfig, *, variant: VariantConfig, idea_id: str
 
 
 def _loop_batch_config(config: IdeasConfig, ideas: list[IdeaPlan], *, run_root: Path) -> dict[str, Any]:
-    return {
-        "schema_version": "arc.llm.proposers_reviewer_batch.config.v1",
-        "run_id": "idea_loops",
-        "run_dir": str(run_root),
-        "max_concurrent_loops": len(ideas),
-        "artifact_options": {"save_prompts": config.save_prompts},
-        "loops": [_idea_loop_payload(idea) for idea in ideas],
-    }
+    max_concurrent = min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12")))
+    return materialize_batch(
+        run_id="idea_loops",
+        run_dir=run_root,
+        max_concurrent_loops=max_concurrent,
+        artifact_options={"save_prompts": config.save_prompts},
+        session={
+            "policy": "stateful",
+            "history_mode": "delta",
+            "max_concurrent_same_prefix": 12,
+            "cache_guard": {
+                "enabled": True,
+                "mode": "warn",
+                "warmup_calls": 1,
+                "min_cached_input_ratio": 0.70,
+            },
+        },
+        loops=[_idea_loop_payload(idea) for idea in ideas],
+    )
 
 
 def _idea_loop_payload(idea: IdeaPlan) -> dict[str, Any]:
-    loop = copy.deepcopy(_read_json(idea.variant.loop_template))
-    loop["loop_id"] = idea.loop_id
-    loop["caller_context"] = copy.deepcopy(idea.caller_context)
-    loop["proposers"] = [_proposer_payload(idea.variant)]
-    loop["reviewers"] = [_loop_reviewer_payload(idea.variant)]
-    return loop
+    return materialize_loop(
+        _read_json(idea.variant.loop_template),
+        loop_id=idea.loop_id,
+        caller_context=idea.caller_context,
+        proposers=[_proposer_payload(idea.variant)],
+        reviewers=[_loop_reviewer_payload(idea.variant)],
+        cache_context={
+            "static_caller_context_keys": [
+                "user_intent",
+                "domain_markdown_files",
+                "arc_paper_tool_notes",
+                "marking_scheme",
+            ],
+            "volatile_caller_context_keys": ["idea_id", "variant_id"],
+        },
+    )
 
 
 def _proposer_payload(variant: VariantConfig) -> dict[str, Any]:
-    return _merged_worker_payload(_read_json(variant.proposer_template), variant.proposer_overrides)
+    return materialize_worker(_read_json(variant.proposer_template), overrides=variant.proposer_overrides)
 
 
 def _merged_worker_payload(template: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(dict(template))
-    for key, value in overrides.items():
-        if key in {"runtime", "prompt"}:
-            target = merged.setdefault(key, {})
-            if not isinstance(target, dict):
-                target = {}
-            target.update(value if isinstance(value, dict) else {})
-            merged[key] = target
-        else:
-            merged[key] = value
-    return merged
+    return deep_merge(template, overrides)
 
 
 def _loop_reviewer_payload(variant: VariantConfig) -> dict[str, Any]:

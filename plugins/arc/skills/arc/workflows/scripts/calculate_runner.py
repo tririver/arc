@@ -397,6 +397,14 @@ def _attempt_batch_config(
         "run_id": attempt_id,
         "run_dir": str(run_root / "attempt_batches"),
         "max_concurrent_loops": 1,
+        "session": {
+            "policy": "stateful",
+            "history_mode": "delta",
+            "scope_id": f"calculate/{config.run_id}/{step.step_id}",
+            "reuse_across_batch_calls": True,
+            "max_concurrent_same_prefix": 4,
+            "root": str(run_root / "llm_sessions"),
+        },
         "artifact_options": {"save_prompts": bool(config.artifact_options.get("save_prompts", True))},
         "defaults": copy.deepcopy(config.defaults),
         "loops": [
@@ -405,6 +413,24 @@ def _attempt_batch_config(
                 "max_rounds": 1,
                 "early_stop": {"enabled": False},
                 "caller_context": caller_context,
+                "cache_context": {
+                    "static_caller_context_keys": [
+                        "step_id",
+                        "step_kind",
+                        "step_prompt",
+                        "allowed_context",
+                        "accepted_prior_step_outputs",
+                        "max_recalculations",
+                        "integrity_reference",
+                        "consensus_instruction",
+                    ],
+                    "volatile_caller_context_keys": [
+                        "attempt_number",
+                        "active_proposer_ids",
+                        "locked_outputs",
+                        "retry_feedback",
+                    ],
+                },
                 "proposers": [
                     _proposer_config(
                         config,

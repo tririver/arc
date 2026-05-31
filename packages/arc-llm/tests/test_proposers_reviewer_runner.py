@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.proposers_reviewer import runner as runner_module
 from arc_llm.proposers_reviewer.artifacts import RunPaths, acquire_lock, atomic_write_json
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
@@ -17,6 +18,7 @@ def base_config(tmp_path: Path, *, max_rounds: int = 2, early_stop: bool = False
         "run_id": "run_001",
         "run_dir": str(tmp_path / "ideas"),
         "max_concurrent_loops": 2,
+        "session": {"policy": "stateless", "history_mode": "full"},
         "defaults": {"provider": "manual", "model": "fake-model"},
         "loops": [
             {
@@ -422,7 +424,7 @@ def test_fail_fast_stops_scheduling_new_loops(monkeypatch, tmp_path):
         config["loops"].append(loop)
     started = []
 
-    def fake_run_loop(loop, paths, run_id, artifact_options, json_runner, base_env, process_chain):
+    def fake_run_loop(loop, paths, run_id, artifact_options, *args):
         started.append(loop.loop_id)
         if loop.loop_id == "loop_001":
             return {
@@ -639,6 +641,227 @@ def test_custom_json_runner_receives_process_chain_when_supported(tmp_path):
 
     assert calls
     assert {tuple(call["process_chain"]) for call in calls} == {("codex", "bash")}
+
+
+def test_stateful_runner_uses_initial_then_delta_prompts_and_stable_session_keys(tmp_path):
+    config = base_config(tmp_path, max_rounds=2)
+    config["session"] = {"policy": "stateful", "history_mode": "delta", "max_concurrent_same_prefix": 2}
+    calls: list[dict[str, Any]] = []
+
+    def fake(prompt, *, schema, provider, model, model_tier=None, env, session_policy, session_key, call_label, **kwargs):
+        calls.append(
+            {
+                "prompt": prompt,
+                "session_policy": session_policy,
+                "session_key": session_key,
+                "call_label": call_label,
+            }
+        )
+        if "/reviewer/" in session_key:
+            round_number = 1 if "round_001" in call_label else 2
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": f"reviewed {round_number}", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": f"revise p1 {round_number}"},
+                    "proposer_002": {"message": f"revise p2 {round_number}"},
+                },
+                "review_payload": {"round": round_number},
+            }
+        worker_id = "proposer_001" if session_key.endswith("/proposer_001") else "proposer_002"
+        round_number = 1 if "round_001" in call_label else 2
+        return {"worker_id": worker_id, "round": round_number, "content": f"output-from-{worker_id}-round-{round_number}"}
+
+    result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    run_root = tmp_path / "ideas" / "run_001"
+    p1_calls = [call for call in calls if call["session_key"].endswith("/proposer/proposer_001")]
+    reviewer_calls = [call for call in calls if call["session_key"].endswith("/reviewer/reviewer_001")]
+    round2_p1_prompt = p1_calls[1]["prompt"]
+    round2_context = json.loads(
+        (run_root / "loops/loop_001/rounds/round_002/context/proposer_001.json").read_text(encoding="utf-8")
+    )
+
+    assert result["status"] == "completed"
+    assert len(p1_calls) == 2
+    assert {call["session_key"] for call in p1_calls} == {"run_001/loop_001/proposer/proposer_001"}
+    assert {call["session_key"] for call in reviewer_calls} == {"run_001/loop_001/reviewer/reviewer_001"}
+    assert "## ARC-LLM Worker Session ABI v2" in p1_calls[0]["prompt"]
+    assert "## ARC-LLM Worker Delta Turn v2" in round2_p1_prompt
+    assert "output-from-proposer_002-round-1" not in round2_p1_prompt
+    assert "revise p1 1" in round2_p1_prompt
+    assert round2_context["turn_kind"] == "delta"
+    assert round2_context["session_key"] == "run_001/loop_001/proposer/proposer_001"
+
+
+def test_non_reuse_scope_id_still_isolates_sessions_by_loop(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["session"] = {"policy": "stateful", "history_mode": "delta", "scope_id": "bench/run/current"}
+    second_loop = json.loads(json.dumps(config["loops"][0]))
+    second_loop["loop_id"] = "loop_002"
+    config["loops"].append(second_loop)
+    session_keys = set()
+
+    def fake(prompt, *, schema, provider, model, model_tier=None, env, session_policy, session_key, call_label, **kwargs):
+        session_keys.add(session_key)
+        if "/reviewer/" in session_key:
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert "bench/run/current/loop_001/proposer/proposer_001" in session_keys
+    assert "bench/run/current/loop_002/proposer/proposer_001" in session_keys
+    assert "bench/run/current/proposer/proposer_001" not in session_keys
+
+
+def test_loop_session_root_is_used_for_stateful_turn_records(tmp_path):
+    shared_root = tmp_path / "shared_sessions"
+    config = base_config(tmp_path, max_rounds=1)
+    config["session"] = {"policy": "stateless", "history_mode": "full"}
+    config["loops"][0]["session"] = {
+        "policy": "stateful",
+        "history_mode": "delta",
+        "scope_id": "shared/scope",
+        "reuse_across_batch_calls": True,
+        "root": str(shared_root),
+    }
+
+    def fake(prompt, *, schema, provider, model, model_tier=None, env, session_policy, session_key, call_label, **kwargs):
+        if "/reviewer/" in session_key:
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert (shared_root / "calls.jsonl").exists()
+    assert not (tmp_path / "ideas/run_001/sessions/calls.jsonl").exists()
+
+
+def test_custom_json_runner_with_var_kwargs_uses_legacy_full_prompts_by_default(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config.pop("session")
+    prompts = []
+
+    def fake(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        prompts.append(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert prompts
+    assert all("## ARC Worker Context" in prompt for prompt in prompts)
+    assert all("## ARC-LLM Worker Session ABI v2" not in prompt for prompt in prompts)
+
+
+def test_stateful_reviewer_validation_retry_is_compact_delta(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["session"] = {"policy": "stateful", "history_mode": "delta"}
+    reviewer_prompts = []
+
+    def invalid_then_valid(prompt, *, schema, provider, model, model_tier=None, env, session_policy, session_key, call_label, **kwargs):
+        if "/reviewer/" in session_key:
+            reviewer_prompts.append(prompt)
+            if len(reviewer_prompts) == 1:
+                return {"message": "not an envelope"}
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "valid after retry", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid, base_env={})
+
+    assert result["status"] == "completed"
+    assert len(reviewer_prompts) == 2
+    assert "## ARC-LLM Reviewer Validation Retry v2" in reviewer_prompts[1]
+    assert "reviewer system" not in reviewer_prompts[1]
+    assert "Current Proposer Outputs" not in reviewer_prompts[1]
+
+
+def test_cache_guard_writes_warning_after_warmup(tmp_path):
+    config = base_config(tmp_path, max_rounds=2)
+    config["session"] = {
+        "policy": "stateful",
+        "history_mode": "delta",
+        "cache_guard": {
+            "enabled": True,
+            "mode": "warn",
+            "warmup_calls": 1,
+            "min_cached_input_ratio": 0.70,
+        },
+    }
+
+    def fake(prompt, *, schema, provider, model, model_tier=None, env, session_policy, session_key, call_label, **kwargs):
+        if "/reviewer/" in session_key:
+            round_number = 1 if "round_001" in call_label else 2
+            result = {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": f"reviewed {round_number}", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": f"revise p1 {round_number}"},
+                    "proposer_002": {"message": f"revise p2 {round_number}"},
+                },
+                "review_payload": {"round": round_number},
+            }
+        else:
+            worker_id = "proposer_001" if session_key.endswith("/proposer_001") else "proposer_002"
+            round_number = 1 if "round_001" in call_label else 2
+            result = {"worker_id": worker_id, "round": round_number, "content": f"proposal {round_number}"}
+        result[ARC_LLM_CALL_RECORD_FIELD] = {
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 0,
+                "cached_input_ratio": 0.0,
+            }
+        }
+        return result
+
+    result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    warning_path = tmp_path / "ideas/run_001/cache_warnings.jsonl"
+    warnings = [json.loads(line) for line in warning_path.read_text(encoding="utf-8").splitlines()]
+
+    assert result["status"] == "completed"
+    assert warnings
+    assert {warning["turn_count"] for warning in warnings} == {2}
+    assert all("round_002" in warning["call_label"] for warning in warnings)
+    assert {warning["cached_input_ratio"] for warning in warnings} == {0.0}
 
 
 def _context_from_prompt(prompt: str) -> dict[str, Any]:

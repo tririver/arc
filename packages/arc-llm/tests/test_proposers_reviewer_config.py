@@ -59,6 +59,9 @@ def test_valid_config_parses_and_merges_defaults():
     assert config.run_id == "idea-test"
     assert config.max_concurrent_loops == 2
     assert config.artifact_options.save_prompts is True
+    assert config.session.policy == "stateful"
+    assert config.session.history_mode == "delta"
+    assert config.session.max_concurrent_same_prefix == 12
     assert len(config.loops) == 1
 
     loop = config.loops[0]
@@ -66,6 +69,7 @@ def test_valid_config_parses_and_merges_defaults():
     assert loop.max_rounds == 5
     assert loop.early_stop_enabled is False
     assert loop.caller_context == {"user_intent": "test intent"}
+    assert loop.session.policy == "stateful"
 
     proposer = loop.proposers[0]
     reviewer = loop.reviewers[0]
@@ -77,6 +81,55 @@ def test_valid_config_parses_and_merges_defaults():
     assert ARC_LLM_CALL_RECORD_FIELD not in proposer.output_schema.get("properties", {})
     assert reviewer.runtime["allow_mcp"] is True
     assert reviewer.runtime["claude_effort"] == "high"
+
+
+def test_session_options_parse_and_loop_overrides_parent():
+    payload = minimal_config()
+    payload["session"] = {
+        "policy": "stateless",
+        "history_mode": "full",
+        "scope_id": "ideas/run",
+        "reuse_across_batch_calls": True,
+        "max_concurrent_same_prefix": 4,
+        "root": "project/ideas/shared-sessions",
+        "cache_guard": {"enabled": True, "mode": "warn", "warmup_calls": 2, "min_cached_input_ratio": 0.5},
+    }
+    payload["loops"][0]["session"] = {"policy": "stateful", "history_mode": "delta", "scope_id": "ideas/run/loop"}
+    payload["loops"][0]["cache_context"] = {
+        "static_caller_context_keys": ["user_intent"],
+        "volatile_caller_context_keys": ["idea_id"],
+    }
+
+    config = load_batch_config(payload)
+    loop = config.loops[0]
+
+    assert config.session.policy == "stateless"
+    assert config.session.history_mode == "full"
+    assert config.session.reuse_across_batch_calls is True
+    assert config.session.max_concurrent_same_prefix == 4
+    assert str(config.session.root) == "project/ideas/shared-sessions"
+    assert loop.session.policy == "stateful"
+    assert loop.session.history_mode == "delta"
+    assert loop.session.scope_id == "ideas/run/loop"
+    assert loop.session.root == config.session.root
+    assert loop.cache_context.static_caller_context_keys == ["user_intent"]
+    assert loop.cache_context.volatile_caller_context_keys == ["idea_id"]
+
+
+def test_session_scope_rejects_absolute_or_parent_paths():
+    payload = minimal_config()
+    payload["session"] = {"scope_id": "../bad"}
+
+    with pytest.raises(ConfigError, match="scope_id"):
+        load_batch_config(payload)
+
+
+def test_reuse_across_batch_calls_requires_scope_id():
+    payload = minimal_config()
+    payload["session"] = {"reuse_across_batch_calls": True}
+
+    with pytest.raises(ConfigError, match="reuse_across_batch_calls requires session.scope_id"):
+        load_batch_config(payload)
 
 
 def test_string_booleans_parse_for_fail_fast_and_early_stop():

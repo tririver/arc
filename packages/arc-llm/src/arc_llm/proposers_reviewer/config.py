@@ -39,6 +39,31 @@ class WorkerConfig:
 
 
 @dataclass(frozen=True)
+class CacheGuardOptions:
+    enabled: bool
+    mode: str
+    warmup_calls: int
+    min_cached_input_ratio: float
+
+
+@dataclass(frozen=True)
+class SessionOptions:
+    policy: str
+    history_mode: str
+    scope_id: str | None
+    reuse_across_batch_calls: bool
+    max_concurrent_same_prefix: int
+    cache_guard: CacheGuardOptions
+    root: Path | None
+
+
+@dataclass(frozen=True)
+class CacheContextOptions:
+    static_caller_context_keys: list[str]
+    volatile_caller_context_keys: list[str]
+
+
+@dataclass(frozen=True)
 class LoopConfig:
     loop_id: str
     max_rounds: int
@@ -46,6 +71,8 @@ class LoopConfig:
     proposers: list[WorkerConfig]
     reviewers: list[WorkerConfig]
     caller_context: dict[str, Any]
+    session: SessionOptions
+    cache_context: CacheContextOptions | None
 
 
 @dataclass(frozen=True)
@@ -61,6 +88,7 @@ class BatchConfig:
     max_concurrent_loops: int
     fail_fast: bool
     artifact_options: ArtifactOptions
+    session: SessionOptions
     loops: list[LoopConfig]
 
 
@@ -75,6 +103,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     max_concurrent_loops = _positive_int(data.get("max_concurrent_loops", 1), "max_concurrent_loops")
     fail_fast = _bool(data.get("fail_fast", False), "fail_fast")
     artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
+    batch_session = _parse_session_options(data.get("session", {}), parent=None, default_policy="stateful")
 
     defaults = _dict(data.get("defaults", {}), "defaults")
     default_runtime = _dict(defaults.get("runtime", {}), "defaults.runtime")
@@ -98,6 +127,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
             default_model=default_model,
             default_model_tier=default_model_tier,
             default_runtime=default_runtime,
+            parent_session=batch_session,
         )
         if loop.loop_id in seen_loop_ids:
             raise ConfigError(f"duplicate loop_id: {loop.loop_id}")
@@ -111,6 +141,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
         max_concurrent_loops=max_concurrent_loops,
         fail_fast=fail_fast,
         artifact_options=artifact_options,
+        session=batch_session,
         loops=loops,
     )
 
@@ -172,6 +203,7 @@ def _parse_loop(
     default_model: str | None,
     default_model_tier: str | None,
     default_runtime: Mapping[str, Any],
+    parent_session: SessionOptions,
 ) -> LoopConfig:
     loop_data = _dict(raw_loop, "loop")
     loop_id = _safe_id(_required_text(loop_data, "loop_id"), "loop_id")
@@ -198,6 +230,7 @@ def _parse_loop(
     )
     if len(reviewers) != 1:
         raise ConfigError(f"{loop_id} must configure exactly one reviewer in v1")
+    session = _parse_session_options(loop_data.get("session"), parent=parent_session, default_policy=parent_session.policy)
     return LoopConfig(
         loop_id=loop_id,
         max_rounds=max_rounds,
@@ -205,6 +238,8 @@ def _parse_loop(
         proposers=proposers,
         reviewers=reviewers,
         caller_context=_dict(loop_data.get("caller_context", {}), f"{loop_id}.caller_context"),
+        session=session,
+        cache_context=_parse_cache_context(loop_data.get("cache_context"), f"{loop_id}.cache_context"),
     )
 
 
@@ -287,6 +322,78 @@ def _parse_artifact_options(raw_options: Any) -> ArtifactOptions:
     return ArtifactOptions(save_prompts=_bool(options.get("save_prompts", True), "artifact_options.save_prompts"))
 
 
+def _parse_session_options(raw_options: Any, *, parent: SessionOptions | None, default_policy: str) -> SessionOptions:
+    options = _dict(raw_options, "session") if raw_options is not None else {}
+    policy = str(options.get("policy", parent.policy if parent else default_policy) or default_policy)
+    if policy not in {"stateful", "stateless"}:
+        raise ConfigError("session.policy must be stateful or stateless")
+    default_history = "delta" if policy == "stateful" else "full"
+    history_mode = str(options.get("history_mode", parent.history_mode if parent else default_history) or default_history)
+    if history_mode not in {"auto", "delta", "full"}:
+        raise ConfigError("session.history_mode must be auto, delta, or full")
+    if history_mode == "auto":
+        history_mode = "delta" if policy == "stateful" else "full"
+    scope_id_raw = options.get("scope_id", parent.scope_id if parent else None)
+    scope_id = None if scope_id_raw in {None, ""} else _safe_scope_id(str(scope_id_raw), "session.scope_id")
+    reuse = _bool(
+        options.get("reuse_across_batch_calls", parent.reuse_across_batch_calls if parent else False),
+        "session.reuse_across_batch_calls",
+    )
+    if reuse and not scope_id:
+        raise ConfigError("reuse_across_batch_calls requires session.scope_id")
+    max_same_prefix = _positive_int(
+        options.get("max_concurrent_same_prefix", parent.max_concurrent_same_prefix if parent else 12),
+        "session.max_concurrent_same_prefix",
+    )
+    root_raw = options.get("root", parent.root if parent else None)
+    root = None if root_raw in {None, ""} else Path(str(root_raw)).expanduser()
+    cache_guard = _parse_cache_guard(options.get("cache_guard"), parent.cache_guard if parent else None)
+    return SessionOptions(
+        policy=policy,
+        history_mode=history_mode,
+        scope_id=scope_id,
+        reuse_across_batch_calls=reuse,
+        max_concurrent_same_prefix=max_same_prefix,
+        cache_guard=cache_guard,
+        root=root,
+    )
+
+
+def _parse_cache_guard(raw_options: Any, parent: CacheGuardOptions | None) -> CacheGuardOptions:
+    options = _dict(raw_options, "session.cache_guard") if raw_options is not None else {}
+    mode = str(options.get("mode", parent.mode if parent else "warn") or "warn")
+    if mode not in {"warn", "abort"}:
+        raise ConfigError("session.cache_guard.mode must be warn or abort")
+    min_ratio = float(options.get("min_cached_input_ratio", parent.min_cached_input_ratio if parent else 0.70))
+    if min_ratio < 0 or min_ratio > 1:
+        raise ConfigError("session.cache_guard.min_cached_input_ratio must be between 0 and 1")
+    return CacheGuardOptions(
+        enabled=_bool(options.get("enabled", parent.enabled if parent else False), "session.cache_guard.enabled"),
+        mode=mode,
+        warmup_calls=_non_negative_int(
+            options.get("warmup_calls", parent.warmup_calls if parent else 1),
+            "session.cache_guard.warmup_calls",
+        ),
+        min_cached_input_ratio=min_ratio,
+    )
+
+
+def _parse_cache_context(raw_options: Any, field_name: str) -> CacheContextOptions | None:
+    if raw_options is None:
+        return None
+    options = _dict(raw_options, field_name)
+    return CacheContextOptions(
+        static_caller_context_keys=_string_list(
+            options.get("static_caller_context_keys", []),
+            f"{field_name}.static_caller_context_keys",
+        ),
+        volatile_caller_context_keys=_string_list(
+            options.get("volatile_caller_context_keys", []),
+            f"{field_name}.volatile_caller_context_keys",
+        ),
+    )
+
+
 def _required_text(data: Mapping[str, Any], key: str) -> str:
     value = data.get(key)
     if value is None:
@@ -315,6 +422,16 @@ def _positive_int(value: Any, field_name: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: Any, field_name: str) -> int:
+    try:
+        parsed = int(value)
+    except Exception as exc:
+        raise ConfigError(f"{field_name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ConfigError(f"{field_name} must be a non-negative integer")
+    return parsed
+
+
 def _bool(value: Any, field_name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -331,6 +448,20 @@ def _safe_id(value: str, field_name: str) -> str:
     if not SAFE_ID_RE.fullmatch(value):
         raise ConfigError(f"{field_name} must contain only letters, numbers, dot, underscore, or dash")
     return value
+
+
+def _safe_scope_id(value: str, field_name: str) -> str:
+    if value.startswith("/") or ".." in value.split("/") or "" in value.split("/"):
+        raise ConfigError(f"{field_name} must be a relative slash path without empty or parent segments")
+    for segment in value.split("/"):
+        _safe_id(segment, field_name)
+    return value
+
+
+def _string_list(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{field_name} must be a list of strings")
+    return list(value)
 
 
 def _put(env: dict[str, str], key: str, value: Any) -> None:

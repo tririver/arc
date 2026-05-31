@@ -7,10 +7,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .cache_audit import audit_run
 from .host import detect_host, select_llm_provider
+from .proposers_reviewer.template_materializer import materialize_batch
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
 from .proposers_reviewer_bench.runner import run_proposers_reviewer_bench
 from .runner import resolve_llm_config, run_json, run_text
+from .sessions import LLMSessionManager
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,6 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_json_parser.add_argument("--model", default=None)
     run_json_parser.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
     run_json_parser.add_argument("--json", action="store_true")
+    _session_args(run_json_parser)
     _shared_runtime_args(run_json_parser)
     _llm_runtime_args(run_json_parser)
 
@@ -43,6 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_text_parser.add_argument("--provider", default="auto")
     run_text_parser.add_argument("--model", default=None)
     run_text_parser.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
+    _session_args(run_text_parser)
     _shared_runtime_args(run_text_parser)
     _llm_runtime_args(run_text_parser)
 
@@ -51,6 +56,10 @@ def _build_parser() -> argparse.ArgumentParser:
     loop_parser.add_argument("--json", action="store_true")
     loop_parser.add_argument("--dry-run", action="store_true")
     loop_parser.add_argument("--max-concurrent-loops", type=int, default=None)
+    loop_parser.add_argument("--session-policy", choices=["stateful", "stateless"], default=None)
+    loop_parser.add_argument("--history-mode", choices=["auto", "delta", "full"], default=None)
+    loop_parser.add_argument("--session-scope-id", default=None)
+    loop_parser.add_argument("--max-concurrent-same-prefix", type=int, default=None)
 
     bench_parser = sub.add_parser("proposers-reviewer-bench")
     bench_parser.add_argument("--config", required=True)
@@ -62,6 +71,10 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_sub.add_parser("host")
     doctor_sub.add_parser("provider")
     doctor_sub.add_parser("config")
+    cache_audit = sub.add_parser("cache-audit")
+    cache_audit.add_argument("run_root")
+    materialize = sub.add_parser("materialize-proposers-reviewer")
+    materialize.add_argument("--spec", required=True)
     return parser
 
 
@@ -84,6 +97,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             "signals": config.signals,
         }
     if args.command == "run-json":
+        session_manager = _session_manager(args)
         return run_json(
             _read_prompt(args.prompt),
             schema=_read_schema(args.schema),
@@ -91,18 +105,33 @@ def _dispatch(args: argparse.Namespace) -> Any:
             model=args.model,
             model_tier=args.model_tier,
             env=_runtime_env(args),
+            session_policy=args.session_policy,
+            session_manager=session_manager,
+            session_key=args.session_key,
+            session_name=args.session_name,
+            call_label=args.call_label,
+            artifact_dir=args.session_root,
         )
     if args.command == "run-text":
+        session_manager = _session_manager(args)
         return run_text(
             _read_prompt(args.prompt),
             provider=args.provider,
             model=args.model,
             model_tier=args.model_tier,
             env=_runtime_env(args),
+            session_policy=args.session_policy,
+            session_manager=session_manager,
+            session_key=args.session_key,
+            session_name=args.session_name,
+            call_label=args.call_label,
+            artifact_dir=args.session_root,
         )
     if args.command == "proposers-reviewer-loop":
+        config = _read_json_file(args.config)
+        _apply_loop_session_overrides(config, args)
         return run_proposers_reviewer_batch(
-            _read_json_file(args.config),
+            config,
             dry_run=args.dry_run,
             max_concurrent_loops=args.max_concurrent_loops,
         )
@@ -111,7 +140,43 @@ def _dispatch(args: argparse.Namespace) -> Any:
             _read_json_file(args.config),
             dry_run=args.dry_run,
         )
+    if args.command == "cache-audit":
+        return audit_run(args.run_root)
+    if args.command == "materialize-proposers-reviewer":
+        spec = _read_json_file(args.spec)
+        return materialize_batch(**spec)
     raise AssertionError(f"Unhandled command: {args.command}")
+
+
+def _session_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--session-policy", choices=["stateless", "stateful"], default="stateless")
+    parser.add_argument("--session-root", default=None)
+    parser.add_argument("--session-key", default=None)
+    parser.add_argument("--session-name", default=None)
+    parser.add_argument("--call-label", default=None)
+
+
+def _session_manager(args: argparse.Namespace):
+    if getattr(args, "session_policy", "stateless") != "stateful":
+        return None
+    root = Path(args.session_root or ".arc-llm/sessions")
+    return LLMSessionManager(root)
+
+
+def _apply_loop_session_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
+    overrides = {}
+    if args.session_policy is not None:
+        overrides["policy"] = args.session_policy
+    if args.history_mode is not None:
+        overrides["history_mode"] = args.history_mode
+    if args.session_scope_id is not None:
+        overrides["scope_id"] = args.session_scope_id
+    if args.max_concurrent_same_prefix is not None:
+        overrides["max_concurrent_same_prefix"] = args.max_concurrent_same_prefix
+    if overrides:
+        session = dict(config.get("session") or {})
+        session.update(overrides)
+        config["session"] = session
 
 
 def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
@@ -146,6 +211,8 @@ def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-claude-strict-mcp-config", action="store_true")
     parser.add_argument("--no-claude-bare", action="store_true")
     parser.add_argument("--no-claude-session-persistence", action="store_true")
+    parser.add_argument("--claude-session-persistence", action="store_true")
+    parser.add_argument("--claude-no-session-persistence", action="store_true")
     parser.add_argument("--no-claude-exclude-dynamic-system-prompt-sections", action="store_true")
     parser.add_argument("--claude-max-budget-usd", default=None)
     parser.add_argument("--claude-fallback-model", default=None)
@@ -198,7 +265,11 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
     if args.no_claude_bare:
         overrides["ARC_CLAUDE_BARE"] = "false"
     if args.no_claude_session_persistence:
+        overrides["ARC_CLAUDE_NO_SESSION_PERSISTENCE"] = "true"
+    if args.claude_session_persistence:
         overrides["ARC_CLAUDE_NO_SESSION_PERSISTENCE"] = "false"
+    if args.claude_no_session_persistence:
+        overrides["ARC_CLAUDE_NO_SESSION_PERSISTENCE"] = "true"
     if args.no_claude_exclude_dynamic_system_prompt_sections:
         overrides["ARC_CLAUDE_EXCLUDE_DYNAMIC_SYSTEM_PROMPT_SECTIONS"] = "false"
     _put(overrides, "ARC_CLAUDE_MAX_BUDGET_USD", args.claude_max_budget_usd)

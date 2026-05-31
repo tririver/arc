@@ -41,6 +41,14 @@ class RunPaths:
     def lock(self) -> Path:
         return self.run_root / "run.lock"
 
+    @property
+    def sessions_root(self) -> Path:
+        return self.run_root / "sessions"
+
+    @property
+    def call_records(self) -> Path:
+        return self.run_root / "call_records.jsonl"
+
     def loop(self, loop_id: str) -> "LoopPaths":
         return LoopPaths(run_root=self.run_root, loop_id=loop_id)
 
@@ -109,7 +117,9 @@ class RoundPaths:
     def reviewer_context(self, worker_id: str) -> Path:
         return self.context_dir / f"{worker_id}.json"
 
-    def prompt(self, worker_id: str) -> Path:
+    def prompt(self, worker_id: str, *, kind: str = "prompt") -> Path:
+        if kind != "prompt":
+            return self.prompt_dir / f"{worker_id}.{kind}.md"
         return self.prompt_dir / f"{worker_id}.md"
 
     def proposer_output(self, worker_id: str) -> Path:

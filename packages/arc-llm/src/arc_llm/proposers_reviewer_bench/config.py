@@ -81,6 +81,13 @@ def materialize_batch_payload(
     source["schema_version"] = BATCH_CONFIG_SCHEMA
     source["run_id"] = f"{config.batch_payload['run_id']}_iter{iteration_index:03d}_{candidate_id}"
     source["max_concurrent_loops"] = options.max_concurrent_loops
+    source["session"] = {
+        "policy": "stateful",
+        "history_mode": "delta",
+        "scope_id": f"bench/{config.batch_payload['run_id']}/{candidate_id}",
+        "reuse_across_batch_calls": False,
+        "max_concurrent_same_prefix": 12,
+    }
     source["defaults"] = _defaults_with_provider_and_model_tier(
         source.get("defaults"),
         default_provider=options.default_provider,

@@ -55,8 +55,24 @@ arc-llm run-json --prompt "Return {\"ok\": true}" --schema schema.json --provide
 `run-json` appends an `arc_llm_call_record` object to the returned JSON. This
 records the requested provider/model tier, actual provider/model used,
 fallback index, successful attempt number, host signal, and all failed/successful
-attempts for that call. Treat this as runtime audit data, not model-generated
-scientific content.
+attempts for that call. New records also include session policy, session key,
+native session id when available, prompt/schema hashes, and provider usage
+telemetry. Treat this as runtime audit data, not model-generated scientific
+content.
+
+Direct calls are stateless by default. For a debugging session that should
+reuse host conversation state, pass all session fields explicitly:
+
+```bash
+arc-llm run-json \
+  --prompt prompt.txt \
+  --schema schema.json \
+  --provider auto \
+  --session-policy stateful \
+  --session-root .arc-llm/sessions \
+  --session-key debug/session_001 \
+  --json
+```
 
 ## Proposers-Reviewer Loops
 
@@ -97,16 +113,30 @@ For example, the idea workflow uses:
 The loop runner owns all artifact writes. Worker prompts and outputs are stored
 under per-loop and per-round directories, so distinct loops can run
 concurrently without sharing mutable context.
-Rendered worker prompts place stable worker instructions before the JSON context
-to improve provider prefix-cache reuse. Callers that put variable placeholders
-directly in prompt templates may still reduce cache reuse for those prompts.
+Proposers-reviewer configs default to stateful delta sessions. First worker
+turns send the static task context and worker instructions; later turns send
+only current deltas while reusing the same provider session. If a custom
+`json_runner` does not accept session kwargs, the runner falls back to stateless
+full prompts.
 
 `artifact_options.save_prompts` defaults to `true`. When enabled, full rendered
-worker prompts are stored under each round's `prompts/` directory for
-debugging. These prompt artifacts are not included in later worker context or
-`transcript.jsonl`; worker context receives only proposer outputs, reviewer
-reviews, controller messages, and reviewer-to-proposer messages. Worker-call
-errors are written under each round's `errors/` directory.
+worker prompts, or initial/delta prompt artifacts for stateful runs, are stored
+under each round's `prompts/` directory for debugging. These prompt artifacts
+are not copied into later worker context or `transcript.jsonl`; worker context
+receives only proposer outputs, reviewer reviews, controller messages, and
+reviewer-to-proposer messages. Worker-call errors are written under each
+round's `errors/` directory.
+
+Session config lives under the top-level `session` object. Use
+`reuse_across_batch_calls: true` with a stable `scope_id` and `root` only when
+separate batch run directories must reuse the same logical worker sessions, as
+in calculation retries.
+
+Audit prompt-cache behavior after a run:
+
+```bash
+arc-llm cache-audit <run-root>
+```
 
 Optional true-LLM integration tests are skipped by default. To run them
 explicitly:

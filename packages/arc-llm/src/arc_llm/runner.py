@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from jsonschema import ValidationError as JsonSchemaValidationError
@@ -12,6 +13,9 @@ from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call
 from .host import HostDetection, select_llm_provider
 from .model import resolve_model
 from .providers.select import select_provider
+from .schema_cache import schema_hash, sha256_text
+from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
+from .usage import LLMProviderResponse, LLMUsage
 
 
 MAX_ATTEMPTS_PER_PROVIDER = 3
@@ -39,6 +43,20 @@ class LLMAttemptFailure:
     provider: str
     attempt: int
     error: str
+
+
+@dataclass(frozen=True)
+class LLMCallOutcome:
+    value: Any
+    usage: LLMUsage
+    native_session_id: str | None
+    session_policy: str
+    session_key: str | None
+    call_label: str | None
+    prompt_sha256: str | None
+    static_prefix_sha256: str | None
+    schema_sha256: str | None
+    runtime_fingerprint: str | None
 
 
 def resolve_llm_config(
@@ -93,7 +111,18 @@ def run_json(
     validate_schema: bool = True,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
+    session_policy: str = "stateless",
+    session_manager: LLMSessionManager | None = None,
+    session_key: str | None = None,
+    session_name: str | None = None,
+    session_metadata: Mapping[str, Any] | None = None,
+    artifact_dir: Path | str | None = None,
+    call_label: str | None = None,
 ) -> dict[str, Any]:
+    if session_policy not in {"stateless", "stateful"}:
+        raise ValueError("session_policy must be stateless or stateful")
+    if session_policy == "stateful" and (session_manager is None or not session_key):
+        raise ValueError("stateful run_json requires session_manager and session_key")
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -115,6 +144,17 @@ def run_json(
             schema=schema,
             model=config.model,
             validate_schema=validate_schema,
+            provider_used=config.provider,
+            model_tier=model_tier,
+            env=env,
+            process_chain=process_chain,
+            session_policy=session_policy,
+            session_manager=session_manager,
+            session_key=session_key,
+            session_name=session_name,
+            session_metadata=session_metadata,
+            artifact_dir=Path(artifact_dir) if artifact_dir else None,
+            call_label=call_label,
         ),
     )
 
@@ -127,7 +167,18 @@ def run_text(
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
+    session_policy: str = "stateless",
+    session_manager: LLMSessionManager | None = None,
+    session_key: str | None = None,
+    session_name: str | None = None,
+    session_metadata: Mapping[str, Any] | None = None,
+    artifact_dir: Path | str | None = None,
+    call_label: str | None = None,
 ) -> str:
+    if session_policy not in {"stateless", "stateful"}:
+        raise ValueError("session_policy must be stateless or stateful")
+    if session_policy == "stateful" and (session_manager is None or not session_key):
+        raise ValueError("stateful run_text requires session_manager and session_key")
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -143,7 +194,22 @@ def run_text(
         attach_call_record=False,
         env=env,
         process_chain=process_chain,
-        call=lambda selected, config: selected.generate_text(prompt, model=config.model),
+        call=lambda selected, config: _generate_text(
+            selected,
+            prompt,
+            model=config.model,
+            provider_used=config.provider,
+            model_tier=model_tier,
+            env=env,
+            process_chain=process_chain,
+            session_policy=session_policy,
+            session_manager=session_manager,
+            session_key=session_key,
+            session_name=session_name,
+            session_metadata=session_metadata,
+            artifact_dir=Path(artifact_dir) if artifact_dir else None,
+            call_label=call_label,
+        ),
     )
 
 
@@ -165,6 +231,7 @@ def _run_with_retries(
         for attempt in range(1, MAX_ATTEMPTS_PER_PROVIDER + 1):
             try:
                 result = call(selected, config)
+                value = result.value if isinstance(result, LLMCallOutcome) else result
                 attempt_record = _attempt_record(
                     config,
                     fallback_index=fallback_index,
@@ -172,9 +239,10 @@ def _run_with_retries(
                     status="success",
                 )
                 attempt_records.append(attempt_record)
-                if attach_call_record and isinstance(result, dict):
+                if attach_call_record and isinstance(value, dict):
+                    outcome = result if isinstance(result, LLMCallOutcome) else None
                     return attach_arc_llm_call_record(
-                        result,
+                        value,
                         _call_record(
                             config,
                             provider_requested=provider_requested,
@@ -183,9 +251,10 @@ def _run_with_retries(
                             fallback_index=fallback_index,
                             attempt=attempt,
                             attempts=attempt_records,
+                            outcome=outcome,
                         ),
                     )
-                return result
+                return value
             except Exception as exc:
                 failures.append(LLMAttemptFailure(provider=config.provider, attempt=attempt, error=str(exc)))
                 attempt_records.append(
@@ -218,11 +287,209 @@ def _generate_json(
     schema: dict[str, Any] | None,
     model: str | None,
     validate_schema: bool,
-) -> dict[str, Any]:
-    result = selected.generate_json(prompt, schema=schema, model=model)
-    if schema is not None and validate_schema:
-        _validate_json_output(result, schema)
-    return result
+    provider_used: str,
+    model_tier: str | None,
+    env: Mapping[str, str] | None,
+    process_chain: Sequence[str] | None,
+    session_policy: str,
+    session_manager: LLMSessionManager | None,
+    session_key: str | None,
+    session_name: str | None,
+    session_metadata: Mapping[str, Any] | None,
+    artifact_dir: Path | None,
+    call_label: str | None,
+) -> LLMCallOutcome:
+    session, runtime_fp = _session_ref(
+        provider_used=provider_used,
+        model=model,
+        model_tier=model_tier,
+        env=env,
+        process_chain=process_chain,
+        session_policy=session_policy,
+        session_manager=session_manager,
+        session_key=session_key,
+        session_name=session_name,
+        session_metadata=session_metadata,
+    )
+    if session_policy == "stateful" and not hasattr(selected, "generate_json_result"):
+        raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
+    def call_provider() -> LLMProviderResponse[dict[str, Any]]:
+        if hasattr(selected, "generate_json_result"):
+            return selected.generate_json_result(
+                prompt,
+                schema=schema,
+                model=model,
+                session=session,
+                session_policy=session_policy,
+                schema_cache_dir=_schema_cache_dir(artifact_dir),
+                artifact_dir=artifact_dir,
+            )
+        return LLMProviderResponse(selected.generate_json(prompt, schema=schema, model=model))
+
+    if session is not None and session_manager is not None:
+        with session_manager.lock(session.key):
+            response = call_provider()
+            result = response.value
+            if schema is not None and validate_schema:
+                _validate_json_output(result, schema)
+            native_session_id = response.native_session_id
+            if native_session_id:
+                session_manager.update_native_session_id(session.key, native_session_id)
+            session_manager.record_turn(
+                session.key,
+                call_label=call_label or "",
+                prompt_sha256=sha256_text(prompt),
+                static_prefix_sha256=None,
+                schema_sha256=schema_hash(schema),
+                usage=response.usage.to_json(),
+                provider_used=provider_used,
+                model_used=model,
+                native_session_id=native_session_id,
+                extra={"runtime_fingerprint": runtime_fp},
+            )
+    else:
+        response = call_provider()
+        result = response.value
+        if schema is not None and validate_schema:
+            _validate_json_output(result, schema)
+        native_session_id = response.native_session_id
+    return LLMCallOutcome(
+        value=result,
+        usage=response.usage,
+        native_session_id=native_session_id,
+        session_policy=session_policy,
+        session_key=session.key if session else None,
+        call_label=call_label,
+        prompt_sha256=sha256_text(prompt),
+        static_prefix_sha256=None,
+        schema_sha256=schema_hash(schema),
+        runtime_fingerprint=runtime_fp,
+    )
+
+
+def _generate_text(
+    selected: Any,
+    prompt: str,
+    *,
+    model: str | None,
+    provider_used: str,
+    model_tier: str | None,
+    env: Mapping[str, str] | None,
+    process_chain: Sequence[str] | None,
+    session_policy: str,
+    session_manager: LLMSessionManager | None,
+    session_key: str | None,
+    session_name: str | None,
+    session_metadata: Mapping[str, Any] | None,
+    artifact_dir: Path | None,
+    call_label: str | None,
+) -> LLMCallOutcome:
+    session, runtime_fp = _session_ref(
+        provider_used=provider_used,
+        model=model,
+        model_tier=model_tier,
+        env=env,
+        process_chain=process_chain,
+        session_policy=session_policy,
+        session_manager=session_manager,
+        session_key=session_key,
+        session_name=session_name,
+        session_metadata=session_metadata,
+    )
+    if session_policy == "stateful" and not hasattr(selected, "generate_text_result"):
+        raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
+
+    def call_provider() -> LLMProviderResponse[str]:
+        if hasattr(selected, "generate_text_result"):
+            return selected.generate_text_result(
+                prompt,
+                model=model,
+                session=session,
+                session_policy=session_policy,
+                artifact_dir=artifact_dir,
+            )
+        return LLMProviderResponse(selected.generate_text(prompt, model=model))
+
+    if session is not None and session_manager is not None:
+        with session_manager.lock(session.key):
+            response = call_provider()
+            if response.native_session_id:
+                session_manager.update_native_session_id(session.key, response.native_session_id)
+            session_manager.record_turn(
+                session.key,
+                call_label=call_label or "",
+                prompt_sha256=sha256_text(prompt),
+                static_prefix_sha256=None,
+                schema_sha256=None,
+                usage=response.usage.to_json(),
+                provider_used=provider_used,
+                model_used=model,
+                native_session_id=response.native_session_id,
+                extra={"runtime_fingerprint": runtime_fp},
+            )
+    else:
+        response = call_provider()
+    return LLMCallOutcome(
+        value=response.value,
+        usage=response.usage,
+        native_session_id=response.native_session_id,
+        session_policy=session_policy,
+        session_key=session.key if session else None,
+        call_label=call_label,
+        prompt_sha256=sha256_text(prompt),
+        static_prefix_sha256=None,
+        schema_sha256=None,
+        runtime_fingerprint=runtime_fp,
+    )
+
+
+def _session_ref(
+    *,
+    provider_used: str,
+    model: str | None,
+    model_tier: str | None,
+    env: Mapping[str, str] | None,
+    process_chain: Sequence[str] | None,
+    session_policy: str,
+    session_manager: LLMSessionManager | None,
+    session_key: str | None,
+    session_name: str | None,
+    session_metadata: Mapping[str, Any] | None,
+) -> tuple[LLMSessionRef | None, str | None]:
+    if session_policy != "stateful":
+        return None, runtime_fingerprint(
+            provider=provider_used,
+            model=model,
+            model_tier=model_tier,
+            env=env,
+            process_chain=process_chain,
+        )
+    assert session_manager is not None
+    assert session_key is not None
+    fp = runtime_fingerprint(
+        provider=provider_used,
+        model=model,
+        model_tier=model_tier,
+        env=env,
+        process_chain=process_chain,
+    )
+    return (
+        session_manager.get_or_create(
+            key=session_key,
+            provider=provider_used,
+            model=model,
+            runtime_fingerprint=fp,
+            name=session_name,
+            metadata=session_metadata,
+        ),
+        fp,
+    )
+
+
+def _schema_cache_dir(artifact_dir: Path | None) -> Path | None:
+    if artifact_dir is None:
+        return None
+    return artifact_dir / "schemas"
 
 
 def _validate_json_output(result: dict[str, Any], schema: dict[str, Any]) -> None:
@@ -243,6 +510,7 @@ def _call_record(
     fallback_index: int,
     attempt: int,
     attempts: Sequence[dict[str, Any]],
+    outcome: LLMCallOutcome | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": ARC_LLM_CALL_RECORD_SCHEMA_VERSION,
@@ -256,6 +524,15 @@ def _call_record(
         "host": config.host.host,
         "signals": list(config.signals),
         "attempts": [dict(item) for item in attempts],
+        "session_policy": outcome.session_policy if outcome else "stateless",
+        "session_key": outcome.session_key if outcome else None,
+        "native_session_id": outcome.native_session_id if outcome else None,
+        "call_label": outcome.call_label if outcome else None,
+        "prompt_sha256": outcome.prompt_sha256 if outcome else None,
+        "static_prefix_sha256": outcome.static_prefix_sha256 if outcome else None,
+        "schema_sha256": outcome.schema_sha256 if outcome else None,
+        "runtime_fingerprint": outcome.runtime_fingerprint if outcome else None,
+        "usage": outcome.usage.to_json() if outcome else LLMUsage().to_json(),
     }
 
 

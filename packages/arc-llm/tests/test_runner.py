@@ -1,6 +1,8 @@
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, allow_arc_llm_call_record
+from arc_llm.sessions import LLMSessionManager
+from arc_llm.usage import LLMProviderResponse, LLMUsage
 from arc_llm import runner
 from arc_llm.runner import resolve_llm_config, run_json, run_text
 
@@ -47,6 +49,30 @@ class FakeProvider:
 
     def generate_text(self, prompt, *, model=None):
         return f"{model}:{prompt}"
+
+
+class FakeResultProvider:
+    name = "codex-cli"
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        return LLMProviderResponse(
+            {"ok": True, "model": model, "session_key": session.key if session else None},
+            usage=LLMUsage(input_tokens=10, cached_input_tokens=8, output_tokens=2),
+            native_session_id="native-123" if session_policy == "stateful" else None,
+        )
+
+    def generate_json(self, prompt, *, schema=None, model=None):
+        return self.generate_json_result(prompt, schema=schema, model=model).value
 
 
 class FlakyJsonProvider:
@@ -111,6 +137,53 @@ def test_run_json_uses_selected_provider_and_model(tmp_path, monkeypatch):
     assert result["model"] == "fast"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["provider_used"] == "codex-cli"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["model_used"] == "fast"
+
+
+def test_run_json_stateful_records_session_usage_and_call_record(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeResultProvider())
+    manager = LLMSessionManager(tmp_path / "sessions")
+
+    result = run_json(
+        "prompt",
+        schema={"type": "object"},
+        model="fast",
+        provider="codex-cli",
+        env={"ARC_AGENT_HOST": "codex"},
+        process_chain=[],
+        session_policy="stateful",
+        session_manager=manager,
+        session_key="scope/proposer/proposer_001",
+        call_label="round_001/proposer_001",
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    call_record = result[ARC_LLM_CALL_RECORD_FIELD]
+    assert result["session_key"] == "scope/proposer/proposer_001"
+    assert call_record["session_policy"] == "stateful"
+    assert call_record["session_key"] == "scope/proposer/proposer_001"
+    assert call_record["native_session_id"] == "native-123"
+    assert call_record["usage"]["cached_input_ratio"] == 0.8
+    assert manager.turn_count("scope/proposer/proposer_001") == 1
+
+
+def test_run_json_stateful_requires_provider_result_support(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeProvider())
+
+    with pytest.raises(runner.LLMTaskError, match="does not support stateful sessions"):
+        run_json(
+            "prompt",
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            session_policy="stateful",
+            session_manager=LLMSessionManager(tmp_path / "sessions"),
+            session_key="scope/proposer/proposer_001",
+        )
+
+
+def test_run_json_stateful_requires_session_key_and_manager():
+    with pytest.raises(ValueError, match="requires session_manager and session_key"):
+        run_json("prompt", provider="codex-cli", env={}, process_chain=[], session_policy="stateful")
 
 
 def test_auto_provider_rejects_exact_model():

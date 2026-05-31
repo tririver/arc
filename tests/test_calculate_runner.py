@@ -96,6 +96,20 @@ def test_calculate_runner_recalculates_only_isolated_wrong_proposer(tmp_path):
         ["proposer_001", "proposer_002", "proposer_003"],
         ["proposer_003"],
     ]
+    assert fake.calls[0]["session"]["scope_id"] == "calculate/calc_001/step_001"
+    assert fake.calls[1]["session"]["scope_id"] == "calculate/calc_001/step_001"
+    assert fake.calls[0]["session"]["root"] == fake.calls[1]["session"]["root"]
+    assert fake.calls[0]["session"]["reuse_across_batch_calls"] is True
+    assert fake.calls[0]["loops"][0]["cache_context"]["static_caller_context_keys"] == [
+        "step_id",
+        "step_kind",
+        "step_prompt",
+        "allowed_context",
+        "accepted_prior_step_outputs",
+        "max_recalculations",
+        "integrity_reference",
+        "consensus_instruction",
+    ]
     assert sorted(fake.calls[1]["loops"][0]["caller_context"]["locked_outputs"]) == [
         "proposer_001",
         "proposer_002",

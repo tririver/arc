@@ -78,6 +78,65 @@ def test_run_text_cli_passes_model_tier(monkeypatch):
     assert captured["model"] is None
 
 
+def test_run_json_cli_passes_stateful_session_args(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run_json(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "_read_prompt", lambda value: "prompt text")
+    monkeypatch.setattr(cli, "run_json", fake_run_json)
+
+    args = cli._build_parser().parse_args(
+        [
+            "run-json",
+            "--prompt",
+            "-",
+            "--provider",
+            "codex-cli",
+            "--session-policy",
+            "stateful",
+            "--session-root",
+            str(tmp_path / "sessions"),
+            "--session-key",
+            "scope/proposer/proposer_001",
+            "--session-name",
+            "proposer_001",
+            "--call-label",
+            "round_001/proposer_001",
+        ]
+    )
+
+    result = cli._dispatch(args)
+
+    assert result == {"ok": True}
+    assert captured["session_policy"] == "stateful"
+    assert captured["session_manager"].root == tmp_path / "sessions"
+    assert captured["session_key"] == "scope/proposer/proposer_001"
+    assert captured["session_name"] == "proposer_001"
+    assert captured["call_label"] == "round_001/proposer_001"
+
+
+def test_claude_session_persistence_flags_are_consistent():
+    parser = cli._build_parser()
+
+    disabled = cli._runtime_env(
+        parser.parse_args(["run-text", "--prompt", "-", "--claude-no-session-persistence"])
+    )
+    legacy_disabled = cli._runtime_env(
+        parser.parse_args(["run-text", "--prompt", "-", "--no-claude-session-persistence"])
+    )
+    enabled = cli._runtime_env(
+        parser.parse_args(["run-text", "--prompt", "-", "--claude-session-persistence"])
+    )
+
+    assert disabled["ARC_CLAUDE_NO_SESSION_PERSISTENCE"] == "true"
+    assert legacy_disabled["ARC_CLAUDE_NO_SESSION_PERSISTENCE"] == "true"
+    assert enabled["ARC_CLAUDE_NO_SESSION_PERSISTENCE"] == "false"
+
+
 def test_run_text_cli_rejects_provider_config_option():
     parser = cli._build_parser()
 

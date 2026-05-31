@@ -9,6 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
+from arc_llm.schema_cache import canonical_json, write_schema_cache_file
+from arc_llm.sessions import LLMSessionRef
+from arc_llm.usage import LLMProviderResponse, LLMUsage
+
 from .base import LLMWorkerError
 
 
@@ -25,28 +29,49 @@ class CodexCliProvider:
         schema: dict[str, Any] | None = None,
         model: str | None = None,
     ) -> dict[str, Any]:
+        return self.generate_json_result(prompt, schema=schema, model=model).value
+
+    def generate_json_result(
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any] | None = None,
+        model: str | None = None,
+        session: LLMSessionRef | None = None,
+        session_policy: str = "stateless",
+        schema_cache_dir: Path | None = None,
+        artifact_dir: Path | None = None,
+    ) -> LLMProviderResponse[dict[str, Any]]:
         schema = schema or {"type": "object"}
+        stateful = session_policy == "stateful" and session is not None
         with tempfile.TemporaryDirectory(prefix="arc-llm-") as tmp:
             tmpdir = Path(tmp)
-            schema_path = tmpdir / "output.schema.json"
             output_path = tmpdir / "output.json"
-            schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+            schema_path: Path | None = write_schema_cache_file(
+                schema,
+                cache_dir=schema_cache_dir or _default_schema_cache_dir(self.env),
+            )
+            resume_id = session.native_session_id if stateful else None
+            use_schema = True
+            effective_prompt = prompt
+            if resume_id and not _codex_resume_supports_output_schema(self.env):
+                use_schema = False
+                effective_prompt = _with_json_schema_contract(prompt, schema)
 
-            cmd = [
-                *_base_cmd(self.env),
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-            ]
-            if model:
-                cmd.extend(["-m", model])
-            cmd.append("-")
+            cmd = _codex_exec_cmd(
+                self.env,
+                stateful=stateful,
+                resume_session_id=resume_id,
+                output_path=output_path,
+                schema_path=schema_path if use_schema else None,
+                model=model,
+                json_events=stateful,
+            )
 
             try:
                 result = subprocess.run(
                     cmd,
-                    input=prompt,
+                    input=effective_prompt,
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -57,25 +82,42 @@ class CodexCliProvider:
                 raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
-            try:
-                payload = json.loads(output_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise LLMWorkerError(f"Could not read Codex JSON output: {exc}") from exc
+            native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
+            payload = _read_json_payload(output_path, result.stdout)
             if not isinstance(payload, dict):
                 raise LLMWorkerError("Codex JSON output was not an object")
-            return payload
+            return LLMProviderResponse(
+                payload,
+                usage=usage,
+                native_session_id=native_session_id or (session.native_session_id if session else None),
+                raw_events=raw_events,
+                raw_output=result.stdout,
+            )
 
     def generate_text(self, prompt: str, *, model: str | None = None) -> str:
+        return self.generate_text_result(prompt, model=model).value
+
+    def generate_text_result(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        session: LLMSessionRef | None = None,
+        session_policy: str = "stateless",
+        artifact_dir: Path | None = None,
+    ) -> LLMProviderResponse[str]:
+        stateful = session_policy == "stateful" and session is not None
         with tempfile.TemporaryDirectory(prefix="arc-llm-") as tmp:
             output_path = Path(tmp) / "output.txt"
-            cmd = [
-                *_base_cmd(self.env),
-                "--output-last-message",
-                str(output_path),
-            ]
-            if model:
-                cmd.extend(["-m", model])
-            cmd.append("-")
+            cmd = _codex_exec_cmd(
+                self.env,
+                stateful=stateful,
+                resume_session_id=session.native_session_id if stateful else None,
+                output_path=output_path,
+                schema_path=None,
+                model=model,
+                json_events=stateful,
+            )
 
             try:
                 result = subprocess.run(
@@ -91,13 +133,21 @@ class CodexCliProvider:
                 raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
+            native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
             try:
-                return output_path.read_text(encoding="utf-8")
+                value = output_path.read_text(encoding="utf-8")
             except OSError as exc:
                 raise LLMWorkerError(f"Could not read Codex text output: {exc}") from exc
+            return LLMProviderResponse(
+                value,
+                usage=usage,
+                native_session_id=native_session_id or (session.native_session_id if session else None),
+                raw_events=raw_events,
+                raw_output=result.stdout,
+            )
 
 
-def _base_cmd(env: Mapping[str, str]) -> list[str]:
+def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
     profile = _env_text(env, "ARC_CODEX_PROFILE", "")
     profile_v2 = _env_text(env, "ARC_CODEX_PROFILE_V2", "")
     enable_mcp = _env_bool(env, "ARC_CODEX_ENABLE_MCP", False)
@@ -121,7 +171,7 @@ def _base_cmd(env: Mapping[str, str]) -> list[str]:
         cmd.extend(["--profile", profile])
     if profile_v2:
         cmd.extend(["--profile-v2", profile_v2])
-    if _env_bool(env, "ARC_CODEX_EPHEMERAL", True):
+    if _env_bool(env, "ARC_CODEX_EPHEMERAL", False if stateful else True):
         cmd.append("--ephemeral")
     ignore_user_config_default = not (enable_mcp or profile or profile_v2)
     if enable_mcp and mcp_mode == "arc-only":
@@ -131,7 +181,7 @@ def _base_cmd(env: Mapping[str, str]) -> list[str]:
     if _env_bool(env, "ARC_CODEX_IGNORE_RULES", True):
         cmd.append("--ignore-rules")
 
-    for key, value in _codex_config_overrides(env):
+    for key, value in _codex_config_overrides(env, stateful=stateful):
         cmd.extend(["-c", f"{key}={value}"])
     for key, value in _arc_only_mcp_config_overrides(env):
         cmd.extend(["-c", f"{key}={value}"])
@@ -140,16 +190,19 @@ def _base_cmd(env: Mapping[str, str]) -> list[str]:
     return cmd
 
 
-def _codex_config_overrides(env: Mapping[str, str]) -> list[tuple[str, str]]:
+def _codex_config_overrides(env: Mapping[str, str], *, stateful: bool = False) -> list[tuple[str, str]]:
     allow_internet = _env_bool(env, "ARC_CODEX_ALLOW_INTERNET", False)
     overrides = [
         ("model_reasoning_effort", _toml_string(_env_text(env, "ARC_CODEX_REASONING_EFFORT", "low"))),
         ("model_reasoning_summary", _toml_string(_env_text(env, "ARC_CODEX_REASONING_SUMMARY", "none"))),
         ("model_verbosity", _toml_string(_env_text(env, "ARC_CODEX_MODEL_VERBOSITY", "low"))),
         ("hide_agent_reasoning", _toml_bool(_env_bool(env, "ARC_CODEX_HIDE_AGENT_REASONING", True))),
-        ("history.persistence", _toml_string(_env_text(env, "ARC_CODEX_HISTORY_PERSISTENCE", "none"))),
         ("web_search", _toml_string(_env_text(env, "ARC_CODEX_WEB_SEARCH", "live" if allow_internet else "disabled"))),
     ]
+    if env.get("ARC_CODEX_HISTORY_PERSISTENCE") is not None:
+        overrides.append(("history.persistence", _toml_string(_env_text(env, "ARC_CODEX_HISTORY_PERSISTENCE", ""))))
+    elif not stateful:
+        overrides.append(("history.persistence", _toml_string("none")))
     if env.get("ARC_CODEX_NETWORK_ACCESS") is not None or allow_internet:
         overrides.append(
             (
@@ -158,6 +211,139 @@ def _codex_config_overrides(env: Mapping[str, str]) -> list[tuple[str, str]]:
             )
         )
     return [(key, value) for key, value in overrides if value]
+
+
+def _codex_exec_cmd(
+    env: Mapping[str, str],
+    *,
+    stateful: bool,
+    resume_session_id: str | None,
+    output_path: Path,
+    schema_path: Path | None,
+    model: str | None,
+    json_events: bool,
+) -> list[str]:
+    cmd = _base_cmd(env, stateful=stateful)
+    if json_events:
+        cmd.append("--json")
+    if schema_path is not None:
+        cmd.extend(["--output-schema", str(schema_path)])
+    cmd.extend(["--output-last-message", str(output_path)])
+    if model:
+        cmd.extend(["-m", model])
+    if resume_session_id:
+        cmd.extend(["resume", resume_session_id, "-"])
+    else:
+        cmd.append("-")
+    return cmd
+
+
+def _default_schema_cache_dir(env: Mapping[str, str]) -> Path:
+    if value := _env_text(env, "ARC_LLM_SCHEMA_CACHE_DIR", ""):
+        return Path(value).expanduser()
+    return Path(tempfile.gettempdir()) / "arc-llm-schema-cache"
+
+
+def _codex_resume_supports_output_schema(env: Mapping[str, str]) -> bool:
+    try:
+        result = subprocess.run(
+            ["codex", "exec", "resume", "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+            timeout=_timeout_seconds(env, "ARC_CODEX_HELP_TIMEOUT_SECONDS") or 5,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and "--output-schema" in result.stdout
+
+
+def _with_json_schema_contract(prompt: str, schema: dict[str, Any]) -> str:
+    return (
+        prompt.rstrip()
+        + "\n\n## JSON output contract for this turn\n"
+        + "Return exactly one JSON object. Do not wrap it in Markdown. It must conform to this JSON Schema:\n"
+        + canonical_json(schema)
+        + "\n"
+    )
+
+
+def _parse_codex_json_events(stdout: str) -> tuple[str | None, LLMUsage, tuple[dict[str, Any], ...]]:
+    events: list[dict[str, Any]] = []
+    thread_id = None
+    usage = LLMUsage()
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        events.append(event)
+        if event.get("type") == "thread.started":
+            thread_id = str(event.get("thread_id") or event.get("session_id") or "") or thread_id
+        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+            raw = event["usage"]
+            usage = LLMUsage(
+                input_tokens=_int_or_none(raw.get("input_tokens")),
+                cached_input_tokens=_int_or_none(raw.get("cached_input_tokens")),
+                output_tokens=_int_or_none(raw.get("output_tokens")),
+                reasoning_output_tokens=_int_or_none(raw.get("reasoning_output_tokens")),
+                raw=raw,
+            )
+    return thread_id, usage, tuple(events)
+
+
+def _read_json_payload(output_path: Path, stdout: str) -> dict[str, Any]:
+    try:
+        text = output_path.read_text(encoding="utf-8")
+    except OSError:
+        text = stdout
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = json.loads(_extract_first_json_object(text))
+    if not isinstance(payload, dict):
+        raise LLMWorkerError("Codex JSON output was not an object")
+    return payload
+
+
+def _extract_first_json_object(text: str) -> str:
+    start = text.find("{")
+    if start < 0:
+        raise LLMWorkerError("Codex JSON output did not contain an object")
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    raise LLMWorkerError("Codex JSON output contained an unterminated object")
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _arc_only_mcp_config_overrides(env: Mapping[str, str]) -> list[tuple[str, str]]:

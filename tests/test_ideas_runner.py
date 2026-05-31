@@ -102,6 +102,9 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     assert batch_config["run_dir"] == str(project_dir / "ideas" / "ideas_test")
     assert batch_config["run_id"] == "idea_loops"
     assert batch_config["max_concurrent_loops"] == 2
+    assert batch_config["session"]["policy"] == "stateful"
+    assert batch_config["session"]["history_mode"] == "delta"
+    assert batch_config["session"]["max_concurrent_same_prefix"] == 12
     assert {loop["loop_id"] for loop in batch_config["loops"]} == {
         "domain_idea_001",
         "no_info_idea_001",
@@ -115,6 +118,7 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
         == "arc.llm.review_envelope.v1"
         for loop in batch_config["loops"]
     )
+    assert all(loop["cache_context"]["volatile_caller_context_keys"] == ["idea_id", "variant_id"] for loop in batch_config["loops"])
     assert all("marking_scheme" in loop["caller_context"] for loop in batch_config["loops"])
     mark_schema = batch_config["loops"][0]["reviewers"][0]["output_schema"]["properties"]["review_payload"][
         "properties"
@@ -128,6 +132,48 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
         "no_info_idea_001",
     }
     assert result["batch_result"]["run_root"] == str(project_dir / "ideas" / "ideas_test" / "idea_loops")
+
+
+def test_ideas_caps_concurrency_for_many_loops(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    (project_dir / "domain").mkdir(parents=True)
+    (project_dir / "domain" / "domain_summary.md").write_text("# Domain\n", encoding="utf-8")
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WJ),
+        "variant_glob": "ideas-*.variant.json",
+        "loops_per_variant": 10,
+    }
+    seen_max_concurrent: list[int | None] = []
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        json_runner: Any,
+        base_env: dict[str, str] | None,
+        process_chain: list[str] | None,
+        dry_run: bool = False,
+        max_concurrent_loops: int | None = None,
+    ) -> dict[str, Any]:
+        seen_max_concurrent.append(max_concurrent_loops)
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(run_root),
+            "loops": [],
+        }
+
+    result = runner.run_ideas(config, batch_runner=fake_batch_runner, base_env={})
+
+    assert result["proposal_count"] == 20
+    assert seen_max_concurrent == [12]
 
 
 def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path: Path) -> None:

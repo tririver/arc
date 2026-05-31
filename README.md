@@ -313,6 +313,11 @@ arc-llm run-text --prompt "Say hello." --provider auto
 arc-llm run-json --prompt "Return {\"ok\": true}" --provider auto --json
 ```
 
+Direct `arc-llm run-*` calls are stateless unless `--session-policy stateful`
+is paired with a session root and session key. Proposers-reviewer workflows use
+stateful delta sessions by default and write cache/session audit data under the
+run artifacts.
+
 ## MCP Tools And Background Jobs
 
 ARC MCP exposes paper tools, domain tools, job tools, and doctor tools. Tools

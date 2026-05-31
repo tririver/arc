@@ -42,9 +42,9 @@ python3 <skill-dir>/workflows/scripts/ideas_runner.py \
   --json
 ```
 
-Step 2: Print any returned `WARNING:` messages. Unlimited loop concurrency is
-intentional for this workflow. The dry run reports the generated loop plan but
-does not create run artifacts.
+Step 2: Print any returned `WARNING:` messages. Loop concurrency is bounded by
+`ARC_IDEAS_MAX_CONCURRENT_LOOPS` and defaults to `12`. The dry run reports the
+generated loop plan but does not create run artifacts.
 
 ### Phase 3: Run Ideas
 
