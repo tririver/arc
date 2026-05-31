@@ -90,7 +90,7 @@ def generate_summary_with_section_pipeline(
         provider=provider,
         model=model,
         run_json=run_json,
-        use_cache=not bool(task.get("refresh")),
+        use_cache=not _bool_value(task.get("refresh"), False),
         progress_callback=progress_callback,
     )
     _emit(
@@ -357,6 +357,18 @@ def _task_prompt(task: dict[str, Any]) -> str:
         ]
         if part
     )
+
+
+def _bool_value(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return default
 
 
 def _read_cached_section_summary(

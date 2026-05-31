@@ -11,5 +11,13 @@
   "artifact_options": {
     "save_prompts": true
   },
+  "defaults": {
+    "model_tier": "high",
+    "runtime": {
+      "codex_reasoning_effort": "high",
+      "codex_model_verbosity": "medium",
+      "claude_effort": "high"
+    }
+  },
   "steps": []
 }

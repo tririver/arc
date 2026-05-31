@@ -23,6 +23,21 @@ from .jobs import (
 )
 
 
+def _bool_arg(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+    return bool(value)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a persisted ARC MCP background job")
     parser.add_argument("job_id")
@@ -76,7 +91,7 @@ def _paper_summary(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
         provider=str(payload.get("provider") or "auto"),
         model=payload.get("model"),
         model_tier=payload.get("model_tier"),
-        refresh=bool(payload.get("refresh", False)),
+        refresh=_bool_arg(payload.get("refresh"), False),
         progress_callback=lambda event: record_progress(job_id, event),
     )
 
@@ -89,7 +104,7 @@ def _main_reference_inference(payload: dict[str, Any], *, job_id: str) -> dict[s
         provider=str(payload.get("provider") or "auto"),
         model=payload.get("model"),
         model_tier=payload.get("model_tier"),
-        refresh=bool(payload.get("refresh", False)),
+        refresh=_bool_arg(payload.get("refresh"), False),
     )
     event = "reference_inference_completed" if _result_ok(result) else "reference_inference_failed"
     record_progress(job_id, {"event": event})
@@ -112,7 +127,7 @@ def _domain_build(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
         "domain_id": payload.get("domain_id"),
         "provider": str(payload.get("provider") or "auto"),
         "model": payload.get("model"),
-        "refresh": bool(payload.get("refresh", False)),
+        "refresh": _bool_arg(payload.get("refresh"), False),
         "workers": int(payload.get("workers", 8)),
     }
     if payload.get("model_tier") is not None:
@@ -179,9 +194,9 @@ def _translate(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
         provider=str(payload.get("provider") or "auto"),
         model=payload.get("model"),
         model_tier=str(payload.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER)),
-        quality=bool(payload.get("quality", False)),
+        quality=_bool_arg(payload.get("quality"), False),
         convert_pdf=True,
-        overwrite=bool(payload.get("overwrite", False)),
+        overwrite=_bool_arg(payload.get("overwrite"), False),
     )
     record_progress(job_id, {"event": "translate_completed" if _result_ok(result) else "translate_failed"})
     return result
@@ -202,8 +217,8 @@ def _batch_translate(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
         provider=str(payload.get("provider") or "auto"),
         model=payload.get("model"),
         model_tier=str(payload.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER)),
-        quality=bool(payload.get("quality", False)),
-        overwrite=bool(payload.get("overwrite", False)),
+        quality=_bool_arg(payload.get("quality"), False),
+        overwrite=_bool_arg(payload.get("overwrite"), False),
     )
     record_progress(job_id, {"event": "batch_translate_completed" if _result_ok(result) else "batch_translate_failed"})
     return result

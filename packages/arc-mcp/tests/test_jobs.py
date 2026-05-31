@@ -127,6 +127,16 @@ def test_resolve_inline_wait_explicit_override():
     assert resolve_inline_wait_seconds(env=env) == 3
 
 
+def test_worker_bool_arg_parses_string_booleans():
+    assert worker._bool_arg("false") is False  # noqa: SLF001
+    assert worker._bool_arg("0") is False  # noqa: SLF001
+    assert worker._bool_arg("true") is True  # noqa: SLF001
+    assert worker._bool_arg("on") is True  # noqa: SLF001
+    assert worker._bool_arg(None, True) is True  # noqa: SLF001
+    assert worker._bool_arg("maybe") is False  # noqa: SLF001
+    assert worker._bool_arg("maybe", True) is True  # noqa: SLF001
+
+
 def test_resolve_inline_wait_reads_codex_config(tmp_path):
     codex_home = tmp_path / "codex"
     codex_home.mkdir()

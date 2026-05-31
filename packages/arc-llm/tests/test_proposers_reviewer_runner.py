@@ -13,7 +13,11 @@ from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.proposers_reviewer.config import load_batch_config
 from arc_llm.proposers_reviewer import runner as runner_module
 from arc_llm.proposers_reviewer.artifacts import RunPaths, acquire_lock, atomic_write_json
-from arc_llm.proposers_reviewer.dialogue import render_initial_worker_prompt
+from arc_llm.proposers_reviewer.dialogue import (
+    render_initial_worker_prompt,
+    render_proposer_delta_prompt,
+    render_reviewer_delta_prompt,
+)
 from arc_llm.proposers_reviewer.runner import PrefixConcurrencyLimiter, run_proposers_reviewer_batch
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
@@ -557,6 +561,39 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
     assert "Previous reviewer response failed validation" in retry_prompt
 
 
+def test_reviewer_schema_validation_is_deferred_to_envelope_retry(tmp_path):
+    calls = []
+
+    def invalid_then_valid_reviewer(prompt, *, validate_schema=True, **kwargs):
+        is_reviewer = "reviewer system" in prompt or "Reviewer Output Retry" in prompt
+        if is_reviewer:
+            calls.append(validate_schema)
+            if validate_schema:
+                raise AssertionError("reviewer calls must bypass generic schema validation")
+            if len(calls) == 1:
+                return {"message": "not an envelope"}
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "valid after retry", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        assert validate_schema is True
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(
+        base_config(tmp_path, max_rounds=1),
+        json_runner=invalid_then_valid_reviewer,
+        base_env={},
+    )
+
+    assert result["status"] == "completed"
+    assert calls == [False, False]
+
+
 def test_reviewer_validation_artifact_is_saved_when_prompts_are_disabled(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
     config["artifact_options"] = {"save_prompts": False}
@@ -725,6 +762,57 @@ def test_initial_prompt_static_prefix_stays_shared_until_variable_context(tmp_pa
     assert prompt_2.startswith(static_prefix_2)
     assert prompt_1[:variable_index] == prompt_2[:variable_index]
     assert prompt_1 != prompt_2
+
+
+def test_initial_prompt_explains_split_caller_context(tmp_path):
+    batch = load_batch_config(base_config(tmp_path, max_rounds=1))
+    loop = batch.loops[0]
+
+    prompt, _context, _static_prefix = render_initial_worker_prompt(
+        loop=loop,
+        worker=loop.proposers[0],
+        role="proposer",
+        round_number=1,
+    )
+
+    assert "union of Shared Static Task Context.caller_context" in prompt
+    assert "Variable Initial Context.caller_context" in prompt
+
+
+def test_proposer_delta_tells_worker_to_recompute_not_patch(tmp_path):
+    batch = load_batch_config(base_config(tmp_path, max_rounds=2))
+    loop = batch.loops[0]
+
+    prompt, _context = render_proposer_delta_prompt(
+        loop=loop,
+        worker=loop.proposers[0],
+        round_number=2,
+        correspondence=[],
+    )
+
+    assert "remembered static caller_context" in prompt
+    assert "caller_context_delta" in prompt
+    assert "tentative scratch work, not as facts" in prompt
+    assert "recompute" in prompt
+    assert "merely patching" in prompt
+
+
+def test_reviewer_delta_requires_independent_current_review(tmp_path):
+    batch = load_batch_config(base_config(tmp_path, max_rounds=2))
+    loop = batch.loops[0]
+
+    prompt, _context = render_reviewer_delta_prompt(
+        loop=loop,
+        worker=loop.reviewers[0],
+        round_number=2,
+        current_proposer_outputs={"proposer_001": {"ok": True}},
+    )
+
+    assert "remembered static caller_context" in prompt
+    assert "caller_context_delta" in prompt
+    assert "independently" in prompt
+    assert "Previous review history is background only" in prompt
+    assert "current active_proposer_ids" in prompt
 
 
 def test_custom_json_runner_that_calls_run_json_does_not_double_record_turns(tmp_path, monkeypatch):

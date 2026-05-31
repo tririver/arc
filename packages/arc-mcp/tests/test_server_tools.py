@@ -35,6 +35,16 @@ def test_call_tool_rejects_both_paper_id_forms():
     assert result["error"]["code"] == "paper_ids_ambiguous"
 
 
+def test_bool_arg_parses_string_booleans():
+    assert server._bool_arg("false") is False  # noqa: SLF001
+    assert server._bool_arg("0") is False  # noqa: SLF001
+    assert server._bool_arg("true") is True  # noqa: SLF001
+    assert server._bool_arg("yes") is True  # noqa: SLF001
+    assert server._bool_arg(None, True) is True  # noqa: SLF001
+    assert server._bool_arg("maybe") is False  # noqa: SLF001
+    assert server._bool_arg("maybe", True) is True  # noqa: SLF001
+
+
 def test_call_tool_md2pdf_starts_background_job_without_waiting(monkeypatch, tmp_path):
     source = tmp_path / "report.md"
     output = tmp_path / "report.pdf"

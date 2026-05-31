@@ -44,6 +44,7 @@ def render_initial_worker_prompt(
     static_parts = [
         "## ARC-LLM Worker Session ABI v2",
         "This initializes a persistent ARC worker session. Remember the static task context and your worker instructions for later turns in this session.",
+        "When Worker Instructions mention caller_context.X, read X from the union of Shared Static Task Context.caller_context and Variable Initial Context.caller_context. Static caller_context fields are remembered for this session; volatile fields are provided in Variable Initial Context or later Delta Context.",
         "",
         "## Shared Static Task Context",
         _canonical_json(shared),
@@ -103,7 +104,10 @@ def render_proposer_delta_prompt(
     prompt = "\n".join(
         [
             "## ARC-LLM Worker Delta Turn v2",
-            "You are continuing the same proposer session. Use the static task context and your previous work already present in this session.",
+            "You are continuing the same proposer session. Use the remembered static task context, worker instructions, and current delta context.",
+            "When Worker Instructions mention caller_context.X, read X from the remembered static caller_context plus the current Delta Context caller_context_delta. Current delta fields override older volatile fields.",
+            "Treat prior unaccepted proposer outputs as tentative scratch work, not as facts. If reviewer or controller feedback identifies an error, asks for recalculation, changes the target, changes active proposer ids, or points to a convention/source-mapping issue, recompute the relevant reasoning from the original task context rather than merely patching your previous answer.",
+            "Locked outputs and accepted_prior_step_outputs are accepted context unless current delta feedback explicitly asks you to re-check them.",
             "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and current turn context, not any older schema or older active proposer list in the session history.",
             "",
             "## Delta Context",
@@ -135,7 +139,9 @@ def render_reviewer_delta_prompt(
     prompt = "\n".join(
         [
             "## ARC-LLM Reviewer Delta Turn v2",
-            "You are continuing the same reviewer session. Use the static task context and previous review history already present in this session.",
+            "You are continuing the same reviewer session. Use the remembered static task context and worker instructions.",
+            "When Worker Instructions mention caller_context.X, read X from the remembered static caller_context plus the current Delta Context caller_context_delta. Current delta fields override older volatile fields.",
+            "Review the Current Proposer Outputs section independently for this turn. Previous review history is background only; do not let an older accepted/rejected judgment override the current proposer outputs, current active_proposer_ids, caller_context_delta, or current JSON schema.",
             "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and the current active_proposer_ids, not any older schema or older active proposer list in the session history.",
             "",
             "## Current Proposer Outputs To Review",
@@ -156,7 +162,7 @@ def render_reviewer_validation_retry_delta(exc: Exception) -> str:
         "## ARC-LLM Reviewer Validation Retry v2\n"
         f"Your previous reviewer JSON failed validation:\n{exc}\n\n"
         "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and the current active_proposer_ids, not any older schema or older active proposer list in the session history.\n"
-        "Use the same current proposer outputs already present in this session. Return exactly one corrected "
+        "Use the same current proposer outputs already present in this session, but validate them against the current schema and current active proposer ids. Do not reuse an older review envelope. Return exactly one corrected "
         "arc.llm.review_envelope.v1 JSON object.\n"
     )
 

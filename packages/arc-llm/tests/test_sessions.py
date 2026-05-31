@@ -8,6 +8,49 @@ import pytest
 from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
 
 
+def _create_session_for_process(args):
+    root_text, key = args
+    from pathlib import Path
+
+    from arc_llm.sessions import LLMSessionManager
+
+    manager = LLMSessionManager(Path(root_text))
+    manager.get_or_create(
+        key=key,
+        provider="codex-cli",
+        model="test-model",
+        runtime_fingerprint="runtime",
+    )
+    return key
+
+
+def _record_turn_for_process(args):
+    root_text, key = args
+    from pathlib import Path
+
+    from arc_llm.sessions import LLMSessionManager
+
+    manager = LLMSessionManager(Path(root_text))
+    manager.get_or_create(
+        key=key,
+        provider="codex-cli",
+        model="test-model",
+        runtime_fingerprint="runtime",
+    )
+    manager.record_turn(
+        key,
+        call_label=f"call/{key}",
+        prompt_sha256="prompt",
+        static_prefix_sha256=None,
+        schema_sha256=None,
+        usage={},
+        provider_used="codex-cli",
+        model_used="test-model",
+        native_session_id=None,
+    )
+    return key
+
+
 def test_session_manager_persists_native_id_and_turns(tmp_path):
     manager = LLMSessionManager(tmp_path / "sessions")
 
@@ -138,6 +181,32 @@ def test_locked_turn_serializes_turn_count_across_manager_instances(tmp_path):
     assert sorted(turn_counts) == [0, 1]
 
 
+def test_session_store_preserves_concurrent_process_keys(tmp_path):
+    from concurrent.futures import ProcessPoolExecutor
+
+    keys = [f"worker_{i:03d}" for i in range(32)]
+    with ProcessPoolExecutor(max_workers=8) as pool:
+        returned = list(pool.map(_create_session_for_process, [(str(tmp_path), key) for key in keys]))
+
+    payload = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert sorted(returned) == sorted(keys)
+    assert set(payload["sessions"]) == set(keys)
+
+
+def test_calls_jsonl_preserves_concurrent_process_records(tmp_path):
+    from concurrent.futures import ProcessPoolExecutor
+
+    keys = [f"worker_{i:03d}" for i in range(32)]
+    with ProcessPoolExecutor(max_workers=8) as pool:
+        returned = list(pool.map(_record_turn_for_process, [(str(tmp_path), key) for key in keys]))
+
+    lines = (tmp_path / "calls.jsonl").read_text(encoding="utf-8").splitlines()
+    seen = {json.loads(line)["session_key"] for line in lines}
+    assert sorted(returned) == sorted(keys)
+    assert seen == set(keys)
+    assert len(lines) == len(keys)
+
+
 def test_runtime_fingerprint_includes_runtime_but_not_prompt_or_run_values():
     first = runtime_fingerprint(
         provider="codex-cli",
@@ -209,3 +278,19 @@ def test_runtime_fingerprint_includes_claude_mcp_config_file_contents(tmp_path):
     )
 
     assert first != second
+
+
+def test_generated_claude_arc_mcp_path_does_not_change_fingerprint_when_file_appears(tmp_path):
+    config_path = tmp_path / "arc-claude-mcp.json"
+    env = {
+        "ARC_CLAUDE_MCP_MODE": "arc-only",
+        "ARC_CLAUDE_ARC_MCP_CONFIG_PATH": str(config_path),
+        "ARC_CLAUDE_ARC_MCP_COMMAND": "arc-mcp",
+        "ARC_CLAUDE_ARC_MCP_ENV_JSON": '{"FOO":"bar"}',
+    }
+    first = runtime_fingerprint(provider="claude-cli", model="m", model_tier=None, env=env)
+
+    config_path.write_text('{"mcpServers":{"arc":{"command":"arc-mcp"}}}', encoding="utf-8")
+    second = runtime_fingerprint(provider="claude-cli", model="m", model_tier=None, env=env)
+
+    assert first == second

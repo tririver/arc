@@ -25,7 +25,8 @@ def test_select_summary_provider_passes_env_to_codex_native_provider():
 
     provider = select_summary_provider("codex-cli", env=env, process_chain=[])
 
-    assert provider.prompt_provider.env is env
+    assert provider.env is env
+    assert provider.prompt_provider is None
 
 
 def test_select_summary_provider_passes_env_to_claude_native_provider():
@@ -33,4 +34,5 @@ def test_select_summary_provider_passes_env_to_claude_native_provider():
 
     provider = select_summary_provider("claude-cli", env=env, process_chain=[])
 
-    assert provider.prompt_provider.env is env
+    assert provider.env is env
+    assert provider.prompt_provider is None

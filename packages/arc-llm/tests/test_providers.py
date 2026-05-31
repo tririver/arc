@@ -2,6 +2,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.providers.base import LLMWorkerError
 from arc_llm.providers.claude_cli import ClaudeCliProvider
@@ -619,7 +621,7 @@ def test_claude_can_use_selected_mcp_config(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    provider = ClaudeCliProvider(env={"ARC_CLAUDE_MCP_CONFIG": "/tmp/arc-mcp.json"})
+    provider = ClaudeCliProvider(env={"ARC_CLAUDE_MCP_CONFIG": "/tmp/arc-mcp.json", "ARC_CLAUDE_TOOLS": "default"})
 
     assert provider.generate_text("prompt") == "plain text"
     assert "--bare" in captured["cmd"]
@@ -642,6 +644,7 @@ def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
         env={
             "ARC_CLAUDE_ALLOW_MCP": "true",
             "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "ARC_CLAUDE_TOOLS": "",
             "ARC_CLAUDE_ARC_MCP_COMMAND": "/tmp/custom-arc-mcp",
             "ARC_CLAUDE_ARC_MCP_ENV_JSON": json.dumps({"EXTRA": "value"}),
             "XDG_CACHE_HOME": str(tmp_path / "cache"),
@@ -659,3 +662,40 @@ def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
     assert payload["mcpServers"]["arc"]["env"]["ARC_AGENT_HOST"] == "claude"
     assert payload["mcpServers"]["arc"]["env"]["ARC_PAPER_CACHE"] == str(tmp_path / "paper-cache")
     assert payload["mcpServers"]["arc"]["env"]["EXTRA"] == "value"
+
+
+def test_claude_no_internet_mcp_requires_explicit_tools(tmp_path):
+    provider = ClaudeCliProvider(
+        env={
+            "ARC_CLAUDE_ALLOW_MCP": "true",
+            "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "ARC_CLAUDE_ALLOW_INTERNET": "false",
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        }
+    )
+
+    with pytest.raises(LLMWorkerError, match="requires explicit ARC_CLAUDE_TOOLS"):
+        provider.generate_text("prompt")
+
+
+def test_claude_no_internet_mcp_allows_explicit_tools(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    provider = ClaudeCliProvider(
+        env={
+            "ARC_CLAUDE_ALLOW_MCP": "true",
+            "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "ARC_CLAUDE_ALLOW_INTERNET": "false",
+            "ARC_CLAUDE_TOOLS": "",
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        }
+    )
+
+    assert provider.generate_text("prompt") == "plain text"
+    assert "--tools" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--tools") + 1] == ""

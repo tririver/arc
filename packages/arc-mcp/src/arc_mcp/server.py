@@ -145,6 +145,21 @@ class ToolInputError(ValueError):
         self.code = code
 
 
+def _bool_arg(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+    return bool(value)
+
+
 def call_tool(name: str, arguments: dict[str, Any]) -> Any:
     try:
         handler = TOOL_HANDLERS[name]
@@ -185,40 +200,40 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "batch_translate": lambda args: _start_batch_translate_job_response(args),
     "extract_paper_ids": lambda args: service.extract_paper_ids(str(args.get("text", ""))),
     "paper_ids_safe_dir_name": lambda args: service.paper_ids_safe_dir_name(_paper_ids(args)),
-    "get_title": lambda args: service.get_title(_paper_ids(args), refresh=bool(args.get("refresh", False))),
-    "get_abstract": lambda args: service.get_abstract(_paper_ids(args), refresh=bool(args.get("refresh", False))),
-    "get_authors": lambda args: service.get_authors(_paper_ids(args), refresh=bool(args.get("refresh", False))),
-    "get_metadata": lambda args: service.get_metadata(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_title": lambda args: service.get_title(_paper_ids(args), refresh=_bool_arg(args.get("refresh"), False)),
+    "get_abstract": lambda args: service.get_abstract(_paper_ids(args), refresh=_bool_arg(args.get("refresh"), False)),
+    "get_authors": lambda args: service.get_authors(_paper_ids(args), refresh=_bool_arg(args.get("refresh"), False)),
+    "get_metadata": lambda args: service.get_metadata(_paper_ids(args), refresh=_bool_arg(args.get("refresh"), False)),
     "get_citers": lambda args: service.get_citers(
         _paper_ids(args),
-        refresh=bool(args.get("refresh", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
         limit=int(args.get("limit", 1000)),
         sort=str(args.get("sort", "mostrecent")),
     ),
-    "get_citer_count": lambda args: service.get_citer_count(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_citer_count": lambda args: service.get_citer_count(_paper_ids(args), refresh=_bool_arg(args.get("refresh"), False)),
     "get_references": lambda args: service.get_references(
         _paper_ids(args),
-        refresh=bool(args.get("refresh", False)),
-        enrich=bool(args.get("enrich", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
+        enrich=_bool_arg(args.get("enrich"), False),
     ),
-    "get_toc": lambda args: service.get_toc(_paper_ids(args), refresh=bool(args.get("refresh", False))),
+    "get_toc": lambda args: service.get_toc(_paper_ids(args), refresh=_bool_arg(args.get("refresh"), False)),
     "get_section": lambda args: service.get_section(
         _paper_ids(args),
         str(args["section"]),
-        refresh=bool(args.get("refresh", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
     ),
     "search_full_text": lambda args: service.search_full_text(
         _optional_paper_ids(args),
         query=str(args.get("query", "")),
-        refresh=bool(args.get("refresh", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
         limit=int(args.get("limit", 20)),
         context=int(args.get("context", 1)),
-        case_sensitive=bool(args.get("case_sensitive", False)),
+        case_sensitive=_bool_arg(args.get("case_sensitive"), False),
     ),
     "get_equation_context": lambda args: service.get_equation_context(
         _paper_ids(args),
         str(args["query"]),
-        refresh=bool(args.get("refresh", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
     ),
     "parse": lambda args: service.parse_source(
         args.get("source_path"),
@@ -228,7 +243,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         html_path=args.get("html_path"),
         tex_path=args.get("tex_path"),
         pdf_path=args.get("pdf_path"),
-        refresh=bool(args.get("refresh", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
     ),
     "mark_parsed_equation": lambda args: service.mark_parsed_equation(
         str(args["source_id"]),
@@ -242,8 +257,8 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
         model_tier=args.get("model_tier"),
-        refresh=bool(args.get("refresh", False)),
-        background=bool(args.get("background", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
+        background=_bool_arg(args.get("background"), False),
     ),
     "llm_infer_main_references": lambda args: _start_reference_inference_job_response(args),
     "job_status": lambda args: job_status(str(args["job_id"])),
@@ -377,8 +392,8 @@ def _start_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
     provider = str(args.get("provider", "auto"))
     model = args.get("model")
     model_tier = str(args.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER))
-    quality = bool(args.get("quality", False))
-    overwrite = bool(args.get("overwrite", False))
+    quality = _bool_arg(args.get("quality"), False)
+    overwrite = _bool_arg(args.get("overwrite"), False)
     payload = {
         "input": str(input_path),
         "output": str(output_path) if output_path else None,
@@ -457,8 +472,8 @@ def _start_batch_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
     provider = str(args.get("provider", "auto"))
     model = args.get("model")
     model_tier = str(args.get("model_tier", typeset_translate.DEFAULT_MODEL_TIER))
-    quality = bool(args.get("quality", False))
-    overwrite = bool(args.get("overwrite", False))
+    quality = _bool_arg(args.get("quality"), False)
+    overwrite = _bool_arg(args.get("overwrite"), False)
     payload = {
         "project_dir": str(project_dir),
         "target_language": target_language,
@@ -530,7 +545,7 @@ def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
         paper_ids = _paper_ids(args)
     except ToolInputError as exc:
         return _error(exc.code, str(exc))
-    if not bool(args.get("refresh", False)):
+    if not _bool_arg(args.get("refresh"), False):
         cached = service.get_cached_llm_summary(paper_ids)
         if _all_ok(cached):
             return cached
@@ -539,8 +554,8 @@ def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
         model_tier=args.get("model_tier"),
-        refresh=bool(args.get("refresh", False)),
-        background=bool(args.get("background", False)),
+        refresh=_bool_arg(args.get("refresh"), False),
+        background=_bool_arg(args.get("background"), False),
     )
 
 
@@ -604,12 +619,12 @@ def _start_reference_inference_job_response(args: dict[str, Any]) -> dict[str, A
     text = str(args.get("text") or "")
     provider = str(args.get("provider", "auto"))
     model = args.get("model")
-    refresh = bool(args.get("refresh", False))
+    refresh = _bool_arg(args.get("refresh"), False)
     extracted = service.extract_paper_ids(text)
     if extracted.get("ok") and extracted.get("data"):
         return service.llm_infer_main_references(text, provider=provider, model=model, refresh=refresh)
 
-    background = bool(args.get("background", False))
+    background = _bool_arg(args.get("background"), False)
     job_id = MCP_JOBS.start(
         job_type="main_reference_inference",
         payload={
@@ -648,9 +663,9 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
     provider = str(args.get("provider", "auto"))
     model = args.get("model")
     model_tier = args.get("model_tier")
-    refresh = bool(args.get("refresh", False))
+    refresh = _bool_arg(args.get("refresh"), False)
     workers = int(args.get("workers", 8))
-    background = bool(args.get("background", False))
+    background = _bool_arg(args.get("background"), False)
     job_id = MCP_JOBS.start(
         job_type="domain_build",
         payload={
@@ -820,7 +835,7 @@ def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
     concurrency = int(args.get("concurrency", 1))
     max_items = args.get("max_items")
     max_items_int = int(max_items) if max_items is not None else None
-    background = bool(args.get("background", False))
+    background = _bool_arg(args.get("background"), False)
     job_id = MCP_JOBS.start(
         job_type="summary_batch_run",
         payload={

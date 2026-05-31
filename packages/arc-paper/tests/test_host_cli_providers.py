@@ -1,6 +1,7 @@
 import json
-import subprocess
 
+from arc_paper.summary.providers import claude_cli as claude_module
+from arc_paper.summary.providers import codex_cli as codex_module
 from arc_paper.summary.providers.claude_cli import ClaudeCliProvider
 from arc_paper.summary.providers.codex_cli import CodexCliProvider
 
@@ -54,84 +55,91 @@ def llm_task():
     }
 
 
-def test_codex_cli_provider_writes_prompt_and_reads_output(monkeypatch):
+def test_codex_summary_provider_uses_arc_llm_run_json(monkeypatch):
     summary = valid_summary()
-    captured = {}
+    calls = []
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["input"] = kwargs.get("input")
-        output_path = cmd[cmd.index("--output-last-message") + 1]
-        with open(output_path, "w", encoding="utf-8") as handle:
-            json.dump(summary, handle)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    def fake_run_json(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return dict(summary)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(codex_module, "run_json", fake_run_json)
 
-    result = CodexCliProvider().generate_summary(llm_task(), model="test-model")
+    result = CodexCliProvider(env={}).generate_summary(llm_task(), model="test-model")
 
     assert result["title"] == "A Test Paper"
-    assert captured["cmd"][:2] == ["codex", "exec"]
-    assert "--output-schema" in captured["cmd"]
-    assert "-m" in captured["cmd"]
-    assert captured["cmd"][-1] == "-"
-    assert captured["input"]
-    assert captured["input"] not in captured["cmd"]
+    assert calls
+    assert calls[0]["provider"] == "codex-cli"
+    assert calls[0]["session_policy"] == "stateless"
+    assert calls[0]["call_label"] == "arc-paper/summary"
+    assert calls[0]["env"] == {}
 
 
 def test_codex_cli_provider_uses_medium_default_model(monkeypatch):
     summary = valid_summary()
-    captured = {}
+    calls = []
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["input"] = kwargs.get("input")
-        output_path = cmd[cmd.index("--output-last-message") + 1]
-        with open(output_path, "w", encoding="utf-8") as handle:
-            json.dump(summary, handle)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    def fake_run_json(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return dict(summary)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(codex_module, "run_json", fake_run_json)
 
-    CodexCliProvider().generate_summary(llm_task())
+    CodexCliProvider(env={}).generate_summary(llm_task())
 
-    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "gpt-5.4"
-    assert captured["input"]
+    assert calls[0]["model"] == "gpt-5.4"
 
 
-def test_claude_cli_provider_parses_json_stdout(monkeypatch):
+def test_claude_summary_provider_uses_arc_llm_run_json(monkeypatch):
     summary = valid_summary()
-    captured = {}
+    calls = []
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["input"] = kwargs.get("input")
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(summary), stderr="")
+    def fake_run_json(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return dict(summary)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_module, "run_json", fake_run_json)
 
-    result = ClaudeCliProvider().generate_summary(llm_task(), model="test-model")
+    result = ClaudeCliProvider(env={}).generate_summary(llm_task(), model="test-model")
 
     assert result["title"] == "A Test Paper"
-    assert captured["cmd"][:2] == ["claude", "-p"]
-    assert "--json-schema" in captured["cmd"]
-    assert "--model" in captured["cmd"]
-    assert captured["input"]
-    assert captured["input"] not in captured["cmd"]
+    assert calls
+    assert calls[0]["provider"] == "claude-cli"
+    assert calls[0]["session_policy"] == "stateless"
+    assert calls[0]["call_label"] == "arc-paper/summary"
+    assert calls[0]["env"] == {}
 
 
 def test_claude_cli_provider_uses_medium_default_model(monkeypatch):
     summary = valid_summary()
-    captured = {}
+    calls = []
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["input"] = kwargs.get("input")
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(summary), stderr="")
+    def fake_run_json(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return dict(summary)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_module, "run_json", fake_run_json)
 
-    ClaudeCliProvider().generate_summary(llm_task())
+    ClaudeCliProvider(env={}).generate_summary(llm_task())
 
-    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "sonnet"
-    assert captured["input"]
+    assert calls[0]["model"] == "sonnet"
+
+
+def test_codex_summary_provider_keeps_injected_prompt_provider():
+    class FakePromptProvider:
+        def generate_json(self, prompt, *, schema, model):
+            return valid_summary()
+
+    result = CodexCliProvider(prompt_provider=FakePromptProvider()).generate_summary(llm_task(), model="test-model")
+
+    assert result["title"] == "A Test Paper"
+
+
+def test_claude_summary_provider_keeps_injected_prompt_provider():
+    class FakePromptProvider:
+        def generate_json(self, prompt, *, schema, model):
+            return valid_summary()
+
+    result = ClaudeCliProvider(prompt_provider=FakePromptProvider()).generate_summary(llm_task(), model="test-model")
+
+    assert result["title"] == "A Test Paper"

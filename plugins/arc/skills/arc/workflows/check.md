@@ -23,6 +23,7 @@ ready-step boundaries, reviewer-only target placement, runtime settings, or
 execution status rules. `plan.md` owns work-note planning and structure.
 `calculate.md` owns consensus execution and result recording. When another
 phase needs behavior outside note parsing and handoff, refer to the owning workflow.
+`calculate.md` uses high reasoning effort by default for mathematical derivations; lower it only for cheap exploratory runs.
 
 ## Phase 1: Parse And Read Notes
 
@@ -131,7 +132,10 @@ Step 3: Repeat Steps 1 and 2 until the requested note-check coverage is
 complete or a workflow stop condition applies. Do not stop only because one
 ready step was accepted; if rough or pending coverage remains, return to
 `plan.md` to promote the next coherent chunk before the next `calculate.md`
-run.
+run. Before final response, adjudicate every rough-step item: promote and run
+triggered items, remove or mark false-trigger items as obsolete/not triggered,
+or record a concrete stop condition in `Open Questions` or
+`Calculation Status`.
 
 ## Phase 5: Note-Check Status
 

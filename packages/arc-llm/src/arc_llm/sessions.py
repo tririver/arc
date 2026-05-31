@@ -65,16 +65,17 @@ class LLMSessionManager:
         metadata: Mapping[str, Any] | None = None,
     ) -> LLMSessionRef:
         with self.lock(key):
-            with self._state_lock:
-                self._reload_sessions_from_disk_locked()
-                return self._get_or_create_locked(
-                    key=key,
-                    provider=provider,
-                    model=model,
-                    runtime_fingerprint=runtime_fingerprint,
-                    name=name,
-                    metadata=metadata,
-                )
+            with self._sessions_store_lock():
+                with self._state_lock:
+                    self._reload_sessions_from_disk_locked()
+                    return self._get_or_create_locked(
+                        key=key,
+                        provider=provider,
+                        model=model,
+                        runtime_fingerprint=runtime_fingerprint,
+                        name=name,
+                        metadata=metadata,
+                    )
 
     def update_native_session_id(
         self,
@@ -84,30 +85,32 @@ class LLMSessionManager:
         allow_overwrite: bool = False,
     ) -> LLMSessionRef:
         with self.lock(key):
-            with self._state_lock:
-                self._reload_sessions_from_disk_locked()
-                ref = self._require_ref(key)
-                if ref.native_session_id and ref.native_session_id != native_session_id and not allow_overwrite:
-                    raise ValueError(f"session native_session_id changed for {key}")
-                if ref.native_session_id == native_session_id:
-                    return ref
-                updated = LLMSessionRef(
-                    key=ref.key,
-                    provider=ref.provider,
-                    model=ref.model,
-                    runtime_fingerprint=ref.runtime_fingerprint,
-                    native_session_id=native_session_id,
-                    name=ref.name,
-                    metadata=dict(ref.metadata),
-                    generation=ref.generation,
-                )
-                self._sessions[key] = updated
-                self._write_sessions()
-                return updated
+            with self._sessions_store_lock():
+                with self._state_lock:
+                    self._reload_sessions_from_disk_locked()
+                    ref = self._require_ref(key)
+                    if ref.native_session_id and ref.native_session_id != native_session_id and not allow_overwrite:
+                        raise ValueError(f"session native_session_id changed for {key}")
+                    if ref.native_session_id == native_session_id:
+                        return ref
+                    updated = LLMSessionRef(
+                        key=ref.key,
+                        provider=ref.provider,
+                        model=ref.model,
+                        runtime_fingerprint=ref.runtime_fingerprint,
+                        native_session_id=native_session_id,
+                        name=ref.name,
+                        metadata=dict(ref.metadata),
+                        generation=ref.generation,
+                    )
+                    self._sessions[key] = updated
+                    self._write_sessions()
+                    return updated
 
     def reload(self) -> None:
-        with self._state_lock:
-            self._reload_sessions_from_disk_locked()
+        with self._sessions_store_lock():
+            with self._state_lock:
+                self._reload_sessions_from_disk_locked()
 
     def record_turn(
         self,
@@ -138,13 +141,15 @@ class LLMSessionManager:
         if extra:
             item.update(dict(extra))
         with self.lock(key):
-            _append_jsonl(self.calls_path, item)
+            with self._calls_store_lock():
+                _append_jsonl(self.calls_path, item)
 
     def turn_count(self, key: str) -> int:
-        try:
-            lines = self.calls_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return 0
+        with self._calls_store_lock():
+            try:
+                lines = self.calls_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return 0
         count = 0
         for line in lines:
             try:
@@ -156,15 +161,32 @@ class LLMSessionManager:
         return count
 
     def has_native_session(self, key: str) -> bool:
-        with self._state_lock:
-            self._reload_sessions_from_disk_locked()
-            ref = self._sessions.get(key)
-            return bool(ref and ref.native_session_id)
+        with self._sessions_store_lock():
+            with self._state_lock:
+                self._reload_sessions_from_disk_locked()
+                ref = self._sessions.get(key)
+                return bool(ref and ref.native_session_id)
 
     @contextmanager
     def lock(self, key: str) -> Iterator[None]:
         safe = _safe_lock_name(key)
         lock_path = self.root / "locks" / f"{safe}.lock"
+        process_lock = _process_lock(lock_path)
+        with process_lock:
+            with _file_lock(lock_path):
+                yield
+
+    @contextmanager
+    def _sessions_store_lock(self) -> Iterator[None]:
+        lock_path = self.root / "locks" / "_sessions_store.lock"
+        process_lock = _process_lock(lock_path)
+        with process_lock:
+            with _file_lock(lock_path):
+                yield
+
+    @contextmanager
+    def _calls_store_lock(self) -> Iterator[None]:
+        lock_path = self.root / "locks" / "_calls_store.lock"
         process_lock = _process_lock(lock_path)
         with process_lock:
             with _file_lock(lock_path):
@@ -182,16 +204,17 @@ class LLMSessionManager:
         metadata: Mapping[str, Any] | None = None,
     ) -> Iterator[tuple[LLMSessionRef, int]]:
         with self.lock(key):
-            with self._state_lock:
-                self._reload_sessions_from_disk_locked()
-                ref = self._get_or_create_locked(
-                    key=key,
-                    provider=provider,
-                    model=model,
-                    runtime_fingerprint=runtime_fingerprint,
-                    name=name,
-                    metadata=metadata,
-                )
+            with self._sessions_store_lock():
+                with self._state_lock:
+                    self._reload_sessions_from_disk_locked()
+                    ref = self._get_or_create_locked(
+                        key=key,
+                        provider=provider,
+                        model=model,
+                        runtime_fingerprint=runtime_fingerprint,
+                        name=name,
+                        metadata=metadata,
+                    )
             yield ref, self.turn_count(key)
 
     def _get_or_create_locked(
@@ -326,17 +349,30 @@ def runtime_fingerprint(
     return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
-def _runtime_file_hashes(env: Mapping[str, str]) -> dict[str, list[dict[str, str | None]]]:
-    paths_by_key = {
+def _runtime_file_hashes(env: Mapping[str, str]) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = {}
+    explicit_paths_by_key = {
         "ARC_CLAUDE_MCP_CONFIG": _newline_paths(env.get("ARC_CLAUDE_MCP_CONFIG")),
         "ARC_CLAUDE_MCP_CONFIG_JSON": _json_paths(env.get("ARC_CLAUDE_MCP_CONFIG_JSON")),
-        "ARC_CLAUDE_ARC_MCP_CONFIG_PATH": _single_path(env.get("ARC_CLAUDE_ARC_MCP_CONFIG_PATH")),
     }
-    result: dict[str, list[dict[str, str | None]]] = {}
-    for key, paths in paths_by_key.items():
-        if not paths:
-            continue
-        result[key] = [_file_hash_entry(path) for path in paths]
+    for key, paths in explicit_paths_by_key.items():
+        if paths:
+            result[key] = [_file_hash_entry(path) for path in paths]
+    generated_arc_mcp_path = env.get("ARC_CLAUDE_ARC_MCP_CONFIG_PATH")
+    if env.get("ARC_CLAUDE_MCP_MODE") == "arc-only":
+        result["ARC_CLAUDE_ARC_MCP_GENERATED_INPUTS"] = [
+            {
+                "path": generated_arc_mcp_path,
+                "command": env.get("ARC_CLAUDE_ARC_MCP_COMMAND"),
+                "args_json": env.get("ARC_CLAUDE_ARC_MCP_ARGS_JSON"),
+                "env_json": env.get("ARC_CLAUDE_ARC_MCP_ENV_JSON"),
+                "arc_paper_cache": env.get("ARC_PAPER_CACHE"),
+                "arc_domain_cache": env.get("ARC_DOMAIN_CACHE"),
+                "arc_mcp_cache": env.get("ARC_MCP_CACHE"),
+            }
+        ]
+    elif generated_arc_mcp_path:
+        result["ARC_CLAUDE_ARC_MCP_CONFIG_PATH"] = [_file_hash_entry(generated_arc_mcp_path)]
     return result
 
 

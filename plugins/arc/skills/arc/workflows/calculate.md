@@ -27,23 +27,14 @@ Copy `workflows/json/calculate.config.template.json` to:
 ```
 
 Replace `<calculate-run-id>`, `<project-dir>`, `<run-id>`, and
-`<skill-workflow-json-dir>`. Use `skill_dir` from context as `<skill-dir>` in
-commands below. Keep `"proposer_count": 2`,
-`"max_recalculations": 2`, and `artifact_options.save_prompts` enabled unless
-the user asks otherwise.
+`<skill-workflow-json-dir>`. Use `skill_dir` from context as `<skill-dir>` in commands below. Keep `"proposer_count": 2`, `"max_recalculations": 2`, and `artifact_options.save_prompts` enabled unless the user asks otherwise.
+The default template uses high reasoning effort and medium verbosity because these tasks are mathematical derivations, not lightweight summaries. Lower effort only for cheap exploratory runs.
 
-The runner reads worker prompt/schema templates from:
-
-- `workflows/json/calculate-proposer.template.json`
-- `workflows/json/calculate-reviewer.template.json`
-- `workflows/json/calculate-reviewer-output.schema.json`
+The runner reads worker prompt/schema templates from `workflows/json/calculate-proposer.template.json`, `workflows/json/calculate-reviewer.template.json`, and `workflows/json/calculate-reviewer-output.schema.json`.
 
 `"max_recalculations": 2` means 3 total attempts: 1 initial attempt + 2 recalculations.
 Do not increase attempts unless the user asks.
-For retryable proposer disagreement statuses, use the recalculation budget
-before pausing for human input.
-Also retry `reference_disagrees` while budget remains when reviewer feedback can
-tell proposers what to recheck without revealing reviewer-only target formulas.
+For retryable proposer disagreement statuses, use the recalculation budget before pausing for human input. Also retry `reference_disagrees` while budget remains when reviewer feedback can tell proposers what to recheck without revealing reviewer-only target formulas.
 
 Remove foundation_check mechanics. Starting points are checked by ordinary ready
 steps when they are marked not accepted in the work note.
@@ -92,9 +83,7 @@ python3 <skill-dir>/workflows/scripts/calculate_runner.py \
   --json
 ```
 
-Inspect the returned JSON and saved artifacts. Large or slow runs are runtime
-facts, not workflow blocks. Use package status or watcher commands instead of
-manual polling when available.
+Inspect the returned JSON and saved artifacts. Large or slow runs are runtime facts, not workflow blocks. Use package status or watcher commands instead of manual polling when available.
 
 ## Phase 4: Review Acceptance
 
@@ -102,9 +91,7 @@ Acceptance depends on reviewer judgment. SymPy, Wolfram, explicit algebra, and
 numerical checks are optional tools, not mandatory gates. Accept only if the
 target quantity agrees in the declared regime and approximation order.
 
-The reviewer must explain the comparison, conventions, rewrites, and identities
-used to relate expressions. Special limits are sanity checks, not proof of full agreement unless the target itself is a limit, asymptotic result, or
-leading-order claim.
+The reviewer must explain the comparison, conventions, rewrites, and identities used to relate expressions. Special limits are sanity checks, not proof of full agreement unless the target itself is a limit, asymptotic result, or leading-order claim.
 
 The main agent audits the reviewer report before updating the work note. Reject
 weak evidence such as formatting agreement, visual similarity, or agreement in
@@ -137,8 +124,7 @@ structure, future premises, source coverage, or physical interpretation. If
 that standard is met, continue without pausing and record the decision beside
 the affected work-note content with `[agent-resolved decision]`, coloring only
 that literal marker red. Record the evidence, rejected alternative, and
-downstream risk in `Journal` or `Calculation Status`. For PDF-oriented
-Markdown, `\textcolor{red}{[agent-resolved decision]}` is acceptable.
+downstream risk in `Journal` or `Calculation Status`. For PDF-oriented Markdown, write the raw LaTeX marker directly in prose, for example: \textcolor{red}{[agent-resolved decision]}. Do not surround color commands with backticks or other Markdown code spans.
 
 If the high-confidence standard is not met, or the decision is important,
 foundation-like, convention-setting, or likely to affect later plan structure,
@@ -161,13 +147,7 @@ For an accepted step, update only the current ready-step slot:
 - use `Journal` for execution facts, consensus paths, attempts, and reviewer
   judgment
 
-For `confirmed_source_error`, put the literal marker `[confirmed source issue]`
-beside the source-disagreement statement, but only color that literal marker
-red. Do not color the surrounding prose. Do not color the surrounding equations.
-For PDF-oriented Markdown, `\textcolor{red}{[confirmed source issue]}` is
-acceptable. Do not use the red marker for likely or convention-dependent source
-mismatches; those must remain blocked until the human expert question is
-answered.
+For `confirmed_source_error`, put `[confirmed source issue]` beside the source-disagreement statement, and only color that marker red. Do not color the surrounding prose. Do not color the surrounding equations. For PDF-oriented Markdown, raw LaTeX such as \textcolor{red}{[confirmed source issue]} is acceptable only outside Markdown code spans. Do not surround color commands with backticks. Do not use the red marker for likely or convention-dependent source mismatches; those must remain blocked until the human expert question is answered.
 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and
@@ -175,17 +155,8 @@ proposed next action. If the block needs human input, ask the exact same
 `Human expert question:` in the user-facing response before ending the turn.
 Limits diagnose; they are not proof.
 
-Any accepted work-note content whose acceptance depends on a specific human
-expert answer resolving an unresolved scientific acceptance question is
-human-resolved content. This includes a blocked step that the expert resolves,
-a source convention the expert chooses, or a main-agent verification that is
-accepted only because the expert allowed that acceptance standard. This does
-not include ordinary user task instructions, source excerpts, or constraints.
-Add marker `[human-resolved]` beside the accepted content, but only color the
-string `human-resolved` blue. Do not color the surrounding prose. Do not color
-the surrounding equations. If color is stripped or unavailable, the marker
-remains authoritative. For PDF-oriented Markdown,
-`[\textcolor{blue}{human-resolved}]` is acceptable.
+Any accepted work-note content whose acceptance depends on a specific human expert answer resolving an unresolved scientific acceptance question is human-resolved content. This includes a blocked step the expert resolves, a source convention the expert chooses, or a main-agent verification accepted only because the expert allowed that standard. It excludes ordinary user task instructions, source excerpts, or constraints.
+Add `[human-resolved]` beside the accepted content, and only color `human-resolved` blue. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. For PDF-oriented Markdown, [\textcolor{blue}{human-resolved}] is acceptable only outside Markdown code spans. Do not surround color commands with backticks.
 
 A human expert later resolves a block and thereby unblocks the workflow; this
 is not by itself a completion condition. After recording the human-resolved
@@ -218,11 +189,7 @@ not edit ready-step boundaries, rough steps, or future plan structure.
 
 Write `<project-dir>/calculate/<run-id>/planning-request.md` with:
 
-- current step id and status
-- consensus artifact paths
-- evidence for the requested change
-- proposer positions and reviewer judgment
-- requested action for `plan.md`
+- current step id/status, consensus artifact paths, evidence, proposer positions, reviewer judgment, and requested `plan.md` action
 
 Then return to `plan.md`. Use the same handoff when blocked refinement needs
 splitting, limits, projections, different source context, or changed future

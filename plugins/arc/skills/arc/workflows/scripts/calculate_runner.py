@@ -82,10 +82,10 @@ def load_calculation_config(payload: Mapping[str, Any]) -> CalculateConfig:
     if defaults.get("model") is not None and str(defaults.get("provider", "auto") or "auto") == "auto":
         raise ConfigError("defaults.model requires explicit provider")
     artifact_options = _dict(data.get("artifact_options", {"save_prompts": True}), "artifact_options")
-    if "save_prompts" not in artifact_options:
-        artifact_options["save_prompts"] = True
-    if not isinstance(artifact_options.get("save_prompts"), bool):
-        raise ConfigError("artifact_options.save_prompts must be a boolean")
+    artifact_options["save_prompts"] = _bool(
+        artifact_options.get("save_prompts", True),
+        "artifact_options.save_prompts",
+    )
 
     raw_steps = data.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
@@ -405,7 +405,7 @@ def _attempt_batch_config(
             "max_concurrent_same_prefix": 4,
             "root": str(run_root / "llm_sessions"),
         },
-        "artifact_options": {"save_prompts": bool(config.artifact_options.get("save_prompts", True))},
+        "artifact_options": {"save_prompts": config.artifact_options.get("save_prompts", True)},
         "defaults": copy.deepcopy(config.defaults),
         "loops": [
             {
@@ -546,14 +546,14 @@ def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str,
         }
     runtime.update(_dict(config.defaults.get("proposer_runtime", {}), "defaults.proposer_runtime"))
     runtime.update(step.proposer_runtime)
-    if runtime.get("allow_mcp") and "mcp_mode" not in runtime:
+    if _bool_default(runtime.get("allow_mcp", False), False) and "mcp_mode" not in runtime:
         runtime["mcp_mode"] = "arc-only"
     return runtime
 
 
 def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
-    allow_mcp = bool(runtime.get("allow_mcp"))
-    allow_internet = bool(runtime.get("allow_internet"))
+    allow_mcp = _bool_default(runtime.get("allow_mcp", False), False)
+    allow_internet = _bool_default(runtime.get("allow_internet", False), False)
     if not allow_mcp and not allow_internet:
         return (
             "Do not use internet search. Do not use ARC paper MCP tools. "
@@ -615,7 +615,7 @@ def _reviewer_status_instruction(*, allow_reference_disagrees: bool) -> str:
 
 
 def _reviewer_workflow_instruction(human_gate: Mapping[str, Any]) -> str:
-    if not bool(human_gate.get("enabled", False)):
+    if not _bool_default(human_gate.get("enabled", False), False):
         return (
             "workflow_action is still required. In normal mode, choose continue for "
             "all_agree and reference_disagrees when legacy acceptance applies; for other "
@@ -1015,7 +1015,7 @@ def _next_active_for_two_agree(consensus: Mapping[str, Any], all_proposer_ids: l
 
 
 def _human_gate_enabled(config: CalculateConfig) -> bool:
-    return bool(config.human_gate.get("enabled", False))
+    return _bool_default(config.human_gate.get("enabled", False), False)
 
 
 def _human_gate_pause_statuses(config: CalculateConfig) -> tuple[str, ...]:
@@ -1055,9 +1055,10 @@ def _normalized_workflow_action(raw: Any, trigger_status: str) -> dict[str, Any]
     issue_type = str(raw.get("issue_type", default["issue_type"])).strip()
     if issue_type not in allowed_issue_types:
         issue_type = default["issue_type"]
-    requires_human = raw.get("requires_human", default["requires_human"])
-    if not isinstance(requires_human, bool):
-        requires_human = bool(default["requires_human"])
+    requires_human = _bool_default(
+        raw.get("requires_human", default["requires_human"]),
+        bool(default["requires_human"]),
+    )
 
     normalized = copy.deepcopy(raw)
     normalized["action"] = action
@@ -1080,8 +1081,9 @@ def _normalized_source_discrepancy(raw: Any) -> dict[str, Any]:
         "source_claim": str(raw.get("source_claim", "") or ""),
         "derived_result": str(raw.get("derived_result", "") or ""),
         "confidence_reason": str(raw.get("confidence_reason", "") or ""),
-        "reviewer_says_no_human_convention_choice_needed": bool(
-            raw.get("reviewer_says_no_human_convention_choice_needed", False)
+        "reviewer_says_no_human_convention_choice_needed": _bool_default(
+            raw.get("reviewer_says_no_human_convention_choice_needed", False),
+            False,
         ),
     }
 
@@ -1288,6 +1290,30 @@ def _dict(value: Any, field_name: str) -> dict[str, Any]:
     return copy.deepcopy(value)
 
 
+def _bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    raise ConfigError(f"{field_name} must be a boolean")
+
+
+def _bool_default(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 def _optional_dict(value: Any, field_name: str) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -1296,7 +1322,7 @@ def _optional_dict(value: Any, field_name: str) -> dict[str, Any] | None:
 
 def _parse_human_gate(value: Any) -> dict[str, Any]:
     data = _dict(value, "human_gate")
-    enabled = bool(data.get("enabled", False))
+    enabled = _bool(data.get("enabled", False), "human_gate.enabled")
     pause_statuses = data.get("pause_on_statuses", DEFAULT_HUMAN_GATE_PAUSE_STATUSES)
     if not isinstance(pause_statuses, (list, tuple)):
         raise ConfigError("human_gate.pause_on_statuses must be a list")

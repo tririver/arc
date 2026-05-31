@@ -448,7 +448,14 @@ def _first_json(root: Path) -> Path | None:
 
 
 def _max_concurrent_loops(proposal_count: int) -> int:
-    return min(proposal_count, int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12")))
+    raw = os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12")
+    try:
+        configured = int(raw)
+    except ValueError as exc:
+        raise ConfigError("ARC_IDEAS_MAX_CONCURRENT_LOOPS must be a positive integer") from exc
+    if configured <= 0:
+        raise ConfigError("ARC_IDEAS_MAX_CONCURRENT_LOOPS must be a positive integer")
+    return min(proposal_count, configured)
 
 
 def _concurrency_warning(config: IdeasConfig, proposal_count: int, *, max_concurrent: int) -> str:

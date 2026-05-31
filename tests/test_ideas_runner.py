@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "plugins/arc/skills/arc/workflows"
@@ -218,6 +220,54 @@ def test_ideas_warning_uses_env_concurrency_cap(tmp_path: Path, monkeypatch: Any
     assert result["max_concurrent_loops"] == 3
     assert "loop concurrency capped at 3" in warning
     assert "unlimited loop concurrency" not in warning
+
+
+def test_ideas_save_prompts_string_false(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WJ),
+        "variant_glob": "ideas-*.variant.json",
+        "loops_per_variant": 1,
+        "artifact_options": {"save_prompts": "false"},
+    }
+
+    parsed = runner.load_ideas_config(config)
+
+    assert parsed.save_prompts is False
+
+
+def test_ideas_rejects_invalid_save_prompts_string(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WJ),
+        "variant_glob": "ideas-*.variant.json",
+        "loops_per_variant": 1,
+        "artifact_options": {"save_prompts": "maybe"},
+    }
+
+    with pytest.raises(runner.ConfigError, match="must be a boolean"):
+        runner.load_ideas_config(config)
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc"])
+def test_max_concurrent_loops_rejects_invalid_env(monkeypatch: Any, value: str) -> None:
+    runner = _load_runner_module()
+    monkeypatch.setenv("ARC_IDEAS_MAX_CONCURRENT_LOOPS", value)
+
+    with pytest.raises(runner.ConfigError, match="positive integer"):
+        runner._max_concurrent_loops(10)  # noqa: SLF001
 
 
 def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path: Path) -> None:

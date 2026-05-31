@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, Mapping
 
 from arc_llm.providers.codex_cli import CodexCliProvider as CodexPromptProvider
+from arc_llm.runner import run_json
 
 from ..model import resolve_summary_model
 from ..schema import load_summary_schema, validate_summary
@@ -18,7 +19,8 @@ class CodexCliProvider:
         *,
         env: Mapping[str, str] | None = None,
     ):
-        self.prompt_provider = prompt_provider or CodexPromptProvider(env=env)
+        self.prompt_provider = prompt_provider
+        self.env = env
 
     def generate_summary(
         self,
@@ -40,4 +42,15 @@ class CodexCliProvider:
         return summary
 
     def _run_json(self, prompt: str, schema: dict, model: str | None) -> dict:
-        return self.prompt_provider.generate_json(prompt, schema=schema or load_summary_schema(), model=model)
+        output_schema = schema or load_summary_schema()
+        if self.prompt_provider is not None:
+            return self.prompt_provider.generate_json(prompt, schema=output_schema, model=model)
+        return run_json(
+            prompt,
+            schema=output_schema,
+            provider=self.name,
+            model=model,
+            env=self.env,
+            session_policy="stateless",
+            call_label="arc-paper/summary",
+        )

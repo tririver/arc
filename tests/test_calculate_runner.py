@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "plugins/arc/skills/arc/workflows"
@@ -413,6 +415,74 @@ def test_calculate_templates_are_external_to_workflow_doc() -> None:
     assert "calculate-reviewer.template.json" in calculate
     assert "work_note_assessment" in proposer["prompt"]["template"]
     assert "agreement_assessment" in reviewer["prompt"]["template"]
+
+
+def test_calculate_template_sets_high_reasoning_defaults() -> None:
+    data = json.loads((WJ / "calculate.config.template.json").read_text(encoding="utf-8"))
+    defaults = data["defaults"]
+    runtime = defaults["runtime"]
+
+    assert defaults["model_tier"] == "high"
+    assert runtime["codex_reasoning_effort"] == "high"
+    assert runtime["codex_model_verbosity"] == "medium"
+    assert runtime["claude_effort"] == "high"
+
+
+def test_attempt_batch_config_carries_reasoning_defaults(tmp_path) -> None:
+    runner = load_calculate_runner()
+    template = json.loads((WJ / "calculate.config.template.json").read_text(encoding="utf-8"))
+    config = runner.load_calculation_config(minimal_config(tmp_path, defaults=template["defaults"]))
+    step = config.steps[0]
+
+    batch = runner._attempt_batch_config(  # noqa: SLF001
+        config,
+        step,
+        attempt_number=1,
+        active_proposer_ids=["proposer_001", "proposer_002"],
+        locked_outputs={},
+        retry_feedback=[],
+        run_root=tmp_path / "execute" / "calc_001",
+        accepted_step_outputs={},
+    )
+
+    assert batch["defaults"] == template["defaults"]
+
+
+def test_calculate_parses_string_false_as_false(tmp_path) -> None:
+    runner = load_calculate_runner()
+    payload = minimal_config(
+        tmp_path,
+        human_gate={"enabled": "false"},
+        artifact_options={"save_prompts": "false"},
+    )
+
+    config = runner.load_calculation_config(payload)
+
+    assert config.human_gate["enabled"] is False
+    assert config.artifact_options["save_prompts"] is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"human_gate": {"enabled": "maybe"}},
+        {"artifact_options": {"save_prompts": "maybe"}},
+    ],
+)
+def test_calculate_rejects_invalid_config_bool_strings(tmp_path, override: dict[str, Any]) -> None:
+    runner = load_calculate_runner()
+
+    with pytest.raises(runner.ConfigError, match="must be a boolean"):
+        runner.load_calculation_config(minimal_config(tmp_path, **override))
+
+
+def test_proposer_source_policy_parses_string_false() -> None:
+    runner = load_calculate_runner()
+
+    policy = runner._proposer_source_policy({"allow_mcp": "false", "allow_internet": "false"})  # noqa: SLF001
+
+    assert "Do not use internet search" in policy
+    assert "Do not use ARC paper MCP tools" in policy
 
 
 def test_calculate_worker_schemas_are_codex_strict(tmp_path) -> None:

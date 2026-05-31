@@ -242,9 +242,15 @@ def _int_or_none(value: Any) -> int | None:
 def _claude_tools(env: Mapping[str, str], *, allow_mcp: bool) -> str | None:
     if "ARC_CLAUDE_TOOLS" in env:
         return env["ARC_CLAUDE_TOOLS"]
+    allow_internet = _env_bool(env, "ARC_CLAUDE_ALLOW_INTERNET", False)
     if allow_mcp:
+        if not allow_internet:
+            raise LLMWorkerError(
+                "Claude MCP with ARC_CLAUDE_ALLOW_INTERNET=false requires explicit ARC_CLAUDE_TOOLS. "
+                "Refusing to use --tools default because that may enable non-ARC built-in tools."
+            )
         return "default"
-    if _env_bool(env, "ARC_CLAUDE_ALLOW_INTERNET", False):
+    if allow_internet:
         return "WebSearch,WebFetch"
     return ""
 

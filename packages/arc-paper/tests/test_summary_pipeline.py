@@ -88,8 +88,9 @@ def test_section_pipeline_summarizes_sections_sequentially_and_uses_compact_fina
     final_prompts.clear()
     cached_events = []
 
+    task_with_string_false_refresh = {**task, "refresh": "false"}
     generate_summary_with_section_pipeline(
-        task,
+        task_with_string_false_refresh,
         model="test-model",
         run_json=run_json,
         progress_callback=cached_events.append,

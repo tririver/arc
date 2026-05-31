@@ -393,6 +393,7 @@ def _call_reviewer_with_validation_retry(
         prefix_limiter=prefix_limiter,
         cache_guard=cache_guard,
         cache_warnings_path=cache_warnings_path,
+        validate_schema=False,
     )
     review_output = first_call.output
     try:
@@ -437,6 +438,7 @@ def _call_reviewer_with_validation_retry(
             static_prefix=None,
             cache_guard=cache_guard,
             cache_warnings_path=cache_warnings_path,
+            validate_schema=False,
         )
         _validate_review_envelope(review_output, loop)
         return review_output
@@ -480,6 +482,7 @@ def _call_json_runner_with_prompt_options(
     prefix_limiter: "PrefixConcurrencyLimiter",
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
+    validate_schema: bool = True,
 ) -> WorkerCallResult:
     selected: WorkerPromptOption | None = None
 
@@ -509,6 +512,7 @@ def _call_json_runner_with_prompt_options(
             static_prefix=selected.static_prefix,
             cache_guard=cache_guard,
             cache_warnings_path=cache_warnings_path,
+            validate_schema=validate_schema,
         )
         return WorkerCallResult(
             output=output,
@@ -558,6 +562,7 @@ def _call_json_runner_with_error_artifact(
     static_prefix: str | None,
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
+    validate_schema: bool = True,
 ) -> dict[str, Any]:
     try:
         def invoke() -> dict[str, Any]:
@@ -576,6 +581,7 @@ def _call_json_runner_with_error_artifact(
                 static_prefix=static_prefix,
                 cache_guard=cache_guard,
                 cache_warnings_path=cache_warnings_path,
+                validate_schema=validate_schema,
             )
 
         if session_policy == "stateful":
@@ -613,6 +619,7 @@ def _call_json_runner(
     static_prefix: str | None,
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
+    validate_schema: bool = True,
 ) -> dict[str, Any]:
     env = worker_env(worker, base_env=base_env)
     effective_session_policy = session_policy
@@ -637,6 +644,7 @@ def _call_json_runner(
                 "call_label": call_label,
                 "artifact_dir": artifact_dir,
                 "static_prefix": static_prefix,
+                "validate_schema": validate_schema,
             }
             for key, value in optional.items():
                 if _accepts_keyword(json_runner, key):
@@ -669,6 +677,7 @@ def _call_json_runner(
         result = run_json(
             prompt,
             schema=worker.output_schema,
+            validate_schema=validate_schema,
             provider=worker.provider,
             model=worker.model,
             model_tier=worker.model_tier,

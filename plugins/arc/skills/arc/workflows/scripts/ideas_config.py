@@ -78,7 +78,7 @@ def load_ideas_config(payload: Mapping[str, Any]) -> IdeasConfig:
         variant_config_dir=variant_config_dir,
         variant_glob=variant_glob,
         loops_per_variant=loops_per_variant,
-        save_prompts=bool(artifact_options.get("save_prompts", True)),
+        save_prompts=_bool(artifact_options.get("save_prompts", True), "artifact_options.save_prompts"),
         variants=variants,
     )
 
