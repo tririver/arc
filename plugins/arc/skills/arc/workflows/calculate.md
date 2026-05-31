@@ -147,7 +147,22 @@ For an accepted step, update only the current ready-step slot:
 - use `Journal` for execution facts, consensus paths, attempts, and reviewer
   judgment
 
-For `confirmed_source_error`, put `[confirmed source issue]` beside the source-disagreement statement, and only color that marker red. Do not color the surrounding prose. Do not color the surrounding equations. For PDF-oriented Markdown, raw LaTeX such as \textcolor{red}{[confirmed source issue]} is acceptable only outside Markdown code spans. Do not surround color commands with backticks. Do not use the red marker for likely or convention-dependent source mismatches; those must remain blocked until the human expert question is answered.
+For PDF-oriented Markdown marker backgrounds, use this exact template. It is shown as code here only; in work notes paste the raw LaTeX directly in prose, not inside Markdown code spans or fenced code blocks. If the work note already has a YAML header, merge these `header-includes`; do not create a second YAML header.
+```yaml
+---
+header-includes:
+  - \usepackage{xcolor}
+  - \definecolor{arcsourceissue}{HTML}{8B0000}
+  - \definecolor{archumanresolved}{HTML}{003F8C}
+---
+```
+```tex
+\colorbox{arcsourceissue}{\textcolor{white}{[confirmed source issue]}}
+\colorbox{archumanresolved}{\textcolor{white}{[human-resolved]}}
+```
+Do not use custom no-argument marker macros such as `\arcsourceissue` or `\archumanresolved`; Pandoc may strip them from inline prose.
+
+For `confirmed_source_error`, put the literal marker `[confirmed source issue]` beside the source-disagreement statement, and only color that marker's background dark red with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. Do not use the red marker for likely or convention-dependent source mismatches; those must remain blocked until the human expert question is answered.
 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and
@@ -156,7 +171,7 @@ proposed next action. If the block needs human input, ask the exact same
 Limits diagnose; they are not proof.
 
 Any accepted work-note content whose acceptance depends on a specific human expert answer resolving an unresolved scientific acceptance question is human-resolved content. This includes a blocked step the expert resolves, a source convention the expert chooses, or a main-agent verification accepted only because the expert allowed that standard. It excludes ordinary user task instructions, source excerpts, or constraints.
-Add `[human-resolved]` beside the accepted content, and only color `human-resolved` blue. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. For PDF-oriented Markdown, [\textcolor{blue}{human-resolved}] is acceptable only outside Markdown code spans. Do not surround color commands with backticks.
+Add the literal marker `[human-resolved]` beside the accepted content, and only color that `human-resolved` marker's background dark blue with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. Do not surround color commands with backticks.
 
 A human expert later resolves a block and thereby unblocks the workflow; this
 is not by itself a completion condition. After recording the human-resolved

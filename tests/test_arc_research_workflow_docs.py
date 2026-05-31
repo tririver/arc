@@ -469,6 +469,16 @@ def test_work_note_color_marking_only_colors_literal_markers() -> None:
     assert "marker-only color rule" in check
 
 
+def test_calculate_workflow_uses_pdf_marker_colorbox_templates() -> None:
+    text = (WF / "calculate.md").read_text(encoding="utf-8")
+
+    assert r"\definecolor{arcsourceissue}{HTML}{8B0000}" in text
+    assert r"\definecolor{archumanresolved}{HTML}{003F8C}" in text
+    assert r"\colorbox{arcsourceissue}{\textcolor{white}{[confirmed source issue]}}" in text
+    assert r"\colorbox{archumanresolved}{\textcolor{white}{[human-resolved]}}" in text
+    assert "Do not use custom no-argument marker macros" in text
+
+
 def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
     run_root = tmp_path / "ideas" / "run_001"
     _write_idea_round(run_root, "idea_001", 1, "first", total=10, novelty=4)
