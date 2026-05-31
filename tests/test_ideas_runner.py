@@ -174,6 +174,50 @@ def test_ideas_caps_concurrency_for_many_loops(tmp_path: Path) -> None:
 
     assert result["proposal_count"] == 20
     assert seen_max_concurrent == [12]
+    assert "loop concurrency capped at 12" in "\n".join(result["warnings"])
+    assert "unlimited loop concurrency" not in "\n".join(result["warnings"])
+
+
+def test_ideas_warning_uses_env_concurrency_cap(tmp_path: Path, monkeypatch: Any) -> None:
+    runner = _load_runner_module()
+    monkeypatch.setenv("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "3")
+    project_dir = tmp_path / "project"
+    (project_dir / "domain").mkdir(parents=True)
+    (project_dir / "domain" / "domain_summary.md").write_text("# Domain\n", encoding="utf-8")
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WJ),
+        "variant_glob": "ideas-*.variant.json",
+        "loops_per_variant": 10,
+    }
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        json_runner: Any,
+        base_env: dict[str, str] | None,
+        process_chain: list[str] | None,
+        dry_run: bool = False,
+        max_concurrent_loops: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(Path(batch_config["run_dir"]) / batch_config["run_id"]),
+            "loops": [],
+        }
+
+    result = runner.run_ideas(config, batch_runner=fake_batch_runner, base_env={})
+    warning = "\n".join(result["warnings"])
+
+    assert result["max_concurrent_loops"] == 3
+    assert "loop concurrency capped at 3" in warning
+    assert "unlimited loop concurrency" not in warning
 
 
 def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path: Path) -> None:

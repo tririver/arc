@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock, get_ident
+from threading import Lock, RLock, get_ident
 from typing import Any, Iterator, Mapping, Sequence
 
 from .schema_cache import sha256_text
@@ -39,8 +39,10 @@ class LLMSessionTurn:
     created_at: str
 
 
-_PROCESS_LOCKS: dict[Path, Lock] = {}
+_PROCESS_LOCKS: dict[Path, RLock] = {}
 _PROCESS_LOCKS_GUARD = Lock()
+_HELD_FILE_LOCKS: dict[tuple[Path, int, int], int] = {}
+_HELD_FILE_LOCKS_GUARD = Lock()
 
 
 class LLMSessionManager:
@@ -62,42 +64,50 @@ class LLMSessionManager:
         name: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> LLMSessionRef:
-        with self._state_lock:
-            existing = self._sessions.get(key)
-            if existing is not None:
-                if existing.provider != provider or existing.model != model:
-                    raise ValueError(f"session provider/model changed for {key}")
-                if existing.runtime_fingerprint != runtime_fingerprint:
-                    raise ValueError(f"session runtime fingerprint changed for {key}")
-                return existing
-            ref = LLMSessionRef(
-                key=key,
-                provider=provider,
-                model=model,
-                runtime_fingerprint=runtime_fingerprint,
-                name=name,
-                metadata=dict(metadata or {}),
-            )
-            self._sessions[key] = ref
-            self._write_sessions()
-            return ref
+        with self.lock(key):
+            with self._state_lock:
+                self._reload_sessions_from_disk_locked()
+                return self._get_or_create_locked(
+                    key=key,
+                    provider=provider,
+                    model=model,
+                    runtime_fingerprint=runtime_fingerprint,
+                    name=name,
+                    metadata=metadata,
+                )
 
-    def update_native_session_id(self, key: str, native_session_id: str) -> LLMSessionRef:
+    def update_native_session_id(
+        self,
+        key: str,
+        native_session_id: str,
+        *,
+        allow_overwrite: bool = False,
+    ) -> LLMSessionRef:
+        with self.lock(key):
+            with self._state_lock:
+                self._reload_sessions_from_disk_locked()
+                ref = self._require_ref(key)
+                if ref.native_session_id and ref.native_session_id != native_session_id and not allow_overwrite:
+                    raise ValueError(f"session native_session_id changed for {key}")
+                if ref.native_session_id == native_session_id:
+                    return ref
+                updated = LLMSessionRef(
+                    key=ref.key,
+                    provider=ref.provider,
+                    model=ref.model,
+                    runtime_fingerprint=ref.runtime_fingerprint,
+                    native_session_id=native_session_id,
+                    name=ref.name,
+                    metadata=dict(ref.metadata),
+                    generation=ref.generation,
+                )
+                self._sessions[key] = updated
+                self._write_sessions()
+                return updated
+
+    def reload(self) -> None:
         with self._state_lock:
-            ref = self._require_ref(key)
-            updated = LLMSessionRef(
-                key=ref.key,
-                provider=ref.provider,
-                model=ref.model,
-                runtime_fingerprint=ref.runtime_fingerprint,
-                native_session_id=native_session_id,
-                name=ref.name,
-                metadata=dict(ref.metadata),
-                generation=ref.generation,
-            )
-            self._sessions[key] = updated
-            self._write_sessions()
-            return updated
+            self._reload_sessions_from_disk_locked()
 
     def record_turn(
         self,
@@ -127,7 +137,8 @@ class LLMSessionManager:
         }
         if extra:
             item.update(dict(extra))
-        _append_jsonl(self.calls_path, item)
+        with self.lock(key):
+            _append_jsonl(self.calls_path, item)
 
     def turn_count(self, key: str) -> int:
         try:
@@ -146,6 +157,7 @@ class LLMSessionManager:
 
     def has_native_session(self, key: str) -> bool:
         with self._state_lock:
+            self._reload_sessions_from_disk_locked()
             ref = self._sessions.get(key)
             return bool(ref and ref.native_session_id)
 
@@ -158,11 +170,67 @@ class LLMSessionManager:
             with _file_lock(lock_path):
                 yield
 
+    @contextmanager
+    def locked_turn(
+        self,
+        *,
+        key: str,
+        provider: str,
+        model: str | None,
+        runtime_fingerprint: str,
+        name: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Iterator[tuple[LLMSessionRef, int]]:
+        with self.lock(key):
+            with self._state_lock:
+                self._reload_sessions_from_disk_locked()
+                ref = self._get_or_create_locked(
+                    key=key,
+                    provider=provider,
+                    model=model,
+                    runtime_fingerprint=runtime_fingerprint,
+                    name=name,
+                    metadata=metadata,
+                )
+            yield ref, self.turn_count(key)
+
+    def _get_or_create_locked(
+        self,
+        *,
+        key: str,
+        provider: str,
+        model: str | None,
+        runtime_fingerprint: str,
+        name: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LLMSessionRef:
+        existing = self._sessions.get(key)
+        if existing is not None:
+            if existing.provider != provider or existing.model != model:
+                raise ValueError(f"session provider/model changed for {key}")
+            if existing.runtime_fingerprint != runtime_fingerprint:
+                raise ValueError(f"session runtime fingerprint changed for {key}")
+            return existing
+        ref = LLMSessionRef(
+            key=key,
+            provider=provider,
+            model=model,
+            runtime_fingerprint=runtime_fingerprint,
+            name=name,
+            metadata=dict(metadata or {}),
+        )
+        self._sessions[key] = ref
+        self._write_sessions()
+        return ref
+
     def _require_ref(self, key: str) -> LLMSessionRef:
         ref = self._sessions.get(key)
         if ref is None:
             raise KeyError(f"unknown LLM session key: {key}")
         return ref
+
+    def _reload_sessions_from_disk_locked(self) -> None:
+        self._sessions = self._load_sessions()
 
     def _load_sessions(self) -> dict[str, LLMSessionRef]:
         try:
@@ -208,6 +276,10 @@ def runtime_fingerprint(
         for key in sorted(
             {
                 "ARC_CODEX_SANDBOX",
+                "ARC_CODEX_CONFIG",
+                "ARC_CODEX_CONFIG_JSON",
+                "ARC_CODEX_HISTORY_PERSISTENCE",
+                "ARC_CODEX_EPHEMERAL",
                 "ARC_CODEX_WORK_DIR",
                 "ARC_CODEX_ADD_DIRS",
                 "ARC_CODEX_PROFILE",
@@ -226,9 +298,14 @@ def runtime_fingerprint(
                 "ARC_CODEX_IGNORE_RULES",
                 "ARC_CLAUDE_TOOLS",
                 "ARC_CLAUDE_ALLOW_MCP",
+                "ARC_CLAUDE_MCP_MODE",
                 "ARC_CLAUDE_MCP_CONFIG",
                 "ARC_CLAUDE_MCP_CONFIG_JSON",
                 "ARC_CLAUDE_STRICT_MCP_CONFIG",
+                "ARC_CLAUDE_ARC_MCP_COMMAND",
+                "ARC_CLAUDE_ARC_MCP_ARGS_JSON",
+                "ARC_CLAUDE_ARC_MCP_CONFIG_PATH",
+                "ARC_CLAUDE_TEXT_OUTPUT_FORMAT_JSON",
                 "ARC_CLAUDE_EFFORT",
                 "ARC_CLAUDE_BARE",
                 "ARC_CLAUDE_EXCLUDE_DYNAMIC_SYSTEM_PROMPT_SECTIONS",
@@ -258,12 +335,12 @@ def _hostname() -> str:
         return ""
 
 
-def _process_lock(lock_path: Path) -> Lock:
+def _process_lock(lock_path: Path) -> RLock:
     resolved = lock_path.resolve()
     with _PROCESS_LOCKS_GUARD:
         lock = _PROCESS_LOCKS.get(resolved)
         if lock is None:
-            lock = Lock()
+            lock = RLock()
             _PROCESS_LOCKS[resolved] = lock
         return lock
 
@@ -271,6 +348,25 @@ def _process_lock(lock_path: Path) -> Lock:
 @contextmanager
 def _file_lock(lock_path: Path) -> Iterator[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = lock_path.resolve()
+    held_key = (resolved, os.getpid(), get_ident())
+    already_held = False
+    with _HELD_FILE_LOCKS_GUARD:
+        held_count = _HELD_FILE_LOCKS.get(held_key, 0)
+        if held_count:
+            _HELD_FILE_LOCKS[held_key] = held_count + 1
+            already_held = True
+    if already_held:
+        try:
+            yield
+        finally:
+            with _HELD_FILE_LOCKS_GUARD:
+                remaining = _HELD_FILE_LOCKS[held_key] - 1
+                if remaining:
+                    _HELD_FILE_LOCKS[held_key] = remaining
+                else:
+                    del _HELD_FILE_LOCKS[held_key]
+        return
     payload = {
         "pid": os.getpid(),
         "thread_id": get_ident(),
@@ -285,6 +381,8 @@ def _file_lock(lock_path: Path) -> Iterator[None]:
             if not _recover_dead_process_lock(lock_path):
                 time.sleep(0.01)
     try:
+        with _HELD_FILE_LOCKS_GUARD:
+            _HELD_FILE_LOCKS[held_key] = 1
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False)
             handle.write("\n")
@@ -292,10 +390,19 @@ def _file_lock(lock_path: Path) -> Iterator[None]:
             os.fsync(handle.fileno())
         yield
     finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+        unlink = False
+        with _HELD_FILE_LOCKS_GUARD:
+            remaining = _HELD_FILE_LOCKS.get(held_key, 1) - 1
+            if remaining:
+                _HELD_FILE_LOCKS[held_key] = remaining
+            else:
+                _HELD_FILE_LOCKS.pop(held_key, None)
+                unlink = True
+        if unlink:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _recover_dead_process_lock(lock_path: Path) -> bool:

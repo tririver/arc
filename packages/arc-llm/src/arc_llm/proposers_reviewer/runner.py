@@ -7,9 +7,9 @@ import os
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, as_completed, wait
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from threading import Semaphore
+from threading import Lock, Semaphore
 from typing import Any, Callable, Mapping
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
@@ -40,6 +40,24 @@ from .prompts import proposer_context, reviewer_context
 
 
 JsonRunner = Callable[..., dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class WorkerPromptOption:
+    turn_kind: str
+    prompt: str
+    context: dict[str, Any]
+    static_prefix: str | None
+    prompt_path: Path
+
+
+@dataclass(frozen=True)
+class WorkerCallResult:
+    output: dict[str, Any]
+    turn_kind: str
+    prompt: str
+    prompt_path: Path | None
+    static_prefix: str | None
 
 
 def run_proposers_reviewer_batch(
@@ -214,38 +232,31 @@ def _run_loop_rounds(
         )
         reviewer = loop.reviewers[0]
         session_key = _worker_session_key(batch.run_id, loop, reviewer, "reviewer")
-        turn_kind = _turn_kind(loop, session_manager, session_key, stateful_supported=_stateful_supported(json_runner))
-        review_prompt, review_context, static_prefix = _reviewer_prompt_and_context(
+        prompt_options = _reviewer_prompt_options(
             loop=loop,
             reviewer=reviewer,
             round_number=round_number,
             correspondence=correspondence,
             proposer_outputs=proposer_outputs,
-            turn_kind=turn_kind,
+            round_paths=round_paths,
+            stateful_supported=_stateful_supported(json_runner),
         )
-        review_context.update({"session_key": session_key, "history_mode": loop.session.history_mode})
-        atomic_write_json(round_paths.reviewer_context(reviewer.id), review_context)
-        prompt_kind = "initial" if turn_kind == "initial" else "delta" if turn_kind == "delta" else "prompt"
-        review_prompt_path = round_paths.prompt(reviewer.id, kind=prompt_kind)
-        if artifact_options.save_prompts:
-            atomic_write_text(review_prompt_path, review_prompt)
         review_output = _call_reviewer_with_validation_retry(
             json_runner,
-            review_prompt,
+            prompt_options,
             worker=reviewer,
             loop=loop,
             batch=batch,
             round_number=round_number,
             error_path=round_paths.worker_error(reviewer.id),
-            prompt_path=review_prompt_path if artifact_options.save_prompts else None,
+            context_path=round_paths.reviewer_context(reviewer.id),
             save_prompt=artifact_options.save_prompts,
             base_env=base_env,
             process_chain=process_chain,
             session_manager=session_manager,
             session_key=session_key,
             prefix_limiter=prefix_limiter,
-            turn_kind=turn_kind,
-            static_prefix=static_prefix,
+            artifact_dir=round_paths.round_root / "llm_calls" / reviewer.id,
             cache_guard=loop.session.cache_guard,
             cache_warnings_path=paths.run_root / "cache_warnings.jsonl",
         )
@@ -297,52 +308,40 @@ def _run_proposers(
     cache_warnings_path: Path,
 ) -> dict[str, Any]:
     outputs: dict[str, Any] = {}
-    prompts: dict[str, str] = {}
-    prompt_paths: dict[str, Path | None] = {}
     session_keys: dict[str, str] = {}
-    turn_kinds: dict[str, str] = {}
-    static_prefixes: dict[str, str | None] = {}
+    prompt_options_by_proposer: dict[str, dict[str, WorkerPromptOption]] = {}
     for proposer in loop.proposers:
         session_key = _worker_session_key(batch.run_id, loop, proposer, "proposer")
-        turn_kind = _turn_kind(loop, session_manager, session_key, stateful_supported=_stateful_supported(json_runner))
-        prompt, context, static_prefix = _proposer_prompt_and_context(
+        prompt_options = _proposer_prompt_options(
             loop=loop,
             proposer=proposer,
             round_number=round_number,
             correspondence=correspondence,
-            turn_kind=turn_kind,
+            round_paths=round_paths,
+            stateful_supported=_stateful_supported(json_runner),
         )
-        context.update({"session_key": session_key, "history_mode": loop.session.history_mode})
         session_keys[proposer.id] = session_key
-        turn_kinds[proposer.id] = turn_kind
-        static_prefixes[proposer.id] = static_prefix
-        prompts[proposer.id] = prompt
-        prompt_kind = "initial" if turn_kind == "initial" else "delta" if turn_kind == "delta" else "prompt"
-        prompt_path = round_paths.prompt(proposer.id, kind=prompt_kind)
-        prompt_paths[proposer.id] = prompt_path if artifact_options.save_prompts else None
-        atomic_write_json(round_paths.proposer_context(proposer.id), context)
-        if artifact_options.save_prompts:
-            atomic_write_text(prompt_path, prompt)
+        prompt_options_by_proposer[proposer.id] = prompt_options
 
     with ThreadPoolExecutor(max_workers=len(loop.proposers)) as executor:
         future_by_proposer = {
             executor.submit(
-                _call_json_runner_with_error_artifact,
+                _call_json_runner_with_prompt_options,
                 json_runner,
-                prompts[proposer.id],
+                prompt_options_by_proposer[proposer.id],
                 worker=proposer,
+                loop=loop,
                 round_number=round_number,
                 error_path=round_paths.worker_error(proposer.id),
-                prompt_path=prompt_paths[proposer.id],
+                context_path=round_paths.proposer_context(proposer.id),
+                save_prompt=artifact_options.save_prompts,
                 base_env=base_env,
                 process_chain=process_chain,
-                session_policy=loop.session.policy if turn_kinds[proposer.id] != "legacy_full" else "stateless",
                 session_manager=session_manager,
                 session_key=session_keys[proposer.id],
                 call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{proposer.id}",
                 artifact_dir=round_paths.round_root / "llm_calls" / proposer.id,
                 prefix_limiter=prefix_limiter,
-                static_prefix=static_prefixes[proposer.id],
                 cache_guard=loop.session.cache_guard,
                 cache_warnings_path=cache_warnings_path,
             ): proposer
@@ -350,7 +349,7 @@ def _run_proposers(
         }
         for future in as_completed(future_by_proposer):
             proposer = future_by_proposer[future]
-            output = future.result()
+            output = future.result().output
             outputs[proposer.id] = output
             atomic_write_json(round_paths.proposer_output(proposer.id), output)
     return dict(sorted(outputs.items()))
@@ -358,51 +357,55 @@ def _run_proposers(
 
 def _call_reviewer_with_validation_retry(
     json_runner: JsonRunner | None,
-    prompt: str,
+    prompt_options: dict[str, WorkerPromptOption],
     *,
     worker: WorkerConfig,
     loop: LoopConfig,
     batch: BatchConfig,
     round_number: int,
     error_path: Path,
-    prompt_path: Path | None,
+    context_path: Path,
     save_prompt: bool,
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
     session_manager: LLMSessionManager,
     session_key: str,
     prefix_limiter: "PrefixConcurrencyLimiter",
-    turn_kind: str,
-    static_prefix: str | None,
+    artifact_dir: Path | None,
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
 ) -> dict[str, Any]:
-    review_output = _call_json_runner_with_error_artifact(
+    first_call = _call_json_runner_with_prompt_options(
         json_runner,
-        prompt,
+        prompt_options,
         worker=worker,
+        loop=loop,
         round_number=round_number,
         error_path=error_path,
-        prompt_path=prompt_path,
+        context_path=context_path,
+        save_prompt=save_prompt,
         base_env=base_env,
         process_chain=process_chain,
-        session_policy=loop.session.policy if turn_kind != "legacy_full" else "stateless",
         session_manager=session_manager,
         session_key=session_key,
         call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
-        artifact_dir=prompt_path.parent.parent / "llm_calls" / worker.id if prompt_path is not None else None,
+        artifact_dir=artifact_dir,
         prefix_limiter=prefix_limiter,
-        static_prefix=static_prefix,
         cache_guard=cache_guard,
         cache_warnings_path=cache_warnings_path,
     )
+    review_output = first_call.output
     try:
         _validate_review_envelope(review_output, loop)
         return review_output
     except Exception as exc:
         stateful_delta = loop.session.policy == "stateful" and loop.session.history_mode == "delta"
-        retry_prompt = render_reviewer_validation_retry_delta(exc) if stateful_delta else _review_validation_retry_prompt(prompt, exc)
-        retry_prompt_path = _retry_artifact_path(prompt_path, retry_number=1) if prompt_path is not None else None
+        retry_prompt = (
+            render_reviewer_validation_retry_delta(exc)
+            if stateful_delta
+            else _review_validation_retry_prompt(first_call.prompt, exc)
+        )
+        retry_prompt_path = _retry_artifact_path(first_call.prompt_path, retry_number=1) if first_call.prompt_path is not None else None
         if save_prompt and retry_prompt_path is not None:
             atomic_write_text(retry_prompt_path, retry_prompt)
         atomic_write_json(
@@ -412,7 +415,7 @@ def _call_reviewer_with_validation_retry(
                 "round_number": round_number,
                 "error_type": type(exc).__name__,
                 "message": str(exc),
-                "original_prompt_path": str(prompt_path) if prompt_path is not None else "",
+                "original_prompt_path": str(first_call.prompt_path) if first_call.prompt_path is not None else "",
                 "retry_prompt_path": str(retry_prompt_path) if retry_prompt_path is not None else "",
             },
         )
@@ -425,13 +428,13 @@ def _call_reviewer_with_validation_retry(
             prompt_path=retry_prompt_path,
             base_env=base_env,
             process_chain=process_chain,
-            session_policy=loop.session.policy if turn_kind != "legacy_full" else "stateless",
+            session_policy=loop.session.policy if first_call.turn_kind != "legacy_full" else "stateless",
             session_manager=session_manager,
             session_key=session_key,
             call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}/validation_retry_001",
-            artifact_dir=prompt_path.parent.parent / "llm_calls" / worker.id if prompt_path is not None else None,
+            artifact_dir=artifact_dir,
             prefix_limiter=prefix_limiter,
-            static_prefix=static_prefix,
+            static_prefix=None,
             cache_guard=cache_guard,
             cache_warnings_path=cache_warnings_path,
         )
@@ -458,6 +461,84 @@ def _validation_error_artifact_path(path: Path, *, retry_number: int) -> Path:
     return path.with_name(f"{path.stem}.validation_{retry_number:03d}.json")
 
 
+def _call_json_runner_with_prompt_options(
+    json_runner: JsonRunner | None,
+    prompt_options: dict[str, WorkerPromptOption],
+    *,
+    worker: WorkerConfig,
+    loop: LoopConfig,
+    round_number: int,
+    error_path: Path,
+    context_path: Path,
+    save_prompt: bool,
+    base_env: Mapping[str, str] | None,
+    process_chain: list[str] | None,
+    session_manager: LLMSessionManager,
+    session_key: str,
+    call_label: str,
+    artifact_dir: Path | None,
+    prefix_limiter: "PrefixConcurrencyLimiter",
+    cache_guard: CacheGuardOptions,
+    cache_warnings_path: Path,
+) -> WorkerCallResult:
+    selected: WorkerPromptOption | None = None
+
+    def invoke_locked() -> WorkerCallResult:
+        nonlocal selected
+        turn_kind = _locked_turn_kind(loop, session_manager, session_key, prompt_options)
+        selected = prompt_options[turn_kind]
+        context = copy.deepcopy(selected.context)
+        context.update({"session_key": session_key, "history_mode": loop.session.history_mode})
+        atomic_write_json(context_path, context)
+        prompt_path = selected.prompt_path if save_prompt else None
+        if prompt_path is not None:
+            atomic_write_text(prompt_path, selected.prompt)
+        session_policy = loop.session.policy if selected.turn_kind != "legacy_full" else "stateless"
+        output = _call_json_runner(
+            json_runner,
+            selected.prompt,
+            worker=worker,
+            base_env=base_env,
+            process_chain=process_chain,
+            session_policy=session_policy,
+            session_manager=session_manager,
+            session_key=session_key,
+            call_label=call_label,
+            artifact_dir=artifact_dir,
+            prefix_limiter=prefix_limiter,
+            static_prefix=selected.static_prefix,
+            cache_guard=cache_guard,
+            cache_warnings_path=cache_warnings_path,
+        )
+        return WorkerCallResult(
+            output=output,
+            turn_kind=selected.turn_kind,
+            prompt=selected.prompt,
+            prompt_path=prompt_path,
+            static_prefix=selected.static_prefix,
+        )
+
+    try:
+        if _uses_stateful_delta(loop, prompt_options):
+            with session_manager.lock(session_key):
+                return invoke_locked()
+        return invoke_locked()
+    except Exception as exc:
+        prompt_path = selected.prompt_path if selected is not None and save_prompt else None
+        atomic_write_json(
+            error_path,
+            {
+                "worker_id": worker.id,
+                "round_number": round_number,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "prompt_path": str(prompt_path) if prompt_path is not None else "",
+                "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            },
+        )
+        raise
+
+
 def _call_json_runner_with_error_artifact(
     json_runner: JsonRunner | None,
     prompt: str,
@@ -479,22 +560,28 @@ def _call_json_runner_with_error_artifact(
     cache_warnings_path: Path,
 ) -> dict[str, Any]:
     try:
-        return _call_json_runner(
-            json_runner,
-            prompt,
-            worker=worker,
-            base_env=base_env,
-            process_chain=process_chain,
-            session_policy=session_policy,
-            session_manager=session_manager,
-            session_key=session_key,
-            call_label=call_label,
-            artifact_dir=artifact_dir,
-            prefix_limiter=prefix_limiter,
-            static_prefix=static_prefix,
-            cache_guard=cache_guard,
-            cache_warnings_path=cache_warnings_path,
-        )
+        def invoke() -> dict[str, Any]:
+            return _call_json_runner(
+                json_runner,
+                prompt,
+                worker=worker,
+                base_env=base_env,
+                process_chain=process_chain,
+                session_policy=session_policy,
+                session_manager=session_manager,
+                session_key=session_key,
+                call_label=call_label,
+                artifact_dir=artifact_dir,
+                prefix_limiter=prefix_limiter,
+                static_prefix=static_prefix,
+                cache_guard=cache_guard,
+                cache_warnings_path=cache_warnings_path,
+            )
+
+        if session_policy == "stateful":
+            with session_manager.lock(session_key):
+                return invoke()
+        return invoke()
     except Exception as exc:
         atomic_write_json(
             error_path,
@@ -534,6 +621,7 @@ def _call_json_runner(
     prefix_key = _prefix_key(worker, env, process_chain, prompt, static_prefix)
     with prefix_limiter.acquire(prefix_key):
         if json_runner is not None:
+            before_count = session_manager.turn_count(session_key) if effective_session_policy == "stateful" else None
             kwargs = {
                 "schema": worker.output_schema,
                 "provider": worker.provider,
@@ -548,23 +636,26 @@ def _call_json_runner(
                 "session_key": session_key,
                 "call_label": call_label,
                 "artifact_dir": artifact_dir,
+                "static_prefix": static_prefix,
             }
             for key, value in optional.items():
                 if _accepts_keyword(json_runner, key):
                     kwargs[key] = value
             result = json_runner(prompt, **kwargs)
-            _record_custom_session_turn(
-                result,
-                session_policy=effective_session_policy,
-                session_manager=session_manager,
-                session_key=session_key,
-                call_label=call_label,
-                prompt=prompt,
-                worker=worker,
-                env=env,
-                process_chain=process_chain,
-                static_prefix=static_prefix,
-            )
+            after_count = session_manager.turn_count(session_key) if effective_session_policy == "stateful" else None
+            if before_count == after_count:
+                _record_custom_session_turn(
+                    result,
+                    session_policy=effective_session_policy,
+                    session_manager=session_manager,
+                    session_key=session_key,
+                    call_label=call_label,
+                    prompt=prompt,
+                    worker=worker,
+                    env=env,
+                    process_chain=process_chain,
+                    static_prefix=static_prefix,
+                )
             _maybe_record_cache_warning(
                 result,
                 session_policy=effective_session_policy,
@@ -590,6 +681,7 @@ def _call_json_runner(
             session_metadata={"worker_id": worker.id},
             artifact_dir=artifact_dir,
             call_label=call_label,
+            static_prefix=static_prefix,
         )
         _maybe_record_cache_warning(
             result,
@@ -630,16 +722,20 @@ def _declares_keyword(callable_obj: JsonRunner, name: str) -> bool:
 
 
 class PrefixConcurrencyLimiter:
+    """Process-local limiter for calls sharing the same cache prefix."""
+
     def __init__(self, default_limit: int) -> None:
         self.default_limit = max(1, int(default_limit))
         self._semaphores: dict[str, Semaphore] = {}
+        self._lock = Lock()
 
     def acquire(self, key: str):
         limiter = self
 
         class _Guard:
             def __enter__(self_inner):
-                semaphore = limiter._semaphores.setdefault(key, Semaphore(limiter.default_limit))
+                with limiter._lock:
+                    semaphore = limiter._semaphores.setdefault(key, Semaphore(limiter.default_limit))
                 semaphore.acquire()
                 self_inner._semaphore = semaphore
                 return None
@@ -688,6 +784,124 @@ def _turn_kind(
 
 def _stateful_supported(json_runner: JsonRunner | None) -> bool:
     return json_runner is None or _declares_keyword(json_runner, "session_policy")
+
+
+def _uses_stateful_delta(loop: LoopConfig, prompt_options: Mapping[str, WorkerPromptOption]) -> bool:
+    return loop.session.policy == "stateful" and "initial" in prompt_options and "delta" in prompt_options
+
+
+def _locked_turn_kind(
+    loop: LoopConfig,
+    session_manager: LLMSessionManager,
+    session_key: str,
+    prompt_options: Mapping[str, WorkerPromptOption],
+) -> str:
+    if not _uses_stateful_delta(loop, prompt_options):
+        return "legacy_full"
+    return "initial" if session_manager.turn_count(session_key) == 0 else "delta"
+
+
+def _proposer_prompt_options(
+    *,
+    loop: LoopConfig,
+    proposer: WorkerConfig,
+    round_number: int,
+    correspondence: list[dict[str, Any]],
+    round_paths,
+    stateful_supported: bool,
+) -> dict[str, WorkerPromptOption]:
+    if loop.session.policy == "stateful" and loop.session.history_mode == "delta" and stateful_supported:
+        return {
+            turn_kind: _prompt_option(
+                worker_id=proposer.id,
+                round_paths=round_paths,
+                turn_kind=turn_kind,
+                rendered=_proposer_prompt_and_context(
+                    loop=loop,
+                    proposer=proposer,
+                    round_number=round_number,
+                    correspondence=correspondence,
+                    turn_kind=turn_kind,
+                ),
+            )
+            for turn_kind in ("initial", "delta")
+        }
+    return {
+        "legacy_full": _prompt_option(
+            worker_id=proposer.id,
+            round_paths=round_paths,
+            turn_kind="legacy_full",
+            rendered=_proposer_prompt_and_context(
+                loop=loop,
+                proposer=proposer,
+                round_number=round_number,
+                correspondence=correspondence,
+                turn_kind="legacy_full",
+            ),
+        )
+    }
+
+
+def _reviewer_prompt_options(
+    *,
+    loop: LoopConfig,
+    reviewer: WorkerConfig,
+    round_number: int,
+    correspondence: list[dict[str, Any]],
+    proposer_outputs: dict[str, Any],
+    round_paths,
+    stateful_supported: bool,
+) -> dict[str, WorkerPromptOption]:
+    if loop.session.policy == "stateful" and loop.session.history_mode == "delta" and stateful_supported:
+        return {
+            turn_kind: _prompt_option(
+                worker_id=reviewer.id,
+                round_paths=round_paths,
+                turn_kind=turn_kind,
+                rendered=_reviewer_prompt_and_context(
+                    loop=loop,
+                    reviewer=reviewer,
+                    round_number=round_number,
+                    correspondence=correspondence,
+                    proposer_outputs=proposer_outputs,
+                    turn_kind=turn_kind,
+                ),
+            )
+            for turn_kind in ("initial", "delta")
+        }
+    return {
+        "legacy_full": _prompt_option(
+            worker_id=reviewer.id,
+            round_paths=round_paths,
+            turn_kind="legacy_full",
+            rendered=_reviewer_prompt_and_context(
+                loop=loop,
+                reviewer=reviewer,
+                round_number=round_number,
+                correspondence=correspondence,
+                proposer_outputs=proposer_outputs,
+                turn_kind="legacy_full",
+            ),
+        )
+    }
+
+
+def _prompt_option(
+    *,
+    worker_id: str,
+    round_paths,
+    turn_kind: str,
+    rendered: tuple[str, dict[str, Any], str | None],
+) -> WorkerPromptOption:
+    prompt, context, static_prefix = rendered
+    prompt_kind = "initial" if turn_kind == "initial" else "delta" if turn_kind == "delta" else "prompt"
+    return WorkerPromptOption(
+        turn_kind=turn_kind,
+        prompt=prompt,
+        context=context,
+        static_prefix=static_prefix,
+        prompt_path=round_paths.prompt(worker_id, kind=prompt_kind),
+    )
 
 
 def _proposer_prompt_and_context(

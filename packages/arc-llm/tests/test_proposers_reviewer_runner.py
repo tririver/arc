@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
+from arc_llm import runner as core_runner
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
+from arc_llm.proposers_reviewer.config import load_batch_config
 from arc_llm.proposers_reviewer import runner as runner_module
 from arc_llm.proposers_reviewer.artifacts import RunPaths, acquire_lock, atomic_write_json
-from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
+from arc_llm.proposers_reviewer.dialogue import render_initial_worker_prompt
+from arc_llm.proposers_reviewer.runner import PrefixConcurrencyLimiter, run_proposers_reviewer_batch
+from arc_llm.usage import LLMProviderResponse, LLMUsage
 
 
 def base_config(tmp_path: Path, *, max_rounds: int = 2, early_stop: bool = False) -> dict[str, Any]:
@@ -688,10 +694,120 @@ def test_stateful_runner_uses_initial_then_delta_prompts_and_stable_session_keys
     assert {call["session_key"] for call in reviewer_calls} == {"run_001/loop_001/reviewer/reviewer_001"}
     assert "## ARC-LLM Worker Session ABI v2" in p1_calls[0]["prompt"]
     assert "## ARC-LLM Worker Delta Turn v2" in round2_p1_prompt
+    assert "JSON Schema/output contract for this turn may differ" in reviewer_calls[1]["prompt"]
     assert "output-from-proposer_002-round-1" not in round2_p1_prompt
     assert "revise p1 1" in round2_p1_prompt
     assert round2_context["turn_kind"] == "delta"
     assert round2_context["session_key"] == "run_001/loop_001/proposer/proposer_001"
+
+
+def test_initial_prompt_static_prefix_stays_shared_until_variable_context(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    batch = load_batch_config(config)
+    loop = batch.loops[0]
+
+    prompt_1, _context_1, static_prefix_1 = render_initial_worker_prompt(
+        loop=loop,
+        worker=loop.proposers[0],
+        role="proposer",
+        round_number=1,
+    )
+    prompt_2, _context_2, static_prefix_2 = render_initial_worker_prompt(
+        loop=loop,
+        worker=loop.proposers[1],
+        role="proposer",
+        round_number=1,
+    )
+    variable_index = prompt_1.index("## Variable Initial Context")
+
+    assert static_prefix_1 == static_prefix_2
+    assert prompt_1.startswith(static_prefix_1)
+    assert prompt_2.startswith(static_prefix_2)
+    assert prompt_1[:variable_index] == prompt_2[:variable_index]
+    assert prompt_1 != prompt_2
+
+
+def test_custom_json_runner_that_calls_run_json_does_not_double_record_turns(tmp_path, monkeypatch):
+    config = base_config(tmp_path, max_rounds=1)
+    config["session"] = {"policy": "stateful", "history_mode": "delta"}
+
+    class Provider:
+        name = "codex-cli"
+
+        def generate_json_result(
+            self,
+            prompt,
+            *,
+            schema=None,
+            model=None,
+            session=None,
+            session_policy="stateless",
+            schema_cache_dir=None,
+            artifact_dir=None,
+        ):
+            if session and "/reviewer/" in session.key:
+                value = {
+                    "schema_version": "arc.llm.review_envelope.v1",
+                    "controller": {"message": "reviewed", "stop_requested": False},
+                    "proposer_messages": {
+                        "proposer_001": {"message": "revise"},
+                        "proposer_002": {"message": "revise"},
+                    },
+                    "review_payload": {"ok": True},
+                }
+            else:
+                value = {"ok": True}
+            return LLMProviderResponse(
+                value,
+                usage=LLMUsage(input_tokens=10, cached_input_tokens=8),
+                native_session_id=f"native-{session.key}" if session else None,
+            )
+
+    def custom_runner(
+        prompt,
+        *,
+        schema,
+        provider,
+        model,
+        model_tier=None,
+        env,
+        process_chain=None,
+        session_policy,
+        session_manager,
+        session_key,
+        call_label,
+        artifact_dir,
+        static_prefix=None,
+    ):
+        return core_runner.run_json(
+            prompt,
+            schema=schema,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            env=env,
+            process_chain=process_chain,
+            session_policy=session_policy,
+            session_manager=session_manager,
+            session_key=session_key,
+            call_label=call_label,
+            artifact_dir=artifact_dir,
+            static_prefix=static_prefix,
+        )
+
+    monkeypatch.setattr(core_runner, "select_provider", lambda provider, **kwargs: Provider())
+
+    result = run_proposers_reviewer_batch(config, json_runner=custom_runner, base_env={})
+    calls_path = tmp_path / "ideas/run_001/sessions/calls.jsonl"
+    calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+
+    assert result["status"] == "completed"
+    assert len(calls) == 3
+    assert {call["call_label"] for call in calls} == {
+        "loop/loop_001/round_001/proposer_001",
+        "loop/loop_001/round_001/proposer_002",
+        "loop/loop_001/round_001/reviewer_001",
+    }
 
 
 def test_non_reuse_scope_id_still_isolates_sessions_by_loop(tmp_path):
@@ -862,6 +978,31 @@ def test_cache_guard_writes_warning_after_warmup(tmp_path):
     assert {warning["turn_count"] for warning in warnings} == {2}
     assert all("round_002" in warning["call_label"] for warning in warnings)
     assert {warning["cached_input_ratio"] for warning in warnings} == {0.0}
+
+
+def test_prefix_concurrency_limiter_caps_threads_per_prefix():
+    limiter = PrefixConcurrencyLimiter(default_limit=2)
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+
+    def worker():
+        nonlocal active, max_active
+        with limiter.acquire("shared-prefix"):
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.01)
+            with guard:
+                active -= 1
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert max_active <= 2
 
 
 def _context_from_prompt(prompt: str) -> dict[str, Any]:

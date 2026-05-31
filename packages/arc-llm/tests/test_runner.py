@@ -1,10 +1,13 @@
+import json
+
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, allow_arc_llm_call_record
+from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionManager
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 from arc_llm import runner
-from arc_llm.runner import resolve_llm_config, run_json, run_text
+from arc_llm.runner import resolve_llm_config, run_json, run_text, run_text_result
 
 
 @pytest.fixture(autouse=True)
@@ -73,6 +76,50 @@ class FakeResultProvider:
 
     def generate_json(self, prompt, *, schema=None, model=None):
         return self.generate_json_result(prompt, schema=schema, model=model).value
+
+
+class FakeTextResultProvider:
+    name = "claude-cli"
+
+    def generate_text_result(
+        self,
+        prompt,
+        *,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        artifact_dir=None,
+    ):
+        return LLMProviderResponse(
+            f"{model}:{prompt}",
+            usage=LLMUsage(input_tokens=12, cached_input_tokens=9, output_tokens=3),
+            native_session_id="native-text" if session_policy == "stateful" else None,
+        )
+
+
+class InvalidThenValidResultProvider:
+    name = "codex-cli"
+
+    def __init__(self):
+        self.attempts = 0
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        self.attempts += 1
+        return LLMProviderResponse(
+            {"ok": "not-a-boolean"} if self.attempts == 1 else {"ok": True},
+            usage=LLMUsage(input_tokens=10, cached_input_tokens=0, output_tokens=2),
+            native_session_id="native-123" if session_policy == "stateful" else None,
+        )
 
 
 class FlakyJsonProvider:
@@ -164,6 +211,82 @@ def test_run_json_stateful_records_session_usage_and_call_record(tmp_path, monke
     assert call_record["native_session_id"] == "native-123"
     assert call_record["usage"]["cached_input_ratio"] == 0.8
     assert manager.turn_count("scope/proposer/proposer_001") == 1
+
+
+def test_run_json_stateful_records_static_prefix(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeResultProvider())
+    manager = LLMSessionManager(tmp_path / "sessions")
+
+    result = run_json(
+        "prompt",
+        schema={"type": "object"},
+        model="fast",
+        provider="codex-cli",
+        env={"ARC_AGENT_HOST": "codex"},
+        process_chain=[],
+        session_policy="stateful",
+        session_manager=manager,
+        session_key="scope/proposer/proposer_001",
+        call_label="round_001/proposer_001",
+        artifact_dir=tmp_path / "artifacts",
+        static_prefix="stable prefix",
+    )
+
+    line = (tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    call = json.loads(line)
+
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["static_prefix_sha256"] == sha256_text("stable prefix")
+    assert call["static_prefix_sha256"] == sha256_text("stable prefix")
+
+
+def test_run_json_stateful_does_not_retry_after_invalid_output(tmp_path, monkeypatch):
+    invalid = InvalidThenValidResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: invalid)
+    manager = LLMSessionManager(tmp_path / "sessions")
+
+    with pytest.raises(runner.LLMTaskError, match="JSON output failed schema validation"):
+        run_json(
+            "prompt",
+            provider="codex-cli",
+            schema={
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": False,
+            },
+            env={},
+            process_chain=[],
+            session_policy="stateful",
+            session_manager=manager,
+            session_key="scope/proposer/proposer_001",
+        )
+
+    assert invalid.attempts == 1
+    assert manager.turn_count("scope/proposer/proposer_001") == 1
+
+
+def test_run_text_result_returns_usage_and_records_stateful_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeTextResultProvider())
+    manager = LLMSessionManager(tmp_path / "sessions")
+
+    outcome = run_text_result(
+        "prompt",
+        provider="claude-cli",
+        model="m",
+        env={},
+        process_chain=[],
+        session_policy="stateful",
+        session_manager=manager,
+        session_key="scope/reviewer/reviewer_001",
+        static_prefix="stable text",
+    )
+
+    call = json.loads((tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8"))
+
+    assert outcome.value == "m:prompt"
+    assert outcome.usage.cached_input_ratio == 0.75
+    assert outcome.static_prefix_sha256 == sha256_text("stable text")
+    assert call["usage"]["cached_input_ratio"] == 0.75
 
 
 def test_run_json_stateful_requires_provider_result_support(tmp_path, monkeypatch):

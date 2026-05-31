@@ -40,29 +40,32 @@ def render_initial_worker_prompt(
         "round_number": round_number,
         "caller_context": pack.volatile,
     }
-    rendered_template = _replace_safe_placeholders(worker.prompt.template, variable)
-    prompt = "\n".join(
+    rendered_template = _replace_safe_placeholders(worker.prompt.template, variable, stable_role=role)
+    static_parts = [
+        "## ARC-LLM Worker Session ABI v2",
+        "This initializes a persistent ARC worker session. Remember the static task context and your worker instructions for later turns in this session.",
+        "",
+        "## Shared Static Task Context",
+        _canonical_json(shared),
+        "",
+        "## Worker Instructions",
+        "### System",
+        worker.prompt.system,
+        "",
+        "### Task",
+        rendered_template,
+        "",
+        "## Output Contract",
+        "Return exactly one JSON object matching the provided schema. Do not wrap it in Markdown.",
+    ]
+    static_prefix = "\n".join(static_parts).rstrip() + "\n\n"
+    variable_suffix = "\n".join(
         [
-            "## ARC-LLM Worker Session ABI v2",
-            "This initializes a persistent ARC worker session. Remember the static task context and your worker instructions for later turns in this session.",
-            "",
-            "## Shared Static Task Context",
-            _canonical_json(shared),
-            "",
             "## Variable Initial Context",
             _canonical_json(variable),
-            "",
-            "## Worker Instructions",
-            "### System",
-            worker.prompt.system,
-            "",
-            "### Task",
-            rendered_template,
-            "",
-            "## Output Contract",
-            "Return exactly one JSON object matching the provided schema. Do not wrap it in Markdown.",
         ]
     ).rstrip() + "\n"
+    prompt = static_prefix + variable_suffix
     context = {
         "turn_kind": "initial",
         "role": role,
@@ -72,7 +75,7 @@ def render_initial_worker_prompt(
         "static_context": shared,
         "variable_context": variable,
     }
-    return prompt, context, _canonical_json(shared)
+    return prompt, context, static_prefix
 
 
 def render_proposer_delta_prompt(
@@ -101,6 +104,7 @@ def render_proposer_delta_prompt(
         [
             "## ARC-LLM Worker Delta Turn v2",
             "You are continuing the same proposer session. Use the static task context and your previous work already present in this session.",
+            "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and current turn context, not any older schema or older active proposer list in the session history.",
             "",
             "## Delta Context",
             _canonical_json(strip_arc_llm_call_records(delta)),
@@ -132,6 +136,7 @@ def render_reviewer_delta_prompt(
         [
             "## ARC-LLM Reviewer Delta Turn v2",
             "You are continuing the same reviewer session. Use the static task context and previous review history already present in this session.",
+            "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and the current active_proposer_ids, not any older schema or older active proposer list in the session history.",
             "",
             "## Current Proposer Outputs To Review",
             _canonical_json(outputs),
@@ -150,6 +155,7 @@ def render_reviewer_validation_retry_delta(exc: Exception) -> str:
     return (
         "## ARC-LLM Reviewer Validation Retry v2\n"
         f"Your previous reviewer JSON failed validation:\n{exc}\n\n"
+        "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and the current active_proposer_ids, not any older schema or older active proposer list in the session history.\n"
         "Use the same current proposer outputs already present in this session. Return exactly one corrected "
         "arc.llm.review_envelope.v1 JSON object.\n"
     )
@@ -178,12 +184,12 @@ def _cache_context_dict(loop: LoopConfig) -> dict[str, Any] | None:
     }
 
 
-def _replace_safe_placeholders(template: str, context: dict[str, Any]) -> str:
+def _replace_safe_placeholders(template: str, context: dict[str, Any], *, stable_role: str) -> str:
     rendered = template
     replacements = {
-        "{loop_id}": str(context.get("loop_id", "")),
-        "{worker_id}": str(context.get("worker_id", "")),
-        "{round_number}": str(context.get("round_number", "")),
+        "{loop_id}": "current loop",
+        "{worker_id}": f"current {stable_role}",
+        "{round_number}": "current round",
     }
     for placeholder in CONTEXT_PLACEHOLDERS:
         rendered = rendered.replace(placeholder, "")

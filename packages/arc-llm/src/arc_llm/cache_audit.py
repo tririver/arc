@@ -9,11 +9,12 @@ def audit_run(run_root: Path | str) -> dict[str, Any]:
     root = Path(run_root)
     call_paths = _session_call_paths(root)
     calls = _read_calls(call_paths)
-    total_input = sum(_int(call.get("usage", {}).get("input_tokens")) for call in calls)
-    total_cached = sum(_int(call.get("usage", {}).get("cached_input_tokens")) for call in calls)
+    total_input = sum(_input_tokens_from_usage(call.get("usage", {})) for call in calls)
+    total_cached = sum(_cached_tokens_from_usage(call.get("usage", {})) for call in calls)
     total_output = sum(_int(call.get("usage", {}).get("output_tokens")) for call in calls)
     groups: dict[str, dict[str, Any]] = {}
     for call in calls:
+        usage = call.get("usage", {})
         key = "|".join(
             [
                 str(call.get("provider_used") or ""),
@@ -24,12 +25,13 @@ def audit_run(run_root: Path | str) -> dict[str, Any]:
         )
         group = groups.setdefault(key, {"calls": 0, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0})
         group["calls"] += 1
-        group["input_tokens"] += _int(call.get("usage", {}).get("input_tokens"))
-        group["cached_input_tokens"] += _int(call.get("usage", {}).get("cached_input_tokens"))
-        group["output_tokens"] += _int(call.get("usage", {}).get("output_tokens"))
+        group["input_tokens"] += _input_tokens_from_usage(usage)
+        group["cached_input_tokens"] += _cached_tokens_from_usage(usage)
+        group["output_tokens"] += _int(usage.get("output_tokens")) if isinstance(usage, dict) else 0
     worst = sorted(
         calls,
-        key=lambda call: _int(call.get("usage", {}).get("input_tokens")) - _int(call.get("usage", {}).get("cached_input_tokens")),
+        key=lambda call: _input_tokens_from_usage(call.get("usage", {}))
+        - _cached_tokens_from_usage(call.get("usage", {})),
         reverse=True,
     )[:20]
     return {
@@ -44,6 +46,7 @@ def audit_run(run_root: Path | str) -> dict[str, Any]:
         "groups": groups,
         "worst_cache_miss_calls": worst,
         "duplicate_context_warnings": _duplicate_context_warnings(root),
+        "schema_change_warnings": _schema_change_warnings(calls),
     }
 
 
@@ -69,7 +72,12 @@ def first_difference(a: str, b: str) -> dict[str, Any]:
 
 
 def _session_call_paths(root: Path) -> list[Path]:
-    paths = [root / "sessions" / "calls.jsonl"]
+    paths = [
+        root / "sessions" / "calls.jsonl",
+        root / "llm_sessions" / "calls.jsonl",
+        root / "idea_loops" / "sessions" / "calls.jsonl",
+        root / "attempt_batches" / "_sessions" / "calls.jsonl",
+    ]
     config = _read_json(root / "config.json")
     session = config.get("session") if isinstance(config, dict) else None
     loop_sessions = (
@@ -90,6 +98,14 @@ def _session_call_paths(root: Path) -> list[Path]:
             run_dir = config.get("run_dir")
             if run_dir:
                 paths.append(Path(str(run_dir)).expanduser() / "_sessions" / "calls.jsonl")
+    if root.exists():
+        recursive_count = 0
+        for path in sorted(root.rglob("calls.jsonl")):
+            if {"sessions", "_sessions", "llm_sessions"} & set(path.parts):
+                paths.append(path)
+                recursive_count += 1
+                if recursive_count >= 100:
+                    break
     return _dedupe_paths(paths)
 
 
@@ -145,6 +161,41 @@ def _duplicate_context_warnings(root: Path) -> list[dict[str, Any]]:
                 }
             )
     return warnings
+
+
+def _schema_change_warnings(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_session: dict[str, set[str]] = {}
+    for call in calls:
+        session_key = call.get("session_key")
+        schema_sha = call.get("schema_sha256")
+        if not session_key or not schema_sha:
+            continue
+        by_session.setdefault(str(session_key), set()).add(str(schema_sha))
+    return [
+        {
+            "session_key": session_key,
+            "distinct_schema_sha256_count": len(values),
+            "schema_sha256_values": sorted(values),
+        }
+        for session_key, values in sorted(by_session.items())
+        if len(values) > 1
+    ]
+
+
+def _input_tokens_from_usage(usage: Any) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    if usage.get("input_tokens") is not None:
+        return _int(usage.get("input_tokens"))
+    return _int(usage.get("cache_creation_input_tokens")) + _int(usage.get("cache_read_input_tokens"))
+
+
+def _cached_tokens_from_usage(usage: Any) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    if usage.get("cached_input_tokens") is not None:
+        return _int(usage.get("cached_input_tokens"))
+    return _int(usage.get("cache_read_input_tokens"))
 
 
 def _int(value: Any) -> int:

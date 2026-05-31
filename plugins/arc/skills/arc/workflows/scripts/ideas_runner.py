@@ -50,11 +50,12 @@ def run_ideas(
     ideas_config = config if isinstance(config, IdeasConfig) else load_ideas_config(config)
     run_root = ideas_config.run_dir / ideas_config.run_id
     ideas = _materialize_ideas(ideas_config)
+    max_concurrent = _max_concurrent_loops(len(ideas))
     batch_config = _loop_batch_config(ideas_config, ideas, run_root=run_root)
     batch_config_path = run_root / "ideas_batch_config.json"
     warnings_path = run_root / "ideas_warnings.txt"
     warnings = [
-        _concurrency_warning(ideas_config, len(ideas)),
+        _concurrency_warning(ideas_config, len(ideas), max_concurrent=max_concurrent),
         *_model_tier_warnings(batch_config),
     ]
 
@@ -84,7 +85,7 @@ def run_ideas(
             base_env=base_env,
             process_chain=process_chain,
             dry_run=False,
-            max_concurrent_loops=min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12"))),
+            max_concurrent_loops=max_concurrent,
         )
     except Exception as exc:
         batch_result = {
@@ -130,8 +131,8 @@ def _result(
         "proposal_count": len(ideas),
         "reviewer_call_count": loop_reviewer_call_count,
         "loop_reviewer_call_count": loop_reviewer_call_count,
-        "max_concurrent_loops": min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12"))),
-        "max_concurrent_proposal_calls": min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12"))),
+        "max_concurrent_loops": _max_concurrent_loops(len(ideas)),
+        "max_concurrent_proposal_calls": _max_concurrent_loops(len(ideas)),
         "batch_config_path": str(batch_config_path),
         "warnings_path": str(warnings_path),
         "loops": [_loop_summary(idea, batch_run_root=batch_run_root) for idea in ideas],
@@ -181,7 +182,7 @@ def _caller_context(config: IdeasConfig, *, variant: VariantConfig, idea_id: str
 
 
 def _loop_batch_config(config: IdeasConfig, ideas: list[IdeaPlan], *, run_root: Path) -> dict[str, Any]:
-    max_concurrent = min(len(ideas), int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12")))
+    max_concurrent = _max_concurrent_loops(len(ideas))
     return materialize_batch(
         run_id="idea_loops",
         run_dir=run_root,
@@ -446,7 +447,11 @@ def _first_json(root: Path) -> Path | None:
     return next(iter(sorted(root.glob("*.json"))), None)
 
 
-def _concurrency_warning(config: IdeasConfig, proposal_count: int) -> str:
+def _max_concurrent_loops(proposal_count: int) -> int:
+    return min(proposal_count, int(os.environ.get("ARC_IDEAS_MAX_CONCURRENT_LOOPS", "12")))
+
+
+def _concurrency_warning(config: IdeasConfig, proposal_count: int, *, max_concurrent: int) -> str:
     round_counts = sorted({int(_read_json(variant.loop_template).get("max_rounds") or 0) for variant in config.variants})
     if len(round_counts) == 1:
         round_text = f"{round_counts[0]} reviewer reports per loop"
@@ -455,7 +460,7 @@ def _concurrency_warning(config: IdeasConfig, proposal_count: int) -> str:
     return (
         "WARNING: Running "
         f"{len(config.variants)} variants x {config.loops_per_variant} proposer-reviewer loops "
-        f"with {round_text} and unlimited loop concurrency ({proposal_count} loops). "
+        f"with {round_text} and loop concurrency capped at {max_concurrent} ({proposal_count} loops). "
         "Concurrent artifacts are written only by arc-llm under the batch run root."
     )
 

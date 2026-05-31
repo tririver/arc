@@ -108,6 +108,38 @@ def test_codex_stateful_first_call_uses_json_events_and_keeps_history(monkeypatc
     assert captured["input"] == "prompt text"
 
 
+def test_codex_stateful_first_call_requires_thread_id(monkeypatch, tmp_path):
+    session = LLMSessionRef(
+        key="scope/proposer/proposer_001",
+        provider="codex-cli",
+        model="test-model",
+        runtime_fingerprint="fp",
+    )
+
+    def fake_run(cmd, **kwargs):
+        output_path = cmd[cmd.index("--output-last-message") + 1]
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump({"ok": True}, handle)
+        stdout = json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}})
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    try:
+        CodexCliProvider().generate_json_result(
+            "prompt text",
+            schema={"type": "object"},
+            model="test-model",
+            session=session,
+            session_policy="stateful",
+            schema_cache_dir=tmp_path / "schemas",
+        )
+    except LLMWorkerError as exc:
+        assert "did not report thread/session id" in str(exc)
+    else:
+        raise AssertionError("expected LLMWorkerError")
+
+
 def test_codex_stateful_resume_keeps_session_when_schema_probe_fails(monkeypatch, tmp_path):
     captured = {}
     session = LLMSessionRef(
@@ -356,6 +388,31 @@ def test_claude_generate_text_returns_stdout(monkeypatch):
     assert ClaudeCliProvider().generate_text("prompt") == "plain text"
 
 
+def test_claude_stateful_text_uses_json_output_and_records_usage(monkeypatch):
+    captured = {}
+    session = LLMSessionRef(key="scope/reviewer/reviewer_001", provider="claude-cli", model="m", runtime_fingerprint="fp")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        payload = {
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "usage": {"input_tokens": 11, "output_tokens": 2, "cache_read_input_tokens": 8},
+            "result": "plain text",
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("arc_llm.providers.claude_cli.uuid.uuid4", lambda: "00000000-0000-4000-8000-000000000001")
+
+    response = ClaudeCliProvider().generate_text_result("prompt", model="m", session=session, session_policy="stateful")
+
+    assert response.value == "plain text"
+    assert response.native_session_id == "00000000-0000-4000-8000-000000000001"
+    assert response.usage.cache_read_input_tokens == 8
+    assert "--output-format" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--output-format") + 1] == "json"
+
+
 def test_claude_stateful_first_call_uses_session_id(monkeypatch):
     captured = {}
     session = LLMSessionRef(key="scope/reviewer/reviewer_001", provider="claude-cli", model="m", runtime_fingerprint="fp")
@@ -506,3 +563,33 @@ def test_claude_can_use_selected_mcp_config(monkeypatch):
     assert captured["cmd"][captured["cmd"].index("--tools") + 1] == "default"
     assert captured["cmd"][captured["cmd"].index("--mcp-config") + 1] == "/tmp/arc-mcp.json"
     assert "--strict-mcp-config" in captured["cmd"]
+
+
+def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("arc_llm.providers.claude_cli.shutil.which", lambda name: "/tmp/arc-mcp" if name == "arc-mcp" else None)
+
+    provider = ClaudeCliProvider(
+        env={
+            "ARC_CLAUDE_ALLOW_MCP": "true",
+            "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+            "ARC_PAPER_CACHE": str(tmp_path / "paper-cache"),
+        }
+    )
+
+    assert provider.generate_text("prompt") == "plain text"
+    config_path = captured["cmd"][captured["cmd"].index("--mcp-config") + 1]
+    payload = json.loads(open(config_path, encoding="utf-8").read())
+
+    assert "--strict-mcp-config" in captured["cmd"]
+    assert payload["mcpServers"]["arc"]["command"] == "/tmp/arc-mcp"
+    assert payload["mcpServers"]["arc"]["args"] == []
+    assert payload["mcpServers"]["arc"]["env"]["ARC_AGENT_HOST"] == "claude"
+    assert payload["mcpServers"]["arc"]["env"]["ARC_PAPER_CACHE"] == str(tmp_path / "paper-cache")

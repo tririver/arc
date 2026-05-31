@@ -83,6 +83,8 @@ class CodexCliProvider:
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
+            if stateful and not resume_id and not native_session_id:
+                raise LLMWorkerError("stateful Codex call did not report thread/session id")
             payload = _read_json_payload(output_path, result.stdout)
             if not isinstance(payload, dict):
                 raise LLMWorkerError("Codex JSON output was not an object")
@@ -134,6 +136,8 @@ class CodexCliProvider:
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
+            if stateful and not session.native_session_id and not native_session_id:
+                raise LLMWorkerError("stateful Codex call did not report thread/session id")
             try:
                 value = output_path.read_text(encoding="utf-8")
             except OSError as exc:
