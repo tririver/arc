@@ -133,10 +133,11 @@ or expected final formula; ask proposers to derive the target quantity in terms 
 
 For note-check steps that may contradict the source, add
 `source-discrepancy handling`: define `confirmed_source_error` versus
-`likely_source_error` or `ambiguous_convention`. Automatic acceptance requires
-blind proposer, reviewer, and main-agent agreement; accepted premises only; no
-convention dependence; and reviewer judgment that no human convention choice is
-needed.
+`likely_source_error` or `ambiguous_convention`. Automatic acceptance as
+`confirmed_source_error` requires blind proposer, reviewer, and main-agent
+agreement; accepted premises only; no convention dependence; and reviewer
+judgment that no human convention choice is needed. `calculate.md` owns any
+auto-mode high-confidence agent resolution for other discrepancy classes.
 
 Step 4: Write deferred work in `## Rough Steps For Later Planning`. Rough-step
 planning records dependency order, likely inputs, risk, and expansion triggers.
@@ -186,8 +187,9 @@ Markdown, `[\textcolor{blue}{human-resolved}]` is acceptable.
 Step 6: For note-check content classified as `confirmed_source_error`, mark the
 source issue with `[confirmed source issue]`, but only color that literal marker
 red. Do not color the surrounding prose or equations. Use raw LaTeX color when
-useful. Do not use red for `likely_source_error` or `ambiguous_convention`; ask
-a human expert question before acceptance.
+useful. For `likely_source_error` or `ambiguous_convention`, use red only for
+the `calculate.md` auto-mode `[agent-resolved decision]` marker; otherwise ask a
+human expert question before acceptance.
 
 ## Phase 4: Version And Export
 Step 1: Find the highest existing immutable version under

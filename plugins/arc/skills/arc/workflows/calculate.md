@@ -123,10 +123,28 @@ classify the discrepancy before updating the work note:
 - `ambiguous_convention`: the mismatch may be due to convention, normalization,
   notation, source mapping, or interpretation.
 
-Only `confirmed_source_error` may continue without human interaction. For
-`likely_source_error` or `ambiguous_convention`, pause and ask a
-`Human expert question:` before accepting the result as a premise or updating
-the affected source claim as resolved.
+Only `confirmed_source_error` may continue without human interaction in
+`interactive` mode. For `likely_source_error` or `ambiguous_convention`,
+pause and ask a `Human expert question:` before accepting the result as a
+premise or updating the affected source claim as resolved.
+
+In `auto` mode, first judge whether a `likely_source_error` or
+`ambiguous_convention` can be resolved with high confidence. High confidence
+requires accepted premises, declared conventions, reviewer reasoning, and the
+main-agent audit to support one option clearly; the choice must be local to the
+current result; no plausible alternative may significantly change later plan
+structure, future premises, source coverage, or physical interpretation. If
+that standard is met, continue without pausing and record the decision beside
+the affected work-note content with `[agent-resolved decision]`, coloring only
+that literal marker red. Record the evidence, rejected alternative, and
+downstream risk in `Journal` or `Calculation Status`. For PDF-oriented
+Markdown, `\textcolor{red}{[agent-resolved decision]}` is acceptable.
+
+If the high-confidence standard is not met, or the decision is important,
+foundation-like, convention-setting, or likely to affect later plan structure,
+future accepted premises, source coverage, or physical interpretation, pause
+and ask a `Human expert question:` before accepting the result as a premise or
+updating the affected source claim as resolved.
 
 When pausing for a human expert, do not merely say that the workflow paused.
 Write and ask one concrete question under the literal label
