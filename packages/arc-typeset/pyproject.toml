@@ -6,10 +6,24 @@ build-backend = "hatchling.build"
 name = "arc-typeset"
 version = "0.1.0"
 description = "Typesetting utilities for ARC research artifacts."
+readme = "../../README.md"
+license = "MIT"
+authors = [{ name = "ARC" }]
 requires-python = ">=3.11"
 dependencies = [
-  "arc-llm"
+  "arc-llm>=0.1,<0.2"
 ]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+
+[project.urls]
+Homepage = "https://github.com/tririver/arc"
+Repository = "https://github.com/tririver/arc"
+Issues = "https://github.com/tririver/arc/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]

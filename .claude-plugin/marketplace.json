@@ -1,0 +1,15 @@
+{
+  "name": "arc",
+  "description": "ARC research tooling for papers, domain construction, planning, calculation, and report typesetting.",
+  "owner": {
+    "name": "ARC"
+  },
+  "plugins": [
+    {
+      "name": "arc",
+      "description": "ARC paper, research-domain, planning, calculation, and typesetting tools.",
+      "source": "./plugins/arc",
+      "category": "productivity"
+    }
+  ]
+}

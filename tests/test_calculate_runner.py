@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WF = ROOT / "skills/arc/workflows"
+WF = ROOT / "plugins/arc/skills/arc/workflows"
 WJ = WF / "json"
 WS = WF / "scripts"
 
@@ -19,7 +19,12 @@ def load_calculate_runner():
     module = importlib.util.module_from_spec(spec)
     sys.modules["calculate_runner"] = module
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    old_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = old_dont_write_bytecode
     return module
 
 

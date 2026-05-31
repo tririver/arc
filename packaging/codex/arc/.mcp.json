@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "arc": {
-      "command": "./scripts/arc-mcp-codex",
-      "args": []
-    }
-  }
-}

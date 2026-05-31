@@ -6,27 +6,28 @@ must not be modified.
 
 ## Project Map
 
-ARC is an agent-skill layer in `skills/arc/` backed by reusable Python packages
-in `packages/`; when the ARC skill is unavailable, agents should read the
-relevant workflow file directly and call the package CLI or MCP tools it names.
+ARC is an agent-skill layer in `plugins/arc/skills/arc/` backed by reusable
+Python packages in `packages/`; when the ARC skill is unavailable, agents
+should read the relevant workflow file directly and call the package CLI or MCP
+tools it names.
 
-- `skills/arc/workflows/domain.md`: Use this workflow to build project-local
-  research-domain artifacts from seed papers, including domain summaries,
-  domain HTML, graph data, and paper JSON packs.
-- `skills/arc/workflows/ideas.md`: Use this workflow to run concurrent
-  proposer-reviewer idea loops, rank completed ideas, and choose a calculation
-  candidate.
-- `skills/arc/workflows/plan.md`: Use this workflow when a task to be planned
-  is available to gather evidence and write a source-aware, reviewable
-  `<project-dir>/work-note.md` with foundations, accepted premises, ready
-  calculation steps, rough later steps, and archived work-note versions.
-- `skills/arc/workflows/calculate.md`: Use this workflow after
+- `plugins/arc/skills/arc/workflows/domain.md`: Use this workflow to build
+  project-local research-domain artifacts from seed papers, including domain
+  summaries, domain HTML, graph data, and paper JSON packs.
+- `plugins/arc/skills/arc/workflows/ideas.md`: Use this workflow to run
+  concurrent proposer-reviewer idea loops, rank completed ideas, and choose a
+  calculation candidate.
+- `plugins/arc/skills/arc/workflows/plan.md`: Use this workflow when a task to
+  be planned is available to gather evidence and write a source-aware,
+  reviewable `<project-dir>/work-note.md` with foundations, accepted premises,
+  ready calculation steps, rough later steps, and archived work-note versions.
+- `plugins/arc/skills/arc/workflows/calculate.md`: Use this workflow after
   `plan.md` creates `<project-dir>/work-note.md` to check work-note premises,
   run blind reference checks, execute ready consensus calculation steps, and
   update calculation status in the work note.
-- `skills/arc/workflows/check.md`: Use this workflow when the user asks to
-  check Markdown or PDF research notes by preparing a planning handoff for
-  `plan.md` and reusing `calculate.md` for claim verification.
+- `plugins/arc/skills/arc/workflows/check.md`: Use this workflow when the user
+  asks to check Markdown or PDF research notes by preparing a planning handoff
+  for `plan.md` and reusing `calculate.md` for claim verification.
 - `packages/arc-domain`: Owns research-domain construction from seed papers,
   including foundation/domain-paper selection, graph artifacts, evidence packs,
   HTML rendering, domain summaries, and paper JSON pack exports.
@@ -127,8 +128,8 @@ relevant workflow file directly and call the package CLI or MCP tools it names.
   LLM work.
 - `packages/arc-mcp` should stay a thin MCP adapter over `arc_paper`,
   `arc_domain`, and batch service functions.
-- `skills/arc`, `prompts/`, `schemas/`, and `packaging/` should describe or
-  wrap package behavior rather than reimplementing it.
+- `plugins/arc/skills/arc`, `prompts/`, `schemas/`, and plugin manifests
+  should describe or wrap package behavior rather than reimplementing it.
 - Keep `0_ref/` as reference-only material. Do not preserve old compatibility
   when it conflicts with the new package architecture.
 

@@ -9,16 +9,19 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WF = ROOT / "skills/arc/workflows"
+WF = ROOT / "plugins/arc/skills/arc/workflows"
 WJ = WF / "json"
 WS = WF / "scripts"
 
 
 def _load_runner_module():
+    old_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     sys.path.insert(0, str(WS))
     try:
         return importlib.import_module("ideas_runner")
     finally:
+        sys.dont_write_bytecode = old_dont_write_bytecode
         sys.path.remove(str(WS))
 
 

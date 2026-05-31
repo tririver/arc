@@ -1,0 +1,136 @@
+---
+name: arc
+description: Use for ARC research workflows involving paper metadata, arXiv full text, INSPIRE references and citers, paper section lookup, equation context, LLM paper summaries, research-domain construction from seed papers, and checking Markdown/PDF research notes.
+---
+
+# Advanced Research Compass (ARC)
+
+ARC is a cache-first research toolkit for theoretical-physics papers and
+research-domain construction. Use ARC tools instead of scraping arXiv/INSPIRE
+or reimplementing paper/domain workflows.
+
+## Required References
+
+Read the relevant reference before calling ARC tools. These reads are required,
+not optional.
+
+- User choices, automation mode, and confirmation behavior: read
+  `rules/interaction.md`. Any ARC user question must use the
+  selection tool; do not wait for typed input.
+- Scientific claims, gap scoring, automated workflow decisions, warning
+  behavior, or robustness-sensitive execution: read
+  `rules/integrity.md`.
+- General ARC operating rules: read `rules/operating.md`.
+- ARC workflow completion checks and improvement notes: read
+  `rules/self-reflection.md`.
+- Single-paper metadata, full text, sections, equations, citers, references,
+  paper summaries, or summary batches: read
+  `manuals/arc-paper.md`.
+- Research field/domain construction, foundation-paper selection, domain
+  networks, evidence packs, graph HTML, or field briefings: read
+  `manuals/arc-domain.md`.
+- Any MCP tool call, background job, job watcher, timeout, or cancellation
+  behavior: read `manuals/arc-mcp.md`.
+- Host LLM/provider detection, model choice, direct prompt tests, or provider
+  troubleshooting: read `manuals/arc-llm.md`.
+- User-facing Markdown report export: when a workflow writes a Markdown report
+  to `<project-dir>/` for human readers, call MCP `md2pdf` on that project-level file.
+  `md2pdf` starts a background PDF job; record the returned job id if present
+  and do not wait before continuing unless the user explicitly asks.
+
+## Workflow
+
+Follow the workflow step by step. Do not skip any step, and do not kill or
+cancel any job because it is slow or time consuming.
+
+### Phase 1: Setup
+
+Step 1: Decide the automation level.
+Use an explicit user choice. If the user asks for automatic or non-interactive
+work, use `auto`. If the user asks to review or confirm steps, use
+`interactive`. Do not treat `continue`, `resume`, or a bare approval to proceed
+as `auto`. 
+
+Step 2: Extract `<user-intent>`.
+Keep the research/scientific request. Remove operational instructions such as
+automation mode, project directory, and output formatting.
+
+Preserve scientific domain anchors in `<user-intent>`, including phrases such
+as "in the field started by arXiv:..." or "in the literature around ...".
+Those phrases are part of the scientific request, not workflow metadata. Keep
+the same paper identifiers separately in `seed_paper_list` as structured
+routing data.
+
+If the request references or attaches accessible files such as `.md`, `.pdf`,
+`.doc`, or `.jpg`, read or extract the relevant content and summarize it as
+part of `<user-intent>`. Treat collaborator notes or images as source context
+for routing, domain building, checking, or later workflows.
+
+Step 3: Resolve `<seed-paper-list>`.
+Use explicit paper identifiers when present. Otherwise infer seed papers from
+`<user-intent>` through ARC paper tools. If a slow MCP call returns a background
+job id, immediately use the blocking CLI watcher described in
+`manuals/arc-mcp.md`.
+
+Step 4: Resolve `<project-dir>`.
+Use a user-specified project directory when present. Otherwise derive a safe
+directory name from `<seed-paper-list>` with ARC paper tools. If the directory
+already exists, follow the automation policy in
+`rules/interaction.md`.
+
+Step 5: Write `<project-dir>/context.json`.
+Include `automation_level`, `workflow`, `original_request`, `user_intent`,
+`project_dir`, `run_id`, `created_at`, `skill_version`, `skill_dir`,
+`skill_workflow_json_dir`, `seed_paper_list`, `provider`, `model_tier`,
+`workers`, and `refresh`.
+
+Use a stable safe `run_id`: lowercase ASCII letters, digits, and underscores,
+for example a short intent slug plus UTC timestamp. Set `skill_dir` to the ARC
+skill directory and `skill_workflow_json_dir` to
+`<skill-dir>/workflows/json`.
+
+### Phase 2: Route Selection
+
+Resolve the user's intent and classify it into one of the four cases below.
+
+Case 1: Build domain references only.
+Read and execute `workflows/domain.md`.
+
+Case 2: Suggest ideas from a not-yet-explicit request.
+First complete Case 1. Then read and execute
+`workflows/ideas.md`.
+
+Case 3: Check note files or collaborator notes.
+Use when the request asks to check, verify, audit, or mark work-note premises
+and claims in one or more accessible `.md` or `.pdf` notes. Read and execute
+`workflows/check.md`.
+
+Before leaving Case 3 or sending a final response, read
+`<project-dir>/work-note.md`. If any ready detailed step exists, execute
+`workflows/calculate.md`. If no ready detailed step exists but rough or pending
+coverage remains from the original note-check request, return to
+`workflows/plan.md`. Only stop when requested coverage is complete or a
+workflow stop condition is recorded in `Open Questions` or
+`Calculation Status`.
+
+Case 4: Calculate from an explicit idea.
+If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
+the user to select one concrete idea.
+If the idea is explicit enough:
+Step 1: Read and execute `workflows/plan.md`. It writes or updates
+`<project-dir>/work-note.md` and an immutable version under
+`<project-dir>/calculate/<run-id>/work-notes/`.
+Step 2: Read and execute `workflows/calculate.md`. If `calculate.md` requests
+macro expansion or blocked-step refinement, return to Step 1 for that region.
+
+Before leaving Case 4 or sending a final response, read
+`<project-dir>/work-note.md`. If any ready detailed step exists, execute
+`workflows/calculate.md`. If no ready detailed step exists but rough or pending
+coverage remains from the original calculation request, return to
+`workflows/plan.md` to promote the next coherent chunk. Only stop when the
+requested calculation coverage is complete or a workflow stop condition is
+recorded in `Open Questions` or `Calculation Status`.
+
+### Phase 3: Self-Reflection
+
+Read and follow `rules/self-reflection.md`.

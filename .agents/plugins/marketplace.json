@@ -1,0 +1,20 @@
+{
+  "name": "arc",
+  "interface": {
+    "displayName": "ARC"
+  },
+  "plugins": [
+    {
+      "name": "arc",
+      "source": {
+        "source": "local",
+        "path": "./plugins/arc"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

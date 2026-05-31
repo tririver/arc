@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "skills/arc/workflows/scripts/rank-ideas.py"
+SCRIPT = ROOT / "plugins/arc/skills/arc/workflows/scripts/rank-ideas.py"
 
 
 def _load_rank_module() -> Any:
@@ -15,7 +16,12 @@ def _load_rank_module() -> Any:
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    old_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = old_dont_write_bytecode
     return module
 
 

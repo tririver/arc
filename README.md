@@ -18,8 +18,8 @@ optional MCP server:
 - `arc-typeset`: deterministic typesetting utilities, including Markdown to PDF
   conversion through Pandoc and XeLaTeX.
 - `arc-mcp`: exposes ARC tools to MCP clients and manages background jobs.
-- `skills/arc`: agent-facing workflow instructions for domain building, idea
-  generation, and research calculations.
+- `plugins/arc/skills/arc`: agent-facing workflow instructions for domain
+  building, idea generation, and research calculations.
 
 ## Who This Is For
 
@@ -49,36 +49,42 @@ Requirements:
 
 ### Agent Plugin Setup
 
-ARC can be used as a host plugin. The repository contains packaged plugin
-directories for Codex and Claude:
+ARC can be installed as a host plugin from this repository. `plugins/arc/` is
+the plugin root for both Codex and Claude Code, and
+`plugins/arc/skills/arc/` is the single canonical skill source.
 
-```text
-packaging/codex/arc
-packaging/claude/arc
-```
-
-Those plugin packages include the ARC skill, MCP configuration, and wrapper
-scripts. The wrapper scripts do not currently build or install the Python
-packages automatically. They run `arc-mcp` from `PATH`, or the command pointed
-to by `ARC_MCP_COMMAND`.
-
-Use the plugin directly when `arc-mcp` is already installed in the environment
-seen by the host. Otherwise, install the Python packages once with the source
-install below, then point the plugin at that command:
+Install for Codex:
 
 ```bash
-export ARC_MCP_COMMAND=/path/to/arc/packages/arc-paper/.venv/bin/arc-mcp
+codex plugin marketplace add tririver/arc
+codex plugin add arc@arc
 ```
 
-Automatic plugin-only bootstrapping would need an additional packaged wheel or
-bootstrap script. The current package is intentionally explicit about the
-Python install step.
+Install for Claude Code:
+
+```bash
+/plugin marketplace add tririver/arc
+/plugin install arc
+```
+
+The plugin starts the ARC MCP server with:
+
+```bash
+uvx arc-mcp
+```
+
+Check the MCP command directly:
+
+```bash
+uvx arc-mcp --help
+```
+
+Use the source install below only for development or local package testing.
 
 ### Source Install
 
-For development, local testing, or a plugin host that does not already have
-`arc-mcp` on `PATH`, create one shared virtual environment and install every
-package in editable mode:
+For development and local testing, create one shared virtual environment and
+install every package in editable mode:
 
 ```bash
 git clone <repo-url> arc
@@ -167,33 +173,22 @@ provider.
 ## Use ARC Through An Agent
 
 For an MCP-capable host, configure an MCP server named `arc` that runs
-`arc-mcp`. If the host does not inherit your activated virtual environment, use
-the full path to the installed command:
+`uvx arc-mcp`:
 
 ```json
 {
   "mcpServers": {
     "arc": {
-      "command": "/path/to/arc/packages/arc-paper/.venv/bin/arc-mcp",
-      "args": []
+      "command": "uvx",
+      "args": ["arc-mcp"]
     }
   }
 }
 ```
 
-Packaged host adapters are included:
-
-- Codex package: `packaging/codex/arc`
-- Claude package: `packaging/claude/arc`
-
-Their `.mcp.json` files call host-specific wrapper scripts:
-
-```text
-packaging/codex/arc/scripts/arc-mcp-codex
-packaging/claude/arc/scripts/arc-mcp-claude
-```
-
-The wrappers set `ARC_AGENT_HOST` before executing `arc-mcp`.
+Codex and Claude Code can install the repository plugin directly with the
+marketplace commands in the install section. ARC detects the host from the MCP
+server process tree when choosing host-native LLM providers.
 
 When using the ARC skill, ask the agent in research terms. Examples:
 
@@ -393,9 +388,9 @@ longer want the result.
 
 ## End-To-End Research Workflows
 
-The `skills/arc` layer turns the package commands into user-facing research
-workflows. It writes a project directory with `context.json` and durable
-artifacts so results can be inspected and resumed.
+The `plugins/arc/skills/arc` layer turns the package commands into
+user-facing research workflows. It writes a project directory with
+`context.json` and durable artifacts so results can be inspected and resumed.
 
 ### 1. Build Domain References
 
@@ -589,8 +584,8 @@ Package boundaries:
   single-paper work and `arc-llm` for LLM work.
 - `packages/arc-mcp` stays a thin MCP adapter over package service functions
   and background-job management.
-- `skills/arc`, `packaging/`, prompts, and schemas describe or wrap package
-  behavior; they should not reimplement package internals.
+- `plugins/arc/skills/arc`, prompts, schemas, and plugin manifests describe or
+  wrap package behavior; they should not reimplement package internals.
 
 Development rules:
 
@@ -634,9 +629,9 @@ packages/arc-paper/.venv/bin/python -m pytest \
   tests -q
 ```
 
-When changing packaged skills or workflows, keep source and packaged copies in
-sync. The repository tests check that key files under `skills/arc` match the
-Codex and Claude packaged copies.
+When changing packaged skills or workflows, edit
+`plugins/arc/skills/arc` only. Codex and Claude load the same plugin skill tree;
+there are no packaged skill copies to synchronize.
 
 Useful docs/packaging check:
 

@@ -6,12 +6,26 @@ build-backend = "hatchling.build"
 name = "arc-domain"
 version = "0.1.0"
 description = "Build cached research-field domain artifacts from a seed paper."
+readme = "../../README.md"
+license = "MIT"
+authors = [{ name = "ARC" }]
 requires-python = ">=3.11"
 dependencies = [
-  "arc-llm",
-  "arc-paper",
+  "arc-llm>=0.1,<0.2",
+  "arc-paper>=0.1,<0.2",
   "jsonschema>=4.22"
 ]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+
+[project.urls]
+Homepage = "https://github.com/tririver/arc"
+Repository = "https://github.com/tririver/arc"
+Issues = "https://github.com/tririver/arc/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]

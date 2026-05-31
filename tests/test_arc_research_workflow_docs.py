@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib
+import os
 import re
 import subprocess
 import sys
@@ -9,10 +10,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WF = ROOT / "skills/arc/workflows"
+PLUGIN = ROOT / "plugins/arc"
+SKILL = PLUGIN / "skills/arc"
+WF = SKILL / "workflows"
 WJ = WF / "json"
 WS = WF / "scripts"
-SKILL = ROOT / "skills/arc"
 
 
 def test_calculation_workflow_files_exist() -> None:
@@ -25,7 +27,7 @@ def test_calculation_workflow_files_exist() -> None:
 
 
 def test_arc_skill_routes_check_and_calculation_workflows() -> None:
-    text = (ROOT / "skills/arc/SKILL.md").read_text(encoding="utf-8")
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
 
     assert "references/" not in text
     assert "classify" in text.lower()
@@ -411,6 +413,16 @@ def test_check_workflow_repeats_until_requested_coverage_complete() -> None:
     assert "return to `plan.md`" in text
 
 
+def test_arc_skill_case4_repeats_until_requested_calculation_complete() -> None:
+    text = " ".join((SKILL / "SKILL.md").read_text(encoding="utf-8").lower().split())
+
+    assert "before leaving case 4" in text
+    assert "ready detailed step exists" in text
+    assert "rough or pending coverage remains from the original calculation request" in text
+    assert "return to `workflows/plan.md`" in text
+    assert "requested calculation coverage is complete" in text
+
+
 def test_work_note_color_marking_only_colors_literal_markers() -> None:
     calculate = " ".join((WF / "calculate.md").read_text(encoding="utf-8").lower().split())
     plan = " ".join((WF / "plan.md").read_text(encoding="utf-8").lower().split())
@@ -453,6 +465,7 @@ def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
         ],
         check=True,
         capture_output=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         text=True,
     )
 
@@ -475,6 +488,7 @@ def test_ideas_ranking_script_selects_best_round_per_loop(tmp_path) -> None:
         ],
         check=True,
         capture_output=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         text=True,
     ).stdout
     assert "# Ideas\n\n" in markdown
@@ -590,11 +604,14 @@ def test_ideas_loop_reviewer_template_has_arc_only_access() -> None:
 
 
 def test_ideas_reviewer_uses_hundred_point_marking_scheme() -> None:
+    old_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     sys.path.insert(0, str(WS))
     try:
         config_module = importlib.import_module("ideas_config")
         runner_module = importlib.import_module("ideas_runner")
     finally:
+        sys.dont_write_bytecode = old_dont_write_bytecode
         sys.path.remove(str(WS))
 
     config = config_module.load_ideas_config(
@@ -706,18 +723,6 @@ def test_ideas_proposer_schemas_are_codex_strict() -> None:
     assert "calculation_plan" in schema["required"]
 
 
-def test_packaged_workflow_copies_match_source() -> None:
-    for host in ["codex", "claude"]:
-        packaged = ROOT / f"packaging/{host}/arc/skills/arc/workflows"
-        assert (packaged / "check.md").read_text(encoding="utf-8") == (
-            WF / "check.md"
-        ).read_text(encoding="utf-8")
-        for path in [*WF.glob("*.md"), *WJ.glob("*.json"), *WS.glob("*.py")]:
-            assert (packaged / path.relative_to(WF)).read_text(encoding="utf-8") == path.read_text(
-                encoding="utf-8"
-            )
-
-
 def test_build_domain_report_instructions_include_task_focus_solved_cases_and_open_axes() -> None:
     text = (WF / "domain.md").read_text(encoding="utf-8")
 
@@ -760,123 +765,64 @@ def test_ideas_requires_domain_markdown_not_single_paper_summaries() -> None:
     assert "single-paper LLM summaries" not in json.dumps(loop)
 
 
-def test_packaged_skill_references_include_required_workflow_inputs() -> None:
-    required = [
-        Path("workflows/check.md"),
-        Path("workflows/domain.md"),
-        Path("workflows/ideas.md"),
-        Path("workflows/calculate.md"),
-        Path("workflows/json/calculate.config.template.json"),
-        Path("workflows/json/calculate-proposer.template.json"),
-        Path("workflows/json/calculate-reviewer.template.json"),
-        Path("workflows/json/calculate-reviewer-output.schema.json"),
-        Path("workflows/scripts/calculate_runner.py"),
-        Path("workflows/json/ideas.config.template.json"),
-        Path("workflows/scripts/ideas_config.py"),
-        Path("workflows/scripts/ideas_marking.py"),
-        Path("workflows/scripts/ideas_runner.py"),
-        Path("workflows/json/ideas-batch.template.json"),
-        Path("workflows/json/ideas-domain.variant.json"),
-        Path("workflows/json/ideas-loop.template.json"),
-        Path("workflows/json/ideas-marking-scheme.json"),
-        Path("workflows/json/ideas-no-info-loop.template.json"),
-        Path("workflows/json/ideas-no-info-proposer.template.json"),
-        Path("workflows/json/ideas-no-info.variant.json"),
-        Path("workflows/json/ideas-proposer.template.json"),
-        Path("workflows/json/ideas-reviewer.template.json"),
-        Path("workflows/json/ideas-reviewer-output.schema.json"),
-        Path("workflows/scripts/rank-ideas.py"),
-        Path("manuals/arc-domain.md"),
-        Path("manuals/arc-llm.md"),
-        Path("manuals/arc-mcp.md"),
-        Path("manuals/arc-paper.md"),
+def test_root_plugin_manifests_use_canonical_arc_skill_tree() -> None:
+    codex_manifest = json.loads((PLUGIN / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    claude_manifest = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+    mcp_config = json.loads((PLUGIN / ".mcp.json").read_text(encoding="utf-8"))
+
+    assert codex_manifest["name"] == "arc"
+    assert codex_manifest["skills"] == "./skills/"
+    assert codex_manifest["mcpServers"] == "./.mcp.json"
+    assert claude_manifest["name"] == "arc"
+    assert "arc" in mcp_config["mcpServers"]
+    assert (SKILL / "SKILL.md").is_file()
+    legacy_skill = ROOT / "skills/arc"
+    assert not legacy_skill.exists()
+    assert not legacy_skill.is_symlink()
+
+
+def test_arc_plugin_has_no_packaged_skill_copies() -> None:
+    legacy_skill = ROOT / "skills/arc"
+    assert not legacy_skill.exists()
+    assert not legacy_skill.is_symlink()
+    assert not (ROOT / "packaging/codex/arc/skills/arc").exists()
+    assert not (ROOT / "packaging/claude/arc/skills/arc").exists()
+
+
+def test_arc_skill_tree_contains_no_python_bytecode() -> None:
+    bad_paths = [
+        str(path.relative_to(ROOT))
+        for root in [PLUGIN, ROOT / ".claude-plugin"]
+        if root.exists()
+        for path in root.rglob("*")
+        if Path(path).name == "__pycache__" or Path(path).suffix == ".pyc"
     ]
-
-    for host in ["codex", "claude"]:
-        packaged_skill = ROOT / f"packaging/{host}/arc/skills/arc"
-        for relative in required:
-            assert (packaged_skill / relative).is_file()
+    assert bad_paths == []
 
 
-def test_packaged_workflows_do_not_include_stale_calculation_artifacts() -> None:
-    stale_paths = [
-        Path("foundation.md"),
-        Path("json/plan.schema.json"),
-        Path("json/foundation.schema.json"),
-        Path("json/calculate.schema.json"),
-        Path("scripts/filter-foundation-context.py"),
-    ]
+def test_root_mcp_config_uses_uvx_arc_mcp() -> None:
+    mcp_config = json.loads((ROOT / "plugins/arc/.mcp.json").read_text(encoding="utf-8"))
+    arc_server = mcp_config["mcpServers"]["arc"]
 
-    for host in ["codex", "claude"]:
-        packaged = ROOT / f"packaging/{host}/arc/skills/arc/workflows"
-        for relative in stale_paths:
-            assert not (packaged / relative).exists()
+    assert arc_server["command"] == "uvx"
+    assert arc_server["args"] == ["arc-mcp"]
 
 
-def test_packaged_skill_references_stay_synced_with_source() -> None:
-    synced_roots = [
-        Path("SKILL.md"),
-        Path("manuals"),
-        Path("workflows/check.md"),
-        Path("workflows/domain.md"),
-        Path("workflows/calculate.md"),
-        Path("workflows/ideas.md"),
-        Path("workflows/json/calculate.config.template.json"),
-        Path("workflows/json/calculate-proposer.template.json"),
-        Path("workflows/json/calculate-reviewer.template.json"),
-        Path("workflows/json/calculate-reviewer-output.schema.json"),
-        Path("workflows/scripts/calculate_runner.py"),
-        Path("workflows/json/ideas.config.template.json"),
-        Path("workflows/plan.md"),
-        Path("workflows/scripts/ideas_config.py"),
-        Path("workflows/scripts/ideas_marking.py"),
-        Path("workflows/scripts/ideas_runner.py"),
-        Path("workflows/json/ideas-batch.template.json"),
-        Path("workflows/json/ideas-domain.variant.json"),
-        Path("workflows/json/ideas-loop.template.json"),
-        Path("workflows/json/ideas-marking-scheme.json"),
-        Path("workflows/json/ideas-no-info-loop.template.json"),
-        Path("workflows/json/ideas-no-info-proposer.template.json"),
-        Path("workflows/json/ideas-no-info.variant.json"),
-        Path("workflows/json/ideas-proposer.template.json"),
-        Path("workflows/json/ideas-reviewer.template.json"),
-        Path("workflows/json/ideas-reviewer-output.schema.json"),
-        Path("workflows/scripts/rank-ideas.py"),
-    ]
+def test_readme_documents_marketplace_first_install() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    expected_files: list[Path] = []
-    for relative in synced_roots:
-        source = SKILL / relative
-        if source.is_dir():
-            expected_files.extend(path.relative_to(SKILL) for path in source.glob("*"))
-        else:
-            expected_files.append(relative)
-
-    for host in ["codex", "claude"]:
-        packaged_skill = ROOT / f"packaging/{host}/arc/skills/arc"
-        for relative in expected_files:
-            assert (packaged_skill / relative).read_text(encoding="utf-8") == (
-                SKILL / relative
-            ).read_text(encoding="utf-8")
-
-
-def test_adapter_scripts_use_installed_arc_mcp_without_repo_local_defaults() -> None:
-    for host in ["codex", "claude"]:
-        script = ROOT / f"packaging/{host}/arc/scripts/arc-mcp-{host}"
-        text = script.read_text(encoding="utf-8")
-
-        assert "/arc-dev" not in text
-        assert ".venv/bin/arc-mcp" not in text
-        assert "ARC_PAPER_CACHE" not in text
-        assert "ARC_DOMAIN_CACHE" not in text
-        assert 'exec arc-mcp "$@"' in text
-        assert "ARC_LLM_MODEL_TIER" not in text
-        assert f"ARC_{host.upper()}_MODEL=" not in text
-        assert f"ARC_{host.upper()}_MODEL_TIER=" not in text
+    assert "uvx arc-mcp --help" in text
+    assert "codex plugin marketplace add tririver/arc" in text
+    assert "codex plugin add arc@arc" in text
+    assert "/plugin marketplace add tririver/arc" in text
+    assert "/plugin install arc" in text
+    assert "/path/to/arc/packages/arc-paper/.venv/bin/arc-mcp" not in text
+    assert "packaging/codex/arc" not in text
+    assert "packaging/claude/arc" not in text
 
 
 def test_interaction_reference_allows_portable_typed_fallback() -> None:
-    text = (ROOT / "skills/arc/rules/interaction.md").read_text(encoding="utf-8").lower()
+    text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8").lower()
 
     assert "typed fallback" in text
     assert "when no discrete selection" in text or "if no discrete selection" in text

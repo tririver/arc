@@ -1,0 +1,12 @@
+{
+  "name": "arc",
+  "version": "0.1.0",
+  "description": "ARC paper, research-domain, and report typesetting tools.",
+  "author": {
+    "name": "ARC"
+  },
+  "homepage": "https://github.com/tririver/arc",
+  "repository": "https://github.com/tririver/arc",
+  "license": "MIT",
+  "keywords": ["arc", "papers", "arxiv", "inspire", "research", "typesetting", "pdf", "translation"]
+}
