@@ -37,6 +37,7 @@ Use this Work Note template:
 ## Validation-Only References
 ## Detailed Steps Ready To Calculate
 ## Rough Steps For Later Planning
+## Equation Coverage Ledger
 ## Reviewer-Only Targets
 ## Calculation Status
 ## Open Questions
@@ -64,6 +65,13 @@ request for planning judgment, not as automatic edits.
 Step 1: Identify the task, target quantity or claim family, source context, and
 coverage requirement. Write this in `## Task` and `## Physics Background And
 Logic Flow`.
+
+For note-check tasks with parsed equations, create an `## Equation Coverage
+Ledger`. Map every parsed equation id from the source inventory to a ready step,
+rough step, or skipped-with-reason entry. Steps may cover multiple equations,
+but the ledger must name the exact equation ids or equation-id ranges covered by
+that step. A broad section label, source span, or source_anchor alone is not
+enough coverage accounting.
 
 Step 2: Add initial foundations to `## Axioms And Starting Points`. Foundations
 may be definitions, conventions, axioms, variational principles, symmetry
@@ -131,7 +139,14 @@ ability are known.
 Rough steps are only for deferred/pending work. When `plan.md` promotes a rough step into `## Detailed Steps Ready To Calculate`, remove that step from `## Rough Steps For Later Planning` in the same work-note version. Accepted, ready, or blocked detailed steps must not remain in the rough-step list.
 Before the workflow finishes, every rough-step item must be adjudicated: promoted to a ready detailed step, removed/marked obsolete because its trigger did not fire, or recorded as an explicit stop condition in `Open Questions` or `Calculation Status`.
 
-Step 5: Put hidden source answers in `## Reviewer-Only Targets`. For note-check
+Step 5: Update `## Equation Coverage Ledger` whenever ready or rough steps
+change. Keep equation ids traceable even when one coherent derivation step
+covers several equations. If a ready step will run with source tools disabled,
+its proposer-visible context must include `source_excerpt`, exact displayed
+formulas, or accepted derivations sufficient to perform the check. Do not mark a
+source-span-only ready step executable when proposers cannot access the source.
+
+Step 6: Put hidden source answers in `## Reviewer-Only Targets`. For note-check
 tasks, write clean proposer-facing explanation using only context up to the
 target. Do not include the target equation or later text in proposer-visible
 context. The target appears only in Reviewer-Only Targets, keyed by target id.
@@ -178,7 +193,7 @@ Step 1: Review the plan before execution. If the host and workflow permissions
 allow delegation, use an independent reviewer. Otherwise the main agent must
 perform the same review.
 
-Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, PDF color markers are not inside code spans, and source coverage is enough for the task.
+Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, PDF color markers are not inside code spans, and source coverage is enough for the task.
 
 Step 3: If review finds gaps, build final content with the planned PDF export
 noted in the Journal, write a new immutable work-note version, mirror it to

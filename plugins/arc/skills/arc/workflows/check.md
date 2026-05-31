@@ -93,6 +93,8 @@ source copy. Include:
 - parsed source IDs
 - original source paths
 - ARC paper commands for parsed sections and equations
+- parsed equation inventory and an instruction that `plan.md` must write an
+  `Equation Coverage Ledger`
 - coverage requirements and claims to check
 - preflight findings
 - user-specified premise instructions, preserved as input and not inferred
@@ -100,14 +102,22 @@ source copy. Include:
   commands should appear later in the work-note Source Audit Trail
 
 Do not copy full note prose or all equation bodies into the planning request.
-Do not write one task item per equation. Do not classify final premises,
-derived claims, or context-only items here; `plan.md` owns that separation.
+Do not write one task item per equation. Do require the handoff to preserve
+traceability: every parsed equation id must later map to a ready step, rough
+step, or skipped-with-reason entry in the Equation Coverage Ledger. A ready step
+may cover multiple equations, but each covered equation id or equation-id range
+must be explicit. Do not classify final premises, derived claims, or
+context-only items here; `plan.md` owns that separation.
 
 Do not pass the full note body to proposer agents. `plan.md` writes
 proposer-facing work-note context and reviewer-only target IDs. The work note
 must be at least as clear as the original note prefix while hiding the target
 equation and later text from proposers. Source claims that need blind reference
 checking should be represented for reviewers as `reviewer_reference_claim`.
+When source tools are disabled for a calculation step, `source_anchor` alone is
+not enough: the ready-step packet should include `source_excerpt`, exact
+displayed formulas, or accepted prior derivations sufficient for proposers to
+perform the check without reading the original source.
 
 After writing `<project-dir>/initial-note-check.md`, call
 `md2pdf(input="<project-dir>/initial-note-check.md")` in the background. Do not wait for PDF completion.

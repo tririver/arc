@@ -156,7 +156,7 @@ def _summary_table(payload: dict[str, Any]) -> str:
         "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
         "PL=planning, WD=well-definedness, T=total.",
     ]
-    for entry in payload.get("summary_order", payload["ranking"]):
+    for entry in payload.get("ranking", payload.get("summary_order", [])):
         lines.extend(["", *_round_marks_summary_section(entry)])
     if lines and lines[-1] == "":
         lines.pop()

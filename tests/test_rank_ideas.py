@@ -17,11 +17,14 @@ def _load_rank_module() -> Any:
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     old_dont_write_bytecode = sys.dont_write_bytecode
+    old_path = list(sys.path)
     sys.dont_write_bytecode = True
+    sys.path.insert(0, str(SCRIPT.parent))
     try:
         spec.loader.exec_module(module)
     finally:
         sys.dont_write_bytecode = old_dont_write_bytecode
+        sys.path[:] = old_path
     return module
 
 
@@ -101,22 +104,22 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
         "Abbreviations:\n\n"
         "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
         "PL=planning, WD=well-definedness, T=total.\n\n"
-        "## `domain_idea_001`\n\n"
-        "Lower scoring idea\n\n"
+        "## `domain_idea_003`\n\n"
+        "Intent-bearing idea\n\n"
         "| Round | IR | N | CN | SV | PL | WD | T |\n"
         "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
-        "| 1 | 20 | 8 | 7 | 9 | 10 | 10 | 64 |\n\n"
+        "| 1 | 25 | 10 | 8 | 12 | 14 | 14 | 84 |\n\n"
         "## `domain_idea_002`\n\n"
         "Higher scoring idea\n\n"
         "| Round | IR | N | CN | SV | PL | WD | T |\n"
         "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         "| 1 | 24 | 10 | 8 | 12 | 14 | 14 | 82 |\n"
         "| 2 | 25 | 10 | 8 | 12 | 14 | 14 | 83 |\n\n"
-        "## `domain_idea_003`\n\n"
-        "Intent-bearing idea\n\n"
+        "## `domain_idea_001`\n\n"
+        "Lower scoring idea\n\n"
         "| Round | IR | N | CN | SV | PL | WD | T |\n"
         "|---:|---:|---:|---:|---:|---:|---:|---:|\n"
-        "| 1 | 25 | 10 | 8 | 12 | 14 | 14 | 84 |"
+        "| 1 | 20 | 8 | 7 | 9 | 10 | 10 | 64 |"
     )
     assert markdown.startswith("# Ideas\n")
     assert "Higher scoring idea (Mark: 83)" not in first_section

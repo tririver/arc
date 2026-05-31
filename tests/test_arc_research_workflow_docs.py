@@ -199,6 +199,26 @@ def test_plan_routes_reference_equations_to_blind_checks() -> None:
     assert "reviewer-only reference claim" in text
 
 
+def test_plan_requires_equation_coverage_ledger() -> None:
+    text = " ".join((WF / "plan.md").read_text(encoding="utf-8").lower().split())
+
+    assert "equation coverage ledger" in text
+    assert "every parsed equation id" in text
+    assert "ready step, rough step, or skipped-with-reason" in text
+    assert "steps may cover multiple equations" in text
+    assert "source_anchor alone is not enough" in text
+
+
+def test_check_workflow_requires_equation_coverage_handoff() -> None:
+    text = " ".join((WF / "check.md").read_text(encoding="utf-8").lower().split())
+
+    assert "equation coverage ledger" in text
+    assert "parsed equation inventory" in text
+    assert "equation id or equation-id range" in text
+    assert "source_excerpt" in text
+    assert "source tools are disabled" in text
+
+
 def test_plan_workflow_writes_work_note_versions() -> None:
     plan = (WF / "plan.md").read_text(encoding="utf-8")
     plan_lower = plan.lower()
@@ -251,6 +271,7 @@ def test_work_note_declares_required_sections() -> None:
         "## Validation-Only References",
         "## Detailed Steps Ready To Calculate",
         "## Rough Steps For Later Planning",
+        "## Equation Coverage Ledger",
         "## Reviewer-Only Targets",
         "## Calculation Status",
         "## Open Questions",
