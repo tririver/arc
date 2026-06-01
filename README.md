@@ -81,7 +81,9 @@ fixing the cause, set `ARC_MCP_INSTALL_RETRY=1` or remove the failure marker
 named in the error. Marketplace installs fetch ARC packages from
 `https://github.com/tririver/arc.git` at `ARC_MCP_INSTALL_REF` (default:
 `main`); set `ARC_MCP_INSTALL_REF` to a tag or commit for pinned package
-installs. Source checkouts use local `packages/` automatically.
+installs. Source checkouts use local `packages/` automatically. For a plugin
+copy that should install from a separate local checkout, set
+`ARC_MCP_REPO_ROOT` to that checkout root and `ARC_MCP_INSTALL_SOURCE=local`.
 
 Check the launcher directly from a source checkout:
 

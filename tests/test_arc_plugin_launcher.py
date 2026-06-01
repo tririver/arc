@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,7 @@ LAUNCHER = ROOT / "plugins/arc/bin/arc-mcp"
 def _run_launcher(
     runtime_dir: Path,
     *args: str,
+    launcher: Path = LAUNCHER,
     uv: Path | None = None,
     retry: bool = False,
     extra_env: dict[str, str] | None = None,
@@ -29,7 +31,7 @@ def _run_launcher(
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        [str(LAUNCHER), *args],
+        [str(launcher), *args],
         cwd=runtime_dir.parent,
         env=env,
         text=True,
@@ -123,3 +125,54 @@ def test_launcher_failed_install_records_failure_without_retrying(tmp_path):
     assert "Previous ARC MCP runtime install failed" in second.stderr
     assert third.returncode == 0
     assert calls.read_text(encoding="utf-8") == "badgoodgood"
+
+
+def test_launcher_uses_configured_repo_root_for_local_packages(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    fake_plugin_root = tmp_path / "installed-plugin"
+    fake_launcher = fake_plugin_root / "bin/arc-mcp"
+    fake_launcher.parent.mkdir(parents=True)
+    shutil.copyfile(LAUNCHER, fake_launcher)
+    fake_launcher.chmod(0o755)
+
+    local_repo = tmp_path / "local-repo"
+    for package in ("arc-llm", "arc-paper", "arc-domain", "arc-typeset", "arc-mcp"):
+        (local_repo / "packages" / package).mkdir(parents=True)
+
+    calls = tmp_path / "uv-calls.log"
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/bin/sh",
+                "printf '%s\\n' \"$*\" >> \"$UV_CALLS\"",
+                "if [ \"$1\" = venv ]; then",
+                "  mkdir -p \"$2/bin\"",
+                "  printf '#!/bin/sh\\nexit 0\\n' > \"$2/bin/python\"",
+                "  printf '#!/bin/sh\\nif [ \"$1\" = --help ]; then exit 0; fi\\necho local:$1\\n' > \"$2/bin/arc-mcp\"",
+                "  chmod +x \"$2/bin/python\" \"$2/bin/arc-mcp\"",
+                "fi",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    result = _run_launcher(
+        runtime_dir,
+        "root",
+        launcher=fake_launcher,
+        uv=fake_uv,
+        extra_env={
+            "ARC_MCP_REPO_ROOT": str(local_repo),
+            "ARC_MCP_INSTALL_SOURCE": "local",
+            "UV_CALLS": str(calls),
+        },
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "local:root\n"
+    install_call = calls.read_text(encoding="utf-8").splitlines()[1]
+    assert str(local_repo / "packages/arc-mcp") in install_call
+    assert "git+" not in install_call

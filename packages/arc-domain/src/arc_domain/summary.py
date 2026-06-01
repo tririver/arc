@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 from arc_llm import run_json
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA, strip_arc_llm_call_records
 
 from .cache import DomainPaths, now_iso, read_json, update_status, write_json, write_text
+
+
+SUMMARY_ABSTRACT_CHAR_LIMIT = 1600
+SUMMARY_CONCLUSION_CHAR_LIMIT = 1600
+SUMMARY_WARNING_CHAR_LIMIT = 160
+SUMMARY_REASON_CHAR_LIMIT = 1200
+SUMMARY_LIST_ITEM_LIMIT = 12
+SUMMARY_DETAILED_PAPER_LIMIT = 150
+SUMMARY_FALLBACK_DETAILED_PAPER_LIMIT = 80
+SUMMARY_GRAPH_NODE_LIMIT = 150
+SUMMARY_FALLBACK_GRAPH_NODE_LIMIT = 80
+SUMMARY_GRAPH_EDGE_LIMIT = 200
+SUMMARY_PROMPT_CHAR_LIMIT = 900_000
+SUMMARY_FALLBACK_ABSTRACT_CHAR_LIMIT = 800
+SUMMARY_FALLBACK_CONCLUSION_CHAR_LIMIT = 800
 
 
 DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
@@ -148,38 +164,66 @@ def summarize_domain(
 
 
 def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selection: dict[str, Any]) -> str:
-    compact_evidence = strip_arc_llm_call_records({
-        "foundation_selection": selection,
+    compact_evidence = _compact_summary_evidence(
+        graph=graph,
+        evidence=evidence,
+        selection=selection,
+        paper_limit=SUMMARY_DETAILED_PAPER_LIMIT,
+        graph_node_limit=SUMMARY_GRAPH_NODE_LIMIT,
+        abstract_limit=SUMMARY_ABSTRACT_CHAR_LIMIT,
+        conclusion_limit=SUMMARY_CONCLUSION_CHAR_LIMIT,
+    )
+    prompt = _render_summary_prompt(compact_evidence)
+    if len(prompt) <= SUMMARY_PROMPT_CHAR_LIMIT:
+        return prompt
+
+    compact_evidence = _compact_summary_evidence(
+        graph=graph,
+        evidence=evidence,
+        selection=selection,
+        paper_limit=SUMMARY_FALLBACK_DETAILED_PAPER_LIMIT,
+        graph_node_limit=SUMMARY_FALLBACK_GRAPH_NODE_LIMIT,
+        abstract_limit=SUMMARY_FALLBACK_ABSTRACT_CHAR_LIMIT,
+        conclusion_limit=SUMMARY_FALLBACK_CONCLUSION_CHAR_LIMIT,
+    )
+    prompt = _render_summary_prompt(compact_evidence)
+    if len(prompt) > SUMMARY_PROMPT_CHAR_LIMIT:
+        raise ValueError(
+            "domain_summary_prompt_too_large:"
+            f"{len(prompt)} chars after compaction exceeds {SUMMARY_PROMPT_CHAR_LIMIT}"
+        )
+    return prompt
+
+
+def _compact_summary_evidence(
+    *,
+    graph: dict[str, Any],
+    evidence: dict[str, Any],
+    selection: dict[str, Any],
+    paper_limit: int,
+    graph_node_limit: int,
+    abstract_limit: int,
+    conclusion_limit: int,
+) -> dict[str, Any]:
+    detailed_papers, omitted_detail_counts = _compact_evidence_papers(
+        evidence.get("papers", []),
+        paper_limit=paper_limit,
+        abstract_limit=abstract_limit,
+        conclusion_limit=conclusion_limit,
+    )
+    return strip_arc_llm_call_records({
+        "foundation_selection": _compact_selection(selection),
         "foundation_paper": selection.get("selected_foundation") or {},
         "best_reference_paper": selection.get("best_reference_paper") or selection.get("selected_foundation"),
-        "graph": {
-            "foundation_paper": graph.get("foundation_paper"),
-            "nodes": [
-                {
-                    "paper_id": node.get("paper_id"),
-                    "role": node.get("role"),
-                    "title": node.get("title"),
-                    "year": node.get("year"),
-                    "citation_count": node.get("citation_count"),
-                    "selection_reason": node.get("selection_reason"),
-                }
-                for node in graph.get("nodes", [])
-            ],
-            "edges": graph.get("edges", [])[:200],
-        },
-        "papers": [
-            {
-                "paper_id": item.get("paper_id"),
-                "role": item.get("role"),
-                "title": item.get("title"),
-                "abstract": item.get("abstract"),
-                "conclusion": (item.get("conclusion") or {}).get("text", ""),
-                "warnings": item.get("warnings", []),
-            }
-            for item in evidence.get("papers", [])
-        ],
-        "warnings": evidence.get("warnings", []),
+        "graph": _compact_graph(graph, node_limit=graph_node_limit),
+        "paper_detail_limit": paper_limit,
+        "papers": detailed_papers,
+        "omitted_detail_counts": omitted_detail_counts,
+        "warnings": _compact_strings(evidence.get("warnings", [])),
     })
+
+
+def _render_summary_prompt(compact_evidence: dict[str, Any]) -> str:
     return "\n\n".join(
         [
             "Write a compact field briefing for an LLM physicist and a human researcher.",
@@ -226,6 +270,137 @@ def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selectio
             "Return JSON only.",
         ]
     )
+
+
+def _compact_selection(selection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": selection.get("schema_version"),
+        "intent": _compact_text(selection.get("intent"), SUMMARY_REASON_CHAR_LIMIT),
+        "selected_foundation": _compact_candidate(selection.get("selected_foundation") or {}),
+        "best_reference_paper": _compact_candidate(selection.get("best_reference_paper") or {}),
+        "parent_foundations": [
+            _compact_candidate(item)
+            for item in _bounded_items(selection.get("parent_foundations", []), SUMMARY_LIST_ITEM_LIMIT)
+            if isinstance(item, dict)
+        ],
+        "rejected_candidates": [
+            _compact_candidate(item)
+            for item in _bounded_items(selection.get("rejected_candidates", []), SUMMARY_LIST_ITEM_LIMIT)
+            if isinstance(item, dict)
+        ],
+        "reasoning": _compact_text(selection.get("reasoning"), SUMMARY_REASON_CHAR_LIMIT),
+        "warnings": _compact_strings(selection.get("warnings", [])),
+    }
+
+
+def _compact_candidate(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "paper_id": item.get("paper_id"),
+        "title": item.get("title"),
+        "year": item.get("year"),
+        "reason": _compact_text(item.get("reason"), SUMMARY_REASON_CHAR_LIMIT),
+        "source_role": item.get("source_role"),
+    }
+
+
+def _compact_graph(graph: dict[str, Any], *, node_limit: int) -> dict[str, Any]:
+    nodes = graph.get("nodes", [])
+    if not isinstance(nodes, list):
+        nodes = []
+    edges = graph.get("edges", [])
+    if not isinstance(edges, list):
+        edges = []
+    return {
+        "foundation_paper": graph.get("foundation_paper"),
+        "node_limit": node_limit,
+        "omitted_node_count": max(0, len(nodes) - node_limit),
+        "nodes": [
+            {
+                "paper_id": node.get("paper_id"),
+                "role": node.get("role"),
+                "title": node.get("title"),
+                "year": node.get("year"),
+                "citation_count": node.get("citation_count"),
+                "selection_reason": node.get("selection_reason"),
+            }
+            for node in _bounded_items(nodes, node_limit)
+            if isinstance(node, dict)
+        ],
+        "edge_limit": SUMMARY_GRAPH_EDGE_LIMIT,
+        "omitted_edge_count": max(0, len(edges) - SUMMARY_GRAPH_EDGE_LIMIT),
+        "edges": edges[:SUMMARY_GRAPH_EDGE_LIMIT],
+    }
+
+
+def _compact_evidence_papers(
+    values: Any,
+    *,
+    paper_limit: int,
+    abstract_limit: int,
+    conclusion_limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    papers = values if isinstance(values, list) else []
+    detailed = [
+        _compact_evidence_paper(item, abstract_limit=abstract_limit, conclusion_limit=conclusion_limit)
+        for item in _bounded_items(papers, paper_limit)
+        if isinstance(item, dict)
+    ]
+    omitted = [item for item in papers[paper_limit:] if isinstance(item, dict)]
+    return detailed, _omitted_detail_counts(omitted, total_paper_count=len(papers), detail_limit=paper_limit)
+
+
+def _omitted_detail_counts(items: list[dict[str, Any]], *, total_paper_count: int, detail_limit: int) -> dict[str, Any]:
+    return {
+        "total_paper_count": total_paper_count,
+        "paper_detail_limit": detail_limit,
+        "omitted_paper_count": len(items),
+        "by_role": _counts_by_field(items, "role"),
+        "by_year": _counts_by_field(items, "year"),
+    }
+
+
+def _counts_by_field(items: list[dict[str, Any]], field: str) -> dict[str, int]:
+    counts = Counter(str(item.get(field) or "unknown") for item in items)
+    return dict(sorted(counts.items(), key=lambda entry: entry[0]))
+
+
+def _compact_evidence_paper(item: dict[str, Any], *, abstract_limit: int, conclusion_limit: int) -> dict[str, Any]:
+    conclusion = item.get("conclusion") or {}
+    conclusion_text = conclusion.get("text", "") if isinstance(conclusion, dict) else conclusion
+    return {
+        "paper_id": item.get("paper_id"),
+        "role": item.get("role"),
+        "title": item.get("title"),
+        "abstract": _compact_text(item.get("abstract"), abstract_limit),
+        "conclusion": _compact_text(conclusion_text, conclusion_limit),
+        "warnings": _compact_strings(item.get("warnings", []), max_items=4),
+    }
+
+
+def _compact_strings(values: Any, *, max_items: int = SUMMARY_LIST_ITEM_LIMIT) -> list[str]:
+    if not isinstance(values, list):
+        values = [values] if values else []
+    compacted = [
+        _compact_text(item, SUMMARY_WARNING_CHAR_LIMIT)
+        for item in _bounded_items(values, max_items)
+        if item
+    ]
+    if len(values) > max_items:
+        compacted.append(f"[truncated list: {len(values) - max_items} more item(s)]")
+    return compacted
+
+
+def _bounded_items(values: Any, max_items: int) -> list[Any]:
+    if not isinstance(values, list):
+        return []
+    return values[:max_items]
+
+
+def _compact_text(value: Any, limit: int) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n[truncated]"
 
 
 def render_summary_markdown(summary: dict[str, Any]) -> str:

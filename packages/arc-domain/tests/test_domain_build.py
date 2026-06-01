@@ -861,6 +861,112 @@ def test_domain_summary_contract_uses_best_reference_and_new_sections():
     assert not hasattr(domain_summary, "_fallback_summary")
 
 
+def test_domain_summary_prompt_compacts_large_evidence_and_warnings():
+    huge_warning = "selection failed " + ("candidate details " * 20000)
+    long_abstract = "abstract sentence. " * 8000
+    long_conclusion = "conclusion sentence. " * 8000
+    papers = [
+        {
+            "paper_id": f"arXiv:2401.{index:05d}",
+            "role": "domain_paper",
+            "title": f"Paper {index}",
+            "abstract": long_abstract,
+            "conclusion": {"text": long_conclusion},
+            "warnings": [huge_warning],
+        }
+        for index in range(90)
+    ]
+
+    prompt = domain_summary._summary_prompt(
+        graph={
+            "foundation_paper": FOUNDATION,
+            "nodes": [
+                {
+                    "paper_id": item["paper_id"],
+                    "role": item["role"],
+                    "title": item["title"],
+                    "year": 2024,
+                    "citation_count": index,
+                    "selection_reason": "selected",
+                }
+                for index, item in enumerate(papers)
+            ],
+            "edges": [{"source": "a", "target": "b", "width": 1}] * 400,
+        },
+        evidence={"papers": papers, "warnings": [huge_warning]},
+        selection={
+            "selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation Paper", "reason": "seed"},
+            "best_reference_paper": {"paper_id": "arXiv:2401.00002", "title": "Best Ref", "reason": "clear"},
+            "warnings": [huge_warning],
+        },
+    )
+
+    assert len(prompt) < 1_000_000
+    assert "[truncated]" in prompt
+    assert prompt.count("candidate details") < 1000
+    assert prompt.count("abstract sentence.") < 10000
+
+
+def test_domain_summary_prompt_caps_detailed_papers_with_global_budget():
+    long_abstract = "abstract sentence. " * 8000
+    long_conclusion = "conclusion sentence. " * 8000
+    papers = [
+        {
+            "paper_id": f"arXiv:2401.{index:05d}",
+            "role": "domain_paper",
+            "title": f"Paper {index}",
+            "abstract": long_abstract,
+            "conclusion": {"text": long_conclusion},
+            "warnings": [],
+        }
+        for index in range(355)
+    ]
+    graph = {
+        "foundation_paper": FOUNDATION,
+        "nodes": [
+            {
+                "paper_id": item["paper_id"],
+                "role": item["role"],
+                "title": item["title"],
+                "year": 2024,
+                "citation_count": index,
+                "selection_reason": "selected",
+            }
+            for index, item in enumerate(papers)
+        ],
+        "edges": [{"source": "a", "target": "b", "width": 1}] * 943,
+    }
+    selection = {
+        "selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation Paper", "reason": "seed"},
+        "best_reference_paper": {"paper_id": "arXiv:2401.00002", "title": "Best Ref", "reason": "clear"},
+    }
+
+    compact = domain_summary._compact_summary_evidence(
+        graph=graph,
+        evidence={"papers": papers, "warnings": []},
+        selection=selection,
+        paper_limit=150,
+        graph_node_limit=150,
+        abstract_limit=domain_summary.SUMMARY_ABSTRACT_CHAR_LIMIT,
+        conclusion_limit=domain_summary.SUMMARY_CONCLUSION_CHAR_LIMIT,
+    )
+
+    prompt = domain_summary._summary_prompt(
+        graph=graph,
+        evidence={"papers": papers, "warnings": []},
+        selection=selection,
+    )
+
+    assert len(compact["papers"]) == 150
+    assert compact["omitted_detail_counts"]["omitted_paper_count"] == 205
+    assert len(compact["graph"]["nodes"]) == 150
+    assert compact["graph"]["omitted_node_count"] == 205
+    assert len(prompt) < 900_000
+    assert "paper_detail_limit" in prompt
+    assert "omitted_detail_counts" in prompt
+    assert prompt.count("abstract sentence.") < 20_000
+
+
 def test_domain_summary_markdown_omits_report_remarks_guidance_and_warnings():
     markdown = domain_summary.render_summary_markdown(
         {
