@@ -98,6 +98,16 @@ weak evidence such as formatting agreement, visual similarity, or agreement in
 an undeclared special limit. Depending on the failure, retry, split, pause for
 the expert question, or write a planning request.
 
+If proposers, reviewer, and the main agent all agree that a specific equation
+or rule should be added to `## Axioms And Starting Points`, do not pause for a
+human expert solely for that promotion. Treat it as a nonhuman planning
+revision: record the exact equation or rule, scope, consensus artifact paths,
+and reason in a planning request, then return to `plan.md`. When `plan.md`
+adds it, mark it with the red `[foundation added by agent]` marker described
+below. Source target formulas, unresolved conventions, and broad unsupported
+rules still require the ordinary validation-only, accepted-derived, blocked, or
+human-question path.
+
 If an accepted derivation contradicts a source or reviewer-only reference claim,
 classify each independent discrepancy before updating the work note. A step may
 have zero or more `source_discrepancies`; do not merge unrelated equations or
@@ -157,11 +167,18 @@ header-includes:
 ```
 ```tex
 \colorbox{arcsourceissue}{\textcolor{white}{[confirmed source issue]}}
+\colorbox{arcsourceissue}{\textcolor{white}{[foundation added by agent]}}
 \colorbox{archumanresolved}{\textcolor{white}{[human-resolved]}}
 ```
 Do not use custom no-argument marker macros such as `\arcsourceissue` or `\archumanresolved`; Pandoc may strip them from inline prose.
 
 For `confirmed_source_error`, put the literal marker `[confirmed source issue]` beside the source-disagreement statement, and only color that marker's background dark red with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. Do not use the red marker for likely or convention-dependent source mismatches until the human expert question is answered and confirms a source issue.
+
+For an agent-added foundation, put the literal marker `[foundation added by agent]`
+beside the foundation equation or rule, and only color that marker's background
+dark red with white text. The marker means proposer/reviewer/main-agent
+consensus promoted it without a human pause; it does not mean the manuscript
+source was correct.
 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and
@@ -200,12 +217,17 @@ do not require any separate report.
 ## Phase 6: Planning Handoff
 
 If proposers, reviewer, or the main agent agree that plan content should
-change, or that a candidate reusable result should become a future premise, do
-not edit ready-step boundaries, rough steps, or future plan structure.
+change, that a candidate reusable result should become a future premise, or
+that an equation/rule should become an agent-added foundation, do not edit
+ready-step boundaries, rough steps, or future plan structure from
+`calculate.md`.
 
 Write `<project-dir>/calculate/<run-id>/planning-request.md` with:
 
 - current step id/status, consensus artifact paths, evidence, proposer positions, reviewer judgment, and requested `plan.md` action
+- for agent-added foundation requests: exact equation or rule, validity scope,
+  why it should live in `## Axioms And Starting Points`, and confirmation that
+  proposers, reviewer, and main agent agree
 
 Then return to `plan.md`. Use the same handoff when blocked refinement needs
 splitting, limits, projections, different source context, or changed future

@@ -81,6 +81,22 @@ assumptions, approximation regimes, boundary conditions, or accepted starting
 equations. Do not accept a source-derived equation as foundation merely because
 it appears early, is boxed, or is used later.
 
+Agent-added foundations are allowed without a human expert pause only when the
+proposers, reviewer, and main agent all agree that a specific equation or rule
+should become a foundation for later steps. Add the equation or rule under
+`## Axioms And Starting Points` with its validity scope, provenance, and the
+literal marker `[foundation added by agent]` formatted exactly like the red
+`[confirmed source issue]` marker:
+
+```tex
+\colorbox{arcsourceissue}{\textcolor{white}{[foundation added by agent]}}
+```
+
+Do not use this marker for source target formulas, unresolved conventions, broad
+unstated theorems, or source-derived equations accepted only because they appear
+in the manuscript. Those remain validation-only, reviewer-only, accepted-derived,
+or blocked until properly checked.
+
 Step 3: Put checked reusable derivations in `## Accepted Derived Results`.
 `calculate.md` may propose a candidate reusable result through a planning
 request, but `plan.md` decides promotion into Accepted Derived Results, allowed
@@ -158,16 +174,18 @@ details and current-step result-status; plan.md updates structure only when a
 planning decision is needed.
 
 Step 2: Use `## Revision History` for version-level changes: added foundation,
-promoted accepted result, changed ready-step boundaries, expanded rough step,
-or moved a target into reviewer-only storage.
+including any `[foundation added by agent]` marker, promoted accepted result,
+changed ready-step boundaries, expanded rough step, or moved a target into
+reviewer-only storage.
 
 Step 3: Use `## Journal` for compact chronology. Preserve useful verbatim
 execution notes, planning-request excerpts, PDF job ids, and reviewer decisions.
 Keep it factual and short.
 
 Step 4: Use `## Source Audit Trail` for every source that shaped the work note:
-paper ids, note paths, sections, equations, commands, MCP tools, URLs, and why
-each source matters.
+paper ids, note paths, sections, equations, commands, MCP tools, URLs, consensus
+artifact paths supporting any agent-added foundation, and why each source
+matters.
 
 Step 5: When preserving accepted or promoted note-check content, preserve any
 `calculate.md` source-discrepancy and human-resolution markers exactly. Do not
@@ -190,7 +208,7 @@ Step 1: Review the plan before execution. If the host and workflow permissions
 allow delegation, use an independent reviewer. Otherwise the main agent must
 perform the same review.
 
-Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, special PDF color markers are not inside code spans, math and TeX snippets follow `rules/math_typeset.md`, and source coverage is enough for the task.
+Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, agent-added foundations have proposer/reviewer/main-agent agreement plus validity scope and the `[foundation added by agent]` marker, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, special PDF color markers are not inside code spans, math and TeX snippets follow `rules/math_typeset.md`, and source coverage is enough for the task.
 
 Step 3: If review finds gaps, build final content with the planned PDF export
 noted in the Journal, write a new immutable work-note version, mirror it to
