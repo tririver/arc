@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins/arc"
 SKILL = PLUGIN / "skills/arc"
+RULES = SKILL / "rules"
 WF = SKILL / "workflows"
 WJ = WF / "json"
 WS = WF / "scripts"
@@ -46,6 +47,33 @@ def test_arc_skill_requires_nonblocking_pdf_export_for_project_markdown_reports(
     assert "background" in text
     assert "do not wait" in text
     assert "markdown report" in text
+
+
+def test_math_typeset_rules_define_markdown_math_hygiene() -> None:
+    text = (RULES / "math_typeset.md").read_text(encoding="utf-8")
+
+    assert "ARC Math Typesetting Reference" in text
+    assert "Use `$...$` for inline math" in text
+    assert "Do not use Markdown code spans for TeX or math snippets" in text
+    assert r"`\partial_{x_0}^2`" in text
+    assert r"$\partial_{x_0}^2$" in text
+    assert r"`\hat{\mathcal K}_+ - \hat{\mathcal K}_-`" in text
+    assert r"$\hat{\mathcal K}_+ - \hat{\mathcal K}_-$" in text
+    assert "stable IDs such as `eq_00009`" in text
+
+
+def test_report_workflows_reference_math_typeset_rules() -> None:
+    for name in ["check.md", "domain.md", "ideas.md", "plan.md", "calculate.md"]:
+        text = (WF / name).read_text(encoding="utf-8")
+
+        assert "`rules/math_typeset.md`" in text
+
+
+def test_arc_skill_lists_math_typeset_reference() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "`rules/math_typeset.md`" in text
+    assert "Markdown math" in text
 
 
 def test_workflows_start_pdf_export_for_user_facing_markdown() -> None:

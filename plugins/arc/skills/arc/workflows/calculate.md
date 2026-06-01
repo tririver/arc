@@ -134,8 +134,7 @@ updating the affected source claim as resolved.
 
 When pausing for a human expert, do not merely say that the workflow paused.
 Write and ask one concrete question under the literal label
-`Human expert question:`. The question must name the step, the unresolved
-equation or claim, the competing options, and what answer is needed to proceed.
+`Human expert question:`. The question must name the step, the unresolved equation or claim, the competing options, and what answer is needed to proceed.
 For important equations, do not cite equation ids alone: display the equation
 body or the decision-critical subequation directly in the work note and in the
 user-facing question. If the equation is long, show the minimal formula fragment
@@ -149,8 +148,8 @@ For an accepted step, update only the current ready-step slot:
 - mark the current ready step accepted
 - record the selected derivation, current result, and status
 - use main prose for the physics argument
-- use `Journal` for execution facts, consensus paths, attempts, and reviewer
-  judgment
+- use `Journal` for execution facts, consensus paths, attempts, reviewer
+  judgment, and `rules/math_typeset.md` math/TeX hygiene
 
 For PDF-oriented Markdown marker backgrounds, use this exact template. It is shown as code here only; in work notes paste the raw LaTeX directly in prose, not inside Markdown code spans or fenced code blocks. If the work note already has a YAML header, merge these `header-includes`; do not create a second YAML header.
 ```yaml

@@ -109,8 +109,9 @@ compact round marks table with columns `Round`, `IR`, `N`, `CN`, `SV`, `PL`,
 ranked idea. Each subsection lists all referee marks from
 every round in that idea loop and quotes only the selected handoff text: title,
 idea summary, and calculation plan. Render that handoff text as normal
-Markdown paragraphs, not a fenced code block. Use PDF-friendly wrapping for
-long titles and proposer text; avoid wide tables with long prose.
+Markdown paragraphs, not a fenced code block. Follow `rules/math_typeset.md`
+for math and TeX snippets. Use PDF-friendly wrapping for long titles and
+proposer text; avoid wide tables with long prose.
 
 Step 2: After writing the project-level Markdown report, call
 MCP `md2pdf(input="<project-dir>/ranked-ideas.md")`. It starts a background

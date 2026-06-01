@@ -47,6 +47,8 @@ Use this Work Note template:
 ```
 
 Each equation-heavy section must include enough prose for a physicist to follow the argument. The work note is not only equations and must be at least as clear as the original note/source context. Main text explains physics; the Journal keeps verbatim or compact execution history. Use logic-flow sentences such as: `Use F1 and F2 to derive S3`.
+Follow `rules/math_typeset.md` for math and TeX snippets in work-note
+Markdown.
 
 ## Inputs
 
@@ -172,7 +174,7 @@ paper ids, note paths, sections, equations, commands, MCP tools, URLs, and why
 each source matters.
 
 Step 5: Any accepted or promoted work-note content whose acceptance depends on a specific human expert answer resolving an unresolved scientific acceptance question is human-resolved content. This does not include ordinary user task instructions, source excerpts, or constraints.
-Add the literal marker `[human-resolved]` beside the content, and only color that marker's background dark blue with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. For PDF-oriented Markdown, use the `calculate.md` marker-background template and write raw LaTeX directly in prose, for example: \colorbox{archumanresolved}{\textcolor{white}{[human-resolved]}}. Do not use Markdown code spans.
+Add the literal marker `[human-resolved]` beside the content, and only color that `human-resolved` marker's background dark blue with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. For PDF-oriented Markdown, use the `calculate.md` marker-background template and write raw LaTeX directly in prose, for example: \colorbox{archumanresolved}{\textcolor{white}{[human-resolved]}}. Do not use Markdown code spans.
 
 Step 6: For note-check content classified as `confirmed_source_error`, mark the source issue with the literal marker `[confirmed source issue]`, and only color that marker's background dark red with white text. Do not color the surrounding prose. Do not color the surrounding equations. For `likely_source_error` or `ambiguous_convention`, use red only for the `calculate.md` auto-mode `[agent-resolved decision]` marker; otherwise ask a human expert question before acceptance. For PDF-oriented Markdown, use the `calculate.md` marker-background template and write raw LaTeX directly in prose, for example: \colorbox{arcsourceissue}{\textcolor{white}{[confirmed source issue]}}. Do not use Markdown code spans.
 
@@ -193,7 +195,7 @@ Step 1: Review the plan before execution. If the host and workflow permissions
 allow delegation, use an independent reviewer. Otherwise the main agent must
 perform the same review.
 
-Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, PDF color markers are not inside code spans, and source coverage is enough for the task.
+Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, special PDF color markers are not inside code spans, math and TeX snippets follow `rules/math_typeset.md`, and source coverage is enough for the task.
 
 Step 3: If review finds gaps, build final content with the planned PDF export
 noted in the Journal, write a new immutable work-note version, mirror it to

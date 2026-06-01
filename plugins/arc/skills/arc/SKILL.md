@@ -21,6 +21,8 @@ not optional.
   behavior, or robustness-sensitive execution: read
   `rules/integrity.md`.
 - General ARC operating rules: read `rules/operating.md`.
+- User-facing Markdown math and TeX typesetting: read
+  `rules/math_typeset.md`.
 - ARC workflow completion checks and improvement notes: read
   `rules/self-reflection.md`.
 - Single-paper metadata, full text, sections, equations, citers, references,

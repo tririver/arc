@@ -167,6 +167,8 @@ visible outside the research briefing.
 After these deliverables are generated, export the domain HTML file and the
 domain summary Markdown file to `<project-dir>/` with the same file names so
 human readers can inspect the main project reports together.
+For the domain summary Markdown, follow `rules/math_typeset.md` for math and
+TeX snippets.
 
 After writing each domain summary Markdown report to `<project-dir>/`, call
 MCP `md2pdf(input="<project-dir>/<seed-safe>_domain_summary.md")`. It starts a
