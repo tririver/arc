@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -679,6 +680,60 @@ def test_render_node_rank_uses_zero_domain_score_not_support_count():
     ranked = sorted([zero_score_with_support, high_score], key=render._node_rank_key)  # noqa: SLF001
 
     assert ranked == [high_score, zero_score_with_support]
+
+
+def test_network_caps_total_papers_including_recent_arxiv(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("paper_cap_test")
+    paths.domain_dir.mkdir(parents=True)
+    parent_ids = [f"arXiv:2301.0000{index}" for index in range(2, 5)]
+    paths.foundation_selection.write_text(
+        json.dumps(
+            {
+                "selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "seed"},
+                "parent_foundations": [
+                    {"paper_id": paper_id, "title": f"Parent {index}", "reason": "parent"}
+                    for index, paper_id in enumerate(parent_ids, start=1)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def metadata(paper_id, *, refresh=False):
+        return {
+            "paper_id": paper_id,
+            "title": paper_id,
+            "abstract": f"Abstract for {paper_id}",
+            "authors": [],
+            "year": 2026,
+            "published": "2026-05-01",
+            "citation_count": int(paper_id.rsplit(".", 1)[-1]) if paper_id.startswith("arXiv:2605.") else 1,
+            "identifiers": {"paper_id": paper_id, "arxiv": paper_id},
+        }
+
+    def citers(paper_id, *, refresh=False, limit=1000, sort="mostrecent"):
+        if paper_id != FOUNDATION:
+            return []
+        return [metadata(f"arXiv:2605.{index:05d}") for index in range(140)]
+
+    monkeypatch.setattr(network.paper, "metadata", metadata)
+    monkeypatch.setattr(network.paper, "citers", citers)
+    monkeypatch.setattr(network.paper, "references", lambda paper_id, **kwargs: [metadata(FOUNDATION)])
+
+    result = network.build_network(
+        seed_paper=SEED,
+        intent="",
+        paths=paths,
+        provider="manual",
+        workers=1,
+    )
+
+    assert result["node_count"] == 90
+    roles = [node["role"] for node in result["graph"]["nodes"]]
+    assert roles.count("selected_foundation") == 1
+    assert roles.count("parent_foundation") == 3
+    assert roles.count("domain_paper") == 86
 
 
 @pytest.mark.skipif(

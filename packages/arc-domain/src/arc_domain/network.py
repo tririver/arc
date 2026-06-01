@@ -32,6 +32,7 @@ INTENT_OVERLAP_WEIGHT = 1.0
 GRAPH_CITER_WEIGHT = 2.0
 REFERENCE_EDGE_WEIGHT = 0.5
 RECENT_ARXIV_WINDOW_DAYS = 365
+MAX_GRAPH_PAPER_COUNT = 90
 
 
 def build_network(
@@ -69,12 +70,15 @@ def build_network(
     intent_ranking = _rank_by_intent(citer_pool, intent=intent, provider=provider, model=model, model_tier=model_tier)
     write_json(paths.intent_rankings, intent_ranking)
 
+    parent_foundation_ids = _parent_foundation_ids(selection.get("parent_foundations") or [])
+    reserved_node_count = 1 + len(parent_foundation_ids)
     selected = _select_domain_papers(
         citer_pool,
         foundation_id=foundation_id,
         intent_ranking=intent_ranking,
         intent=intent,
         selected_count=selected_count,
+        max_total=max(0, MAX_GRAPH_PAPER_COUNT - reserved_node_count),
     )
 
     selected_ids = [item["paper_id"] for item in selected]
@@ -89,7 +93,7 @@ def build_network(
         foundation_id=foundation_id,
         selected_ids=selected_ids,
         refs_by_selected=refs_by_selected,
-        max_extra=max(0, max_nodes - 1 - len(selected)),
+        max_extra=max(0, min(max_nodes, MAX_GRAPH_PAPER_COUNT) - reserved_node_count - len(selected)),
         refresh=refresh,
         workers=workers,
     )
@@ -275,6 +279,7 @@ def _select_domain_papers(
     intent_ranking: dict[str, Any],
     intent: str,
     selected_count: int,
+    max_total: int = MAX_GRAPH_PAPER_COUNT,
 ) -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
     current_year = now.year
@@ -323,14 +328,23 @@ def _select_domain_papers(
         key=lambda item: (item["domain_score"], item.get("citation_count") or 0, item.get("year") or 0),
         reverse=True,
     )
-    selected = scored[:selected_count]
+    max_total = max(0, max_total)
+    selected = scored[: min(selected_count, max_total)]
     selected_ids = {item["paper_id"] for item in selected}
     recent = [
         item
         for item in scored[selected_count:]
         if item.get("recent_arxiv") and item["paper_id"] not in selected_ids
-    ]
+    ][: max(0, max_total - len(selected))]
     return [*selected, *recent]
+
+
+def _parent_foundation_ids(parent_foundations: list[dict[str, Any]]) -> set[str]:
+    return {
+        normalize_paper_id(paper_key(item))
+        for item in parent_foundations
+        if isinstance(item, dict) and paper_key(item)
+    }
 
 
 def _add_in_graph_citer_scores(
