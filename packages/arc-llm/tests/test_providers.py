@@ -664,6 +664,37 @@ def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
     assert payload["mcpServers"]["arc"]["env"]["EXTRA"] == "value"
 
 
+def test_claude_arc_only_mcp_default_does_not_fall_back_to_uvx(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("arc_llm.providers.claude_cli.shutil.which", lambda name: None)
+    fake_python = tmp_path / "bin/python"
+    fake_python.parent.mkdir()
+    fake_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr("arc_llm.providers.claude_cli.sys.executable", str(fake_python))
+
+    provider = ClaudeCliProvider(
+        env={
+            "ARC_CLAUDE_ALLOW_MCP": "true",
+            "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "ARC_CLAUDE_TOOLS": "",
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        }
+    )
+
+    assert provider.generate_text("prompt") == "plain text"
+    config_path = captured["cmd"][captured["cmd"].index("--mcp-config") + 1]
+    payload = json.loads(open(config_path, encoding="utf-8").read())
+
+    assert payload["mcpServers"]["arc"]["command"] == "arc-mcp"
+    assert payload["mcpServers"]["arc"]["args"] == []
+
+
 def test_claude_no_internet_mcp_requires_explicit_tools(tmp_path):
     provider = ClaudeCliProvider(
         env={

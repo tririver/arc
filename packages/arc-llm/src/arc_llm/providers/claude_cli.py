@@ -315,7 +315,7 @@ def _arc_mcp_command_and_args(env: Mapping[str, str]) -> tuple[str, list[str]]:
     sibling = Path(sys.executable).with_name("arc-mcp")
     if sibling.exists():
         return str(sibling), []
-    return "uvx", ["arc-mcp"]
+    return "arc-mcp", []
 
 
 def _env_json_string_list(env: Mapping[str, str], key: str) -> list[str]:

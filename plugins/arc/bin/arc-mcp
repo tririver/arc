@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+launcher_version="1"
+install_ref="${ARC_MCP_INSTALL_REF:-main}"
+install_repo="${ARC_MCP_INSTALL_REPO:-https://github.com/tririver/arc.git}"
+install_source="${ARC_MCP_INSTALL_SOURCE:-auto}"
+python_spec="${ARC_MCP_INSTALL_PYTHON:->=3.11}"
+uv_bin="${ARC_MCP_INSTALLER_UV:-uv}"
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+plugin_root="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
+repo_root="$(CDPATH= cd -- "$plugin_root/../.." && pwd -P)"
+
+is_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_path() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null && return 0
+  fi
+  realpath "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+sanitize_key() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c 1-160
+}
+
+if ! is_true "${ARC_MCP_LAUNCHER_NO_PATH:-}"; then
+  candidate="$(command -v arc-mcp 2>/dev/null || true)"
+  if [ -n "$candidate" ] && [ "$(resolve_path "$candidate")" != "$(resolve_path "$0")" ]; then
+    exec "$candidate" "$@"
+  fi
+fi
+
+if [ -n "${ARC_MCP_RUNTIME_DIR:-}" ]; then
+  runtime_dir="${ARC_MCP_RUNTIME_DIR}"
+else
+  cache_home="${XDG_CACHE_HOME:-${HOME}/.cache}"
+  cache_key="$(sanitize_key "${install_repo}@${install_ref}")"
+  runtime_dir="${cache_home}/arc/arc-mcp-runtime/v${launcher_version}/${cache_key}"
+fi
+
+venv_dir="${runtime_dir}/venv"
+ready_file="${runtime_dir}/install.ok"
+failed_file="${runtime_dir}/install.failed"
+status_file="${runtime_dir}/install.status"
+log_file="${runtime_dir}/install.log"
+lock_dir="${runtime_dir}/install.lock"
+
+runtime_ready() {
+  [ -f "$ready_file" ] && [ -x "${venv_dir}/bin/arc-mcp" ]
+}
+
+runtime_failed() {
+  [ -f "$failed_file" ] && ! is_true "${ARC_MCP_INSTALL_RETRY:-}"
+}
+
+previous_status() {
+  status="$(cat "$status_file" 2>/dev/null || true)"
+  case "$status" in
+    ''|*[!0-9]*) printf '1\n' ;;
+    *) printf '%s\n' "$status" ;;
+  esac
+}
+
+if runtime_ready; then
+  exec "${venv_dir}/bin/arc-mcp" "$@"
+fi
+
+if runtime_failed; then
+  {
+    printf 'Previous ARC MCP runtime install failed; not retrying automatically.\n'
+    printf 'Failure marker: %s\n' "$failed_file"
+    printf 'Install log: %s\n' "$log_file"
+    printf 'Set ARC_MCP_INSTALL_RETRY=1 to retry, or delete the failure marker after fixing the cause.\n'
+  } >&2
+  exit "$(previous_status)"
+fi
+
+mkdir -p "$runtime_dir"
+
+waited=0
+lock_timeout="${ARC_MCP_INSTALL_LOCK_TIMEOUT_SEC:-600}"
+while ! mkdir "$lock_dir" 2>/dev/null; do
+  if [ "$waited" -ge "$lock_timeout" ]; then
+    printf 'Timed out waiting for ARC MCP runtime install lock: %s\n' "$lock_dir" >&2
+    exit 75
+  fi
+  sleep 1
+  waited=$((waited + 1))
+done
+release_lock() {
+  rm -rf "$lock_dir"
+}
+trap release_lock EXIT
+
+if runtime_ready; then
+  release_lock
+  trap - EXIT
+  exec "${venv_dir}/bin/arc-mcp" "$@"
+fi
+
+if runtime_failed; then
+  {
+    printf 'Previous ARC MCP runtime install failed; not retrying automatically.\n'
+    printf 'Failure marker: %s\n' "$failed_file"
+    printf 'Install log: %s\n' "$log_file"
+    printf 'Set ARC_MCP_INSTALL_RETRY=1 to retry, or delete the failure marker after fixing the cause.\n'
+  } >&2
+  exit "$(previous_status)"
+fi
+
+install_runtime() {
+  if [ "$install_source" != "auto" ] && [ "$install_source" != "local" ] && [ "$install_source" != "git" ]; then
+    printf 'ARC_MCP_INSTALL_SOURCE must be one of: auto, local, git\n' >&2
+    return 2
+  fi
+
+  rm -rf "$venv_dir"
+  "$uv_bin" venv "$venv_dir" --python "$python_spec" || return $?
+
+  if { [ "$install_source" = "auto" ] || [ "$install_source" = "local" ]; } \
+    && [ -d "${repo_root}/packages/arc-mcp" ] \
+    && [ -d "${repo_root}/packages/arc-paper" ]; then
+    requirements=(
+      "${repo_root}/packages/arc-llm"
+      "${repo_root}/packages/arc-paper"
+      "${repo_root}/packages/arc-domain"
+      "${repo_root}/packages/arc-typeset"
+      "${repo_root}/packages/arc-mcp"
+    )
+  else
+    source_base="git+${install_repo}@${install_ref}"
+    requirements=(
+      "arc-llm @ ${source_base}#subdirectory=packages/arc-llm"
+      "arc-paper @ ${source_base}#subdirectory=packages/arc-paper"
+      "arc-domain @ ${source_base}#subdirectory=packages/arc-domain"
+      "arc-typeset @ ${source_base}#subdirectory=packages/arc-typeset"
+      "arc-mcp @ ${source_base}#subdirectory=packages/arc-mcp"
+    )
+  fi
+
+  "$uv_bin" pip install --python "${venv_dir}/bin/python" "${requirements[@]}" || return $?
+  "${venv_dir}/bin/arc-mcp" --help >/dev/null || return $?
+  {
+    printf 'repo=%s\n' "$install_repo"
+    printf 'ref=%s\n' "$install_ref"
+    printf 'source=%s\n' "$install_source"
+    printf 'launcher_version=%s\n' "$launcher_version"
+  } > "$ready_file"
+}
+
+rm -f "$failed_file" "$status_file"
+set +e
+install_runtime >"$log_file" 2>&1
+install_status=$?
+set -e
+
+if [ "$install_status" -ne 0 ]; then
+  rm -rf "$venv_dir"
+  printf '%s\n' "$install_status" > "$status_file"
+  {
+    printf 'ARC MCP runtime install failed.\n'
+    printf 'Install log: %s\n' "$log_file"
+    printf 'Set ARC_MCP_INSTALL_RETRY=1 to retry after fixing the cause.\n'
+  } > "$failed_file"
+  cat "$failed_file" >&2
+  exit "$install_status"
+fi
+
+rm -f "$failed_file" "$status_file"
+release_lock
+trap - EXIT
+exec "${venv_dir}/bin/arc-mcp" "$@"

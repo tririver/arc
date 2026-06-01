@@ -41,6 +41,7 @@ provider.
 Requirements:
 
 - Python 3.11 or newer.
+- `uv` for first-time plugin MCP runtime setup.
 - Network access for first-time INSPIRE/ar5iv fetches.
 - Codex or Claude Code for host LLM work; unknown hosts fall back to manual
   prompt handoff.
@@ -67,16 +68,25 @@ Install for Claude Code:
 /plugin install arc
 ```
 
-The plugin starts the ARC MCP server with:
+The plugin starts the ARC MCP server with a bundled launcher:
 
 ```bash
-uvx arc-mcp
+./bin/arc-mcp
 ```
 
-Check the MCP command directly:
+On first MCP use, the launcher installs ARC into a cache-local runtime and
+reuses it for later MCP calls. If that install fails, later starts fail fast with
+the saved log path instead of retrying a broken partial install. To retry after
+fixing the cause, set `ARC_MCP_INSTALL_RETRY=1` or remove the failure marker
+named in the error. Marketplace installs fetch ARC packages from
+`https://github.com/tririver/arc.git` at `ARC_MCP_INSTALL_REF` (default:
+`main`); set `ARC_MCP_INSTALL_REF` to a tag or commit for pinned package
+installs. Source checkouts use local `packages/` automatically.
+
+Check the launcher directly from a source checkout:
 
 ```bash
-uvx arc-mcp --help
+plugins/arc/bin/arc-mcp --help
 ```
 
 Use the source install below only for development or local package testing.
@@ -172,15 +182,16 @@ provider.
 
 ## Use ARC Through An Agent
 
-For an MCP-capable host, configure an MCP server named `arc` that runs
-`uvx arc-mcp`:
+For an MCP-capable host using the repository plugin, configure an MCP server
+named `arc` that runs the bundled launcher from the plugin root:
 
 ```json
 {
   "mcpServers": {
     "arc": {
-      "command": "uvx",
-      "args": ["arc-mcp"]
+      "command": "./bin/arc-mcp",
+      "args": [],
+      "cwd": "."
     }
   }
 }

@@ -865,18 +865,20 @@ def test_arc_skill_tree_contains_no_python_bytecode() -> None:
     assert bad_paths == []
 
 
-def test_root_mcp_config_uses_uvx_arc_mcp() -> None:
+def test_root_mcp_config_uses_bundled_arc_mcp_launcher() -> None:
     mcp_config = json.loads((ROOT / "plugins/arc/.mcp.json").read_text(encoding="utf-8"))
     arc_server = mcp_config["mcpServers"]["arc"]
 
-    assert arc_server["command"] == "uvx"
-    assert arc_server["args"] == ["arc-mcp"]
+    assert arc_server["command"] == "./bin/arc-mcp"
+    assert arc_server["args"] == []
+    assert arc_server["cwd"] == "."
 
 
 def test_readme_documents_marketplace_first_install() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "uvx arc-mcp --help" in text
+    assert "plugins/arc/bin/arc-mcp --help" in text
+    assert "ARC_MCP_INSTALL_RETRY=1" in text
     assert "codex plugin marketplace add tririver/arc" in text
     assert "codex plugin add arc@arc" in text
     assert "/plugin marketplace add tririver/arc" in text

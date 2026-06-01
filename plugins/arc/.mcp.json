@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "arc": {
-      "command": "uvx",
-      "args": ["arc-mcp"]
+      "command": "./bin/arc-mcp",
+      "args": [],
+      "cwd": "."
     }
   }
 }
