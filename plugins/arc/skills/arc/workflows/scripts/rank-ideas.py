@@ -15,7 +15,7 @@ WORKFLOW_DIR = Path(__file__).resolve().parents[1]
 if str(WORKFLOW_DIR) not in sys.path:
     sys.path.insert(0, str(WORKFLOW_DIR))
 
-from ideas_marking import normalized_marks, rank_key_from_marks, report_columns  # noqa: E402
+from ideas_marking import normalized_marks, rank_key_from_marks, report_columns, score_fields  # noqa: E402
 
 
 def main() -> None:
@@ -81,6 +81,8 @@ def _round_entry(loop_root: Path, round_root: Path) -> dict[str, Any] | None:
     marks = review.get("review_payload", {}).get("marks", {})
     if "total_score" not in marks:
         return None
+    if _major_recovered(review) or _major_recovered(proposer_output):
+        marks = {field: 0 for field in score_fields()}
 
     relative = lambda path: str(path.relative_to(loop_root.parents[1]))
     return {
@@ -98,6 +100,16 @@ def _first_json(root: Path) -> Path | None:
     if not root.is_dir():
         return None
     return next(iter(sorted(root.glob("*.json"))), None)
+
+
+def _major_recovered(payload: dict[str, Any]) -> bool:
+    record = payload.get("arc_llm_call_record")
+    if not isinstance(record, dict):
+        return False
+    structured = record.get("structured_output")
+    if not isinstance(structured, dict):
+        return False
+    return structured.get("mode") == "recovered" and structured.get("severity") in {"major", "fatal"}
 
 
 def _read_json(path: Path) -> dict[str, Any]:

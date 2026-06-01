@@ -316,6 +316,36 @@ class InvalidThenValidResultProvider:
         )
 
 
+class RecoverableTextResultProvider:
+    name = "claude-cli"
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+        output_recovery="strict",
+    ):
+        return LLMProviderResponse(
+            {},
+            raw_output=json.dumps({"type": "result", "result": "Recovered idea text"}),
+            structured_output={
+                "schema_version": "arc.llm.structured_output.v1",
+                "mode": "recovered",
+                "severity": "major",
+                "warnings": ["provider returned natural language"],
+                "raw_text_excerpt": "Recovered idea text",
+                "provider_error_type": None,
+                "recovery_strategy": "natural_language_fallback",
+            },
+        )
+
+
 class FlakyJsonProvider:
     def __init__(self, *, name, failures_before_success=None, result=None):
         self.name = name
@@ -408,6 +438,66 @@ def test_run_json_passes_provider_safe_schema_but_preserves_local_validation(mon
     assert provider.schema["properties"] == {"ok": {"type": "boolean"}}
     assert provider.schema["additionalProperties"] is False
     assert schema == original
+
+
+def test_run_json_recovery_warn_valid_json_is_unchanged(monkeypatch):
+    provider = CapturingSchemaResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+    schema = {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+
+    result = run_json(
+        "prompt",
+        schema=schema,
+        provider="codex-cli",
+        model="m",
+        env={},
+        process_chain=[],
+        output_recovery="warn",
+    )
+
+    assert without_call_record(result) == {"ok": True}
+    assert result[ARC_LLM_CALL_RECORD_FIELD].get("structured_output") is None
+
+
+def test_run_json_recovery_warn_builds_known_proposer_fallback(monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: RecoverableTextResultProvider())
+    schema = {
+        "type": "object",
+        "required": ["title", "idea_summary", "motivation", "novelty_checks", "calculation_plan", "validation_checks", "risks"],
+        "properties": {
+            "title": {"type": "string"},
+            "idea_summary": {"type": "string"},
+            "motivation": {"type": "string"},
+            "novelty_checks": {"type": "array", "items": {"type": "string"}},
+            "calculation_plan": {"type": "string"},
+            "validation_checks": {"type": "array", "items": {"type": "string"}},
+            "risks": {"type": "array", "items": {"type": "string"}},
+        },
+        "additionalProperties": False,
+    }
+
+    result = run_json(
+        "prompt",
+        schema=schema,
+        provider="claude-cli",
+        model="deepseek-v4-flash",
+        env={},
+        process_chain=[],
+        output_recovery="warn",
+        role_hint="proposer",
+    )
+
+    assert result["title"] == "Recovered idea text"
+    assert result["idea_summary"] == "Recovered idea text"
+    assert result["risks"]
+    structured = result[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]
+    assert structured["severity"] == "major"
+    assert structured["recovery_strategy"] == "natural_language_fallback"
 
 
 def test_run_json_without_schema_passes_none_and_adds_call_record(monkeypatch):

@@ -25,6 +25,7 @@ from .config import (
     CacheGuardOptions,
     ConfigError,
     LoopConfig,
+    OutputRecoveryOptions,
     WorkerConfig,
     load_batch_config,
     worker_env,
@@ -344,6 +345,7 @@ def _run_proposers(
                 prefix_limiter=prefix_limiter,
                 cache_guard=loop.session.cache_guard,
                 cache_warnings_path=cache_warnings_path,
+                output_recovery=batch.output_recovery,
             ): proposer
             for proposer in loop.proposers
         }
@@ -393,6 +395,7 @@ def _call_reviewer_with_validation_retry(
         prefix_limiter=prefix_limiter,
         cache_guard=cache_guard,
         cache_warnings_path=cache_warnings_path,
+        output_recovery=batch.output_recovery,
         validate_schema=False,
     )
     review_output = first_call.output
@@ -438,6 +441,7 @@ def _call_reviewer_with_validation_retry(
             static_prefix=None,
             cache_guard=cache_guard,
             cache_warnings_path=cache_warnings_path,
+            output_recovery=batch.output_recovery,
             validate_schema=False,
         )
         _validate_review_envelope(review_output, loop)
@@ -482,6 +486,7 @@ def _call_json_runner_with_prompt_options(
     prefix_limiter: "PrefixConcurrencyLimiter",
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
+    output_recovery: OutputRecoveryOptions,
     validate_schema: bool = True,
 ) -> WorkerCallResult:
     selected: WorkerPromptOption | None = None
@@ -512,6 +517,7 @@ def _call_json_runner_with_prompt_options(
             static_prefix=selected.static_prefix,
             cache_guard=cache_guard,
             cache_warnings_path=cache_warnings_path,
+            output_recovery=output_recovery,
             validate_schema=validate_schema,
         )
         return WorkerCallResult(
@@ -562,6 +568,7 @@ def _call_json_runner_with_error_artifact(
     static_prefix: str | None,
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
+    output_recovery: OutputRecoveryOptions,
     validate_schema: bool = True,
 ) -> dict[str, Any]:
     try:
@@ -581,6 +588,7 @@ def _call_json_runner_with_error_artifact(
                 static_prefix=static_prefix,
                 cache_guard=cache_guard,
                 cache_warnings_path=cache_warnings_path,
+                output_recovery=output_recovery,
                 validate_schema=validate_schema,
             )
 
@@ -619,6 +627,7 @@ def _call_json_runner(
     static_prefix: str | None,
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
+    output_recovery: OutputRecoveryOptions,
     validate_schema: bool = True,
 ) -> dict[str, Any]:
     env = worker_env(worker, base_env=base_env)
@@ -645,6 +654,8 @@ def _call_json_runner(
                 "artifact_dir": artifact_dir,
                 "static_prefix": static_prefix,
                 "validate_schema": validate_schema,
+                "output_recovery": _output_recovery_mode(output_recovery),
+                "role_hint": _role_hint(worker),
             }
             for key, value in optional.items():
                 if _accepts_keyword(json_runner, key):
@@ -673,6 +684,12 @@ def _call_json_runner(
                 cache_guard=cache_guard,
                 cache_warnings_path=cache_warnings_path,
             )
+            _maybe_record_structured_output_warning(
+                result,
+                warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
+                worker=worker,
+                call_label=call_label,
+            )
             return result
         result = run_json(
             prompt,
@@ -691,6 +708,8 @@ def _call_json_runner(
             artifact_dir=artifact_dir,
             call_label=call_label,
             static_prefix=static_prefix,
+            output_recovery=_output_recovery_mode(output_recovery),
+            role_hint=_role_hint(worker),
         )
         _maybe_record_cache_warning(
             result,
@@ -700,6 +719,12 @@ def _call_json_runner(
             call_label=call_label,
             cache_guard=cache_guard,
             cache_warnings_path=cache_warnings_path,
+        )
+        _maybe_record_structured_output_warning(
+            result,
+            warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
+            worker=worker,
+            call_label=call_label,
         )
         return result
 
@@ -1087,6 +1112,48 @@ def _maybe_record_cache_warning(
             f"{call_label}: cached_input_ratio={ratio:.3f} "
             f"< {cache_guard.min_cached_input_ratio:.3f}"
         )
+
+
+def _maybe_record_structured_output_warning(
+    result: dict[str, Any],
+    *,
+    warnings_path: Path,
+    worker: WorkerConfig,
+    call_label: str,
+) -> None:
+    record = result.get(ARC_LLM_CALL_RECORD_FIELD) if isinstance(result, dict) else None
+    structured = record.get("structured_output") if isinstance(record, Mapping) else None
+    if not isinstance(structured, Mapping) or structured.get("mode") != "recovered":
+        return
+    append_jsonl(
+        warnings_path,
+        {
+            "schema_version": "arc.llm.structured_output_warning.v1",
+            "worker_id": worker.id,
+            "call_label": call_label,
+            "severity": structured.get("severity"),
+            "warnings": list(structured.get("warnings", []))
+            if isinstance(structured.get("warnings"), list)
+            else [],
+            "raw_text_excerpt": str(structured.get("raw_text_excerpt") or ""),
+            "recovery_strategy": structured.get("recovery_strategy"),
+            "provider_error_type": structured.get("provider_error_type"),
+        },
+    )
+
+
+def _output_recovery_mode(options: OutputRecoveryOptions) -> str:
+    if not options.enabled or not options.allow_natural_language:
+        return "strict"
+    return options.mode
+
+
+def _role_hint(worker: WorkerConfig) -> str:
+    if worker.id.startswith("reviewer"):
+        return "reviewer"
+    if worker.id.startswith("proposer"):
+        return "proposer"
+    return "generic"
 
 
 def _cached_input_ratio(result: dict[str, Any]) -> float | None:

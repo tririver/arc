@@ -444,6 +444,125 @@ def test_claude_generate_json_parses_result_wrapper(monkeypatch):
     assert ClaudeCliProvider().generate_json("prompt") == {"ok": True}
 
 
+def test_claude_deepseek_auto_uses_prompt_contract_not_json_schema(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"result": {"ok": True}}), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider(env={}).generate_json_result(
+        "prompt",
+        schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
+        model="deepseek-v4-flash",
+    )
+
+    assert response.value == {"ok": True}
+    assert "--json-schema" not in captured["cmd"]
+    assert "JSON output contract" in captured["input"]
+    assert "prompt" in captured["input"]
+
+
+def test_claude_provider_mode_keeps_json_schema_for_deepseek(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"result": {"ok": True}}), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ClaudeCliProvider(env={"ARC_CLAUDE_JSON_SCHEMA_MODE": "provider"}).generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        model="deepseek-v4-flash",
+    )
+
+    assert "--json-schema" in captured["cmd"]
+    assert captured["input"] == "prompt"
+
+
+def test_claude_natural_language_result_recovered_in_warn_mode(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        payload = {
+            "type": "result",
+            "result": "Here is the idea: compute a controlled correlator.",
+            "session_id": "s1",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        model="deepseek-v4-flash",
+        output_recovery="warn",
+    )
+
+    assert response.value == {}
+    assert response.native_session_id == "s1"
+    assert response.structured_output["severity"] == "major"
+    assert response.structured_output["recovery_strategy"] == "natural_language_fallback"
+
+
+def test_claude_natural_language_result_still_raises_in_strict_mode(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        payload = {"type": "result", "result": "not json"}
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(LLMWorkerError, match="Claude result field was not JSON"):
+        ClaudeCliProvider().generate_json_result("prompt", schema={"type": "object"})
+
+
+def test_claude_structured_output_retry_error_recovered_in_warn_mode(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        payload = {
+            "type": "result",
+            "subtype": "error_max_structured_output_retries",
+            "is_error": True,
+            "session_id": "s1",
+            "errors": ["Failed to provide valid structured output after 5 attempts"],
+            "usage": {"input_tokens": 10, "cache_read_input_tokens": 100, "output_tokens": 20},
+        }
+        return subprocess.CompletedProcess(cmd, 1, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        model="deepseek-v4-flash",
+        output_recovery="warn",
+    )
+
+    assert response.value == {}
+    assert response.structured_output["provider_error_type"] == "error_max_structured_output_retries"
+    assert response.usage.cache_read_input_tokens == 100
+
+
+def test_claude_nonzero_mcp_failure_still_raises_in_warn_mode(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="MCP server failed")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(LLMWorkerError, match="MCP server failed"):
+        ClaudeCliProvider().generate_json_result(
+            "prompt",
+            schema={"type": "object"},
+            model="deepseek-v4-flash",
+            output_recovery="warn",
+        )
+
+
 def test_claude_generate_text_returns_stdout(monkeypatch):
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")

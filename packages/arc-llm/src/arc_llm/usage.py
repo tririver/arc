@@ -68,3 +68,4 @@ class LLMProviderResponse(Generic[T]):
     raw_events: tuple[dict[str, Any], ...] = ()
     raw_output: str = ""
     prompt_sent_sha256: str | None = None
+    structured_output: dict[str, Any] | None = None

@@ -71,6 +71,13 @@ def base_config(tmp_path: Path, *, max_rounds: int = 2, early_stop: bool = False
     }
 
 
+def test_batch_config_defaults_output_recovery_to_warn(tmp_path: Path):
+    batch = load_batch_config(base_config(tmp_path, max_rounds=1))
+
+    assert batch.output_recovery.enabled is True
+    assert batch.output_recovery.mode == "warn"
+
+
 class FakeJsonRunner:
     def __init__(self, *, stop_round: int | None = None, fail_loop: str | None = None) -> None:
         self.stop_round = stop_round
@@ -986,6 +993,82 @@ def test_custom_json_runner_with_var_kwargs_uses_legacy_full_prompts_by_default(
     assert prompts
     assert all("## ARC Worker Context" in prompt for prompt in prompts)
     assert all("## ARC-LLM Worker Session ABI v2" not in prompt for prompt in prompts)
+
+
+def test_custom_json_runner_receives_output_recovery_when_supported(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    seen: list[tuple[str, str | None]] = []
+
+    def fake(
+        prompt,
+        *,
+        schema,
+        provider,
+        model,
+        model_tier=None,
+        env,
+        session_policy,
+        session_key,
+        call_label,
+        output_recovery,
+        role_hint,
+        **kwargs,
+    ):
+        seen.append((output_recovery, role_hint))
+        if role_hint == "reviewer":
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert ("warn", "proposer") in seen
+    assert ("warn", "reviewer") in seen
+
+
+def test_output_recovery_disables_natural_language_when_configured(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {"enabled": True, "mode": "warn", "allow_natural_language": False}
+    seen: list[str] = []
+
+    def fake(
+        prompt,
+        *,
+        schema,
+        provider,
+        model,
+        model_tier=None,
+        env,
+        output_recovery,
+        role_hint,
+        **kwargs,
+    ):
+        seen.append(output_recovery)
+        if role_hint == "reviewer":
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
+
+    assert result["status"] == "completed"
+    assert seen
+    assert set(seen) == {"strict"}
 
 
 def test_stateful_reviewer_validation_retry_is_compact_delta(tmp_path):

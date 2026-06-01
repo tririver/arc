@@ -143,30 +143,131 @@ def test_markdown_summary_uses_round_marks_by_idea_format(tmp_path: Path) -> Non
     assert "\\operatorname" not in markdown
 
 
-def _write_round(run_root: Path, loop_id: str, round_number: int, *, title: str, marks: dict[str, int]) -> None:
+def test_rank_run_zeroes_major_recovered_reviewer_marks(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001"
+    _write_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Clean lower round",
+        marks={
+            "user_intent_relevance": 20,
+            "novelty": 8,
+            "confidence_of_novelty": 7,
+            "scientific_value": 9,
+            "planning": 10,
+            "problem_well_definedness": 10,
+            "total_score": 64,
+        },
+    )
+    _write_round(
+        run_root,
+        "domain_idea_001",
+        2,
+        title="Recovered high round",
+        marks={
+            "user_intent_relevance": 25,
+            "novelty": 10,
+            "confidence_of_novelty": 10,
+            "scientific_value": 15,
+            "planning": 15,
+            "problem_well_definedness": 15,
+            "total_score": 90,
+        },
+        review_extra={
+            "arc_llm_call_record": {
+                "structured_output": {"mode": "recovered", "severity": "major"}
+            }
+        },
+    )
+
+    entry = ranker.rank_run(run_root)["ranking"][0]
+    recovered_round = next(item for item in entry["rounds"] if item["round"] == 2)
+
+    assert entry["round"] == 1
+    assert recovered_round["marks"]["total_score"] == 0
+    assert all(value == 0 for value in recovered_round["marks"].values())
+
+
+def test_rank_run_zeroes_major_recovered_proposer_marks(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001"
+    _write_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Clean lower round",
+        marks={
+            "user_intent_relevance": 20,
+            "novelty": 8,
+            "confidence_of_novelty": 7,
+            "scientific_value": 9,
+            "planning": 10,
+            "problem_well_definedness": 10,
+            "total_score": 64,
+        },
+    )
+    _write_round(
+        run_root,
+        "domain_idea_001",
+        2,
+        title="Recovered proposer high round",
+        marks={
+            "user_intent_relevance": 25,
+            "novelty": 10,
+            "confidence_of_novelty": 10,
+            "scientific_value": 15,
+            "planning": 15,
+            "problem_well_definedness": 15,
+            "total_score": 90,
+        },
+        proposer_extra={
+            "arc_llm_call_record": {
+                "structured_output": {"mode": "recovered", "severity": "major"}
+            }
+        },
+    )
+
+    entry = ranker.rank_run(run_root)["ranking"][0]
+    recovered_round = next(item for item in entry["rounds"] if item["round"] == 2)
+
+    assert entry["round"] == 1
+    assert recovered_round["marks"]["total_score"] == 0
+    assert all(value == 0 for value in recovered_round["marks"].values())
+
+
+def _write_round(
+    run_root: Path,
+    loop_id: str,
+    round_number: int,
+    *,
+    title: str,
+    marks: dict[str, int],
+    proposer_extra: dict[str, Any] | None = None,
+    review_extra: dict[str, Any] | None = None,
+) -> None:
     round_root = run_root / "loops" / loop_id / "rounds" / f"round_{round_number:03d}"
     proposer_dir = round_root / "proposer_outputs"
     review_dir = round_root / "reviews"
     proposer_dir.mkdir(parents=True, exist_ok=True)
     review_dir.mkdir(parents=True, exist_ok=True)
-    (proposer_dir / "proposer_001.json").write_text(
-        json.dumps(
-            {
-                "title": title,
-                "idea_summary": "summary",
-                "calculation_plan": (
-                    "Compute `ρ_E=⟨T_ab⟩u^a u^b`. Raw T_ab, η_SL, and G^a_b. "
-                    "Geometry `δ_ij` and `α ∈ {0,0.3}`. "
-                    "Explicit commands `\\rho_E` and `\\partial^a T_ab=0` stay unchanged.\n\n"
-                    "T_kk(t,ρ,z)=A q(t/τ) sech(z/L)\n\n"
-                    "ΔT(0,b_ref) = -4 G ∫ d^4x T_kk(x),\n\n"
-                    "$$\nE(α,β;N)=E_diag(N)+2\\,\\Re[z]\n$$"
-                ),
-            }
+    proposer_payload = {
+        "title": title,
+        "idea_summary": "summary",
+        "calculation_plan": (
+            "Compute `ρ_E=⟨T_ab⟩u^a u^b`. Raw T_ab, η_SL, and G^a_b. "
+            "Geometry `δ_ij` and `α ∈ {0,0.3}`. "
+            "Explicit commands `\\rho_E` and `\\partial^a T_ab=0` stay unchanged.\n\n"
+            "T_kk(t,ρ,z)=A q(t/τ) sech(z/L)\n\n"
+            "ΔT(0,b_ref) = -4 G ∫ d^4x T_kk(x),\n\n"
+            "$$\nE(α,β;N)=E_diag(N)+2\\,\\Re[z]\n$$"
         ),
-        encoding="utf-8",
-    )
-    (review_dir / "reviewer_001.json").write_text(
-        json.dumps({"review_payload": {"marks": marks}}),
-        encoding="utf-8",
-    )
+    }
+    if proposer_extra:
+        proposer_payload.update(proposer_extra)
+    (proposer_dir / "proposer_001.json").write_text(json.dumps(proposer_payload), encoding="utf-8")
+    review_payload = {"review_payload": {"marks": marks}}
+    if review_extra:
+        review_payload.update(review_extra)
+    (review_dir / "reviewer_001.json").write_text(json.dumps(review_payload), encoding="utf-8")

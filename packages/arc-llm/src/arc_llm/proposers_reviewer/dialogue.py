@@ -57,7 +57,7 @@ def render_initial_worker_prompt(
         rendered_template,
         "",
         "## Output Contract",
-        "Return exactly one JSON object matching the provided schema. Do not wrap it in Markdown.",
+        "Return exactly one JSON object matching the provided schema. Do not wrap it in Markdown. If unsure about a field, still include the field with your best useful value. For arrays, return [] when no items are available. For booleans, return true or false. For nullable fields, use null when appropriate. Do not return explanatory prose outside the JSON object.",
     ]
     static_prefix = "\n".join(static_parts).rstrip() + "\n\n"
     variable_suffix = "\n".join(
@@ -113,7 +113,7 @@ def render_proposer_delta_prompt(
             "## Delta Context",
             _canonical_json(strip_arc_llm_call_records(delta)),
             "",
-            "Return the revised proposer JSON object for this round.",
+            "Return the revised proposer JSON object for this round. If you cannot complete the derivation or proposal, still return every required JSON field and put the partial work or difficulty inside the appropriate field rather than prose outside JSON.",
         ]
     ) + "\n"
     context = {"turn_kind": "delta", **strip_arc_llm_call_records(delta)}
@@ -150,7 +150,7 @@ def render_reviewer_delta_prompt(
             "## Delta Context",
             _canonical_json(delta),
             "",
-            "Return exactly one arc.llm.review_envelope.v1 JSON object for this round.",
+            "Return exactly one arc.llm.review_envelope.v1 JSON object for this round. If you cannot complete a full review, still return a valid review envelope with a non-accepting status, explanatory analysis/controller.message, and proposer_messages for every active proposer id.",
         ]
     ) + "\n"
     context = {"turn_kind": "delta", **delta, "current_proposer_outputs": outputs}
@@ -163,7 +163,7 @@ def render_reviewer_validation_retry_delta(exc: Exception) -> str:
         f"Your previous reviewer JSON failed validation:\n{exc}\n\n"
         "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and the current active_proposer_ids, not any older schema or older active proposer list in the session history.\n"
         "Use the same current proposer outputs already present in this session, but validate them against the current schema and current active proposer ids. Do not reuse an older review envelope. Return exactly one corrected "
-        "arc.llm.review_envelope.v1 JSON object.\n"
+        "arc.llm.review_envelope.v1 JSON object. If you cannot complete the review, use a non-accepting status and explain why inside the envelope.\n"
     )
 
 

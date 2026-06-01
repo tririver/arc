@@ -510,6 +510,89 @@ def test_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path:
     assert "| no_info_idea_001 | no_info | no_info_idea_001 final title | 75 | 80 | 80 | 80 | 80 | +5 | 80 |" in table["markdown"]
 
 
+def test_major_recovered_reviewer_marks_are_zero_in_round_scores(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    scheme = runner.load_marking_scheme(WJ)
+    loop_root = tmp_path / "idea_loops" / "loops" / "domain_idea_001"
+    loop_root.mkdir(parents=True)
+    with (loop_root / "transcript.jsonl").open("w", encoding="utf-8") as handle:
+        _write_jsonl(
+            handle,
+            {
+                "type": "review",
+                "round_number": 1,
+                "output": {
+                    "arc_llm_call_record": {
+                        "structured_output": {"mode": "recovered", "severity": "major"}
+                    },
+                    "review_payload": {
+                        "marks": {
+                            "user_intent_relevance": 25,
+                            "novelty": 10,
+                            "confidence_of_novelty": 10,
+                            "scientific_value": 15,
+                            "planning": 15,
+                            "problem_well_definedness": 15,
+                            "total_score": 90,
+                        }
+                    },
+                },
+            },
+        )
+
+    rounds, _title = runner._loop_round_scores_from_transcript(loop_root, scheme=scheme)  # noqa: SLF001
+
+    assert rounds[1]["total_score"] == 0
+    assert all(value == 0 for value in rounds[1].values())
+
+
+def test_major_recovered_proposer_marks_are_zero_in_round_scores(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    scheme = runner.load_marking_scheme(WJ)
+    loop_root = tmp_path / "idea_loops" / "loops" / "domain_idea_001"
+    loop_root.mkdir(parents=True)
+    with (loop_root / "transcript.jsonl").open("w", encoding="utf-8") as handle:
+        _write_jsonl(
+            handle,
+            {
+                "type": "proposer_output",
+                "round_number": 1,
+                "output": {
+                    "title": "Recovered idea",
+                    "arc_llm_call_record": {
+                        "structured_output": {"mode": "recovered", "severity": "major"}
+                    },
+                },
+            },
+        )
+        _write_jsonl(
+            handle,
+            {
+                "type": "review",
+                "round_number": 1,
+                "output": {
+                    "review_payload": {
+                        "marks": {
+                            "user_intent_relevance": 25,
+                            "novelty": 10,
+                            "confidence_of_novelty": 10,
+                            "scientific_value": 15,
+                            "planning": 15,
+                            "problem_well_definedness": 15,
+                            "total_score": 90,
+                        }
+                    },
+                },
+            },
+        )
+
+    rounds, title = runner._loop_round_scores_from_transcript(loop_root, scheme=scheme)  # noqa: SLF001
+
+    assert title == "Recovered idea"
+    assert rounds[1]["total_score"] == 0
+    assert all(value == 0 for value in rounds[1].values())
+
+
 def _write_jsonl(handle: Any, payload: dict[str, Any]) -> None:
     handle.write(json.dumps(payload) + "\n")
 

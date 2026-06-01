@@ -70,6 +70,7 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
         "schema_sha256": {"type": ["string", "null"]},
         "runtime_fingerprint": {"type": ["string", "null"]},
         "usage": {"type": "object"},
+        "structured_output": {"type": ["object", "null"], "additionalProperties": True},
     },
 }
 

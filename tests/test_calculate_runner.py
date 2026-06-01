@@ -118,6 +118,30 @@ def test_calculate_runner_recalculates_only_isolated_wrong_proposer(tmp_path):
     ]
 
 
+def test_major_recovered_reviewer_output_cannot_accept_calculation(tmp_path):
+    runner = load_calculate_runner()
+    review = calculate_review("all_agree", agreed=["proposer_001", "proposer_002"])
+    review["arc_llm_call_record"] = {
+        "structured_output": {
+            "mode": "recovered",
+            "severity": "major",
+            "recovery_strategy": "natural_language_fallback",
+        }
+    }
+    fake = FakeBatchRunner([review])
+
+    result = runner.run_calculation(
+        minimal_config(tmp_path, max_recalculations=0),
+        batch_runner=fake,
+        base_env={},
+    )
+
+    step = result["steps"][0]
+    assert step["status"] == "blocked_for_user"
+    assert step["reviewer_consensus"]["status"] == "unresolved"
+    assert step["reviewer_consensus"]["accepted_result"] is None
+
+
 def test_human_gate_does_not_preempt_retry_budget_for_retryable_status(tmp_path):
     runner = load_calculate_runner()
     fake = FakeBatchRunner(

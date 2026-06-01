@@ -20,7 +20,7 @@ from arc_llm.proposers_reviewer.template_materializer import (
 )
 
 from ideas_config import ConfigError, IdeasConfig, VariantConfig, load_ideas_config
-from ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema, normalized_marks
+from ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema, normalized_marks, score_fields
 
 
 JsonRunner = Callable[..., dict[str, Any]]
@@ -337,6 +337,7 @@ def _loop_round_scores_from_transcript(
 
     rounds: dict[int, dict[str, Any]] = {}
     titles: dict[int, str] = {}
+    recovered_proposer_rounds: set[int] = set()
     for line in transcript.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -353,6 +354,8 @@ def _loop_round_scores_from_transcript(
         if event_type == "proposer_output":
             output = event.get("output")
             if isinstance(output, Mapping):
+                if _major_recovered(output):
+                    recovered_proposer_rounds.add(round_number)
                 title = str(output.get("title", "")).strip()
                 if title:
                     titles[round_number] = title
@@ -361,6 +364,8 @@ def _loop_round_scores_from_transcript(
             if isinstance(output, Mapping):
                 marks = output.get("review_payload", {}).get("marks", {})
                 if isinstance(marks, Mapping) and "total_score" in marks:
+                    if _major_recovered(output) or round_number in recovered_proposer_rounds:
+                        marks = _zero_marks(scheme)
                     rounds[round_number] = normalized_marks(marks, scheme)
 
     final_title = titles[max(titles)] if titles else ""
@@ -382,15 +387,21 @@ def _loop_round_scores_from_round_dirs(
         if round_number is None:
             continue
         proposer_output = _first_json(round_root / "proposer_outputs")
+        recovered_proposer = False
         if proposer_output is not None:
-            title = str(_read_json(proposer_output).get("title", "")).strip()
+            proposer_payload = _read_json(proposer_output)
+            recovered_proposer = _major_recovered(proposer_payload)
+            title = str(proposer_payload.get("title", "")).strip()
             if title:
                 titles[round_number] = title
         review_path = _first_json(round_root / "reviews")
         if review_path is None:
             continue
-        marks = _read_json(review_path).get("review_payload", {}).get("marks", {})
+        review = _read_json(review_path)
+        marks = review.get("review_payload", {}).get("marks", {})
         if isinstance(marks, Mapping) and "total_score" in marks:
+            if _major_recovered(review) or recovered_proposer:
+                marks = _zero_marks(scheme)
             rounds[round_number] = normalized_marks(marks, scheme)
     final_title = titles[max(titles)] if titles else ""
     return rounds, final_title
@@ -425,6 +436,20 @@ def _format_delta(value: Any) -> str:
     if isinstance(value, (int, float)):
         return f"{value:+g}"
     return ""
+
+
+def _major_recovered(payload: Mapping[str, Any]) -> bool:
+    record = payload.get("arc_llm_call_record")
+    if not isinstance(record, Mapping):
+        return False
+    structured = record.get("structured_output")
+    if not isinstance(structured, Mapping):
+        return False
+    return structured.get("mode") == "recovered" and structured.get("severity") in {"major", "fatal"}
+
+
+def _zero_marks(scheme: Mapping[str, Any]) -> dict[str, int]:
+    return {field: 0 for field in score_fields(scheme)}
 
 
 def _positive_int(value: Any) -> int | None:

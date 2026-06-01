@@ -86,6 +86,7 @@ def materialize_batch(
     loops: list[Mapping[str, Any]],
     defaults: Mapping[str, Any] | None = None,
     artifact_options: Mapping[str, Any] | None = None,
+    output_recovery: Mapping[str, Any] | None = None,
     session: Mapping[str, Any] | None = None,
     max_concurrent_loops: int = 1,
     fail_fast: bool = False,
@@ -102,6 +103,16 @@ def materialize_batch(
         payload["defaults"] = copy.deepcopy(dict(defaults))
     if artifact_options is not None:
         payload["artifact_options"] = copy.deepcopy(dict(artifact_options))
+    payload["output_recovery"] = copy.deepcopy(
+        dict(
+            output_recovery
+            or {
+                "enabled": True,
+                "mode": "warn",
+                "allow_natural_language": True,
+            }
+        )
+    )
     if session is not None:
         payload["session"] = copy.deepcopy(dict(session))
     return payload

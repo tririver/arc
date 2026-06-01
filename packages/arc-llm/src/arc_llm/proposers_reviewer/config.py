@@ -81,6 +81,13 @@ class ArtifactOptions:
 
 
 @dataclass(frozen=True)
+class OutputRecoveryOptions:
+    enabled: bool
+    mode: str
+    allow_natural_language: bool
+
+
+@dataclass(frozen=True)
 class BatchConfig:
     schema_version: str
     run_id: str
@@ -88,6 +95,7 @@ class BatchConfig:
     max_concurrent_loops: int
     fail_fast: bool
     artifact_options: ArtifactOptions
+    output_recovery: OutputRecoveryOptions
     session: SessionOptions
     loops: list[LoopConfig]
 
@@ -103,6 +111,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     max_concurrent_loops = _positive_int(data.get("max_concurrent_loops", 1), "max_concurrent_loops")
     fail_fast = _bool(data.get("fail_fast", False), "fail_fast")
     artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
+    output_recovery = _parse_output_recovery(data.get("output_recovery", {}))
     batch_session = _parse_session_options(data.get("session", {}), parent=None, default_policy="stateful")
 
     defaults = _dict(data.get("defaults", {}), "defaults")
@@ -141,6 +150,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
         max_concurrent_loops=max_concurrent_loops,
         fail_fast=fail_fast,
         artifact_options=artifact_options,
+        output_recovery=output_recovery,
         session=batch_session,
         loops=loops,
     )
@@ -322,6 +332,21 @@ def _parse_worker(
 def _parse_artifact_options(raw_options: Any) -> ArtifactOptions:
     options = _dict(raw_options, "artifact_options")
     return ArtifactOptions(save_prompts=_bool(options.get("save_prompts", True), "artifact_options.save_prompts"))
+
+
+def _parse_output_recovery(raw_options: Any) -> OutputRecoveryOptions:
+    options = _dict(raw_options, "output_recovery")
+    mode = str(options.get("mode", "warn") or "warn").strip().lower()
+    if mode not in {"strict", "warn"}:
+        raise ConfigError("output_recovery.mode must be strict or warn")
+    return OutputRecoveryOptions(
+        enabled=_bool(options.get("enabled", True), "output_recovery.enabled"),
+        mode=mode,
+        allow_natural_language=_bool(
+            options.get("allow_natural_language", True),
+            "output_recovery.allow_natural_language",
+        ),
+    )
 
 
 def _parse_session_options(raw_options: Any, *, parent: SessionOptions | None, default_policy: str) -> SessionOptions:

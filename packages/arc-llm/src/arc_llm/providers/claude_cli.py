@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.sessions import LLMSessionRef
+from arc_llm.schema_cache import canonical_json, sha256_text
+from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
 from .base import LLMWorkerError
@@ -38,17 +40,23 @@ class ClaudeCliProvider:
         model: str | None = None,
         session: LLMSessionRef | None = None,
         session_policy: str = "stateless",
+        schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
+        output_recovery: str = "strict",
     ) -> LLMProviderResponse[dict[str, Any]]:
         schema = schema or {"type": "object"}
         stateful = session_policy == "stateful" and session is not None
+        mode = _json_schema_mode(self.env, model=model)
         cmd = [
             *_base_cmd(self.env, stateful=stateful),
             "--output-format",
             "json",
-            "--json-schema",
-            json.dumps(schema, ensure_ascii=False),
         ]
+        effective_prompt = prompt
+        if mode == "provider":
+            cmd.extend(["--json-schema", json.dumps(schema, ensure_ascii=False)])
+        else:
+            effective_prompt = _with_json_schema_contract(prompt, schema)
         native_id = session.native_session_id if stateful else None
         if stateful:
             if native_id:
@@ -62,7 +70,7 @@ class ClaudeCliProvider:
         try:
             result = subprocess.run(
                 cmd,
-                input=prompt,
+                input=effective_prompt,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -71,14 +79,31 @@ class ClaudeCliProvider:
             )
         except subprocess.TimeoutExpired as exc:
             raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
+        _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
+            recovered = _maybe_recover_claude_error_envelope(result.stdout, output_recovery=output_recovery)
+            if recovered is not None:
+                value, usage, returned_session_id, structured_output = recovered
+                return LLMProviderResponse(
+                    value,
+                    usage=usage,
+                    native_session_id=returned_session_id or native_id,
+                    raw_output=result.stdout,
+                    prompt_sent_sha256=sha256_text(effective_prompt),
+                    structured_output=structured_output,
+                )
             raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
-        value, usage, returned_session_id = _extract_claude_metadata(result.stdout)
+        value, usage, returned_session_id, structured_output = _extract_claude_metadata(
+            result.stdout,
+            output_recovery=output_recovery,
+        )
         return LLMProviderResponse(
             value,
             usage=usage,
             native_session_id=returned_session_id or native_id,
             raw_output=result.stdout,
+            prompt_sent_sha256=sha256_text(effective_prompt),
+            structured_output=structured_output,
         )
 
     def generate_text(self, prompt: str, *, model: str | None = None) -> str:
@@ -133,7 +158,7 @@ class ClaudeCliProvider:
         return LLMProviderResponse(result.stdout, native_session_id=native_id, raw_output=result.stdout)
 
 
-def _extract_json(stdout: str) -> dict[str, Any]:
+def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict[str, Any], dict[str, Any] | None]:
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -142,38 +167,39 @@ def _extract_json(stdout: str) -> dict[str, Any]:
         try:
             nested = json.loads(payload["result"])
         except json.JSONDecodeError as exc:
-            raise LLMWorkerError(f"Claude result field was not JSON: {exc}") from exc
+            if output_recovery != "warn":
+                raise LLMWorkerError(f"Claude result field was not JSON: {exc}") from exc
+            extracted, warnings = parse_json_object_relaxed(payload["result"])
+            if isinstance(extracted, dict):
+                return extracted, structured_metadata(
+                    severity="minor",
+                    warnings=["Claude result field was a string; extracted JSON object from it.", *warnings],
+                    raw_text=payload["result"],
+                    strategy="extract_json",
+                )
+            return {}, structured_metadata(
+                severity="major",
+                warnings=["Claude result field was not JSON; using schema recovery.", *warnings],
+                raw_text=payload["result"],
+                strategy="natural_language_fallback",
+            )
         if not isinstance(nested, dict):
             raise LLMWorkerError("Claude result JSON was not an object")
-        return nested
+        return nested, None
     if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
-        return payload["result"]
+        return payload["result"], None
     if isinstance(payload, dict):
-        return payload
+        return payload, None
     raise LLMWorkerError("Claude JSON output was not an object")
 
 
-def _extract_claude_metadata(stdout: str) -> tuple[dict[str, Any], LLMUsage, str | None]:
+def _extract_claude_metadata(stdout: str, *, output_recovery: str = "strict") -> tuple[dict[str, Any], LLMUsage, str | None, dict[str, Any] | None]:
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
-    usage_source = payload.get("usage") or payload.get("current_usage") or {} if isinstance(payload, dict) else {}
-    if not isinstance(usage_source, dict):
-        usage_source = {}
-    usage = LLMUsage(
-        input_tokens=_int_or_none(usage_source.get("input_tokens")),
-        output_tokens=_int_or_none(usage_source.get("output_tokens")),
-        cache_creation_input_tokens=_int_or_none(usage_source.get("cache_creation_input_tokens")),
-        cache_read_input_tokens=_int_or_none(usage_source.get("cache_read_input_tokens")),
-        raw=usage_source,
-    )
-    native_session_id = None
-    if isinstance(payload, dict):
-        native_session_id = payload.get("session_id") or payload.get("sessionId")
-        if native_session_id is not None:
-            native_session_id = str(native_session_id)
-    return _extract_json(stdout), usage, native_session_id
+    value, structured_output = _extract_json(stdout, output_recovery=output_recovery)
+    return value, _usage_from_payload(payload), _session_id_from_payload(payload), structured_output
 
 
 def _extract_claude_text_metadata(stdout: str) -> tuple[str, LLMUsage, str | None]:
@@ -183,21 +209,61 @@ def _extract_claude_text_metadata(stdout: str) -> tuple[str, LLMUsage, str | Non
         raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise LLMWorkerError("Claude text output JSON was not an object")
-    usage_source = payload.get("usage") or payload.get("current_usage") or {}
+    usage = _usage_from_payload(payload)
+    result = payload.get("result", "")
+    if not isinstance(result, str):
+        raise LLMWorkerError("Claude text result field was not a string")
+    native_session_id = payload.get("session_id") or payload.get("sessionId")
+    return result, usage, str(native_session_id) if native_session_id is not None else None
+
+
+def _maybe_recover_claude_error_envelope(
+    stdout: str,
+    *,
+    output_recovery: str,
+) -> tuple[dict[str, Any], LLMUsage, str | None, dict[str, Any] | None] | None:
+    if output_recovery != "warn":
+        return None
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("subtype") != "error_max_structured_output_retries":
+        return None
+    return (
+        {},
+        _usage_from_payload(payload),
+        _session_id_from_payload(payload),
+        structured_metadata(
+            severity="major",
+            warnings=["Claude structured output failed after provider retries."],
+            raw_text=stdout,
+            strategy="schema_default",
+            provider_error_type="error_max_structured_output_retries",
+        ),
+    )
+
+
+def _usage_from_payload(payload: Any) -> LLMUsage:
+    usage_source = payload.get("usage") or payload.get("current_usage") or {} if isinstance(payload, dict) else {}
     if not isinstance(usage_source, dict):
         usage_source = {}
-    usage = LLMUsage(
+    return LLMUsage(
         input_tokens=_int_or_none(usage_source.get("input_tokens")),
         output_tokens=_int_or_none(usage_source.get("output_tokens")),
         cache_creation_input_tokens=_int_or_none(usage_source.get("cache_creation_input_tokens")),
         cache_read_input_tokens=_int_or_none(usage_source.get("cache_read_input_tokens")),
         raw=usage_source,
     )
-    result = payload.get("result", "")
-    if not isinstance(result, str):
-        raise LLMWorkerError("Claude text result field was not a string")
+
+
+def _session_id_from_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
     native_session_id = payload.get("session_id") or payload.get("sessionId")
-    return result, usage, str(native_session_id) if native_session_id is not None else None
+    return str(native_session_id) if native_session_id is not None else None
 
 
 def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
@@ -230,6 +296,42 @@ def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
         if _env_bool(env, "ARC_CLAUDE_STRICT_MCP_CONFIG", True):
             cmd.append("--strict-mcp-config")
     return cmd
+
+
+def _json_schema_mode(env: Mapping[str, str], *, model: str | None) -> str:
+    raw = _env_text(env, "ARC_CLAUDE_JSON_SCHEMA_MODE", "auto").strip().lower()
+    if raw not in {"auto", "provider", "prompt"}:
+        raise LLMWorkerError("ARC_CLAUDE_JSON_SCHEMA_MODE must be auto, provider, or prompt")
+    if raw != "auto":
+        return raw
+    model_text = (model or env.get("ARC_CLAUDE_MODEL") or "").lower()
+    prompt_markers = _env_text(env, "ARC_CLAUDE_JSON_SCHEMA_PROMPT_MODELS", _default_prompt_schema_model_markers())
+    if any(marker and marker.lower() in model_text for marker in prompt_markers.split(",")):
+        return "prompt"
+    return "provider"
+
+
+def _default_prompt_schema_model_markers() -> str:
+    return "".join(("deep", "seek"))
+
+
+def _with_json_schema_contract(prompt: str, schema: Mapping[str, Any]) -> str:
+    return (
+        prompt.rstrip()
+        + "\n\n## JSON output contract\n"
+        + "Return one JSON object. Prefer exact compliance with this schema. "
+        + "If you cannot satisfy a field exactly, return the closest useful value rather than prose outside JSON.\n"
+        + canonical_json(dict(schema))
+        + "\n"
+    )
+
+
+def _write_raw_artifacts(artifact_dir: Path | None, *, stdout: str, stderr: str) -> None:
+    if artifact_dir is None:
+        return
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "raw_stdout.txt").write_text(stdout, encoding="utf-8", errors="replace")
+    (artifact_dir / "raw_stderr.txt").write_text(stderr, encoding="utf-8", errors="replace")
 
 
 def _int_or_none(value: Any) -> int | None:

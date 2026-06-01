@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -16,6 +17,7 @@ from .model import resolve_model
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
+from .structured_recovery import recover_json_output
 from .usage import LLMProviderResponse, LLMUsage
 
 
@@ -58,6 +60,7 @@ class LLMCallOutcome:
     static_prefix_sha256: str | None
     schema_sha256: str | None
     runtime_fingerprint: str | None
+    structured_output: dict[str, Any] | None = None
 
 
 def resolve_llm_config(
@@ -110,6 +113,8 @@ def run_json(
     model: str | None = None,
     model_tier: str | None = None,
     validate_schema: bool = True,
+    output_recovery: str = "strict",
+    role_hint: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
     session_policy: str = "stateless",
@@ -123,6 +128,8 @@ def run_json(
 ) -> dict[str, Any]:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
+    if output_recovery not in {"strict", "warn"}:
+        raise ValueError("output_recovery must be strict or warn")
     if session_policy == "stateful" and (session_manager is None or not session_key):
         raise ValueError("stateful run_json requires session_manager and session_key")
     configs = resolve_llm_configs(
@@ -147,6 +154,8 @@ def run_json(
             schema=schema,
             model=config.model,
             validate_schema=validate_schema,
+            output_recovery=output_recovery,
+            role_hint=role_hint,
             provider_used=config.provider,
             model_tier=model_tier,
             env=env,
@@ -333,6 +342,8 @@ def _generate_json(
     schema: dict[str, Any] | None,
     model: str | None,
     validate_schema: bool,
+    output_recovery: str,
+    role_hint: str | None,
     provider_used: str,
     model_tier: str | None,
     env: Mapping[str, str] | None,
@@ -359,15 +370,17 @@ def _generate_json(
 
     def call_provider(session: LLMSessionRef | None) -> LLMProviderResponse[dict[str, Any]]:
         if hasattr(selected, "generate_json_result"):
-            return selected.generate_json_result(
-                prompt,
-                schema=provider_schema,
-                model=model,
-                session=session,
-                session_policy=session_policy,
-                schema_cache_dir=_schema_cache_dir(artifact_dir),
-                artifact_dir=artifact_dir,
-            )
+            kwargs = {
+                "schema": provider_schema,
+                "model": model,
+                "session": session,
+                "session_policy": session_policy,
+                "schema_cache_dir": _schema_cache_dir(artifact_dir),
+                "artifact_dir": artifact_dir,
+            }
+            if _accepts_keyword(selected.generate_json_result, "output_recovery"):
+                kwargs["output_recovery"] = output_recovery
+            return selected.generate_json_result(prompt, **kwargs)
         return LLMProviderResponse(selected.generate_json(prompt, schema=provider_schema, model=model))
 
     if session_policy == "stateful":
@@ -388,26 +401,49 @@ def _generate_json(
             if native_session_id:
                 session_manager.update_native_session_id(session.key, native_session_id)
             recorded_native_session_id = native_session_id or session.native_session_id
-            session_manager.record_turn(
-                session.key,
-                call_label=call_label or "",
-                prompt_sha256=prompt_sha,
-                static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
-                schema_sha256=schema_hash(schema),
-                usage=response.usage.to_json(),
-                provider_used=provider_used,
-                model_used=model,
-                native_session_id=recorded_native_session_id,
-                extra={"runtime_fingerprint": runtime_fp},
-            )
-            if schema is not None and validate_schema:
-                _validate_json_output(result, schema)
+
+            def record_turn(structured_output: dict[str, Any] | None = None) -> None:
+                extra = {"runtime_fingerprint": runtime_fp}
+                if structured_output:
+                    extra["structured_output"] = structured_output
+                session_manager.record_turn(
+                    session.key,
+                    call_label=call_label or "",
+                    prompt_sha256=prompt_sha,
+                    static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
+                    schema_sha256=schema_hash(schema),
+                    usage=response.usage.to_json(),
+                    provider_used=provider_used,
+                    model_used=model,
+                    native_session_id=recorded_native_session_id,
+                    extra=extra,
+                )
+
+            try:
+                result, structured_output = _recover_or_validate_json_output(
+                    result,
+                    schema=schema,
+                    validate_schema=validate_schema,
+                    output_recovery=output_recovery,
+                    role_hint=role_hint,
+                    response=response,
+                )
+            except Exception:
+                record_turn(response.structured_output)
+                raise
+            record_turn(structured_output)
     else:
         session = None
         response = call_provider(None)
         result = response.value
-        if schema is not None and validate_schema:
-            _validate_json_output(result, schema)
+        result, structured_output = _recover_or_validate_json_output(
+            result,
+            schema=schema,
+            validate_schema=validate_schema,
+            output_recovery=output_recovery,
+            role_hint=role_hint,
+            response=response,
+        )
         native_session_id = response.native_session_id
         prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
     return LLMCallOutcome(
@@ -421,6 +457,7 @@ def _generate_json(
         static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
         schema_sha256=schema_hash(schema),
         runtime_fingerprint=runtime_fp,
+        structured_output=structured_output,
     )
 
 
@@ -541,6 +578,66 @@ def _validate_json_output(result: dict[str, Any], schema: dict[str, Any]) -> Non
         raise LLMOutputValidationError(f"JSON schema is invalid: {exc.message}") from exc
 
 
+def _recover_or_validate_json_output(
+    result: Any,
+    *,
+    schema: dict[str, Any] | None,
+    validate_schema: bool,
+    output_recovery: str,
+    role_hint: str | None,
+    response: LLMProviderResponse[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    structured_output = response.structured_output
+    provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
+    if not isinstance(result, dict):
+        if output_recovery != "warn":
+            raise LLMOutputValidationError("JSON output was not an object")
+        recovered = recover_json_output(
+            value=result,
+            schema=schema,
+            raw_text=response.raw_output,
+            role_hint=role_hint,
+            provider_metadata=structured_output,
+        )
+        result = recovered.value
+        structured_output = recovered.structured_output or structured_output
+        if schema is not None:
+            _validate_json_output(result, schema)
+        return result, structured_output
+    if schema is None:
+        return result, structured_output
+    if validate_schema:
+        try:
+            _validate_json_output(result, schema)
+            return result, structured_output
+        except Exception as exc:
+            if output_recovery != "warn":
+                raise
+            recovered = recover_json_output(
+                value=result,
+                schema=schema,
+                raw_text=response.raw_output,
+                error=exc,
+                role_hint=role_hint,
+                provider_metadata=structured_output,
+            )
+            result = recovered.value
+            structured_output = recovered.structured_output or structured_output
+            _validate_json_output(result, schema)
+            return result, structured_output
+    if provider_recovered and output_recovery == "warn":
+        recovered = recover_json_output(
+            value=result,
+            schema=schema,
+            raw_text=response.raw_output,
+            role_hint=role_hint,
+            provider_metadata=structured_output,
+        )
+        result = recovered.value
+        structured_output = recovered.structured_output or structured_output
+    return result, structured_output
+
+
 def _call_record(
     config: LLMConfig,
     *,
@@ -573,6 +670,7 @@ def _call_record(
         "schema_sha256": outcome.schema_sha256 if outcome else None,
         "runtime_fingerprint": outcome.runtime_fingerprint if outcome else None,
         "usage": outcome.usage.to_json() if outcome else LLMUsage().to_json(),
+        "structured_output": outcome.structured_output if outcome else None,
     }
 
 
@@ -608,3 +706,17 @@ def _failure_message(failures: Sequence[LLMAttemptFailure], *, max_attempts: int
     for failure in failures:
         lines.append(f"- {failure.provider} attempt {failure.attempt}/{max_attempts}: {failure.error}")
     return "\n".join(lines)
+
+
+def _accepts_keyword(callable_obj: Any, name: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.kind in {inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}:
+            if parameter.name == name:
+                return True
+    return False

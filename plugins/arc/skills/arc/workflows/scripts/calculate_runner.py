@@ -787,6 +787,9 @@ def _review_consensus(
     consensus = dict(consensus)
     _validate_source_discrepancies(consensus)
     consensus["workflow_action"] = _normalized_workflow_action(consensus.get("workflow_action"), str(status))
+    if _structured_recovery_severity(review) in {"major", "fatal"}:
+        consensus = _force_unresolved_after_recovered_review(consensus, active_proposer_ids=active_proposer_ids)
+        status = "unresolved"
     if status == "all_agree":
         _validate_best_written_selection(
             consensus,
@@ -805,6 +808,53 @@ def _review_consensus(
             active_proposer_ids=active_proposer_ids,
         )
     return consensus
+
+
+def _structured_recovery_severity(payload: Mapping[str, Any]) -> str:
+    record = payload.get("arc_llm_call_record")
+    if not isinstance(record, Mapping):
+        return "none"
+    structured = record.get("structured_output")
+    if not isinstance(structured, Mapping):
+        return "none"
+    return str(structured.get("severity") or "none")
+
+
+def _force_unresolved_after_recovered_review(
+    consensus: Mapping[str, Any],
+    *,
+    active_proposer_ids: list[str],
+) -> dict[str, Any]:
+    result = dict(consensus)
+    analysis = str(result.get("analysis", "")).strip()
+    warning = (
+        "ARC warning: reviewer output required major structured-output recovery; "
+        "forcing unresolved/retry instead of accepting."
+    )
+    result.update(
+        {
+            "status": "unresolved",
+            "accepted_result": None,
+            "agreed_proposer_ids": [],
+            "likely_wrong_proposer_ids": list(active_proposer_ids),
+            "recalculate_proposer_ids": list(active_proposer_ids),
+            "analysis": f"{analysis}\n\n{warning}".strip(),
+            "best_written_proposer_id": None,
+            "best_written_selection_reason": "",
+            "workflow_action": _normalized_workflow_action(
+                {
+                    "action": "retry",
+                    "requires_human": False,
+                    "issue_type": "worker_failure",
+                    "proposed_revision": None,
+                    "reason": "Reviewer output required major structured-output recovery.",
+                    "expert_question": "",
+                },
+                "unresolved",
+            ),
+        }
+    )
+    return result
 
 
 def _validate_best_written_selection(
