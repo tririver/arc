@@ -366,6 +366,93 @@ def test_all_agree_likely_source_error_blocks_for_human(tmp_path):
     assert step["blocked_output"]["trigger_status"] == "all_agree"
     assert step["blocked_output"]["reason"] == "source_discrepancy_requires_human"
     assert "Human expert" not in step["blocked_output"]["expert_question"]
+    assert step["blocked_output"]["source_discrepancies"][0]["item_id"] == "source_discrepancy"
+
+
+def test_all_agree_blocks_on_every_nonconfirmed_source_discrepancy(tmp_path):
+    runner = load_calculate_runner()
+    fake = FakeBatchRunner(
+        [
+            calculate_review(
+                "all_agree",
+                agreed=["proposer_001", "proposer_002"],
+                source_discrepancies=[
+                    {
+                        "item_id": "eq_00008",
+                        "status": "likely_source_error",
+                        "source_claim": "eq_00008 uses H^2/sqrt(2k^3)",
+                        "derived_result": "canonical normalization gives H/sqrt(2k^3)",
+                        "confidence_reason": "both proposers and reviewer find an extra H",
+                        "reviewer_says_no_human_convention_choice_needed": False,
+                        "decision_question": (
+                            "Is eq_00008 a source normalization typo, or is an unstated "
+                            "field rescaling intended?"
+                        ),
+                    },
+                    {
+                        "item_id": "eq_00009",
+                        "status": "ambiguous_convention",
+                        "source_claim": "eq_00009 omits the SK branch factor",
+                        "derived_result": "ordinary SK propagators give a branch-signed contact term",
+                        "confidence_reason": "source may use an implicit signed SK metric",
+                        "reviewer_says_no_human_convention_choice_needed": False,
+                        "decision_question": (
+                            "Should eq_00009 use an implicit signed SK metric, or should "
+                            "downstream collapse signs remain pending?"
+                        ),
+                    },
+                ],
+            )
+        ]
+    )
+
+    result = runner.run_calculation(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "blocked_for_user"
+    blocked = result["steps"][0]["blocked_output"]
+    assert blocked["reason"] == "source_discrepancy_requires_human"
+    assert [item["item_id"] for item in blocked["source_discrepancies"]] == ["eq_00008", "eq_00009"]
+    assert "eq_00008" in blocked["expert_question"]
+    assert "eq_00009" in blocked["expert_question"]
+
+
+def test_old_single_source_discrepancy_output_is_rejected(tmp_path):
+    runner = load_calculate_runner()
+    review = calculate_review("all_agree", agreed=["proposer_001", "proposer_002"])
+    consensus = review["review_payload"]["consensus"]
+    consensus.pop("source_discrepancies")
+    consensus["source_discrepancy"] = {
+        "status": "likely_source_error",
+        "source_claim": "old source claim",
+        "derived_result": "old derived result",
+        "confidence_reason": "old schema",
+        "reviewer_says_no_human_convention_choice_needed": False,
+    }
+    fake = FakeBatchRunner([review])
+
+    result = runner.run_calculation(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "source_discrepancies" in result["steps"][0]["error"]
+
+
+def test_legacy_source_discrepancy_field_is_rejected_even_with_new_array(tmp_path):
+    runner = load_calculate_runner()
+    review = calculate_review("all_agree", agreed=["proposer_001", "proposer_002"])
+    consensus = review["review_payload"]["consensus"]
+    consensus["source_discrepancy"] = {
+        "status": "likely_source_error",
+        "source_claim": "old source claim",
+        "derived_result": "old derived result",
+        "confidence_reason": "old schema",
+        "reviewer_says_no_human_convention_choice_needed": False,
+    }
+    fake = FakeBatchRunner([review])
+
+    result = runner.run_calculation(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    assert result["status"] == "failed"
+    assert "source_discrepancy" in result["steps"][0]["error"]
 
 
 def test_all_agree_confirmed_source_error_can_continue(tmp_path):
@@ -508,6 +595,9 @@ def test_calculate_worker_schemas_are_codex_strict(tmp_path) -> None:
         "accepted_result"
     ]
     assert "object" in accepted_result_schema["type"]
+    consensus_schema = reviewer_schema["properties"]["review_payload"]["properties"]["consensus"]
+    assert "source_discrepancies" in consensus_schema["properties"]
+    assert "source_discrepancy" not in consensus_schema["properties"]
 
 
 def assert_codex_strict_objects(schema: Any) -> None:
@@ -639,6 +729,7 @@ def calculate_review(
     source_discrepancy_status: str = "none",
     source_discrepancy_confidence_reason: str = "no source discrepancy",
     reviewer_says_no_human_convention_choice_needed: bool = False,
+    source_discrepancies: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     workflow_action = action or ("continue" if status == "all_agree" else "retry")
     consensus = {
@@ -672,13 +763,25 @@ def calculate_review(
             "issue_type": "none" if status == "all_agree" else "calculation_disagreement",
             "reason": "test",
         },
-        "source_discrepancy": {
-            "status": source_discrepancy_status,
-            "source_claim": "source claim",
-            "derived_result": "derived result",
-            "confidence_reason": source_discrepancy_confidence_reason,
-            "reviewer_says_no_human_convention_choice_needed": reviewer_says_no_human_convention_choice_needed,
-        },
+        "source_discrepancies": source_discrepancies
+        if source_discrepancies is not None
+        else (
+            []
+            if source_discrepancy_status == "none"
+            else [
+                {
+                    "item_id": "source_discrepancy",
+                    "status": source_discrepancy_status,
+                    "source_claim": "source claim",
+                    "derived_result": "derived result",
+                    "confidence_reason": source_discrepancy_confidence_reason,
+                    "reviewer_says_no_human_convention_choice_needed": (
+                        reviewer_says_no_human_convention_choice_needed
+                    ),
+                    "decision_question": "How should ARC resolve this source discrepancy?",
+                }
+            ]
+        ),
     }
     messages = {
         proposer_id: {"message": message}

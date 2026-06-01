@@ -59,7 +59,7 @@
             "agreement_assessment",
             "best_written_proposer_id",
             "best_written_selection_reason",
-            "source_discrepancy",
+            "source_discrepancies",
             "workflow_action"
           ],
           "properties": {
@@ -133,39 +133,49 @@
             "best_written_selection_reason": {
               "type": "string"
             },
-            "source_discrepancy": {
-              "type": "object",
-              "required": [
-                "status",
-                "source_claim",
-                "derived_result",
-                "confidence_reason",
-                "reviewer_says_no_human_convention_choice_needed"
-              ],
-              "properties": {
-                "status": {
-                  "type": "string",
-                  "enum": [
-                    "none",
-                    "confirmed_source_error",
-                    "likely_source_error",
-                    "ambiguous_convention"
-                  ]
+            "source_discrepancies": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "item_id",
+                  "status",
+                  "source_claim",
+                  "derived_result",
+                  "confidence_reason",
+                  "reviewer_says_no_human_convention_choice_needed",
+                  "decision_question"
+                ],
+                "properties": {
+                  "item_id": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "confirmed_source_error",
+                      "likely_source_error",
+                      "ambiguous_convention"
+                    ]
+                  },
+                  "source_claim": {
+                    "type": "string"
+                  },
+                  "derived_result": {
+                    "type": "string"
+                  },
+                  "confidence_reason": {
+                    "type": "string"
+                  },
+                  "reviewer_says_no_human_convention_choice_needed": {
+                    "type": "boolean"
+                  },
+                  "decision_question": {
+                    "type": "string"
+                  }
                 },
-                "source_claim": {
-                  "type": "string"
-                },
-                "derived_result": {
-                  "type": "string"
-                },
-                "confidence_reason": {
-                  "type": "string"
-                },
-                "reviewer_says_no_human_convention_choice_needed": {
-                  "type": "boolean"
-                }
-              },
-              "additionalProperties": false
+                "additionalProperties": false
+              }
             },
             "workflow_action": {
               "type": "object",

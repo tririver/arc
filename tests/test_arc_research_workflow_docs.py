@@ -477,22 +477,28 @@ def test_work_note_color_marking_only_colors_literal_markers() -> None:
     plan = " ".join((WF / "plan.md").read_text(encoding="utf-8").lower().split())
     check = " ".join((WF / "check.md").read_text(encoding="utf-8").lower().split())
 
-    for text in [calculate, plan]:
-        assert "specific human" in text
-        assert "expert answer" in text
-        assert "unresolved scientific acceptance" in text
-        assert "question" in text
-        assert "ordinary user task" in text
-        assert "only color" in text
-        assert "literal marker" in text
-        assert "`[confirmed source issue]`" in text
-        assert "`human-resolved`" in text
-        assert "do not color the surrounding prose" in text
-        assert "do not color the surrounding equations" in text
-        assert "color is stripped" in text or "color is unavailable" in text
-        assert "marker remains authoritative" in text
-        assert "whole affected prose/equation block" not in text
-        assert "affected visible block in red" not in text
+    assert "specific human" in calculate
+    assert "expert answer" in calculate
+    assert "unresolved scientific acceptance" in calculate
+    assert "question" in calculate
+    assert "ordinary user task" in calculate
+    assert "only color" in calculate
+    assert "literal marker" in calculate
+    assert "`[confirmed source issue]`" in calculate
+    assert "`human-resolved`" in calculate
+    assert "do not color the surrounding prose" in calculate
+    assert "do not color the surrounding equations" in calculate
+    assert "color is stripped" in calculate or "color is unavailable" in calculate
+    assert "marker remains authoritative" in calculate
+    assert "exactly one of the below two cases" in calculate
+    assert "source_discrepancies" in calculate
+    assert "whole affected prose/equation block" not in calculate
+    assert "affected visible block in red" not in calculate
+
+    assert "`calculate.md` source-discrepancy" in plan
+    assert "do not define new marker semantics in `plan.md`" in plan
+    assert "`[confirmed source issue]`" not in plan
+    assert "`human-resolved` marker's background" not in plan
 
     assert "marker-only color rule" in check
 

@@ -125,12 +125,8 @@ and what is forbidden as input. Do not disclose the exact expected expression
 or expected final formula; ask proposers to derive the target quantity in terms of named dependencies.
 
 For note-check steps that may contradict the source, add
-`source-discrepancy handling`: define `confirmed_source_error` versus
-`likely_source_error` or `ambiguous_convention`. Automatic acceptance as
-`confirmed_source_error` requires blind proposer, reviewer, and main-agent
-agreement; accepted premises only; no convention dependence; and reviewer
-judgment that no human convention choice is needed. `calculate.md` owns any
-auto-mode high-confidence agent resolution for other discrepancy classes.
+`source-discrepancy handling`: say that `calculate.md` owns per-item source
+discrepancy classification, human gates, and markers.
 
 Step 4: Write deferred work in `## Rough Steps For Later Planning`. Rough-step
 planning records dependency order, likely inputs, risk, and expansion triggers.
@@ -173,10 +169,9 @@ Step 4: Use `## Source Audit Trail` for every source that shaped the work note:
 paper ids, note paths, sections, equations, commands, MCP tools, URLs, and why
 each source matters.
 
-Step 5: Any accepted or promoted work-note content whose acceptance depends on a specific human expert answer resolving an unresolved scientific acceptance question is human-resolved content. This does not include ordinary user task instructions, source excerpts, or constraints.
-Add the literal marker `[human-resolved]` beside the content, and only color that `human-resolved` marker's background dark blue with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. For PDF-oriented Markdown, use the `calculate.md` marker-background template and write raw LaTeX directly in prose, for example: \colorbox{archumanresolved}{\textcolor{white}{[human-resolved]}}. Do not use Markdown code spans.
-
-Step 6: For note-check content classified as `confirmed_source_error`, mark the source issue with the literal marker `[confirmed source issue]`, and only color that marker's background dark red with white text. Do not color the surrounding prose. Do not color the surrounding equations. For `likely_source_error` or `ambiguous_convention`, use red only for the `calculate.md` auto-mode `[agent-resolved decision]` marker; otherwise ask a human expert question before acceptance. For PDF-oriented Markdown, use the `calculate.md` marker-background template and write raw LaTeX directly in prose, for example: \colorbox{arcsourceissue}{\textcolor{white}{[confirmed source issue]}}. Do not use Markdown code spans.
+Step 5: When preserving accepted or promoted note-check content, preserve any
+`calculate.md` source-discrepancy and human-resolution markers exactly. Do not
+define new marker semantics in `plan.md`.
 
 ## Phase 4: Version And Export
 Step 1: Find the highest existing immutable version under

@@ -26,7 +26,6 @@ DEFAULT_HUMAN_GATE_PAUSE_STATUSES = (
 RETRYABLE_CONSENSUS_STATUSES = {"reference_disagrees", "two_agree", "all_disagree", "unresolved"}
 REVISION_ACTIONS = {"revise_plan", "split_step"}
 SOURCE_DISCREPANCY_STATUSES = {
-    "none",
     "confirmed_source_error",
     "likely_source_error",
     "ambiguous_convention",
@@ -786,7 +785,7 @@ def _review_consensus(
             message += ", or reference_disagrees"
         raise ValueError(message)
     consensus = dict(consensus)
-    _validate_source_discrepancy(consensus)
+    _validate_source_discrepancies(consensus)
     consensus["workflow_action"] = _normalized_workflow_action(consensus.get("workflow_action"), str(status))
     if status == "all_agree":
         _validate_best_written_selection(
@@ -1070,13 +1069,14 @@ def _normalized_workflow_action(raw: Any, trigger_status: str) -> dict[str, Any]
     return normalized
 
 
-def _normalized_source_discrepancy(raw: Any) -> dict[str, Any]:
+def _normalized_source_discrepancy_item(raw: Any, index: int) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        raw = {}
-    status = str(raw.get("status", "none") or "none").strip()
+        raise ValueError("source_discrepancies[] items must be objects")
+    status = str(raw.get("status", "") or "").strip()
     if status not in SOURCE_DISCREPANCY_STATUSES:
-        status = "ambiguous_convention"
+        raise ValueError("source_discrepancies[].status is invalid")
     return {
+        "item_id": str(raw.get("item_id", "") or f"source_discrepancy_{index + 1}"),
         "status": status,
         "source_claim": str(raw.get("source_claim", "") or ""),
         "derived_result": str(raw.get("derived_result", "") or ""),
@@ -1085,23 +1085,36 @@ def _normalized_source_discrepancy(raw: Any) -> dict[str, Any]:
             raw.get("reviewer_says_no_human_convention_choice_needed", False),
             False,
         ),
+        "decision_question": str(raw.get("decision_question", "") or ""),
     }
 
 
-def _validate_source_discrepancy(consensus: dict[str, Any]) -> None:
-    source_discrepancy = _normalized_source_discrepancy(consensus.get("source_discrepancy"))
-    status = source_discrepancy["status"]
-    if status != "none" and not source_discrepancy["confidence_reason"].strip():
-        raise ValueError("source_discrepancy.confidence_reason is required when status is not none")
-    if status == "confirmed_source_error" and not source_discrepancy[
-        "reviewer_says_no_human_convention_choice_needed"
-    ]:
-        source_discrepancy["status"] = "likely_source_error"
-        if not source_discrepancy["confidence_reason"].strip():
-            source_discrepancy["confidence_reason"] = (
-                "Reviewer did not explicitly state that no human convention choice is needed."
+def _normalized_source_discrepancies(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        raise ValueError("consensus.source_discrepancies must be an array")
+    return [_normalized_source_discrepancy_item(item, index) for index, item in enumerate(raw)]
+
+
+def _validate_source_discrepancies(consensus: dict[str, Any]) -> None:
+    if "source_discrepancy" in consensus:
+        raise ValueError("consensus.source_discrepancy is not supported; use source_discrepancies")
+    source_discrepancies = _normalized_source_discrepancies(consensus.get("source_discrepancies"))
+    for item in source_discrepancies:
+        if not item["confidence_reason"].strip():
+            raise ValueError("source_discrepancies[].confidence_reason is required")
+        if item["status"] in {"likely_source_error", "ambiguous_convention"} and not item[
+            "decision_question"
+        ].strip():
+            raise ValueError("source_discrepancies[].decision_question is required for unresolved items")
+        if item["status"] == "confirmed_source_error" and not item[
+            "reviewer_says_no_human_convention_choice_needed"
+        ]:
+            item["status"] = "likely_source_error"
+            item["confidence_reason"] = (
+                item["confidence_reason"].rstrip()
+                + " Reviewer did not explicitly state that no human convention choice is needed."
             )
-    consensus["source_discrepancy"] = source_discrepancy
+    consensus["source_discrepancies"] = source_discrepancies
 
 
 def _source_discrepancy_blocked_step_result(
@@ -1110,16 +1123,23 @@ def _source_discrepancy_blocked_step_result(
     attempts: list[dict[str, Any]],
     consensus: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    source_discrepancy = _normalized_source_discrepancy(consensus.get("source_discrepancy"))
-    status = source_discrepancy["status"]
-    if status in {"none", "confirmed_source_error"}:
+    source_discrepancies = _normalized_source_discrepancies(consensus.get("source_discrepancies"))
+    unresolved = [
+        item for item in source_discrepancies if item["status"] in {"likely_source_error", "ambiguous_convention"}
+    ]
+    if not unresolved:
         return None
-    source_claim = source_discrepancy["source_claim"].strip() or "the source claim"
-    derived_result = source_discrepancy["derived_result"].strip() or "the derived result"
+    questions = []
+    for item in unresolved:
+        question = item["decision_question"].strip()
+        if not question:
+            source_claim = item["source_claim"].strip() or "the source claim"
+            derived_result = item["derived_result"].strip() or "the derived result"
+            question = f"Should ARC treat {source_claim} or {derived_result} as the premise?"
+        questions.append(f"- {item['item_id']}: {question}")
     expert_question = (
-        "Accepted derivation does not match the source, but ARC cannot classify it as a "
-        f"confirmed source error. For step `{step.step_id}`, should ARC treat {source_claim} "
-        f"or {derived_result} as the premise for subsequent work?"
+        "Accepted derivation has source discrepancies that need human resolution before "
+        f"step `{step.step_id}` can become an accepted premise:\n" + "\n".join(questions)
     )
     workflow_action = {
         "action": "pause_for_human",
@@ -1141,6 +1161,7 @@ def _source_discrepancy_blocked_step_result(
             "requires_human": True,
             "workflow_action": workflow_action,
             "expert_question": expert_question,
+            "source_discrepancies": copy.deepcopy(unresolved),
             "analysis": str(consensus.get("analysis", "")),
             "last_consensus": copy.deepcopy(dict(consensus)),
         },

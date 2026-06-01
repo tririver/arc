@@ -99,7 +99,9 @@ an undeclared special limit. Depending on the failure, retry, split, pause for
 the expert question, or write a planning request.
 
 If an accepted derivation contradicts a source or reviewer-only reference claim,
-classify the discrepancy before updating the work note:
+classify each independent discrepancy before updating the work note. A step may
+have zero or more `source_discrepancies`; do not merge unrelated equations or
+claims into one aggregate status:
 
 - `confirmed_source_error`: blind proposers agree, the reviewer agrees, the
   main agent agrees with the reviewer, the derivation uses only accepted
@@ -110,31 +112,24 @@ classify the discrepancy before updating the work note:
 - `ambiguous_convention`: the mismatch may be due to convention, normalization,
   notation, source mapping, or interpretation.
 
-Only `confirmed_source_error` may continue without human interaction in
-`interactive` mode. For `likely_source_error` or `ambiguous_convention`,
-pause and ask a `Human expert question:` before accepting the result as a
-premise or updating the affected source claim as resolved.
+Before a step can become an accepted premise, every source-discrepancy item must
+fall into exactly one of the below two cases:
 
-In `auto` mode, first judge whether a `likely_source_error` or
-`ambiguous_convention` can be resolved with high confidence. High confidence
-requires accepted premises, declared conventions, reviewer reasoning, and the
-main-agent audit to support one option clearly; the choice must be local to the
-current result; no plausible alternative may significantly change later plan
-structure, future premises, source coverage, or physical interpretation. If
-that standard is met, continue without pausing and record the decision beside
-the affected work-note content with `[agent-resolved decision]`, coloring only
-that literal marker red. Record the evidence, rejected alternative, and
-downstream risk in `Journal` or `Calculation Status`. For PDF-oriented Markdown, write the raw LaTeX marker directly in prose, for example: \textcolor{red}{[agent-resolved decision]}. Do not surround color commands with backticks or other Markdown code spans.
-
-If the high-confidence standard is not met, or the decision is important,
-foundation-like, convention-setting, or likely to affect later plan structure,
-future accepted premises, source coverage, or physical interpretation, pause
-and ask a `Human expert question:` before accepting the result as a premise or
-updating the affected source claim as resolved.
+1. It is classified as `confirmed_source_error`; mark the source-disagreement
+   statement with `[confirmed source issue]`. In reviewer JSON, keep that item's
+   `decision_question` as an empty string.
+2. It is classified as `likely_source_error` or `ambiguous_convention`; pause
+   and ask a `Human expert question:` before accepting the item. After the
+   human answer resolves the item, mark the accepted content with
+   `[human-resolved]`. If the human answer confirms a source issue, also mark the
+   source-disagreement statement with `[confirmed source issue]`.
 
 When pausing for a human expert, do not merely say that the workflow paused.
 Write and ask one concrete question under the literal label
-`Human expert question:`. The question must name the step, the unresolved equation or claim, the competing options, and what answer is needed to proceed.
+`Human expert question:`. If multiple source-discrepancy items remain unresolved
+in the same step, enumerate each item in the same question. Each item must name the step.
+It must also identify the unresolved equation or claim, the competing options,
+and what answer is needed to proceed.
 For important equations, do not cite equation ids alone: display the equation
 body or the decision-critical subequation directly in the work note and in the
 user-facing question. If the equation is long, show the minimal formula fragment
@@ -166,7 +161,7 @@ header-includes:
 ```
 Do not use custom no-argument marker macros such as `\arcsourceissue` or `\archumanresolved`; Pandoc may strip them from inline prose.
 
-For `confirmed_source_error`, put the literal marker `[confirmed source issue]` beside the source-disagreement statement, and only color that marker's background dark red with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. Do not use the red marker for likely or convention-dependent source mismatches; those must remain blocked until the human expert question is answered.
+For `confirmed_source_error`, put the literal marker `[confirmed source issue]` beside the source-disagreement statement, and only color that marker's background dark red with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. Do not use the red marker for likely or convention-dependent source mismatches until the human expert question is answered and confirms a source issue.
 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and
@@ -176,7 +171,7 @@ including any displayed equation body or formula fragment required by the
 question.
 Limits diagnose; they are not proof.
 
-Any accepted work-note content whose acceptance depends on a specific human expert answer resolving an unresolved scientific acceptance question is human-resolved content. This includes a blocked step the expert resolves, a source convention the expert chooses, or a main-agent verification accepted only because the expert allowed that standard. It excludes ordinary user task instructions, source excerpts, or constraints.
+Any accepted work-note content whose acceptance depends on a specific human expert answer resolving an unresolved scientific acceptance question is human-resolved content. This includes a blocked step the expert resolves, a source convention the expert chooses, a likely source error the expert confirms, or a main-agent verification accepted only because the expert allowed that standard. It excludes ordinary user task instructions, source excerpts, or constraints.
 Add the literal marker `[human-resolved]` beside the accepted content, and only color that `human-resolved` marker's background dark blue with white text. Do not color the surrounding prose. Do not color the surrounding equations. If color is stripped or unavailable, the marker remains authoritative. Do not surround color commands with backticks.
 
 A human expert later resolves a block and thereby unblocks the workflow; this
