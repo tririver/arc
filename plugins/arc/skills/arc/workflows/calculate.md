@@ -134,7 +134,12 @@ updating the affected source claim as resolved.
 
 When pausing for a human expert, do not merely say that the workflow paused.
 Write and ask one concrete question under the literal label
-`Human expert question:`. The question must name the step, the unresolved equation or claim, the competing options, and what answer is needed to proceed.
+`Human expert question:`. The question must name the step, the unresolved
+equation or claim, the competing options, and what answer is needed to proceed.
+For important equations, do not cite equation ids alone: display the equation
+body or the decision-critical subequation directly in the work note and in the
+user-facing question. If the equation is long, show the minimal formula fragment
+that the decision turns on, plus the source equation id and anchor.
 Record the same question in `Open Questions` or `Calculation Status`.
 
 ## Phase 5: Update Work Note
@@ -167,7 +172,9 @@ For `confirmed_source_error`, put the literal marker `[confirmed source issue]` 
 If the step is blocked, mark the current ready step blocked and record the
 disagreement, proposer positions, reviewer judgment, expert question, and
 proposed next action. If the block needs human input, ask the exact same
-`Human expert question:` in the user-facing response before ending the turn.
+`Human expert question:` in the user-facing response before ending the turn,
+including any displayed equation body or formula fragment required by the
+question.
 Limits diagnose; they are not proof.
 
 Any accepted work-note content whose acceptance depends on a specific human expert answer resolving an unresolved scientific acceptance question is human-resolved content. This includes a blocked step the expert resolves, a source convention the expert chooses, or a main-agent verification accepted only because the expert allowed that standard. It excludes ordinary user task instructions, source excerpts, or constraints.
