@@ -126,6 +126,26 @@ def test_codex_warn_mode_recovers_plain_text_output(monkeypatch):
     assert response.structured_output["recovery_strategy"] == "natural_language_fallback"
 
 
+def test_codex_warn_mode_repairs_malformed_json_output(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        output_path = Path(cmd[cmd.index("--output-last-message") + 1])
+        output_path.write_text('```json\n{"ok": true, "items": ["a", "b"]\n```', encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = CodexCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        output_recovery="warn",
+    )
+
+    assert response.value == {"ok": True, "items": ["a", "b"]}
+    assert response.structured_output["severity"] == "minor"
+    assert response.structured_output["recovery_strategy"] == "extract_json"
+    assert any("json_repair" in warning for warning in response.structured_output["warnings"])
+
+
 def test_codex_strict_mode_raises_on_plain_text_output(monkeypatch):
     def fake_run(cmd, **kwargs):
         output_path = Path(cmd[cmd.index("--output-last-message") + 1])
@@ -628,6 +648,32 @@ def test_claude_natural_language_result_recovered_in_warn_mode(monkeypatch):
     assert response.native_session_id == "s1"
     assert response.structured_output["severity"] == "major"
     assert response.structured_output["recovery_strategy"] == "natural_language_fallback"
+
+
+def test_claude_warn_mode_repairs_malformed_result_json(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        payload = {
+            "type": "result",
+            "result": '```json\n{"ok": true, "items": ["a", "b"]\n```',
+            "session_id": "s1",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        model="deepseek-v4-flash",
+        output_recovery="warn",
+    )
+
+    assert response.value == {"ok": True, "items": ["a", "b"]}
+    assert response.native_session_id == "s1"
+    assert response.structured_output["severity"] == "minor"
+    assert response.structured_output["recovery_strategy"] == "extract_json"
+    assert any("json_repair" in warning for warning in response.structured_output["warnings"])
 
 
 def test_claude_natural_language_result_still_raises_in_strict_mode(monkeypatch):

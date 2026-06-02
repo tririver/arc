@@ -50,6 +50,10 @@ def parse_json_object_relaxed(text: str) -> tuple[dict[str, Any] | None, list[st
         if parsed is not None:
             warnings.append("Recovered JSON object after cleanup.")
             return parsed, warnings
+    repaired = _repair_json_object(raw)
+    if repaired is not None:
+        warnings.append("Repaired malformed JSON object with json_repair.")
+        return repaired, warnings
     return None, ["No JSON object could be extracted."]
 
 
@@ -163,6 +167,71 @@ def _loads_object(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _repair_json_object(text: str) -> dict[str, Any] | None:
+    candidates = _json_repair_candidates(text)
+    if not candidates:
+        return None
+    try:
+        from json_repair import repair_json
+    except ImportError:
+        return None
+
+    for candidate in candidates:
+        try:
+            repaired = repair_json(candidate, return_objects=True, skip_json_loads=True, ensure_ascii=False)
+        except (TypeError, ValueError, RecursionError):
+            continue
+        if isinstance(repaired, dict):
+            return repaired
+    return None
+
+
+def _json_repair_candidates(text: str) -> list[str]:
+    raw = text.strip()
+    candidates: list[str] = []
+    fenced = _first_fenced_block(raw)
+    if fenced:
+        candidates.append(_clean_json_text(fenced))
+        candidates.append(fenced.strip())
+    candidates.extend(_object_like_suffixes(raw))
+    cleaned = _clean_json_text(raw)
+    if cleaned != raw:
+        candidates.append(cleaned)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not _looks_like_json_object(candidate) or candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def _object_like_suffixes(text: str) -> list[str]:
+    suffixes: list[str] = []
+    start = -1
+    while True:
+        start = text.find("{", start + 1)
+        if start < 0:
+            return suffixes
+        suffix = text[start:].strip()
+        if _looks_like_json_object(suffix):
+            suffixes.append(suffix)
+
+
+def _looks_like_json_object(text: str) -> bool:
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return False
+    for char in stripped[1:]:
+        if char.isspace():
+            continue
+        return char in {'"', "}"}
+    return True
 
 
 def _first_fenced_block(text: str) -> str | None:

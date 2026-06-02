@@ -1,6 +1,6 @@
 import json
 
-from arc_llm.structured_recovery import recover_json_output
+from arc_llm.structured_recovery import parse_json_object_relaxed, recover_json_output
 
 
 def test_recover_json_output_valid_schema_object_is_unchanged():
@@ -73,6 +73,39 @@ def test_recovery_still_drops_additional_properties_when_forbidden():
 
     assert recovered.value == {"a": "x"}
     assert any("Dropped extra properties" in warning for warning in recovered.structured_output["warnings"])
+
+
+def test_relaxed_parser_repairs_truncated_fenced_json_object():
+    text = """```json
+{"title": "x", "items": ["a", "b"]
+```"""
+
+    parsed, warnings = parse_json_object_relaxed(text)
+
+    assert parsed == {"title": "x", "items": ["a", "b"]}
+    assert any("json_repair" in warning for warning in warnings)
+
+
+def test_relaxed_parser_keeps_plain_text_as_unstructured_fallback():
+    parsed, warnings = parse_json_object_relaxed("plain calculation answer")
+
+    assert parsed is None
+    assert warnings == ["No JSON object could be extracted."]
+
+
+def test_relaxed_parser_does_not_repair_rootless_json_fragment():
+    text = """Continuing from where output was cut off:
+
+```json
+    "Massless limit $m=0$ ($\\nu=3/2$): $K_{3/2}(t)$": "check",
+    "risks": []
+}
+```"""
+
+    parsed, warnings = parse_json_object_relaxed(text)
+
+    assert parsed is None
+    assert warnings == ["No JSON object could be extracted."]
 
 
 def test_calculation_recovery_requires_revision_before_continuing():
