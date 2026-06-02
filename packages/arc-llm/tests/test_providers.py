@@ -1107,11 +1107,55 @@ def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
     payload = json.loads(open(config_path, encoding="utf-8").read())
 
     assert "--strict-mcp-config" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--allowedTools") + 1] == "mcp__arc__*"
     assert payload["mcpServers"]["arc"]["command"] == "/tmp/custom-arc-mcp"
     assert payload["mcpServers"]["arc"]["args"] == []
     assert payload["mcpServers"]["arc"]["env"]["ARC_AGENT_HOST"] == "claude"
     assert payload["mcpServers"]["arc"]["env"]["ARC_PAPER_CACHE"] == str(tmp_path / "paper-cache")
     assert payload["mcpServers"]["arc"]["env"]["EXTRA"] == "value"
+
+
+def test_claude_arc_only_mcp_uses_web_tools_plus_arc_allowlist(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    provider = ClaudeCliProvider(
+        env={
+            "ARC_CLAUDE_ALLOW_INTERNET": "true",
+            "ARC_CLAUDE_ALLOW_MCP": "true",
+            "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        }
+    )
+
+    assert provider.generate_text("prompt") == "plain text"
+    assert captured["cmd"][captured["cmd"].index("--tools") + 1] == "WebSearch,WebFetch"
+    assert captured["cmd"][captured["cmd"].index("--allowedTools") + 1] == "mcp__arc__*"
+
+
+def test_claude_allowed_tools_can_be_overridden(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    provider = ClaudeCliProvider(
+        env={
+            "ARC_CLAUDE_ALLOW_MCP": "true",
+            "ARC_CLAUDE_MCP_MODE": "arc-only",
+            "ARC_CLAUDE_ALLOWED_TOOLS": "mcp__arc__get_title",
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        }
+    )
+
+    assert provider.generate_text("prompt") == "plain text"
+    assert captured["cmd"][captured["cmd"].index("--allowedTools") + 1] == "mcp__arc__get_title"
 
 
 def test_claude_arc_only_rejects_extra_mcp_configs(tmp_path):
@@ -1167,7 +1211,14 @@ def test_claude_arc_only_mcp_default_does_not_fall_back_to_uvx(monkeypatch, tmp_
     assert payload["mcpServers"]["arc"]["args"] == []
 
 
-def test_claude_no_internet_mcp_requires_explicit_tools(tmp_path):
+def test_claude_no_internet_mcp_disables_builtin_tools_and_allows_arc(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
     provider = ClaudeCliProvider(
         env={
             "ARC_CLAUDE_ALLOW_MCP": "true",
@@ -1177,8 +1228,9 @@ def test_claude_no_internet_mcp_requires_explicit_tools(tmp_path):
         }
     )
 
-    with pytest.raises(LLMWorkerError, match="requires explicit ARC_CLAUDE_TOOLS"):
-        provider.generate_text("prompt")
+    assert provider.generate_text("prompt") == "plain text"
+    assert captured["cmd"][captured["cmd"].index("--tools") + 1] == ""
+    assert captured["cmd"][captured["cmd"].index("--allowedTools") + 1] == "mcp__arc__*"
 
 
 def test_claude_no_internet_mcp_allows_explicit_tools(monkeypatch, tmp_path):
@@ -1202,3 +1254,4 @@ def test_claude_no_internet_mcp_allows_explicit_tools(monkeypatch, tmp_path):
     assert provider.generate_text("prompt") == "plain text"
     assert "--tools" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--tools") + 1] == ""
+    assert captured["cmd"][captured["cmd"].index("--allowedTools") + 1] == "mcp__arc__*"

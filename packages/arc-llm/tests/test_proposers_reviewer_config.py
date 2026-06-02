@@ -256,6 +256,7 @@ def test_worker_env_maps_arc_only_mcp_and_codex_filesystem_options():
             "arc_mcp_env": {"ARC_PAPER_CACHE": "/tmp/arc-paper"},
             "codex_work_dir": "/tmp/project",
             "codex_add_dirs": ["/tmp/project/skills", "/tmp/arc-skills"],
+            "claude_allowed_tools": "mcp__arc__get_title",
         }
     )
     config = load_batch_config(payload)
@@ -269,6 +270,7 @@ def test_worker_env_maps_arc_only_mcp_and_codex_filesystem_options():
     assert env["ARC_CLAUDE_ARC_MCP_COMMAND"] == "/tmp/arc-mcp"
     assert json.loads(env["ARC_CODEX_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
     assert json.loads(env["ARC_CLAUDE_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
+    assert env["ARC_CLAUDE_ALLOWED_TOOLS"] == "mcp__arc__get_title"
     assert env["ARC_CODEX_WORK_DIR"] == "/tmp/project"
     assert json.loads(env["ARC_CODEX_ADD_DIRS"]) == ["/tmp/project/skills", "/tmp/arc-skills"]
 

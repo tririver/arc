@@ -206,6 +206,7 @@ def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-ignore-rules", action="store_true")
     parser.add_argument("--claude-effort", default=None)
     parser.add_argument("--claude-tools", default=None)
+    parser.add_argument("--claude-allowed-tools", default=None)
     parser.add_argument("--claude-mcp-config", action="append", default=[])
     parser.add_argument("--claude-strict-mcp-config", action="store_true")
     parser.add_argument("--no-claude-strict-mcp-config", action="store_true")
@@ -259,6 +260,7 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
         overrides["ARC_CODEX_IGNORE_RULES"] = "true"
     _put(overrides, "ARC_CLAUDE_EFFORT", args.claude_effort)
     _put(overrides, "ARC_CLAUDE_TOOLS", args.claude_tools)
+    _put(overrides, "ARC_CLAUDE_ALLOWED_TOOLS", args.claude_allowed_tools)
     if args.claude_mcp_config:
         overrides["ARC_CLAUDE_MCP_CONFIG"] = "\n".join(args.claude_mcp_config)
     if args.claude_strict_mcp_config:

@@ -308,6 +308,9 @@ def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
     tools = _claude_tools(env, allow_mcp=allow_mcp)
     if tools is not None:
         cmd.extend(["--tools", tools])
+    allowed_tools = _claude_allowed_tools(env, allow_mcp=allow_mcp)
+    if allowed_tools is not None:
+        cmd.extend(["--allowedTools", allowed_tools])
     effort = _env_text(env, "ARC_CLAUDE_EFFORT", "low")
     if effort:
         cmd.extend(["--effort", effort])
@@ -387,15 +390,18 @@ def _claude_tools(env: Mapping[str, str], *, allow_mcp: bool) -> str | None:
         return env["ARC_CLAUDE_TOOLS"]
     allow_internet = _env_bool(env, "ARC_CLAUDE_ALLOW_INTERNET", False)
     if allow_mcp:
-        if not allow_internet:
-            raise LLMWorkerError(
-                "Claude MCP with ARC_CLAUDE_ALLOW_INTERNET=false requires explicit ARC_CLAUDE_TOOLS. "
-                "Refusing to use --tools default because that may enable non-ARC built-in tools."
-            )
-        return "default"
+        return "WebSearch,WebFetch" if allow_internet else ""
     if allow_internet:
         return "WebSearch,WebFetch"
     return ""
+
+
+def _claude_allowed_tools(env: Mapping[str, str], *, allow_mcp: bool) -> str | None:
+    if "ARC_CLAUDE_ALLOWED_TOOLS" in env:
+        return env["ARC_CLAUDE_ALLOWED_TOOLS"]
+    if allow_mcp and _env_text(env, "ARC_CLAUDE_MCP_MODE", "user-config") == "arc-only":
+        return "mcp__arc__*"
+    return None
 
 
 def _mcp_configs(env: Mapping[str, str]) -> list[str]:

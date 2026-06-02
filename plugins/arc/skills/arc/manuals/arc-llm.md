@@ -43,6 +43,13 @@ With `--provider auto`, ARC uses only host-native providers: Codex selects
 `manual`. `arc-llm` does not read provider config files, API-key files, or
 URL-based provider definitions.
 
+Claude Code requires explicit permission for MCP tools in non-interactive
+workers. ARC-only MCP sessions therefore allow `mcp__arc__*` by default while
+keeping built-in tools limited to the requested internet setting. If a Claude
+worker reports that ARC MCP tool permission is pending, check that the command
+includes `--allowedTools mcp__arc__*`. Advanced callers may override this with
+`ARC_CLAUDE_ALLOWED_TOOLS` or `--claude-allowed-tools`.
+
 ## Direct Prompt Tests
 
 Use direct `arc-llm` calls only for debugging or standalone LLM tasks.

@@ -30,6 +30,8 @@ def test_runtime_env_merges_cli_llm_options(monkeypatch):
             'mcp_servers.arc.command="arc-mcp"',
             "--claude-effort",
             "medium",
+            "--claude-allowed-tools",
+            "mcp__arc__get_title",
             "--claude-mcp-config",
             "/tmp/arc-mcp.json",
             "--prompt",
@@ -54,6 +56,7 @@ def test_runtime_env_merges_cli_llm_options(monkeypatch):
     assert json.loads(env["ARC_CLAUDE_ARC_MCP_ENV_JSON"]) == {"ARC_PAPER_CACHE": "/tmp/arc-paper"}
     assert env["ARC_CODEX_CONFIG"] == 'mcp_servers.arc.command="arc-mcp"'
     assert env["ARC_CLAUDE_EFFORT"] == "medium"
+    assert env["ARC_CLAUDE_ALLOWED_TOOLS"] == "mcp__arc__get_title"
     assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/arc-mcp.json"
 
 

@@ -327,6 +327,7 @@ def runtime_fingerprint(
                 "ARC_CODEX_IGNORE_USER_CONFIG",
                 "ARC_CODEX_IGNORE_RULES",
                 "ARC_CLAUDE_TOOLS",
+                "ARC_CLAUDE_ALLOWED_TOOLS",
                 "ARC_CLAUDE_ALLOW_MCP",
                 "ARC_CLAUDE_MCP_MODE",
                 "ARC_CLAUDE_MCP_CONFIG",
