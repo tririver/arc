@@ -486,11 +486,50 @@ def test_review_envelope_requires_review_payload(tmp_path):
             "content": "proposal",
         }
 
-    result = run_proposers_reviewer_batch(base_config(tmp_path, max_rounds=1), json_runner=invalid_reviewer, base_env={})
+    config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {"enabled": True, "mode": "strict"}
+
+    result = run_proposers_reviewer_batch(config, json_runner=invalid_reviewer, base_env={})
 
     assert result["status"] == "failed"
     assert result["loops"][0]["status"] == "failed"
     assert "review.review_payload must be an object" in result["loops"][0]["error"]
+
+
+def test_invalid_reviewer_retry_uses_minimal_fallback_in_warn_mode(tmp_path):
+    def invalid_reviewer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "missing payload", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+            }
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(base_config(tmp_path, max_rounds=1), json_runner=invalid_reviewer, base_env={})
+
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    structured = review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]
+
+    assert result["status"] == "completed"
+    assert review["controller"]["stop_requested"] is False
+    assert sorted(review["proposer_messages"]) == ["proposer_001", "proposer_002"]
+    assert isinstance(review["review_payload"], dict)
+    assert structured["severity"] == "major"
+    warnings = [
+        json.loads(line)
+        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert warnings[-1]["severity"] == "major"
+    assert warnings[-1]["recovery_strategy"] == "reviewer_schema_failure_fallback"
 
 
 def test_review_envelope_rejects_unexpected_proposer_ids(tmp_path):
@@ -509,7 +548,10 @@ def test_review_envelope_rejects_unexpected_proposer_ids(tmp_path):
             }
         return {"ok": True}
 
-    result = run_proposers_reviewer_batch(base_config(tmp_path, max_rounds=1), json_runner=reviewer_with_extra_target, base_env={})
+    config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {"enabled": True, "mode": "strict"}
+
+    result = run_proposers_reviewer_batch(config, json_runner=reviewer_with_extra_target, base_env={})
 
     assert result["status"] == "failed"
     assert "review.proposer_messages unexpected: proposer_999" in result["loops"][0]["error"]
@@ -566,6 +608,268 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
     assert review["controller"]["message"] == "valid after retry"
     assert "Previous reviewer response failed validation" not in original_prompt
     assert "Previous reviewer response failed validation" in retry_prompt
+
+
+def _strict_reviewer_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
+        "properties": {
+            "schema_version": {"type": "string", "const": "arc.llm.review_envelope.v1"},
+            "controller": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["message", "stop_requested", "stop_reason"],
+                "properties": {
+                    "message": {"type": "string"},
+                    "stop_requested": {"type": "boolean"},
+                    "stop_reason": {"type": ["string", "null"]},
+                },
+            },
+            "proposer_messages": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["proposer_001", "proposer_002"],
+                "properties": {
+                    "proposer_001": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["message"],
+                        "properties": {"message": {"type": "string"}},
+                    },
+                    "proposer_002": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["message"],
+                        "properties": {"message": {"type": "string"}},
+                    },
+                },
+            },
+            "review_payload": {
+                "type": "object",
+                "required": ["consensus"],
+                "properties": {
+                    "consensus": {
+                        "type": "object",
+                        "required": ["status", "workflow_action"],
+                        "properties": {
+                            "status": {"type": "string", "enum": ["accepted", "unresolved"]},
+                            "workflow_action": {
+                                "type": "object",
+                                "required": ["action"],
+                                "properties": {
+                                    "action": {"type": "string", "enum": ["finalize", "retry", "pause_for_human"]},
+                                    "requires_human": {"type": "boolean"},
+                                    "issue_type": {"type": "string", "enum": ["none", "worker_failure"]},
+                                    "proposed_revision": {"type": ["string", "null"]},
+                                    "reason": {"type": "string"},
+                                    "expert_question": {"type": ["string", "null"]},
+                                },
+                                "additionalProperties": True,
+                            },
+                        },
+                        "additionalProperties": True,
+                    },
+                },
+                "additionalProperties": True,
+            },
+        },
+    }
+
+
+def _reviewer_schema_config(tmp_path: Path, *, output_recovery: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = base_config(tmp_path, max_rounds=1)
+    config["loops"][0]["reviewers"][0]["output_schema"] = _strict_reviewer_schema()
+    if output_recovery is not None:
+        config["output_recovery"] = output_recovery
+    return config
+
+
+def _valid_strict_review(message: str = "valid") -> dict[str, Any]:
+    return {
+        "schema_version": "arc.llm.review_envelope.v1",
+        "controller": {"message": message, "stop_requested": False, "stop_reason": None},
+        "proposer_messages": {
+            "proposer_001": {"message": "revise"},
+            "proposer_002": {"message": "revise"},
+        },
+        "review_payload": {
+            "consensus": {
+                "status": "unresolved",
+                "workflow_action": {"action": "retry"},
+            }
+        },
+    }
+
+
+def _shallow_valid_nested_invalid_review() -> dict[str, Any]:
+    return {
+        "schema_version": "arc.llm.review_envelope.v1",
+        "controller": {"message": "missing nested fields", "stop_requested": False, "stop_reason": None},
+        "proposer_messages": {
+            "proposer_001": {"message": "revise"},
+            "proposer_002": {"message": "revise"},
+        },
+        "review_payload": {},
+    }
+
+
+def test_reviewer_valid_schema_does_not_retry_or_recover(tmp_path):
+    calls = 0
+
+    def valid_reviewer(prompt, **kwargs):
+        nonlocal calls
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls += 1
+            return _valid_strict_review("valid first try")
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(
+        _reviewer_schema_config(tmp_path),
+        json_runner=valid_reviewer,
+        base_env={},
+    )
+
+    review_path = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+
+    assert result["status"] == "completed"
+    assert calls == 1
+    assert not (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/prompts/reviewer_001.retry_001.md").exists()
+    assert not (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/errors/reviewer_001.validation_001.json").exists()
+    record = review.get(ARC_LLM_CALL_RECORD_FIELD, {})
+    assert record.get("structured_output") in (None, {})
+
+
+def test_reviewer_full_schema_failure_triggers_validation_retry(tmp_path):
+    calls = 0
+
+    def invalid_then_valid_reviewer(prompt, **kwargs):
+        nonlocal calls
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls += 1
+            if calls == 1:
+                return _shallow_valid_nested_invalid_review()
+            return _valid_strict_review("valid after full schema retry")
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(
+        _reviewer_schema_config(tmp_path),
+        json_runner=invalid_then_valid_reviewer,
+        base_env={},
+    )
+
+    retry_prompt = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/prompts/reviewer_001.retry_001.md"
+    validation_error = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/errors/reviewer_001.validation_001.json"
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert calls == 2
+    assert retry_prompt.exists()
+    assert validation_error.exists()
+    assert "reviewer output failed JSON schema validation" in validation_error.read_text(encoding="utf-8")
+    assert review["controller"]["message"] == "valid after full schema retry"
+
+
+def test_reviewer_validation_retry_failure_uses_conservative_fallback_in_warn_mode(tmp_path):
+    calls = 0
+
+    def invalid_reviewer(prompt, **kwargs):
+        nonlocal calls
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls += 1
+            return _shallow_valid_nested_invalid_review()
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(
+        _reviewer_schema_config(tmp_path, output_recovery={"enabled": True, "mode": "warn"}),
+        json_runner=invalid_reviewer,
+        base_env={},
+    )
+
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    structured = review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]
+    consensus = review["review_payload"]["consensus"]
+
+    assert result["status"] == "completed"
+    assert calls == 2
+    assert structured["mode"] == "recovered"
+    assert structured["severity"] == "major"
+    assert structured["recovery_strategy"] == "reviewer_schema_failure_fallback"
+    assert review["controller"]["stop_requested"] is False
+    assert consensus["status"] == "unresolved"
+    assert consensus["workflow_action"]["action"] == "retry"
+
+
+def test_reviewer_schema_failure_fallback_cannot_preserve_approving_retry(tmp_path):
+    calls = 0
+
+    def invalid_then_approving_invalid_reviewer(prompt, **kwargs):
+        nonlocal calls
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls += 1
+            if calls == 1:
+                return _shallow_valid_nested_invalid_review()
+            review = _valid_strict_review("invalid approving retry")
+            review["review_payload"]["consensus"]["status"] = "accepted"
+            review["review_payload"]["consensus"]["workflow_action"]["action"] = "finalize"
+            review["review_payload"]["consensus"]["workflow_action"]["requires_human"] = False
+            review["review_payload"]["consensus"]["accepted_result"] = {"value": "unsafe"}
+            review["extra_property_breaks_schema"] = True
+            return review
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(
+        _reviewer_schema_config(tmp_path, output_recovery={"enabled": True, "mode": "warn"}),
+        json_runner=invalid_then_approving_invalid_reviewer,
+        base_env={},
+    )
+
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    consensus = review["review_payload"]["consensus"]
+
+    assert result["status"] == "completed"
+    assert calls == 2
+    assert consensus["status"] == "unresolved"
+    assert consensus["accepted_result"] is None
+    assert consensus["agreed_proposer_ids"] == []
+    assert consensus["workflow_action"]["action"] == "retry"
+    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["severity"] == "major"
+
+
+def test_reviewer_validation_retry_failure_raises_in_strict_mode(tmp_path):
+    def invalid_reviewer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            return _shallow_valid_nested_invalid_review()
+        return {"ok": True}
+
+    result = run_proposers_reviewer_batch(
+        _reviewer_schema_config(tmp_path, output_recovery={"enabled": True, "mode": "strict"}),
+        json_runner=invalid_reviewer,
+        base_env={},
+    )
+
+    assert result["status"] == "failed"
+    assert result["loops"][0]["status"] == "failed"
+    assert "reviewer output failed JSON schema validation" in result["loops"][0]["error"]
 
 
 def test_reviewer_schema_validation_is_deferred_to_envelope_retry(tmp_path):

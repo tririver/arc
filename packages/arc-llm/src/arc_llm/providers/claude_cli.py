@@ -319,8 +319,11 @@ def _with_json_schema_contract(prompt: str, schema: Mapping[str, Any]) -> str:
     return (
         prompt.rstrip()
         + "\n\n## JSON output contract\n"
-        + "Return one JSON object. Prefer exact compliance with this schema. "
-        + "If you cannot satisfy a field exactly, return the closest useful value rather than prose outside JSON.\n"
+        + "Return exactly one JSON object and no surrounding prose.\n"
+        + "The JSON object must satisfy the supplied schema. Every required field must be present.\n"
+        + "Do not wrap the object in Markdown. Do not put the JSON object inside a string field such as result.\n"
+        + "If uncertain, use a short explanatory string for required string fields.\n"
+        + "Use null only when the schema explicitly allows null.\n"
         + canonical_json(dict(schema))
         + "\n"
     )

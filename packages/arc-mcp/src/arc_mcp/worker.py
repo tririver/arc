@@ -4,13 +4,6 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from arc_domain import service as domain_service
-from arc_paper import service as paper_service
-from arc_paper.batch.runner import run_batch
-from arc_paper.ids import normalize_paper_id
-from arc_typeset import md2pdf as typeset_md2pdf
-from arc_typeset import translate as typeset_translate
-
 from .jobs import (
     MCPJobCancelled,
     acquire_worker_lock,
@@ -84,6 +77,8 @@ def _dispatch(job_type: str, payload: dict[str, Any], *, job_id: str) -> Any:
 
 
 def _paper_summary(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    from arc_paper import service as paper_service
+
     _check_cancel(job_id)
     record_progress(job_id, {"event": "job_started"})
     return paper_service.generate_llm_summary(
@@ -97,6 +92,8 @@ def _paper_summary(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
 
 
 def _main_reference_inference(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    from arc_paper import service as paper_service
+
     _check_cancel(job_id)
     record_progress(job_id, {"event": "reference_inference_started"})
     result = paper_service.llm_infer_main_references(
@@ -112,6 +109,9 @@ def _main_reference_inference(payload: dict[str, Any], *, job_id: str) -> dict[s
 
 
 def _domain_build(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    from arc_domain import service as domain_service
+    from arc_paper.ids import normalize_paper_id
+
     _check_cancel(job_id)
     seed_paper = str(payload["seed_paper"])
     record_progress(
@@ -138,6 +138,8 @@ def _domain_build(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
 
 
 def _summary_batch_run(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    from arc_paper.batch.runner import run_batch
+
     _check_cancel(job_id)
     name = str(payload["name"])
     record_progress(job_id, {"event": "summary_batch_started", "name": name})
@@ -154,6 +156,8 @@ def _summary_batch_run(payload: dict[str, Any], *, job_id: str) -> dict[str, Any
 
 
 def _md2pdf(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    from arc_typeset import md2pdf as typeset_md2pdf
+
     _check_cancel(job_id)
     input_path = Path(str(payload["input"]))
     output_path = Path(str(payload["output"])) if payload.get("output") else None
@@ -181,6 +185,8 @@ def _md2pdf(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
 
 
 def _translate(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    from arc_typeset import translate as typeset_translate
+
     _check_cancel(job_id)
     input_path = Path(str(payload["input"]))
     output_path = Path(str(payload["output"])) if payload.get("output") else None
@@ -203,6 +209,8 @@ def _translate(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
 
 
 def _batch_translate(payload: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+    from arc_typeset import translate as typeset_translate
+
     _check_cancel(job_id)
     project_dir = Path(str(payload["project_dir"]))
     target_locale = str(payload.get("target_locale", typeset_translate.DEFAULT_TARGET_LOCALE))

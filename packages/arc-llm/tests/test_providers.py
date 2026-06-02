@@ -463,6 +463,11 @@ def test_claude_deepseek_auto_uses_prompt_contract_not_json_schema(monkeypatch):
     assert response.value == {"ok": True}
     assert "--json-schema" not in captured["cmd"]
     assert "JSON output contract" in captured["input"]
+    assert "Return exactly one JSON object and no surrounding prose." in captured["input"]
+    assert "Every required field must be present." in captured["input"]
+    assert "Do not wrap the object in Markdown." in captured["input"]
+    assert "Do not put the JSON object inside a string field such as result." in captured["input"]
+    assert "Use null only when the schema explicitly allows null." in captured["input"]
     assert "prompt" in captured["input"]
 
 

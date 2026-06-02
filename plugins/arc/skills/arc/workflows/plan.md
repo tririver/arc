@@ -85,8 +85,8 @@ Agent-added foundations are allowed without a human expert pause only when the
 proposers, reviewer, and main agent all agree that a specific equation or rule
 should become a foundation for later steps. Add the equation or rule under
 `## Axioms And Starting Points` with its validity scope, provenance, and the
-literal marker `[foundation added by agent]` formatted exactly like the red
-`[confirmed source issue]` marker:
+literal marker `[foundation added by agent]` formatted with the red marker
+style owned by `calculate.md`:
 
 ```tex
 \colorbox{arcsourceissue}{\textcolor{white}{[foundation added by agent]}}

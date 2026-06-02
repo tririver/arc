@@ -137,6 +137,14 @@ def test_worker_bool_arg_parses_string_booleans():
     assert worker._bool_arg("maybe", True) is True  # noqa: SLF001
 
 
+def test_worker_keeps_heavy_service_imports_lazy():
+    assert not hasattr(worker, "domain_service")
+    assert not hasattr(worker, "paper_service")
+    assert not hasattr(worker, "run_batch")
+    assert not hasattr(worker, "typeset_md2pdf")
+    assert not hasattr(worker, "typeset_translate")
+
+
 def test_resolve_inline_wait_reads_codex_config(tmp_path):
     codex_home = tmp_path / "codex"
     codex_home.mkdir()
@@ -158,7 +166,7 @@ def test_process_worker_persists_failed_status(tmp_path, monkeypatch):
 
     job_id = manager.start(job_type="unsupported_test_job", payload={})
 
-    assert manager.wait(job_id, timeout=5) is True
+    assert manager.wait(job_id, timeout=2) is True
     status = manager.status(job_id)
     assert status["status"] == "failed"
     assert status["error"]["code"] == "job_failed"
@@ -194,6 +202,8 @@ def test_cli_accepts_flat_job_commands(tmp_path, monkeypatch, capsys):
 
 
 def test_worker_dispatches_md2pdf_job(monkeypatch, tmp_path):
+    from arc_typeset import md2pdf as typeset_md2pdf
+
     source = tmp_path / "report.md"
     output = tmp_path / "report.pdf"
     source.write_text("# Report\n", encoding="utf-8")
@@ -211,7 +221,7 @@ def test_worker_dispatches_md2pdf_job(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
     monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
-    monkeypatch.setattr(worker.typeset_md2pdf, "convert_markdown_to_pdf", convert_markdown_to_pdf)
+    monkeypatch.setattr(typeset_md2pdf, "convert_markdown_to_pdf", convert_markdown_to_pdf)
 
     result = worker._dispatch(
         "md2pdf",
@@ -237,6 +247,8 @@ def test_worker_dispatches_md2pdf_job(monkeypatch, tmp_path):
 
 
 def test_worker_dispatches_translate_job(monkeypatch, tmp_path):
+    from arc_typeset import translate as typeset_translate
+
     source = tmp_path / "report.md"
     output = tmp_path / "report.zh_CN.md"
     source.write_text("# Report\n", encoding="utf-8")
@@ -258,7 +270,7 @@ def test_worker_dispatches_translate_job(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
     monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
-    monkeypatch.setattr(worker.typeset_translate, "translate_markdown", translate_markdown)
+    monkeypatch.setattr(typeset_translate, "translate_markdown", translate_markdown)
 
     result = worker._dispatch(
         "translate",
@@ -285,6 +297,8 @@ def test_worker_dispatches_translate_job(monkeypatch, tmp_path):
 
 
 def test_worker_dispatches_batch_translate_job(monkeypatch, tmp_path):
+    from arc_typeset import translate as typeset_translate
+
     calls = {}
     events = []
 
@@ -299,7 +313,7 @@ def test_worker_dispatches_batch_translate_job(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
     monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
-    monkeypatch.setattr(worker.typeset_translate, "batch_translate_project", batch_translate_project)
+    monkeypatch.setattr(typeset_translate, "batch_translate_project", batch_translate_project)
 
     result = worker._dispatch(
         "batch_translate",
@@ -316,6 +330,8 @@ def test_worker_dispatches_batch_translate_job(monkeypatch, tmp_path):
 
 
 def test_worker_dispatches_domain_build_model_tier(monkeypatch):
+    from arc_domain import service as domain_service
+
     calls = {}
     events = []
 
@@ -326,7 +342,7 @@ def test_worker_dispatches_domain_build_model_tier(monkeypatch):
 
     monkeypatch.setattr(worker, "is_cancel_requested", lambda job_id: False)
     monkeypatch.setattr(worker, "record_progress", lambda job_id, event: events.append(event))
-    monkeypatch.setattr(worker.domain_service, "build_domain", build_domain)
+    monkeypatch.setattr(domain_service, "build_domain", build_domain)
 
     result = worker._dispatch(
         "domain_build",

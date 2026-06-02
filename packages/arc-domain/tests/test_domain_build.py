@@ -266,9 +266,54 @@ def test_summarize_domain_reports_llm_failure_without_fallback(monkeypatch, tmp_
 
     result = service.summarize_domain(SEED, intent="intent", domain_id=domain_id, provider="auto")
 
-    assert result["ok"] is False
-    assert result["error"]["code"] == "domain_summary_failed"
-    assert "summary prompt too large" in result["error"]["message"]
+    assert result["ok"] is True
+    assert result["data"]["summary_available"] is False
+    assert result["data"]["summary"] is None
+    assert result["data"]["domain_summary_path"] is None
+    assert result["data"]["domain_summary_markdown_path"] is None
+    assert result["data"]["warnings"]
+    assert result["data"]["warnings"][0]["code"] == "domain_summary_failed"
+    assert "summary prompt too large" in result["data"]["warnings"][0]["message"]
+    assert not paths.domain_summary.exists()
+    assert not paths.domain_summary_markdown.exists()
+    status = read_json(paths.status)
+    assert status["stage"] == "summary_failed"
+    assert status["domain_summary_available"] is False
+    assert status["domain_summary_path"] is None
+    assert status["domain_summary_markdown_path"] is None
+    assert status["warnings"]
+
+
+def test_build_domain_continues_when_llm_summary_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+
+    monkeypatch.setattr(service, "_identify_foundation", lambda **kwargs: {"selection": {"selected_foundation": {}}})
+    monkeypatch.setattr(
+        service,
+        "_build_network",
+        lambda **kwargs: {"node_count": 1, "edge_count": 0, "graph_path": "graph.json"},
+    )
+    monkeypatch.setattr(service, "render_network_html", lambda **kwargs: {"network_html_path": "network.html"})
+    monkeypatch.setattr(service, "_build_paper_json_pack", lambda **kwargs: {"paper_json_pack_path": "pack.json"})
+    monkeypatch.setattr(service, "_build_evidence_pack", lambda **kwargs: {"evidence_pack_path": "evidence.json"})
+
+    def fail_summary(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(service, "_summarize_domain", fail_summary)
+
+    result = service.build_domain(SEED, intent="intent", provider="auto", workers=1)
+
+    assert result["ok"] is True
+    data = result["data"]
+    paths = DomainPaths.for_domain(data["domain_id"])
+    assert data["domain_summary_path"] is None
+    assert data["domain_summary_markdown_path"] is None
+    assert data["summary"] is None
+    assert data["summary_available"] is False
+    assert data["warnings"][0]["code"] == "domain_summary_failed"
+    assert data["paper_json_pack_path"] == "pack.json"
+    assert data["evidence_pack_path"] == "evidence.json"
     assert not paths.domain_summary.exists()
     assert not paths.domain_summary_markdown.exists()
 

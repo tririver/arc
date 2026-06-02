@@ -439,7 +439,8 @@ def test_call_tool_rejects_unknown_tool():
 
 
 def test_fastmcp_tools_have_discovery_metadata():
-    from mcp.server.fastmcp import FastMCP
+    fastmcp = pytest.importorskip("mcp.server.fastmcp")
+    FastMCP = fastmcp.FastMCP
 
     app = FastMCP("arc", instructions=server.SERVER_INSTRUCTIONS)
     server._register_tools(app)

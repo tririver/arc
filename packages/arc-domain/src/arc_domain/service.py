@@ -170,9 +170,16 @@ def summarize_domain(
         )
         if not paths.evidence_pack.exists():
             raise FileNotFoundError("evidence_pack.json missing; run build-evidence first")
-        return ok(_summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier))
     except Exception as exc:
         return err("domain_summary_failed", str(exc))
+    try:
+        return ok(_summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier))
+    except Exception as exc:
+        warning = _record_domain_summary_warning(paths, exc)
+        return ok(
+            _domain_summary_unavailable_result(paths, warning),
+            warning=f"domain_summary_failed: {exc}",
+        )
 
 
 def build_domain(
@@ -218,7 +225,15 @@ def build_domain(
         html = render_network_html(paths=paths)
         paper_pack = _build_paper_json_pack(paths=paths, refresh=refresh, workers=workers)
         evidence = _build_evidence_pack(paths=paths, refresh=refresh, workers=workers)
-        summary = _summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier)
+        warnings: list[dict[str, Any]] = []
+        try:
+            summary = _summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier)
+            summary_available = True
+        except Exception as exc:
+            warning = _record_domain_summary_warning(paths, exc)
+            warnings.append(warning)
+            summary = _domain_summary_unavailable_result(paths, warning)
+            summary_available = False
         return ok(
             {
                 "domain_id": paths.domain_id,
@@ -232,9 +247,11 @@ def build_domain(
                 },
                 "paper_json_pack_path": paper_pack["paper_json_pack_path"],
                 "evidence_pack_path": evidence["evidence_pack_path"],
-                "domain_summary_path": summary["domain_summary_path"],
+                "domain_summary_path": summary.get("domain_summary_path"),
                 "domain_summary_markdown_path": summary.get("domain_summary_markdown_path"),
-                "summary": summary["summary"],
+                "summary": summary.get("summary"),
+                "summary_available": summary_available,
+                "warnings": warnings,
             }
         )
     except Exception as exc:
@@ -434,3 +451,38 @@ def _paths(seed_paper: str | None, *, intent: str, domain_id: str | None) -> Dom
 
 def _exists(path) -> dict[str, Any]:
     return {"exists": path.exists(), "path": str(path)}
+
+
+def _record_domain_summary_warning(paths: DomainPaths, exc: Exception) -> dict[str, Any]:
+    warning = {
+        "code": "domain_summary_failed",
+        "message": str(exc),
+        "error_type": type(exc).__name__,
+        "created_at": now_iso(),
+    }
+    status = read_json(paths.status, {}) or {}
+    warnings = status.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    warnings.append(warning)
+    update_status(
+        paths,
+        stage="summary_failed",
+        domain_summary_available=False,
+        domain_summary_path=None,
+        domain_summary_markdown_path=None,
+        domain_summary_error=warning,
+        warnings=warnings,
+    )
+    return warning
+
+
+def _domain_summary_unavailable_result(paths: DomainPaths, warning: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "domain_id": paths.domain_id,
+        "domain_summary_path": None,
+        "domain_summary_markdown_path": None,
+        "summary": None,
+        "summary_available": False,
+        "warnings": [warning],
+    }

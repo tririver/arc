@@ -526,6 +526,11 @@ def test_calculate_templates_are_external_to_workflow_doc() -> None:
     assert "calculate-reviewer.template.json" in calculate
     assert "work_note_assessment" in proposer["prompt"]["template"]
     assert "agreement_assessment" in reviewer["prompt"]["template"]
+    assert "arc_llm_call_record.structured_output" in reviewer["prompt"]["template"]
+    assert "major" in reviewer["prompt"]["template"]
+    assert "Do not mark consensus as accepted/all_agree based solely on major/fatal recovered proposer output." in reviewer[
+        "prompt"
+    ]["template"]
 
 
 def test_calculate_template_sets_high_reasoning_defaults() -> None:
