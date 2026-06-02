@@ -6,6 +6,8 @@ import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.providers.base import LLMWorkerError
+from arc_llm.providers import claude_cli as claude_module
+from arc_llm.providers import codex_cli as codex_module
 from arc_llm.providers.claude_cli import ClaudeCliProvider
 from arc_llm.providers.codex_cli import CodexCliProvider
 from arc_llm.schema_cache import sha256_text
@@ -273,6 +275,41 @@ def test_codex_stateful_resume_keeps_session_when_schema_probe_fails(monkeypatch
     assert "delta prompt" in captured["input"]
 
 
+def test_codex_resume_schema_support_probe_is_memoized(monkeypatch):
+    if hasattr(codex_module, "_RESUME_SCHEMA_SUPPORT_CACHE"):
+        codex_module._RESUME_SCHEMA_SUPPORT_CACHE.clear()  # noqa: SLF001
+    calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(cmd, 0, stdout="--output-schema", stderr="")
+
+    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    env = {"PATH": "/tmp/test-path"}
+
+    assert codex_module._codex_resume_supports_output_schema(env) is True  # noqa: SLF001
+    assert codex_module._codex_resume_supports_output_schema(env) is True  # noqa: SLF001
+    assert calls == 1
+
+
+def test_codex_resume_schema_support_override_skips_probe(monkeypatch):
+    if hasattr(codex_module, "_RESUME_SCHEMA_SUPPORT_CACHE"):
+        codex_module._RESUME_SCHEMA_SUPPORT_CACHE.clear()  # noqa: SLF001
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("resume support override should not probe subprocess")
+
+    monkeypatch.setattr(codex_module.subprocess, "run", fail_run)
+
+    assert codex_module._codex_resume_supports_output_schema(  # noqa: SLF001
+        {"ARC_CODEX_RESUME_SUPPORTS_OUTPUT_SCHEMA": "true"}
+    ) is True
+    assert codex_module._codex_resume_supports_output_schema(  # noqa: SLF001
+        {"ARC_CODEX_RESUME_SUPPORTS_OUTPUT_SCHEMA": "false"}
+    ) is False
+
+
 def test_codex_passes_provider_env_to_subprocess(monkeypatch):
     captured = {}
     provider_env = {"ARC_CODEX_SANDBOX": "read-only", "CUSTOM_SETTING": "value"}
@@ -404,6 +441,29 @@ def test_codex_arc_only_mcp_keeps_user_config_ignored_and_injects_arc_server(mon
     assert 'mcp_servers.arc.env.ARC_AGENT_HOST="codex"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_PAPER_CACHE="/tmp/cache/arc-paper"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_MCP_CACHE="/tmp/cache/arc-mcp"' in captured["cmd"]
+
+
+def test_codex_arc_only_rejects_mcp_server_extra_config():
+    env = {
+        "ARC_CODEX_ENABLE_MCP": "true",
+        "ARC_CODEX_MCP_MODE": "arc-only",
+        "ARC_CODEX_CONFIG_JSON": json.dumps({"mcp_servers.other.command": "bad"}),
+    }
+
+    with pytest.raises(LLMWorkerError, match="arc-only"):
+        codex_module._base_cmd(env, stateful=True)  # noqa: SLF001
+
+
+def test_codex_arc_only_allows_non_mcp_extra_config():
+    env = {
+        "ARC_CODEX_ENABLE_MCP": "true",
+        "ARC_CODEX_MCP_MODE": "arc-only",
+        "ARC_CODEX_CONFIG_JSON": json.dumps({"model_verbosity": "medium"}),
+    }
+
+    cmd = codex_module._base_cmd(env, stateful=True)  # noqa: SLF001
+
+    assert any(item == 'model_verbosity="medium"' for item in cmd)
 
 
 def test_codex_invalid_mcp_mode_fails_closed(monkeypatch):
@@ -686,6 +746,31 @@ def test_claude_stateful_text_uses_json_output_and_records_usage(monkeypatch):
     assert captured["cmd"][captured["cmd"].index("--output-format") + 1] == "json"
 
 
+def test_claude_text_result_writes_raw_artifacts(monkeypatch, tmp_path):
+    def fake_run(cmd, **kwargs):
+        payload = {
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "usage": {"input_tokens": 11, "output_tokens": 2},
+            "result": "plain text",
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="debug stderr")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_text_result(
+        "prompt",
+        session=LLMSessionRef(key="scope/reviewer/reviewer_001", provider="claude-cli", model="m", runtime_fingerprint="fp"),
+        session_policy="stateful",
+        artifact_dir=tmp_path,
+    )
+
+    assert response.value == "plain text"
+    assert (tmp_path / "raw_stdout.txt").exists()
+    assert (tmp_path / "raw_stderr.txt").exists()
+    assert "plain text" in (tmp_path / "raw_stdout.txt").read_text(encoding="utf-8")
+    assert (tmp_path / "raw_stderr.txt").read_text(encoding="utf-8") == "debug stderr"
+
+
 def test_claude_stateful_first_call_uses_session_id(monkeypatch):
     captured = {}
     session = LLMSessionRef(key="scope/reviewer/reviewer_001", provider="claude-cli", model="m", runtime_fingerprint="fp")
@@ -870,6 +955,28 @@ def test_claude_arc_only_mcp_generates_strict_arc_config(monkeypatch, tmp_path):
     assert payload["mcpServers"]["arc"]["env"]["ARC_AGENT_HOST"] == "claude"
     assert payload["mcpServers"]["arc"]["env"]["ARC_PAPER_CACHE"] == str(tmp_path / "paper-cache")
     assert payload["mcpServers"]["arc"]["env"]["EXTRA"] == "value"
+
+
+def test_claude_arc_only_rejects_extra_mcp_configs(tmp_path):
+    env = {
+        "ARC_CLAUDE_MCP_MODE": "arc-only",
+        "ARC_CLAUDE_MCP_CONFIG": "/tmp/not-arc.json",
+        "ARC_CLAUDE_ARC_MCP_CONFIG_PATH": str(tmp_path / "arc.json"),
+    }
+
+    with pytest.raises(LLMWorkerError, match="arc-only"):
+        claude_module._mcp_configs(env)  # noqa: SLF001
+
+
+def test_claude_arc_only_always_generates_arc_config(tmp_path):
+    env = {
+        "ARC_CLAUDE_MCP_MODE": "arc-only",
+        "ARC_CLAUDE_ARC_MCP_CONFIG_PATH": str(tmp_path / "arc.json"),
+    }
+
+    configs = claude_module._mcp_configs(env)  # noqa: SLF001
+
+    assert configs == [str(tmp_path / "arc.json")]
 
 
 def test_claude_arc_only_mcp_default_does_not_fall_back_to_uvx(monkeypatch, tmp_path):

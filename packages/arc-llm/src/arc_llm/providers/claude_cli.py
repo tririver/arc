@@ -145,6 +145,7 @@ class ClaudeCliProvider:
             )
         except subprocess.TimeoutExpired as exc:
             raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
+        _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
             raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
         if json_output:
@@ -374,6 +375,18 @@ def _claude_tools(env: Mapping[str, str], *, allow_mcp: bool) -> str | None:
 
 
 def _mcp_configs(env: Mapping[str, str]) -> list[str]:
+    mcp_mode = _env_text(env, "ARC_CLAUDE_MCP_MODE", "user-config")
+    if mcp_mode not in {"", "user-config", "arc-only"}:
+        raise LLMWorkerError("ARC_CLAUDE_MCP_MODE must be one of: user-config, arc-only")
+    if mcp_mode == "arc-only":
+        if (env.get("ARC_CLAUDE_MCP_CONFIG") or env.get("ARC_CLAUDE_MCP_CONFIG_JSON")) and not _env_bool(
+            env, "ARC_CLAUDE_ARC_ONLY_ALLOW_EXTRA_CONFIGS", False
+        ):
+            raise LLMWorkerError(
+                "ARC_CLAUDE_MCP_MODE=arc-only cannot be combined with ARC_CLAUDE_MCP_CONFIG "
+                "or ARC_CLAUDE_MCP_CONFIG_JSON. Use user-config mode or unset the extra configs."
+            )
+        return [str(_write_arc_only_mcp_config(env))]
     values = []
     if raw_json := env.get("ARC_CLAUDE_MCP_CONFIG_JSON"):
         try:
@@ -385,11 +398,6 @@ def _mcp_configs(env: Mapping[str, str]) -> list[str]:
         values.extend(payload)
     if raw := env.get("ARC_CLAUDE_MCP_CONFIG"):
         values.extend(line.strip() for line in raw.splitlines() if line.strip())
-    mcp_mode = _env_text(env, "ARC_CLAUDE_MCP_MODE", "user-config")
-    if mcp_mode not in {"", "user-config", "arc-only"}:
-        raise LLMWorkerError("ARC_CLAUDE_MCP_MODE must be one of: user-config, arc-only")
-    if mcp_mode == "arc-only" and not values:
-        values.append(str(_write_arc_only_mcp_config(env)))
     return values
 
 

@@ -136,8 +136,13 @@ def test_worker_bool_arg_parses_string_booleans():
     assert worker._bool_arg("true") is True  # noqa: SLF001
     assert worker._bool_arg("on") is True  # noqa: SLF001
     assert worker._bool_arg(None, True) is True  # noqa: SLF001
-    assert worker._bool_arg("maybe") is False  # noqa: SLF001
-    assert worker._bool_arg("maybe", True) is True  # noqa: SLF001
+
+
+def test_worker_bool_arg_rejects_invalid_values():
+    with pytest.raises(ValueError, match="Expected boolean string"):
+        worker._bool_arg("flase")  # noqa: SLF001
+    with pytest.raises(ValueError, match="Expected boolean"):
+        worker._bool_arg(2)  # noqa: SLF001
 
 
 def test_worker_keeps_heavy_service_imports_lazy():

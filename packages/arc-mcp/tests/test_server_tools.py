@@ -43,8 +43,13 @@ def test_bool_arg_parses_string_booleans():
     assert server._bool_arg("true") is True  # noqa: SLF001
     assert server._bool_arg("yes") is True  # noqa: SLF001
     assert server._bool_arg(None, True) is True  # noqa: SLF001
-    assert server._bool_arg("maybe") is False  # noqa: SLF001
-    assert server._bool_arg("maybe", True) is True  # noqa: SLF001
+
+
+def test_bool_arg_rejects_invalid_values():
+    with pytest.raises(server.ToolInputError, match="Expected boolean string"):
+        server._bool_arg("flase")  # noqa: SLF001
+    with pytest.raises(server.ToolInputError, match="Expected boolean"):
+        server._bool_arg(2)  # noqa: SLF001
 
 
 def test_arc_mcp_watch_command_uses_runtime_executable_when_path_absent(monkeypatch, tmp_path):

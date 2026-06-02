@@ -865,6 +865,19 @@ def _valid_strict_review(message: str = "valid") -> dict[str, Any]:
     }
 
 
+def test_raw_output_text_prefers_structured_raw_excerpt():
+    output = {
+        ARC_LLM_CALL_RECORD_FIELD: {
+            "structured_output": {
+                "mode": "recovered",
+                "raw_text_excerpt": "real raw model text",
+            }
+        }
+    }
+
+    assert runner_module._raw_output_text(output) == "real raw model text"  # noqa: SLF001
+
+
 def _shallow_valid_nested_invalid_review() -> dict[str, Any]:
     return {
         "schema_version": "arc.llm.review_envelope.v1",
@@ -972,7 +985,8 @@ def test_reviewer_validation_retry_failure_uses_conservative_fallback_in_warn_mo
     assert structured["recovery_strategy"] == "reviewer_schema_failure_fallback"
     assert review["controller"]["stop_requested"] is False
     assert consensus["status"] == "unresolved"
-    assert consensus["workflow_action"]["action"] == "retry"
+    assert consensus["workflow_action"]["action"] == "pause_for_human"
+    assert consensus["workflow_action"]["requires_human"] is True
 
 
 def test_reviewer_schema_failure_fallback_cannot_preserve_approving_retry(tmp_path):
@@ -1012,7 +1026,8 @@ def test_reviewer_schema_failure_fallback_cannot_preserve_approving_retry(tmp_pa
     assert consensus["status"] == "unresolved"
     assert consensus["accepted_result"] is None
     assert consensus["agreed_proposer_ids"] == []
-    assert consensus["workflow_action"]["action"] == "retry"
+    assert consensus["workflow_action"]["action"] == "pause_for_human"
+    assert consensus["workflow_action"]["requires_human"] is True
     assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["severity"] == "major"
 
 

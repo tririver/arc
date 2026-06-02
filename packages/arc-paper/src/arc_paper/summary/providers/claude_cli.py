@@ -15,12 +15,16 @@ class ClaudeCliProvider:
 
     def __init__(
         self,
-        prompt_provider: ClaudePromptProvider | None = None,
         *,
         env: Mapping[str, str] | None = None,
+        _test_prompt_provider: ClaudePromptProvider | None = None,
     ):
-        self.prompt_provider = prompt_provider
+        self._test_prompt_provider = _test_prompt_provider
         self.env = env
+
+    @property
+    def prompt_provider(self) -> ClaudePromptProvider | None:
+        return self._test_prompt_provider
 
     def generate_summary(
         self,
@@ -43,8 +47,8 @@ class ClaudeCliProvider:
 
     def _run_json(self, prompt: str, schema: dict, model: str | None) -> dict:
         output_schema = schema or load_summary_schema()
-        if self.prompt_provider is not None:
-            return self.prompt_provider.generate_json(prompt, schema=output_schema, model=model)
+        if self._test_prompt_provider is not None:
+            return self._test_prompt_provider.generate_json(prompt, schema=output_schema, model=model)
         return run_json(
             prompt,
             schema=output_schema,

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,6 +17,10 @@ from arc_llm.structured_recovery import parse_json_object_relaxed, structured_me
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
 from .base import LLMWorkerError
+
+
+_RESUME_SCHEMA_SUPPORT_CACHE: dict[tuple[str, str | None], bool] = {}
+_RESUME_SCHEMA_SUPPORT_LOCK = threading.Lock()
 
 
 class CodexCliProvider:
@@ -195,7 +200,7 @@ def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
         cmd.extend(["-c", f"{key}={value}"])
     for key, value in _arc_only_mcp_config_overrides(env):
         cmd.extend(["-c", f"{key}={value}"])
-    for override in _extra_config_overrides(env):
+    for override in _extra_config_overrides(env, mcp_mode=mcp_mode):
         cmd.extend(["-c", override])
     return cmd
 
@@ -255,9 +260,24 @@ def _default_schema_cache_dir(env: Mapping[str, str]) -> Path:
 
 
 def _codex_resume_supports_output_schema(env: Mapping[str, str]) -> bool:
+    override = env.get("ARC_CODEX_RESUME_SUPPORTS_OUTPUT_SCHEMA")
+    if override is not None:
+        return _env_bool(env, "ARC_CODEX_RESUME_SUPPORTS_OUTPUT_SCHEMA", False)
+    key = (env.get("ARC_CODEX_BIN", "codex"), env.get("PATH"))
+    with _RESUME_SCHEMA_SUPPORT_LOCK:
+        cached = _RESUME_SCHEMA_SUPPORT_CACHE.get(key)
+        if cached is not None:
+            return cached
+    supported = _probe_codex_resume_schema_support(env)
+    with _RESUME_SCHEMA_SUPPORT_LOCK:
+        _RESUME_SCHEMA_SUPPORT_CACHE[key] = supported
+    return supported
+
+
+def _probe_codex_resume_schema_support(env: Mapping[str, str]) -> bool:
     try:
         result = subprocess.run(
-            ["codex", "exec", "resume", "--help"],
+            [env.get("ARC_CODEX_BIN", "codex"), "exec", "resume", "--help"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -439,7 +459,7 @@ def _arc_mcp_command(env: Mapping[str, str]) -> str:
     return "arc-mcp"
 
 
-def _extra_config_overrides(env: Mapping[str, str]) -> list[str]:
+def _extra_config_overrides(env: Mapping[str, str], *, mcp_mode: str = "user-config") -> list[str]:
     values = []
     if raw_json := env.get("ARC_CODEX_CONFIG_JSON"):
         try:
@@ -451,6 +471,14 @@ def _extra_config_overrides(env: Mapping[str, str]) -> list[str]:
         values.extend(f"{key}={_toml_value(value)}" for key, value in payload.items())
     if raw := env.get("ARC_CODEX_CONFIG"):
         values.extend(line.strip() for line in raw.splitlines() if line.strip())
+    if mcp_mode == "arc-only":
+        for item in values:
+            key = item.split("=", 1)[0].strip()
+            if key.startswith("mcp_servers."):
+                raise LLMWorkerError(
+                    "ARC_CODEX_MCP_MODE=arc-only cannot be combined with ARC_CODEX_CONFIG/JSON "
+                    "entries under mcp_servers.*"
+                )
     return values
 
 

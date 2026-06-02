@@ -18,7 +18,7 @@ from .retryable_output import ProviderOutputClass, classify_provider_output_text
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
-from .structured_recovery import recover_json_output
+from .structured_recovery import recover_json_output, structured_metadata
 from .usage import LLMProviderResponse, LLMUsage
 
 
@@ -597,6 +597,12 @@ def _recover_or_validate_json_output(
     structured_output = response.structured_output
     _raise_if_provider_failure_text(result, structured_output=structured_output, raw_output=response.raw_output)
     provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
+    if not validate_schema:
+        if isinstance(result, dict):
+            return result, structured_output
+        if output_recovery != "warn":
+            raise LLMOutputValidationError("JSON output was not an object")
+        return {}, _recovered_natural_language_metadata(result, response)
     if not isinstance(result, dict):
         if output_recovery != "warn":
             raise LLMOutputValidationError("JSON output was not an object")
@@ -644,6 +650,20 @@ def _recover_or_validate_json_output(
         result = recovered.value
         structured_output = recovered.structured_output or structured_output
     return result, structured_output
+
+
+def _recovered_natural_language_metadata(result: Any, response: LLMProviderResponse[Any]) -> dict[str, Any]:
+    existing = response.structured_output if isinstance(response.structured_output, Mapping) else None
+    if isinstance(existing, Mapping):
+        return dict(existing)
+    raw_text = response.raw_output or (result if isinstance(result, str) else repr(result))
+    return structured_metadata(
+        severity="major",
+        warnings=["Provider returned non-object output; accepted because schema validation is disabled for this call."],
+        raw_text=str(raw_text),
+        strategy="natural_language_fallback",
+        provider_error_type=type(result).__name__,
+    )
 
 
 def _raise_if_provider_failure_text(

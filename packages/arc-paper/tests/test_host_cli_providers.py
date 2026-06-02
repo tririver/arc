@@ -125,21 +125,21 @@ def test_claude_cli_provider_uses_medium_default_model(monkeypatch):
     assert calls[0]["model"] == "sonnet"
 
 
-def test_codex_summary_provider_keeps_injected_prompt_provider():
+def test_codex_summary_provider_keeps_test_prompt_provider():
     class FakePromptProvider:
         def generate_json(self, prompt, *, schema, model):
             return valid_summary()
 
-    result = CodexCliProvider(prompt_provider=FakePromptProvider()).generate_summary(llm_task(), model="test-model")
+    result = CodexCliProvider(_test_prompt_provider=FakePromptProvider()).generate_summary(llm_task(), model="test-model")
 
     assert result["title"] == "A Test Paper"
 
 
-def test_claude_summary_provider_keeps_injected_prompt_provider():
+def test_claude_summary_provider_keeps_test_prompt_provider():
     class FakePromptProvider:
         def generate_json(self, prompt, *, schema, model):
             return valid_summary()
 
-    result = ClaudeCliProvider(prompt_provider=FakePromptProvider()).generate_summary(llm_task(), model="test-model")
+    result = ClaudeCliProvider(_test_prompt_provider=FakePromptProvider()).generate_summary(llm_task(), model="test-model")
 
     assert result["title"] == "A Test Paper"

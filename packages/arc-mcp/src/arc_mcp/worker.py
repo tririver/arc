@@ -27,8 +27,10 @@ def _bool_arg(value: Any, default: bool = False) -> bool:
             return True
         if text in {"0", "false", "no", "off"}:
             return False
-        return default
-    return bool(value)
+        raise ValueError(f"Expected boolean string, got {value!r}")
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"Expected boolean, got {type(value).__name__}")
 
 
 def main(argv: list[str] | None = None) -> int:

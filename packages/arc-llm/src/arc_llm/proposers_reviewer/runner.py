@@ -736,11 +736,11 @@ def _force_non_approving_reviewer_fallback(
         consensus["workflow_action"] = workflow_action
     workflow_action["action"] = _preferred_enum(
         _schema_enum(_schema_at(schema, "review_payload", "consensus", "workflow_action", "action")),
-        preferred=("retry", "pause_for_human", "revise_plan", "split_step"),
-        fallback="retry",
+        preferred=("pause_for_human", "revise_plan", "split_step", "retry"),
+        fallback="pause_for_human",
         unsafe=("continue", "finalize", "accept"),
     )
-    _set_if_schema_allows_or_present(workflow_action, "requires_human", workflow_action["action"] != "retry", workflow_schema)
+    _set_if_schema_allows_or_present(workflow_action, "requires_human", True, workflow_schema)
     _set_if_schema_allows_or_present(
         workflow_action,
         "issue_type",
@@ -1687,6 +1687,12 @@ def _output_recovery_mode(options: OutputRecoveryOptions) -> str:
 
 
 def _raw_output_text(output: Any) -> str:
+    if isinstance(output, Mapping):
+        structured = _structured_output_from_payload(output)
+        if isinstance(structured, Mapping):
+            raw_excerpt = structured.get("raw_text_excerpt")
+            if isinstance(raw_excerpt, str) and raw_excerpt.strip():
+                return raw_excerpt
     if isinstance(output, str):
         return output
     return json.dumps(output, ensure_ascii=False, sort_keys=True, default=str)

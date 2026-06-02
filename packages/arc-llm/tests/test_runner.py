@@ -7,6 +7,7 @@ from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, allow_arc_llm_call_re
 from arc_llm.json_schema import to_provider_json_schema
 from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionManager
+from arc_llm.structured_recovery import structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 from arc_llm import runner
 from arc_llm.runner import LLMTaskError, resolve_llm_config, run_json, run_text, run_text_result
@@ -183,6 +184,62 @@ def test_provider_schema_makes_additional_items_schema_strict():
     provider_schema = to_provider_json_schema(schema)
 
     assert provider_schema["additionalItems"]["additionalProperties"] is False
+
+
+def test_warn_recovery_does_not_force_unknown_schema_when_validation_disabled():
+    schema = {
+        "type": "object",
+        "required": ["foo"],
+        "properties": {"foo": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    response = LLMProviderResponse(
+        {},
+        raw_output="plain text",
+        structured_output=structured_metadata(
+            severity="major",
+            warnings=["natural language fallback"],
+            raw_text="plain text",
+            strategy="natural_language_fallback",
+            provider_error_type="text",
+        ),
+    )
+
+    result, structured = runner._recover_or_validate_json_output(  # noqa: SLF001
+        {},
+        schema=schema,
+        validate_schema=False,
+        output_recovery="warn",
+        role_hint="proposer",
+        response=response,
+    )
+
+    assert result == {}
+    assert structured["mode"] == "recovered"
+    assert structured["recovery_strategy"] == "natural_language_fallback"
+
+
+def test_valid_schema_output_unchanged_when_validation_enabled():
+    schema = {
+        "type": "object",
+        "required": ["foo"],
+        "properties": {"foo": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    payload = {"foo": "bar"}
+    response = LLMProviderResponse(payload, raw_output='{"foo":"bar"}')
+
+    result, structured = runner._recover_or_validate_json_output(  # noqa: SLF001
+        payload,
+        schema=schema,
+        validate_schema=True,
+        output_recovery="warn",
+        role_hint="proposer",
+        response=response,
+    )
+
+    assert result == {"foo": "bar"}
+    assert structured is None
 
 
 def assert_strict_objects(schema):

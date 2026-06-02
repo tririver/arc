@@ -340,8 +340,11 @@ def _known_schema_fallback(schema: Mapping[str, Any], *, raw_text: str, role_hin
                 "needs_revision": True,
                 "issue_type": "other",
                 "proposed_revision": None,
-                "rationale": "The proposer output did not fully comply with the required JSON schema.",
-                "can_continue_without_revision": True,
+                "rationale": (
+                    "The proposer output did not fully comply with the required JSON schema; "
+                    "do not accept without reviewer/human inspection."
+                ),
+                "can_continue_without_revision": False,
             },
         }
     if {"schema_version", "controller", "proposer_messages", "review_payload"} <= required:
@@ -443,10 +446,10 @@ def _workflow_action_fallback(schema: Mapping[str, Any]) -> dict[str, Any]:
     issue_schema = props.get("issue_type", {}) if isinstance(props.get("issue_type"), Mapping) else {}
     actions = list(action_schema.get("enum") or [])
     issues = list(issue_schema.get("enum") or [])
-    action = "retry" if "retry" in actions else ("pause_for_human" if "pause_for_human" in actions else _safe_enum(actions))
+    action = "pause_for_human" if "pause_for_human" in actions else ("retry" if "retry" in actions else _safe_enum(actions))
     return {
         "action": action,
-        "requires_human": action != "retry",
+        "requires_human": True,
         "issue_type": "worker_failure" if "worker_failure" in issues else _safe_enum(issues),
         "proposed_revision": None,
         "reason": "Reviewer output required major structured-output recovery.",
