@@ -76,6 +76,8 @@ def test_batch_config_defaults_output_recovery_to_warn(tmp_path: Path):
 
     assert batch.output_recovery.enabled is True
     assert batch.output_recovery.mode == "warn"
+    assert batch.output_recovery.schema_violation_policy == "retry_then_recover"
+    assert batch.output_recovery.reviewer_validation_retries == 1
 
 
 class FakeJsonRunner:
@@ -608,6 +610,143 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
     assert review["controller"]["message"] == "valid after retry"
     assert "Previous reviewer response failed validation" not in original_prompt
     assert "Previous reviewer response failed validation" in retry_prompt
+
+
+def test_reviewer_validation_retry_count_is_configurable(tmp_path):
+    calls = 0
+
+    def invalid_twice_then_valid(prompt, **kwargs):
+        nonlocal calls
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls += 1
+            if calls < 3:
+                return {"message": f"invalid {calls}"}
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "valid after second retry", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {"enabled": True, "mode": "warn", "reviewer_validation_retries": 2}
+
+    result = run_proposers_reviewer_batch(config, json_runner=invalid_twice_then_valid, base_env={})
+
+    round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
+    review = json.loads((round_root / "reviews/reviewer_001.json").read_text(encoding="utf-8"))
+    assert result["status"] == "completed"
+    assert calls == 3
+    assert (round_root / "prompts/reviewer_001.retry_001.md").exists()
+    assert (round_root / "prompts/reviewer_001.retry_002.md").exists()
+    assert review["controller"]["message"] == "valid after second retry"
+
+
+def test_peer_visible_reviewer_schema_violation_skips_validation_retry_and_records_warning(tmp_path):
+    calls = 0
+
+    def invalid_reviewer(prompt, **kwargs):
+        nonlocal calls
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls += 1
+            return "Referee says derivation is unclear; ask both proposers to recompute the boundary term."
+        return {"ok": True}
+
+    config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {
+        "enabled": True,
+        "mode": "warn",
+        "allow_natural_language": True,
+        "schema_violation_policy": "peer_visible",
+        "reviewer_validation_retries": 0,
+    }
+
+    result = run_proposers_reviewer_batch(config, json_runner=invalid_reviewer, base_env={})
+
+    round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
+    review = json.loads((round_root / "reviews/reviewer_001.json").read_text(encoding="utf-8"))
+    warnings = [
+        json.loads(line)
+        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result["status"] == "completed"
+    assert calls == 1
+    assert not (round_root / "prompts/reviewer_001.retry_001.md").exists()
+    assert review["review_payload"]["consensus"]["status"] == "unresolved"
+    assert "Referee says derivation is unclear" in review["proposer_messages"]["proposer_001"]["message"]
+    assert warnings[-1]["recovery_strategy"] == "peer_visible_reviewer_fallback"
+
+
+def test_peer_visible_proposer_plain_text_is_wrapped_for_reviewer_context_and_warned(tmp_path):
+    reviewer_seen: dict[str, Any] = {}
+
+    def plain_text_proposer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"] == "proposer_001":
+            return "Proposal: compute the saddle correction and compare the two asymptotic limits."
+        if context["worker_id"].startswith("reviewer"):
+            reviewer_seen.update(context["current_proposer_outputs"])
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "expand"},
+                    "proposer_002": {"message": "expand"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"ok": True}
+
+    config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {
+        "enabled": True,
+        "mode": "warn",
+        "allow_natural_language": True,
+        "schema_violation_policy": "peer_visible",
+        "reviewer_validation_retries": 0,
+    }
+
+    result = run_proposers_reviewer_batch(config, json_runner=plain_text_proposer, base_env={})
+
+    wrapped = reviewer_seen["proposer_001"]
+    warnings = [
+        json.loads(line)
+        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert result["status"] == "completed"
+    assert wrapped["schema_version"] == "arc.llm.unstructured_output.v1"
+    assert wrapped["raw_text"].startswith("Proposal: compute")
+    assert warnings[-1]["worker_id"] == "proposer_001"
+    assert warnings[-1]["recovery_strategy"] == "peer_visible_unstructured_output"
+
+
+def test_peer_visible_provider_failure_text_is_not_treated_as_reviewer_reply(tmp_path):
+    def service_unavailable_reviewer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            return "Service unavailable"
+        return {"ok": True}
+
+    config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {
+        "enabled": True,
+        "mode": "warn",
+        "allow_natural_language": True,
+        "schema_violation_policy": "peer_visible",
+        "reviewer_validation_retries": 0,
+    }
+
+    result = run_proposers_reviewer_batch(config, json_runner=service_unavailable_reviewer, base_env={})
+
+    assert result["status"] == "failed"
+    assert "retryable provider failure text" in result["loops"][0]["error"]
 
 
 def _strict_reviewer_schema() -> dict[str, Any]:

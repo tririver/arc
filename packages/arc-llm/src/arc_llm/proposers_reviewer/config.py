@@ -85,6 +85,8 @@ class OutputRecoveryOptions:
     enabled: bool
     mode: str
     allow_natural_language: bool
+    schema_violation_policy: str
+    reviewer_validation_retries: int
 
 
 @dataclass(frozen=True)
@@ -339,12 +341,22 @@ def _parse_output_recovery(raw_options: Any) -> OutputRecoveryOptions:
     mode = str(options.get("mode", "warn") or "warn").strip().lower()
     if mode not in {"strict", "warn"}:
         raise ConfigError("output_recovery.mode must be strict or warn")
+    schema_violation_policy = str(
+        options.get("schema_violation_policy", "retry_then_recover") or "retry_then_recover"
+    ).strip().lower()
+    if schema_violation_policy not in {"retry_then_recover", "peer_visible"}:
+        raise ConfigError("output_recovery.schema_violation_policy must be retry_then_recover or peer_visible")
     return OutputRecoveryOptions(
         enabled=_bool(options.get("enabled", True), "output_recovery.enabled"),
         mode=mode,
         allow_natural_language=_bool(
             options.get("allow_natural_language", True),
             "output_recovery.allow_natural_language",
+        ),
+        schema_violation_policy=schema_violation_policy,
+        reviewer_validation_retries=_non_negative_int(
+            options.get("reviewer_validation_retries", 1),
+            "output_recovery.reviewer_validation_retries",
         ),
     )
 

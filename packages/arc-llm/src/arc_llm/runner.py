@@ -14,6 +14,7 @@ from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
 from .model import resolve_model
+from .retryable_output import ProviderOutputClass, classify_provider_output_text
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
@@ -30,6 +31,10 @@ class LLMTaskError(RuntimeError):
 
 
 class LLMOutputValidationError(RuntimeError):
+    pass
+
+
+class LLMFatalProviderOutputError(LLMOutputValidationError):
     pass
 
 
@@ -320,6 +325,8 @@ def _run_with_retries(
                         error=exc,
                     )
                 )
+                if isinstance(exc, LLMFatalProviderOutputError):
+                    raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts)) from exc
                 if _has_remaining_attempt(configs, fallback_index=fallback_index, attempt=attempt, max_attempts=max_attempts):
                     time.sleep(RETRY_INTERVAL_SECONDS)
     raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts))
@@ -588,6 +595,7 @@ def _recover_or_validate_json_output(
     response: LLMProviderResponse[dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     structured_output = response.structured_output
+    _raise_if_provider_failure_text(result, structured_output=structured_output, raw_output=response.raw_output)
     provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
     if not isinstance(result, dict):
         if output_recovery != "warn":
@@ -636,6 +644,28 @@ def _recover_or_validate_json_output(
         result = recovered.value
         structured_output = recovered.structured_output or structured_output
     return result, structured_output
+
+
+def _raise_if_provider_failure_text(
+    result: Any,
+    *,
+    structured_output: Any,
+    raw_output: str | None,
+) -> None:
+    candidate = result if isinstance(result, str) else None
+    metadata = structured_output if isinstance(structured_output, Mapping) else None
+    if candidate is None and metadata is not None:
+        raw_excerpt = metadata.get("raw_text_excerpt")
+        if isinstance(raw_excerpt, str) and raw_excerpt.strip():
+            candidate = raw_excerpt
+    if candidate is None:
+        return
+    classification = classify_provider_output_text(candidate, metadata=metadata)
+    if classification.classification == ProviderOutputClass.OK:
+        return
+    if classification.classification == ProviderOutputClass.RETRYABLE_PROVIDER_FAILURE:
+        raise LLMOutputValidationError(f"retryable provider failure text: {classification.reason}")
+    raise LLMFatalProviderOutputError(f"fatal provider failure text: {classification.reason}")
 
 
 def _call_record(

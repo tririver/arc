@@ -9,7 +9,7 @@ from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionManager
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 from arc_llm import runner
-from arc_llm.runner import resolve_llm_config, run_json, run_text, run_text_result
+from arc_llm.runner import LLMTaskError, resolve_llm_config, run_json, run_text, run_text_result
 
 
 @pytest.fixture(autouse=True)
@@ -346,6 +346,50 @@ class RecoverableTextResultProvider:
         )
 
 
+class ServiceUnavailableThenOkProvider:
+    name = "codex-cli"
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        self.attempts += 1
+        if self.attempts == 1:
+            return LLMProviderResponse("Service unavailable")
+        return LLMProviderResponse({"ok": True})
+
+
+class FatalBadRequestProvider:
+    name = "codex-cli"
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        self.attempts += 1
+        return LLMProviderResponse("HTTP 400 Bad Request: invalid schema")
+
+
 class FlakyJsonProvider:
     def __init__(self, *, name, failures_before_success=None, result=None):
         self.name = name
@@ -462,6 +506,45 @@ def test_run_json_recovery_warn_valid_json_is_unchanged(monkeypatch):
 
     assert without_call_record(result) == {"ok": True}
     assert result[ARC_LLM_CALL_RECORD_FIELD].get("structured_output") is None
+
+
+def test_run_json_retries_provider_failure_text_before_recovery(monkeypatch):
+    provider = ServiceUnavailableThenOkProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    result = run_json(
+        "prompt",
+        schema={
+            "type": "object",
+            "required": ["ok"],
+            "properties": {"ok": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+        provider="codex-cli",
+        env={},
+        process_chain=[],
+        output_recovery="warn",
+    )
+
+    assert provider.attempts == 2
+    assert result["ok"] is True
+
+
+def test_run_json_fails_fast_for_fatal_provider_failure_text(monkeypatch):
+    provider = FatalBadRequestProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    with pytest.raises(LLMTaskError, match="fatal provider failure text"):
+        run_json(
+            "prompt",
+            schema={"type": "object"},
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            output_recovery="warn",
+        )
+
+    assert provider.attempts == 1
 
 
 def test_run_json_recovery_warn_builds_known_proposer_fallback(monkeypatch):

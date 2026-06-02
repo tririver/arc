@@ -110,6 +110,8 @@ def materialize_batch(
                 "enabled": True,
                 "mode": "warn",
                 "allow_natural_language": True,
+                "schema_violation_policy": "retry_then_recover",
+                "reviewer_validation_retries": 1,
             }
         )
     )
