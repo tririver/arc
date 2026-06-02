@@ -74,21 +74,26 @@ The plugin starts the ARC MCP server with a bundled launcher:
 ./bin/arc-mcp
 ```
 
-On first MCP use, the launcher installs ARC into a cache-local runtime and
-reuses it for later MCP calls. If that install fails, later starts fail fast with
-the saved log path instead of retrying a broken partial install. To retry after
-fixing the cause, set `ARC_MCP_INSTALL_RETRY=1` or remove the failure marker
-named in the error. Marketplace installs fetch ARC packages from
-`https://github.com/tririver/arc.git` at `ARC_MCP_INSTALL_REF` (default:
-`main`); set `ARC_MCP_INSTALL_REF` to a tag or commit for pinned package
-installs. Source checkouts use local `packages/` automatically. For a plugin
-copy that should install from a separate local checkout, set
-`ARC_MCP_REPO_ROOT` to that checkout root and `ARC_MCP_INSTALL_SOURCE=local`.
+On first MCP or CLI use, the launcher installs ARC into a cache-local runtime
+and reuses it for later MCP calls and plugin CLI shims. The plugin exposes
+`arc-paper`, `arc-domain`, `arc-llm`, `arc-typeset`, and `arc-mcp` from
+`plugins/arc/bin/`; the Python packages are installed inside the private
+runtime, so `pip show arc-paper` in the host shell is not expected to find them.
+If that install fails, later starts fail fast with the saved log path instead of
+retrying a broken partial install. To retry after fixing the cause, set
+`ARC_MCP_INSTALL_RETRY=1` or remove the failure marker named in the error.
+Marketplace installs fetch ARC packages from `https://github.com/tririver/arc.git`
+at `ARC_MCP_INSTALL_REF` (default: `main`); set `ARC_MCP_INSTALL_REF` to a tag
+or commit for pinned package installs. Source checkouts use local `packages/`
+automatically. For a plugin copy that should install from a separate local
+checkout, set `ARC_MCP_REPO_ROOT` to that checkout root and
+`ARC_MCP_INSTALL_SOURCE=local`.
 
 Check the launcher directly from a source checkout:
 
 ```bash
 plugins/arc/bin/arc-mcp --help
+plugins/arc/bin/arc-paper --help
 ```
 
 Use the source install below only for development or local package testing.

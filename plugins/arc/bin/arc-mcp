@@ -12,6 +12,16 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 plugin_root="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
 default_repo_root="$(CDPATH= cd -- "$plugin_root/../.." && pwd -P)"
 repo_root="${ARC_MCP_REPO_ROOT:-$default_repo_root}"
+tool_name="${ARC_MCP_TOOL_NAME:-$(basename -- "$0")}"
+arc_tools="arc-mcp arc-paper arc-domain arc-llm arc-typeset"
+
+case " ${arc_tools} " in
+  *" ${tool_name} "*) ;;
+  *)
+    printf 'Unsupported ARC tool launcher: %s\n' "$tool_name" >&2
+    exit 64
+    ;;
+esac
 
 is_true() {
   case "${1:-}" in
@@ -32,8 +42,11 @@ sanitize_key() {
 }
 
 if ! is_true "${ARC_MCP_LAUNCHER_NO_PATH:-}"; then
-  candidate="$(command -v arc-mcp 2>/dev/null || true)"
-  if [ -n "$candidate" ] && [ "$(resolve_path "$candidate")" != "$(resolve_path "$0")" ]; then
+  candidate="$(command -v "$tool_name" 2>/dev/null || true)"
+  plugin_tool_path="${script_dir}/${tool_name}"
+  if [ -n "$candidate" ] \
+    && [ "$(resolve_path "$candidate")" != "$(resolve_path "$0")" ] \
+    && [ "$(resolve_path "$candidate")" != "$(resolve_path "$plugin_tool_path")" ]; then
     exec "$candidate" "$@"
   fi
 fi
@@ -54,7 +67,7 @@ log_file="${runtime_dir}/install.log"
 lock_dir="${runtime_dir}/install.lock"
 
 runtime_ready() {
-  [ -f "$ready_file" ] && [ -x "${venv_dir}/bin/arc-mcp" ]
+  [ -f "$ready_file" ] && [ -x "${venv_dir}/bin/${tool_name}" ]
 }
 
 runtime_failed() {
@@ -70,7 +83,7 @@ previous_status() {
 }
 
 if runtime_ready; then
-  exec "${venv_dir}/bin/arc-mcp" "$@"
+  exec "${venv_dir}/bin/${tool_name}" "$@"
 fi
 
 if runtime_failed; then
@@ -103,7 +116,7 @@ trap release_lock EXIT
 if runtime_ready; then
   release_lock
   trap - EXIT
-  exec "${venv_dir}/bin/arc-mcp" "$@"
+  exec "${venv_dir}/bin/${tool_name}" "$@"
 fi
 
 if runtime_failed; then
@@ -147,6 +160,12 @@ install_runtime() {
   fi
 
   "$uv_bin" pip install --python "${venv_dir}/bin/python" "${requirements[@]}" || return $?
+  for expected_tool in $arc_tools; do
+    [ -x "${venv_dir}/bin/${expected_tool}" ] || {
+      printf 'Missing ARC runtime command after install: %s\n' "$expected_tool" >&2
+      return 127
+    }
+  done
   "${venv_dir}/bin/arc-mcp" --help >/dev/null || return $?
   {
     printf 'repo=%s\n' "$install_repo"
@@ -177,4 +196,4 @@ fi
 rm -f "$failed_file" "$status_file"
 release_lock
 trap - EXIT
-exec "${venv_dir}/bin/arc-mcp" "$@"
+exec "${venv_dir}/bin/${tool_name}" "$@"
