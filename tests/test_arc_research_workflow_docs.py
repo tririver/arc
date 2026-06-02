@@ -58,6 +58,7 @@ def test_arc_skill_has_preflight_gate_for_workflow_deliverables() -> None:
 def test_arc_skill_references_pdf_export_manuals() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8").lower()
     manual = (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8").lower()
+    manual_flat = " ".join(manual.split())
 
     assert "markdown report export" in text
     assert "`rules/math_typeset.md`" in text
@@ -66,6 +67,10 @@ def test_arc_skill_references_pdf_export_manuals() -> None:
     assert "background pdf job" in manual
     assert "do not wait" in manual
     assert "markdown report" in manual
+    assert "pdf export is a completion gate" in manual
+    assert "do not type `md2pdf(...)` as a shell" in manual_flat
+    assert "warning: pdf export not started" in manual_flat
+    assert "do not debug or fix pdf generation" in manual
 
 
 def test_math_typeset_rules_define_markdown_math_hygiene() -> None:
@@ -96,17 +101,22 @@ def test_arc_skill_lists_math_typeset_reference() -> None:
 
 
 def test_workflows_start_pdf_export_for_user_facing_markdown() -> None:
-    for name in [
-        "check.md",
-        "domain.md",
-        "ideas.md",
-        "plan.md",
-        "calculate.md",
-    ]:
+    expected_pdf_guard_counts = {
+        "check.md": 1,
+        "domain.md": 1,
+        "ideas.md": 1,
+        "plan.md": 2,
+        "calculate.md": 1,
+    }
+    for name, guard_count in expected_pdf_guard_counts.items():
         text = (WF / name).read_text(encoding="utf-8").lower()
+        text_flat = " ".join(text.split())
+        assert "`manuals/arc-mcp.md` markdown report export" in text
         assert "md2pdf" in text
-        assert "background" in text
+        assert "report-export gate" in text
+        assert "warning:" in text
         assert "do not wait" in text
+        assert text_flat.count("do not debug or fix pdf generation") == guard_count
 
 
 def test_ideas_phase_4_uses_clean_selection_prompt_without_dry_run() -> None:

@@ -156,10 +156,13 @@ human readers can inspect the main project reports together.
 For the domain summary Markdown, follow `rules/math_typeset.md` for math and
 TeX snippets.
 
-After writing each domain summary Markdown report to `<project-dir>/`, call
-MCP `md2pdf(input="<project-dir>/<seed-safe>_domain_summary.md")`. It starts a
-background PDF job; record the returned job id if present and do not wait
-before continuing.
+After writing each domain summary Markdown report to `<project-dir>/`, follow
+`manuals/arc-mcp.md` Markdown Report Export for
+`md2pdf(input="<project-dir>/<seed-safe>_domain_summary.md")`. This
+report-export gate is not satisfied until `md2pdf` has been started or a
+`WARNING:` with the exact blocker is recorded. Do not wait for PDF completion.
+If PDF generation appears bugged, report it and continue this workflow; do not
+debug or fix PDF generation unless the user explicitly asks.
 
 Do not generate, attach, or copy separate single-paper LLM summaries for the
 foundation paper or best-reference paper as part of the domain build. The

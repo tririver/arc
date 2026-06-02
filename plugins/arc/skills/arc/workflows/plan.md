@@ -194,14 +194,11 @@ define new marker semantics in `plan.md`.
 ## Phase 4: Version And Export
 Step 1: Find the highest existing immutable version under
 `<project-dir>/calculate/<run-id>/work-notes/work-note-vNNN.md`.
-Step 2: Build final content before writing files and note planned PDF export in
-`## Journal`.
+Step 2: Build final content before writing files and note planned PDF export in `## Journal`.
 Step 3: Write the next immutable version, starting with `work-note-v001.md`;
 never overwrite an old version.
 Step 4: Mirror it to `<project-dir>/work-note.md`.
-Step 5: Call `md2pdf(input="<project-dir>/work-note.md")` in the background; do not wait.
-Record any job id in host logs or the next work-note version, not by editing an
-old immutable version.
+Step 5: Follow `manuals/arc-mcp.md` Markdown Report Export for `md2pdf(input="<project-dir>/work-note.md")`. This report-export gate is not satisfied until `md2pdf` has been started or a `WARNING:` with the exact blocker is recorded. Do not wait for PDF completion. Record any job id in host logs or the next work-note version, not by editing an old immutable version. If PDF generation appears bugged, report it and continue this workflow; do not debug or fix PDF generation unless the user explicitly asks.
 
 ## Phase 5: Review
 Step 1: Review the plan before execution. If the host and workflow permissions
@@ -211,7 +208,9 @@ perform the same review.
 Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, agent-added foundations have proposer/reviewer/main-agent agreement plus validity scope and the `[foundation added by agent]` marker, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, special PDF color markers are not inside code spans, math and TeX snippets follow `rules/math_typeset.md`, and source coverage is enough for the task.
 
 Step 3: If review finds gaps, build final content with the planned PDF export
-noted in the Journal, write a new immutable work-note version, mirror it to
-root, and call background `md2pdf`. Record any returned job id in host/run logs
-or the next work-note version, not by editing the immutable version just written.
+noted in the Journal, write a new immutable work-note version, mirror it to root,
+and follow `manuals/arc-mcp.md` Markdown Report Export. Record any returned job
+id in host/run logs or the next work-note version, not by editing the immutable
+version just written. If PDF generation appears bugged, report it and continue
+this workflow; do not debug or fix PDF generation unless the user explicitly asks.
 Then hand off ready steps to `calculate.md` for consensus execution.

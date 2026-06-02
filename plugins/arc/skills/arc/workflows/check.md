@@ -99,8 +99,13 @@ not enough: the ready-step packet should include `source_excerpt`, exact
 displayed formulas, or accepted prior derivations sufficient for proposers to
 perform the check without reading the original source.
 
-After writing `<project-dir>/initial-note-check.md`, call
-`md2pdf(input="<project-dir>/initial-note-check.md")` in the background. Do not wait for PDF completion.
+After writing `<project-dir>/initial-note-check.md`, follow
+`manuals/arc-mcp.md` Markdown Report Export for
+`md2pdf(input="<project-dir>/initial-note-check.md")`. This report-export gate
+is not satisfied until `md2pdf` has been started or a `WARNING:` with the exact
+blocker is recorded. Do not wait for PDF completion.
+If PDF generation appears bugged, report it and continue this workflow; do not
+debug or fix PDF generation unless the user explicitly asks.
 This `md2pdf` call applies only to ARC-generated Markdown reports, not to the
 original TeX/PDF note being checked.
 Record any returned job id in host/run logs or later

@@ -101,10 +101,13 @@ Markdown paragraphs, not a fenced code block. Follow `rules/math_typeset.md`
 for math and TeX snippets. Use PDF-friendly wrapping for long titles and
 proposer text; avoid wide tables with long prose.
 
-Step 2: After writing the project-level Markdown report, call
-MCP `md2pdf(input="<project-dir>/ranked-ideas.md")`. It starts a background
-PDF job; record the returned job id if present and do not wait before
-continuing.
+Step 2: After writing the project-level Markdown report, follow
+`manuals/arc-mcp.md` Markdown Report Export for
+`md2pdf(input="<project-dir>/ranked-ideas.md")`. This report-export gate is not
+satisfied until `md2pdf` has been started or a `WARNING:` with the exact blocker
+is recorded. Do not wait for PDF completion.
+If PDF generation appears bugged, report it and continue this workflow; do not
+debug or fix PDF generation unless the user explicitly asks.
 
 Do not invent rankings or novelty claims. Use the recorded proposer outputs and
 per-round reviewer reports from the `arc-llm` loop artifacts.

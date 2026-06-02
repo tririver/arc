@@ -72,10 +72,23 @@ the user asks for another language, locale, model, or quality pass.
 
 ## Markdown Report Export
 
-When a workflow writes a user-facing Markdown report to `<project-dir>/`, call
-`md2pdf` on that project-level file. `md2pdf` starts a background PDF job;
-record the returned job id if present and do not wait before continuing unless
-the user explicitly asks.
+When a workflow writes or copies a user-facing Markdown report to
+`<project-dir>/`, PDF export is a completion gate. The Markdown deliverable is
+not complete until the agent has either called the ARC MCP `md2pdf` tool for
+that project-level Markdown file, or recorded a `WARNING:` with the exact reason
+PDF export could not be started.
+
+Use the host's MCP tool call for `md2pdf`; do not type `md2pdf(...)` as a shell
+command. The examples below show the argument shape. `md2pdf` starts a
+background PDF job; record the returned job id if present and do not wait before
+continuing unless the user explicitly asks.
+
+If the MCP tool is unavailable or fails to launch, do not silently skip export
+and do not run unrelated TeX build commands. Record `WARNING: PDF export not
+started: <reason>` in the workflow log, self-reflection entry, work-note journal,
+or final response as appropriate for the workflow.
+Do not debug or fix PDF generation unless the user explicitly asks; continue
+the owning ARC workflow after reporting the warning.
 
 ## Background Jobs
 

@@ -156,7 +156,15 @@ A human expert later resolves a block and thereby unblocks the workflow; this is
 When a result may help later steps, record it only as a candidate reusable
 result. Promotion to an accepted premise belongs to `plan.md`.
 
-Write an immutable next work-note version at `<project-dir>/calculate/<run-id>/work-notes/work-note-vNNN.md`, then mirror it to `<project-dir>/work-note.md`. After writing the root work note, start `md2pdf(input="<project-dir>/work-note.md")` in the background. Do not wait, and do not require any separate report.
+Write an immutable next work-note version at
+`<project-dir>/calculate/<run-id>/work-notes/work-note-vNNN.md`, then mirror it
+to `<project-dir>/work-note.md`. After writing the root work note, follow
+`manuals/arc-mcp.md` Markdown Report Export for
+`md2pdf(input="<project-dir>/work-note.md")`. This report-export gate is not
+satisfied until `md2pdf` has been started or a `WARNING:` with the exact blocker
+is recorded. Do not wait for PDF completion, and do not require any separate
+report. If PDF generation appears bugged, report it and continue this workflow;
+do not debug or fix PDF generation unless the user explicitly asks.
 
 ## Phase 6: Planning Handoff
 
