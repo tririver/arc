@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 
 
@@ -72,6 +73,59 @@ def _fake_uv_installs_all_tools(path: Path, prefix: str = "installed") -> Path:
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _fake_python3_installs_all_tools(path: Path, prefix: str = "pip") -> Path:
+    inner = f"""\
+#!/usr/bin/python3
+import os
+import pathlib
+import sys
+
+with open(os.environ["PY_CALLS"], "a", encoding="utf-8") as handle:
+    handle.write("venv-python:" + " ".join(sys.argv[1:]) + "\\n")
+
+if sys.argv[1:4] != ["-m", "pip", "install"]:
+    sys.exit(99)
+
+bin_dir = pathlib.Path(sys.argv[0]).parent
+for tool in {list(ARC_TOOLS)!r}:
+    target = bin_dir / tool
+    target.write_text(
+        "#!/bin/sh\\n"
+        "if [ \\"$1\\" = --help ]; then exit 0; fi\\n"
+        "echo {prefix}:" + tool + ":$1\\n",
+        encoding="utf-8",
+    )
+    target.chmod(0o755)
+sys.exit(0)
+"""
+    outer = f"""\
+#!/usr/bin/python3
+import os
+import pathlib
+import sys
+
+with open(os.environ["PY_CALLS"], "a", encoding="utf-8") as handle:
+    handle.write("python3:" + " ".join(sys.argv[1:]) + "\\n")
+
+if sys.argv[1:2] == ["-c"]:
+    sys.exit(0)
+
+if sys.argv[1:3] != ["-m", "venv"]:
+    sys.exit(98)
+
+venv = pathlib.Path(sys.argv[3])
+bin_dir = venv / "bin"
+bin_dir.mkdir(parents=True, exist_ok=True)
+python = bin_dir / "python"
+python.write_text({inner!r}, encoding="utf-8")
+python.chmod(0o755)
+sys.exit(0)
+"""
+    path.write_text(textwrap.dedent(outer), encoding="utf-8")
     path.chmod(0o755)
     return path
 
@@ -150,6 +204,96 @@ def test_launcher_installs_once_outside_current_directory(tmp_path):
     assert ".venv" not in calls.read_text(encoding="utf-8")
 
 
+def test_ready_runtime_does_not_need_installer_tools(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    bin_dir = runtime_dir / "venv/bin"
+    bin_dir.mkdir(parents=True)
+    (runtime_dir / "install.ok").write_text("ready\n", encoding="utf-8")
+    _write_fake_runtime_tool(bin_dir, "arc-mcp")
+
+    result = _run_launcher(
+        runtime_dir,
+        "status",
+        extra_env={"ARC_MCP_INSTALLER_UV": str(tmp_path / "missing-uv")},
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "cached:status\n"
+    assert result.stderr == ""
+
+
+def test_launcher_falls_back_to_python_venv_when_uv_is_unavailable(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _fake_python3_installs_all_tools(fake_bin / "python3", prefix="fallback")
+    calls = tmp_path / "python-calls.log"
+
+    result = _run_launcher(
+        runtime_dir,
+        "status",
+        extra_env={
+            "ARC_MCP_INSTALLER_UV": str(tmp_path / "missing-uv"),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "PY_CALLS": str(calls),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "fallback:arc-mcp:status\n"
+    call_text = calls.read_text(encoding="utf-8")
+    assert "python3:-m venv " in call_text
+    assert "venv-python:-m pip install " in call_text
+
+
+def test_launcher_uses_claude_installed_plugin_commit_for_git_runtime(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    fake_plugin_root = tmp_path / ".claude/plugins/cache/arc/arc/0.1.0"
+    fake_launcher = fake_plugin_root / "bin/arc-mcp"
+    fake_launcher.parent.mkdir(parents=True)
+    shutil.copyfile(LAUNCHER, fake_launcher)
+    fake_launcher.chmod(0o755)
+
+    home = tmp_path / "home"
+    metadata_dir = home / ".claude/plugins"
+    metadata_dir.mkdir(parents=True)
+    installed_commit = "15ce9ea6138ccf98f73bc64963964d7b0666ab73"
+    (metadata_dir / "installed_plugins.json").write_text(
+        (
+            '{"version":2,"plugins":{"arc@arc":[{"scope":"user",'
+            f'"installPath":"{fake_plugin_root}",'
+            '"version":"0.1.0",'
+            f'"gitCommitSha":"{installed_commit}"'
+            "}]}}"
+        ),
+        encoding="utf-8",
+    )
+
+    calls = tmp_path / "uv-calls.log"
+    fake_uv = tmp_path / "uv"
+    _fake_uv_installs_all_tools(fake_uv, prefix="pinned")
+
+    result = _run_launcher(
+        runtime_dir,
+        "status",
+        launcher=fake_launcher,
+        uv=fake_uv,
+        extra_env={
+            "HOME": str(home),
+            "UV_CALLS": str(calls),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "pinned:arc-mcp:status\n"
+    install_call = calls.read_text(encoding="utf-8").splitlines()[1]
+    assert f"@{installed_commit}#subdirectory=packages/arc-mcp" in install_call
+    assert "@main#subdirectory" not in install_call
+    assert f"ref={installed_commit}" in (runtime_dir / "install.ok").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_launcher_failed_install_records_failure_without_retrying(tmp_path):
     runtime_dir = tmp_path / "runtime"
     calls = tmp_path / "uv-calls.log"
@@ -172,6 +316,23 @@ def test_launcher_failed_install_records_failure_without_retrying(tmp_path):
     retry_calls = calls.read_text(encoding="utf-8")
     assert retry_calls.startswith("badvenv ")
     assert "\npip install --python " in retry_calls
+
+
+def test_launcher_failure_stderr_includes_install_log_tail(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    bad_uv = tmp_path / "bad-uv"
+    bad_uv.write_text(
+        "#!/bin/sh\nprintf 'fake installer exploded\\n' >&2\nexit 42\n",
+        encoding="utf-8",
+    )
+    bad_uv.chmod(0o755)
+
+    result = _run_launcher(runtime_dir, uv=bad_uv)
+
+    assert result.returncode == 42
+    assert "ARC MCP runtime install failed." in result.stderr
+    assert "Install log tail:" in result.stderr
+    assert "fake installer exploded" in result.stderr
 
 
 def test_launcher_uses_configured_repo_root_for_local_packages(tmp_path):

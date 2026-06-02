@@ -879,6 +879,9 @@ def test_readme_documents_marketplace_first_install() -> None:
 
     assert "plugins/arc/bin/arc-mcp --help" in text
     assert "ARC_MCP_INSTALL_RETRY=1" in text
+    assert "do not need `uv`, `pip`, or other installer tools" in text
+    assert "falls back to `python3 -m venv` plus" in text
+    assert "plugin `gitCommitSha`" in text
     assert "codex plugin marketplace add tririver/arc" in text
     assert "codex plugin add arc@arc" in text
     assert "/plugin marketplace add tririver/arc" in text

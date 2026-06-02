@@ -75,18 +75,24 @@ The plugin starts the ARC MCP server with a bundled launcher:
 ```
 
 On first MCP or CLI use, the launcher installs ARC into a cache-local runtime
-and reuses it for later MCP calls and plugin CLI shims. The plugin exposes
+and reuses it for later MCP calls and plugin CLI shims. After `install.ok`
+exists, the launcher directly execs the cached runtime command; later MCP starts
+do not need `uv`, `pip`, or other installer tools. The plugin exposes
 `arc-paper`, `arc-domain`, `arc-llm`, `arc-typeset`, and `arc-mcp` from
 `plugins/arc/bin/`; the Python packages are installed inside the private
 runtime, so `pip show arc-paper` in the host shell is not expected to find them.
-If that install fails, later starts fail fast with the saved log path instead of
-retrying a broken partial install. To retry after fixing the cause, set
-`ARC_MCP_INSTALL_RETRY=1` or remove the failure marker named in the error.
-Marketplace installs fetch ARC packages from `https://github.com/tririver/arc.git`
-at `ARC_MCP_INSTALL_REF` (default: `main`); set `ARC_MCP_INSTALL_REF` to a tag
-or commit for pinned package installs. Source checkouts use local `packages/`
-automatically. For a plugin copy that should install from a separate local
-checkout, set `ARC_MCP_REPO_ROOT` to that checkout root and
+First install uses `uv` when available and falls back to `python3 -m venv` plus
+`pip` when `uv` is not on the MCP process `PATH`.
+
+If that install fails, later starts fail fast with the saved log path and a
+short log tail instead of retrying a broken partial install. To retry after
+fixing the cause, set `ARC_MCP_INSTALL_RETRY=1` or remove the failure marker
+named in the error. Marketplace installs fetch ARC packages from
+`https://github.com/tririver/arc.git`; `ARC_MCP_INSTALL_REF` overrides the ref,
+otherwise the launcher uses a packaged install ref or Claude Code's installed
+plugin `gitCommitSha` when available, then falls back to `main`. Source checkouts
+use local `packages/` automatically. For a plugin copy that should install from a
+separate local checkout, set `ARC_MCP_REPO_ROOT` to that checkout root and
 `ARC_MCP_INSTALL_SOURCE=local`.
 
 Check the launcher directly from a source checkout:
