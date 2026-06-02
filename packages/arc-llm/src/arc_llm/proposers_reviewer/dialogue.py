@@ -157,16 +157,6 @@ def render_reviewer_delta_prompt(
     return prompt, context
 
 
-def render_reviewer_validation_retry_delta(exc: Exception) -> str:
-    return (
-        "## ARC-LLM Reviewer Validation Retry v2\n"
-        f"Your previous reviewer JSON failed validation:\n{exc}\n\n"
-        "The JSON Schema/output contract for this turn may differ from earlier turns. Obey the schema provided for this turn and the current active_proposer_ids, not any older schema or older active proposer list in the session history.\n"
-        "Use the same current proposer outputs already present in this session, but validate them against the current schema and current active proposer ids. Do not reuse an older review envelope. Return exactly one corrected "
-        "arc.llm.review_envelope.v1 JSON object. If you cannot complete the review, use a non-accepting status and explain why inside the envelope.\n"
-    )
-
-
 def _static_loop_metadata(loop: LoopConfig) -> dict[str, Any]:
     return {
         "max_rounds": loop.max_rounds,

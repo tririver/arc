@@ -72,14 +72,16 @@ def base_config(tmp_path: Path, *, max_rounds: int = 2, early_stop: bool = False
     }
 
 
-def _retry_then_recover_output_recovery(reviewer_validation_retries: int) -> dict[str, Any]:
-    return {
+def _fallback_output_recovery(legacy_reviewer_validation_retries: int | None = None) -> dict[str, Any]:
+    options: dict[str, Any] = {
         "enabled": True,
         "mode": "warn",
         "allow_natural_language": True,
-        "schema_violation_policy": "retry_then_recover",
-        "reviewer_validation_retries": reviewer_validation_retries,
+        "schema_violation_policy": "fallback",
     }
+    if legacy_reviewer_validation_retries is not None:
+        options["reviewer_validation_retries"] = legacy_reviewer_validation_retries
+    return options
 
 
 def test_batch_config_defaults_output_recovery_to_warn(tmp_path: Path):
@@ -89,14 +91,15 @@ def test_batch_config_defaults_output_recovery_to_warn(tmp_path: Path):
     assert batch.output_recovery.mode == "warn"
     assert batch.output_recovery.allow_natural_language is True
     assert batch.output_recovery.schema_violation_policy == "peer_visible"
-    assert batch.output_recovery.reviewer_validation_retries == 0
+    assert batch.output_recovery.schema_formatter_enabled is True
 
 
-def test_materialize_batch_defaults_to_peer_visible_no_retry(tmp_path: Path):
+def test_materialize_batch_defaults_to_peer_visible_schema_formatter(tmp_path: Path):
     cfg = materialize_batch(run_id="r", run_dir=tmp_path, loops=[])
 
     assert cfg["output_recovery"]["schema_violation_policy"] == "peer_visible"
-    assert cfg["output_recovery"]["reviewer_validation_retries"] == 0
+    assert "reviewer_validation_retries" not in cfg["output_recovery"]
+    assert cfg["output_recovery"]["schema_formatter"]["enabled"] is True
 
 
 class FakeJsonRunner:
@@ -596,7 +599,7 @@ def test_invalid_reviewer_retry_uses_minimal_fallback_in_warn_mode(tmp_path):
         return {"ok": True}
 
     config = base_config(tmp_path, max_rounds=1)
-    config["output_recovery"] = _retry_then_recover_output_recovery(1)
+    config["output_recovery"] = _fallback_output_recovery(1)
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_reviewer, base_env={})
 
@@ -645,7 +648,7 @@ def test_review_envelope_rejects_unexpected_proposer_ids(tmp_path):
     assert "review.proposer_messages unexpected: proposer_999" in result["loops"][0]["error"]
 
 
-def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_path):
+def test_invalid_reviewer_envelope_is_not_retried_for_format_feedback(tmp_path):
     calls = []
 
     def invalid_then_valid_reviewer(prompt, **kwargs):
@@ -671,7 +674,7 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
         }
 
     config = base_config(tmp_path, max_rounds=1)
-    config["output_recovery"] = _retry_then_recover_output_recovery(1)
+    config["output_recovery"] = _fallback_output_recovery(1)
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid_reviewer, base_env={})
 
@@ -681,23 +684,19 @@ def test_invalid_reviewer_envelope_is_retried_once_with_validation_feedback(tmp_
             encoding="utf-8"
         )
     )
-    original_prompt = (
-        tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/prompts/reviewer_001.md"
-    ).read_text(encoding="utf-8")
-    retry_prompt = (
-        tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/prompts/reviewer_001.retry_001.md"
-    ).read_text(encoding="utf-8")
+    round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
 
     assert result["status"] == "completed"
-    assert len(reviewer_prompts) == 2
-    assert "Previous reviewer response failed validation" in reviewer_prompts[1]
-    assert "review schema_version must be arc.llm.review_envelope.v1" in reviewer_prompts[1]
-    assert review["controller"]["message"] == "valid after retry"
-    assert "Previous reviewer response failed validation" not in original_prompt
-    assert "Previous reviewer response failed validation" in retry_prompt
+    assert len(reviewer_prompts) == 1
+    assert not (round_root / "prompts/reviewer_001.retry_001.md").exists()
+    assert review["controller"]["message"] != "valid after retry"
+    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] in {
+        "reviewer_schema_failure_fallback",
+        "peer_visible_reviewer_fallback",
+    }
 
 
-def test_reviewer_validation_retry_count_is_configurable(tmp_path):
+def test_reviewer_schema_failure_ignores_legacy_retry_count(tmp_path):
     calls = 0
 
     def invalid_twice_then_valid(prompt, **kwargs):
@@ -719,20 +718,20 @@ def test_reviewer_validation_retry_count_is_configurable(tmp_path):
         return {"ok": True}
 
     config = base_config(tmp_path, max_rounds=1)
-    config["output_recovery"] = _retry_then_recover_output_recovery(2)
+    config["output_recovery"] = _fallback_output_recovery(2)
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_twice_then_valid, base_env={})
 
     round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
     review = json.loads((round_root / "reviews/reviewer_001.json").read_text(encoding="utf-8"))
     assert result["status"] == "completed"
-    assert calls == 3
-    assert (round_root / "prompts/reviewer_001.retry_001.md").exists()
-    assert (round_root / "prompts/reviewer_001.retry_002.md").exists()
-    assert review["controller"]["message"] == "valid after second retry"
+    assert calls == 1
+    assert not (round_root / "prompts/reviewer_001.retry_001.md").exists()
+    assert not (round_root / "prompts/reviewer_001.retry_002.md").exists()
+    assert review["controller"]["message"] != "valid after second retry"
 
 
-def test_peer_visible_reviewer_schema_violation_skips_validation_retry_and_records_warning(tmp_path):
+def test_peer_visible_reviewer_schema_violation_records_warning_without_retry(tmp_path):
     calls = 0
 
     def invalid_reviewer(prompt, **kwargs):
@@ -793,6 +792,63 @@ def test_peer_visible_idea_reviewer_fallback_writes_zero_marks(tmp_path):
     assert marks["total_score"] == 0
     assert all(value == 0 for value in marks.values())
     assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "peer_visible_reviewer_fallback"
+
+
+def test_peer_visible_idea_reviewer_uses_schema_formatter_for_rich_format_failure(tmp_path):
+    calls = {"reviewer": 0, "formatter": 0}
+
+    def rich_malformed_reviewer(prompt, **kwargs):
+        if "Schema Formatter" in prompt:
+            calls["formatter"] += 1
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {
+                    "message": "formatted rich review",
+                    "stop_requested": True,
+                    "stop_reason": "ready",
+                },
+                "proposer_messages": {
+                    "proposer_001": {"message": "accepted"},
+                    "proposer_002": {"message": "accepted"},
+                },
+                "review_payload": {
+                    "marks": {
+                        "user_intent_relevance": 25,
+                        "novelty": 13,
+                        "confidence_of_novelty": 13,
+                        "scientific_value": 13,
+                        "planning": 14,
+                        "problem_well_definedness": 14,
+                        "total_score": 92,
+                    }
+                },
+            }
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            calls["reviewer"] += 1
+            return (
+                "Final referee review: ready for execution. "
+                "Scores: user_intent_relevance 25, novelty 13, confidence_of_novelty 13, "
+                "scientific_value 13, planning 14, problem_well_definedness 14, total_score 92."
+            )
+        return {"title": "idea", "idea_summary": "summary"}
+
+    config = base_config(tmp_path, max_rounds=1, early_stop=True)
+    config["loops"][0]["reviewers"][0]["output_schema"] = _idea_reviewer_schema()
+
+    result = run_proposers_reviewer_batch(config, json_runner=rich_malformed_reviewer, base_env={})
+
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    marks = review["review_payload"]["marks"]
+
+    assert result["status"] == "stopped"
+    assert calls == {"reviewer": 1, "formatter": 1}
+    assert marks["total_score"] == 92
+    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "schema_formatter"
 
 
 def test_reviewer_exception_does_not_fail_warn_mode_loop(tmp_path):
@@ -1143,7 +1199,7 @@ def test_reviewer_valid_schema_does_not_retry_or_recover(tmp_path):
     assert record.get("structured_output") in (None, {})
 
 
-def test_reviewer_full_schema_failure_triggers_validation_retry(tmp_path):
+def test_reviewer_full_schema_failure_uses_fallback_without_retry(tmp_path):
     calls = 0
 
     def invalid_then_valid_reviewer(prompt, **kwargs):
@@ -1157,7 +1213,7 @@ def test_reviewer_full_schema_failure_triggers_validation_retry(tmp_path):
         return {"ok": True}
 
     result = run_proposers_reviewer_batch(
-        _reviewer_schema_config(tmp_path, output_recovery=_retry_then_recover_output_recovery(1)),
+        _reviewer_schema_config(tmp_path, output_recovery=_fallback_output_recovery(1)),
         json_runner=invalid_then_valid_reviewer,
         base_env={},
     )
@@ -1171,14 +1227,15 @@ def test_reviewer_full_schema_failure_triggers_validation_retry(tmp_path):
     )
 
     assert result["status"] == "completed"
-    assert calls == 2
-    assert retry_prompt.exists()
+    assert calls == 1
+    assert not retry_prompt.exists()
     assert validation_error.exists()
     assert "reviewer output failed JSON schema validation" in validation_error.read_text(encoding="utf-8")
-    assert review["controller"]["message"] == "valid after full schema retry"
+    assert review["controller"]["message"] != "valid after full schema retry"
+    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "reviewer_schema_failure_fallback"
 
 
-def test_reviewer_validation_retry_failure_uses_conservative_fallback_in_warn_mode(tmp_path):
+def test_reviewer_schema_failure_uses_conservative_fallback_in_warn_mode(tmp_path):
     calls = 0
 
     def invalid_reviewer(prompt, **kwargs):
@@ -1190,7 +1247,7 @@ def test_reviewer_validation_retry_failure_uses_conservative_fallback_in_warn_mo
         return {"ok": True}
 
     result = run_proposers_reviewer_batch(
-        _reviewer_schema_config(tmp_path, output_recovery=_retry_then_recover_output_recovery(1)),
+        _reviewer_schema_config(tmp_path, output_recovery=_fallback_output_recovery(1)),
         json_runner=invalid_reviewer,
         base_env={},
     )
@@ -1204,7 +1261,7 @@ def test_reviewer_validation_retry_failure_uses_conservative_fallback_in_warn_mo
     consensus = review["review_payload"]["consensus"]
 
     assert result["status"] == "completed"
-    assert calls == 2
+    assert calls == 1
     assert structured["mode"] == "recovered"
     assert structured["severity"] == "major"
     assert structured["recovery_strategy"] == "reviewer_schema_failure_fallback"
@@ -1234,7 +1291,7 @@ def test_reviewer_schema_failure_fallback_cannot_preserve_approving_retry(tmp_pa
         return {"ok": True}
 
     result = run_proposers_reviewer_batch(
-        _reviewer_schema_config(tmp_path, output_recovery=_retry_then_recover_output_recovery(1)),
+        _reviewer_schema_config(tmp_path, output_recovery=_fallback_output_recovery(1)),
         json_runner=invalid_then_approving_invalid_reviewer,
         base_env={},
     )
@@ -1247,7 +1304,7 @@ def test_reviewer_schema_failure_fallback_cannot_preserve_approving_retry(tmp_pa
     consensus = review["review_payload"]["consensus"]
 
     assert result["status"] == "completed"
-    assert calls == 2
+    assert calls == 1
     assert consensus["status"] == "unresolved"
     assert consensus["accepted_result"] is None
     assert consensus["agreed_proposer_ids"] == []
@@ -1256,7 +1313,7 @@ def test_reviewer_schema_failure_fallback_cannot_preserve_approving_retry(tmp_pa
     assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["severity"] == "major"
 
 
-def test_reviewer_validation_retry_failure_raises_in_strict_mode(tmp_path):
+def test_reviewer_schema_failure_raises_in_strict_mode(tmp_path):
     def invalid_reviewer(prompt, **kwargs):
         context = _context_from_prompt(prompt)
         if context["worker_id"].startswith("reviewer"):
@@ -1274,11 +1331,11 @@ def test_reviewer_validation_retry_failure_raises_in_strict_mode(tmp_path):
     assert "reviewer output failed JSON schema validation" in result["loops"][0]["error"]
 
 
-def test_reviewer_schema_validation_is_deferred_to_envelope_retry(tmp_path):
+def test_reviewer_schema_validation_is_deferred_to_envelope_recovery(tmp_path):
     calls = []
 
     def invalid_then_valid_reviewer(prompt, *, validate_schema=True, **kwargs):
-        is_reviewer = "reviewer system" in prompt or "Reviewer Output Retry" in prompt
+        is_reviewer = "reviewer system" in prompt
         if is_reviewer:
             calls.append(validate_schema)
             if validate_schema:
@@ -1298,18 +1355,18 @@ def test_reviewer_schema_validation_is_deferred_to_envelope_retry(tmp_path):
         return {"ok": True}
 
     config = base_config(tmp_path, max_rounds=1)
-    config["output_recovery"] = _retry_then_recover_output_recovery(1)
+    config["output_recovery"] = _fallback_output_recovery(1)
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid_reviewer, base_env={})
 
     assert result["status"] == "completed"
-    assert calls == [False, False]
+    assert calls == [False]
 
 
 def test_reviewer_validation_artifact_is_saved_when_prompts_are_disabled(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
     config["artifact_options"] = {"save_prompts": False}
-    config["output_recovery"] = _retry_then_recover_output_recovery(1)
+    config["output_recovery"] = _fallback_output_recovery(1)
     calls = 0
 
     def invalid_then_valid_reviewer(prompt, **kwargs):
@@ -1809,10 +1866,10 @@ def test_output_recovery_disables_natural_language_when_configured(tmp_path):
     assert set(seen) == {"strict"}
 
 
-def test_stateful_reviewer_validation_retry_is_compact_delta(tmp_path):
+def test_stateful_reviewer_validation_failure_is_not_retried(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
     config["session"] = {"policy": "stateful", "history_mode": "delta"}
-    config["output_recovery"] = _retry_then_recover_output_recovery(1)
+    config["output_recovery"] = _fallback_output_recovery(1)
     reviewer_prompts = []
 
     def invalid_then_valid(prompt, *, schema, provider, model, model_tier=None, env, session_policy, session_key, call_label, **kwargs):
@@ -1834,10 +1891,7 @@ def test_stateful_reviewer_validation_retry_is_compact_delta(tmp_path):
     result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid, base_env={})
 
     assert result["status"] == "completed"
-    assert len(reviewer_prompts) == 2
-    assert "## ARC-LLM Reviewer Validation Retry v2" in reviewer_prompts[1]
-    assert "reviewer system" not in reviewer_prompts[1]
-    assert "Current Proposer Outputs" not in reviewer_prompts[1]
+    assert len(reviewer_prompts) == 1
 
 
 def test_cache_guard_writes_warning_after_warmup(tmp_path):

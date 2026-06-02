@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from arc_llm import cli
 
@@ -122,6 +123,30 @@ def test_run_json_cli_passes_stateful_session_args(tmp_path, monkeypatch):
     assert captured["session_key"] == "scope/proposer/proposer_001"
     assert captured["session_name"] == "proposer_001"
     assert captured["call_label"] == "round_001/proposer_001"
+
+
+def test_schema_format_cli_passes_schema_and_model_tier(monkeypatch):
+    captured = {}
+
+    def fake_format_to_schema(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(value={"ok": True})
+
+    monkeypatch.setattr(cli, "_read_prompt", lambda value: "raw text")
+    monkeypatch.setattr(cli, "_read_schema", lambda value: {"type": "object"})
+    monkeypatch.setattr(cli, "format_to_schema", fake_format_to_schema)
+
+    args = cli._build_parser().parse_args(
+        ["schema-format", "--input", "-", "--schema", "schema.json", "--model-tier", "medium", "--role-hint", "reviewer"]
+    )
+
+    result = cli._dispatch(args)
+
+    assert result == {"ok": True}
+    assert captured["raw_text"] == "raw text"
+    assert captured["schema"] == {"type": "object"}
+    assert captured["model_tier"] == "medium"
+    assert captured["role_hint"] == "reviewer"
 
 
 def test_claude_session_persistence_flags_are_consistent():

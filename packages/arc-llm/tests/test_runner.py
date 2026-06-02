@@ -942,7 +942,7 @@ def test_run_json_validates_provider_output_against_schema(monkeypatch):
             process_chain=[],
         )
 
-    assert invalid.attempts == runner.MAX_ATTEMPTS_PER_PROVIDER
+    assert invalid.attempts == 1
 
 
 def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):

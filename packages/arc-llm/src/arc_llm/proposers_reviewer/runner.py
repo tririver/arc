@@ -21,6 +21,7 @@ from arc_llm.call_record import strip_arc_llm_call_records
 from arc_llm.retryable_output import ProviderOutputClass, classify_provider_output_text
 from arc_llm.runner import run_json
 from arc_llm.schema_cache import schema_hash, sha256_text
+from arc_llm.schema_formatter import format_to_schema
 from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
 from arc_llm.structured_recovery import recover_json_output, structured_metadata
 
@@ -42,7 +43,6 @@ from .dialogue import (
     render_legacy_full_prompt,
     render_proposer_delta_prompt,
     render_reviewer_delta_prompt,
-    render_reviewer_validation_retry_delta,
 )
 from .prompts import proposer_context, reviewer_context
 
@@ -269,7 +269,7 @@ def _run_loop_rounds(
             stateful_supported=_stateful_supported(json_runner),
         )
         try:
-            review_output = _call_reviewer_with_validation_retry(
+            review_output = _call_reviewer_with_schema_recovery(
                 json_runner,
                 prompt_options,
                 worker=reviewer,
@@ -420,7 +420,7 @@ def _run_proposers(
     return dict(sorted(outputs.items()))
 
 
-def _call_reviewer_with_validation_retry(
+def _call_reviewer_with_schema_recovery(
     json_runner: JsonRunner | None,
     prompt_options: dict[str, WorkerPromptOption],
     *,
@@ -477,6 +477,24 @@ def _call_reviewer_with_validation_retry(
                 "retry_prompt_path": "",
             },
         )
+        if _output_recovery_mode(batch.output_recovery) == "warn" and batch.output_recovery.schema_formatter_enabled:
+            formatted = _try_format_reviewer_schema_failure(
+                raw_output=review_output,
+                worker=worker,
+                loop=loop,
+                json_runner=json_runner,
+                base_env=base_env,
+                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}/schema_formatter",
+            )
+            if formatted is not None:
+                _validate_reviewer_output(formatted, worker=worker, loop=loop)
+                _record_structured_output_warning(
+                    formatted[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
+                    warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
+                    worker=worker,
+                    call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
+                )
+                return formatted
         if _peer_visible_schema_policy(batch.output_recovery):
             recovered = _peer_visible_reviewer_fallback(
                 raw_output=review_output,
@@ -492,9 +510,7 @@ def _call_reviewer_with_validation_retry(
                 call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
             )
             return recovered
-        if batch.output_recovery.reviewer_validation_retries <= 0:
-            if _output_recovery_mode(batch.output_recovery) != "warn":
-                raise
+        if _output_recovery_mode(batch.output_recovery) == "warn":
             recovered = _conservative_reviewer_schema_failure_fallback(
                 raw_output=review_output,
                 error=exc,
@@ -510,100 +526,49 @@ def _call_reviewer_with_validation_retry(
                 call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
             )
             return recovered
-        stateful_delta = loop.session.policy == "stateful" and loop.session.history_mode == "delta"
-        retry_exc: Exception = exc
-        for retry_number in range(1, batch.output_recovery.reviewer_validation_retries + 1):
-            retry_prompt = (
-                render_reviewer_validation_retry_delta(retry_exc)
-                if stateful_delta
-                else _review_validation_retry_prompt(first_call.prompt, retry_exc)
-            )
-            retry_prompt_path = (
-                _retry_artifact_path(first_call.prompt_path, retry_number=retry_number)
-                if first_call.prompt_path is not None
-                else None
-            )
-            if save_prompt and retry_prompt_path is not None:
-                atomic_write_text(retry_prompt_path, retry_prompt)
-            atomic_write_json(
-                _validation_error_artifact_path(error_path, retry_number=retry_number),
-                {
-                    "worker_id": worker.id,
-                    "round_number": round_number,
-                    "error_type": type(retry_exc).__name__,
-                    "message": str(retry_exc),
-                    "original_prompt_path": str(first_call.prompt_path) if first_call.prompt_path is not None else "",
-                    "retry_prompt_path": str(retry_prompt_path) if retry_prompt_path is not None else "",
-                },
-            )
-            review_output = _call_json_runner_with_error_artifact(
-                json_runner,
-                retry_prompt,
-                worker=worker,
-                round_number=round_number,
-                error_path=error_path,
-                prompt_path=retry_prompt_path,
-                base_env=base_env,
-                process_chain=process_chain,
-                session_policy=loop.session.policy if first_call.turn_kind != "legacy_full" else "stateless",
-                session_manager=session_manager,
-                session_key=session_key,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}/validation_retry_{retry_number:03d}",
-                artifact_dir=artifact_dir,
-                prefix_limiter=prefix_limiter,
-                static_prefix=None,
-                cache_guard=cache_guard,
-                cache_warnings_path=cache_warnings_path,
-                output_recovery=batch.output_recovery,
-                validate_schema=False,
-            )
-            try:
-                _validate_reviewer_output(review_output, worker=worker, loop=loop)
-                return review_output
-            except Exception as next_exc:
-                retry_exc = next_exc
-        if _output_recovery_mode(batch.output_recovery) != "warn":
-            raise retry_exc
-        recovered = _conservative_reviewer_schema_failure_fallback(
-            raw_output=review_output,
-            error=retry_exc,
-            worker=worker,
-            loop=loop,
-            call_label=(
-                f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}/"
-                f"validation_retry_{batch.output_recovery.reviewer_validation_retries:03d}"
-            ),
-        )
-        _validate_reviewer_output(recovered, worker=worker, loop=loop)
-        _maybe_record_structured_output_warning(
-            recovered,
-            warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
-            worker=worker,
-            call_label=(
-                f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}/"
-                f"validation_retry_{batch.output_recovery.reviewer_validation_retries:03d}"
-            ),
-        )
-        return recovered
-
-
-def _review_validation_retry_prompt(prompt: str, exc: Exception) -> str:
-    return (
-        f"{prompt.rstrip()}\n\n"
-        "## Reviewer Output Retry\n"
-        f"Previous reviewer response failed validation: {exc}\n"
-        "Retry the review. Return exactly one JSON object using schema_version "
-        f"{REVIEW_ENVELOPE_SCHEMA}, with controller, proposer_messages for every proposer, "
-        "and review_payload. Do not return a proposer idea or any non-envelope object.\n"
-    )
-
-
-def _retry_artifact_path(path: Path, *, retry_number: int) -> Path:
-    return path.with_name(f"{path.stem}.retry_{retry_number:03d}{path.suffix}")
+        raise
 
 
 def _validation_error_artifact_path(path: Path, *, retry_number: int) -> Path:
     return path.with_name(f"{path.stem}.validation_{retry_number:03d}.json")
+
+
+def _try_format_reviewer_schema_failure(
+    *,
+    raw_output: Any,
+    worker: WorkerConfig,
+    loop: LoopConfig,
+    json_runner: JsonRunner | None,
+    base_env: Mapping[str, str] | None,
+    call_label: str,
+) -> dict[str, Any] | None:
+    raw_text = _raw_excerpt_from_any(raw_output)
+    if not raw_text.strip():
+        return None
+    schema = _reviewer_recovery_schema(worker.output_schema, loop=loop)
+    runner = json_runner or run_json
+    try:
+        formatted = format_to_schema(
+            raw_text=raw_text,
+            schema=schema,
+            role_hint="reviewer",
+            json_runner=runner,
+            provider=worker.provider,
+            model=worker.model,
+            model_tier=worker.model_tier,
+            env=worker_env(worker, base_env=base_env),
+        )
+    except Exception:
+        return None
+    output = strip_arc_llm_call_records(dict(formatted.value))
+    output[ARC_LLM_CALL_RECORD_FIELD] = _local_recovery_call_record(
+        worker=worker,
+        schema=worker.output_schema,
+        signal="schema_formatter",
+        structured_output=formatted.structured_output,
+        call_label=call_label,
+    )
+    return output
 
 
 def _peer_visible_reviewer_fallback(
@@ -1144,68 +1109,6 @@ def _call_json_runner_with_prompt_options(
         return invoke_locked()
     except Exception as exc:
         prompt_path = selected.prompt_path if selected is not None and save_prompt else None
-        atomic_write_json(
-            error_path,
-            {
-                "worker_id": worker.id,
-                "round_number": round_number,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
-                "prompt_path": str(prompt_path) if prompt_path is not None else "",
-                "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-            },
-        )
-        raise
-
-
-def _call_json_runner_with_error_artifact(
-    json_runner: JsonRunner | None,
-    prompt: str,
-    *,
-    worker: WorkerConfig,
-    round_number: int,
-    error_path: Path,
-    prompt_path: Path | None,
-    base_env: Mapping[str, str] | None,
-    process_chain: list[str] | None,
-    session_policy: str,
-    session_manager: LLMSessionManager,
-    session_key: str,
-    call_label: str,
-    artifact_dir: Path | None,
-    prefix_limiter: "PrefixConcurrencyLimiter",
-    static_prefix: str | None,
-    cache_guard: CacheGuardOptions,
-    cache_warnings_path: Path,
-    output_recovery: OutputRecoveryOptions,
-    validate_schema: bool = True,
-) -> dict[str, Any]:
-    try:
-        def invoke() -> dict[str, Any]:
-            return _call_json_runner(
-                json_runner,
-                prompt,
-                worker=worker,
-                base_env=base_env,
-                process_chain=process_chain,
-                session_policy=session_policy,
-                session_manager=session_manager,
-                session_key=session_key,
-                call_label=call_label,
-                artifact_dir=artifact_dir,
-                prefix_limiter=prefix_limiter,
-                static_prefix=static_prefix,
-                cache_guard=cache_guard,
-                cache_warnings_path=cache_warnings_path,
-                output_recovery=output_recovery,
-                validate_schema=validate_schema,
-            )
-
-        if session_policy == "stateful":
-            with session_manager.lock(session_key):
-                return invoke()
-        return invoke()
-    except Exception as exc:
         atomic_write_json(
             error_path,
             {

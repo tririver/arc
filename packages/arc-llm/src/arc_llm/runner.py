@@ -34,6 +34,10 @@ class LLMOutputValidationError(RuntimeError):
     pass
 
 
+class LLMRetryableProviderOutputError(RuntimeError):
+    pass
+
+
 class LLMFatalProviderOutputError(LLMOutputValidationError):
     pass
 
@@ -325,7 +329,7 @@ def _run_with_retries(
                         error=exc,
                     )
                 )
-                if isinstance(exc, LLMFatalProviderOutputError):
+                if isinstance(exc, LLMOutputValidationError):
                     raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts)) from exc
                 if _has_remaining_attempt(configs, fallback_index=fallback_index, attempt=attempt, max_attempts=max_attempts):
                     time.sleep(RETRY_INTERVAL_SECONDS)
@@ -784,7 +788,7 @@ def _raise_if_provider_failure_text(
     if classification.classification == ProviderOutputClass.OK:
         return
     if classification.classification == ProviderOutputClass.RETRYABLE_PROVIDER_FAILURE:
-        raise LLMOutputValidationError(f"retryable provider failure text: {classification.reason}")
+        raise LLMRetryableProviderOutputError(f"retryable provider failure text: {classification.reason}")
     raise LLMFatalProviderOutputError(f"fatal provider failure text: {classification.reason}")
 
 

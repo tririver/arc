@@ -9,7 +9,7 @@ from .config import (
     DEFAULT_ALLOW_NATURAL_LANGUAGE,
     DEFAULT_OUTPUT_RECOVERY_ENABLED,
     DEFAULT_OUTPUT_RECOVERY_MODE,
-    DEFAULT_REVIEWER_VALIDATION_RETRIES,
+    DEFAULT_SCHEMA_FORMATTER_ENABLED,
     DEFAULT_SCHEMA_VIOLATION_POLICY,
 )
 
@@ -119,7 +119,7 @@ def materialize_batch(
                 "mode": DEFAULT_OUTPUT_RECOVERY_MODE,
                 "allow_natural_language": DEFAULT_ALLOW_NATURAL_LANGUAGE,
                 "schema_violation_policy": DEFAULT_SCHEMA_VIOLATION_POLICY,
-                "reviewer_validation_retries": DEFAULT_REVIEWER_VALIDATION_RETRIES,
+                "schema_formatter": {"enabled": DEFAULT_SCHEMA_FORMATTER_ENABLED},
             }
         )
     )

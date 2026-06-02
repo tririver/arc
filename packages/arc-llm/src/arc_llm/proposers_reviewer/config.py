@@ -19,7 +19,7 @@ DEFAULT_OUTPUT_RECOVERY_ENABLED = True
 DEFAULT_OUTPUT_RECOVERY_MODE = "warn"
 DEFAULT_ALLOW_NATURAL_LANGUAGE = True
 DEFAULT_SCHEMA_VIOLATION_POLICY = "peer_visible"
-DEFAULT_REVIEWER_VALIDATION_RETRIES = 0
+DEFAULT_SCHEMA_FORMATTER_ENABLED = True
 
 
 class ConfigError(ValueError):
@@ -91,7 +91,7 @@ class OutputRecoveryOptions:
     mode: str
     allow_natural_language: bool
     schema_violation_policy: str
-    reviewer_validation_retries: int
+    schema_formatter_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -353,8 +353,20 @@ def _parse_output_recovery(raw_options: Any) -> OutputRecoveryOptions:
     schema_violation_policy = str(
         options.get("schema_violation_policy", DEFAULT_SCHEMA_VIOLATION_POLICY) or DEFAULT_SCHEMA_VIOLATION_POLICY
     ).strip().lower()
-    if schema_violation_policy not in {"retry_then_recover", "peer_visible"}:
-        raise ConfigError("output_recovery.schema_violation_policy must be retry_then_recover or peer_visible")
+    if schema_violation_policy == "retry_then_recover":
+        schema_violation_policy = "fallback"
+    if schema_violation_policy not in {"fallback", "peer_visible"}:
+        raise ConfigError("output_recovery.schema_violation_policy must be fallback or peer_visible")
+    if "reviewer_validation_retries" in options:
+        _non_negative_int(
+            options.get("reviewer_validation_retries"),
+            "output_recovery.reviewer_validation_retries",
+        )
+    schema_formatter = _dict(options.get("schema_formatter", {}), "output_recovery.schema_formatter")
+    schema_formatter_enabled = options.get(
+        "schema_formatter_enabled",
+        schema_formatter.get("enabled", DEFAULT_SCHEMA_FORMATTER_ENABLED),
+    )
     return OutputRecoveryOptions(
         enabled=_bool(options.get("enabled", DEFAULT_OUTPUT_RECOVERY_ENABLED), "output_recovery.enabled"),
         mode=mode,
@@ -363,9 +375,9 @@ def _parse_output_recovery(raw_options: Any) -> OutputRecoveryOptions:
             "output_recovery.allow_natural_language",
         ),
         schema_violation_policy=schema_violation_policy,
-        reviewer_validation_retries=_non_negative_int(
-            options.get("reviewer_validation_retries", DEFAULT_REVIEWER_VALIDATION_RETRIES),
-            "output_recovery.reviewer_validation_retries",
+        schema_formatter_enabled=_bool(
+            schema_formatter_enabled,
+            "output_recovery.schema_formatter.enabled",
         ),
     )
 

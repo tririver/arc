@@ -13,6 +13,7 @@ from .proposers_reviewer.template_materializer import materialize_batch
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
 from .proposers_reviewer_bench.runner import run_proposers_reviewer_bench
 from .runner import resolve_llm_config, run_json, run_text
+from .schema_formatter import format_to_schema
 from .sessions import LLMSessionManager
 
 
@@ -50,6 +51,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _session_args(run_text_parser)
     _shared_runtime_args(run_text_parser)
     _llm_runtime_args(run_text_parser)
+
+    schema_format_parser = sub.add_parser("schema-format")
+    schema_format_parser.add_argument("--input", default="-")
+    schema_format_parser.add_argument("--schema", required=True)
+    schema_format_parser.add_argument("--provider", default="auto")
+    schema_format_parser.add_argument("--model", default=None)
+    schema_format_parser.add_argument("--model-tier", choices=["high", "medium", "low"], default=None)
+    schema_format_parser.add_argument("--role-hint", default=None)
+    schema_format_parser.add_argument("--json", action="store_true")
+    _shared_runtime_args(schema_format_parser)
+    _llm_runtime_args(schema_format_parser)
 
     loop_parser = sub.add_parser("proposers-reviewer-loop")
     loop_parser.add_argument("--config", required=True)
@@ -127,6 +139,17 @@ def _dispatch(args: argparse.Namespace) -> Any:
             call_label=args.call_label,
             artifact_dir=args.session_root,
         )
+    if args.command == "schema-format":
+        return format_to_schema(
+            raw_text=_read_prompt(args.input),
+            schema=_read_schema(args.schema) or {},
+            role_hint=args.role_hint,
+            json_runner=run_json,
+            provider=args.provider,
+            model=args.model,
+            model_tier=args.model_tier,
+            env=_runtime_env(args),
+        ).value
     if args.command == "proposers-reviewer-loop":
         config = _read_json_file(args.config)
         _apply_loop_session_overrides(config, args)
