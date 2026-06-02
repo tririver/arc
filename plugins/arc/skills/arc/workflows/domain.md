@@ -18,12 +18,8 @@ Do not substitute a paraphrased intent string into ARC calls.
 
 ### Phase 2: Build Domain Caches
 
-Concurrent domain builds are safe when each build targets a distinct ARC
-domain id. ARC writes domain artifacts under per-domain cache directories, MCP
-background jobs use per-job directories, and shared paper caches use atomic
-cache-file replacement. Do not run duplicate builds for the same domain id in
-parallel; keep one build for that domain, or run duplicate-domain rebuilds
-sequentially if `refresh=true`.
+Distinct ARC domain ids may build concurrently. Do not run duplicate builds for
+the same domain id in parallel; see `manuals/arc-domain.md`.
 
 Step 1: Resolve the domain id for each `<seed-paper>` with the exact
 `<user-intent>`. If multiple entries resolve to the same domain id, keep one
@@ -50,33 +46,18 @@ If there is more than one distinct domain, launch all `llm_domain_build`
 background jobs before watching any of them. This allows independent domains to
 build concurrently while preserving per-job result inspection.
 
-Step 3: For every MCP response that contains `status: "job_running"` and
-`job_id`, run the returned `next.cli_command`, for example:
-
-```bash
-arc-mcp watch <job-id> --json
-```
-
-Plugin or Codex shells may not have `arc-mcp` on `PATH`; the MCP response may
-therefore return an absolute runtime command. Use that exact command when
-present. If the CLI is unavailable, poll `job_status(job_id)` and then
-`job_result(job_id)`.
-
-Watch all launched jobs to a terminal result. If host or MCP execution cannot
-run jobs concurrently, fall back to watching/running them sequentially without
-changing the artifact contract.
+Step 3: For every background job, follow `manuals/arc-mcp.md` using the
+returned `next.cli_command`. Watch all launched jobs to a terminal result. If
+host or MCP execution cannot run jobs concurrently, fall back to sequential
+watching/running without changing the artifact contract.
 
 Step 4: Inspect each returned JSON body. Do not treat command exit code alone
 as success. Continue only when every domain job result is successful. If any
 job failed, was cancelled, or returned `needs_llm`, print `WARNING:` with the
 reason and stop before exporting project-local artifacts.
 
-The domain build includes the selected domain papers and every arXiv paper in
-the domain candidate pool that appeared within the last year. ARC domain logic
-only chooses the cross-paper set and relations; per-paper metadata,
-references, citers, and ar5iv JSON parsing must come from `arc-paper`.
-`arc-domain` writes `paper_json_pack.json` after fetching the graph papers
-concurrently through the `arc-paper` interface.
+For domain package boundaries and `paper_json_pack.json`, see
+`manuals/arc-domain.md`.
 
 ### Phase 3: Copy Domain Artifacts
 

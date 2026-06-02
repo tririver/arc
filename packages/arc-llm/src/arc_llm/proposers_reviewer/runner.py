@@ -249,25 +249,41 @@ def _run_loop_rounds(
             round_paths=round_paths,
             stateful_supported=_stateful_supported(json_runner),
         )
-        review_output = _call_reviewer_with_validation_retry(
-            json_runner,
-            prompt_options,
-            worker=reviewer,
-            loop=loop,
-            batch=batch,
-            round_number=round_number,
-            error_path=round_paths.worker_error(reviewer.id),
-            context_path=round_paths.reviewer_context(reviewer.id),
-            save_prompt=artifact_options.save_prompts,
-            base_env=base_env,
-            process_chain=process_chain,
-            session_manager=session_manager,
-            session_key=session_key,
-            prefix_limiter=prefix_limiter,
-            artifact_dir=round_paths.round_root / "llm_calls" / reviewer.id,
-            cache_guard=loop.session.cache_guard,
-            cache_warnings_path=paths.run_root / "cache_warnings.jsonl",
-        )
+        try:
+            review_output = _call_reviewer_with_validation_retry(
+                json_runner,
+                prompt_options,
+                worker=reviewer,
+                loop=loop,
+                batch=batch,
+                round_number=round_number,
+                error_path=round_paths.worker_error(reviewer.id),
+                context_path=round_paths.reviewer_context(reviewer.id),
+                save_prompt=artifact_options.save_prompts,
+                base_env=base_env,
+                process_chain=process_chain,
+                session_manager=session_manager,
+                session_key=session_key,
+                prefix_limiter=prefix_limiter,
+                artifact_dir=round_paths.round_root / "llm_calls" / reviewer.id,
+                cache_guard=loop.session.cache_guard,
+                cache_warnings_path=paths.run_root / "cache_warnings.jsonl",
+            )
+        except Exception as exc:
+            if not _warn_continue_policy(batch.output_recovery) or _is_provider_failure_exception(exc):
+                raise
+            review_output = _peer_visible_reviewer_fallback(
+                raw_output=str(exc),
+                error=exc,
+                worker=reviewer,
+                loop=loop,
+            )
+            _record_structured_output_warning(
+                review_output[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
+                warnings_path=paths.run_root / "structured_output_warnings.jsonl",
+                worker=reviewer,
+                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{reviewer.id}",
+            )
         atomic_write_json(round_paths.review(reviewer.id), review_output)
 
         round_events = _round_events(
@@ -359,14 +375,26 @@ def _run_proposers(
         }
         for future in as_completed(future_by_proposer):
             proposer = future_by_proposer[future]
-            output = future.result().output
-            output = _prepare_peer_visible_proposer_output(
-                output,
-                worker=proposer,
-                output_recovery=batch.output_recovery,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{proposer.id}",
-                warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
-            )
+            call_label = f"loop/{loop.loop_id}/round_{round_number:03d}/{proposer.id}"
+            try:
+                output = future.result().output
+                output = _prepare_peer_visible_proposer_output(
+                    output,
+                    worker=proposer,
+                    output_recovery=batch.output_recovery,
+                    call_label=call_label,
+                    warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
+                )
+            except Exception as exc:
+                if not _warn_continue_policy(batch.output_recovery) or _is_provider_failure_exception(exc):
+                    raise
+                output = _worker_exception_output(worker=proposer, role="proposer", exc=exc, call_label=call_label)
+                _record_structured_output_warning(
+                    output[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
+                    warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
+                    worker=proposer,
+                    call_label=call_label,
+                )
             outputs[proposer.id] = output
             atomic_write_json(round_paths.proposer_output(proposer.id), output)
     return dict(sorted(outputs.items()))
@@ -560,61 +588,36 @@ def _peer_visible_reviewer_fallback(
     loop: LoopConfig,
 ) -> dict[str, Any]:
     raw_text = _raw_output_text(raw_output)
-    proposer_ids = [proposer.id for proposer in loop.proposers]
-    structured_output = structured_metadata(
-        severity="major",
-        warnings=[
-            "Reviewer output failed schema validation and was exposed to peers as an unstructured message.",
-            str(error),
-        ],
+    recovery_schema = _reviewer_recovery_schema(worker.output_schema, loop=loop)
+    recovered = recover_json_output(
+        value={},
+        schema=recovery_schema,
         raw_text=raw_text,
-        strategy="peer_visible_reviewer_fallback",
-        provider_error_type=type(error).__name__,
+        error=error,
+        role_hint="reviewer",
+        strict_first=False,
+        provider_metadata={
+            "mode": "recovered",
+            "severity": "major",
+            "warnings": [
+                "Reviewer output failed schema validation and was exposed to peers as a warning artifact.",
+                str(error),
+            ],
+            "provider_error_type": type(error).__name__,
+            "recovery_strategy": "peer_visible_reviewer_fallback",
+        },
     )
-    return {
-        "schema_version": REVIEW_ENVELOPE_SCHEMA,
-        "controller": {
-            "message": "Reviewer output did not match the review schema; unstructured text was forwarded.",
-            "stop_requested": False,
-            "stop_reason": None,
-        },
-        "proposer_messages": {
-            proposer_id: {
-                "message": (
-                    "Reviewer output was unstructured and could not approve this round. "
-                    f"Raw reviewer text:\n{raw_text}"
-                )
-            }
-            for proposer_id in proposer_ids
-        },
-        "review_payload": {
-            "consensus": {
-                "status": "unresolved",
-                "analysis": "Reviewer output failed schema validation; forcing manual inspection.",
-                "accepted_result": None,
-                "agreed_proposer_ids": [],
-                "likely_wrong_proposer_ids": proposer_ids,
-                "recalculate_proposer_ids": proposer_ids,
-                "best_written_proposer_id": None,
-                "best_written_selection_reason": "",
-                "source_discrepancies": [],
-                "workflow_action": {
-                    "action": "pause_for_human",
-                    "requires_human": True,
-                    "issue_type": "worker_failure",
-                    "proposed_revision": None,
-                    "reason": "Reviewer output failed schema validation and was forwarded as unstructured text.",
-                    "expert_question": "Inspect the raw reviewer text and decide whether to accept, revise, or rerun.",
-                },
-            }
-        },
-        ARC_LLM_CALL_RECORD_FIELD: _local_recovery_call_record(
-            worker=worker,
-            schema=worker.output_schema,
-            signal="peer_visible_reviewer_fallback",
-            structured_output=structured_output,
-        ),
-    }
+    output = dict(recovered.value)
+    _force_non_approving_reviewer_fallback(output, schema=recovery_schema, loop=loop)
+    _force_zero_marks_if_present(output, schema=recovery_schema)
+    structured_output = {**dict(recovered.structured_output or {}), "recovery_strategy": "peer_visible_reviewer_fallback"}
+    output[ARC_LLM_CALL_RECORD_FIELD] = _local_recovery_call_record(
+        worker=worker,
+        schema=worker.output_schema,
+        signal="peer_visible_reviewer_fallback",
+        structured_output=structured_output,
+    )
+    return output
 
 
 def _conservative_reviewer_schema_failure_fallback(
@@ -764,6 +767,47 @@ def _force_non_approving_reviewer_fallback(
         "expert_question",
         "The reviewer returned malformed structured output. Should this step be retried or inspected manually?",
         workflow_schema,
+    )
+
+
+def _force_zero_marks_if_present(output: dict[str, Any], *, schema: Mapping[str, Any]) -> None:
+    review_payload = output.setdefault("review_payload", {})
+    if not isinstance(review_payload, dict):
+        output["review_payload"] = review_payload = {}
+    marks_schema = _schema_at(schema, "review_payload", "marks")
+    if not marks_schema:
+        return
+    props = marks_schema.get("properties") if isinstance(marks_schema.get("properties"), Mapping) else {}
+    fields = {str(item) for item in marks_schema.get("required", [])}
+    fields.update(str(key) for key in props)
+    if fields:
+        review_payload["marks"] = {field: 0 for field in fields}
+
+
+def _worker_exception_output(
+    *,
+    worker: WorkerConfig,
+    role: str,
+    exc: BaseException,
+    call_label: str,
+) -> dict[str, Any]:
+    del call_label
+    raw_text = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    structured_output = structured_metadata(
+        severity="major",
+        warnings=[
+            f"{role} worker call failed; ARC is continuing with a warning artifact instead of aborting the loop.",
+            raw_text,
+        ],
+        raw_text=raw_text,
+        strategy="worker_exception_continue",
+        provider_error_type=type(exc).__name__,
+    )
+    return _unstructured_output_wrapper(
+        raw_text=raw_text,
+        worker=worker,
+        role=role,
+        structured_output=structured_output,
     )
 
 
@@ -1351,7 +1395,11 @@ def _locked_turn_kind(
 ) -> str:
     if not _uses_stateful_delta(loop, prompt_options):
         return "legacy_full"
-    return "initial" if session_manager.turn_count(session_key) == 0 else "delta"
+    if session_manager.turn_count(session_key) == 0:
+        return "initial"
+    if not session_manager.has_native_session(session_key):
+        return "initial"
+    return "delta"
 
 
 def _proposer_prompt_options(
@@ -1680,10 +1728,19 @@ def _peer_visible_schema_policy(options: OutputRecoveryOptions) -> bool:
     return options.schema_violation_policy == "peer_visible" and _output_recovery_mode(options) == "warn"
 
 
+def _warn_continue_policy(options: OutputRecoveryOptions) -> bool:
+    return _output_recovery_mode(options) == "warn" and options.allow_natural_language
+
+
 def _output_recovery_mode(options: OutputRecoveryOptions) -> str:
     if not options.enabled or not options.allow_natural_language:
         return "strict"
     return options.mode
+
+
+def _is_provider_failure_exception(exc: BaseException) -> bool:
+    text = str(exc)
+    return "retryable provider failure text" in text or "fatal provider failure text" in text
 
 
 def _raw_output_text(output: Any) -> str:

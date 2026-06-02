@@ -35,10 +35,8 @@ not optional.
   behavior: read `manuals/arc-mcp.md`.
 - Host LLM/provider detection, model choice, direct prompt tests, or provider
   troubleshooting: read `manuals/arc-llm.md`.
-- User-facing Markdown report export: when a workflow writes a Markdown report
-  to `<project-dir>/` for human readers, call MCP `md2pdf` on that project-level file.
-  `md2pdf` starts a background PDF job; record the returned job id if present
-  and do not wait before continuing unless the user explicitly asks.
+- User-facing Markdown report export: see `rules/math_typeset.md` and
+  `manuals/arc-mcp.md`.
 
 ## Workflow
 
@@ -74,9 +72,8 @@ for routing, domain building, checking, or later workflows.
 
 Step 3: Resolve `<seed-paper-list>`.
 Use explicit paper identifiers when present. Otherwise infer seed papers from
-`<user-intent>` through ARC paper tools. If a slow MCP call returns a background
-job id, immediately use the blocking CLI watcher described in
-`manuals/arc-mcp.md`.
+`<user-intent>` through ARC paper tools. See `manuals/arc-paper.md` for paper
+identifier inference and `manuals/arc-mcp.md` for background jobs.
 
 Step 4: Resolve `<project-dir>`.
 Use a user-specified project directory when present. Otherwise derive a safe
@@ -91,8 +88,8 @@ Include `automation_level`, `workflow`, `original_request`, `user_intent`,
 `workers`, and `refresh`.
 
 Set `provider` to `auto` unless the user pins a provider. Set `model_tier` to
-`medium` unless the user explicitly asks for `low` or `high`. Do not write
-`model_tier: "auto"`; valid tiers are only `low`, `medium`, and `high`.
+`medium` unless the user explicitly asks otherwise. See `manuals/arc-llm.md`
+for model tiers.
 
 Use a stable safe `run_id`: lowercase ASCII letters, digits, and underscores,
 for example a short intent slug plus UTC timestamp. Set `skill_dir` to the ARC

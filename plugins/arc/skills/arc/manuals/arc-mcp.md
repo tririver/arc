@@ -70,6 +70,13 @@ Tools that may invoke a host LLM provider use the `llm_` prefix.
 return immediately. Translation defaults to Chinese and low-tier LLMs unless
 the user asks for another language, locale, model, or quality pass.
 
+## Markdown Report Export
+
+When a workflow writes a user-facing Markdown report to `<project-dir>/`, call
+`md2pdf` on that project-level file. `md2pdf` starts a background PDF job;
+record the returned job id if present and do not wait before continuing unless
+the user explicitly asks.
+
 ## Background Jobs
 
 Use `background=true` for slow tools, large launches, and anything likely to

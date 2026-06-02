@@ -5,7 +5,7 @@
   "loop_template": "ideas-loop.template.json",
   "proposer_template": "ideas-proposer.template.json",
   "context_policy": {
-    "require_domain_markdown": true,
+    "require_domain_markdown": false,
     "attach_domain_markdown": true,
     "attach_arc_paper_tool_notes": true
   },

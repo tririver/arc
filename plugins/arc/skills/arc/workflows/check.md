@@ -30,42 +30,20 @@ Markdown reports and planning handoffs.
 ## Phase 1: Parse And Read Notes
 
 Step 1: For local notes or papers, parse accessible sources before checking
-claims:
+claims. See `manuals/arc-paper.md` for parse commands and parsed-source reads.
 
 This phase is a parsing workflow, not a TeX build workflow. Do not run
 `pdflatex`, `latexmk`, `chktex`, or other TeX compilers/linters as part of
 content checking unless the user explicitly asks for build/typesetting QA.
-For TeX/PDF notes, `arc-paper parse` is the required source-ingestion step;
-parsed ARC paper output is the source of truth for sections, equations, line
-anchors, and PDF page anchors.
-
-```bash
-arc-paper parse --tex NOTE.tex --pdf NOTE.pdf --id NOTE_ID --json
-arc-paper parse --tex NOTE.tex --id NOTE_ID --json
-arc-paper parse --pdf NOTE.pdf --id NOTE_ID --json
-arc-paper parse --html NOTE.html --id NOTE_ID --json
-arc-paper parse --paper-id 0911.3380 --source ar5iv --json
-```
-
-If a PDF is larger than the TeX source, such as a book containing one TeX
-section, use the TeX+PDF parse command so ARC paper can locate equation numbers
-and pages from nearby prose, equation tokens, and printed number candidates. If
-a PDF cannot be used, rely on warnings returned by `arc-paper parse`.
+For TeX/PDF notes, ARC parsed paper output is the source of truth for sections,
+equations, line anchors, and PDF page anchors.
 
 Step 2: Read parsed sources through ARC paper commands. Treat command output as
 the source of truth for parsed note structure.
 
-```bash
-arc-paper get-parsed NOTE_ID --json
-arc-paper get-parsed-toc NOTE_ID --json
-arc-paper get-parsed-section NOTE_ID --section SECTION_ID --json
-arc-paper get-parsed-equations NOTE_ID --json
-arc-paper get-parsed-equation NOTE_ID --equation-id EQUATION_ID --json
-```
-
 For Markdown notes, read the Markdown file directly and preserve source file
 names and headings. For PDF-only notes, parse first, then read parsed sections
-and equations with the commands above.
+and equations with commands from `manuals/arc-paper.md`.
 
 ## Phase 2: Main-Agent Preflight
 
@@ -158,14 +136,4 @@ the work note. Human-resolved accepted content must follow the owning
 workflow's marker-only color rule for `human-resolved`.
 
 If checking shows that a parsed equation is problematic, ask the user to choose
-either an ARC paper annotation or a re-parse.
-
-For annotation:
-
-```bash
-arc-paper mark-parsed-equation NOTE_ID --equation-id eq_00042 \
-  --status problematic --reason "Short reason from the check"
-```
-
-For re-parse, update the parse input and rerun `arc-paper parse` with the same
-`--id`.
+either an ARC paper annotation or a re-parse. See `manuals/arc-paper.md`.

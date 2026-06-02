@@ -80,7 +80,8 @@ def _round_entry(loop_root: Path, round_root: Path) -> dict[str, Any] | None:
     review = _read_json(review_path)
     marks = review.get("review_payload", {}).get("marks", {})
     if "total_score" not in marks:
-        return None
+        marks = {field: 0 for field in score_fields()}
+        marks["total_score"] = 0
     if _major_recovered(review) or _major_recovered(proposer_output):
         marks = {field: 0 for field in score_fields()}
 
@@ -88,7 +89,7 @@ def _round_entry(loop_root: Path, round_root: Path) -> dict[str, Any] | None:
     return {
         "loop_id": loop_root.name,
         "round": _round_number(round_root),
-        "title": str(proposer_output.get("title", "")),
+        "title": str(proposer_output.get("title") or proposer_output.get("warning") or "Recovered / unstructured idea"),
         "marks": normalized_marks(marks),
         "proposer_output": proposer_output,
         "proposer_output_text": proposer_output_text,

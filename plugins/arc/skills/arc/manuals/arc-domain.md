@@ -8,6 +8,15 @@ packs, and compact field briefings.
 Intent affects the domain cache. A different intent string should be treated as
 a different domain selection.
 
+## Concurrency
+
+Concurrent domain builds are safe when each build targets a distinct ARC domain
+id. ARC writes domain artifacts under per-domain cache directories, MCP
+background jobs use per-job directories, and shared paper caches use atomic
+cache-file replacement. Do not run duplicate builds for the same domain id in
+parallel; keep one build for that domain, or run duplicate-domain rebuilds
+sequentially if `refresh=true`.
+
 ## Full Build CLI
 
 ### Phase 1: Initialize or build from a seed paper.
@@ -123,6 +132,13 @@ arc-domain status <seed-paper> --intent "<user-intent>" --json
 
 ## Package Boundary
 
+The domain build includes the selected domain papers and every arXiv paper in
+the domain candidate pool that appeared within the last year. ARC domain logic
+only chooses the cross-paper set and relations.
+
 All single-paper metadata, references, citers, full text, and sections should
 come through `arc-paper`. Do not fetch INSPIRE or ar5iv directly inside domain
 workflows.
+
+`arc-domain` writes `paper_json_pack.json` after fetching the graph papers
+concurrently through the `arc-paper` interface.

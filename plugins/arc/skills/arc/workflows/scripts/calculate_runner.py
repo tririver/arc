@@ -8,6 +8,10 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from _arc_script_bootstrap import bootstrap_arc_pythonpath
+
+bootstrap_arc_pythonpath()
+
 from arc_llm.proposers_reviewer.artifacts import RunPaths, atomic_write_json
 from arc_llm.proposers_reviewer.config import ConfigError, SAFE_ID_RE
 from arc_llm.proposers_reviewer.runner import JsonRunner, run_proposers_reviewer_batch

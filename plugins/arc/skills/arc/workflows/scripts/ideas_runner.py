@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from _arc_script_bootstrap import bootstrap_arc_pythonpath
+
+bootstrap_arc_pythonpath()
+
 from arc_llm.proposers_reviewer.artifacts import atomic_write_json, atomic_write_text
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 from arc_llm.proposers_reviewer.template_materializer import (
@@ -57,6 +61,7 @@ def run_ideas(
     warnings = [
         _concurrency_warning(ideas_config, len(ideas), max_concurrent=max_concurrent),
         *_model_tier_warnings(batch_config),
+        *_caller_context_warnings(ideas),
     ]
 
     if dry_run:
@@ -171,14 +176,32 @@ def _caller_context(config: IdeasConfig, *, variant: VariantConfig, idea_id: str
     caller_context["marking_scheme"] = marking_scheme_for_context(load_marking_scheme(variant.path.parent))
     if variant.context_policy.attach_domain_markdown:
         markdown_files = _domain_markdown_files(config.project_dir / "domain")
-        if variant.context_policy.require_domain_markdown and not markdown_files:
-            raise ConfigError(f"{variant.variant_id} requires domain markdown under {config.project_dir / 'domain'}")
-        caller_context["domain_markdown_files"] = markdown_files
+        if markdown_files:
+            caller_context["domain_markdown_files"] = markdown_files
+        else:
+            if variant.context_policy.require_domain_markdown:
+                raise ConfigError(f"{variant.variant_id} requires domain markdown under {config.project_dir / 'domain'}")
+            caller_context.pop("domain_markdown_files", None)
+            caller_context.setdefault("warnings", []).append(
+                "domain_markdown_unavailable: Domain markdown was unavailable; continuing with user intent and ARC paper/tool context only."
+            )
     else:
         caller_context.pop("domain_markdown_files", None)
     if not variant.context_policy.attach_arc_paper_tool_notes:
         caller_context.pop("arc_paper_tool_notes", None)
     return caller_context
+
+
+def _caller_context_warnings(ideas: list[IdeaPlan]) -> list[str]:
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for idea in ideas:
+        for warning in idea.caller_context.get("warnings", []):
+            text = str(warning)
+            if text not in seen:
+                seen.add(text)
+                warnings.append(text)
+    return warnings
 
 
 def _loop_batch_config(config: IdeasConfig, ideas: list[IdeaPlan], *, run_root: Path) -> dict[str, Any]:

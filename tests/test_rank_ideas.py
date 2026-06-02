@@ -237,6 +237,36 @@ def test_rank_run_zeroes_major_recovered_proposer_marks(tmp_path: Path) -> None:
     assert all(value == 0 for value in recovered_round["marks"].values())
 
 
+def test_rank_run_includes_unstructured_round_without_marks(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001"
+    round_root = run_root / "loops/domain_idea_001/rounds/round_001"
+    proposer_dir = round_root / "proposer_outputs"
+    review_dir = round_root / "reviews"
+    proposer_dir.mkdir(parents=True)
+    review_dir.mkdir(parents=True)
+    (proposer_dir / "proposer_001.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.llm.unstructured_output.v1",
+                "warning": "Output did not satisfy the requested JSON schema.",
+                "raw_text": "Recovered natural-language idea",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (review_dir / "reviewer_001.json").write_text(
+        json.dumps({"review_payload": {"comments": "marks missing"}}),
+        encoding="utf-8",
+    )
+
+    entry = ranker.rank_run(run_root)["ranking"][0]
+
+    assert entry["title"] == "Output did not satisfy the requested JSON schema."
+    assert entry["marks"]["total_score"] == 0
+    assert all(value == 0 for value in entry["marks"].values())
+
+
 def _write_round(
     run_root: Path,
     loop_id: str,

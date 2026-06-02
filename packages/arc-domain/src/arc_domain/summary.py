@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from typing import Any
+
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema import validate as validate_json_schema
+from jsonschema.exceptions import SchemaError as JsonSchemaError
 
 from arc_llm import run_json
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA, strip_arc_llm_call_records
@@ -130,6 +135,42 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
 }
 
 
+def _schema_error(payload: dict[str, Any], schema: dict[str, Any]) -> str | None:
+    try:
+        validate_json_schema(instance=payload, schema=schema)
+        return None
+    except (JsonSchemaValidationError, JsonSchemaError) as exc:
+        return str(exc)
+
+
+def _call_record_warning(payload: dict[str, Any]) -> str | None:
+    record = payload.get(ARC_LLM_CALL_RECORD_FIELD)
+    if not isinstance(record, dict):
+        return None
+    structured = record.get("structured_output")
+    if not isinstance(structured, dict) or structured.get("mode") != "recovered":
+        return None
+    bits = []
+    if structured.get("severity"):
+        bits.append(f"severity={structured['severity']}")
+    if structured.get("recovery_strategy"):
+        bits.append(f"strategy={structured['recovery_strategy']}")
+    warnings = structured.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        bits.append("; ".join(str(item) for item in warnings[:3]))
+    return "domain_summary_structured_recovery:" + " | ".join(bits) if bits else None
+
+
+def _raw_text_from_call_record(payload: dict[str, Any]) -> str:
+    record = payload.get(ARC_LLM_CALL_RECORD_FIELD)
+    if not isinstance(record, dict):
+        return ""
+    structured = record.get("structured_output")
+    if not isinstance(structured, dict):
+        return ""
+    return str(structured.get("raw_text_excerpt") or "").strip()
+
+
 def summarize_domain(
     *,
     paths: DomainPaths,
@@ -142,8 +183,23 @@ def summarize_domain(
     evidence = read_json(paths.evidence_pack, {})
     selection = read_json(paths.foundation_selection, {})
     prompt = _summary_prompt(graph=graph, evidence=evidence, selection=selection)
-    summary = run_json(prompt, schema=DOMAIN_SUMMARY_SCHEMA, provider=provider, model=model, model_tier=model_tier)
-    summary["summary_method"] = "llm"
+    raw_summary = run_json(
+        prompt,
+        schema=DOMAIN_SUMMARY_SCHEMA,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        validate_schema=False,
+        output_recovery="warn",
+    )
+    summary, method, relaxed_warnings = _normalize_domain_summary_output(
+        raw_summary,
+        paths=paths,
+        graph=graph,
+        evidence=evidence,
+        selection=selection,
+    )
+    summary["summary_method"] = method
     summary["schema_version"] = "arc.domain_summary.v4"
     summary["domain_id"] = paths.domain_id
     summary["created_at"] = now_iso()
@@ -155,12 +211,215 @@ def summarize_domain(
         domain_summary_path=str(paths.domain_summary),
         domain_summary_markdown_path=str(paths.domain_summary_markdown),
     )
+    if relaxed_warnings:
+        status = read_json(paths.status, {}) or {}
+        prior = status.get("warnings") if isinstance(status.get("warnings"), list) else []
+        update_status(
+            paths,
+            warnings=[
+                *prior,
+                *[
+                    {"code": "domain_summary_relaxed", "message": warning, "created_at": now_iso()}
+                    for warning in relaxed_warnings
+                ],
+            ],
+        )
     return {
         "domain_id": paths.domain_id,
         "domain_summary_path": str(paths.domain_summary),
         "domain_summary_markdown_path": str(paths.domain_summary_markdown),
         "summary": summary,
     }
+
+
+def _normalize_domain_summary_output(
+    raw: dict[str, Any],
+    *,
+    paths: DomainPaths,
+    graph: dict[str, Any],
+    evidence: dict[str, Any],
+    selection: dict[str, Any],
+) -> tuple[dict[str, Any], str, list[str]]:
+    del paths, graph, evidence
+    raw = dict(raw or {})
+    warnings: list[str] = []
+    schema_error = _schema_error(raw, DOMAIN_SUMMARY_SCHEMA)
+    recovery_warning = _call_record_warning(raw)
+    if schema_error is None and recovery_warning is None:
+        return raw, "llm", []
+
+    if schema_error is not None:
+        warnings.append("domain_summary_schema_relaxed:" + _compact_text(schema_error, SUMMARY_REASON_CHAR_LIMIT))
+    if recovery_warning:
+        warnings.append(recovery_warning)
+
+    raw_without_record = strip_arc_llm_call_records(raw)
+    raw_text = _raw_text_from_call_record(raw) or _best_relaxed_summary_text(raw_without_record)
+    foundation = _paper_summary_from_any(
+        raw_without_record.get("foundation_paper") or selection.get("selected_foundation") or {},
+        fallback_reason="Foundation paper from ARC selection.",
+    )
+    best_reference = _paper_summary_from_any(
+        raw_without_record.get("best_reference_paper")
+        or raw_without_record.get("best_reference")
+        or selection.get("best_reference_paper")
+        or selection.get("selected_foundation")
+        or {},
+        fallback_reason="Best reference paper from ARC selection.",
+    )
+    raw_warnings = raw_without_record.get("warnings")
+    normalized_warnings = [str(item) for item in raw_warnings if item] if isinstance(raw_warnings, list) else []
+    normalized = {
+        "schema_version": "arc.domain_summary.v4",
+        "domain_title": str(
+            raw_without_record.get("domain_title")
+            or raw_without_record.get("domain")
+            or raw_without_record.get("title")
+            or "Research Domain"
+        ),
+        "brief_introduction": raw_text or "LLM returned a malformed domain summary; inspect relaxed_payload for details.",
+        "task_focus": _task_focus_from_relaxed(raw_without_record, selection=selection),
+        "foundation_paper": foundation,
+        "best_reference_paper": best_reference,
+        "methodology": _methodology_from_relaxed(raw_without_record),
+        "known_solved_cases": _solved_cases_from_relaxed(raw_without_record),
+        "open_axes_for_new_work": _open_axes_from_relaxed(raw_without_record),
+        "warnings": [*normalized_warnings, *warnings],
+        "relaxed_payload": raw_without_record,
+    }
+    if isinstance(raw.get(ARC_LLM_CALL_RECORD_FIELD), dict):
+        normalized[ARC_LLM_CALL_RECORD_FIELD] = raw[ARC_LLM_CALL_RECORD_FIELD]
+    method = "llm_relaxed_text" if _raw_text_from_call_record(raw) and not raw_without_record else "llm_relaxed"
+    return normalized, method, warnings
+
+
+def _best_relaxed_summary_text(raw: dict[str, Any]) -> str:
+    for key in (
+        "brief_introduction",
+        "summary",
+        "overview",
+        "domain",
+        "core_methodology",
+        "methodology",
+        "priority_rules",
+        "open_axes",
+        "open_axes_for_new_work",
+    ):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if raw:
+        return json.dumps(raw, ensure_ascii=False, indent=2, default=str)[:8000]
+    return ""
+
+
+def _paper_summary_from_any(value: Any, *, fallback_reason: str) -> dict[str, str]:
+    if isinstance(value, dict):
+        return {
+            "paper_id": str(value.get("paper_id") or value.get("id") or ""),
+            "title": str(value.get("title") or ""),
+            "reason": str(value.get("reason") or fallback_reason),
+        }
+    return {"paper_id": "", "title": "", "reason": fallback_reason}
+
+
+def _task_focus_from_relaxed(raw: dict[str, Any], *, selection: dict[str, Any]) -> dict[str, Any]:
+    task_focus = raw.get("task_focus") if isinstance(raw.get("task_focus"), dict) else {}
+    priority_rules = task_focus.get("priority_rules") or raw.get("priority_rules") or []
+    if isinstance(priority_rules, str):
+        priority_rules = [priority_rules]
+    if not isinstance(priority_rules, list):
+        priority_rules = []
+    return {
+        "user_intent": str(task_focus.get("user_intent") or selection.get("intent") or ""),
+        "research_scope": str(task_focus.get("research_scope") or raw.get("research_scope") or raw.get("domain") or ""),
+        "priority_rules": [str(item) for item in priority_rules if item],
+    }
+
+
+def _methodology_from_relaxed(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    source = raw.get("methodology") or raw.get("core_methodology") or []
+    return _items_as_claims(source, claim_key="claim")
+
+
+def _solved_cases_from_relaxed(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    source = raw.get("known_solved_cases") or raw.get("solved_cases") or []
+    items = []
+    for item in _listify(source):
+        if isinstance(item, dict):
+            items.append(
+                {
+                    "solved_case": str(item.get("solved_case") or item.get("title") or item.get("case") or ""),
+                    "why_it_is_solved": str(item.get("why_it_is_solved") or item.get("description") or ""),
+                    "transferable_form": str(item.get("transferable_form") or ""),
+                    "forbidden_reuse": str(item.get("forbidden_reuse") or ""),
+                    "valid_new_axes": [str(value) for value in _listify(item.get("valid_new_axes"))],
+                    "papers": [str(value) for value in _listify(item.get("papers"))],
+                }
+            )
+        else:
+            text = str(item)
+            items.append(
+                {
+                    "solved_case": text,
+                    "why_it_is_solved": "Recovered from relaxed domain summary text.",
+                    "transferable_form": "",
+                    "forbidden_reuse": "",
+                    "valid_new_axes": [],
+                    "papers": [],
+                }
+            )
+    return items[:SUMMARY_LIST_ITEM_LIMIT]
+
+
+def _open_axes_from_relaxed(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    source = raw.get("open_axes_for_new_work") or raw.get("open_axes") or []
+    items = []
+    for item in _listify(source):
+        if isinstance(item, dict):
+            items.append(
+                {
+                    "axis": str(item.get("axis") or item.get("title") or item.get("direction") or ""),
+                    "guidance": str(item.get("guidance") or item.get("description") or ""),
+                    "example_variations": [str(value) for value in _listify(item.get("example_variations"))],
+                    "papers": [str(value) for value in _listify(item.get("papers"))],
+                }
+            )
+        else:
+            items.append(
+                {
+                    "axis": str(item),
+                    "guidance": "Recovered from relaxed domain summary text.",
+                    "example_variations": [],
+                    "papers": [],
+                }
+            )
+    return items[:SUMMARY_LIST_ITEM_LIMIT]
+
+
+def _items_as_claims(source: Any, *, claim_key: str) -> list[dict[str, Any]]:
+    items = []
+    for item in _listify(source):
+        if isinstance(item, dict):
+            items.append(
+                {
+                    "claim": str(item.get(claim_key) or item.get("description") or item.get("method") or item),
+                    "papers": [str(value) for value in _listify(item.get("papers"))],
+                }
+            )
+        else:
+            items.append({"claim": str(item), "papers": []})
+    return items[:SUMMARY_LIST_ITEM_LIMIT]
+
+
+def _listify(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
 
 
 def _summary_prompt(*, graph: dict[str, Any], evidence: dict[str, Any], selection: dict[str, Any]) -> str:
@@ -483,6 +742,23 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
                 lines.append(f"  Example variations: {joined_variations}")
             _append_papers(lines, item.get("papers"))
         lines.append("")
+    relaxed_payload = summary.get("relaxed_payload")
+    if relaxed_payload:
+        lines.extend(
+            [
+                "## Relaxed LLM Output Warning",
+                "",
+                (
+                    "The domain summary did not fully match the strict schema. ARC preserved the recovered content "
+                    "below for downstream reading."
+                ),
+                "",
+                "```json",
+                json.dumps(relaxed_payload, ensure_ascii=False, indent=2, default=str)[:12000],
+                "```",
+                "",
+            ]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 

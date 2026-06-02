@@ -80,6 +80,48 @@ Step 1: If `get-section` cannot find the requested section, read the returned
 `toc`.
 Step 2: Retry with a valid section id, number, or heading from that `toc`.
 
+## Parsed Source CLI
+
+For TeX/PDF notes, `arc-paper parse` is the required source-ingestion step.
+Parsed ARC paper output is the source of truth for sections, equations, line
+anchors, and PDF page anchors.
+
+Parse accessible sources before checking claims:
+
+```bash
+arc-paper parse --tex NOTE.tex --pdf NOTE.pdf --id NOTE_ID --json
+arc-paper parse --tex NOTE.tex --id NOTE_ID --json
+arc-paper parse --pdf NOTE.pdf --id NOTE_ID --json
+arc-paper parse --html NOTE.html --id NOTE_ID --json
+arc-paper parse --paper-id 0911.3380 --source ar5iv --json
+```
+
+If a PDF is larger than the TeX source, such as a book containing one TeX
+section, use the TeX+PDF parse command so ARC paper can locate equation numbers
+and pages from nearby prose, equation tokens, and printed number candidates. If
+a PDF cannot be used, rely on warnings returned by `arc-paper parse`.
+
+Read parsed sources through ARC paper commands:
+
+```bash
+arc-paper get-parsed NOTE_ID --json
+arc-paper get-parsed-toc NOTE_ID --json
+arc-paper get-parsed-section NOTE_ID --section SECTION_ID --json
+arc-paper get-parsed-equations NOTE_ID --json
+arc-paper get-parsed-equation NOTE_ID --equation-id EQUATION_ID --json
+```
+
+If checking shows that a parsed equation is problematic, annotate it or reparse
+with the same source id:
+
+```bash
+arc-paper mark-parsed-equation NOTE_ID --equation-id eq_00042 \
+  --status problematic --reason "Short reason from the check"
+```
+
+For re-parse, update the parse input and rerun `arc-paper parse` with the same
+`--id`.
+
 ## LLM Summary CLI
 
 ### Phase 1: Try the cached-or-generate command.

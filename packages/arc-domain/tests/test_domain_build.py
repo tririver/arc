@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Any
 
 import pytest
 
@@ -198,7 +199,7 @@ def test_domain_llm_helpers_pass_model_tier_to_run_json(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
     captured = []
 
-    def fake_run_json(prompt, *, schema, provider, model=None, model_tier=None):
+    def fake_run_json(prompt, *, schema, provider, model=None, model_tier=None, **kwargs):
         captured.append((schema["$id"], provider, model, model_tier))
         if schema["$id"] == "arc.domain-foundation-candidate-audit-v1":
             return {
@@ -259,6 +260,148 @@ def test_domain_llm_helpers_pass_model_tier_to_run_json(monkeypatch, tmp_path):
         ("arc.domain-intent-ranking-v1", "auto", None, "high"),
         ("arc.domain-summary-v4", "auto", None, "high"),
     ]
+
+
+def test_summarize_domain_valid_json_no_relaxed_warning(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("summary_valid_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text('{"nodes":[]}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers":[]}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        json.dumps(
+            {
+                "selected_foundation": {
+                    "paper_id": FOUNDATION,
+                    "title": "Foundation",
+                    "reason": "selected",
+                },
+                "best_reference_paper": {
+                    "paper_id": FOUNDATION,
+                    "title": "Foundation",
+                    "reason": "reference",
+                },
+                "intent": "intent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_run_json(prompt, **kwargs):
+        captured.update(kwargs)
+        return _summary_payload()
+
+    monkeypatch.setattr(domain_summary, "run_json", fake_run_json)
+
+    result = domain_summary.summarize_domain(paths=paths, provider="auto")
+    summary = result["summary"]
+
+    assert captured["validate_schema"] is False
+    assert captured["output_recovery"] == "warn"
+    assert summary["summary_method"] == "llm"
+    assert "relaxed_payload" not in summary
+    assert "domain_summary_relaxed" not in json.dumps(read_json(paths.status, {}))
+
+
+def test_summarize_domain_accepts_extra_keys_with_warning(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("summary_relaxed_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text('{"nodes":[]}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers":[]}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        json.dumps(
+            {
+                "selected_foundation": {
+                    "paper_id": FOUNDATION,
+                    "title": "Foundation",
+                    "reason": "selected",
+                },
+                "best_reference_paper": {
+                    "paper_id": "arXiv:2401.00002",
+                    "title": "Best Ref",
+                    "reason": "reference",
+                },
+                "intent": "intent",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        domain_summary,
+        "run_json",
+        lambda *args, **kwargs: {
+            "domain": "DeepSeek Domain",
+            "core_methodology": ["Use exchange Witten diagrams."],
+            "key_papers": [FOUNDATION],
+            "open_axes": ["higher-point correlators"],
+            "priority_rules": "satisfy user intent first",
+            "sufficient": True,
+        },
+    )
+
+    result = domain_summary.summarize_domain(paths=paths, provider="auto")
+    summary = result["summary"]
+    markdown = paths.domain_summary_markdown.read_text(encoding="utf-8")
+    status = read_json(paths.status, {})
+
+    assert summary["summary_method"] == "llm_relaxed"
+    assert summary["domain_title"] == "DeepSeek Domain"
+    assert summary["task_focus"]["priority_rules"] == ["satisfy user intent first"]
+    assert summary["relaxed_payload"]["sufficient"] is True
+    assert any("domain_summary_schema_relaxed" in item for item in summary["warnings"])
+    assert "## Relaxed LLM Output Warning" in markdown
+    assert "DeepSeek Domain" in markdown
+    assert "domain_summary_relaxed" in json.dumps(status)
+
+
+def test_summarize_domain_accepts_plain_text_recovery_with_warning(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("summary_text_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text('{"nodes":[]}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers":[]}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        json.dumps(
+            {
+                "selected_foundation": {
+                    "paper_id": FOUNDATION,
+                    "title": "Foundation",
+                    "reason": "selected",
+                },
+                "intent": "intent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    raw_text = "Plain text briefing about massive scalar exchange."
+
+    monkeypatch.setattr(
+        domain_summary,
+        "run_json",
+        lambda *args, **kwargs: {
+            "arc_llm_call_record": {
+                "structured_output": {
+                    "mode": "recovered",
+                    "severity": "major",
+                    "recovery_strategy": "natural_language_fallback",
+                    "warnings": ["provider returned text"],
+                    "raw_text_excerpt": raw_text,
+                }
+            }
+        },
+    )
+
+    result = domain_summary.summarize_domain(paths=paths, provider="auto")
+    summary = result["summary"]
+    markdown = paths.domain_summary_markdown.read_text(encoding="utf-8")
+
+    assert summary["summary_method"] == "llm_relaxed_text"
+    assert raw_text in summary["brief_introduction"]
+    assert raw_text in markdown
+    assert any("domain_summary_structured_recovery" in item for item in summary["warnings"])
 
 
 def test_summarize_domain_reports_llm_failure_without_fallback(monkeypatch, tmp_path):
@@ -701,6 +844,114 @@ def test_candidate_audit_moves_uncertain_queries_to_warnings():
 
     assert [item["query"] for item in audit["search_queries"]] == ["confident missing foundation"]
     assert any("maybe missing foundation" in warning for warning in audit["warnings"])
+
+
+def test_candidate_audit_relaxed_call_records_schema_warning(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_run_json(prompt, **kwargs):
+        captured.update(kwargs)
+        return {
+            "sufficient": False,
+            "candidate_set_sufficient": False,
+            "confidence": "complete",
+            "search_queries": [
+                {
+                    "query": "missing same-scope foundation",
+                    "reason": "complete evidence",
+                    "confidence": "complete",
+                }
+            ],
+            "citation_directions": ["references"],
+            "reasoning": "extra key should not discard useful audit output",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(foundation, "run_json", fake_run_json)
+
+    audit = foundation._llm_audit_candidates(
+        seed_metadata={"paper_id": SEED, "title": "Seed"},
+        candidates=[{"paper_id": FOUNDATION, "title": "Foundation"}],
+        intent="intent",
+        provider="auto",
+        model=None,
+    )
+
+    assert captured["validate_schema"] is False
+    assert captured["output_recovery"] == "warn"
+    assert audit["audit_method"] == "llm_relaxed"
+    assert audit["search_queries"][0]["query"] == "missing same-scope foundation"
+    assert any("candidate_audit_schema_relaxed" in warning for warning in audit["warnings"])
+
+
+def test_foundation_selection_relaxed_call_uses_foundation_paper_mapping(monkeypatch):
+    captured: dict[str, Any] = {}
+    low_candidate = {
+        "paper_id": "arXiv:2401.00002",
+        "title": "LLM Chosen Lower Support",
+        "citation_count": 10,
+        "witness_citation_overlap": 1,
+        "intent_overlap": 0.9,
+    }
+    high_candidate = {
+        "paper_id": FOUNDATION,
+        "title": "Deterministic Higher Support",
+        "citation_count": 500,
+        "witness_citation_overlap": 9,
+        "intent_overlap": 0.1,
+    }
+
+    def fake_run_json(prompt, **kwargs):
+        captured.update(kwargs)
+        return {
+            "foundation_paper": {
+                "paper_id": low_candidate["paper_id"],
+                "title": low_candidate["title"],
+                "reason": "DeepSeek used natural key",
+            },
+            "parent_foundations": [],
+            "rejected_candidates": [],
+            "reasoning": "missing schema_version should repair",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(foundation, "run_json", fake_run_json)
+
+    selection = foundation._llm_select_foundation(
+        seed_metadata={"paper_id": SEED, "title": "Seed"},
+        candidates=[low_candidate, high_candidate],
+        intent="intent",
+        provider="auto",
+        model=None,
+    )
+
+    assert captured["validate_schema"] is False
+    assert captured["output_recovery"] == "warn"
+    assert selection["selected_foundation"]["paper_id"] == low_candidate["paper_id"]
+    assert selection["selection_method"] == "llm_relaxed"
+
+
+def test_intent_ranking_relaxed_non_list_ids_do_not_fallback(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_run_json(prompt, **kwargs):
+        captured.update(kwargs)
+        return {"ranked_paper_ids": FOUNDATION, "reasoning": "string ids are malformed but recoverable"}
+
+    monkeypatch.setattr(network, "run_json", fake_run_json)
+
+    ranking = network._rank_by_intent(
+        [{"paper_id": FOUNDATION, "title": "Foundation", "abstract": "scalar exchange", "citation_count": 5}],
+        intent="scalar exchange",
+        provider="auto",
+        model=None,
+    )
+
+    assert captured["validate_schema"] is False
+    assert captured["output_recovery"] == "warn"
+    assert ranking["method"] == "llm_relaxed"
+    assert ranking["ranked_paper_ids"] == []
+    assert "ranked_paper_ids was not a list" in ranking["reasoning"]
 
 
 def test_evidence_pack_sorts_same_role_by_paper_id(monkeypatch, tmp_path):

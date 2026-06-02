@@ -5,6 +5,13 @@ should call `arc-paper`, `arc-domain`, or ARC MCP tools instead of calling
 `arc-llm` directly. Use this reference for provider diagnosis, direct prompt
 tests, and advanced LLM runtime options.
 
+ARC tools are provided through the ARC MCP/plugin launcher and its bundled
+runtime. Do not diagnose `arc-llm` by running `pip show arc-llm` in the system
+Python. `arc_llm` is an internal Python module under ARC's bundled source/runtime.
+If a workflow script cannot import `arc_llm`, it is using the wrong Python path/runtime;
+use the ARC plugin launcher/runtime or source-tree `PYTHONPATH`/`ARC_MCP_REPO_ROOT`,
+not `pip install arc-llm` from PyPI.
+
 ## Provider Diagnosis
 
 ### Phase 1: Check host detection.
@@ -117,6 +124,23 @@ For example, the idea workflow uses:
 The loop runner owns all artifact writes. Worker prompts and outputs are stored
 under per-loop and per-round directories, so distinct loops can run
 concurrently without sharing mutable context.
+
+Idea workflow loop concurrency is bounded by `ARC_IDEAS_MAX_CONCURRENT_LOOPS`
+and defaults to `12`.
+
+The idea workflow runner writes only the generated batch config before launch:
+
+```text
+<project-dir>/ideas/<run-id>/ideas_batch_config.json
+```
+
+All concurrent proposer-reviewer artifacts are owned by `arc-llm` under the
+batch run root. The workflow runner does not copy selected rounds or write a
+project-level latest report while loops are running. Completed runner results
+include `round_score_table`, a Markdown and structured per-loop table of
+reviewer total scores by round, built from loop artifacts available at
+completion time.
+
 Proposers-reviewer configs default to stateful delta sessions. First worker
 turns send the static task context and worker instructions; later turns send
 only current deltas while reusing the same provider session. If a custom

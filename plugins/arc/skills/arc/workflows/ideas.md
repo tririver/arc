@@ -31,22 +31,7 @@ variant, rename it so it no longer matches, for example
 Step 5: Keep `loops_per_variant` at `5` unless the run should use a different
 number of concurrent instances for each setup.
 
-### Phase 2: Check Planned Calls
-
-Step 1: Run:
-
-```bash
-python3 <skill-dir>/workflows/scripts/ideas_runner.py \
-  --config <project-dir>/ideas/<run-id>.config.json \
-  --dry-run \
-  --json
-```
-
-Step 2: Print any returned `WARNING:` messages. Loop concurrency is bounded by
-`ARC_IDEAS_MAX_CONCURRENT_LOOPS` and defaults to `12`. The dry run reports the
-generated loop plan but does not create run artifacts.
-
-### Phase 3: Run Ideas
+### Phase 2: Run Ideas
 
 Step 1: Run:
 
@@ -56,24 +41,22 @@ python3 <skill-dir>/workflows/scripts/ideas_runner.py \
   --json
 ```
 
-Step 2: Continue only if the returned status is `completed`. If status is
+Step 2: Print any returned `WARNING:` messages. For loop concurrency, see
+`manuals/arc-llm.md`.
+
+Step 3: Continue only if the returned status is `completed`. If status is
 `failed`, print `WARNING:` with the error and artifact root.
 
-The workflow runner writes only the generated batch config before launch:
+The workflow runner writes this generated batch config before launch:
 
 ```text
 <project-dir>/ideas/<run-id>/ideas_batch_config.json
 ```
 
-All concurrent proposer-reviewer artifacts are owned by `arc-llm` under the
-batch run root. The workflow runner does not copy selected rounds or write a
-project-level latest report while loops are running.
+For proposer-reviewer artifact ownership and runner result shape, see
+`manuals/arc-llm.md`.
 
-The runner result includes `round_score_table`, a Markdown and structured
-per-loop table of reviewer total scores by round, built from the loop artifacts
-available at completion time.
-
-### Phase 4: Inspect Artifacts
+### Phase 3: Inspect Artifacts
 
 Report these paths:
 
@@ -121,7 +104,7 @@ continuing.
 Do not invent rankings or novelty claims. Use the recorded proposer outputs and
 per-round reviewer reports from the `arc-llm` loop artifacts.
 
-### Phase 5: Select Next Action
+### Phase 4: Select Next Action
 
 Step 1: Print the top three ranked ideas on screen.
 

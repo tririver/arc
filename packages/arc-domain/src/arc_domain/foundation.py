@@ -4,6 +4,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any
 
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema import validate as validate_json_schema
+from jsonschema.exceptions import SchemaError as JsonSchemaError
+
 from arc_llm import run_json
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_paper.ids import extract_paper_ids, normalize_paper_id
@@ -147,6 +151,22 @@ FOUNDATION_CANDIDATE_AUDIT_SCHEMA: dict[str, Any] = {
         ARC_LLM_CALL_RECORD_FIELD: ARC_LLM_CALL_RECORD_SCHEMA,
     },
 }
+
+
+def _schema_error(payload: dict[str, Any], schema: dict[str, Any]) -> str | None:
+    try:
+        validate_json_schema(instance=payload, schema=schema)
+        return None
+    except (JsonSchemaValidationError, JsonSchemaError) as exc:
+        return str(exc)
+
+
+def _domain_llm_recovered(payload: dict[str, Any]) -> bool:
+    record = payload.get(ARC_LLM_CALL_RECORD_FIELD) if isinstance(payload, dict) else None
+    if not isinstance(record, dict):
+        return False
+    structured = record.get("structured_output")
+    return isinstance(structured, dict) and structured.get("mode") == "recovered"
 
 
 def identify_foundation(
@@ -368,8 +388,11 @@ def _llm_audit_candidates(
             provider=provider,
             model=model,
             model_tier=model_tier,
+            validate_schema=False,
+            output_recovery="warn",
         )
-        return _repair_candidate_audit(audit, method="llm")
+        method = "llm_relaxed" if _domain_llm_recovered(audit) or _schema_error(audit, FOUNDATION_CANDIDATE_AUDIT_SCHEMA) else "llm"
+        return _repair_candidate_audit(audit, method=method)
     except Exception as exc:
         audit = _default_candidate_audit()
         audit["warnings"].append(f"llm_candidate_audit_failed:{exc}")
@@ -415,6 +438,7 @@ def _default_candidate_audit() -> dict[str, Any]:
 
 
 def _repair_candidate_audit(audit: dict[str, Any], *, method: str) -> dict[str, Any]:
+    schema_error = _schema_error(audit if isinstance(audit, dict) else {}, FOUNDATION_CANDIDATE_AUDIT_SCHEMA)
     repaired = dict(audit or {})
     repaired["schema_version"] = "arc.domain_foundation_candidate_audit.v1"
     repaired["candidate_set_sufficient"] = bool(repaired.get("candidate_set_sufficient", True))
@@ -429,6 +453,8 @@ def _repair_candidate_audit(audit: dict[str, Any], *, method: str) -> dict[str, 
     repaired["reasoning"] = str(repaired.get("reasoning") or "")
     repaired["warnings"] = [str(item) for item in repaired.get("warnings", [])]
     repaired["warnings"].extend(skipped)
+    if schema_error:
+        repaired["warnings"].append("candidate_audit_schema_relaxed:" + schema_error[:500])
     repaired["audit_method"] = method
     return repaired
 
@@ -807,8 +833,17 @@ def _llm_select_foundation(
             provider=provider,
             model=model,
             model_tier=model_tier,
+            validate_schema=False,
+            output_recovery="warn",
         )
-        return _repair_selection(selection, candidates, method="llm", intent=intent)
+        method = "llm_relaxed" if _domain_llm_recovered(selection) or _schema_error(selection, FOUNDATION_SELECTION_SCHEMA) else "llm"
+        return _repair_selection(
+            selection,
+            candidates,
+            method=method,
+            intent=intent,
+            min_citation_count=min_citation_count,
+        )
     except Exception as exc:
         selection = _deterministic_selection(
             candidates,
@@ -902,6 +937,11 @@ def _repair_selection(
     intent: str = "",
     min_citation_count: int = MIN_FOUNDATION_CITATION_COUNT,
 ) -> dict[str, Any]:
+    if not isinstance(selection, dict):
+        selection = {}
+    selection.setdefault("warnings", [])
+    if "selected_foundation" not in selection and isinstance(selection.get("foundation_paper"), dict):
+        selection["selected_foundation"] = selection["foundation_paper"]
     candidate_by_id = {
         normalize_paper_id(str(item.get("paper_id") or "")): item
         for item in candidates

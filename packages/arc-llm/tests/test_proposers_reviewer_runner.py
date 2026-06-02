@@ -302,8 +302,9 @@ def test_prompt_artifacts_put_instructions_before_variable_context_for_cache_reu
     assert first_prompt.index("### Task") < first_prompt.index("## ARC Worker Context")
 
 
-def test_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
+def test_strict_mode_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {"enabled": True, "mode": "strict"}
 
     result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(fail_loop="loop_001"), base_env={})
 
@@ -314,6 +315,47 @@ def test_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
     assert error["worker_id"] == "proposer_001"
     assert error["error_type"] == "RuntimeError"
     assert error["message"] == "simulated provider failure"
+
+
+def test_proposer_exception_does_not_fail_warn_mode_loop(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    calls: list[str] = []
+
+    def failing_proposer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        calls.append(context["worker_id"])
+        if context["worker_id"] == "proposer_001":
+            raise RuntimeError("simulated proposer failure")
+        if context["worker_id"].startswith("reviewer"):
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "reviewed", "stop_requested": False, "stop_reason": ""},
+                "proposer_messages": {
+                    "proposer_001": {"message": "inspect failure"},
+                    "proposer_002": {"message": "ok"},
+                },
+                "review_payload": {"ok": True},
+            }
+        return {"worker_id": context["worker_id"], "content": "ok"}
+
+    result = run_proposers_reviewer_batch(config, json_runner=failing_proposer, base_env={})
+
+    run_root = tmp_path / "ideas/run_001"
+    proposer_output = json.loads(
+        (run_root / "loops/loop_001/rounds/round_001/proposer_outputs/proposer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    warnings = [
+        json.loads(line)
+        for line in (run_root / "structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result["status"] == "completed"
+    assert "reviewer_001" in calls
+    assert proposer_output["schema_version"] == "arc.llm.unstructured_output.v1"
+    assert proposer_output["role"] == "proposer"
+    assert warnings[-1]["recovery_strategy"] == "worker_exception_continue"
 
 
 def test_three_proposers_follow_targeted_reviewer_requests_for_three_rounds(tmp_path):
@@ -417,6 +459,7 @@ def test_early_stop_request_is_recorded_but_ignored_when_disabled(tmp_path):
 
 def test_failed_loop_does_not_corrupt_successful_loop(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
+    config["output_recovery"] = {"enabled": True, "mode": "strict"}
     second = json.loads(json.dumps(config["loops"][0]))
     second["loop_id"] = "loop_bad"
     config["loops"].append(second)
@@ -700,11 +743,63 @@ def test_peer_visible_reviewer_schema_violation_skips_validation_retry_and_recor
     assert result["status"] == "completed"
     assert calls == 1
     assert not (round_root / "prompts/reviewer_001.retry_001.md").exists()
-    assert review["review_payload"]["consensus"]["status"] == "unresolved"
-    assert review["review_payload"]["consensus"]["workflow_action"]["action"] == "pause_for_human"
-    assert "forcing retry" not in review["review_payload"]["consensus"]["analysis"]
+    assert review["controller"]["stop_requested"] is False
+    assert review["review_payload"] == {}
     assert "Referee says derivation is unclear" in review["proposer_messages"]["proposer_001"]["message"]
     assert warnings[-1]["recovery_strategy"] == "peer_visible_reviewer_fallback"
+
+
+def test_peer_visible_idea_reviewer_fallback_writes_zero_marks(tmp_path):
+    def invalid_idea_reviewer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            return "Malformed review, but all ideas should receive zero fallback marks."
+        return {"title": "idea", "idea_summary": "summary"}
+
+    config = base_config(tmp_path, max_rounds=1)
+    config["loops"][0]["reviewers"][0]["output_schema"] = _idea_reviewer_schema()
+
+    result = run_proposers_reviewer_batch(config, json_runner=invalid_idea_reviewer, base_env={})
+
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    marks = review["review_payload"]["marks"]
+
+    assert result["status"] == "completed"
+    assert marks["total_score"] == 0
+    assert all(value == 0 for value in marks.values())
+    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "peer_visible_reviewer_fallback"
+
+
+def test_reviewer_exception_does_not_fail_warn_mode_loop(tmp_path):
+    def reviewer_raises(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            raise RuntimeError("reviewer crashed")
+        return {"title": "idea", "idea_summary": "summary"}
+
+    config = base_config(tmp_path, max_rounds=1)
+    config["loops"][0]["reviewers"][0]["output_schema"] = _idea_reviewer_schema()
+
+    result = run_proposers_reviewer_batch(config, json_runner=reviewer_raises, base_env={})
+
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    warnings = [
+        json.loads(line)
+        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result["status"] == "completed"
+    assert review["review_payload"]["marks"]["total_score"] == 0
+    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "peer_visible_reviewer_fallback"
+    assert warnings[-1]["provider_error_type"] == "RuntimeError"
 
 
 def test_peer_visible_proposer_plain_text_is_wrapped_for_reviewer_context_and_warned(tmp_path):
@@ -835,6 +930,75 @@ def _strict_reviewer_schema() -> dict[str, Any]:
                     },
                 },
                 "additionalProperties": True,
+            },
+        },
+    }
+
+
+def _idea_reviewer_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
+        "properties": {
+            "schema_version": {"type": "string", "const": "arc.llm.review_envelope.v1"},
+            "controller": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["message", "stop_requested", "stop_reason"],
+                "properties": {
+                    "message": {"type": "string"},
+                    "stop_requested": {"type": "boolean"},
+                    "stop_reason": {"type": ["string", "null"]},
+                },
+            },
+            "proposer_messages": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["proposer_001", "proposer_002"],
+                "properties": {
+                    "proposer_001": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["message"],
+                        "properties": {"message": {"type": "string"}},
+                    },
+                    "proposer_002": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["message"],
+                        "properties": {"message": {"type": "string"}},
+                    },
+                },
+            },
+            "review_payload": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["marks"],
+                "properties": {
+                    "marks": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "user_intent_relevance",
+                            "novelty",
+                            "confidence_of_novelty",
+                            "scientific_value",
+                            "planning",
+                            "problem_well_definedness",
+                            "total_score",
+                        ],
+                        "properties": {
+                            "user_intent_relevance": {"type": "number"},
+                            "novelty": {"type": "number"},
+                            "confidence_of_novelty": {"type": "number"},
+                            "scientific_value": {"type": "number"},
+                            "planning": {"type": "number"},
+                            "problem_well_definedness": {"type": "number"},
+                            "total_score": {"type": "number"},
+                        },
+                    }
+                },
             },
         },
     }
@@ -1198,10 +1362,16 @@ def test_stateful_runner_uses_initial_then_delta_prompts_and_stable_session_keys
                     "proposer_002": {"message": f"revise p2 {round_number}"},
                 },
                 "review_payload": {"round": round_number},
+                ARC_LLM_CALL_RECORD_FIELD: {"native_session_id": f"native:{session_key}"},
             }
         worker_id = "proposer_001" if session_key.endswith("/proposer_001") else "proposer_002"
         round_number = 1 if "round_001" in call_label else 2
-        return {"worker_id": worker_id, "round": round_number, "content": f"output-from-{worker_id}-round-{round_number}"}
+        return {
+            "worker_id": worker_id,
+            "round": round_number,
+            "content": f"output-from-{worker_id}-round-{round_number}",
+            ARC_LLM_CALL_RECORD_FIELD: {"native_session_id": f"native:{session_key}"},
+        }
 
     result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
 
@@ -1224,6 +1394,32 @@ def test_stateful_runner_uses_initial_then_delta_prompts_and_stable_session_keys
     assert "revise p1 1" in round2_p1_prompt
     assert round2_context["turn_kind"] == "delta"
     assert round2_context["session_key"] == "run_001/loop_001/proposer/proposer_001"
+
+
+def test_locked_turn_kind_uses_initial_when_calls_exist_but_native_session_missing(tmp_path):
+    config = base_config(tmp_path, max_rounds=2)
+    config["session"] = {"policy": "stateful", "history_mode": "delta"}
+    batch = load_batch_config(config)
+    loop = batch.loops[0]
+    manager = core_runner.LLMSessionManager(tmp_path / "sessions")
+    session_key = "run_001/loop_001/proposer/proposer_001"
+    manager.record_turn(
+        session_key,
+        call_label="prior",
+        prompt_sha256="prompt",
+        static_prefix_sha256=None,
+        schema_sha256=None,
+        usage={},
+        provider_used="codex-cli",
+        model_used="m",
+        native_session_id=None,
+    )
+    prompt_options = {
+        "initial": runner_module.WorkerPromptOption("initial", "initial", {}, None, tmp_path / "initial.md"),
+        "delta": runner_module.WorkerPromptOption("delta", "delta", {}, None, tmp_path / "delta.md"),
+    }
+
+    assert runner_module._locked_turn_kind(loop, manager, session_key, prompt_options) == "initial"  # noqa: SLF001
 
 
 def test_initial_prompt_static_prefix_stays_shared_until_variable_context(tmp_path):

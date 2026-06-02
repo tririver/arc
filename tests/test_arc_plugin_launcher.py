@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -51,6 +52,25 @@ def _write_fake_runtime_tool(bin_dir: Path, name: str, prefix: str = "cached") -
         encoding="utf-8",
     )
     tool.chmod(0o755)
+
+
+def test_workflow_scripts_bootstrap_arc_llm_without_external_pythonpath():
+    env = os.environ.copy()
+    env["PYTHONPATH"] = ""
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    for script in ("ideas_runner.py", "calculate_runner.py"):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "plugins/arc/skills/arc/workflows/scripts" / script), "--help"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
 
 
 def _fake_uv_installs_all_tools(path: Path, prefix: str = "installed") -> Path:

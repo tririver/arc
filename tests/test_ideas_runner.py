@@ -327,6 +327,56 @@ def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path:
     ]
 
 
+def test_domain_variant_warns_and_continues_without_domain_markdown_when_optional(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    workflow_dir = tmp_path / "workflow"
+    shutil.copytree(WJ, workflow_dir)
+    variant_path = workflow_dir / "ideas-domain.variant.json"
+    variant = json.loads(variant_path.read_text(encoding="utf-8"))
+    variant["context_policy"]["require_domain_markdown"] = False
+    variant_path.write_text(json.dumps(variant, indent=2), encoding="utf-8")
+    project_dir = tmp_path / "project"
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(workflow_dir),
+        "variant_glob": "ideas-domain.variant.json",
+        "loops_per_variant": 1,
+    }
+
+    seen_batch_configs: list[dict[str, Any]] = []
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        json_runner: Any,
+        base_env: dict[str, str] | None,
+        process_chain: list[str] | None,
+        dry_run: bool = False,
+        max_concurrent_loops: int | None = None,
+    ) -> dict[str, Any]:
+        seen_batch_configs.append(batch_config)
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(run_root),
+            "loops": [],
+        }
+
+    result = runner.run_ideas(config, batch_runner=fake_batch_runner, base_env={})
+
+    assert result["status"] == "completed"
+    assert "domain_markdown_unavailable" in "\n".join(result["warnings"])
+    caller_context = seen_batch_configs[0]["loops"][0]["caller_context"]
+    assert "domain_markdown_files" not in caller_context
+    assert "Domain markdown was unavailable" in "\n".join(caller_context["warnings"])
+
+
 def test_ideas_warns_when_reviewer_tier_is_below_proposer(tmp_path: Path) -> None:
     runner = _load_runner_module()
     workflow_dir = _workflow_dir_with_reviewer_tier(tmp_path, "low")

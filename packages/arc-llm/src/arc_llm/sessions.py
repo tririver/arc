@@ -108,6 +108,12 @@ class LLMSessionManager:
                     self._write_sessions()
                     return updated
 
+    def get_existing(self, key: str) -> LLMSessionRef | None:
+        with self._sessions_store_lock():
+            with self._state_lock:
+                self._reload_sessions_from_disk_locked()
+                return self._sessions.get(key)
+
     def reload(self) -> None:
         with self._sessions_store_lock():
             with self._state_lock:

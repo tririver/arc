@@ -40,13 +40,17 @@ def test_arc_skill_routes_check_and_calculation_workflows() -> None:
     assert "work-note.md" in text
 
 
-def test_arc_skill_requires_nonblocking_pdf_export_for_project_markdown_reports() -> None:
+def test_arc_skill_references_pdf_export_manuals() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8").lower()
+    manual = (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8").lower()
 
-    assert "md2pdf" in text
-    assert "background" in text
-    assert "do not wait" in text
-    assert "markdown report" in text
+    assert "markdown report export" in text
+    assert "`rules/math_typeset.md`" in text
+    assert "`manuals/arc-mcp.md`" in text
+    assert "md2pdf" in manual
+    assert "background pdf job" in manual
+    assert "do not wait" in manual
+    assert "markdown report" in manual
 
 
 def test_math_typeset_rules_define_markdown_math_hygiene() -> None:
@@ -90,11 +94,15 @@ def test_workflows_start_pdf_export_for_user_facing_markdown() -> None:
         assert "do not wait" in text
 
 
-def test_ideas_phase_5_uses_clean_selection_prompt() -> None:
+def test_ideas_phase_4_uses_clean_selection_prompt_without_dry_run() -> None:
     text = (WF / "ideas.md").read_text(encoding="utf-8")
+    manual = (SKILL / "manuals/arc-llm.md").read_text(encoding="utf-8")
     lower = text.lower()
 
-    assert "### Phase 5: Select Next Action" in text
+    assert "--dry-run" not in text
+    assert "Check Planned Calls" not in text
+    assert "idea workflow dry run" not in manual.lower()
+    assert "### Phase 4: Select Next Action" in text
     assert "use the host's discrete" in lower
     assert "option labels must be the raw labels" in lower
     assert "`1`" in text
@@ -121,12 +129,20 @@ def test_arc_context_json_defines_run_identity_and_skill_paths() -> None:
 def test_workflow_script_commands_use_skill_dir_placeholder() -> None:
     ideas = (WF / "ideas.md").read_text(encoding="utf-8")
     calculate = (WF / "calculate.md").read_text(encoding="utf-8")
+    manual = (SKILL / "manuals/arc-llm.md").read_text(encoding="utf-8")
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "python3 <skill-dir>/workflows/scripts/ideas_runner.py" in ideas
     assert "python3 <skill-dir>/workflows/scripts/rank-ideas.py" in ideas
     assert "python3 <skill-dir>/workflows/scripts/calculate_runner.py" in calculate
     assert "python3 workflows/scripts/" not in ideas
     assert "python3 workflows/scripts/" not in calculate
+    assert "Do not diagnose `arc-llm` by running `pip show arc-llm`" in manual
+    assert "wrong Python path/runtime" in manual
+    for text in (ideas, calculate, skill, readme):
+        assert "Do not diagnose `arc-llm` by running `pip show arc-llm`" not in text
+        assert "wrong Python path/runtime" not in text
 
 
 def test_domain_summary_warnings_are_visible_and_recorded() -> None:
@@ -819,11 +835,11 @@ def test_arc_skill_preserves_seed_domain_anchor_in_user_intent() -> None:
     assert "seed_paper_list" in text
 
 
-def test_ideas_requires_domain_markdown_not_single_paper_summaries() -> None:
+def test_ideas_attaches_optional_domain_markdown_not_single_paper_summaries() -> None:
     variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))
     loop = json.loads((WJ / "ideas-loop.template.json").read_text(encoding="utf-8"))
 
-    assert variant["context_policy"]["require_domain_markdown"] is True
+    assert variant["context_policy"]["require_domain_markdown"] is False
     assert variant["context_policy"]["attach_domain_markdown"] is True
     assert "domain_markdown_files" in loop["caller_context"]
     assert "best-reference paper summaries" not in json.dumps(loop)

@@ -219,6 +219,55 @@ def test_warn_recovery_does_not_force_unknown_schema_when_validation_disabled():
     assert structured["recovery_strategy"] == "natural_language_fallback"
 
 
+def test_warn_validate_false_valid_object_no_structured_warning():
+    schema = {
+        "type": "object",
+        "required": ["foo"],
+        "properties": {"foo": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    payload = {"foo": "bar"}
+    response = LLMProviderResponse(payload, raw_output='{"foo":"bar"}')
+
+    result, structured = runner._recover_or_validate_json_output(  # noqa: SLF001
+        payload,
+        schema=schema,
+        validate_schema=False,
+        output_recovery="warn",
+        role_hint="domain",
+        response=response,
+    )
+
+    assert result == payload
+    assert structured is None
+
+
+def test_warn_validate_false_invalid_object_records_schema_warning():
+    schema = {
+        "type": "object",
+        "required": ["foo"],
+        "properties": {"foo": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    payload = {"bar": "extra"}
+    response = LLMProviderResponse(payload, raw_output='{"bar":"extra"}')
+
+    result, structured = runner._recover_or_validate_json_output(  # noqa: SLF001
+        payload,
+        schema=schema,
+        validate_schema=False,
+        output_recovery="warn",
+        role_hint="domain",
+        response=response,
+    )
+
+    assert result == payload
+    assert structured["mode"] == "recovered"
+    assert structured["severity"] == "minor"
+    assert structured["recovery_strategy"] == "schema_warning_no_validation"
+    assert "validate_schema=False allowed continuation" in "\n".join(structured["warnings"])
+
+
 def test_valid_schema_output_unchanged_when_validation_enabled():
     schema = {
         "type": "object",
@@ -240,6 +289,38 @@ def test_valid_schema_output_unchanged_when_validation_enabled():
 
     assert result == {"foo": "bar"}
     assert structured is None
+
+
+def test_stateful_run_json_self_heals_missing_session_on_native_id_update(monkeypatch, tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    provider = FakeResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+    original_update = manager.update_native_session_id
+    calls = 0
+
+    def flaky_update(key, native_session_id, *, allow_overwrite=False):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyError(f"unknown LLM session key: {key}")
+        return original_update(key, native_session_id, allow_overwrite=allow_overwrite)
+
+    monkeypatch.setattr(manager, "update_native_session_id", flaky_update)
+
+    result = run_json(
+        "prompt",
+        provider="codex-cli",
+        model="m",
+        env={},
+        process_chain=[],
+        session_policy="stateful",
+        session_manager=manager,
+        session_key="idea_loops/loop/proposer/proposer_001",
+    )
+
+    assert result["ok"] is True
+    assert calls == 2
+    assert manager.has_native_session("idea_loops/loop/proposer/proposer_001") is True
 
 
 def assert_strict_objects(schema):

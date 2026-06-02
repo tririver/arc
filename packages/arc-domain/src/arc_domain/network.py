@@ -35,6 +35,14 @@ RECENT_ARXIV_WINDOW_DAYS = 365
 MAX_GRAPH_PAPER_COUNT = 90
 
 
+def _domain_llm_recovered(payload: dict[str, Any]) -> bool:
+    record = payload.get(ARC_LLM_CALL_RECORD_FIELD) if isinstance(payload, dict) else None
+    if not isinstance(record, dict):
+        return False
+    structured = record.get("structured_output")
+    return isinstance(structured, dict) and structured.get("mode") == "recovered"
+
+
 def build_network(
     *,
     seed_paper: str,
@@ -246,14 +254,28 @@ def _rank_by_intent(
         ]
     )
     try:
-        result = run_json(prompt, schema=INTENT_RANKING_SCHEMA, provider=provider, model=model, model_tier=model_tier)
-        ids = [normalize_paper_id(item) for item in result.get("ranked_paper_ids", []) if item]
+        result = run_json(
+            prompt,
+            schema=INTENT_RANKING_SCHEMA,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            validate_schema=False,
+            output_recovery="warn",
+        )
+        raw_ids = result.get("ranked_paper_ids", [])
+        id_warning = ""
+        if not isinstance(raw_ids, list):
+            id_warning = "ranked_paper_ids was not a list; ignored malformed LLM ranking ids."
+            raw_ids = []
+        ids = [normalize_paper_id(item) for item in raw_ids if item]
         valid = {item["paper_id"] for item in citer_pool}
+        recovered = _domain_llm_recovered(result)
         ranking = {
             "schema_version": "arc.domain_intent_ranking.v1",
             "ranked_paper_ids": [item for item in ids if item in valid][:10],
-            "reasoning": str(result.get("reasoning") or ""),
-            "method": "llm",
+            "reasoning": "\n".join(item for item in [str(result.get("reasoning") or ""), id_warning] if item),
+            "method": "llm_relaxed" if recovered or id_warning else "llm",
         }
         if isinstance(result.get(ARC_LLM_CALL_RECORD_FIELD), dict):
             ranking[ARC_LLM_CALL_RECORD_FIELD] = result[ARC_LLM_CALL_RECORD_FIELD]

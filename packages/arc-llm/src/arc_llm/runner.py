@@ -405,14 +405,28 @@ def _generate_json(
             result = response.value
             prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
             native_session_id = response.native_session_id
+            session_warnings: list[str] = []
             if native_session_id:
-                session_manager.update_native_session_id(session.key, native_session_id)
+                warning = _update_native_session_id_with_self_heal(
+                    session_manager,
+                    session=session,
+                    native_session_id=native_session_id,
+                    provider=provider_used,
+                    model=model,
+                    runtime_fingerprint=runtime_fp,
+                    name=session_name,
+                    metadata=session_metadata,
+                )
+                if warning:
+                    session_warnings.append(warning)
             recorded_native_session_id = native_session_id or session.native_session_id
 
             def record_turn(structured_output: dict[str, Any] | None = None) -> None:
                 extra = {"runtime_fingerprint": runtime_fp}
                 if structured_output:
                     extra["structured_output"] = structured_output
+                if session_warnings:
+                    extra["session_warnings"] = list(session_warnings)
                 session_manager.record_turn(
                     session.key,
                     call_label=call_label or "",
@@ -520,9 +534,24 @@ def _generate_text(
         ) as (session, _turn_count):
             response = call_provider(session)
             prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
+            session_warnings: list[str] = []
             if response.native_session_id:
-                session_manager.update_native_session_id(session.key, response.native_session_id)
+                warning = _update_native_session_id_with_self_heal(
+                    session_manager,
+                    session=session,
+                    native_session_id=response.native_session_id,
+                    provider=provider_used,
+                    model=model,
+                    runtime_fingerprint=runtime_fp,
+                    name=session_name,
+                    metadata=session_metadata,
+                )
+                if warning:
+                    session_warnings.append(warning)
             recorded_native_session_id = response.native_session_id or session.native_session_id
+            extra = {"runtime_fingerprint": runtime_fp}
+            if session_warnings:
+                extra["session_warnings"] = list(session_warnings)
             session_manager.record_turn(
                 session.key,
                 call_label=call_label or "",
@@ -533,7 +562,7 @@ def _generate_text(
                 provider_used=provider_used,
                 model_used=model,
                 native_session_id=recorded_native_session_id,
-                extra={"runtime_fingerprint": runtime_fp},
+                extra=extra,
             )
     else:
         session = None
@@ -576,6 +605,33 @@ def _schema_cache_dir(artifact_dir: Path | None) -> Path | None:
     return artifact_dir / "schemas"
 
 
+def _update_native_session_id_with_self_heal(
+    session_manager: LLMSessionManager,
+    *,
+    session: LLMSessionRef,
+    native_session_id: str,
+    provider: str,
+    model: str | None,
+    runtime_fingerprint: str,
+    name: str | None,
+    metadata: Mapping[str, Any] | None,
+) -> str | None:
+    try:
+        session_manager.update_native_session_id(session.key, native_session_id)
+        return None
+    except KeyError:
+        session_manager.get_or_create(
+            key=session.key,
+            provider=provider,
+            model=model,
+            runtime_fingerprint=runtime_fingerprint,
+            name=name,
+            metadata=metadata,
+        )
+        session_manager.update_native_session_id(session.key, native_session_id)
+        return f"self_healed_missing_session_record:{session.key}"
+
+
 def _validate_json_output(result: dict[str, Any], schema: dict[str, Any]) -> None:
     try:
         validate_json_schema(instance=result, schema=schema)
@@ -599,6 +655,21 @@ def _recover_or_validate_json_output(
     provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
     if not validate_schema:
         if isinstance(result, dict):
+            if schema is not None and output_recovery == "warn":
+                try:
+                    _validate_json_output(result, schema)
+                except Exception as exc:
+                    structured_output = _merge_structured_output_warning(
+                        structured_output,
+                        severity="minor",
+                        warnings=[
+                            "JSON object did not satisfy schema, but validate_schema=False allowed continuation.",
+                            str(exc),
+                        ],
+                        raw_text=response.raw_output,
+                        strategy="schema_warning_no_validation",
+                        provider_error_type=type(exc).__name__,
+                    )
             return result, structured_output
         if output_recovery != "warn":
             raise LLMOutputValidationError("JSON output was not an object")
@@ -663,6 +734,35 @@ def _recovered_natural_language_metadata(result: Any, response: LLMProviderRespo
         raw_text=str(raw_text),
         strategy="natural_language_fallback",
         provider_error_type=type(result).__name__,
+    )
+
+
+def _merge_structured_output_warning(
+    existing: Any,
+    *,
+    severity: str,
+    warnings: list[str],
+    raw_text: str | None,
+    strategy: str,
+    provider_error_type: str | None,
+) -> dict[str, Any]:
+    if isinstance(existing, Mapping):
+        merged = dict(existing)
+        old_warnings = merged.get("warnings") if isinstance(merged.get("warnings"), list) else []
+        merged["warnings"] = [*old_warnings, *warnings]
+        if not merged.get("raw_text_excerpt") and raw_text:
+            merged["raw_text_excerpt"] = str(raw_text)[:4000]
+        merged.setdefault("mode", "recovered")
+        merged.setdefault("severity", severity)
+        merged.setdefault("recovery_strategy", strategy)
+        merged.setdefault("provider_error_type", provider_error_type)
+        return merged
+    return structured_metadata(
+        severity=severity,
+        warnings=warnings,
+        raw_text=raw_text,
+        strategy=strategy,
+        provider_error_type=provider_error_type,
     )
 
 
