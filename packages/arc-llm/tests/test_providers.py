@@ -555,6 +555,20 @@ def test_claude_generate_json_parses_result_wrapper(monkeypatch):
     assert ClaudeCliProvider().generate_json("prompt") == {"ok": True}
 
 
+def test_claude_generate_json_prefers_provider_structured_output(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        wrapped = {
+            "type": "result",
+            "result": "Markdown summary, not JSON.",
+            "structured_output": {"ok": True},
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(wrapped), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert ClaudeCliProvider().generate_json("prompt") == {"ok": True}
+
+
 def test_claude_deepseek_auto_uses_prompt_contract_not_json_schema(monkeypatch):
     captured = {}
 
@@ -733,6 +747,43 @@ def test_claude_warn_mode_valid_json_has_no_structured_warning(monkeypatch):
     )
 
     assert response.value == {"ok": True}
+    assert response.structured_output is None
+
+
+def test_claude_warn_mode_preserves_reviewer_marks_from_structured_output(monkeypatch):
+    marks = {
+        "user_intent_relevance": 25,
+        "novelty": 13,
+        "confidence_of_novelty": 12,
+        "scientific_value": 12,
+        "planning": 14,
+        "problem_well_definedness": 14,
+        "total_score": 90,
+    }
+
+    def fake_run(cmd, **kwargs):
+        wrapped = {
+            "type": "result",
+            "result": "## Final Review\n\n**Total: 90/100**",
+            "structured_output": {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "accept", "stop_requested": True},
+                "proposer_messages": {"proposer_001": {"message": "accepted"}},
+                "review_payload": {"marks": marks},
+            },
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(wrapped), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        output_recovery="warn",
+    )
+
+    assert response.value["review_payload"]["marks"]["total_score"] == 90
+    assert response.value["review_payload"]["marks"] == marks
     assert response.structured_output is None
 
 

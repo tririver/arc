@@ -164,6 +164,12 @@ def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
+    if (
+        isinstance(payload, dict)
+        and payload.get("type") == "result"
+        and isinstance(payload.get("structured_output"), dict)
+    ):
+        return payload["structured_output"], None
     if isinstance(payload, dict) and isinstance(payload.get("result"), str):
         try:
             nested = json.loads(payload["result"])
