@@ -209,7 +209,22 @@ def _extract_claude_metadata(stdout: str, *, output_recovery: str = "strict") ->
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
+        if output_recovery != "warn":
+            raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
+        return (
+            {},
+            LLMUsage(),
+            None,
+            structured_metadata(
+                severity="major",
+                warnings=[
+                    f"Claude output was not a JSON envelope; accepted as natural language warning: {exc}"
+                ],
+                raw_text=stdout,
+                strategy="natural_language_fallback",
+                provider_error_type="JSONDecodeError",
+            ),
+        )
     value, structured_output = _extract_json(stdout, output_recovery=output_recovery)
     return value, _usage_from_payload(payload), _session_id_from_payload(payload), structured_output
 
@@ -317,7 +332,10 @@ def _json_schema_mode(env: Mapping[str, str], *, model: str | None, output_recov
     if raw != "auto":
         return raw
     if output_recovery == "warn":
-        return "prompt"
+        warn_mode = _env_text(env, "ARC_CLAUDE_WARN_JSON_SCHEMA_MODE", "provider").strip().lower()
+        if warn_mode not in {"provider", "prompt"}:
+            raise LLMWorkerError("ARC_CLAUDE_WARN_JSON_SCHEMA_MODE must be provider or prompt")
+        return warn_mode
     model_text = (model or env.get("ARC_CLAUDE_MODEL") or "").lower()
     prompt_markers = _env_text(env, "ARC_CLAUDE_JSON_SCHEMA_PROMPT_MODELS", _default_prompt_schema_model_markers())
     if any(marker and marker.lower() in model_text for marker in prompt_markers.split(",")):

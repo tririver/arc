@@ -143,7 +143,7 @@ def test_codex_warn_mode_repairs_malformed_json_output(monkeypatch):
     assert response.value == {"ok": True, "items": ["a", "b"]}
     assert response.structured_output["severity"] == "minor"
     assert response.structured_output["recovery_strategy"] == "extract_json"
-    assert any("json_repair" in warning for warning in response.structured_output["warnings"])
+    assert any("repair" in warning.lower() for warning in response.structured_output["warnings"])
 
 
 def test_codex_strict_mode_raises_on_plain_text_output(monkeypatch):
@@ -582,7 +582,7 @@ def test_claude_deepseek_auto_uses_prompt_contract_not_json_schema(monkeypatch):
     assert "prompt" in captured["input"]
 
 
-def test_claude_warn_mode_auto_uses_prompt_schema_even_without_model_marker(monkeypatch):
+def test_claude_warn_mode_auto_uses_provider_schema_like_arc02(monkeypatch):
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -593,6 +593,28 @@ def test_claude_warn_mode_auto_uses_prompt_schema_even_without_model_marker(monk
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     response = ClaudeCliProvider(env={}).generate_json_result(
+        "prompt",
+        schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
+        model=None,
+        output_recovery="warn",
+    )
+
+    assert response.value == {"ok": True}
+    assert "--json-schema" in captured["cmd"]
+    assert captured["input"] == "prompt"
+
+
+def test_claude_warn_mode_prompt_override_uses_prompt_contract(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"result": {"ok": True}}), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider(env={"ARC_CLAUDE_WARN_JSON_SCHEMA_MODE": "prompt"}).generate_json_result(
         "prompt",
         schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
         model=None,
@@ -673,7 +695,45 @@ def test_claude_warn_mode_repairs_malformed_result_json(monkeypatch):
     assert response.native_session_id == "s1"
     assert response.structured_output["severity"] == "minor"
     assert response.structured_output["recovery_strategy"] == "extract_json"
-    assert any("json_repair" in warning for warning in response.structured_output["warnings"])
+    assert any("repair" in warning.lower() for warning in response.structured_output["warnings"])
+
+
+def test_claude_warn_mode_recovers_top_level_plain_stdout(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="A useful plain-text domain summary", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        output_recovery="warn",
+    )
+
+    assert response.value == {}
+    assert response.structured_output["severity"] == "major"
+    assert "useful plain-text" in response.structured_output["raw_text_excerpt"]
+
+
+def test_claude_warn_mode_valid_json_has_no_structured_warning(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"result": {"ok": True}, "usage": {"input_tokens": 1}}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}},
+        output_recovery="warn",
+    )
+
+    assert response.value == {"ok": True}
+    assert response.structured_output is None
 
 
 def test_claude_natural_language_result_still_raises_in_strict_mode(monkeypatch):

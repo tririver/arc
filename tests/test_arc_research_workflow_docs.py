@@ -881,6 +881,13 @@ def test_arc_skill_tree_contains_no_python_bytecode() -> None:
     assert bad_paths == []
 
 
+def test_generated_python_caches_are_ignored_for_release_artifacts() -> None:
+    text = (ROOT / ".gitignore").read_text(encoding="utf-8")
+
+    for pattern in ("__pycache__/", "*.py[cod]", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/"):
+        assert pattern in text
+
+
 def test_root_mcp_config_uses_bundled_arc_mcp_launcher() -> None:
     mcp_config = json.loads((ROOT / "plugins/arc/.mcp.json").read_text(encoding="utf-8"))
     arc_server = mcp_config["mcpServers"]["arc"]

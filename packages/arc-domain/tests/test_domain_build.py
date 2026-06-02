@@ -434,13 +434,13 @@ def test_summarize_domain_reports_llm_failure_without_fallback(monkeypatch, tmp_
     assert result["data"]["domain_summary_path"] is None
     assert result["data"]["domain_summary_markdown_path"] is None
     assert result["data"]["warnings"]
-    assert result["data"]["warnings"][0]["code"] == "domain_summary_failed"
+    assert result["data"]["warnings"][0]["code"] == "domain_summary_llm_failed"
     assert "summary prompt too large" in result["data"]["warnings"][0]["message"]
     assert not paths.domain_summary.exists()
     assert not paths.domain_summary_markdown.exists()
     status = read_json(paths.status)
-    assert status["stage"] == "summary_failed"
-    assert status["domain_summary_available"] is False
+    assert status["stage"] == "summary_warning_no_summary"
+    assert status["summary_available"] is False
     assert status["domain_summary_path"] is None
     assert status["domain_summary_markdown_path"] is None
     assert status["warnings"]
@@ -481,6 +481,38 @@ def test_build_domain_continues_when_llm_summary_fails(monkeypatch, tmp_path):
     assert data["evidence_pack_path"] == "evidence.json"
     assert not paths.domain_summary.exists()
     assert not paths.domain_summary_markdown.exists()
+
+
+def test_build_domain_marks_summary_unavailable_when_summary_returns_no_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+
+    monkeypatch.setattr(service, "_identify_foundation", lambda **kwargs: {"selection": {"selected_foundation": {}}})
+    monkeypatch.setattr(
+        service,
+        "_build_network",
+        lambda **kwargs: {"node_count": 1, "edge_count": 0, "graph_path": "graph.json"},
+    )
+    monkeypatch.setattr(service, "render_network_html", lambda **kwargs: {"network_html_path": "network.html"})
+    monkeypatch.setattr(service, "_build_paper_json_pack", lambda **kwargs: {"paper_json_pack_path": "pack.json"})
+    monkeypatch.setattr(service, "_build_evidence_pack", lambda **kwargs: {"evidence_pack_path": "evidence.json"})
+    monkeypatch.setattr(
+        service,
+        "_summarize_domain",
+        lambda **kwargs: {
+            "domain_summary_path": None,
+            "domain_summary_markdown_path": None,
+            "summary": None,
+            "summary_available": False,
+            "warnings": [{"code": "domain_summary_llm_failed", "message": "boom"}],
+        },
+    )
+
+    result = service.build_domain(SEED, intent="intent", provider="auto", workers=1)
+
+    assert result["ok"] is True
+    assert result["data"]["summary_available"] is False
+    assert result["data"]["summary"] is None
+    assert result["data"]["warnings"][0]["code"] == "domain_summary_llm_failed"
 
 
 def test_get_domain_summary_rejects_cached_deterministic_fallback(monkeypatch, tmp_path):
@@ -882,6 +914,29 @@ def test_candidate_audit_relaxed_call_records_schema_warning(monkeypatch):
     assert audit["audit_method"] == "llm_relaxed"
     assert audit["search_queries"][0]["query"] == "missing same-scope foundation"
     assert any("candidate_audit_schema_relaxed" in warning for warning in audit["warnings"])
+
+
+def test_relaxed_foundation_audit_string_false_is_false():
+    audit = foundation._repair_candidate_audit(
+        {
+            "candidate_set_sufficient": "false",
+            "confidence": "complete",
+            "search_queries": [
+                {
+                    "query": "confident missing foundation",
+                    "reason": "complete certainty",
+                    "confidence": "complete",
+                }
+            ],
+            "citation_directions": [],
+            "reasoning": "string false should remain false",
+            "warnings": [],
+        },
+        method="llm_relaxed",
+    )
+
+    assert audit["candidate_set_sufficient"] is False
+    assert audit["search_queries"][0]["query"] == "confident missing foundation"
 
 
 def test_foundation_selection_relaxed_call_uses_foundation_paper_mapping(monkeypatch):

@@ -355,7 +355,28 @@ def test_proposer_exception_does_not_fail_warn_mode_loop(tmp_path):
     assert "reviewer_001" in calls
     assert proposer_output["schema_version"] == "arc.llm.unstructured_output.v1"
     assert proposer_output["role"] == "proposer"
+    assert proposer_output["recovered_unstructured_text"]
+    assert proposer_output[ARC_LLM_CALL_RECORD_FIELD]["call_label"] == "loop/loop_001/round_001/proposer_001"
+    assert warnings[-1]["call_label"] == "loop/loop_001/round_001/proposer_001"
     assert warnings[-1]["recovery_strategy"] == "worker_exception_continue"
+
+
+def test_worker_env_maps_claude_json_schema_runtime_options(tmp_path):
+    config = base_config(tmp_path, max_rounds=1)
+    config["loops"][0]["proposers"][0]["runtime"].update(
+        {
+            "claude_json_schema_mode": "auto",
+            "claude_warn_json_schema_mode": "provider",
+            "claude_json_schema_prompt_models": "deepseek,qwen",
+        }
+    )
+    batch = load_batch_config(config)
+
+    env = runner_module.worker_env(batch.loops[0].proposers[0], base_env={})
+
+    assert env["ARC_CLAUDE_JSON_SCHEMA_MODE"] == "auto"
+    assert env["ARC_CLAUDE_WARN_JSON_SCHEMA_MODE"] == "provider"
+    assert env["ARC_CLAUDE_JSON_SCHEMA_PROMPT_MODELS"] == "deepseek,qwen"
 
 
 def test_three_proposers_follow_targeted_reviewer_requests_for_three_rounds(tmp_path):
@@ -845,7 +866,7 @@ def test_peer_visible_proposer_plain_text_is_wrapped_for_reviewer_context_and_wa
     assert warnings[-1]["recovery_strategy"] == "peer_visible_unstructured_output"
 
 
-def test_peer_visible_provider_failure_text_is_not_treated_as_reviewer_reply(tmp_path):
+def test_peer_visible_retryable_provider_failure_text_becomes_warning_placeholder(tmp_path):
     def service_unavailable_reviewer(prompt, **kwargs):
         context = _context_from_prompt(prompt)
         if context["worker_id"].startswith("reviewer"):
@@ -863,8 +884,48 @@ def test_peer_visible_provider_failure_text_is_not_treated_as_reviewer_reply(tmp
 
     result = run_proposers_reviewer_batch(config, json_runner=service_unavailable_reviewer, base_env={})
 
+    review = json.loads(
+        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    warnings = [
+        json.loads(line)
+        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result["status"] == "completed"
+    assert result["warnings_summary"]["structured_output_warning_count"] == 1
+    assert "retryable provider failure text" in review["proposer_messages"]["proposer_001"]["message"]
+    assert review[ARC_LLM_CALL_RECORD_FIELD]["call_label"] == "loop/loop_001/round_001/reviewer_001"
+    assert warnings[-1]["call_label"] == "loop/loop_001/round_001/reviewer_001"
+
+
+def test_warn_mode_fatal_mcp_failure_still_raises(tmp_path):
+    def fatal_reviewer(prompt, **kwargs):
+        context = _context_from_prompt(prompt)
+        if context["worker_id"].startswith("reviewer"):
+            raise RuntimeError("MCP server failed")
+        return {"ok": True}
+
+    config = base_config(tmp_path, max_rounds=1)
+
+    result = run_proposers_reviewer_batch(config, json_runner=fatal_reviewer, base_env={})
+
     assert result["status"] == "failed"
-    assert "retryable provider failure text" in result["loops"][0]["error"]
+    assert "MCP server failed" in result["loops"][0]["error"]
+
+
+def test_valid_json_batch_has_empty_warning_summary(tmp_path):
+    result = run_proposers_reviewer_batch(base_config(tmp_path, max_rounds=1), json_runner=FakeJsonRunner(), base_env={})
+
+    summary = result["warnings_summary"]
+
+    assert result["status"] == "completed"
+    assert summary["structured_output_warning_count"] == 0
+    assert summary["cache_warning_count"] == 0
+    assert not Path(summary["structured_output_warnings_path"]).exists()
+    assert not Path(summary["cache_warnings_path"]).exists()
 
 
 def _strict_reviewer_schema() -> dict[str, Any]:

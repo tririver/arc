@@ -73,6 +73,48 @@ def test_workflow_scripts_bootstrap_arc_llm_without_external_pythonpath():
         assert result.returncode == 0, result.stderr
 
 
+def test_workflow_bootstrap_failure_lists_searched_roots_and_runtimes(tmp_path):
+    scripts_dir = tmp_path / "installed-plugin/skills/arc/workflows/scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copyfile(
+        ROOT / "plugins/arc/skills/arc/workflows/scripts/_arc_script_bootstrap.py",
+        scripts_dir / "_arc_script_bootstrap.py",
+    )
+    env = {
+        "PYTHONPATH": "",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "ARC_REPO_ROOT": str(tmp_path / "missing-repo"),
+        "ARC_MCP_REPO_ROOT": str(tmp_path / "missing-mcp-repo"),
+        "ARC_MCP_RUNTIME_DIR": str(tmp_path / "missing-runtime"),
+        "XDG_CACHE_HOME": str(tmp_path / "empty-cache"),
+    }
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(scripts_dir)!r}); "
+                "from _arc_script_bootstrap import bootstrap_arc_pythonpath; "
+                "bootstrap_arc_pythonpath()"
+            ),
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Cannot import ARC internal module `arc_llm`" in result.stderr
+    assert "Searched ARC roots:" in result.stderr
+    assert "Searched ARC runtime site-packages:" in result.stderr
+
+
 def _fake_uv_installs_all_tools(path: Path, prefix: str = "installed") -> Path:
     lines = [
         "#!/bin/sh",

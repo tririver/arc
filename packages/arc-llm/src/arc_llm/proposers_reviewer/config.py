@@ -212,6 +212,9 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
     _put(env, "ARC_CLAUDE_TOOLS", runtime.get("claude_tools"))
     _put(env, "ARC_CLAUDE_MAX_BUDGET_USD", runtime.get("claude_max_budget_usd"))
     _put(env, "ARC_CLAUDE_FALLBACK_MODEL", runtime.get("claude_fallback_model"))
+    _put(env, "ARC_CLAUDE_JSON_SCHEMA_MODE", runtime.get("claude_json_schema_mode"))
+    _put(env, "ARC_CLAUDE_WARN_JSON_SCHEMA_MODE", runtime.get("claude_warn_json_schema_mode"))
+    _put(env, "ARC_CLAUDE_JSON_SCHEMA_PROMPT_MODELS", runtime.get("claude_json_schema_prompt_models"))
     return env
 
 

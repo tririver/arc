@@ -183,15 +183,40 @@ def summarize_domain(
     evidence = read_json(paths.evidence_pack, {})
     selection = read_json(paths.foundation_selection, {})
     prompt = _summary_prompt(graph=graph, evidence=evidence, selection=selection)
-    raw_summary = run_json(
-        prompt,
-        schema=DOMAIN_SUMMARY_SCHEMA,
-        provider=provider,
-        model=model,
-        model_tier=model_tier,
-        validate_schema=False,
-        output_recovery="warn",
-    )
+    try:
+        raw_summary = run_json(
+            prompt,
+            schema=DOMAIN_SUMMARY_SCHEMA,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            validate_schema=False,
+            output_recovery="warn",
+        )
+    except Exception as exc:
+        warning = {
+            "code": "domain_summary_llm_failed",
+            "message": f"LLM domain summary failed; proceeding without domain summary: {type(exc).__name__}: {exc}",
+            "created_at": now_iso(),
+        }
+        _append_status_warnings(paths, [warning])
+        _remove_stale_domain_summary_artifacts(paths)
+        update_status(
+            paths,
+            stage="summary_warning_no_summary",
+            domain_summary_path=None,
+            domain_summary_markdown_path=None,
+            summary_available=False,
+            domain_summary_available=False,
+        )
+        return {
+            "domain_id": paths.domain_id,
+            "summary_available": False,
+            "domain_summary_path": None,
+            "domain_summary_markdown_path": None,
+            "summary": None,
+            "warnings": [warning],
+        }
     summary, method, relaxed_warnings = _normalize_domain_summary_output(
         raw_summary,
         paths=paths,
@@ -210,6 +235,8 @@ def summarize_domain(
         stage="summary_done",
         domain_summary_path=str(paths.domain_summary),
         domain_summary_markdown_path=str(paths.domain_summary_markdown),
+        summary_available=True,
+        domain_summary_available=True,
     )
     if relaxed_warnings:
         status = read_json(paths.status, {}) or {}
@@ -226,14 +253,29 @@ def summarize_domain(
         )
     return {
         "domain_id": paths.domain_id,
+        "summary_available": True,
         "domain_summary_path": str(paths.domain_summary),
         "domain_summary_markdown_path": str(paths.domain_summary_markdown),
         "summary": summary,
     }
 
 
+def _append_status_warnings(paths: DomainPaths, warnings: list[dict[str, Any]]) -> None:
+    status = read_json(paths.status, {}) or {}
+    prior = status.get("warnings") if isinstance(status.get("warnings"), list) else []
+    update_status(paths, warnings=[*prior, *warnings])
+
+
+def _remove_stale_domain_summary_artifacts(paths: DomainPaths) -> None:
+    for path in (paths.domain_summary, paths.domain_summary_markdown):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _normalize_domain_summary_output(
-    raw: dict[str, Any],
+    raw: Any,
     *,
     paths: DomainPaths,
     graph: dict[str, Any],
@@ -241,8 +283,15 @@ def _normalize_domain_summary_output(
     selection: dict[str, Any],
 ) -> tuple[dict[str, Any], str, list[str]]:
     del paths, graph, evidence
-    raw = dict(raw or {})
     warnings: list[str] = []
+    if isinstance(raw, dict):
+        raw_dict = dict(raw)
+        raw_non_dict_text = ""
+    else:
+        raw_dict = {}
+        raw_non_dict_text = _compact_text(str(raw or ""), SUMMARY_REASON_CHAR_LIMIT)
+        warnings.append("domain_summary_non_object_relaxed: LLM returned non-object output; preserved as text.")
+    raw = raw_dict
     schema_error = _schema_error(raw, DOMAIN_SUMMARY_SCHEMA)
     recovery_warning = _call_record_warning(raw)
     if schema_error is None and recovery_warning is None:
@@ -254,7 +303,7 @@ def _normalize_domain_summary_output(
         warnings.append(recovery_warning)
 
     raw_without_record = strip_arc_llm_call_records(raw)
-    raw_text = _raw_text_from_call_record(raw) or _best_relaxed_summary_text(raw_without_record)
+    raw_text = _raw_text_from_call_record(raw) or raw_non_dict_text or _best_relaxed_summary_text(raw_without_record)
     foundation = _paper_summary_from_any(
         raw_without_record.get("foundation_paper") or selection.get("selected_foundation") or {},
         fallback_reason="Foundation paper from ARC selection.",
@@ -289,7 +338,7 @@ def _normalize_domain_summary_output(
     }
     if isinstance(raw.get(ARC_LLM_CALL_RECORD_FIELD), dict):
         normalized[ARC_LLM_CALL_RECORD_FIELD] = raw[ARC_LLM_CALL_RECORD_FIELD]
-    method = "llm_relaxed_text" if _raw_text_from_call_record(raw) and not raw_without_record else "llm_relaxed"
+    method = "llm_relaxed_text" if (_raw_text_from_call_record(raw) or raw_non_dict_text) and not raw_without_record else "llm_relaxed"
     return normalized, method, warnings
 
 

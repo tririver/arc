@@ -1,4 +1,5 @@
 import json
+import builtins
 
 from arc_llm.structured_recovery import parse_json_object_relaxed, recover_json_output
 
@@ -83,7 +84,23 @@ def test_relaxed_parser_repairs_truncated_fenced_json_object():
     parsed, warnings = parse_json_object_relaxed(text)
 
     assert parsed == {"title": "x", "items": ["a", "b"]}
-    assert any("json_repair" in warning for warning in warnings)
+    assert any("repair" in warning.lower() for warning in warnings)
+
+
+def test_relaxed_parser_repairs_truncated_fenced_json_without_json_repair(monkeypatch):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "json_repair":
+            raise ImportError("not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    parsed, warnings = parse_json_object_relaxed('```json\n{"title": "x", "items": ["a", "b"]\n```')
+
+    assert parsed == {"title": "x", "items": ["a", "b"]}
+    assert any("repair" in warning.lower() for warning in warnings)
 
 
 def test_relaxed_parser_keeps_plain_text_as_unstructured_fallback():
@@ -106,6 +123,76 @@ def test_relaxed_parser_does_not_repair_rootless_json_fragment():
 
     assert parsed is None
     assert warnings == ["No JSON object could be extracted."]
+
+
+def test_workflow_action_fallback_prefers_manual_action_over_retry():
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["retry", "manual_inspection", "continue_with_warning"],
+            },
+            "issue_type": {"type": "string", "enum": ["worker_failure"]},
+        },
+    }
+    review_schema = {
+        "type": "object",
+        "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
+        "properties": {
+            "schema_version": {"type": "string"},
+            "controller": {"type": "object", "properties": {}},
+            "proposer_messages": {"type": "object", "properties": {}, "required": []},
+            "review_payload": {
+                "type": "object",
+                "properties": {
+                    "consensus": {
+                        "type": "object",
+                        "properties": {
+                            "workflow_action": schema,
+                        },
+                    }
+                },
+            },
+        },
+    }
+
+    recovered = recover_json_output(value={}, schema=review_schema, raw_text="bad reviewer", role_hint="reviewer", strict_first=False)
+
+    assert recovered.value["review_payload"]["consensus"]["workflow_action"]["action"] == "manual_inspection"
+
+
+def test_workflow_action_fallback_uses_retry_only_when_only_choice():
+    review_schema = {
+        "type": "object",
+        "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
+        "properties": {
+            "schema_version": {"type": "string"},
+            "controller": {"type": "object", "properties": {}},
+            "proposer_messages": {"type": "object", "properties": {}, "required": []},
+            "review_payload": {
+                "type": "object",
+                "properties": {
+                    "consensus": {
+                        "type": "object",
+                        "properties": {
+                            "workflow_action": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {"type": "string", "enum": ["retry"]},
+                                    "issue_type": {"type": "string", "enum": ["worker_failure"]},
+                                },
+                            },
+                        },
+                    }
+                },
+            },
+        },
+    }
+
+    recovered = recover_json_output(value={}, schema=review_schema, raw_text="bad reviewer", role_hint="reviewer", strict_first=False)
+
+    assert recovered.value["review_payload"]["consensus"]["workflow_action"]["action"] == "retry"
 
 
 def test_calculation_recovery_requires_revision_before_continuing():

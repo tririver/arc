@@ -52,7 +52,7 @@ def parse_json_object_relaxed(text: str) -> tuple[dict[str, Any] | None, list[st
             return parsed, warnings
     repaired = _repair_json_object(raw)
     if repaired is not None:
-        warnings.append("Repaired malformed JSON object with json_repair.")
+        warnings.append("Repaired malformed JSON object with local/json_repair repair.")
         return repaired, warnings
     return None, ["No JSON object could be extracted."]
 
@@ -176,16 +176,66 @@ def _repair_json_object(text: str) -> dict[str, Any] | None:
     try:
         from json_repair import repair_json
     except ImportError:
-        return None
+        repair_json = None
+
+    if repair_json is not None:
+        for candidate in candidates:
+            try:
+                repaired = repair_json(candidate, return_objects=True, skip_json_loads=True, ensure_ascii=False)
+            except (TypeError, ValueError, RecursionError):
+                continue
+            if isinstance(repaired, dict):
+                return repaired
 
     for candidate in candidates:
-        try:
-            repaired = repair_json(candidate, return_objects=True, skip_json_loads=True, ensure_ascii=False)
-        except (TypeError, ValueError, RecursionError):
+        repaired_text = _locally_repair_truncated_json(candidate)
+        if repaired_text is None:
             continue
-        if isinstance(repaired, dict):
-            return repaired
+        parsed = _loads_object(repaired_text)
+        if parsed is not None:
+            return parsed
     return None
+
+
+def _locally_repair_truncated_json(text: str) -> str | None:
+    source = _clean_json_text(text).strip()
+    if not source.startswith("{"):
+        return None
+
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for char in source:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char == "}":
+            if not stack or stack[-1] != "{":
+                return None
+            stack.pop()
+        elif char == "]":
+            if not stack or stack[-1] != "[":
+                return None
+            stack.pop()
+
+    if in_string:
+        source += '"'
+
+    source = re.sub(r",\s*$", "", source.rstrip())
+    closer = {"{": "}", "[": "]"}
+    source += "".join(closer[token] for token in reversed(stack))
+    source = re.sub(r",\s*([}\]])", r"\1", source)
+    return source
 
 
 def _json_repair_candidates(text: str) -> list[str]:
@@ -515,7 +565,7 @@ def _workflow_action_fallback(schema: Mapping[str, Any]) -> dict[str, Any]:
     issue_schema = props.get("issue_type", {}) if isinstance(props.get("issue_type"), Mapping) else {}
     actions = list(action_schema.get("enum") or [])
     issues = list(issue_schema.get("enum") or [])
-    action = "pause_for_human" if "pause_for_human" in actions else ("retry" if "retry" in actions else _safe_enum(actions))
+    action = _preferred_workflow_action(actions)
     return {
         "action": action,
         "requires_human": True,
@@ -524,6 +574,20 @@ def _workflow_action_fallback(schema: Mapping[str, Any]) -> dict[str, Any]:
         "reason": "Reviewer output required major structured-output recovery.",
         "expert_question": "The reviewer returned malformed structured output. Should this step be retried or inspected manually?",
     }
+
+
+def _preferred_workflow_action(actions: list[Any]) -> Any:
+    for action in (
+        "pause_for_human",
+        "manual_inspection",
+        "continue_with_warning",
+        "accept_with_warning",
+        "stop",
+        "unresolved",
+    ):
+        if action in actions:
+            return action
+    return _safe_enum(actions)
 
 
 def _schema_default(schema: Mapping[str, Any], *, warnings: list[str]) -> Any:

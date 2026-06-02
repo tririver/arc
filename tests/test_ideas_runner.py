@@ -62,6 +62,12 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
             "status": "completed",
             "run_id": batch_config["run_id"],
             "run_root": str(run_root),
+            "warnings_summary": {
+                "structured_output_warning_count": 2,
+                "structured_output_warnings_path": str(run_root / "structured_output_warnings.jsonl"),
+                "cache_warning_count": 1,
+                "cache_warnings_path": str(run_root / "cache_warnings.jsonl"),
+            },
             "loops": [
                 {
                     "loop_id": loop["loop_id"],
@@ -136,6 +142,8 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
         "no_info_idea_001",
     }
     assert result["batch_result"]["run_root"] == str(project_dir / "ideas" / "ideas_test" / "idea_loops")
+    assert result["warnings_summary"]["structured_output_warning_count"] == 2
+    assert result["warnings_summary"]["cache_warning_count"] == 1
 
 
 def test_ideas_caps_concurrency_for_many_loops(tmp_path: Path) -> None:

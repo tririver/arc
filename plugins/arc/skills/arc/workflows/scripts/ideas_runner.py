@@ -133,6 +133,7 @@ def _result(
         "run_id": config.run_id,
         "run_root": str(run_root),
         "warnings": warnings,
+        "warnings_summary": _batch_warnings_summary(batch_result),
         "proposal_count": len(ideas),
         "reviewer_call_count": loop_reviewer_call_count,
         "loop_reviewer_call_count": loop_reviewer_call_count,
@@ -143,6 +144,16 @@ def _result(
         "loops": [_loop_summary(idea, batch_run_root=batch_run_root) for idea in ideas],
         "round_score_table": round_score_table,
         "batch_result": dict(batch_result),
+    }
+
+
+def _batch_warnings_summary(batch_result: Mapping[str, Any]) -> dict[str, Any]:
+    summary = batch_result.get("warnings_summary")
+    return dict(summary) if isinstance(summary, Mapping) else {
+        "structured_output_warning_count": 0,
+        "structured_output_warnings_path": "",
+        "cache_warning_count": 0,
+        "cache_warnings_path": "",
     }
 
 

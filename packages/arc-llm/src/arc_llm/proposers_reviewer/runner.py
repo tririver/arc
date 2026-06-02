@@ -137,6 +137,7 @@ def run_proposers_reviewer_batch(
         "status": status,
         "run_id": batch.run_id,
         "run_root": str(paths.run_root),
+        "warnings_summary": _warnings_summary(paths),
         "loops": loop_results,
     }
     _write_run_state(paths, run_result)
@@ -169,6 +170,24 @@ def _prepare_run(paths: RunPaths, batch: BatchConfig) -> None:
 def _write_run_state(paths: RunPaths, run_result: dict[str, Any]) -> None:
     with acquire_lock(paths.lock, run_id=run_result["run_id"]):
         atomic_write_json(paths.state, run_result)
+
+
+def _warnings_summary(paths: RunPaths) -> dict[str, Any]:
+    structured_path = paths.run_root / "structured_output_warnings.jsonl"
+    cache_path = paths.run_root / "cache_warnings.jsonl"
+    return {
+        "structured_output_warning_count": _count_jsonl(structured_path),
+        "structured_output_warnings_path": str(structured_path),
+        "cache_warning_count": _count_jsonl(cache_path),
+        "cache_warnings_path": str(cache_path),
+    }
+
+
+def _count_jsonl(path: Path) -> int:
+    try:
+        return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    except FileNotFoundError:
+        return 0
 
 
 def _run_loop(
@@ -270,13 +289,14 @@ def _run_loop_rounds(
                 cache_warnings_path=paths.run_root / "cache_warnings.jsonl",
             )
         except Exception as exc:
-            if not _warn_continue_policy(batch.output_recovery) or _is_provider_failure_exception(exc):
+            if not _warn_continue_policy(batch.output_recovery) or _is_fatal_provider_failure_exception(exc):
                 raise
             review_output = _peer_visible_reviewer_fallback(
                 raw_output=str(exc),
                 error=exc,
                 worker=reviewer,
                 loop=loop,
+                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{reviewer.id}",
             )
             _record_structured_output_warning(
                 review_output[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
@@ -386,7 +406,7 @@ def _run_proposers(
                     warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
                 )
             except Exception as exc:
-                if not _warn_continue_policy(batch.output_recovery) or _is_provider_failure_exception(exc):
+                if not _warn_continue_policy(batch.output_recovery) or _is_fatal_provider_failure_exception(exc):
                     raise
                 output = _worker_exception_output(worker=proposer, role="proposer", exc=exc, call_label=call_label)
                 _record_structured_output_warning(
@@ -463,6 +483,7 @@ def _call_reviewer_with_validation_retry(
                 error=exc,
                 worker=worker,
                 loop=loop,
+                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
             )
             _record_structured_output_warning(
                 recovered[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
@@ -479,6 +500,7 @@ def _call_reviewer_with_validation_retry(
                 error=exc,
                 worker=worker,
                 loop=loop,
+                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
             )
             _validate_reviewer_output(recovered, worker=worker, loop=loop)
             _maybe_record_structured_output_warning(
@@ -547,6 +569,10 @@ def _call_reviewer_with_validation_retry(
             error=retry_exc,
             worker=worker,
             loop=loop,
+            call_label=(
+                f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}/"
+                f"validation_retry_{batch.output_recovery.reviewer_validation_retries:03d}"
+            ),
         )
         _validate_reviewer_output(recovered, worker=worker, loop=loop)
         _maybe_record_structured_output_warning(
@@ -586,8 +612,9 @@ def _peer_visible_reviewer_fallback(
     error: Exception,
     worker: WorkerConfig,
     loop: LoopConfig,
+    call_label: str | None = None,
 ) -> dict[str, Any]:
-    raw_text = _raw_output_text(raw_output)
+    raw_text = _raw_excerpt_from_any(raw_output)
     recovery_schema = _reviewer_recovery_schema(worker.output_schema, loop=loop)
     recovered = recover_json_output(
         value={},
@@ -608,7 +635,7 @@ def _peer_visible_reviewer_fallback(
         },
     )
     output = dict(recovered.value)
-    _force_non_approving_reviewer_fallback(output, schema=recovery_schema, loop=loop)
+    _force_non_approving_reviewer_fallback(output, schema=recovery_schema, loop=loop, raw_excerpt=raw_text)
     _force_zero_marks_if_present(output, schema=recovery_schema)
     structured_output = {**dict(recovered.structured_output or {}), "recovery_strategy": "peer_visible_reviewer_fallback"}
     output[ARC_LLM_CALL_RECORD_FIELD] = _local_recovery_call_record(
@@ -616,6 +643,7 @@ def _peer_visible_reviewer_fallback(
         schema=worker.output_schema,
         signal="peer_visible_reviewer_fallback",
         structured_output=structured_output,
+        call_label=call_label,
     )
     return output
 
@@ -626,9 +654,10 @@ def _conservative_reviewer_schema_failure_fallback(
     error: Exception,
     worker: WorkerConfig,
     loop: LoopConfig,
+    call_label: str | None = None,
 ) -> dict[str, Any]:
     """Return a schema-valid reviewer envelope that cannot approve the round."""
-    raw_text = json.dumps(raw_output, ensure_ascii=False, sort_keys=True, default=str)
+    raw_text = _raw_excerpt_from_any(raw_output)
     recovery_schema = _reviewer_recovery_schema(worker.output_schema, loop=loop)
     recovered = recover_json_output(
         value={},
@@ -649,7 +678,7 @@ def _conservative_reviewer_schema_failure_fallback(
         },
     )
     output = dict(recovered.value)
-    _force_non_approving_reviewer_fallback(output, schema=recovery_schema, loop=loop)
+    _force_non_approving_reviewer_fallback(output, schema=recovery_schema, loop=loop, raw_excerpt=raw_text)
     structured_output = dict(recovered.structured_output or {})
     structured_output.update(
         {
@@ -673,7 +702,7 @@ def _conservative_reviewer_schema_failure_fallback(
         "session_policy": "local-recovery",
         "session_key": None,
         "native_session_id": None,
-        "call_label": None,
+        "call_label": call_label,
         "prompt_sha256": None,
         "static_prefix_sha256": None,
         "schema_sha256": schema_hash(worker.output_schema),
@@ -689,6 +718,7 @@ def _force_non_approving_reviewer_fallback(
     *,
     schema: Mapping[str, Any],
     loop: LoopConfig,
+    raw_excerpt: str = "",
 ) -> None:
     controller = output.setdefault("controller", {})
     if isinstance(controller, dict):
@@ -720,7 +750,10 @@ def _force_non_approving_reviewer_fallback(
     _set_if_schema_allows_or_present(
         consensus,
         "analysis",
-        "Reviewer output failed full schema validation; forcing unresolved status.",
+        _with_raw_excerpt(
+            "Reviewer output failed full schema validation; forcing unresolved status.",
+            raw_excerpt,
+        ),
         consensus_schema,
     )
     _set_if_schema_allows_or_present(
@@ -759,7 +792,10 @@ def _force_non_approving_reviewer_fallback(
     _set_if_schema_allows_or_present(
         workflow_action,
         "reason",
-        "Reviewer output failed full schema validation; used conservative reviewer fallback.",
+        _with_raw_excerpt(
+            "Reviewer output failed full schema validation; used conservative reviewer fallback.",
+            raw_excerpt,
+        ),
         workflow_schema,
     )
     _set_if_schema_allows_or_present(
@@ -791,7 +827,6 @@ def _worker_exception_output(
     exc: BaseException,
     call_label: str,
 ) -> dict[str, Any]:
-    del call_label
     raw_text = "".join(traceback.format_exception_only(type(exc), exc)).strip()
     structured_output = structured_metadata(
         severity="major",
@@ -808,6 +843,7 @@ def _worker_exception_output(
         worker=worker,
         role=role,
         structured_output=structured_output,
+        call_label=call_label,
     )
 
 
@@ -835,6 +871,7 @@ def _prepare_peer_visible_proposer_output(
             worker=worker,
             role="proposer",
             structured_output=structured_output,
+            call_label=call_label,
         )
         _record_structured_output_warning(
             structured_output,
@@ -864,6 +901,7 @@ def _prepare_peer_visible_proposer_output(
             worker=worker,
             role="proposer",
             structured_output=structured_output,
+            call_label=call_label,
         )
         _record_structured_output_warning(
             structured_output,
@@ -899,18 +937,26 @@ def _unstructured_output_wrapper(
     worker: WorkerConfig,
     role: str,
     structured_output: dict[str, Any],
+    call_label: str | None = None,
 ) -> dict[str, Any]:
+    excerpt = raw_text[:4000]
     return {
         "schema_version": "arc.llm.unstructured_output.v1",
         "worker_id": worker.id,
         "role": role,
         "raw_text": raw_text,
+        "recovered_unstructured_text": excerpt,
+        "structured_output_warning": "This output was recovered from malformed or natural-language LLM output.",
+        "idea_title": _first_nonempty_line(raw_text)[:120] or "Recovered unstructured idea",
+        "idea_summary": excerpt[:2000],
+        "description": excerpt[:2000],
         "warning": "Output did not satisfy the requested JSON schema and was forwarded as unstructured text.",
         ARC_LLM_CALL_RECORD_FIELD: _local_recovery_call_record(
             worker=worker,
             schema=worker.output_schema,
             signal="peer_visible_unstructured_output",
             structured_output=structured_output,
+            call_label=call_label,
         ),
     }
 
@@ -921,6 +967,7 @@ def _local_recovery_call_record(
     schema: Mapping[str, Any] | None,
     signal: str,
     structured_output: dict[str, Any],
+    call_label: str | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": ARC_LLM_CALL_RECORD_SCHEMA_VERSION,
@@ -937,7 +984,7 @@ def _local_recovery_call_record(
         "session_policy": "local-recovery",
         "session_key": None,
         "native_session_id": None,
-        "call_label": None,
+        "call_label": call_label,
         "prompt_sha256": None,
         "static_prefix_sha256": None,
         "schema_sha256": schema_hash(schema),
@@ -1738,21 +1785,52 @@ def _output_recovery_mode(options: OutputRecoveryOptions) -> str:
     return options.mode
 
 
-def _is_provider_failure_exception(exc: BaseException) -> bool:
-    text = str(exc)
-    return "retryable provider failure text" in text or "fatal provider failure text" in text
+def _is_fatal_provider_failure_exception(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    fatal_markers = [
+        "fatal provider failure text",
+        "mcp server failed",
+        "authentication",
+        "permission denied",
+        "invalid api key",
+        "not authorized",
+        "command not found",
+        "no such file or directory",
+        "arc-only mcp",
+    ]
+    return any(marker in text for marker in fatal_markers)
 
 
 def _raw_output_text(output: Any) -> str:
+    return _raw_excerpt_from_any(output)
+
+
+def _raw_excerpt_from_any(output: Any) -> str:
     if isinstance(output, Mapping):
         structured = _structured_output_from_payload(output)
         if isinstance(structured, Mapping):
             raw_excerpt = structured.get("raw_text_excerpt")
             if isinstance(raw_excerpt, str) and raw_excerpt.strip():
                 return raw_excerpt
+        return json.dumps(strip_arc_llm_call_records(dict(output)), ensure_ascii=False, sort_keys=True, default=str)[:4000]
     if isinstance(output, str):
-        return output
-    return json.dumps(output, ensure_ascii=False, sort_keys=True, default=str)
+        return output[:4000]
+    return str(output or "")[:4000]
+
+
+def _with_raw_excerpt(message: str, raw_excerpt: str) -> str:
+    excerpt = raw_excerpt.strip()
+    if not excerpt:
+        return message
+    return f"{message}\n\nRecovered raw text excerpt:\n{excerpt[:1000]}"
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip().strip("#*- ")
+        if stripped:
+            return stripped
+    return ""
 
 
 def _structured_output_from_payload(output: Mapping[str, Any]) -> Mapping[str, Any] | None:

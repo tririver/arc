@@ -201,6 +201,7 @@ def run_calculation(
         "max_recalculations": calculation.max_recalculations,
         "human_gate": copy.deepcopy(calculation.human_gate),
         "steps": step_results,
+        "warnings_summary": _aggregate_warnings_summary(step_results),
     }
     atomic_write_json(paths.state, result)
     return result
@@ -254,6 +255,7 @@ def _run_calculation_step(
             "batch_loop_id": batch_config["loops"][0]["loop_id"],
             "batch_root": str(attempt_paths["run_root"]),
             "review_path": str(attempt_paths["review_path"]),
+            "warnings_summary": _batch_warnings_summary(batch_result),
         }
         if batch_result.get("status") != "completed":
             attempt_record["batch_result"] = batch_result
@@ -386,6 +388,42 @@ def _run_calculation_step(
         locked_outputs = {}
 
     raise AssertionError("unreachable calculation loop exit")
+
+
+def _batch_warnings_summary(batch_result: Mapping[str, Any]) -> dict[str, Any]:
+    summary = batch_result.get("warnings_summary")
+    return dict(summary) if isinstance(summary, Mapping) else {
+        "structured_output_warning_count": 0,
+        "structured_output_warnings_path": "",
+        "cache_warning_count": 0,
+        "cache_warnings_path": "",
+    }
+
+
+def _aggregate_warnings_summary(step_results: list[dict[str, Any]]) -> dict[str, Any]:
+    structured_count = 0
+    cache_count = 0
+    structured_paths: list[str] = []
+    cache_paths: list[str] = []
+    for step in step_results:
+        for attempt in step.get("attempts", []):
+            if not isinstance(attempt, Mapping):
+                continue
+            summary = attempt.get("warnings_summary")
+            if not isinstance(summary, Mapping):
+                continue
+            structured_count += int(summary.get("structured_output_warning_count") or 0)
+            cache_count += int(summary.get("cache_warning_count") or 0)
+            if path := str(summary.get("structured_output_warnings_path") or ""):
+                structured_paths.append(path)
+            if path := str(summary.get("cache_warnings_path") or ""):
+                cache_paths.append(path)
+    return {
+        "structured_output_warning_count": structured_count,
+        "structured_output_warnings_paths": sorted(set(structured_paths)),
+        "cache_warning_count": cache_count,
+        "cache_warnings_paths": sorted(set(cache_paths)),
+    }
 
 
 def _attempt_batch_config(

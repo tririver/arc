@@ -441,7 +441,7 @@ def _repair_candidate_audit(audit: dict[str, Any], *, method: str) -> dict[str, 
     schema_error = _schema_error(audit if isinstance(audit, dict) else {}, FOUNDATION_CANDIDATE_AUDIT_SCHEMA)
     repaired = dict(audit or {})
     repaired["schema_version"] = "arc.domain_foundation_candidate_audit.v1"
-    repaired["candidate_set_sufficient"] = bool(repaired.get("candidate_set_sufficient", True))
+    repaired["candidate_set_sufficient"] = _relaxed_bool(repaired.get("candidate_set_sufficient"), default=True)
     repaired["confidence"] = _confidence(repaired.get("confidence"))
     search_queries, skipped = _complete_audit_search_queries(repaired.get("search_queries"))
     repaired["search_queries"] = search_queries
@@ -457,6 +457,20 @@ def _repair_candidate_audit(audit: dict[str, Any], *, method: str) -> dict[str, 
         repaired["warnings"].append("candidate_audit_schema_relaxed:" + schema_error[:500])
     repaired["audit_method"] = method
     return repaired
+
+
+def _relaxed_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", ""}:
+            return False
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    return default
 
 
 def _complete_audit_search_queries(raw_queries: Any) -> tuple[list[dict[str, str]], list[str]]:

@@ -25,12 +25,16 @@ def bootstrap_arc_pythonpath() -> None:
             sys.path.insert(0, str(site_packages))
             if _can_import_arc_llm():
                 return
+    searched_roots = "\n".join(f"  - {root}" for root in _candidate_roots()) or "  - (none)"
+    searched_runtimes = "\n".join(f"  - {path}" for path in _candidate_runtime_site_packages()) or "  - (none)"
     raise RuntimeError(
         "Cannot import ARC internal module `arc_llm`. This does NOT mean `arc-llm` "
         "should be installed from PyPI. ARC tools are provided by the ARC MCP/plugin "
         "launcher and its bundled runtime. Run this workflow with the ARC runtime, "
         "or set ARC_MCP_REPO_ROOT/ARC_REPO_ROOT/PYTHONPATH to a checkout containing "
-        "packages/arc-llm/src."
+        "packages/arc-llm/src.\n"
+        f"Searched ARC roots:\n{searched_roots}\n"
+        f"Searched ARC runtime site-packages:\n{searched_runtimes}"
     )
 
 

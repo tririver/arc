@@ -228,7 +228,9 @@ def build_domain(
         warnings: list[dict[str, Any]] = []
         try:
             summary = _summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier)
-            summary_available = True
+            summary_available = bool(summary.get("summary_available", summary.get("summary") is not None))
+            if not summary_available and isinstance(summary.get("warnings"), list):
+                warnings.extend(summary["warnings"])
         except Exception as exc:
             warning = _record_domain_summary_warning(paths, exc)
             warnings.append(warning)

@@ -70,6 +70,7 @@ def test_calculate_runner_uses_templates_and_hides_reviewer_reference_claim(tmp_
     assert "reviewer_reference_claim" not in loop["proposers"][0]["prompt"]["template"]
     assert loop["proposers"][0]["runtime"]["allow_internet"] is False
     assert loop["proposers"][0]["runtime"]["allow_mcp"] is False
+    assert result["warnings_summary"]["structured_output_warning_count"] == 0
 
 
 def test_calculate_runner_recalculates_only_isolated_wrong_proposer(tmp_path):
@@ -743,10 +744,16 @@ def test_human_gate_respects_nonhuman_continue_action(tmp_path: Path) -> None:
 
 
 class FakeBatchRunner:
-    def __init__(self, reviews: list[dict[str, Any]]) -> None:
+    def __init__(self, reviews: list[dict[str, Any]], warnings_summary: dict[str, Any] | None = None) -> None:
         self.reviews = list(reviews)
         self.calls: list[dict[str, Any]] = []
         self.active_proposers_by_call: list[list[str]] = []
+        self.warnings_summary = warnings_summary or {
+            "structured_output_warning_count": 0,
+            "structured_output_warnings_path": "",
+            "cache_warning_count": 0,
+            "cache_warnings_path": "",
+        }
 
     def __call__(self, config: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         payload = json.loads(json.dumps(config))
@@ -770,6 +777,7 @@ class FakeBatchRunner:
             "status": "completed",
             "run_id": payload["run_id"],
             "run_root": str(paths["run_root"]),
+            "warnings_summary": self.warnings_summary,
             "loops": [{"loop_id": loop["loop_id"], "status": "completed"}],
         }
 
