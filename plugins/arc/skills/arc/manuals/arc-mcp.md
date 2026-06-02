@@ -93,11 +93,14 @@ llm_summary_batch_run(name="<batch-name>", provider="auto", concurrency=2, backg
 ```
 
 ### Phase 2: Watch with CLI.
-Step 1: Immediately run:
+Step 1: Immediately run the returned `next.cli_command`, for example:
 
 ```bash
 arc-mcp watch <job_id> --json
 ```
+
+Plugin or Codex shells may not have `arc-mcp` on `PATH`; `next.cli_command`
+may use an absolute runtime command. Use it exactly when present.
 
 Step 2: Use the watcher output as the final result when it completes.
 

@@ -105,6 +105,37 @@ def test_codex_generate_json_without_schema_omits_output_schema(monkeypatch):
     assert "Return exactly one JSON object" in captured["input"]
 
 
+def test_codex_warn_mode_recovers_plain_text_output(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        output_path = Path(cmd[cmd.index("--output-last-message") + 1])
+        output_path.write_text("plain calculation answer", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = CodexCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        output_recovery="warn",
+    )
+
+    assert response.value == {}
+    assert response.structured_output["severity"] == "major"
+    assert response.structured_output["recovery_strategy"] == "natural_language_fallback"
+
+
+def test_codex_strict_mode_raises_on_plain_text_output(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        output_path = Path(cmd[cmd.index("--output-last-message") + 1])
+        output_path.write_text("plain calculation answer", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(LLMWorkerError, match="Codex JSON output"):
+        CodexCliProvider().generate_json_result("prompt", schema={"type": "object"}, output_recovery="strict")
+
+
 def test_codex_generate_text_reads_last_message(monkeypatch):
     def fake_run(cmd, **kwargs):
         output_path = cmd[cmd.index("--output-last-message") + 1]
@@ -471,6 +502,28 @@ def test_claude_deepseek_auto_uses_prompt_contract_not_json_schema(monkeypatch):
     assert "prompt" in captured["input"]
 
 
+def test_claude_warn_mode_auto_uses_prompt_schema_even_without_model_marker(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"result": {"ok": True}}), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider(env={}).generate_json_result(
+        "prompt",
+        schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
+        model=None,
+        output_recovery="warn",
+    )
+
+    assert response.value == {"ok": True}
+    assert "--json-schema" not in captured["cmd"]
+    assert "JSON output contract" in captured["input"]
+
+
 def test_claude_provider_mode_keeps_json_schema_for_deepseek(monkeypatch):
     captured = {}
 
@@ -485,6 +538,7 @@ def test_claude_provider_mode_keeps_json_schema_for_deepseek(monkeypatch):
         "prompt",
         schema={"type": "object"},
         model="deepseek-v4-flash",
+        output_recovery="warn",
     )
 
     assert "--json-schema" in captured["cmd"]
@@ -525,6 +579,36 @@ def test_claude_natural_language_result_still_raises_in_strict_mode(monkeypatch)
 
     with pytest.raises(LLMWorkerError, match="Claude result field was not JSON"):
         ClaudeCliProvider().generate_json_result("prompt", schema={"type": "object"})
+
+
+def test_claude_warn_mode_recovers_result_json_array(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        payload = {"type": "result", "result": json.dumps(["not", "object"]), "session_id": "s1"}
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object"},
+        output_recovery="warn",
+    )
+
+    assert response.value == {}
+    assert response.native_session_id == "s1"
+    assert response.structured_output["severity"] == "major"
+    assert response.structured_output["recovery_strategy"] == "natural_language_fallback"
+
+
+def test_claude_strict_mode_raises_on_result_json_array(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        payload = {"type": "result", "result": json.dumps(["not", "object"])}
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(LLMWorkerError, match="Claude result JSON was not an object"):
+        ClaudeCliProvider().generate_json_result("prompt", schema={"type": "object"}, output_recovery="strict")
 
 
 def test_claude_structured_output_retry_error_recovered_in_warn_mode(monkeypatch):

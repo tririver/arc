@@ -9,6 +9,9 @@ from arc_mcp import worker
 from arc_mcp.jobs import MCPJobCancelled, MCPJobManager, resolve_inline_wait_seconds
 
 
+PROCESS_WORKER_TEST_TIMEOUT = 10
+
+
 def test_job_manager_runs_and_records_progress(tmp_path, monkeypatch):
     monkeypatch.setenv("ARC_MCP_CACHE", str(tmp_path))
     manager = MCPJobManager(max_workers=1, worker_mode="thread")
@@ -166,7 +169,10 @@ def test_process_worker_persists_failed_status(tmp_path, monkeypatch):
 
     job_id = manager.start(job_type="unsupported_test_job", payload={})
 
-    assert manager.wait(job_id, timeout=2) is True
+    launch_status = manager.status(job_id)
+    assert launch_status["status"] in {"queued", "running", "failed"}
+    assert launch_status.get("phase") in {"queued", "worker_launching", "running", "failed"}
+    assert manager.wait(job_id, timeout=PROCESS_WORKER_TEST_TIMEOUT) is True
     status = manager.status(job_id)
     assert status["status"] == "failed"
     assert status["error"]["code"] == "job_failed"

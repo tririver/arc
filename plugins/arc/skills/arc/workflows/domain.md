@@ -51,11 +51,16 @@ background jobs before watching any of them. This allows independent domains to
 build concurrently while preserving per-job result inspection.
 
 Step 3: For every MCP response that contains `status: "job_running"` and
-`job_id`, run:
+`job_id`, run the returned `next.cli_command`, for example:
 
 ```bash
 arc-mcp watch <job-id> --json
 ```
+
+Plugin or Codex shells may not have `arc-mcp` on `PATH`; the MCP response may
+therefore return an absolute runtime command. Use that exact command when
+present. If the CLI is unavailable, poll `job_status(job_id)` and then
+`job_result(job_id)`.
 
 Watch all launched jobs to a terminal result. If host or MCP execution cannot
 run jobs concurrently, fall back to watching/running them sequentially without

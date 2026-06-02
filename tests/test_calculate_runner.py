@@ -142,6 +142,33 @@ def test_major_recovered_reviewer_output_cannot_accept_calculation(tmp_path):
     assert step["reviewer_consensus"]["accepted_result"] is None
 
 
+def test_major_recovered_reviewer_blocks_without_full_retry(tmp_path):
+    runner = load_calculate_runner()
+    review = calculate_review("all_agree", agreed=["proposer_001", "proposer_002"])
+    review["arc_llm_call_record"] = {
+        "structured_output": {
+            "mode": "recovered",
+            "severity": "major",
+            "recovery_strategy": "peer_visible_reviewer_fallback",
+        }
+    }
+    fake = FakeBatchRunner(
+        [
+            review,
+            calculate_review("all_agree", agreed=["proposer_001", "proposer_002"]),
+        ]
+    )
+
+    result = runner.run_calculation(minimal_config(tmp_path), batch_runner=fake, base_env={})
+
+    step = result["steps"][0]
+    assert len(fake.calls) == 1
+    assert step["status"] == "blocked_for_user"
+    assert step["accepted_output"] is None
+    assert step["blocked_output"]["reason"] == "reviewer_structured_output_recovery"
+    assert step["reviewer_consensus"]["status"] == "unresolved"
+
+
 def test_human_gate_does_not_preempt_retry_budget_for_retryable_status(tmp_path):
     runner = load_calculate_runner()
     fake = FakeBatchRunner(
@@ -562,6 +589,25 @@ def test_attempt_batch_config_carries_reasoning_defaults(tmp_path) -> None:
     )
 
     assert batch["defaults"] == template["defaults"]
+
+
+def test_attempt_batch_config_uses_peer_visible_no_retry(tmp_path) -> None:
+    runner = load_calculate_runner()
+    config = runner.load_calculation_config(minimal_config(tmp_path))
+
+    batch = runner._attempt_batch_config(  # noqa: SLF001
+        config,
+        config.steps[0],
+        attempt_number=1,
+        active_proposer_ids=["proposer_001", "proposer_002"],
+        locked_outputs={},
+        retry_feedback=[],
+        run_root=tmp_path / "execute" / "calc_001",
+        accepted_step_outputs={},
+    )
+
+    assert batch["output_recovery"]["schema_violation_policy"] == "peer_visible"
+    assert batch["output_recovery"]["reviewer_validation_retries"] == 0
 
 
 def test_calculate_parses_string_false_as_false(tmp_path) -> None:

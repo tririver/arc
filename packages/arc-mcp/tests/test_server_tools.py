@@ -1,6 +1,8 @@
 import asyncio
+import shlex
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +45,23 @@ def test_bool_arg_parses_string_booleans():
     assert server._bool_arg(None, True) is True  # noqa: SLF001
     assert server._bool_arg("maybe") is False  # noqa: SLF001
     assert server._bool_arg("maybe", True) is True  # noqa: SLF001
+
+
+def test_arc_mcp_watch_command_uses_runtime_executable_when_path_absent(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    runtime_python = bin_dir / "python"
+    runtime_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    runtime_arc_mcp = bin_dir / "arc-mcp"
+    runtime_arc_mcp.write_text("#!/bin/sh\n", encoding="utf-8")
+    runtime_arc_mcp.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(server, "sys", SimpleNamespace(executable=str(runtime_python)), raising=False)
+
+    result = server._arc_mcp_watch_command("job id")  # noqa: SLF001
+
+    assert shlex.split(result["cli_command"]) == [str(runtime_arc_mcp), "watch", "job id", "--json"]
+    assert result["mcp_fallback_tool"] == "job_status"
 
 
 def test_call_tool_md2pdf_starts_background_job_without_waiting(monkeypatch, tmp_path):

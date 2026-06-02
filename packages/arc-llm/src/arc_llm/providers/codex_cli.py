@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from arc_llm.json_schema import to_provider_json_schema
 from arc_llm.schema_cache import canonical_json, sha256_text, write_schema_cache_file
 from arc_llm.sessions import LLMSessionRef
+from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
 from .base import LLMWorkerError
@@ -42,6 +43,7 @@ class CodexCliProvider:
         session_policy: str = "stateless",
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
+        output_recovery: str = "strict",
     ) -> LLMProviderResponse[dict[str, Any]]:
         provider_schema = to_provider_json_schema(schema)
         stateful = session_policy == "stateful" and session is not None
@@ -88,9 +90,7 @@ class CodexCliProvider:
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
             if stateful and not resume_id and not native_session_id:
                 raise LLMWorkerError("stateful Codex call did not report thread/session id")
-            payload = _read_json_payload(output_path, result.stdout)
-            if not isinstance(payload, dict):
-                raise LLMWorkerError("Codex JSON output was not an object")
+            payload, structured_output = _read_json_payload(output_path, result.stdout, output_recovery=output_recovery)
             return LLMProviderResponse(
                 payload,
                 usage=usage,
@@ -98,6 +98,7 @@ class CodexCliProvider:
                 raw_events=raw_events,
                 raw_output=result.stdout,
                 prompt_sent_sha256=sha256_text(effective_prompt),
+                structured_output=structured_output,
             )
 
     def generate_text(self, prompt: str, *, model: str | None = None) -> str:
@@ -314,7 +315,12 @@ def _parse_codex_json_events(stdout: str) -> tuple[str | None, LLMUsage, tuple[d
     return thread_id, usage, tuple(events)
 
 
-def _read_json_payload(output_path: Path, stdout: str) -> dict[str, Any]:
+def _read_json_payload(
+    output_path: Path,
+    stdout: str,
+    *,
+    output_recovery: str = "strict",
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     try:
         text = output_path.read_text(encoding="utf-8")
     except OSError:
@@ -322,10 +328,39 @@ def _read_json_payload(output_path: Path, stdout: str) -> dict[str, Any]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        payload = json.loads(_extract_first_json_object(text))
+        if output_recovery != "warn":
+            payload = json.loads(_extract_first_json_object(text))
+        else:
+            try:
+                payload = json.loads(_extract_first_json_object(text))
+            except Exception as exc:
+                extracted, warnings = parse_json_object_relaxed(text)
+                if isinstance(extracted, dict):
+                    return extracted, structured_metadata(
+                        severity="minor",
+                        warnings=["Codex output was not direct JSON; extracted JSON object from text.", *warnings],
+                        raw_text=text,
+                        strategy="extract_json",
+                        provider_error_type=type(exc).__name__,
+                    )
+                return {}, structured_metadata(
+                    severity="major",
+                    warnings=["Codex output did not contain a JSON object; using local recovery.", *warnings],
+                    raw_text=text,
+                    strategy="natural_language_fallback",
+                    provider_error_type=type(exc).__name__,
+                )
     if not isinstance(payload, dict):
-        raise LLMWorkerError("Codex JSON output was not an object")
-    return payload
+        if output_recovery != "warn":
+            raise LLMWorkerError("Codex JSON output was not an object")
+        return {}, structured_metadata(
+            severity="major",
+            warnings=["Codex JSON output was not an object; using local recovery."],
+            raw_text=text,
+            strategy="natural_language_fallback",
+            provider_error_type=type(payload).__name__,
+        )
+    return payload, None
 
 
 def _extract_first_json_object(text: str) -> str:

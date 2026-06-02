@@ -6,6 +6,7 @@ import re
 
 import pytest
 
+from arc_llm.json_schema import to_provider_json_schema
 from arc_domain import foundation
 from arc_domain import evidence
 from arc_domain import network
@@ -18,6 +19,19 @@ from arc_domain import paper
 
 SEED = "arXiv:2401.00001"
 FOUNDATION = "arXiv:2301.00001"
+
+
+def _assert_openai_strict(node):
+    if isinstance(node, dict):
+        props = node.get("properties")
+        if isinstance(props, dict):
+            assert node.get("additionalProperties") is False
+            assert set(node.get("required") or []) == set(props)
+        for value in node.values():
+            _assert_openai_strict(value)
+    elif isinstance(node, list):
+        for value in node:
+            _assert_openai_strict(value)
 
 
 @pytest.mark.skipif(
@@ -258,6 +272,11 @@ def test_summarize_domain_reports_llm_failure_without_fallback(monkeypatch, tmp_
         '{"selected_foundation": {"paper_id": "arXiv:2301.00001", "title": "Foundation", "reason": "seed"}}',
         encoding="utf-8",
     )
+    paths.domain_summary.write_text(
+        '{"schema_version": "arc.domain_summary.v4", "summary_method": "llm", "overview": "stale"}',
+        encoding="utf-8",
+    )
+    paths.domain_summary_markdown.write_text("# stale\n", encoding="utf-8")
 
     def fail_summary(*args, **kwargs):
         raise RuntimeError("summary prompt too large")
@@ -282,6 +301,9 @@ def test_summarize_domain_reports_llm_failure_without_fallback(monkeypatch, tmp_
     assert status["domain_summary_path"] is None
     assert status["domain_summary_markdown_path"] is None
     assert status["warnings"]
+    stale_read = service.get_domain_summary(domain_id=domain_id)
+    assert stale_read["ok"] is False
+    assert stale_read["error"]["code"] == "domain_summary_not_available"
 
 
 def test_build_domain_continues_when_llm_summary_fails(monkeypatch, tmp_path):
@@ -421,6 +443,12 @@ def test_foundation_selection_contract_includes_best_reference_paper():
     assert "best_reference_paper" in foundation.FOUNDATION_SELECTION_SCHEMA["required"]
     assert selection["selected_foundation"]["paper_id"] == "arXiv:2301.00001"
     assert selection["best_reference_paper"]["paper_id"] == "arXiv:2401.00002"
+
+
+def test_foundation_selection_provider_schema_is_openai_strict():
+    schema = to_provider_json_schema(foundation.FOUNDATION_SELECTION_SCHEMA)
+
+    _assert_openai_strict(schema)
 
 
 def test_foundation_audit_adds_verified_llm_candidate(monkeypatch):

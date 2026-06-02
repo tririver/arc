@@ -41,6 +41,16 @@ CALLER_ALLOWED_CONTEXT_OMIT_KEYS = {
 BatchRunner = Callable[..., dict[str, Any]]
 
 
+def _relaxed_output_recovery_config() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "mode": "warn",
+        "allow_natural_language": True,
+        "schema_violation_policy": "peer_visible",
+        "reviewer_validation_retries": 0,
+    }
+
+
 @dataclass(frozen=True)
 class CalculateStep:
     step_id: str
@@ -273,6 +283,13 @@ def _run_calculation_step(
         }
         attempts.append(attempt_record)
 
+        if _reviewer_output_requires_manual_block(review):
+            return _structured_recovery_blocked_step_result(
+                step,
+                attempts=attempts,
+                consensus=review_consensus,
+            )
+
         status = str(review_consensus.get("status", "unresolved"))
         retryable_status = status in RETRYABLE_CONSENSUS_STATUSES
         retry_budget_available = attempt_number < max_attempts
@@ -405,6 +422,7 @@ def _attempt_batch_config(
             "root": str(run_root / "llm_sessions"),
         },
         "artifact_options": {"save_prompts": config.artifact_options.get("save_prompts", True)},
+        "output_recovery": _relaxed_output_recovery_config(),
         "defaults": copy.deepcopy(config.defaults),
         "loops": [
             {
@@ -747,6 +765,45 @@ def _human_gate_blocked_step_result(
     }
 
 
+def _structured_recovery_blocked_step_result(
+    step: CalculateStep,
+    *,
+    attempts: list[dict[str, Any]],
+    consensus: Mapping[str, Any],
+) -> dict[str, Any]:
+    workflow_action = _normalized_workflow_action(
+        {
+            "action": "pause_for_human",
+            "requires_human": True,
+            "issue_type": "worker_failure",
+            "proposed_revision": None,
+            "reason": "Reviewer output required major structured-output recovery; automatic retry is disabled.",
+            "expert_question": (
+                "The reviewer returned malformed or unstructured output. "
+                "Inspect the reviewer raw text and decide whether to accept, revise, or rerun."
+            ),
+        },
+        "unresolved",
+    )
+    return {
+        "step_id": step.step_id,
+        "kind": step.kind,
+        "status": "blocked_for_user",
+        "attempts": attempts,
+        "accepted_output": None,
+        "blocked_output": {
+            "reason": "reviewer_structured_output_recovery",
+            "trigger_status": "unresolved",
+            "requires_human": True,
+            "workflow_action": workflow_action,
+            "expert_question": workflow_action["expert_question"],
+            "analysis": str(consensus.get("analysis", "")),
+            "last_consensus": copy.deepcopy(dict(consensus)),
+        },
+        "reviewer_consensus": dict(consensus),
+    }
+
+
 def _attempt_paths(batch_config: Mapping[str, Any]) -> dict[str, Path]:
     run_root = Path(str(batch_config["run_dir"])) / str(batch_config["run_id"])
     loop_id = str(batch_config["loops"][0]["loop_id"])
@@ -820,6 +877,10 @@ def _structured_recovery_severity(payload: Mapping[str, Any]) -> str:
     return str(structured.get("severity") or "none")
 
 
+def _reviewer_output_requires_manual_block(review: Mapping[str, Any]) -> bool:
+    return _structured_recovery_severity(review) in {"major", "fatal"}
+
+
 def _force_unresolved_after_recovered_review(
     consensus: Mapping[str, Any],
     *,
@@ -829,7 +890,7 @@ def _force_unresolved_after_recovered_review(
     analysis = str(result.get("analysis", "")).strip()
     warning = (
         "ARC warning: reviewer output required major structured-output recovery; "
-        "forcing unresolved/retry instead of accepting."
+        "forcing unresolved/manual inspection instead of accepting."
     )
     result.update(
         {
@@ -843,12 +904,12 @@ def _force_unresolved_after_recovered_review(
             "best_written_selection_reason": "",
             "workflow_action": _normalized_workflow_action(
                 {
-                    "action": "retry",
-                    "requires_human": False,
+                    "action": "pause_for_human",
+                    "requires_human": True,
                     "issue_type": "worker_failure",
                     "proposed_revision": None,
-                    "reason": "Reviewer output required major structured-output recovery.",
-                    "expert_question": "",
+                    "reason": "Reviewer output required major structured-output recovery; automatic retry is disabled.",
+                    "expert_question": "Inspect the reviewer raw text and decide whether to accept, revise, or rerun.",
                 },
                 "unresolved",
             ),

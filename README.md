@@ -164,7 +164,7 @@ arc-typeset batch-translate <project-dir> --json
 The same converter is available from MCP as `md2pdf`.
 The MCP `md2pdf`, `translate`, and `batch_translate` tools always start
 background jobs and return a `job_id` immediately; use `job_status`/`job_result`
-or `arc-mcp watch <job_id> --json` to inspect completion.
+or the returned `next.cli_command` to inspect completion.
 
 ## Configure LLM Providers
 
@@ -404,7 +404,9 @@ doctor_cache
 ```
 
 Long-running MCP calls can return a `job_id`. Use the CLI watcher to block
-until a terminal result:
+until a terminal result. In plugin or Codex shells, use the returned
+`next.cli_command` because it may contain an absolute runtime command when
+`arc-mcp` is not on `PATH`:
 
 ```bash
 arc-mcp watch <job_id> --json
@@ -577,6 +579,9 @@ If an MCP call returns a job ID:
 ```bash
 arc-mcp watch <job_id> --json
 ```
+
+When using MCP, prefer the returned `next.cli_command`; plugin or Codex shells
+may need an absolute runtime command instead of bare `arc-mcp`.
 
 If a domain summary or graph is missing:
 

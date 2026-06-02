@@ -268,10 +268,23 @@ def _normalize_value(value: Any, schema: Mapping[str, Any], *, warnings: list[st
                 result[str(key)] = _normalize_value(source[key], child_schema, warnings=warnings, fill_required=fill_required)
             elif fill_required and key in required:
                 result[str(key)] = _schema_default(child_schema, warnings=warnings)
-        if schema.get("additionalProperties") is False:
-            dropped = sorted(str(key) for key in source if key not in props)
+        extra_schema = schema.get("additionalProperties", True)
+        extra_keys = [key for key in source if key not in props]
+        if extra_schema is False:
+            dropped = sorted(str(key) for key in extra_keys)
             if dropped:
                 warnings.append("Dropped extra properties: " + ", ".join(dropped))
+        elif isinstance(extra_schema, Mapping):
+            for key in extra_keys:
+                result[str(key)] = _normalize_value(
+                    source[key],
+                    extra_schema,
+                    warnings=warnings,
+                    fill_required=fill_required,
+                )
+        else:
+            for key in extra_keys:
+                result[str(key)] = source[key]
         return result
     if schema_type == "array":
         item_schema = schema.get("items") if isinstance(schema.get("items"), Mapping) else {}

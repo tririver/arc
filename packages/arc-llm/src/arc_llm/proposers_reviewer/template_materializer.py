@@ -5,6 +5,14 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from .config import (
+    DEFAULT_ALLOW_NATURAL_LANGUAGE,
+    DEFAULT_OUTPUT_RECOVERY_ENABLED,
+    DEFAULT_OUTPUT_RECOVERY_MODE,
+    DEFAULT_REVIEWER_VALIDATION_RETRIES,
+    DEFAULT_SCHEMA_VIOLATION_POLICY,
+)
+
 
 def read_json_template(path: Path | str) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -107,11 +115,11 @@ def materialize_batch(
         dict(
             output_recovery
             or {
-                "enabled": True,
-                "mode": "warn",
-                "allow_natural_language": True,
-                "schema_violation_policy": "retry_then_recover",
-                "reviewer_validation_retries": 1,
+                "enabled": DEFAULT_OUTPUT_RECOVERY_ENABLED,
+                "mode": DEFAULT_OUTPUT_RECOVERY_MODE,
+                "allow_natural_language": DEFAULT_ALLOW_NATURAL_LANGUAGE,
+                "schema_violation_policy": DEFAULT_SCHEMA_VIOLATION_POLICY,
+                "reviewer_validation_retries": DEFAULT_REVIEWER_VALIDATION_RETRIES,
             }
         )
     )

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shlex
+import sys
 from pathlib import Path
+from shutil import which
 from typing import Annotated, Any, Callable
 
 from arc_domain import service as domain_service
@@ -951,7 +954,7 @@ def _wait_or_background(
         "inline_wait_seconds": inline_wait,
         "background_requested": background,
         "next": {
-            "cli_command": f"arc-mcp watch {job_id} --json",
+            **_arc_mcp_watch_command(job_id),
             "tool": "job_status",
             "arguments": {"job_id": job_id},
             "poll_after_seconds": poll_after_seconds,
@@ -959,6 +962,19 @@ def _wait_or_background(
         "job": status,
         "errors": [],
         "meta": {},
+    }
+
+
+def _arc_mcp_watch_command(job_id: str) -> dict[str, str]:
+    found = which("arc-mcp")
+    if found:
+        cmd = found
+    else:
+        runtime_cmd = Path(sys.executable).with_name("arc-mcp")
+        cmd = str(runtime_cmd) if runtime_cmd.exists() else "arc-mcp"
+    return {
+        "cli_command": f"{shlex.quote(cmd)} watch {shlex.quote(job_id)} --json",
+        "mcp_fallback_tool": "job_status",
     }
 
 

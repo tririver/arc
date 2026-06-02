@@ -454,6 +454,7 @@ def _exists(path) -> dict[str, Any]:
 
 
 def _record_domain_summary_warning(paths: DomainPaths, exc: Exception) -> dict[str, Any]:
+    _remove_stale_domain_summary_artifacts(paths)
     warning = {
         "code": "domain_summary_failed",
         "message": str(exc),
@@ -475,6 +476,14 @@ def _record_domain_summary_warning(paths: DomainPaths, exc: Exception) -> dict[s
         warnings=warnings,
     )
     return warning
+
+
+def _remove_stale_domain_summary_artifacts(paths: DomainPaths) -> None:
+    for path in (paths.domain_summary, paths.domain_summary_markdown):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _domain_summary_unavailable_result(paths: DomainPaths, warning: dict[str, Any]) -> dict[str, Any]:

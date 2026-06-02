@@ -188,6 +188,7 @@ def _loop_batch_config(config: IdeasConfig, ideas: list[IdeaPlan], *, run_root: 
         run_dir=run_root,
         max_concurrent_loops=max_concurrent,
         artifact_options={"save_prompts": config.save_prompts},
+        output_recovery=_relaxed_output_recovery_config(),
         session={
             "policy": "stateful",
             "history_mode": "delta",
@@ -201,6 +202,16 @@ def _loop_batch_config(config: IdeasConfig, ideas: list[IdeaPlan], *, run_root: 
         },
         loops=[_idea_loop_payload(idea) for idea in ideas],
     )
+
+
+def _relaxed_output_recovery_config() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "mode": "warn",
+        "allow_natural_language": True,
+        "schema_violation_policy": "peer_visible",
+        "reviewer_validation_retries": 0,
+    }
 
 
 def _idea_loop_payload(idea: IdeaPlan) -> dict[str, Any]:

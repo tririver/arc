@@ -46,7 +46,7 @@ class ClaudeCliProvider:
     ) -> LLMProviderResponse[dict[str, Any]]:
         schema = schema or {"type": "object"}
         stateful = session_policy == "stateful" and session is not None
-        mode = _json_schema_mode(self.env, model=model)
+        mode = _json_schema_mode(self.env, model=model, output_recovery=output_recovery)
         cmd = [
             *_base_cmd(self.env, stateful=stateful),
             "--output-format",
@@ -184,6 +184,17 @@ def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict
                 strategy="natural_language_fallback",
             )
         if not isinstance(nested, dict):
+            if output_recovery == "warn":
+                return {}, structured_metadata(
+                    severity="major",
+                    warnings=[
+                        "Claude result field decoded as JSON but was not an object; using local recovery.",
+                        f"decoded_type={type(nested).__name__}",
+                    ],
+                    raw_text=payload["result"],
+                    strategy="natural_language_fallback",
+                    provider_error_type=type(nested).__name__,
+                )
             raise LLMWorkerError("Claude result JSON was not an object")
         return nested, None
     if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
@@ -298,12 +309,14 @@ def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
     return cmd
 
 
-def _json_schema_mode(env: Mapping[str, str], *, model: str | None) -> str:
+def _json_schema_mode(env: Mapping[str, str], *, model: str | None, output_recovery: str = "strict") -> str:
     raw = _env_text(env, "ARC_CLAUDE_JSON_SCHEMA_MODE", "auto").strip().lower()
     if raw not in {"auto", "provider", "prompt"}:
         raise LLMWorkerError("ARC_CLAUDE_JSON_SCHEMA_MODE must be auto, provider, or prompt")
     if raw != "auto":
         return raw
+    if output_recovery == "warn":
+        return "prompt"
     model_text = (model or env.get("ARC_CLAUDE_MODEL") or "").lower()
     prompt_markers = _env_text(env, "ARC_CLAUDE_JSON_SCHEMA_PROMPT_MODELS", _default_prompt_schema_model_markers())
     if any(marker and marker.lower() in model_text for marker in prompt_markers.split(",")):

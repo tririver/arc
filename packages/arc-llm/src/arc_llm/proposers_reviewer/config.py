@@ -15,6 +15,11 @@ from arc_llm.model import VALID_MODEL_TIERS
 BATCH_CONFIG_SCHEMA = "arc.llm.proposers_reviewer_batch.config.v1"
 REVIEW_ENVELOPE_SCHEMA = "arc.llm.review_envelope.v1"
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+DEFAULT_OUTPUT_RECOVERY_ENABLED = True
+DEFAULT_OUTPUT_RECOVERY_MODE = "warn"
+DEFAULT_ALLOW_NATURAL_LANGUAGE = True
+DEFAULT_SCHEMA_VIOLATION_POLICY = "peer_visible"
+DEFAULT_REVIEWER_VALIDATION_RETRIES = 0
 
 
 class ConfigError(ValueError):
@@ -338,24 +343,24 @@ def _parse_artifact_options(raw_options: Any) -> ArtifactOptions:
 
 def _parse_output_recovery(raw_options: Any) -> OutputRecoveryOptions:
     options = _dict(raw_options, "output_recovery")
-    mode = str(options.get("mode", "warn") or "warn").strip().lower()
+    mode = str(options.get("mode", DEFAULT_OUTPUT_RECOVERY_MODE) or DEFAULT_OUTPUT_RECOVERY_MODE).strip().lower()
     if mode not in {"strict", "warn"}:
         raise ConfigError("output_recovery.mode must be strict or warn")
     schema_violation_policy = str(
-        options.get("schema_violation_policy", "retry_then_recover") or "retry_then_recover"
+        options.get("schema_violation_policy", DEFAULT_SCHEMA_VIOLATION_POLICY) or DEFAULT_SCHEMA_VIOLATION_POLICY
     ).strip().lower()
     if schema_violation_policy not in {"retry_then_recover", "peer_visible"}:
         raise ConfigError("output_recovery.schema_violation_policy must be retry_then_recover or peer_visible")
     return OutputRecoveryOptions(
-        enabled=_bool(options.get("enabled", True), "output_recovery.enabled"),
+        enabled=_bool(options.get("enabled", DEFAULT_OUTPUT_RECOVERY_ENABLED), "output_recovery.enabled"),
         mode=mode,
         allow_natural_language=_bool(
-            options.get("allow_natural_language", True),
+            options.get("allow_natural_language", DEFAULT_ALLOW_NATURAL_LANGUAGE),
             "output_recovery.allow_natural_language",
         ),
         schema_violation_policy=schema_violation_policy,
         reviewer_validation_retries=_non_negative_int(
-            options.get("reviewer_validation_retries", 1),
+            options.get("reviewer_validation_retries", DEFAULT_REVIEWER_VALIDATION_RETRIES),
             "output_recovery.reviewer_validation_retries",
         ),
     )

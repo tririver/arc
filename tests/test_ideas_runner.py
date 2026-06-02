@@ -107,6 +107,8 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     assert batch_config["session"]["policy"] == "stateful"
     assert batch_config["session"]["history_mode"] == "delta"
     assert batch_config["session"]["max_concurrent_same_prefix"] == 12
+    assert batch_config["output_recovery"]["schema_violation_policy"] == "peer_visible"
+    assert batch_config["output_recovery"]["reviewer_validation_retries"] == 0
     assert {loop["loop_id"] for loop in batch_config["loops"]} == {
         "domain_idea_001",
         "no_info_idea_001",

@@ -271,6 +271,7 @@ class MCPJobManager:
             stderr.close()
         update_status(
             job_id,
+            phase="worker_launching",
             worker={"pid": process.pid, "command": command},
         )
 

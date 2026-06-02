@@ -590,7 +590,7 @@ def _peer_visible_reviewer_fallback(
         "review_payload": {
             "consensus": {
                 "status": "unresolved",
-                "analysis": "Reviewer output failed schema validation; forcing retry.",
+                "analysis": "Reviewer output failed schema validation; forcing manual inspection.",
                 "accepted_result": None,
                 "agreed_proposer_ids": [],
                 "likely_wrong_proposer_ids": proposer_ids,
@@ -599,12 +599,12 @@ def _peer_visible_reviewer_fallback(
                 "best_written_selection_reason": "",
                 "source_discrepancies": [],
                 "workflow_action": {
-                    "action": "retry",
-                    "requires_human": False,
+                    "action": "pause_for_human",
+                    "requires_human": True,
                     "issue_type": "worker_failure",
                     "proposed_revision": None,
                     "reason": "Reviewer output failed schema validation and was forwarded as unstructured text.",
-                    "expert_question": "",
+                    "expert_question": "Inspect the raw reviewer text and decide whether to accept, revise, or rerun.",
                 },
             }
         },
@@ -638,7 +638,7 @@ def _conservative_reviewer_schema_failure_fallback(
             "mode": "recovered",
             "severity": "major",
             "warnings": [
-                "Reviewer output failed full schema validation after retry; used conservative reviewer fallback.",
+                "Reviewer output failed full schema validation; used conservative reviewer fallback.",
                 str(error),
             ],
             "provider_error_type": type(error).__name__,
@@ -717,7 +717,7 @@ def _force_non_approving_reviewer_fallback(
     _set_if_schema_allows_or_present(
         consensus,
         "analysis",
-        "Reviewer output failed full schema validation after retry; forcing unresolved status.",
+        "Reviewer output failed full schema validation; forcing unresolved status.",
         consensus_schema,
     )
     _set_if_schema_allows_or_present(
@@ -756,7 +756,7 @@ def _force_non_approving_reviewer_fallback(
     _set_if_schema_allows_or_present(
         workflow_action,
         "reason",
-        "Reviewer output failed full schema validation after retry; used conservative reviewer fallback.",
+        "Reviewer output failed full schema validation; used conservative reviewer fallback.",
         workflow_schema,
     )
     _set_if_schema_allows_or_present(
