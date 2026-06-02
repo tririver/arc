@@ -9,6 +9,9 @@ sends five reviewer reports per loop by default.
 
 Read `<project-dir>/context.json`. Use the exact `user_intent`.
 Use `skill_dir` from context as `<skill-dir>` in commands below.
+If `<project-dir>/context.json` is missing, or if it does not contain an
+explicit `automation_level`, return to `SKILL.md` Phase 1 Step 1 before doing
+any idea-generation work. Do not synthesize ideas manually.
 
 ### Phase 1: Prepare Config
 
@@ -55,6 +58,8 @@ The workflow runner writes this generated batch config before launch:
 
 For proposer-reviewer artifact ownership and runner result shape, see
 `manuals/arc-llm.md`.
+Final ranked ideas must come from `ideas_runner.py` artifacts and the
+read-only ranking helper, not ad-hoc agent judgment.
 
 ### Phase 3: Inspect Artifacts
 

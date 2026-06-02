@@ -40,6 +40,21 @@ def test_arc_skill_routes_check_and_calculation_workflows() -> None:
     assert "work-note.md" in text
 
 
+def test_arc_skill_has_preflight_gate_for_workflow_deliverables() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "## Preflight Gate" in text
+    assert "workflow deliverable" in text
+    assert "recommendations" in text
+    assert "research directions" in text
+    assert "idea generation" in text
+    assert "There is no \"lightweight recommendation\" exception." in text
+    assert "Direct factual lookup is exempt only" in text
+    assert "get_metadata" in text
+    assert "domain_get_summary" in text
+    assert text.index("## Preflight Gate") < text.index("## Required References")
+
+
 def test_arc_skill_references_pdf_export_manuals() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8").lower()
     manual = (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8").lower()
@@ -178,6 +193,18 @@ def test_interaction_rules_name_codex_discrete_choice_tool() -> None:
     assert "codex" in lower
     assert "collaboration mode" in lower
     assert "before printing a typed fallback" in lower
+
+
+def test_interaction_rules_define_automation_mode_gate_examples() -> None:
+    text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8")
+    lower = text.lower()
+
+    assert "## Automation Mode Gate" in text
+    assert "Do not gather \"just context\"" in text
+    assert "recommend research directions" in text
+    assert "suggest ideas" in text
+    assert "what is the title and abstract" in text
+    assert "direct paper lookup allowed" in text
     assert "do not include list numbering inside option labels" in lower
 
 
@@ -664,6 +691,16 @@ def test_ideas_workflow_points_to_active_runner_without_global_review() -> None:
     assert "scripts/rank-ideas.py" in text
     assert "<project-dir>/ideas/<run-id>/ideas.md" not in text
     assert "<project-dir>/ideas.md" not in text
+
+
+def test_ideas_workflow_requires_context_and_runner_artifacts() -> None:
+    text = (WF / "ideas.md").read_text(encoding="utf-8")
+
+    assert "If `<project-dir>/context.json` is missing" in text
+    assert "explicit `automation_level`" in text
+    assert "return to `SKILL.md` Phase 1 Step 1" in text
+    assert "Do not synthesize ideas manually" in text
+    assert "Final ranked ideas must come from `ideas_runner.py` artifacts" in text
 
 
 def test_ideas_workflow_has_deterministic_ranked_report_deliverable() -> None:

@@ -9,6 +9,25 @@ ARC is a cache-first research toolkit for theoretical-physics papers and
 research-domain construction. Use ARC tools instead of scraping arXiv/INSPIRE
 or reimplementing paper/domain workflows.
 
+## Preflight Gate
+
+Before any ARC workflow MCP or CLI call, decide whether the user requested a
+workflow deliverable or a direct factual lookup.
+
+Workflow deliverables include recommendations, research directions, idea generation,
+domain construction, note checking, planning, calculations,
+reports, rankings, or follow-up project artifacts. For these, read
+`rules/interaction.md` and obtain an explicit automation mode before calling
+ARC paper/domain/LLM tools. Do not perform preliminary calls such as
+`get_metadata`, `get_citers`, `llm_get_summary`, `domain_get_summary`, seed
+resolution, or project-directory derivation before the mode choice.
+There is no "lightweight recommendation" exception.
+
+Direct factual lookup is exempt only when the user asks for a bounded paper
+fact such as title, authors, abstract, citation count, section text, or
+equation context, and does not ask for recommendations, ideas, domain work,
+checking, planning, calculation, reports, rankings, or project artifacts.
+
 ## Required References
 
 Read the relevant reference before calling ARC tools. These reads are required,

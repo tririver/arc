@@ -3,16 +3,31 @@
 Use this reference whenever ARC needs any user question, choice,
 confirmation, or mode decision.
 
-## Automation Modes
+## Automation Mode Gate
 
 - `auto`: continue without asking additional questions. Use safe defaults,
   preserve warnings, and write decisions to `<project-dir>/context.json`.
 - `interactive`: ask for confirmation after each major workflow step and before
   destructive or ambiguous actions.
 
-If the mode is not clear from the user's request, ask once before resolving
-seeds, creating project directories, building domains, suggesting ideas, or
-planning calculations.
+If the mode is not clear from the user's request and the task is a workflow
+deliverable, ask once before resolving seeds, creating project directories,
+building domains, suggesting ideas, checking notes, planning, or calculating.
+Do not gather "just context" with ARC paper/domain/LLM tools before the mode
+choice.
+
+Examples:
+
+- `use arc, in field arXiv:0911.3380, recommend research directions`: ask
+  for `auto`, `interactive`, or `Let's discuss` before any ARC paper/domain
+  tool call.
+- `use arc, suggest ideas for massive scalar exchange around arXiv:0911.3380`:
+  ask for mode first; after the choice, route through Case 1 and Case 2.
+- `use arc, what is the title and abstract of arXiv:0911.3380?`: direct paper lookup allowed;
+  no automation mode question is needed.
+
+If a workflow deliverable lacks an explicit mode, stop before tool calls and
+ask for mode. Do not infer `auto` from `continue`, `resume`, or a bare approval.
 
 ## Discrete Selection Protocol
 
