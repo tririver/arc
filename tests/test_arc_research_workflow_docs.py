@@ -980,9 +980,9 @@ def test_readme_documents_marketplace_first_install() -> None:
     assert "do not need `uv`, `pip`, or other installer tools" in text
     assert "falls back to `python3 -m venv` plus" in text
     assert "plugin `gitCommitSha`" in text
-    assert "codex plugin marketplace add tririver/arc" in text
+    assert "codex plugin marketplace add tririver/arc --ref stable" in text
     assert "codex plugin add arc@arc" in text
-    assert "/plugin marketplace add tririver/arc" in text
+    assert "/plugin marketplace add tririver/arc@stable" in text
     assert "/plugin install arc" in text
     assert "/path/to/arc/packages/arc-paper/.venv/bin/arc-mcp" not in text
     assert "packaging/codex/arc" not in text

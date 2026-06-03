@@ -57,14 +57,14 @@ the plugin root for both Codex and Claude Code, and
 Install for Codex (run in shell, or in Codex with `!` prefix):
 
 ```bash
-codex plugin marketplace add tririver/arc
+codex plugin marketplace add tririver/arc --ref stable
 codex plugin add arc@arc
 ```
 
 Install for Claude Code (run in Claude Code):
 
 ```bash
-/plugin marketplace add tririver/arc
+/plugin marketplace add tririver/arc@stable
 /plugin install arc
 ```
 
