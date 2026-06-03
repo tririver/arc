@@ -1760,7 +1760,12 @@ def test_custom_json_runner_with_var_kwargs_uses_legacy_full_prompts_by_default(
 
 def test_custom_json_runner_receives_output_recovery_when_supported(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
-    seen: list[tuple[str, str | None]] = []
+    config["output_recovery"] = {
+        "enabled": True,
+        "mode": "warn",
+        "schema_formatter": {"enabled": False},
+    }
+    seen: list[tuple[str, bool, str | None]] = []
 
     def fake(
         prompt,
@@ -1774,10 +1779,11 @@ def test_custom_json_runner_receives_output_recovery_when_supported(tmp_path):
         session_key,
         call_label,
         output_recovery,
+        schema_formatter_enabled,
         role_hint,
         **kwargs,
     ):
-        seen.append((output_recovery, role_hint))
+        seen.append((output_recovery, schema_formatter_enabled, role_hint))
         if role_hint == "reviewer":
             return {
                 "schema_version": "arc.llm.review_envelope.v1",
@@ -1793,8 +1799,8 @@ def test_custom_json_runner_receives_output_recovery_when_supported(tmp_path):
     result = run_proposers_reviewer_batch(config, json_runner=fake, base_env={})
 
     assert result["status"] == "completed"
-    assert ("warn", "proposer") in seen
-    assert ("warn", "reviewer") in seen
+    assert ("warn", False, "proposer") in seen
+    assert ("warn", False, "reviewer") in seen
 
 
 def test_output_recovery_disables_natural_language_when_configured(tmp_path):

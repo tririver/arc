@@ -8,16 +8,11 @@ import inspect
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from jsonschema import ValidationError as JsonSchemaValidationError
-from jsonschema import validate as validate_json_schema
-from jsonschema.exceptions import SchemaError as JsonSchemaError
-
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record, strip_arc_llm_call_records
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
 from .model import resolve_model
 from .providers.select import select_provider
-from .schema_formatter import format_to_schema_or_retry
 from .schema_cache import schema_hash, sha256_text
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
 from .structured_recovery import recover_json_output, structured_metadata
@@ -122,6 +117,7 @@ def run_json(
     model_tier: str | None = None,
     validate_schema: bool = True,
     output_recovery: str = "strict",
+    schema_formatter_enabled: bool = True,
     role_hint: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
@@ -163,6 +159,7 @@ def run_json(
             model=config.model,
             validate_schema=validate_schema,
             output_recovery=output_recovery,
+            schema_formatter_enabled=schema_formatter_enabled,
             role_hint=role_hint,
             provider_used=config.provider,
             model_tier=model_tier,
@@ -353,6 +350,7 @@ def _generate_json(
     model: str | None,
     validate_schema: bool,
     output_recovery: str,
+    schema_formatter_enabled: bool,
     role_hint: str | None,
     provider_used: str,
     model_tier: str | None,
@@ -449,6 +447,7 @@ def _generate_json(
                     schema=schema,
                     validate_schema=validate_schema,
                     output_recovery=output_recovery,
+                    schema_formatter_enabled=schema_formatter_enabled,
                     role_hint=role_hint,
                     response=response,
                     provider=provider_used,
@@ -470,6 +469,7 @@ def _generate_json(
             schema=schema,
             validate_schema=validate_schema,
             output_recovery=output_recovery,
+            schema_formatter_enabled=schema_formatter_enabled,
             role_hint=role_hint,
             response=response,
             provider=provider_used,
@@ -646,6 +646,10 @@ def _update_native_session_id_with_self_heal(
 
 
 def _validate_json_output(result: dict[str, Any], schema: dict[str, Any]) -> None:
+    from jsonschema import ValidationError as JsonSchemaValidationError
+    from jsonschema import validate as validate_json_schema
+    from jsonschema.exceptions import SchemaError as JsonSchemaError
+
     try:
         validate_json_schema(instance=result, schema=schema)
     except JsonSchemaValidationError as exc:
@@ -654,12 +658,19 @@ def _validate_json_output(result: dict[str, Any], schema: dict[str, Any]) -> Non
         raise LLMOutputValidationError(f"JSON schema is invalid: {exc.message}") from exc
 
 
+def format_to_schema_or_retry(*args: Any, **kwargs: Any):
+    from .schema_formatter import format_to_schema_or_retry as formatter
+
+    return formatter(*args, **kwargs)
+
+
 def _recover_or_validate_json_output(
     result: Any,
     *,
     schema: dict[str, Any] | None,
     validate_schema: bool,
     output_recovery: str,
+    schema_formatter_enabled: bool = True,
     role_hint: str | None,
     response: LLMProviderResponse[dict[str, Any]],
     provider: str = "auto",
@@ -703,6 +714,7 @@ def _recover_or_validate_json_output(
             response=response,
             error=LLMOutputValidationError("JSON output was not an object"),
             provider_metadata=structured_output,
+            schema_formatter_enabled=schema_formatter_enabled,
             provider=provider,
             model=model,
             model_tier=model_tier,
@@ -728,6 +740,7 @@ def _recover_or_validate_json_output(
                 response=response,
                 error=exc,
                 provider_metadata=structured_output,
+                schema_formatter_enabled=schema_formatter_enabled,
                 provider=provider,
                 model=model,
                 model_tier=model_tier,
@@ -757,6 +770,7 @@ def _recover_warn_schema_output(
     response: LLMProviderResponse[dict[str, Any]],
     error: Exception,
     provider_metadata: Any,
+    schema_formatter_enabled: bool,
     provider: str,
     model: str | None,
     model_tier: str | None,
@@ -782,6 +796,8 @@ def _recover_warn_schema_output(
             return recovered.value, recovered.structured_output or provider_metadata
     except Exception:
         pass
+    if not schema_formatter_enabled:
+        raise LLMOutputValidationError("JSON output failed schema validation and schema formatter is disabled")
     try:
         formatted = format_to_schema_or_retry(
             raw_text=source,

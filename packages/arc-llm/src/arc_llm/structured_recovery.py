@@ -5,10 +5,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from jsonschema import ValidationError as JsonSchemaValidationError
-from jsonschema import validate as validate_json_schema
-from jsonschema.exceptions import SchemaError as JsonSchemaError
-
 
 SCHEMA_VERSION = "arc.llm.structured_output.v1"
 
@@ -596,6 +592,10 @@ def _schema_default(schema: Mapping[str, Any], *, warnings: list[str]) -> Any:
 
 
 def _validates(value: Any, schema: Mapping[str, Any]) -> bool:
+    from jsonschema import ValidationError as JsonSchemaValidationError
+    from jsonschema import validate as validate_json_schema
+    from jsonschema.exceptions import SchemaError as JsonSchemaError
+
     try:
         validate_json_schema(instance=value, schema=dict(schema))
     except (JsonSchemaValidationError, JsonSchemaError):

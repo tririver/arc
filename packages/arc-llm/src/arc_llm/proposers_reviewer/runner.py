@@ -12,10 +12,6 @@ from pathlib import Path
 from threading import Lock, Semaphore
 from typing import Any, Callable, Mapping
 
-from jsonschema import ValidationError as JsonSchemaValidationError
-from jsonschema import validate as validate_json_schema
-from jsonschema.exceptions import SchemaError as JsonSchemaError
-
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA_VERSION
 from arc_llm.call_record import strip_arc_llm_call_records
 from arc_llm.runner import run_json
@@ -763,6 +759,7 @@ def _call_json_runner(
                 "static_prefix": static_prefix,
                 "validate_schema": validate_schema,
                 "output_recovery": _output_recovery_mode(output_recovery),
+                "schema_formatter_enabled": output_recovery.schema_formatter_enabled,
                 "role_hint": _role_hint(worker),
             }
             for key, value in optional.items():
@@ -817,6 +814,7 @@ def _call_json_runner(
             call_label=call_label,
             static_prefix=static_prefix,
             output_recovery=_output_recovery_mode(output_recovery),
+            schema_formatter_enabled=output_recovery.schema_formatter_enabled,
             role_hint=_role_hint(worker),
         )
         _maybe_record_cache_warning(
@@ -1335,6 +1333,10 @@ def _structured_output_from_payload(output: Mapping[str, Any]) -> Mapping[str, A
 def _schema_validation_error(output: Mapping[str, Any], schema: Mapping[str, Any] | None) -> str | None:
     if schema is None:
         return None
+    from jsonschema import ValidationError as JsonSchemaValidationError
+    from jsonschema import validate as validate_json_schema
+    from jsonschema.exceptions import SchemaError as JsonSchemaError
+
     try:
         validate_json_schema(instance=strip_arc_llm_call_records(dict(output)), schema=schema)
     except JsonSchemaValidationError as exc:
@@ -1411,6 +1413,10 @@ def _validate_reviewer_output(review_output: dict[str, Any], *, worker: WorkerCo
     """Validate reviewer output against full schema plus envelope rules."""
     payload = strip_arc_llm_call_records(review_output)
     if worker.output_schema is not None:
+        from jsonschema import ValidationError as JsonSchemaValidationError
+        from jsonschema import validate as validate_json_schema
+        from jsonschema.exceptions import SchemaError as JsonSchemaError
+
         try:
             validate_json_schema(instance=payload, schema=worker.output_schema)
         except JsonSchemaValidationError as exc:

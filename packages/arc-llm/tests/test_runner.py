@@ -812,6 +812,34 @@ def test_run_json_warn_uses_schema_formatter_for_rich_schema_failure(monkeypatch
     assert result[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "schema_formatter"
 
 
+def test_run_json_warn_can_disable_schema_formatter(monkeypatch):
+    provider = RichInvalidResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    def formatter_should_not_run(**kwargs):
+        raise AssertionError("schema formatter disabled")
+
+    monkeypatch.setattr(runner, "format_to_schema_or_retry", formatter_should_not_run, raising=False)
+
+    with pytest.raises(LLMTaskError, match="schema formatter is disabled"):
+        run_json(
+            "prompt",
+            schema={
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": False,
+            },
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            output_recovery="warn",
+            schema_formatter_enabled=False,
+        )
+
+    assert provider.attempts == 1
+
+
 def test_run_json_warn_retries_when_schema_formatter_requests_retry(monkeypatch):
     provider = RichInvalidResultProvider()
     monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)

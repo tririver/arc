@@ -122,6 +122,14 @@ if [ -n "$dirty" ]; then
   fi
 fi
 
+tracked_generated="$(
+  git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache)(/|$)|\.pyc$' || true
+)"
+if [ -n "$tracked_generated" ]; then
+  printf '%s\n' "$tracked_generated" >&2
+  die "Generated Python cache files are tracked; remove them before release"
+fi
+
 branch="$(git branch --show-current)"
 if [ -z "$branch" ]; then
   die "Detached HEAD; checkout a release branch before running this script"

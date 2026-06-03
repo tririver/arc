@@ -261,6 +261,20 @@ def test_release_script_resumes_after_uncommitted_version_bump(tmp_path: Path) -
     assert _git(work, "log", "-1", "--pretty=%s").stdout.strip() == "chore: release v0.2.0"
 
 
+def test_release_script_rejects_tracked_generated_python_cache(tmp_path: Path) -> None:
+    work, _origin = _init_release_repo(tmp_path)
+    cache_dir = work / "packages/arc-llm/src/arc_llm/__pycache__"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "bad.cpython-311.pyc").write_bytes(b"cache")
+    _git(work, "add", "-f", str(cache_dir / "bad.cpython-311.pyc"))
+    _git(work, "commit", "-m", "chore: accidentally track pyc")
+
+    result = _run_script(work)
+
+    assert result.returncode != 0
+    assert "Generated Python cache files are tracked" in result.stderr
+
+
 def test_release_script_resumes_after_local_tag_at_head(tmp_path: Path) -> None:
     work, origin = _init_release_repo(tmp_path)
     _commit_release_bump(work)
