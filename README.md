@@ -115,10 +115,10 @@ scripts/release-arc.sh 0.2.0
 ```
 
 The helper checks that the branch is not behind its upstream, that committed
-changes exist since the latest `v*` release tag, and that the target tags do
+changes exist since the latest `v*` release tag, and that the target tag does
 not already exist. It then pauses for Enter before each mutating step, bumps
 ARC package/plugin versions, commits the bump, creates `vX.Y.Z` and
-`arc--vX.Y.Z` tags, performs push dry-runs, pushes the branch and tags, and
+performs push dry-runs, pushes the branch and tag, and
 moves `stable` to the release commit.
 
 After the script succeeds, create the human-facing GitHub Release from the

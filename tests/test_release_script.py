@@ -144,7 +144,7 @@ def _run_script(
     )
 
 
-def test_release_script_bumps_versions_tags_and_pushes_stable(tmp_path: Path) -> None:
+def test_release_script_bumps_versions_creates_one_tag_and_pushes_stable(tmp_path: Path) -> None:
     work, origin = _init_release_repo(tmp_path)
 
     result = _run_script(work)
@@ -162,15 +162,16 @@ def test_release_script_bumps_versions_tags_and_pushes_stable(tmp_path: Path) ->
     assert "refs/heads/main" in refs
     assert "refs/heads/stable" in refs
     assert "refs/tags/v0.2.0" in refs
-    assert "refs/tags/arc--v0.2.0" in refs
+    assert "refs/tags/arc--v0.2.0" not in refs
     assert _git(work, "log", "-1", "--pretty=%s").stdout.strip() == "chore: release v0.2.0"
 
-    dry_run_index = result.stdout.index("DRY RUN: git push --dry-run origin HEAD:main v0.2.0 arc--v0.2.0")
-    push_index = result.stdout.index("RUN: git push origin HEAD:main v0.2.0 arc--v0.2.0")
+    dry_run_index = result.stdout.index("DRY RUN: git push --dry-run origin HEAD:main v0.2.0")
+    push_index = result.stdout.index("RUN: git push origin HEAD:main v0.2.0")
     assert dry_run_index < push_index
+    assert "arc--v0.2.0" not in result.stdout
 
 
-def test_release_script_forces_claude_tag_dry_run_before_commit(tmp_path: Path) -> None:
+def test_release_script_validates_claude_manifest_without_claude_tag(tmp_path: Path) -> None:
     work, _origin = _init_release_repo(tmp_path)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -182,18 +183,7 @@ def test_release_script_forces_claude_tag_dry_run_before_commit(tmp_path: Path) 
                 "#!/usr/bin/env bash",
                 "printf '%s\\n' \"$*\" >> \"$CLAUDE_CALLS\"",
                 "if [ \"$1 $2\" = 'plugin validate' ]; then exit 0; fi",
-                "if [ \"$1 $2\" = 'plugin tag' ]; then",
-                "  dry_run=0",
-                "  force=0",
-                "  for arg in \"$@\"; do",
-                "    [ \"$arg\" = '--dry-run' ] && dry_run=1",
-                "    [ \"$arg\" = '--force' ] && force=1",
-                "  done",
-                "  if [ \"$dry_run\" = 1 ] && [ \"$force\" = 1 ]; then exit 0; fi",
-                "  if [ \"$dry_run\" = 1 ]; then exit 42; fi",
-                "  git tag -a arc--v0.2.0 -m 'arc 0.2.0'",
-                "  exit 0",
-                "fi",
+                "if [ \"$1 $2\" = 'plugin tag' ]; then exit 42; fi",
                 "exit 64",
             ]
         )
@@ -211,7 +201,9 @@ def test_release_script_forces_claude_tag_dry_run_before_commit(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
-    assert "plugin tag --dry-run --force plugins/arc" in calls.read_text(encoding="utf-8")
+    call_text = calls.read_text(encoding="utf-8")
+    assert "plugin validate plugins/arc" in call_text
+    assert "plugin tag" not in call_text
 
 
 def test_release_script_rejects_dirty_worktree(tmp_path: Path) -> None:

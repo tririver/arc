@@ -49,7 +49,6 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 tag="v${version}"
-plugin_tag="arc--v${version}"
 major="${version%%.*}"
 rest="${version#*.}"
 minor="${rest%%.*}"
@@ -136,9 +135,6 @@ fi
 
 if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
   die "Tag already exists: $tag"
-fi
-if git rev-parse -q --verify "refs/tags/${plugin_tag}" >/dev/null; then
-  die "Tag already exists: $plugin_tag"
 fi
 
 pause "Step 2/8: bump plugin manifests, Python package versions, internal dependency ranges, and version tests to $version."
@@ -230,9 +226,8 @@ PY
 run git diff --check -- "${existing_version_paths[@]}"
 if command -v claude >/dev/null 2>&1; then
   run claude plugin validate plugins/arc
-  run claude plugin tag --dry-run --force plugins/arc
 else
-  printf 'SKIP: claude not found on PATH; using built-in manifest checks and git tag fallback.\n'
+  printf 'SKIP: claude not found on PATH; using built-in manifest checks.\n'
 fi
 
 pause "Step 4/8: commit version bump."
@@ -240,22 +235,17 @@ pause "Step 4/8: commit version bump."
 run git add "${existing_version_paths[@]}"
 run git commit -m "chore: release ${tag}"
 
-pause "Step 5/8: create release tags $tag and $plugin_tag."
+pause "Step 5/8: create release tag $tag."
 
 run git tag -a "$tag" -m "$tag"
-if command -v claude >/dev/null 2>&1; then
-  run claude plugin tag plugins/arc -m 'arc %s'
-else
-  run git tag -a "$plugin_tag" -m "arc $version"
-fi
 
-pause "Step 6/8: dry-run push release branch and tags."
+pause "Step 6/8: dry-run push release branch and tag."
 
-run_dry git push --dry-run "$remote_name" "HEAD:${branch}" "$tag" "$plugin_tag"
+run_dry git push --dry-run "$remote_name" "HEAD:${branch}" "$tag"
 
-pause "Step 7/8: push release branch and tags."
+pause "Step 7/8: push release branch and tag."
 
-run git push "$remote_name" "HEAD:${branch}" "$tag" "$plugin_tag"
+run git push "$remote_name" "HEAD:${branch}" "$tag"
 
 pause "Step 8/8: dry-run then push stable branch to this release commit."
 
