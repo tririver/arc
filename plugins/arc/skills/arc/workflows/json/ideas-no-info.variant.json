@@ -1,5 +1,6 @@
 {
   "schema_version": "arc.workflow.ideas.variant.v1",
+  "enabled": false,
   "variant_id": "no_info",
   "description": "Proposer receives the exact user intent, common marking scheme, prior correspondence, and internet access; no ARC domain Markdown, no ARC paper-tool guidance, no local cache context, and no MCP access.",
   "loop_template": "ideas-no-info-loop.template.json",

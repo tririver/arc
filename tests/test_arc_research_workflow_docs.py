@@ -820,10 +820,30 @@ def test_ideas_no_info_description_mentions_shared_marking_scheme() -> None:
     variant = json.loads((WJ / "ideas-no-info.variant.json").read_text(encoding="utf-8"))
     description = variant["description"]
 
+    assert variant["enabled"] is False
     assert "common marking scheme" in description
     assert "no ARC domain Markdown" in description
     assert "no ARC paper-tool guidance" in description
     assert "no MCP access" in description
+
+
+def test_readme_documents_domain_only_ideas_release_default() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    ideas_section = text.split("### 2. Ideas", 1)[1].split("### 3.", 1)[0]
+
+    assert "release idea workflow feeds ARC-built domain Markdown" in ideas_section
+    assert "no-info variant is disabled by default" in ideas_section
+    assert "opt-in test fixture" in ideas_section
+    assert "comparison" not in ideas_section
+
+
+def test_ideas_workflow_documents_enabled_variants_not_file_renaming() -> None:
+    text = (WF / "ideas.md").read_text(encoding="utf-8")
+
+    assert "runs only enabled variants" in text
+    assert "domain variant" in text
+    assert "variant_inactivated" not in text
+    assert "rename" not in text.lower()
 
 
 def test_ideas_proposer_templates_emphasize_marking_scheme_quality_checklist() -> None:

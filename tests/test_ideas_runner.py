@@ -98,9 +98,9 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     )
 
     assert result["status"] == "completed"
-    assert result["proposal_count"] == 2
-    assert result["reviewer_call_count"] == 10
-    assert result["loop_reviewer_call_count"] == 10
+    assert result["proposal_count"] == 1
+    assert result["reviewer_call_count"] == 5
+    assert result["loop_reviewer_call_count"] == 5
     assert "global_review" not in result
     assert "ideas" not in result
     assert "report" not in result
@@ -109,16 +109,13 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     batch_config = seen_batch_configs[0]
     assert batch_config["run_dir"] == str(project_dir / "ideas" / "ideas_test")
     assert batch_config["run_id"] == "idea_loops"
-    assert batch_config["max_concurrent_loops"] == 2
+    assert batch_config["max_concurrent_loops"] == 1
     assert batch_config["session"]["policy"] == "stateful"
     assert batch_config["session"]["history_mode"] == "delta"
     assert batch_config["session"]["max_concurrent_same_prefix"] == 12
     assert batch_config["output_recovery"]["schema_violation_policy"] == "peer_visible"
     assert batch_config["output_recovery"]["reviewer_validation_retries"] == 0
-    assert {loop["loop_id"] for loop in batch_config["loops"]} == {
-        "domain_idea_001",
-        "no_info_idea_001",
-    }
+    assert {loop["loop_id"] for loop in batch_config["loops"]} == {"domain_idea_001"}
     assert {loop["max_rounds"] for loop in batch_config["loops"]} == {5}
     assert all(loop["early_stop"]["enabled"] is False for loop in batch_config["loops"])
     assert all(loop["proposers"][0]["model_tier"] == "medium" for loop in batch_config["loops"])
@@ -137,10 +134,7 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     assert "evidence_of_novelty" not in mark_schema["required"]
     assert mark_schema["properties"]["user_intent_relevance"]["maximum"] == 25
     assert mark_schema["properties"]["problem_well_definedness"]["maximum"] == 15
-    assert {loop["loop_id"] for loop in result["loops"]} == {
-        "domain_idea_001",
-        "no_info_idea_001",
-    }
+    assert {loop["loop_id"] for loop in result["loops"]} == {"domain_idea_001"}
     assert result["batch_result"]["run_root"] == str(project_dir / "ideas" / "ideas_test" / "idea_loops")
     assert result["warnings_summary"]["structured_output_warning_count"] == 2
     assert result["warnings_summary"]["cache_warning_count"] == 1
@@ -159,7 +153,7 @@ def test_ideas_caps_concurrency_for_many_loops(tmp_path: Path) -> None:
         "user_intent": "intent",
         "variant_config_dir": str(WJ),
         "variant_glob": "ideas-*.variant.json",
-        "loops_per_variant": 10,
+        "loops_per_variant": 20,
     }
     seen_max_concurrent: list[int | None] = []
 
@@ -228,6 +222,7 @@ def test_ideas_warning_uses_env_concurrency_cap(tmp_path: Path, monkeypatch: Any
     warning = "\n".join(result["warnings"])
 
     assert result["max_concurrent_loops"] == 3
+    assert "Running 1 variants x 10 proposer-reviewer loops" in warning
     assert "loop concurrency capped at 3" in warning
     assert "unlimited loop concurrency" not in warning
 
@@ -488,10 +483,7 @@ def test_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path:
         max_concurrent_loops: int | None = None,
     ) -> dict[str, Any]:
         run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
-        scores_by_loop = {
-            "domain_idea_001": [77, 78, 78, 78, 78],
-            "no_info_idea_001": [75, 80, 80, 80, 80],
-        }
+        scores_by_loop = {"domain_idea_001": [77, 78, 78, 78, 78]}
         for loop in batch_config["loops"]:
             loop_id = loop["loop_id"]
             loop_root = run_root / "loops" / loop_id
@@ -559,15 +551,12 @@ def test_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path:
         "Δ R1→R5",
         "Best",
     ]
-    assert [row["loop_id"] for row in table["rows"]] == ["domain_idea_001", "no_info_idea_001"]
+    assert [row["loop_id"] for row in table["rows"]] == ["domain_idea_001"]
     assert table["rows"][0]["total_scores_by_round"] == {"1": 77, "2": 78, "3": 78, "4": 78, "5": 78}
     assert table["rows"][0]["delta_total"] == 1
     assert table["rows"][0]["best_total"] == 78
-    assert table["rows"][1]["total_scores_by_round"] == {"1": 75, "2": 80, "3": 80, "4": 80, "5": 80}
-    assert table["rows"][1]["delta_total"] == 5
-    assert table["rows"][1]["best_total"] == 80
     assert "| domain_idea_001 | domain | domain_idea_001 final title | 77 | 78 | 78 | 78 | 78 | +1 | 78 |" in table["markdown"]
-    assert "| no_info_idea_001 | no_info | no_info_idea_001 final title | 75 | 80 | 80 | 80 | 80 | +5 | 80 |" in table["markdown"]
+    assert "no_info_idea_001" not in table["markdown"]
 
 
 def test_major_recovered_reviewer_marks_are_zero_in_round_scores(tmp_path: Path) -> None:
@@ -660,6 +649,10 @@ def _write_jsonl(handle: Any, payload: dict[str, Any]) -> None:
 def _workflow_dir_with_reviewer_tier(tmp_path: Path, tier: str) -> Path:
     workflow_dir = tmp_path / "workflow"
     shutil.copytree(WJ, workflow_dir)
+    variant_path = workflow_dir / "ideas-no-info.variant.json"
+    variant = json.loads(variant_path.read_text(encoding="utf-8"))
+    variant["enabled"] = True
+    variant_path.write_text(json.dumps(variant, indent=2), encoding="utf-8")
     reviewer_path = workflow_dir / "ideas-reviewer.template.json"
     reviewer = json.loads(reviewer_path.read_text(encoding="utf-8"))
     reviewer["model_tier"] = tier

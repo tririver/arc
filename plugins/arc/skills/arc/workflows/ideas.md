@@ -27,9 +27,9 @@ Step 2: Copy
 Step 3: Replace `<run-id>`, `<project-dir>`, `<user_intent>`, and
 `<skill-workflow-json-dir>`.
 
-Step 4: Keep `variant_glob` as `ideas-*.variant.json`. To disable a
-variant, rename it so it no longer matches, for example
-`ideas-no-info.variant_inactivated.json`.
+Step 4: Keep `variant_glob` as `ideas-*.variant.json`. The release package
+runs only enabled variants; the normal idea-generation workflow uses the
+domain variant.
 
 Step 5: Keep `loops_per_variant` at `5` unless the run should use a different
 number of concurrent instances for each setup.

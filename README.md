@@ -475,9 +475,8 @@ asking for ideas or calculations.
 
 Input: a not-yet-explicit research request plus built domain context.
 
-The normal workflow feeds ARC-built domain Markdown to proposers. The no-info
-workflow intentionally withholds ARC domain context for comparison. Both use
-reviewer marks and write a ranked task-to-be-planned candidate report:
+The release idea workflow feeds ARC-built domain Markdown to proposers. It uses
+reviewer marks and writes a ranked task-to-be-planned candidate report:
 
 ```text
 <project-dir>/ideas/<run-id>/
@@ -489,6 +488,9 @@ The report starts with a compact marked summary for each candidate, then
 appends one detail section per idea with all round-by-round referee marks and
 selected handoff text: title, idea summary, and calculation plan. It should not
 invent novelty claims or hide failed idea history.
+
+The no-info variant is disabled by default and kept as an opt-in test fixture
+for workflow development.
 
 ### 3. Plan And Execute A Calculation
 
