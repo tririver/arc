@@ -83,10 +83,13 @@ command. The examples below show the argument shape. `md2pdf` starts a
 background PDF job; record the returned job id if present and do not wait before
 continuing unless the user explicitly asks.
 
-If the MCP tool is unavailable or fails to launch, do not silently skip export
-and do not run unrelated TeX build commands. Record `WARNING: PDF export not
-started: <reason>` in the workflow log, self-reflection entry, work-note journal,
-or final response as appropriate for the workflow.
+If the MCP tool is unavailable, use `arc-mcp md2pdf <project-dir>/report.md
+--json` to start the same ARC MCP background job through the CLI. This is only a
+job-launch fallback, not a TeX/Pandoc debugging step. If MCP and CLI launch both
+fail, do not silently skip export and do not run unrelated TeX build commands.
+Record `WARNING: PDF export not started: <reason>` in the workflow log,
+self-reflection entry, work-note journal, or final response as appropriate for
+the workflow.
 Do not debug or fix PDF generation unless the user explicitly asks; continue
 the owning ARC workflow after reporting the warning.
 
@@ -104,6 +107,7 @@ Examples:
 
 ```text
 md2pdf(input="<project-dir>/work-note.md")
+arc-mcp md2pdf <project-dir>/work-note.md --json
 translate(input="<project-dir>/work-note.md")
 batch_translate(project_dir="<project-dir>")
 llm_infer_main_references(text="<user-intent>", background=true)

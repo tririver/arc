@@ -16,6 +16,8 @@ def main(argv: list[str] | None = None) -> int:
         return _jobs(argv[1:])
     if argv and argv[0] in {"status", "result", "watch", "cancel", "list", "root", "-h", "--help"}:
         return _jobs(argv)
+    if argv and argv[0] == "md2pdf":
+        return _md2pdf(argv[1:])
     if argv and argv[0] == "worker":
         parser = argparse.ArgumentParser(description="Run ARC MCP worker")
         parser.add_argument("job_id")
@@ -73,6 +75,42 @@ def _jobs(argv: list[str]) -> int:
     if args.command == "watch":
         return _watch(manager, args.job_id, interval=args.interval, json_output=args.json, progress_jsonl=args.progress_jsonl)
     raise AssertionError(f"Unhandled jobs command: {args.command}")
+
+
+def _md2pdf(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Start an ARC MCP Markdown-to-PDF background job")
+    parser.add_argument("input", help="Markdown file to convert")
+    parser.add_argument("--output", help="Optional output PDF path")
+    parser.add_argument("--texlive-bin", default=None, help='Optional TeX Live bin directory. Pass "" to disable.')
+    parser.add_argument("--margin", default=None, help="LaTeX geometry margin value")
+    parser.add_argument("--mainfont", default=None, help="Main font passed to Pandoc's LaTeX template")
+    parser.add_argument("--cjk-mainfont", default=None, help="CJK main font passed to Pandoc's LaTeX template")
+    parser.add_argument(
+        "--resource-path",
+        action="append",
+        default=None,
+        help="Pandoc resource path entry. May be passed multiple times.",
+    )
+    parser.add_argument("--timeout-seconds", type=float, default=None, help="Pandoc/XeLaTeX timeout in seconds")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    payload: dict[str, Any] = {"input": args.input}
+    for key in ("output", "texlive_bin", "margin", "mainfont", "cjk_mainfont", "timeout_seconds"):
+        value = getattr(args, key)
+        if value is not None:
+            payload[key] = value
+    if args.resource_path is not None:
+        payload["resource_path"] = args.resource_path
+
+    result = _server().call_tool("md2pdf", payload)
+    exit_code = 0 if _job_launch_succeeded(result) else 1
+    _emit(result, json_output=args.json)
+    return exit_code
+
+
+def _job_launch_succeeded(result: Any) -> bool:
+    return isinstance(result, dict) and (result.get("status") == "job_running" or result.get("ok") is True)
 
 
 def _watch(

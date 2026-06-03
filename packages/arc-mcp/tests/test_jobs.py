@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -128,6 +129,88 @@ def test_resolve_inline_wait_explicit_override():
     env = {"ARC_MCP_INLINE_WAIT_SEC": "3", "ARC_MCP_TOOL_TIMEOUT_SEC": "120"}
 
     assert resolve_inline_wait_seconds(env=env) == 3
+
+
+def test_cli_md2pdf_starts_background_job_with_payload(monkeypatch, tmp_path, capsys):
+    source = tmp_path / "report.md"
+    output = tmp_path / "report.pdf"
+    source.write_text("# Report\n", encoding="utf-8")
+    calls = {}
+
+    class FakeServer:
+        def call_tool(self, name, args):
+            calls["name"] = name
+            calls["args"] = args
+            return {
+                "ok": False,
+                "status": "job_running",
+                "job_id": "job-123",
+                "job_type": "md2pdf",
+                "next": {"cli_command": "arc-mcp watch job-123 --json"},
+                "errors": [],
+                "meta": {},
+            }
+
+    monkeypatch.setattr(cli, "_server", lambda: FakeServer())
+
+    exit_code = cli.main(
+        [
+            "md2pdf",
+            str(source),
+            "--output",
+            str(output),
+            "--texlive-bin",
+            "",
+            "--margin",
+            "2cm",
+            "--mainfont",
+            "Noto Sans",
+            "--cjk-mainfont",
+            "Noto Sans CJK SC",
+            "--resource-path",
+            str(tmp_path),
+            "--timeout-seconds",
+            "12",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["status"] == "job_running"
+    assert payload["job_id"] == "job-123"
+    assert calls["name"] == "md2pdf"
+    assert calls["args"] == {
+        "input": str(source),
+        "output": str(output),
+        "texlive_bin": "",
+        "margin": "2cm",
+        "mainfont": "Noto Sans",
+        "cjk_mainfont": "Noto Sans CJK SC",
+        "resource_path": [str(tmp_path)],
+        "timeout_seconds": 12.0,
+    }
+
+
+def test_cli_md2pdf_returns_nonzero_when_launch_fails(monkeypatch, tmp_path, capsys):
+    source = tmp_path / "report.md"
+    source.write_text("# Report\n", encoding="utf-8")
+
+    class FakeServer:
+        def call_tool(self, name, args):
+            return {
+                "ok": False,
+                "error": {"code": "invalid_timeout", "message": "timeout_seconds must be positive"},
+                "errors": [],
+                "meta": {},
+            }
+
+    monkeypatch.setattr(cli, "_server", lambda: FakeServer())
+
+    assert cli.main(["md2pdf", str(source), "--timeout-seconds", "-1", "--json"]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "invalid_timeout"
 
 
 def test_worker_bool_arg_parses_string_booleans():

@@ -71,6 +71,8 @@ def test_arc_skill_references_pdf_export_manuals() -> None:
     assert "do not type `md2pdf(...)` as a shell" in manual_flat
     assert "warning: pdf export not started" in manual_flat
     assert "do not debug or fix pdf generation" in manual
+    assert "arc-mcp md2pdf" in manual
+    assert "if the mcp tool is unavailable, use `arc-mcp md2pdf" in manual_flat
 
 
 def test_math_typeset_rules_define_markdown_math_hygiene() -> None:
@@ -116,6 +118,7 @@ def test_workflows_start_pdf_export_for_user_facing_markdown() -> None:
         assert "report-export gate" in text
         assert "warning:" in text
         assert "do not wait" in text
+        assert "arc-mcp md2pdf" not in text
         assert text_flat.count("do not debug or fix pdf generation") == guard_count
 
 
