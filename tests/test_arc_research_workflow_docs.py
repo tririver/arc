@@ -131,17 +131,15 @@ def test_ideas_phase_4_uses_clean_selection_prompt_without_dry_run() -> None:
     assert "Check Planned Calls" not in text
     assert "idea workflow dry run" not in manual.lower()
     assert "### Phase 4: Select Next Action" in text
-    assert "use the host's discrete" in lower
-    assert "option labels must be the raw labels" in lower
-    assert "`1`" in text
-    assert "`2`" in text
-    assert "`3`" in text
-    assert "`other`" in text
+    assert "use the host's selection/menu" in lower
+    assert "`Proceed with ranked idea #1 (Recommended)`" in text
+    assert "`Proceed with ranked idea #2`" in text
+    assert "`Proceed with ranked idea #3`" in text
+    assert "`other`" not in text
     assert "or quit" not in lower
-    assert "`Let's discuss`" in text
-    assert "Do not render numbered-list prefixes inside option labels" in text
-    assert "If no discrete selection tool is available, ask only for the idea number" in text
-    assert "Keep `Let's discuss` as the final typed fallback option" in text
+    assert "`Let's discuss`" not in text
+    assert "The option labels must be the raw labels" not in text
+    assert "with the same three options" in text
 
 
 def test_arc_context_json_defines_run_identity_and_skill_paths() -> None:
@@ -198,19 +196,23 @@ def test_self_reflection_allows_missing_git_metadata() -> None:
     assert "Run: <run_id>" in text
 
 
-def test_interaction_rules_name_codex_discrete_choice_tool() -> None:
+def test_interaction_rules_define_portable_selection_menu() -> None:
     text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8")
     lower = text.lower()
 
-    assert "`request_user_input`" in text
-    assert "codex" in lower
-    assert "collaboration mode" in lower
-    assert "before printing a typed fallback" in lower
+    assert "`request_user_input`" not in text
+    assert "codex" not in lower
+    assert "collaboration mode" not in lower
+    assert "selection/menu tool" in lower
+    assert "two or three real, bounded options" in lower
+    assert "end that label with" in lower
+    assert "`(Recommended)`" in text
 
 
 def test_interaction_rules_define_automation_mode_gate_examples() -> None:
     text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8")
     lower = text.lower()
+    lower_flat = " ".join(lower.split())
 
     assert "## Automation Mode Gate" in text
     assert "Do not gather \"just context\"" in text
@@ -218,7 +220,10 @@ def test_interaction_rules_define_automation_mode_gate_examples() -> None:
     assert "suggest ideas" in text
     assert "what is the title and abstract" in text
     assert "direct paper lookup allowed" in text
-    assert "do not include list numbering inside option labels" in lower
+    assert "do not include list numbering inside option labels" in lower_flat
+    assert "Run automatically (Recommended)" in text
+    assert "Confirm major steps" in text
+    assert "Discuss before running" in text
 
 
 def test_workflow_docs_stay_human_readable() -> None:
@@ -979,7 +984,7 @@ def test_interaction_reference_allows_portable_typed_fallback() -> None:
     text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8").lower()
 
     assert "typed fallback" in text
-    assert "when no discrete selection" in text or "if no discrete selection" in text
+    assert "when no selection/menu tool" in text or "if no selection/menu tool" in text
     assert "enter the exact option label" in text
     assert "cannot present the required selection ui" not in text
 

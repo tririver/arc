@@ -5,10 +5,13 @@ confirmation, or mode decision.
 
 ## Automation Mode Gate
 
-- `auto`: continue without asking additional questions. Use safe defaults,
+- `Run automatically (Recommended)` / `auto`: continue without asking
+  additional questions. Use safe defaults,
   preserve warnings, and write decisions to `<project-dir>/context.json`.
-- `interactive`: ask for confirmation after each major workflow step and before
-  destructive or ambiguous actions.
+- `Confirm major steps` / `interactive`: ask for confirmation after each major
+  workflow step and before destructive or ambiguous actions.
+- `Discuss before running`: stop before ARC workflow tool calls and ask what the
+  user wants to change.
 
 If the mode is not clear from the user's request and the task is a workflow
 deliverable, ask once before resolving seeds, creating project directories,
@@ -19,8 +22,8 @@ choice.
 Examples:
 
 - `use arc, in field arXiv:0911.3380, recommend research directions`: ask
-  for `auto`, `interactive`, or `Let's discuss` before any ARC paper/domain
-  tool call.
+  for `Run automatically (Recommended)`, `Confirm major steps`, or
+  `Discuss before running` before any ARC paper/domain tool call.
 - `use arc, suggest ideas for massive scalar exchange around arXiv:0911.3380`:
   ask for mode first; after the choice, route through Case 1 and Case 2.
 - `use arc, what is the title and abstract of arXiv:0911.3380?`: direct paper lookup allowed;
@@ -29,45 +32,37 @@ Examples:
 If a workflow deliverable lacks an explicit mode, stop before tool calls and
 ask for mode. Do not infer `auto` from `continue`, `resume`, or a bare approval.
 
-## Discrete Selection Protocol
+## Selection Protocol
 
-Ask user questions through the host's discrete selection tool when one is
-available. Do not use open-ended prose questions when a bounded choice can
-express the decision.
-
-Before printing a typed fallback, check the tools available in the current
-turn. In Codex, use `request_user_input` when it is listed as an available
-tool and allowed by the current collaboration mode. Other hosts should use their
-native select/menu tool when available. Do not infer that no discrete tool
-exists from automation mode text alone; only use the typed fallback when no
-suitable tool is available, when Codex reports `request_user_input` unavailable
-in the current collaboration mode, or when a tool call is rejected.
+Ask user questions through the host's selection/menu tool when one is
+available. Use a typed fallback only when no suitable selection/menu tool is
+available or a tool call is rejected.
 
 The default/recommended option must be first, so pressing Enter chooses it.
 The user can use arrow keys to choose another option.
 
 Every choice prompt must:
 
-- Use two or more bounded options.
-- Put the recommended/default continuation first.
-- Use raw option labels. Do not include list numbering inside option labels,
-  such as `1. 1`, `2:`, or `3:`.
-- Make the final option exactly `Let's discuss`.
+- Use two or three real, bounded options.
+- Put the recommended/default continuation first and end that label with
+  `(Recommended)`.
+- Use short, informative option labels. Do not include list numbering inside
+  option labels, such as `1. Run`, `2:`, or `3:`.
 - Avoid open-ended prose questions when a bounded choice can express the
   decision.
 
-If no discrete selection tool is available and a question is required, use a
+If no selection/menu tool is available and a question is required, use a
 portable typed fallback with the same bounded options. Present the options as a
 short numbered list, mark the first option as the default, and ask the user to
 enter the exact option label or number. Pressing Enter selects the default.
-Keep `Let's discuss` as the final option.
 
 ## Existing Project Directory
 
 When `<project-dir>` already exists:
 
-- In `interactive` mode, ask whether to reuse it, rename the existing
-  directory, choose another directory, or `Let's discuss`.
+- In `interactive` mode, ask with these options: `Reuse existing directory
+  (Recommended)`, `Archive existing directory and create fresh`, and
+  `Choose another directory`.
 - In `auto` mode, rename the existing directory to
   `<project-dir>_yy-mm-dd-hh-mm-ss`, then create a fresh `<project-dir>`.
 
@@ -75,6 +70,6 @@ When `<project-dir>` already exists:
 
 When seed resolution returns multiple papers:
 
-- In `interactive` mode, ask whether to use all seeds, choose a subset, use the
-  first seed only, or `Let's discuss`.
+- In `interactive` mode, ask with these options: `Use all seeds
+  (Recommended)`, `Choose seed subset`, and `Use first seed only`.
 - In `auto` mode, keep all returned seed papers.

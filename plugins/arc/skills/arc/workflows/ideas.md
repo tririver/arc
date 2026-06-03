@@ -116,22 +116,16 @@ per-round reviewer reports from the `arc-llm` loop artifacts.
 
 Step 1: Print the top three ranked ideas on screen.
 
-Step 2: If the workflow is running in auto mode, use the host's discrete
-selection tool, following `rules/interaction.md`, to ask whether to
-proceed to calculation. Use these option labels exactly:
+Step 2: If the workflow is running in auto mode, use the host's selection/menu
+tool, following `rules/interaction.md`, to ask whether to proceed to
+calculation. Use these option labels exactly:
 
-- `1` (default): proceed with ranked idea #1.
-- `2`: proceed with ranked idea #2.
-- `3`: proceed with ranked idea #3.
-- `other`: enter another ranked idea number.
-- `Let's discuss`: stop automated progression and discuss.
+- `Proceed with ranked idea #1 (Recommended)`
+- `Proceed with ranked idea #2`
+- `Proceed with ranked idea #3`
 
-Do not render numbered-list prefixes inside option labels; for example, use
-label `1`, not `1. 1`, and label `2`, not `2:`.
-The option labels must be the raw labels listed above.
-
-If no discrete selection tool is available, ask only for the idea number,
-`other`, or `Let's discuss`. Keep `Let's discuss` as the final typed fallback option.
+If no selection/menu tool is available, use the typed fallback from
+`rules/interaction.md` with the same three options.
 
 If the workflow is running in interactive mode, stop after printing the top
 three ideas.

@@ -68,11 +68,12 @@ Step 1: Decide the automation level.
 Use an explicit user choice. If the user asks for automatic or non-interactive
 work, use `auto`. If the user asks to review or confirm steps, use
 `interactive`. If the user did not specify `auto` or `interactive` explicitly,
-do not infer the mode. Use the host's discrete selection tool, following
-`rules/interaction.md`, to ask the user to choose `auto`, `interactive`, or
-`Let's discuss`. If no suitable selection tool is available, use the typed
-fallback from `rules/interaction.md`. Do not treat `continue`, `resume`, or a
-bare approval to proceed as `auto`.
+do not infer the mode. Use the host's selection/menu tool, following
+`rules/interaction.md`, with these options: `Run automatically (Recommended)`,
+`Confirm major steps`, and `Discuss before running`. If no suitable
+selection/menu tool is available, use the typed fallback from
+`rules/interaction.md`. Do not treat `continue`, `resume`, or a bare approval
+to proceed as `auto`.
 
 Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as

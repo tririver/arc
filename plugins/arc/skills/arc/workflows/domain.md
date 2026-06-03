@@ -171,7 +171,8 @@ domain summary should mention both papers briefly instead.
 ### Phase 4: Interactive Review
 
 Case 1: In `interactive` mode, show the domain artifact paths and ask with the
-discrete selection protocol whether to continue, rebuild, or `Let's discuss`.
+selection protocol using these options: `Continue with this domain
+(Recommended)`, `Rebuild domain`, and `Discuss before continuing`.
 
 Case 2: In `auto` mode, continue without asking unless a warning or failure
 occurred.
