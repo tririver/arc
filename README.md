@@ -104,6 +104,32 @@ plugins/arc/bin/arc-paper --help
 
 Use the source install below only for development or local package testing.
 
+### Release Process
+
+ARC releases use explicit versions in Python package metadata and plugin
+manifests. GitHub tags or releases do not update those files automatically.
+Run the release helper from a clean checkout on the release branch:
+
+```bash
+scripts/release-arc.sh 0.2.0
+```
+
+The helper checks that the branch is not behind its upstream, that committed
+changes exist since the latest `v*` release tag, and that the target tags do
+not already exist. It then pauses for Enter before each mutating step, bumps
+ARC package/plugin versions, commits the bump, creates `vX.Y.Z` and
+`arc--vX.Y.Z` tags, performs push dry-runs, pushes the branch and tags, and
+moves `stable` to the release commit.
+
+After the script succeeds, create the human-facing GitHub Release from the
+`vX.Y.Z` tag. Marketplace users who should track stable releases should add ARC
+with the stable ref:
+
+```bash
+codex plugin marketplace add tririver/arc --ref stable
+claude plugin marketplace add tririver/arc@stable
+```
+
 ### Source Install
 
 For development and local testing, create one shared virtual environment and
