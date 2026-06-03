@@ -38,11 +38,13 @@ provider.
 
 ## Install
 
-### Important Remarks
+### Remarks:
 
 - Permission: the same as many heavy skills/plugins, ARC will need permissions to run Python scripts. Accepting permissions could be annoying. We recommend installing ARC within docker or a virtual machine, and allow all permissions in that virtual environment. As always for working with AI agents, be aware of risk to your data and system. 
 
 - Token usage. As measured using Claude + DeepSeek, a typical run of domain build + idea generation consumes about 1M uncached input tokens, and 0.5M output tokens, in about an hour's running time. The token usage may vary depending on the specific tasks and LLM used. Be aware of token usage and costs. 
+
+- If ARC has played a role in your research, please consider citing the ARC manual: _ARC: An LLM-Native Agent Workflow for Theoretical Physics Research_, Yanjiao Ma, Yi Wang, Xingkai Zhang (to appear).
 
 ### Requirements:
 
