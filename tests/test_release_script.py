@@ -126,6 +126,32 @@ def _init_release_repo(tmp_path: Path, *, push_feature: bool = True) -> tuple[Pa
     return work, origin
 
 
+def _replace(path: Path, old: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    assert old in text
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def _commit_release_bump(work: Path, version: str = "0.2.0") -> None:
+    _apply_release_bump(work, version)
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", f"chore: release v{version}")
+
+
+def _apply_release_bump(work: Path, version: str = "0.2.0") -> None:
+    _replace(work / "plugins/arc/.codex-plugin/plugin.json", '"version": "0.1.0"', f'"version": "{version}"')
+    _replace(work / "plugins/arc/.claude-plugin/plugin.json", '"version": "0.1.0"', f'"version": "{version}"')
+    for pyproject in (work / "packages").glob("arc-*/pyproject.toml"):
+        _replace(pyproject, 'version = "0.1.0"', f'version = "{version}"')
+        text = pyproject.read_text(encoding="utf-8")
+        text = text.replace(">=0.1,<0.2", ">=0.2,<0.3")
+        pyproject.write_text(text, encoding="utf-8")
+    _replace(work / "packages/arc-mcp/src/arc_mcp/__init__.py", '0.1.0', version)
+    _replace(work / "packages/arc-paper/src/arc_paper/__init__.py", '0.1.0', version)
+    _replace(work / "packages/arc-paper/tests/test_import.py", '0.1.0', version)
+    _replace(work / "packages/arc-paper/tests/test_package_metadata.py", ">=0.1,<0.2", ">=0.2,<0.3")
+
+
 def _run_script(
     work: Path,
     version: str = "0.2.0",
@@ -204,6 +230,51 @@ def test_release_script_validates_claude_manifest_without_claude_tag(tmp_path: P
     call_text = calls.read_text(encoding="utf-8")
     assert "plugin validate plugins/arc" in call_text
     assert "plugin tag" not in call_text
+
+
+def test_release_script_resumes_after_committed_version_bump(tmp_path: Path) -> None:
+    work, origin = _init_release_repo(tmp_path)
+    _commit_release_bump(work)
+    _git(work, "push", "origin", "main")
+
+    result = _run_script(work)
+
+    assert result.returncode == 0, result.stderr
+    refs = _git(origin, "show-ref").stdout
+    assert "refs/tags/v0.2.0" in refs
+    assert "refs/heads/stable" in refs
+    assert "Version files already at 0.2.0; continuing without a bump commit." in result.stdout
+    assert "RUN: git commit -m chore: release v0.2.0" not in result.stdout
+
+
+def test_release_script_resumes_after_uncommitted_version_bump(tmp_path: Path) -> None:
+    work, origin = _init_release_repo(tmp_path)
+    _apply_release_bump(work)
+
+    result = _run_script(work)
+
+    assert result.returncode == 0, result.stderr
+    refs = _git(origin, "show-ref").stdout
+    assert "refs/tags/v0.2.0" in refs
+    assert "refs/heads/stable" in refs
+    assert "Worktree has only release version-file changes; continuing resume." in result.stdout
+    assert _git(work, "log", "-1", "--pretty=%s").stdout.strip() == "chore: release v0.2.0"
+
+
+def test_release_script_resumes_after_local_tag_at_head(tmp_path: Path) -> None:
+    work, origin = _init_release_repo(tmp_path)
+    _commit_release_bump(work)
+    _git(work, "push", "origin", "main")
+    _git(work, "tag", "-a", "v0.2.0", "-m", "v0.2.0")
+
+    result = _run_script(work)
+
+    assert result.returncode == 0, result.stderr
+    refs = _git(origin, "show-ref").stdout
+    assert "refs/tags/v0.2.0" in refs
+    assert "refs/heads/stable" in refs
+    assert "Reusing existing local tag v0.2.0 at HEAD." in result.stdout
+    assert "RUN: git tag -a v0.2.0 -m v0.2.0" not in result.stdout
 
 
 def test_release_script_rejects_dirty_worktree(tmp_path: Path) -> None:

@@ -83,12 +83,43 @@ if [ "${#existing_version_paths[@]}" -eq 0 ]; then
   die "No ARC version files found under $root"
 fi
 
+path_is_version_path() {
+  candidate="$1"
+  for path in "${existing_version_paths[@]}"; do
+    if [ "$candidate" = "$path" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 pause "Step 1/8: preflight checks for clean worktree, upstream freshness, release commits, and tag availability."
 
 dirty="$(git status --short --untracked-files=all)"
 if [ -n "$dirty" ]; then
-  printf '%s\n' "$dirty" >&2
-  die "Worktree is dirty; commit or stash changes before release"
+  version_only_dirty=1
+  untracked="$(git ls-files --others --exclude-standard)"
+  changed_files="$(
+    {
+      git diff --name-only
+      git diff --cached --name-only
+    } | sort -u
+  )"
+  if [ -n "$untracked" ] || [ -z "$changed_files" ]; then
+    version_only_dirty=0
+  fi
+  while IFS= read -r changed_path; do
+    [ -z "$changed_path" ] && continue
+    if ! path_is_version_path "$changed_path"; then
+      version_only_dirty=0
+    fi
+  done <<< "$changed_files"
+  if [ "$version_only_dirty" = "1" ]; then
+    printf 'Worktree has only release version-file changes; continuing resume.\n'
+  else
+    printf '%s\n' "$dirty" >&2
+    die "Worktree is dirty; commit or stash changes before release"
+  fi
 fi
 
 branch="$(git branch --show-current)"
@@ -109,6 +140,16 @@ fi
 run git fetch --tags "$remote_name"
 
 local_rev="$(git rev-parse HEAD)"
+target_tag_exists=0
+if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+  target_tag_exists=1
+  target_tag_rev="$(git rev-list -n 1 "$tag")"
+  if [ "$target_tag_rev" != "$local_rev" ]; then
+    die "Tag already exists but does not point to HEAD: $tag"
+  fi
+  printf 'Reusing existing local tag %s at HEAD.\n' "$tag"
+fi
+
 upstream_rev="$(git rev-parse "$upstream")"
 merge_base="$(git merge-base HEAD "$upstream")"
 if [ "$local_rev" = "$upstream_rev" ]; then
@@ -126,15 +167,16 @@ latest_release_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | sed -n '1p')"
 if [ -n "$latest_release_tag" ]; then
   commit_count="$(git rev-list --count "${latest_release_tag}..HEAD")"
   if [ "$commit_count" = "0" ]; then
-    die "No committed changes since $latest_release_tag; refusing empty release"
+    if [ "$latest_release_tag" = "$tag" ] && [ "$target_tag_exists" = "1" ]; then
+      printf 'Release tag %s already points at HEAD; resuming release push/stable steps.\n' "$tag"
+    else
+      die "No committed changes since $latest_release_tag; refusing empty release"
+    fi
+  else
+    printf 'Committed changes since %s: %s\n' "$latest_release_tag" "$commit_count"
   fi
-  printf 'Committed changes since %s: %s\n' "$latest_release_tag" "$commit_count"
 else
   printf 'No existing v* release tag found; treating this as first release.\n'
-fi
-
-if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-  die "Tag already exists: $tag"
 fi
 
 pause "Step 2/8: bump plugin manifests, Python package versions, internal dependency ranges, and version tests to $version."
@@ -183,12 +225,17 @@ for path in paths:
         replace_all(path, internal_dep_re, rf"\1{internal_range}")
 PY
 
+version_changed=1
 if git diff --quiet -- "${existing_version_paths[@]}"; then
-  die "Version files already at $version; no release bump produced"
+  version_changed=0
+  printf 'Version files already at %s; continuing without a bump commit.\n' "$version"
+else
+  if [ "$target_tag_exists" = "1" ]; then
+    die "Tag $tag already exists at the pre-bump HEAD; remove it before changing version files"
+  fi
+  printf '\nVersion diff:\n'
+  git diff -- "${existing_version_paths[@]}"
 fi
-
-printf '\nVersion diff:\n'
-git diff -- "${existing_version_paths[@]}"
 
 pause "Step 3/8: validate bumped metadata."
 
@@ -230,14 +277,22 @@ else
   printf 'SKIP: claude not found on PATH; using built-in manifest checks.\n'
 fi
 
-pause "Step 4/8: commit version bump."
+pause "Step 4/8: commit version bump if needed."
 
-run git add "${existing_version_paths[@]}"
-run git commit -m "chore: release ${tag}"
+if [ "$version_changed" = "1" ]; then
+  run git add "${existing_version_paths[@]}"
+  run git commit -m "chore: release ${tag}"
+else
+  printf 'SKIP: no version bump commit needed.\n'
+fi
 
-pause "Step 5/8: create release tag $tag."
+pause "Step 5/8: create release tag $tag if needed."
 
-run git tag -a "$tag" -m "$tag"
+if [ "$target_tag_exists" = "1" ]; then
+  printf 'SKIP: release tag %s already exists at HEAD.\n' "$tag"
+else
+  run git tag -a "$tag" -m "$tag"
+fi
 
 pause "Step 6/8: dry-run push release branch and tag."
 

@@ -121,6 +121,12 @@ ARC package/plugin versions, commits the bump, creates `vX.Y.Z` and
 performs push dry-runs, pushes the branch and tag, and
 moves `stable` to the release commit.
 
+If you abort after changing version files, after the version bump commit, or
+after creating the local release tag, rerun the same command. The helper allows
+dirty version-file-only resumes, skips the bump commit when the committed files
+already match the requested version, and reuses a local `vX.Y.Z` tag that
+already points at `HEAD`.
+
 After the script succeeds, create the human-facing GitHub Release from the
 `vX.Y.Z` tag. Marketplace users who should track stable releases should add ARC
 with the stable ref:
