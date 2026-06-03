@@ -117,10 +117,9 @@ is trying to show, why each block follows, what assumptions are active, and how
 dependencies flow. Avoid turning extracted equations into a mechanical step
 list.
 
-Step 2: Choose ready-step boundaries for `## Detailed Steps Ready To Calculate`.
-Use the largest coherent chunks current agents can calculate and reviewers can
-check reliably. Split only when context, algebra, ambiguity, or target secrecy
-requires it. Do not split by raw equation count.
+Step 2: Choose ready-step boundaries. `## Detailed Steps Ready To Calculate` is the executable backlog; it contains only steps still intended for consensus execution.
+Use the largest coherent chunks current agents can calculate and reviewers can check reliably. Split only when context, algebra, ambiguity, or target secrecy requires it; do not split by raw equation count.
+Accepted steps must live in `## Accepted Derived Results` plus status/history/journal trace, not in the ready-step section.
 
 Ordering rule: arrange derivation blocks by dependency/topological order. When multiple blocks have the same dependency priority, put the block with the earliest source anchor first: source line number if known, otherwise first target equation, page, or stable block id. Use this order for accepted results, detailed steps, and rough steps. Keep Journal and Revision History chronological.
 
@@ -209,7 +208,7 @@ Step 1: Review the plan before execution. If the host and workflow permissions
 allow delegation, use an independent reviewer. Otherwise the main agent must
 perform the same review.
 
-Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, agent-added foundations have proposer/reviewer/main-agent agreement plus validity scope and the `[foundation added by agent]` marker, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, special PDF color markers are not inside code spans, math and TeX snippets follow `rules/math_typeset.md`, and source coverage is enough for the task.
+Step 2: Check that foundations are separated from derived results, accepted derived results were actually accepted, agent-added foundations have proposer/reviewer/main-agent agreement plus validity scope and the `[foundation added by agent]` marker, validation-only references are not premises, ready steps have complete contracts, rough steps are not executable, target secrecy is preserved, no `status: accepted` entry remains in `## Detailed Steps Ready To Calculate`, no accepted/ready/blocked step is duplicated in `## Rough Steps For Later Planning`, all rough-step triggers are adjudicated, every parsed equation id is represented in the Equation Coverage Ledger, ready steps with disabled source tools have enough proposer-visible source excerpt or exact formula context, special PDF color markers are not inside code spans, math and TeX snippets follow `rules/math_typeset.md`, and source coverage is enough for the task.
 
 Step 3: If review finds gaps, build final content with the planned PDF export
 noted in the Journal, write a new immutable work-note version, mirror it to root,

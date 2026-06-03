@@ -119,12 +119,14 @@ Record the same question in `Open Questions` or `Calculation Status`.
 
 ## Phase 5: Update Work Note
 
-For an accepted step, update only the current ready-step slot:
+For an accepted step, update the work note and remove it from the executable backlog:
 
-- mark the current ready step accepted
-- record the selected derivation, current result, and status
+- accepted step result goes to `## Accepted Derived Results`
+- remove the accepted step block from `## Detailed Steps Ready To Calculate`
 - use main prose for the physics argument
-- use `Journal` for execution facts, consensus paths, attempts, reviewer judgment, and `rules/math_typeset.md` math/TeX hygiene
+- keep compact trace in `## Calculation Status`, `## Revision History`, and `## Journal`: step id, accepted status, attempt, reviewer status, source discrepancy status, and artifact paths
+- no `status: accepted` step block may remain under `## Detailed Steps Ready To Calculate`
+- follow `rules/math_typeset.md` math/TeX hygiene
 
 For PDF-oriented Markdown marker backgrounds, use this exact template. It is shown as code here only; in work notes paste the raw LaTeX directly in prose, not inside Markdown code spans or fenced code blocks. If the work note already has a YAML header, merge these `header-includes`; do not create a second YAML header.
 ```yaml

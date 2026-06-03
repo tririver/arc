@@ -495,6 +495,30 @@ def test_plan_workflow_removes_promoted_steps_from_rough_list() -> None:
     assert "no accepted/ready/blocked step is duplicated" in plan
 
 
+def test_accepted_steps_leave_detailed_ready_section() -> None:
+    calculate = " ".join((WF / "calculate.md").read_text(encoding="utf-8").lower().split())
+    plan = " ".join((WF / "plan.md").read_text(encoding="utf-8").lower().split())
+
+    assert "accepted step result goes to `## accepted derived results`" in calculate
+    assert "remove the accepted step block from `## detailed steps ready to calculate`" in calculate
+    assert "no `status: accepted` step block may remain" in calculate
+    assert "`## detailed steps ready to calculate` is the executable backlog" in plan
+    assert "accepted steps must live in `## accepted derived results`" in plan
+    assert "not in the ready-step section" in plan
+
+
+def test_accepted_steps_keep_trace_outside_ready_section() -> None:
+    calculate = " ".join((WF / "calculate.md").read_text(encoding="utf-8").lower().split())
+
+    assert "calculation status" in calculate
+    assert "revision history" in calculate
+    assert "journal" in calculate
+    assert "step id" in calculate
+    assert "reviewer status" in calculate
+    assert "source discrepancy status" in calculate
+    assert "artifact paths" in calculate
+
+
 def test_calculate_workflow_owns_consensus_results_only() -> None:
     calculate = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
