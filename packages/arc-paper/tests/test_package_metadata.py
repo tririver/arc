@@ -14,14 +14,14 @@ PACKAGE_ROOTS = {
 }
 EXPECTED_INTERNAL_DEPENDENCIES = {
     "arc-llm": [],
-    "arc-paper": ["arc-llm>=0.1,<0.2"],
-    "arc-domain": ["arc-llm>=0.1,<0.2", "arc-paper>=0.1,<0.2"],
-    "arc-typeset": ["arc-llm>=0.1,<0.2"],
+    "arc-paper": ["arc-llm>=0.9,<0.10"],
+    "arc-domain": ["arc-llm>=0.9,<0.10", "arc-paper>=0.9,<0.10"],
+    "arc-typeset": ["arc-llm>=0.9,<0.10"],
     "arc-mcp": [
-        "arc-domain>=0.1,<0.2",
-        "arc-llm>=0.1,<0.2",
-        "arc-paper>=0.1,<0.2",
-        "arc-typeset>=0.1,<0.2",
+        "arc-domain>=0.9,<0.10",
+        "arc-llm>=0.9,<0.10",
+        "arc-paper>=0.9,<0.10",
+        "arc-typeset>=0.9,<0.10",
     ],
 }
 
@@ -61,4 +61,4 @@ def test_arc_llm_dependency_is_version_bounded():
 
     dependencies = pyproject["project"]["dependencies"]
 
-    assert "arc-llm>=0.1,<0.2" in dependencies
+    assert "arc-llm>=0.9,<0.10" in dependencies

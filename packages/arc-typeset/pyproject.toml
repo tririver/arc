@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arc-typeset"
-version = "0.1.0"
+version = "0.9.1"
 description = "Typesetting utilities for ARC research artifacts."
 readme = "../../README.md"
 license = "MIT"
 authors = [{ name = "ARC" }]
 requires-python = ">=3.11"
 dependencies = [
-  "arc-llm>=0.1,<0.2"
+  "arc-llm>=0.9,<0.10"
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
