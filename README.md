@@ -466,6 +466,11 @@ The `plugins/arc/skills/arc` layer turns the package commands into
 user-facing research workflows. It writes a project directory with
 `context.json` and durable artifacts so results can be inspected and resumed.
 
+Generated workflow project directories are a direct child of the directory where
+the agent command was launched: `<launch-cwd>/<safe-dir-name>/context.json`.
+They are not under host-internal directories such as `.claude/projects` and are
+not wrapped in `arc-output/`.
+
 ### 1. Build Domain References
 
 Input: a seed paper and optional intent.

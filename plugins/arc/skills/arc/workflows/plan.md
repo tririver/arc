@@ -3,6 +3,10 @@
 Use this workflow when a research task, planning request, or note-check handoff needs a human-readable calculation work note. `plan.md owns work-note structure`, `initial foundations`, `accepted-premise promotion`, `ready-step boundaries`, `rough-step planning`, and reviewer-only target placement.
 It does not own consensus execution; `calculate.md` owns current-step status/result recording. For Markdown or PDF note parsing, use `check.md`; for execution and result capture, use `calculate.md`. When another phase needs behavior outside these boundaries, refer to the owning workflow.
 
+Heavy Workload Rule: This workflow can be long; heavy workload and many claims/equations are expected runtime facts. Workload size is not a stop condition.
+The agent must not skip mandatory phases or shorten requested coverage because work is heavy.
+Continue until requested coverage is complete, a concrete workflow stop condition applies, or the user explicitly stops the workflow.
+
 No JSON file is the source of truth for planning. Runtime JSON, consensus config, and execution records belong to the workflows and packages that own runtime execution.
 
 Read optional planning requests from:

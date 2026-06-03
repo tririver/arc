@@ -55,6 +55,42 @@ def test_arc_skill_has_preflight_gate_for_workflow_deliverables() -> None:
     assert text.index("## Preflight Gate") < text.index("## Required References")
 
 
+def test_arc_skill_frontloads_workflow_references_before_route_selection() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    required = text[text.index("## Required References") : text.index("## Workflow")]
+    required_flat = " ".join(required.split())
+
+    assert "Note checking, verification, or audit requests" in required
+    assert "`workflows/check.md` before any parse, section read, or equation extraction call" in required_flat
+    assert "When the user intent triggers a workflow-specific file" in required
+    for name in ["check.md", "domain.md", "ideas.md", "plan.md", "calculate.md"]:
+        assert f"`workflows/{name}`" in required
+    assert "blocking requirement before any workflow MCP or CLI call" in required_flat
+
+
+def test_arc_skill_case3_requires_full_check_workflow_phases() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    case3 = text[text.index("Case 3:") : text.index("Case 4:")]
+    case3_flat = " ".join(case3.split())
+
+    assert "`workflows/check.md` was already loaded in Required References" in case3
+    assert (
+        "Parse -> Preflight -> Write Planning Handoff -> Execute `plan.md` and "
+        "`calculate.md` -> Record Note-Check Status"
+    ) in case3_flat
+    assert "Do not skip directly to parsing results" in case3
+    assert "mandatory" in case3
+
+
+def test_check_plan_calculate_workflows_treat_heavy_workload_as_nonoptional() -> None:
+    for name in ["check.md", "plan.md", "calculate.md"]:
+        text = " ".join((WF / name).read_text(encoding="utf-8").lower().split())
+        assert "heavy workload" in text
+        assert "workload size is not a stop condition" in text
+        assert "must not skip mandatory phases" in text
+        assert "user explicitly stops" in text
+
+
 def test_arc_skill_references_pdf_export_manuals() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8").lower()
     manual = (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8").lower()
@@ -147,9 +183,36 @@ def test_arc_context_json_defines_run_identity_and_skill_paths() -> None:
 
     assert "`run_id`" in text
     assert "`created_at`" in text
+    assert "`arc_run_root`" in text
+    assert "`project_dir_name`" in text
     assert "`skill_version`" in text
     assert "`skill_dir`" in text
     assert "`skill_workflow_json_dir`" in text
+
+
+def test_arc_skill_resolves_generated_project_dir_under_launch_cwd() -> None:
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    setup = text[text.index("Step 4: Resolve `<project-dir>`.") : text.index("Step 5: Write `<project-dir>/context.json`.")]
+    setup_flat = " ".join(setup.split())
+
+    assert "Capture `<arc-run-root>` by running `pwd -P`" in setup
+    assert "resolve-project-dir.py" in setup
+    assert "<arc-run-root>/<project_dir_name>" in setup_flat
+    assert "direct child" in setup
+    assert "Do not create `arc-output/<project_dir_name>`" in setup_flat
+    assert ".claude" in setup
+    assert ".codex" in setup
+
+
+def test_readme_documents_project_dirs_as_launch_cwd_children() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    workflow = text[text.index("## End-To-End Research Workflows") :]
+    workflow_flat = " ".join(workflow.split())
+
+    assert "<launch-cwd>/<safe-dir-name>/context.json" in workflow
+    assert "direct child of the directory where the agent command was launched" in workflow_flat
+    assert "not under host-internal directories such as `.claude/projects`" in workflow
+    assert "not wrapped in `arc-output/`" in workflow
 
 
 def test_workflow_script_commands_use_skill_dir_placeholder() -> None:

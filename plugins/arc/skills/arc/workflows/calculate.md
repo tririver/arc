@@ -10,6 +10,11 @@ It does not change ready-step boundaries, does not change rough steps, and
 does not change future plan structure. Calculate does not own note parsing. When
 a different workflow owns the needed change, refer to the owning workflow.
 
+Heavy Workload Rule: This workflow can be long. Heavy workload and many
+claims/equations are expected runtime facts; workload size is not a stop condition.
+The agent must not skip mandatory phases or shorten requested coverage because work is heavy.
+Continue until requested coverage is complete, a concrete workflow stop condition applies, or the user explicitly stops the workflow.
+
 ## Phase 1: Prepare Runtime
 
 Runtime artifacts:

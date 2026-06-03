@@ -23,6 +23,12 @@ ready-step boundaries, reviewer-only target placement, runtime settings, or
 execution status rules. `plan.md` owns work-note planning and structure.
 `calculate.md` owns consensus execution and result recording. When another
 phase needs behavior outside note parsing and handoff, refer to the owning workflow.
+
+Heavy Workload Rule: This workflow can be long. Heavy workload and many
+claims/equations are expected runtime facts; workload size is not a stop condition.
+The agent must not skip mandatory phases or shorten requested coverage because work is heavy.
+Continue until requested coverage is complete, a concrete workflow stop condition applies, or the user explicitly stops the workflow.
+
 `calculate.md` uses high reasoning effort by default for mathematical derivations; lower it only for cheap exploratory runs.
 Follow `rules/math_typeset.md` for math and TeX snippets in ARC-generated
 Markdown reports and planning handoffs.

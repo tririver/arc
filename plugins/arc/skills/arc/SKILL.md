@@ -42,6 +42,13 @@ not optional.
 - General ARC operating rules: read `rules/operating.md`.
 - User-facing Markdown math and TeX typesetting: read
   `rules/math_typeset.md`.
+- Note checking, verification, or audit requests: read
+  `workflows/check.md` before any parse, section read, or equation extraction call.
+- When the user intent triggers a workflow-specific file
+  (`workflows/check.md`, `workflows/domain.md`, `workflows/ideas.md`,
+  `workflows/plan.md`, or `workflows/calculate.md`), read that workflow file
+  and follow its steps. Reading the workflow file is a blocking requirement
+  before any workflow MCP or CLI call.
 - ARC workflow completion checks and improvement notes: read
   `rules/self-reflection.md`.
 - Single-paper metadata, full text, sections, equations, citers, references,
@@ -96,16 +103,34 @@ Use explicit paper identifiers when present. Otherwise infer seed papers from
 identifier inference and `manuals/arc-mcp.md` for background jobs.
 
 Step 4: Resolve `<project-dir>`.
-Use a user-specified project directory when present. Otherwise derive a safe
-directory name from `<seed-paper-list>` with ARC paper tools. If the directory
-already exists, follow the automation policy in
-`rules/interaction.md`.
+Capture `<arc-run-root>` by running `pwd -P` in the directory where the user
+launched the agent command. Do not use host-internal project/cache locations.
+If `<arc-run-root>` is under `.claude`, `.codex`, a plugin directory, or a
+cache directory, print `WARNING:` and stop before writing artifacts.
+
+Use a user-specified project directory when present. Otherwise derive
+`<project_dir_name>` as a safe directory stem from `<seed-paper-list>` with ARC
+paper tools, then resolve `<project-dir>` with:
+
+```bash
+python3 <skill-dir>/workflows/scripts/resolve-project-dir.py \
+  --name <project_dir_name> \
+  --run-root <arc-run-root> \
+  --json
+```
+
+The generated `<project-dir>` must be the direct child
+`<arc-run-root>/<project_dir_name>`. Do not create
+`arc-output/<project_dir_name>`, do not wrap the safe name in another directory,
+and do not write generated workflow artifacts under `.claude`, `.codex`,
+plugin dirs, or cache dirs. If the directory already exists, follow the
+automation policy in `rules/interaction.md`.
 
 Step 5: Write `<project-dir>/context.json`.
 Include `automation_level`, `workflow`, `original_request`, `user_intent`,
-`project_dir`, `run_id`, `created_at`, `skill_version`, `skill_dir`,
-`skill_workflow_json_dir`, `seed_paper_list`, `provider`, `model_tier`,
-`workers`, and `refresh`.
+`arc_run_root`, `project_dir_name`, `project_dir`, `run_id`, `created_at`,
+`skill_version`, `skill_dir`, `skill_workflow_json_dir`, `seed_paper_list`,
+`provider`, `model_tier`, `workers`, and `refresh`.
 
 Set `provider` to `auto` unless the user pins a provider. Set `model_tier` to
 `medium` unless the user explicitly asks otherwise. See `manuals/arc-llm.md`
@@ -129,8 +154,12 @@ First complete Case 1. Then read and execute
 
 Case 3: Check note files or collaborator notes.
 Use when the request asks to check, verify, audit, or mark work-note premises
-and claims in one or more accessible `.md` or `.pdf` notes. Read and execute
-`workflows/check.md`.
+and claims in one or more accessible `.md` or `.pdf` notes.
+`workflows/check.md` was already loaded in Required References.
+Follow its 5-phase workflow: Parse -> Preflight -> Write Planning Handoff ->
+Execute `plan.md` and `calculate.md` -> Record Note-Check Status.
+Do not skip directly to parsing results; the preflight, planning handoff, and
+owned-workflow execution steps are mandatory.
 
 Before leaving Case 3 or sending a final response, read
 `<project-dir>/work-note.md`. If any ready detailed step exists, execute
