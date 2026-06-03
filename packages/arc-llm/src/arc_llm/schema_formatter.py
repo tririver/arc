@@ -27,6 +27,31 @@ class SchemaFormatResult:
     structured_output: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SchemaFormatDecision:
+    action: str
+    value: dict[str, Any] | None
+    reason: str
+    structured_output: dict[str, Any]
+
+
+FORMATTER_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["action", "reason", "formatted_output"],
+    "properties": {
+        "action": {"type": "string", "enum": ["format", "retry"]},
+        "reason": {"type": "string"},
+        "formatted_output": {
+            "anyOf": [
+                {"type": "object", "additionalProperties": True},
+                {"type": "null"},
+            ]
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 def format_to_schema(
     *,
     raw_text: str,
@@ -78,6 +103,83 @@ def format_to_schema(
     )
 
 
+def format_to_schema_or_retry(
+    *,
+    raw_text: str,
+    schema: Mapping[str, Any],
+    role_hint: str | None = None,
+    json_runner: JsonRunner,
+    provider: str = "auto",
+    model: str | None = None,
+    model_tier: str | None = None,
+    env: Mapping[str, str] | None = None,
+    process_chain: list[str] | None = None,
+) -> SchemaFormatDecision:
+    source = str(raw_text or "").strip()
+    if not source:
+        raise SchemaFormatError("schema_formatter_empty_source")
+    prompt = _formatter_decision_prompt(source, schema=schema, role_hint=role_hint)
+    kwargs = {
+        "schema": dict(FORMATTER_DECISION_SCHEMA),
+        "provider": provider,
+        "model": model,
+        "model_tier": model_tier,
+        "env": dict(env or {}),
+    }
+    for key, value in {
+        "validate_schema": True,
+        "output_recovery": "strict",
+        "role_hint": "schema_formatter",
+        "process_chain": process_chain,
+    }.items():
+        if _accepts_keyword(json_runner, key):
+            kwargs[key] = value
+    decision = json_runner(prompt, **kwargs)
+    if not isinstance(decision, dict):
+        raise SchemaFormatError("schema_formatter_non_object_output")
+    decision = strip_arc_llm_call_records(decision)
+    if not isinstance(decision, dict):
+        raise SchemaFormatError("schema_formatter_non_object_output")
+    _validate(decision, FORMATTER_DECISION_SCHEMA)
+    action = str(decision.get("action") or "")
+    reason = str(decision.get("reason") or "")
+    if action == "retry":
+        return SchemaFormatDecision(
+            action="retry",
+            value=None,
+            reason=reason,
+            structured_output=structured_metadata(
+                severity="major",
+                warnings=["Schema formatter requested original worker retry.", reason],
+                raw_text=source,
+                strategy="schema_formatter_retry",
+                provider_error_type=None,
+            ),
+        )
+    formatted = decision.get("formatted_output")
+    if not isinstance(formatted, dict):
+        raise SchemaFormatError("schema_formatter_missing_formatted_output")
+    formatted = strip_arc_llm_call_records(formatted)
+    if not isinstance(formatted, dict):
+        raise SchemaFormatError("schema_formatter_non_object_output")
+    _validate(formatted, schema)
+    missing = _numeric_values_not_in_source(formatted, raw_text=source)
+    if missing:
+        raise SchemaFormatError("missing_required_numeric_fields: " + ", ".join(missing))
+    return SchemaFormatDecision(
+        action="format",
+        value=formatted,
+        reason=reason,
+        structured_output=structured_metadata(
+            severity="minor",
+            warnings=["Formatted content-rich output to match schema without retrying original worker.", reason],
+            raw_text=source,
+            strategy="schema_formatter",
+            provider_error_type=None,
+        ),
+    )
+
+
 def _formatter_prompt(raw_text: str, *, schema: Mapping[str, Any], role_hint: str | None) -> str:
     return (
         "## Schema Formatter\n"
@@ -94,6 +196,25 @@ def _formatter_prompt(raw_text: str, *, schema: Mapping[str, Any], role_hint: st
         f"{raw_text[:12000]}\n\n"
         "## JSON Schema\n"
         f"{json.dumps(dict(schema), ensure_ascii=False, sort_keys=True)}\n"
+    )
+
+
+def _formatter_decision_prompt(raw_text: str, *, schema: Mapping[str, Any], role_hint: str | None) -> str:
+    return (
+        "## Schema Formatter\n"
+        "Decide whether source text contains enough information to reformat into the target schema.\n"
+        "Return exactly one JSON object matching the formatter decision schema.\n"
+        "Use action=\"format\" only when source text contains enough information to fill required fields without inventing scientific claims, scores, evidence, or judgments.\n"
+        "Use action=\"retry\" when source text is empty, mostly provider/CLI metadata, too incomplete, or would require invented content.\n"
+        "For numeric fields, use only numbers explicitly present in source text. If a required numeric field has no explicit source number, choose action=\"retry\".\n"
+        "Do not wrap the object in Markdown.\n"
+        f"Role hint: {role_hint or 'unknown'}\n\n"
+        "## Source Text\n"
+        f"{raw_text[:12000]}\n\n"
+        "## Target JSON Schema\n"
+        f"{json.dumps(dict(schema), ensure_ascii=False, sort_keys=True)}\n\n"
+        "## Formatter Decision Schema\n"
+        f"{json.dumps(FORMATTER_DECISION_SCHEMA, ensure_ascii=False, sort_keys=True)}\n"
     )
 
 

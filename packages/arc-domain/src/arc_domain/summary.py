@@ -190,7 +190,6 @@ def summarize_domain(
             provider=provider,
             model=model,
             model_tier=model_tier,
-            validate_schema=False,
             output_recovery="warn",
         )
     except Exception as exc:

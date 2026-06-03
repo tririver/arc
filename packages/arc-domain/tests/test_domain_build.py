@@ -297,7 +297,7 @@ def test_summarize_domain_valid_json_no_relaxed_warning(monkeypatch, tmp_path):
     result = domain_summary.summarize_domain(paths=paths, provider="auto")
     summary = result["summary"]
 
-    assert captured["validate_schema"] is False
+    assert "validate_schema" not in captured
     assert captured["output_recovery"] == "warn"
     assert summary["summary_method"] == "llm"
     assert "relaxed_payload" not in summary
@@ -909,7 +909,7 @@ def test_candidate_audit_relaxed_call_records_schema_warning(monkeypatch):
         model=None,
     )
 
-    assert captured["validate_schema"] is False
+    assert "validate_schema" not in captured
     assert captured["output_recovery"] == "warn"
     assert audit["audit_method"] == "llm_relaxed"
     assert audit["search_queries"][0]["query"] == "missing same-scope foundation"
@@ -980,7 +980,7 @@ def test_foundation_selection_relaxed_call_uses_foundation_paper_mapping(monkeyp
         model=None,
     )
 
-    assert captured["validate_schema"] is False
+    assert "validate_schema" not in captured
     assert captured["output_recovery"] == "warn"
     assert selection["selected_foundation"]["paper_id"] == low_candidate["paper_id"]
     assert selection["selection_method"] == "llm_relaxed"
@@ -1002,7 +1002,7 @@ def test_intent_ranking_relaxed_non_list_ids_do_not_fallback(monkeypatch):
         model=None,
     )
 
-    assert captured["validate_schema"] is False
+    assert "validate_schema" not in captured
     assert captured["output_recovery"] == "warn"
     assert ranking["method"] == "llm_relaxed"
     assert ranking["ranked_paper_ids"] == []

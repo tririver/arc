@@ -388,7 +388,6 @@ def _llm_audit_candidates(
             provider=provider,
             model=model,
             model_tier=model_tier,
-            validate_schema=False,
             output_recovery="warn",
         )
         method = "llm_relaxed" if _domain_llm_recovered(audit) or _schema_error(audit, FOUNDATION_CANDIDATE_AUDIT_SCHEMA) else "llm"
@@ -847,7 +846,6 @@ def _llm_select_foundation(
             provider=provider,
             model=model,
             model_tier=model_tier,
-            validate_schema=False,
             output_recovery="warn",
         )
         method = "llm_relaxed" if _domain_llm_recovered(selection) or _schema_error(selection, FOUNDATION_SELECTION_SCHEMA) else "llm"

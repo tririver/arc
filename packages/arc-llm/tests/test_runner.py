@@ -1,5 +1,6 @@
 import json
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -457,6 +458,9 @@ class InvalidThenValidResultProvider:
 class RecoverableTextResultProvider:
     name = "claude-cli"
 
+    def __init__(self):
+        self.attempts = 0
+
     def generate_json_result(
         self,
         prompt,
@@ -469,6 +473,7 @@ class RecoverableTextResultProvider:
         artifact_dir=None,
         output_recovery="strict",
     ):
+        self.attempts += 1
         return LLMProviderResponse(
             {},
             raw_output=json.dumps({"type": "result", "result": "Recovered idea text"}),
@@ -526,6 +531,53 @@ class FatalBadRequestProvider:
     ):
         self.attempts += 1
         return LLMProviderResponse("HTTP 400 Bad Request: invalid schema")
+
+
+class EmptyThenValidResultProvider:
+    name = "codex-cli"
+
+    def __init__(self):
+        self.attempts = 0
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        self.attempts += 1
+        if self.attempts == 1:
+            return LLMProviderResponse({}, raw_output="")
+        return LLMProviderResponse({"ok": True})
+
+
+class RichInvalidResultProvider:
+    name = "codex-cli"
+
+    def __init__(self):
+        self.attempts = 0
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+    ):
+        self.attempts += 1
+        if self.attempts == 1:
+            raw = "Detailed proposal text with enough scientific content to reformat into the required schema."
+            return LLMProviderResponse({"notes": raw}, raw_output=raw)
+        return LLMProviderResponse({"ok": True})
 
 
 class FlakyJsonProvider:
@@ -668,25 +720,138 @@ def test_run_json_retries_provider_failure_text_before_recovery(monkeypatch):
     assert result["ok"] is True
 
 
-def test_run_json_fails_fast_for_fatal_provider_failure_text(monkeypatch):
+def test_run_json_warn_retries_short_provider_text_without_status_code_policy(monkeypatch):
     provider = FatalBadRequestProvider()
     monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
 
-    with pytest.raises(LLMTaskError, match="fatal provider failure text"):
+    def formatter_should_not_run(**kwargs):
+        raise AssertionError("short provider text should retry before schema formatter")
+
+    monkeypatch.setattr(runner, "format_to_schema_or_retry", formatter_should_not_run, raising=False)
+
+    with pytest.raises(LLMTaskError, match="JSON output failed schema validation"):
         run_json(
             "prompt",
-            schema={"type": "object"},
+            schema={
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": False,
+            },
             provider="codex-cli",
             env={},
             process_chain=[],
             output_recovery="warn",
         )
 
+    assert provider.attempts == 3
+
+
+def test_run_json_warn_retries_empty_schema_failure_before_formatter(monkeypatch):
+    provider = EmptyThenValidResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    def formatter_should_not_run(**kwargs):
+        raise AssertionError("empty output should retry before schema formatter")
+
+    monkeypatch.setattr(runner, "format_to_schema_or_retry", formatter_should_not_run, raising=False)
+
+    result = run_json(
+        "prompt",
+        schema={
+            "type": "object",
+            "required": ["ok"],
+            "properties": {"ok": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+        provider="codex-cli",
+        env={},
+        process_chain=[],
+        output_recovery="warn",
+    )
+
+    assert provider.attempts == 2
+    assert result["ok"] is True
+
+
+def test_run_json_warn_uses_schema_formatter_for_rich_schema_failure(monkeypatch):
+    provider = RichInvalidResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    def fake_formatter(**kwargs):
+        return SimpleNamespace(
+            action="format",
+            value={"ok": True},
+            reason="rich text had enough information",
+            structured_output=structured_metadata(
+                severity="minor",
+                warnings=["formatted"],
+                raw_text=kwargs["raw_text"],
+                strategy="schema_formatter",
+            ),
+        )
+
+    monkeypatch.setattr(runner, "format_to_schema_or_retry", fake_formatter, raising=False)
+
+    result = run_json(
+        "prompt",
+        schema={
+            "type": "object",
+            "required": ["ok"],
+            "properties": {"ok": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+        provider="codex-cli",
+        env={},
+        process_chain=[],
+        output_recovery="warn",
+    )
+
     assert provider.attempts == 1
+    assert result["ok"] is True
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "schema_formatter"
 
 
-def test_run_json_recovery_warn_builds_known_proposer_fallback(monkeypatch):
-    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: RecoverableTextResultProvider())
+def test_run_json_warn_retries_when_schema_formatter_requests_retry(monkeypatch):
+    provider = RichInvalidResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    def fake_formatter(**kwargs):
+        return SimpleNamespace(
+            action="retry",
+            value=None,
+            reason="formatter judged source unrecoverable",
+            structured_output=structured_metadata(
+                severity="major",
+                warnings=["retry requested"],
+                raw_text=kwargs["raw_text"],
+                strategy="schema_formatter_retry",
+            ),
+        )
+
+    monkeypatch.setattr(runner, "format_to_schema_or_retry", fake_formatter, raising=False)
+
+    result = run_json(
+        "prompt",
+        schema={
+            "type": "object",
+            "required": ["ok"],
+            "properties": {"ok": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+        provider="codex-cli",
+        env={},
+        process_chain=[],
+        output_recovery="warn",
+    )
+
+    assert provider.attempts == 2
+    assert result["ok"] is True
+
+
+def test_run_json_recovery_warn_retries_low_content_natural_language(monkeypatch):
+    provider = RecoverableTextResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
     schema = {
         "type": "object",
         "required": ["title", "idea_summary", "motivation", "novelty_checks", "calculation_plan", "validation_checks", "risks"],
@@ -702,23 +867,19 @@ def test_run_json_recovery_warn_builds_known_proposer_fallback(monkeypatch):
         "additionalProperties": False,
     }
 
-    result = run_json(
-        "prompt",
-        schema=schema,
-        provider="claude-cli",
-        model="deepseek-v4-flash",
-        env={},
-        process_chain=[],
-        output_recovery="warn",
-        role_hint="proposer",
-    )
+    with pytest.raises(LLMTaskError, match="empty or low-content output"):
+        run_json(
+            "prompt",
+            schema=schema,
+            provider="claude-cli",
+            model="deepseek-v4-flash",
+            env={},
+            process_chain=[],
+            output_recovery="warn",
+            role_hint="proposer",
+        )
 
-    assert result["title"] == "Recovered idea text"
-    assert result["idea_summary"] == "Recovered idea text"
-    assert result["risks"]
-    structured = result[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]
-    assert structured["severity"] == "major"
-    assert structured["recovery_strategy"] == "natural_language_fallback"
+    assert provider.attempts == 3
 
 
 def test_run_json_without_schema_passes_none_and_adds_call_record(monkeypatch):

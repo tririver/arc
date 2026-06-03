@@ -341,19 +341,11 @@ def _json_schema_mode(env: Mapping[str, str], *, model: str | None, output_recov
     if raw != "auto":
         return raw
     if output_recovery == "warn":
-        warn_mode = _env_text(env, "ARC_CLAUDE_WARN_JSON_SCHEMA_MODE", "provider").strip().lower()
+        warn_mode = _env_text(env, "ARC_CLAUDE_WARN_JSON_SCHEMA_MODE", "prompt").strip().lower()
         if warn_mode not in {"provider", "prompt"}:
             raise LLMWorkerError("ARC_CLAUDE_WARN_JSON_SCHEMA_MODE must be provider or prompt")
         return warn_mode
-    model_text = (model or env.get("ARC_CLAUDE_MODEL") or "").lower()
-    prompt_markers = _env_text(env, "ARC_CLAUDE_JSON_SCHEMA_PROMPT_MODELS", _default_prompt_schema_model_markers())
-    if any(marker and marker.lower() in model_text for marker in prompt_markers.split(",")):
-        return "prompt"
-    return "provider"
-
-
-def _default_prompt_schema_model_markers() -> str:
-    return "".join(("deep", "seek"))
+    return "prompt"
 
 
 def _with_json_schema_contract(prompt: str, schema: Mapping[str, Any]) -> str:

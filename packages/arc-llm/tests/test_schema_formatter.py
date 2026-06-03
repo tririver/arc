@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
-from arc_llm.schema_formatter import SchemaFormatError, format_to_schema
+from arc_llm.schema_formatter import SchemaFormatError, format_to_schema, format_to_schema_or_retry
 
 
 def _review_schema() -> dict:
@@ -88,6 +88,52 @@ def test_schema_formatter_strips_call_record_before_validation() -> None:
 
     assert ARC_LLM_CALL_RECORD_FIELD not in result.value
     assert result.value["review_payload"]["marks"]["total_score"] == 92
+
+
+def test_schema_formatter_decision_formats_valid_output() -> None:
+    calls = []
+
+    def fake_runner(prompt: str, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return {
+            "action": "format",
+            "reason": "numbers present",
+            "formatted_output": {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "review_payload": {"marks": {"total_score": 92, "novelty": 13}},
+            },
+        }
+
+    result = format_to_schema_or_retry(
+        raw_text="Final review. Total 92/100. Novelty 13/15.",
+        schema=_review_schema(),
+        role_hint="reviewer",
+        json_runner=fake_runner,
+        process_chain=["pytest"],
+    )
+
+    assert result.action == "format"
+    assert result.value["review_payload"]["marks"]["total_score"] == 92
+    assert result.structured_output["recovery_strategy"] == "schema_formatter"
+    assert calls[0]["output_recovery"] == "strict"
+    assert calls[0]["role_hint"] == "schema_formatter"
+    assert calls[0]["process_chain"] == ["pytest"]
+
+
+def test_schema_formatter_decision_can_request_retry() -> None:
+    def fake_runner(prompt: str, **kwargs):
+        return {"action": "retry", "reason": "metadata only", "formatted_output": None}
+
+    result = format_to_schema_or_retry(
+        raw_text='{"type":"result","result":""}',
+        schema=_review_schema(),
+        role_hint="reviewer",
+        json_runner=fake_runner,
+    )
+
+    assert result.action == "retry"
+    assert result.value is None
+    assert result.structured_output["recovery_strategy"] == "schema_formatter_retry"
 
 
 @pytest.mark.parametrize(

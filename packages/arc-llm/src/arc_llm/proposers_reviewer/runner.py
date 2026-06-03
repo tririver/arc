@@ -18,12 +18,10 @@ from jsonschema.exceptions import SchemaError as JsonSchemaError
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA_VERSION
 from arc_llm.call_record import strip_arc_llm_call_records
-from arc_llm.retryable_output import ProviderOutputClass, classify_provider_output_text
 from arc_llm.runner import run_json
 from arc_llm.schema_cache import schema_hash, sha256_text
-from arc_llm.schema_formatter import format_to_schema
 from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
-from arc_llm.structured_recovery import recover_json_output, structured_metadata
+from arc_llm.structured_recovery import structured_metadata
 
 from .artifacts import LockConflictError, RunPaths, acquire_lock, append_jsonl, atomic_write_json, atomic_write_text
 from .config import (
@@ -269,7 +267,7 @@ def _run_loop_rounds(
             stateful_supported=_stateful_supported(json_runner),
         )
         try:
-            review_output = _call_reviewer_with_schema_recovery(
+            review_output = _call_reviewer(
                 json_runner,
                 prompt_options,
                 worker=reviewer,
@@ -291,11 +289,10 @@ def _run_loop_rounds(
         except Exception as exc:
             if not _warn_continue_policy(batch.output_recovery) or _is_fatal_provider_failure_exception(exc):
                 raise
-            review_output = _peer_visible_reviewer_fallback(
-                raw_output=str(exc),
-                error=exc,
+            review_output = _worker_exception_output(
                 worker=reviewer,
-                loop=loop,
+                role="reviewer",
+                exc=exc,
                 call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{reviewer.id}",
             )
             _record_structured_output_warning(
@@ -389,7 +386,7 @@ def _run_proposers(
                 cache_guard=loop.session.cache_guard,
                 cache_warnings_path=cache_warnings_path,
                 output_recovery=batch.output_recovery,
-                validate_schema=not _peer_visible_schema_policy(batch.output_recovery),
+                validate_schema=True,
             ): proposer
             for proposer in loop.proposers
         }
@@ -420,7 +417,7 @@ def _run_proposers(
     return dict(sorted(outputs.items()))
 
 
-def _call_reviewer_with_schema_recovery(
+def _call_reviewer(
     json_runner: JsonRunner | None,
     prompt_options: dict[str, WorkerPromptOption],
     *,
@@ -459,330 +456,11 @@ def _call_reviewer_with_schema_recovery(
         cache_guard=cache_guard,
         cache_warnings_path=cache_warnings_path,
         output_recovery=batch.output_recovery,
-        validate_schema=False,
+        validate_schema=True,
     )
     review_output = first_call.output
-    try:
-        _validate_reviewer_output(review_output, worker=worker, loop=loop)
-        return review_output
-    except Exception as exc:
-        atomic_write_json(
-            _validation_error_artifact_path(error_path, retry_number=1),
-            {
-                "worker_id": worker.id,
-                "round_number": round_number,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
-                "original_prompt_path": str(first_call.prompt_path) if first_call.prompt_path is not None else "",
-                "retry_prompt_path": "",
-            },
-        )
-        if _output_recovery_mode(batch.output_recovery) == "warn" and batch.output_recovery.schema_formatter_enabled:
-            formatted = _try_format_reviewer_schema_failure(
-                raw_output=review_output,
-                worker=worker,
-                loop=loop,
-                json_runner=json_runner,
-                base_env=base_env,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}/schema_formatter",
-            )
-            if formatted is not None:
-                _validate_reviewer_output(formatted, worker=worker, loop=loop)
-                _record_structured_output_warning(
-                    formatted[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
-                    warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
-                    worker=worker,
-                    call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
-                )
-                return formatted
-        if _peer_visible_schema_policy(batch.output_recovery):
-            recovered = _peer_visible_reviewer_fallback(
-                raw_output=review_output,
-                error=exc,
-                worker=worker,
-                loop=loop,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
-            )
-            _record_structured_output_warning(
-                recovered[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
-                warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
-                worker=worker,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
-            )
-            return recovered
-        if _output_recovery_mode(batch.output_recovery) == "warn":
-            recovered = _conservative_reviewer_schema_failure_fallback(
-                raw_output=review_output,
-                error=exc,
-                worker=worker,
-                loop=loop,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
-            )
-            _validate_reviewer_output(recovered, worker=worker, loop=loop)
-            _maybe_record_structured_output_warning(
-                recovered,
-                warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
-                worker=worker,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
-            )
-            return recovered
-        raise
-
-
-def _validation_error_artifact_path(path: Path, *, retry_number: int) -> Path:
-    return path.with_name(f"{path.stem}.validation_{retry_number:03d}.json")
-
-
-def _try_format_reviewer_schema_failure(
-    *,
-    raw_output: Any,
-    worker: WorkerConfig,
-    loop: LoopConfig,
-    json_runner: JsonRunner | None,
-    base_env: Mapping[str, str] | None,
-    call_label: str,
-) -> dict[str, Any] | None:
-    raw_text = _raw_excerpt_from_any(raw_output)
-    if not raw_text.strip():
-        return None
-    schema = _reviewer_recovery_schema(worker.output_schema, loop=loop)
-    runner = json_runner or run_json
-    try:
-        formatted = format_to_schema(
-            raw_text=raw_text,
-            schema=schema,
-            role_hint="reviewer",
-            json_runner=runner,
-            provider=worker.provider,
-            model=worker.model,
-            model_tier=worker.model_tier,
-            env=worker_env(worker, base_env=base_env),
-        )
-    except Exception:
-        return None
-    output = strip_arc_llm_call_records(dict(formatted.value))
-    output[ARC_LLM_CALL_RECORD_FIELD] = _local_recovery_call_record(
-        worker=worker,
-        schema=worker.output_schema,
-        signal="schema_formatter",
-        structured_output=formatted.structured_output,
-        call_label=call_label,
-    )
-    return output
-
-
-def _peer_visible_reviewer_fallback(
-    *,
-    raw_output: Any,
-    error: Exception,
-    worker: WorkerConfig,
-    loop: LoopConfig,
-    call_label: str | None = None,
-) -> dict[str, Any]:
-    raw_text = _raw_excerpt_from_any(raw_output)
-    recovery_schema = _reviewer_recovery_schema(worker.output_schema, loop=loop)
-    recovered = recover_json_output(
-        value={},
-        schema=recovery_schema,
-        raw_text=raw_text,
-        error=error,
-        role_hint="reviewer",
-        strict_first=False,
-        provider_metadata={
-            "mode": "recovered",
-            "severity": "major",
-            "warnings": [
-                "Reviewer output failed schema validation and was exposed to peers as a warning artifact.",
-                str(error),
-            ],
-            "provider_error_type": type(error).__name__,
-            "recovery_strategy": "peer_visible_reviewer_fallback",
-        },
-    )
-    output = dict(recovered.value)
-    _force_non_approving_reviewer_fallback(output, schema=recovery_schema, loop=loop, raw_excerpt=raw_text)
-    _force_zero_marks_if_present(output, schema=recovery_schema)
-    structured_output = {**dict(recovered.structured_output or {}), "recovery_strategy": "peer_visible_reviewer_fallback"}
-    output[ARC_LLM_CALL_RECORD_FIELD] = _local_recovery_call_record(
-        worker=worker,
-        schema=worker.output_schema,
-        signal="peer_visible_reviewer_fallback",
-        structured_output=structured_output,
-        call_label=call_label,
-    )
-    return output
-
-
-def _conservative_reviewer_schema_failure_fallback(
-    *,
-    raw_output: Any,
-    error: Exception,
-    worker: WorkerConfig,
-    loop: LoopConfig,
-    call_label: str | None = None,
-) -> dict[str, Any]:
-    """Return a schema-valid reviewer envelope that cannot approve the round."""
-    raw_text = _raw_excerpt_from_any(raw_output)
-    recovery_schema = _reviewer_recovery_schema(worker.output_schema, loop=loop)
-    recovered = recover_json_output(
-        value={},
-        schema=recovery_schema,
-        raw_text=raw_text,
-        error=error,
-        role_hint="reviewer",
-        strict_first=False,
-        provider_metadata={
-            "mode": "recovered",
-            "severity": "major",
-            "warnings": [
-                "Reviewer output failed full schema validation; used conservative reviewer fallback.",
-                str(error),
-            ],
-            "provider_error_type": type(error).__name__,
-            "recovery_strategy": "reviewer_schema_failure_fallback",
-        },
-    )
-    output = dict(recovered.value)
-    _force_non_approving_reviewer_fallback(output, schema=recovery_schema, loop=loop, raw_excerpt=raw_text)
-    structured_output = dict(recovered.structured_output or {})
-    structured_output.update(
-        {
-            "mode": "recovered",
-            "severity": "major",
-            "recovery_strategy": "reviewer_schema_failure_fallback",
-        }
-    )
-    output[ARC_LLM_CALL_RECORD_FIELD] = {
-        "schema_version": ARC_LLM_CALL_RECORD_SCHEMA_VERSION,
-        "provider_requested": worker.provider,
-        "model_requested": worker.model,
-        "model_tier_requested": worker.model_tier,
-        "provider_used": worker.provider,
-        "model_used": worker.model,
-        "fallback_index": 0,
-        "attempt": 1,
-        "host": "local-recovery",
-        "signals": ["reviewer_schema_failure_fallback"],
-        "attempts": [],
-        "session_policy": "local-recovery",
-        "session_key": None,
-        "native_session_id": None,
-        "call_label": call_label,
-        "prompt_sha256": None,
-        "static_prefix_sha256": None,
-        "schema_sha256": schema_hash(worker.output_schema),
-        "runtime_fingerprint": None,
-        "usage": {},
-        "structured_output": structured_output,
-    }
-    return output
-
-
-def _force_non_approving_reviewer_fallback(
-    output: dict[str, Any],
-    *,
-    schema: Mapping[str, Any],
-    loop: LoopConfig,
-    raw_excerpt: str = "",
-) -> None:
-    controller = output.setdefault("controller", {})
-    if isinstance(controller, dict):
-        controller["stop_requested"] = False
-        controller.setdefault("message", "Reviewer output required structured recovery. Treat this review as low confidence.")
-
-    review_payload = output.setdefault("review_payload", {})
-    if not isinstance(review_payload, dict):
-        output["review_payload"] = {}
-        return
-    consensus = review_payload.get("consensus")
-    if not isinstance(consensus, dict):
-        return
-
-    proposer_ids = [proposer.id for proposer in loop.proposers]
-    consensus_schema = _schema_at(schema, "review_payload", "consensus")
-    workflow_schema = _schema_at(schema, "review_payload", "consensus", "workflow_action")
-
-    consensus["status"] = _preferred_enum(
-        _schema_enum(_schema_at(schema, "review_payload", "consensus", "status")),
-        preferred=("unresolved", "all_disagree", "two_agree"),
-        fallback="unresolved",
-        unsafe=("accepted", "all_agree", "reference_disagrees"),
-    )
-    _set_if_schema_allows_or_present(consensus, "accepted_result", None, consensus_schema)
-    _set_if_schema_allows_or_present(consensus, "agreed_proposer_ids", [], consensus_schema)
-    _set_if_schema_allows_or_present(consensus, "likely_wrong_proposer_ids", proposer_ids, consensus_schema)
-    _set_if_schema_allows_or_present(consensus, "recalculate_proposer_ids", proposer_ids, consensus_schema)
-    _set_if_schema_allows_or_present(
-        consensus,
-        "analysis",
-        _with_raw_excerpt(
-            "Reviewer output failed full schema validation; forcing unresolved status.",
-            raw_excerpt,
-        ),
-        consensus_schema,
-    )
-    _set_if_schema_allows_or_present(
-        consensus,
-        "validity_scope",
-        "Uncertain: reviewer output required structured recovery.",
-        consensus_schema,
-    )
-    _set_if_schema_allows_or_present(consensus, "best_written_proposer_id", None, consensus_schema)
-    _set_if_schema_allows_or_present(consensus, "best_written_selection_reason", "", consensus_schema)
-    _set_if_schema_allows_or_present(consensus, "source_discrepancies", [], consensus_schema)
-
-    workflow_action = consensus.get("workflow_action")
-    if not isinstance(workflow_action, dict):
-        workflow_action = {}
-        consensus["workflow_action"] = workflow_action
-    workflow_action["action"] = _preferred_enum(
-        _schema_enum(_schema_at(schema, "review_payload", "consensus", "workflow_action", "action")),
-        preferred=("pause_for_human", "revise_plan", "split_step", "retry"),
-        fallback="pause_for_human",
-        unsafe=("continue", "finalize", "accept"),
-    )
-    _set_if_schema_allows_or_present(workflow_action, "requires_human", True, workflow_schema)
-    _set_if_schema_allows_or_present(
-        workflow_action,
-        "issue_type",
-        _preferred_enum(
-            _schema_enum(_schema_at(schema, "review_payload", "consensus", "workflow_action", "issue_type")),
-            preferred=("worker_failure", "other", "calculation_disagreement"),
-            fallback="worker_failure",
-            unsafe=("none",),
-        ),
-        workflow_schema,
-    )
-    _set_if_schema_allows_or_present(workflow_action, "proposed_revision", None, workflow_schema)
-    _set_if_schema_allows_or_present(
-        workflow_action,
-        "reason",
-        _with_raw_excerpt(
-            "Reviewer output failed full schema validation; used conservative reviewer fallback.",
-            raw_excerpt,
-        ),
-        workflow_schema,
-    )
-    _set_if_schema_allows_or_present(
-        workflow_action,
-        "expert_question",
-        "The reviewer returned malformed structured output. Should this step be retried or inspected manually?",
-        workflow_schema,
-    )
-
-
-def _force_zero_marks_if_present(output: dict[str, Any], *, schema: Mapping[str, Any]) -> None:
-    review_payload = output.setdefault("review_payload", {})
-    if not isinstance(review_payload, dict):
-        output["review_payload"] = review_payload = {}
-    marks_schema = _schema_at(schema, "review_payload", "marks")
-    if not marks_schema:
-        return
-    props = marks_schema.get("properties") if isinstance(marks_schema.get("properties"), Mapping) else {}
-    fields = {str(item) for item in marks_schema.get("required", [])}
-    fields.update(str(key) for key in props)
-    if fields:
-        review_payload["marks"] = {field: 0 for field in fields}
+    _validate_reviewer_output(review_output, worker=worker, loop=loop)
+    return review_output
 
 
 def _worker_exception_output(
@@ -959,88 +637,6 @@ def _local_recovery_call_record(
     }
 
 
-def _schema_at(schema: Mapping[str, Any], *path: str) -> Mapping[str, Any]:
-    current: Any = schema
-    for key in path:
-        if not isinstance(current, Mapping):
-            return {}
-        props = current.get("properties")
-        if not isinstance(props, Mapping):
-            return {}
-        current = props.get(key)
-    return current if isinstance(current, Mapping) else {}
-
-
-def _schema_enum(schema: Mapping[str, Any]) -> list[Any]:
-    values = schema.get("enum")
-    return list(values) if isinstance(values, list) else []
-
-
-def _preferred_enum(
-    values: list[Any],
-    *,
-    preferred: tuple[Any, ...],
-    fallback: Any,
-    unsafe: tuple[Any, ...],
-) -> Any:
-    if not values:
-        return fallback
-    for value in preferred:
-        if value in values:
-            return value
-    for value in values:
-        if value not in unsafe:
-            return value
-    return fallback
-
-
-def _set_if_schema_allows_or_present(target: dict[str, Any], key: str, value: Any, schema: Mapping[str, Any]) -> None:
-    props = schema.get("properties")
-    if key in target or not isinstance(props, Mapping) or key in props or schema.get("additionalProperties") is not False:
-        target[key] = value
-
-
-def _reviewer_recovery_schema(schema: Mapping[str, Any] | None, *, loop: LoopConfig) -> Mapping[str, Any]:
-    if isinstance(schema, Mapping):
-        required = {str(item) for item in schema.get("required", [])}
-        if {"schema_version", "controller", "proposer_messages", "review_payload"} <= required:
-            return schema
-    proposer_ids = [proposer.id for proposer in loop.proposers]
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
-        "properties": {
-            "schema_version": {"type": "string", "const": REVIEW_ENVELOPE_SCHEMA},
-            "controller": {
-                "type": "object",
-                "additionalProperties": True,
-                "required": ["message", "stop_requested"],
-                "properties": {
-                    "message": {"type": "string"},
-                    "stop_requested": {"type": "boolean"},
-                    "stop_reason": {"type": ["string", "null"]},
-                },
-            },
-            "proposer_messages": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": proposer_ids,
-                "properties": {
-                    proposer_id: {
-                        "type": "object",
-                        "additionalProperties": True,
-                        "required": ["message"],
-                        "properties": {"message": {"type": "string"}},
-                    }
-                    for proposer_id in proposer_ids
-                },
-            },
-            "review_payload": {"type": "object", "additionalProperties": True},
-        },
-    }
-
-
 def _call_json_runner_with_prompt_options(
     json_runner: JsonRunner | None,
     prompt_options: dict[str, WorkerPromptOption],
@@ -1173,7 +769,6 @@ def _call_json_runner(
                 if _accepts_keyword(json_runner, key):
                     kwargs[key] = value
             result = json_runner(prompt, **kwargs)
-            _raise_if_provider_failure_text(result)
             after_count = session_manager.turn_count(session_key) if effective_session_policy == "stateful" else None
             if before_count == after_count:
                 _record_custom_session_turn(
@@ -1721,13 +1316,6 @@ def _raw_excerpt_from_any(output: Any) -> str:
     return str(output or "")[:4000]
 
 
-def _with_raw_excerpt(message: str, raw_excerpt: str) -> str:
-    excerpt = raw_excerpt.strip()
-    if not excerpt:
-        return message
-    return f"{message}\n\nRecovered raw text excerpt:\n{excerpt[:1000]}"
-
-
 def _first_nonempty_line(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip().strip("#*- ")
@@ -1762,24 +1350,6 @@ def _attach_structured_output(output: dict[str, Any], structured_output: dict[st
         record = {}
         output[ARC_LLM_CALL_RECORD_FIELD] = record
     record["structured_output"] = structured_output
-
-
-def _raise_if_provider_failure_text(output: Any) -> None:
-    if isinstance(output, dict):
-        structured = _structured_output_from_payload(output)
-        raw_text = structured.get("raw_text_excerpt") if isinstance(structured, Mapping) else None
-        if not isinstance(raw_text, str) or not raw_text.strip():
-            return
-        classification = classify_provider_output_text(raw_text, metadata=structured)
-    elif isinstance(output, str):
-        classification = classify_provider_output_text(output)
-    else:
-        return
-    if classification.classification == ProviderOutputClass.OK:
-        return
-    if classification.classification == ProviderOutputClass.RETRYABLE_PROVIDER_FAILURE:
-        raise RuntimeError(f"retryable provider failure text: {classification.reason}")
-    raise RuntimeError(f"fatal provider failure text: {classification.reason}")
 
 
 def _role_hint(worker: WorkerConfig) -> str:

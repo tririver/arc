@@ -260,7 +260,6 @@ def _rank_by_intent(
             provider=provider,
             model=model,
             model_tier=model_tier,
-            validate_schema=False,
             output_recovery="warn",
         )
         raw_ids = result.get("ranked_paper_ids", [])

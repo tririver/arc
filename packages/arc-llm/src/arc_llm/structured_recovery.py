@@ -66,6 +66,7 @@ def recover_json_output(
     role_hint: str | None = None,
     strict_first: bool = True,
     provider_metadata: Mapping[str, Any] | None = None,
+    allow_schema_fallback: bool = True,
 ) -> StructuredRecoveryResult:
     provider_meta = dict(provider_metadata or {})
     warnings = [str(item) for item in provider_meta.get("warnings", []) if item]
@@ -122,7 +123,7 @@ def recover_json_output(
             ),
         )
 
-    fallback = _known_schema_fallback(schema, raw_text=raw, role_hint=role_hint)
+    fallback = _known_schema_fallback(schema, raw_text=raw, role_hint=role_hint) if allow_schema_fallback else None
     if fallback is not None and _validates(fallback, schema):
         return StructuredRecoveryResult(
             value=fallback,

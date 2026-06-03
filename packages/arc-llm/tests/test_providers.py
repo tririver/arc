@@ -539,9 +539,10 @@ def test_claude_generate_json_parses_direct_json(monkeypatch):
     assert captured["cmd"][captured["cmd"].index("--effort") + 1] == "low"
     assert "--no-session-persistence" in captured["cmd"]
     assert "--exclude-dynamic-system-prompt-sections" in captured["cmd"]
-    assert "--json-schema" in captured["cmd"]
+    assert "--json-schema" not in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "test-model"
-    assert captured["input"] == "prompt text"
+    assert captured["input"].startswith("prompt text")
+    assert "JSON output contract" in captured["input"]
     assert "prompt text" not in captured["cmd"]
 
 
@@ -596,7 +597,7 @@ def test_claude_deepseek_auto_uses_prompt_contract_not_json_schema(monkeypatch):
     assert "prompt" in captured["input"]
 
 
-def test_claude_warn_mode_auto_uses_provider_schema_like_arc02(monkeypatch):
+def test_claude_warn_mode_auto_uses_prompt_contract_not_json_schema(monkeypatch):
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -614,8 +615,9 @@ def test_claude_warn_mode_auto_uses_provider_schema_like_arc02(monkeypatch):
     )
 
     assert response.value == {"ok": True}
-    assert "--json-schema" in captured["cmd"]
-    assert captured["input"] == "prompt"
+    assert "--json-schema" not in captured["cmd"]
+    assert "JSON output contract" in captured["input"]
+    assert "prompt" in captured["input"]
 
 
 def test_claude_warn_mode_prompt_override_uses_prompt_contract(monkeypatch):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import time
 from dataclasses import dataclass
 import inspect
@@ -10,12 +12,12 @@ from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema import validate as validate_json_schema
 from jsonschema.exceptions import SchemaError as JsonSchemaError
 
-from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record
+from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record, strip_arc_llm_call_records
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
 from .model import resolve_model
-from .retryable_output import ProviderOutputClass, classify_provider_output_text
 from .providers.select import select_provider
+from .schema_formatter import format_to_schema_or_retry
 from .schema_cache import schema_hash, sha256_text
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
 from .structured_recovery import recover_json_output, structured_metadata
@@ -24,6 +26,7 @@ from .usage import LLMProviderResponse, LLMUsage
 
 MAX_ATTEMPTS_PER_PROVIDER = 3
 RETRY_INTERVAL_SECONDS = 10
+LOW_CONTENT_TOKEN_THRESHOLD = 10
 
 
 class LLMTaskError(RuntimeError):
@@ -35,10 +38,6 @@ class LLMOutputValidationError(RuntimeError):
 
 
 class LLMRetryableProviderOutputError(RuntimeError):
-    pass
-
-
-class LLMFatalProviderOutputError(LLMOutputValidationError):
     pass
 
 
@@ -156,7 +155,7 @@ def run_json(
         attach_call_record=True,
         env=env,
         process_chain=process_chain,
-        max_attempts=1 if session_policy == "stateful" else MAX_ATTEMPTS_PER_PROVIDER,
+        max_attempts=MAX_ATTEMPTS_PER_PROVIDER,
         call=lambda selected, config: _generate_json(
             selected,
             prompt,
@@ -452,6 +451,11 @@ def _generate_json(
                     output_recovery=output_recovery,
                     role_hint=role_hint,
                     response=response,
+                    provider=provider_used,
+                    model=model,
+                    model_tier=model_tier,
+                    env=env,
+                    process_chain=process_chain,
                 )
             except Exception:
                 record_turn(response.structured_output)
@@ -468,6 +472,11 @@ def _generate_json(
             output_recovery=output_recovery,
             role_hint=role_hint,
             response=response,
+            provider=provider_used,
+            model=model,
+            model_tier=model_tier,
+            env=env,
+            process_chain=process_chain,
         )
         native_session_id = response.native_session_id
         prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
@@ -653,9 +662,13 @@ def _recover_or_validate_json_output(
     output_recovery: str,
     role_hint: str | None,
     response: LLMProviderResponse[dict[str, Any]],
+    provider: str = "auto",
+    model: str | None = None,
+    model_tier: str | None = None,
+    env: Mapping[str, str] | None = None,
+    process_chain: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     structured_output = response.structured_output
-    _raise_if_provider_failure_text(result, structured_output=structured_output, raw_output=response.raw_output)
     provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
     if not validate_schema:
         if isinstance(result, dict):
@@ -681,15 +694,21 @@ def _recover_or_validate_json_output(
     if not isinstance(result, dict):
         if output_recovery != "warn":
             raise LLMOutputValidationError("JSON output was not an object")
-        recovered = recover_json_output(
-            value=result,
+        if schema is None:
+            return {}, _recovered_natural_language_metadata(result, response)
+        result, structured_output = _recover_warn_schema_output(
+            result,
             schema=schema,
-            raw_text=response.raw_output,
             role_hint=role_hint,
+            response=response,
+            error=LLMOutputValidationError("JSON output was not an object"),
             provider_metadata=structured_output,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            env=env,
+            process_chain=process_chain,
         )
-        result = recovered.value
-        structured_output = recovered.structured_output or structured_output
         if schema is not None:
             _validate_json_output(result, schema)
         return result, structured_output
@@ -702,16 +721,19 @@ def _recover_or_validate_json_output(
         except Exception as exc:
             if output_recovery != "warn":
                 raise
-            recovered = recover_json_output(
-                value=result,
+            result, structured_output = _recover_warn_schema_output(
+                result,
                 schema=schema,
-                raw_text=response.raw_output,
-                error=exc,
                 role_hint=role_hint,
+                response=response,
+                error=exc,
                 provider_metadata=structured_output,
+                provider=provider,
+                model=model,
+                model_tier=model_tier,
+                env=env,
+                process_chain=process_chain,
             )
-            result = recovered.value
-            structured_output = recovered.structured_output or structured_output
             _validate_json_output(result, schema)
             return result, structured_output
     if provider_recovered and output_recovery == "warn":
@@ -725,6 +747,135 @@ def _recover_or_validate_json_output(
         result = recovered.value
         structured_output = recovered.structured_output or structured_output
     return result, structured_output
+
+
+def _recover_warn_schema_output(
+    result: Any,
+    *,
+    schema: dict[str, Any] | None,
+    role_hint: str | None,
+    response: LLMProviderResponse[dict[str, Any]],
+    error: Exception,
+    provider_metadata: Any,
+    provider: str,
+    model: str | None,
+    model_tier: str | None,
+    env: Mapping[str, str] | None,
+    process_chain: Sequence[str] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    source = _schema_recovery_source_text(result, response=response, provider_metadata=provider_metadata)
+    if _is_low_content_source(source):
+        raise LLMRetryableProviderOutputError(
+            "JSON output failed schema validation: empty or low-content output; retry original worker"
+        )
+    try:
+        recovered = recover_json_output(
+            value=result,
+            schema=schema,
+            raw_text=source,
+            error=error,
+            role_hint=role_hint,
+            provider_metadata=provider_metadata if isinstance(provider_metadata, Mapping) else None,
+            allow_schema_fallback=False,
+        )
+        if schema is None or _json_output_validates(recovered.value, schema):
+            return recovered.value, recovered.structured_output or provider_metadata
+    except Exception:
+        pass
+    try:
+        formatted = format_to_schema_or_retry(
+            raw_text=source,
+            schema=schema or {"type": "object"},
+            role_hint=role_hint,
+            json_runner=run_json,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            env=env,
+            process_chain=list(process_chain) if process_chain is not None else None,
+        )
+    except Exception as exc:
+        raise LLMRetryableProviderOutputError(
+            f"JSON output failed schema validation: schema formatter failed; retry original worker: {exc}"
+        ) from exc
+    if formatted.action == "retry":
+        reason = getattr(formatted, "reason", "")
+        raise LLMRetryableProviderOutputError(
+            f"JSON output failed schema validation: schema formatter requested retry: {reason}"
+        )
+    if not isinstance(formatted.value, dict):
+        raise LLMRetryableProviderOutputError(
+            "JSON output failed schema validation: schema formatter returned no formatted object"
+        )
+    return formatted.value, formatted.structured_output
+
+
+def _json_output_validates(value: Any, schema: Mapping[str, Any]) -> bool:
+    try:
+        _validate_json_output(value, dict(schema))
+        return True
+    except Exception:
+        return False
+
+
+def _schema_recovery_source_text(
+    result: Any,
+    *,
+    response: LLMProviderResponse[dict[str, Any]],
+    provider_metadata: Any,
+) -> str:
+    metadata = provider_metadata if isinstance(provider_metadata, Mapping) else {}
+    raw_output = response.raw_output or ""
+    if metadata.get("provider_error_type") == "error_max_structured_output_retries":
+        return _model_text_from_raw_output(raw_output)
+    raw_excerpt = metadata.get("raw_text_excerpt")
+    if isinstance(raw_excerpt, str) and raw_excerpt.strip():
+        return raw_excerpt
+    model_text = _model_text_from_raw_output(raw_output)
+    if model_text.strip():
+        return model_text
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return json.dumps(strip_arc_llm_call_records(result), ensure_ascii=False, sort_keys=True, default=str)
+    return str(result or "")
+
+
+def _model_text_from_raw_output(raw_output: str | None) -> str:
+    raw = str(raw_output or "").strip()
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, Mapping):
+        return raw
+    result = payload.get("result")
+    if isinstance(result, str):
+        return result
+    if isinstance(result, Mapping):
+        return json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+    return ""
+
+
+def _is_low_content_source(source: str) -> bool:
+    return _content_token_count(source) < LOW_CONTENT_TOKEN_THRESHOLD
+
+
+def _content_token_count(source: str) -> int:
+    text = str(source or "").strip()
+    if not text or text in {"{}", "[]"}:
+        return 0
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, Mapping):
+        parsed = strip_arc_llm_call_records(dict(parsed))
+        text = json.dumps(parsed, ensure_ascii=False, sort_keys=True, default=str)
+    tokens = re.findall(r"[A-Za-z0-9]+", text)
+    return len(tokens)
 
 
 def _recovered_natural_language_metadata(result: Any, response: LLMProviderResponse[Any]) -> dict[str, Any]:
@@ -768,28 +919,6 @@ def _merge_structured_output_warning(
         strategy=strategy,
         provider_error_type=provider_error_type,
     )
-
-
-def _raise_if_provider_failure_text(
-    result: Any,
-    *,
-    structured_output: Any,
-    raw_output: str | None,
-) -> None:
-    candidate = result if isinstance(result, str) else None
-    metadata = structured_output if isinstance(structured_output, Mapping) else None
-    if candidate is None and metadata is not None:
-        raw_excerpt = metadata.get("raw_text_excerpt")
-        if isinstance(raw_excerpt, str) and raw_excerpt.strip():
-            candidate = raw_excerpt
-    if candidate is None:
-        return
-    classification = classify_provider_output_text(candidate, metadata=metadata)
-    if classification.classification == ProviderOutputClass.OK:
-        return
-    if classification.classification == ProviderOutputClass.RETRYABLE_PROVIDER_FAILURE:
-        raise LLMRetryableProviderOutputError(f"retryable provider failure text: {classification.reason}")
-    raise LLMFatalProviderOutputError(f"fatal provider failure text: {classification.reason}")
 
 
 def _call_record(
