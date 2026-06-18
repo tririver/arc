@@ -1,6 +1,6 @@
 # ARC
 
-Advanced Research Compass (ARC) is a cache-first research toolkit for
+Agent Research Copilot (ARC) is a cache-first research toolkit for
 theoretical-physics papers and paper-centered research workflows. It gives an
 agent, or a human using the command line, structured access to arXiv full text,
 INSPIRE metadata, references, citers, paper summaries, research-domain graphs,
