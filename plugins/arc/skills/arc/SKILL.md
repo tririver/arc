@@ -3,7 +3,7 @@ name: arc
 description: Use for ARC research workflows involving paper metadata, arXiv full text, INSPIRE references and citers, paper section lookup, equation context, LLM paper summaries, research-domain construction from seed papers, and checking Markdown/PDF research notes.
 ---
 
-# Advanced Research Compass (ARC)
+# Agent Research Copilot  (ARC)
 
 ARC is a cache-first research toolkit for theoretical-physics papers and
 research-domain construction. Use ARC tools instead of scraping arXiv/INSPIRE
