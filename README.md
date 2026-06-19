@@ -263,12 +263,15 @@ Use ARC to develop ideas about cosmological collider scalar exchange.
 Use ARC to plan and execute the task to be planned.
 ```
 
-ARC workflows use two automation modes:
+Managed ARC workflows use two automation modes:
 
 - `auto`: continue with safe defaults, while preserving visible warnings.
 - `interactive`: ask for confirmation after major workflow steps.
 
-If you do not specify a mode and the choice matters, the skill asks once.
+If you do not specify a mode and the managed workflow choice matters, the skill
+asks once. Direct ARC tool tasks, such as metadata lookup, citer collection, or
+paper summary batches, run automatically unless you ask to review or confirm
+steps.
 
 ## Use ARC From The CLI
 

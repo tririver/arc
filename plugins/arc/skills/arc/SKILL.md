@@ -11,22 +11,32 @@ or reimplementing paper/domain workflows.
 
 ## Preflight Gate
 
-Before any ARC workflow MCP or CLI call, decide whether the user requested a
-workflow deliverable or a direct factual lookup.
+Before any ARC MCP or CLI call, decide whether the user requested a managed ARC
+workflow run or a direct ARC tool task.
 
-Workflow deliverables include recommendations, research directions, idea generation,
-domain construction, note checking, planning, calculations,
-reports, rankings, or follow-up project artifacts. For these, read
-`rules/interaction.md` and obtain an explicit automation mode before calling
-ARC paper/domain/LLM tools. Do not perform preliminary calls such as
-`get_metadata`, `get_citers`, `llm_get_summary`, `domain_get_summary`, seed
-resolution, or project-directory derivation before the mode choice.
-There is no "lightweight recommendation" exception.
+Managed workflow runs follow `workflows/domain.md`, `workflows/ideas.md`,
+`workflows/check.md`, `workflows/plan.md`, or `workflows/calculate.md`, and
+create project-local workflow artifacts such as domain references, ranked
+ideas, work notes, note-check records, calculation records, reports, rankings,
+recommendations, research directions, or follow-up project directories. For
+these, read `rules/interaction.md` and obtain an explicit automation mode
+before calling ARC paper/domain/LLM tools. Do not perform preliminary calls such
+as `get_metadata`, `get_citers`, `llm_get_summary`, `domain_get_summary`, seed
+resolution, or project-directory derivation before the mode choice. There is no
+"lightweight recommendation" exception for managed workflows.
 
-Direct factual lookup is exempt only when the user asks for a bounded paper
-fact such as title, authors, abstract, citation count, section text, or
-equation context, and does not ask for recommendations, ideas, domain work,
-checking, planning, calculation, reports, rankings, or project artifacts.
+Direct ARC tool tasks are exempt from the automation mode gate. These include
+bounded paper facts such as title, authors, abstract, citation count, section
+text, or equation context, plus user-directed tool orchestration such as
+collecting citers or references, filtering papers by date, generating paper
+summaries or summary batches, translating named reports, or combining those
+steps into a non-evaluative paper-data output. Direct tasks must not produce
+recommendations, research directions, scientific rankings, ARC reports, or
+project-local workflow artifacts; route those through the managed workflow
+gate. Run direct tasks automatically with safe defaults unless the user
+explicitly asks to review or confirm steps. Example: `use arc to download
+papers that cited 0911.3380 since 2024 and create a full summary of these
+papers` is direct ARC tool orchestration, not a managed workflow mode prompt.
 
 ## Required References
 
@@ -72,13 +82,17 @@ cancel any job because it is slow or time consuming.
 ### Phase 1: Setup
 
 Step 1: Decide the automation level.
-Use an explicit user choice. If the user asks for automatic or non-interactive
-work, use `auto`. If the user asks to review or confirm steps, use
-`interactive`. If the user did not specify `auto` or `interactive` explicitly,
-do not infer the mode. Use the host's selection/menu tool, following
-`rules/interaction.md`, with these options: `Run automatically (Recommended)`,
-`Confirm major steps`, and `Discuss before running`. If no suitable
-selection/menu tool is available, use the typed fallback from
+Use this step only for managed ARC workflow runs. For direct ARC tool tasks,
+skip the Workflow section and use the relevant manuals and MCP/CLI tools
+directly.
+
+For managed workflows, use an explicit user choice. If the user asks for
+automatic or non-interactive work, use `auto`. If the user asks to review or
+confirm steps, use `interactive`. If the user did not specify `auto` or
+`interactive` explicitly, do not infer the mode. Use the host's selection/menu
+tool, following `rules/interaction.md`, with these options: `Run automatically
+(Recommended)`, `Confirm major steps`, and `Discuss before running`. If no
+suitable selection/menu tool is available, use the typed fallback from
 `rules/interaction.md`. Do not treat `continue`, `resume`, or a bare approval
 to proceed as `auto`.
 

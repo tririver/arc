@@ -40,16 +40,25 @@ def test_arc_skill_routes_check_and_calculation_workflows() -> None:
     assert "work-note.md" in text
 
 
-def test_arc_skill_has_preflight_gate_for_workflow_deliverables() -> None:
+def test_arc_skill_has_preflight_gate_for_managed_workflows() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    text_flat = " ".join(text.split())
 
     assert "## Preflight Gate" in text
-    assert "workflow deliverable" in text
-    assert "recommendations" in text
-    assert "research directions" in text
-    assert "idea generation" in text
-    assert "There is no \"lightweight recommendation\" exception." in text
-    assert "Direct factual lookup is exempt only" in text
+    assert "managed ARC workflow run" in text
+    assert "workflow artifacts" in text
+    assert "domain references" in text
+    assert "ranked ideas" in text_flat
+    assert "recommendations, research directions" in text_flat
+    assert "There is no \"lightweight recommendation\" exception for managed workflows." in text_flat
+    assert "Direct ARC tool tasks are exempt from the automation mode gate" in text_flat
+    assert "collecting citers or references" in text_flat
+    assert "generating paper summaries or summary batches" in text_flat
+    assert "non-evaluative paper-data output" in text_flat
+    assert "must not produce recommendations, research directions, scientific rankings" in text_flat
+    assert "ARC reports, or project-local workflow artifacts" in text_flat
+    assert "download papers that cited 0911.3380 since 2024" in text_flat
+    assert "direct ARC tool orchestration" in text_flat
     assert "get_metadata" in text
     assert "domain_get_summary" in text
     assert text.index("## Preflight Gate") < text.index("## Required References")
@@ -278,11 +287,19 @@ def test_interaction_rules_define_automation_mode_gate_examples() -> None:
     lower_flat = " ".join(lower.split())
 
     assert "## Automation Mode Gate" in text
-    assert "Do not gather \"just context\"" in text
+    text_flat = " ".join(text.split())
+    assert "Do not gather \"just context\"" in text_flat
+    assert "managed ARC workflow run" in text_flat
+    assert "Direct ARC tool tasks do not need an automation mode" in text_flat
+    assert "recommendations, research directions, scientific rankings, or ARC reports" in text_flat
+    assert "non-evaluative paper-data outputs" in text_flat
+    assert "Direct tasks must not produce" in text_flat
     assert "recommend research directions" in text
     assert "suggest ideas" in text
     assert "what is the title and abstract" in text
     assert "direct paper lookup allowed" in text
+    assert "download papers that cited 0911.3380 since 2024" in text_flat
+    assert "direct tool orchestration allowed" in text_flat
     assert "do not include list numbering inside option labels" in lower_flat
     assert "Run automatically (Recommended)" in text
     assert "Confirm major steps" in text
