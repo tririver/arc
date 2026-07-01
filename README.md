@@ -48,7 +48,7 @@ provider.
 
 ### Citation
 
-Ma, Yanjiao, Yi Wang, and Xingkai Zhang. _ARC: An LLM-Native Agent
+Yanjiao Ma, Yi Wang, and Xingkai Zhang. _ARC: An LLM-Native Agent
 Workflow for Theoretical Physics Research_. ChinaXiv:202606.00234, 2026.
 https://chinaxiv.org/abs/202606.00234
 
