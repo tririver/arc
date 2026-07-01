@@ -44,7 +44,27 @@ provider.
 
 - Token usage. As measured using Claude + DeepSeek, a typical run of domain build + idea generation consumes about 1M uncached input tokens, and 0.5M output tokens, in about an hour's running time. The token usage may vary depending on the specific tasks and LLM used. Be aware of token usage and costs. 
 
-- If ARC has played a role in your research, please consider citing the ARC manual: _ARC: An LLM-Native Agent Workflow for Theoretical Physics Research_, Yanjiao Ma, Yi Wang, Xingkai Zhang (to appear).
+- If ARC has played a role in your research, please consider citing the ARC manual.
+
+### Citation
+
+Ma, Yanjiao, Yi Wang, and Xingkai Zhang. _ARC: An LLM-Native Agent
+Workflow for Theoretical Physics Research_. ChinaXiv:202606.00234, 2026.
+https://chinaxiv.org/abs/202606.00234
+
+```bibtex
+@misc{ma2026arc,
+  title         = {{ARC}: An {LLM}-Native Agent Workflow for Theoretical Physics Research},
+  author        = {Ma, Yanjiao and Wang, Yi and Zhang, Xingkai},
+  year          = {2026},
+  month         = jun,
+  publisher     = {ChinaXiv},
+  eprint        = {202606.00234},
+  archivePrefix = {ChinaXiv},
+  url           = {https://chinaxiv.org/abs/202606.00234},
+  note          = {Version 1}
+}
+```
 
 ### Requirements:
 
