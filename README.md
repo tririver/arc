@@ -1,13 +1,8 @@
 # ARC
 
-Agent Research Copilot (ARC) is a cache-first research toolkit for
-theoretical-physics papers and paper-centered research workflows. It gives an
-agent, or a human using the command line, structured access to arXiv full text,
-INSPIRE metadata, references, citers, paper summaries, research-domain graphs,
-and multi-agent idea/calculation workflows.
+Agent Research Copilot (ARC) is an angentic research toolkit for theoretical physics knowledge domain construction, idea generation and calculation workflows. It works as a plugin of coding agents such as Codex / Claude Code, with the strength of bringing coding agents into a research context, and generating publication-level ideas in theoretical research.
 
-ARC is built around five Python command line tools; `arc-mcp` also runs the
-optional MCP server:
+ARC is a set of workflow skills built around five Python command line tools; `arc-mcp` also runs the optional MCP server:
 
 - `arc-paper`: paper metadata, references, citers, ar5iv sections, equation
   context, full-text search, LLM paper summaries, and paper-summary batches.
