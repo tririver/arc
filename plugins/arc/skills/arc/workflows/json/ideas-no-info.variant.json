@@ -11,7 +11,7 @@
     "attach_arc_paper_tool_notes": false
   },
   "proposer": {
-    "model_tier": "medium",
+    "model_tier": "high",
     "runtime": {
       "allow_mcp": false
     }

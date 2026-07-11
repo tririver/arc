@@ -31,7 +31,10 @@ Step 4: Keep `variant_glob` as `ideas-*.variant.json`. The release package
 runs only enabled variants; the normal idea-generation workflow uses the
 domain variant.
 
-Step 5: Keep `loops_per_variant` at `5` unless the run should use a different
+Step 5: Keep the shipped proposer and reviewer `model_tier` values at `high`
+for normal idea generation unless the user requests another quality/cost tier.
+
+Step 6: Keep `loops_per_variant` at `5` unless the run should use a different
 number of concurrent instances for each setup.
 
 ### Phase 2: Run Ideas

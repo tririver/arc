@@ -116,6 +116,8 @@ llm_domain_build(seed_paper="<seed-paper>", intent="<user-intent>", background=t
 llm_summary_batch_run(name="<batch-name>", provider="auto", concurrency=2, background=true)
 ```
 
+The LLM summary tools and summary-batch runner default to `model_tier="low"`.
+
 ### Phase 2: Watch with CLI.
 Step 1: Immediately run the returned `next.cli_command`, for example:
 

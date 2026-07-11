@@ -131,6 +131,9 @@ Step 1: Run:
 arc-paper llm-summary <seed-paper> --json
 ```
 
+Paper-summary generation defaults to `--model-tier low`; pass another tier
+explicitly when the user requests a different quality/cost tradeoff.
+
 Step 2: If it returns a summary, use it.
 Step 3: If it returns `status: "needs_llm"`, use the manual fallback below.
 

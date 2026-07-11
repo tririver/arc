@@ -69,7 +69,7 @@ def valid_summary():
 class FakeSummaryProvider:
     name = "fake"
 
-    def generate_summary(self, task, *, model=None, progress_callback=None):
+    def generate_summary(self, task, *, model=None, model_tier=None, progress_callback=None):
         summary = valid_summary()
         summary["provenance"]["source_hash"] = task["input_pack"]["source_hash"]
         if model:
@@ -81,9 +81,11 @@ class RecordingSummaryProvider(FakeSummaryProvider):
     def __init__(self):
         self.tasks = []
 
-    def generate_summary(self, task, *, model=None, progress_callback=None):
+    def generate_summary(self, task, *, model=None, model_tier=None, progress_callback=None):
         self.tasks.append(task)
-        return super().generate_summary(task, model=model, progress_callback=progress_callback)
+        return super().generate_summary(
+            task, model=model, model_tier=model_tier, progress_callback=progress_callback
+        )
 
 
 class ModelRecordingSummaryProvider(FakeSummaryProvider):
@@ -91,10 +93,14 @@ class ModelRecordingSummaryProvider(FakeSummaryProvider):
 
     def __init__(self):
         self.models = []
+        self.model_tiers = []
 
-    def generate_summary(self, task, *, model=None, progress_callback=None):
+    def generate_summary(self, task, *, model=None, model_tier=None, progress_callback=None):
         self.models.append(model)
-        summary = super().generate_summary(task, model=model, progress_callback=progress_callback)
+        self.model_tiers.append(model_tier)
+        summary = super().generate_summary(
+            task, model=model, model_tier=model_tier, progress_callback=progress_callback
+        )
         summary["provenance"]["method"] = self.name
         summary["provenance"]["model"] = model or "default-model"
         return summary
@@ -211,6 +217,21 @@ def test_generate_llm_summary_resolves_model_tier_before_summary_provider(monkey
     assert result["meta"]["provider"] == "codex-cli"
     assert captured["provider"] == "codex-cli"
     assert result["data"]["provenance"]["model"] == "gpt-5.6-sol"
+
+
+def test_generate_llm_summary_defaults_to_low_model_tier(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    monkeypatch.setenv("ARC_AGENT_HOST", "codex")
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    provider = ModelRecordingSummaryProvider()
+    monkeypatch.setattr(service, "select_summary_provider", lambda _provider: provider)
+
+    result = service.generate_llm_summary("0911.3380")
+
+    assert result["ok"] is True
+    assert provider.models == ["gpt-5.6-luna"]
+    assert provider.model_tiers == ["low"]
 
 
 def test_cli_get_llm_summary_can_force_manual_provider(monkeypatch, tmp_path, capsys):

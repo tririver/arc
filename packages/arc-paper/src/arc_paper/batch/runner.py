@@ -10,6 +10,7 @@ from typing import Any
 from arc_llm.runner import resolve_llm_config
 
 from .. import service
+from ..summary.model import DEFAULT_SUMMARY_MODEL_TIER
 from .db import BatchDB, BatchItem
 
 
@@ -28,7 +29,7 @@ def run_batch(
     *,
     provider: str = "auto",
     model: str | None = None,
-    model_tier: str | None = None,
+    model_tier: str | None = DEFAULT_SUMMARY_MODEL_TIER,
     concurrency: int = 1,
     max_items: int | None = None,
     db: BatchDB | None = None,

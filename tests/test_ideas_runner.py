@@ -118,8 +118,8 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     assert {loop["loop_id"] for loop in batch_config["loops"]} == {"domain_idea_001"}
     assert {loop["max_rounds"] for loop in batch_config["loops"]} == {5}
     assert all(loop["early_stop"]["enabled"] is False for loop in batch_config["loops"])
-    assert all(loop["proposers"][0]["model_tier"] == "medium" for loop in batch_config["loops"])
-    assert all(loop["reviewers"][0]["model_tier"] == "medium" for loop in batch_config["loops"])
+    assert all(loop["proposers"][0]["model_tier"] == "high" for loop in batch_config["loops"])
+    assert all(loop["reviewers"][0]["model_tier"] == "high" for loop in batch_config["loops"])
     assert all(
         loop["reviewers"][0]["output_schema"]["properties"]["schema_version"]["const"]
         == "arc.llm.review_envelope.v1"
@@ -418,7 +418,7 @@ def test_ideas_warns_when_reviewer_tier_is_below_proposer(tmp_path: Path) -> Non
     warning = "\n".join(result["warnings"])
     assert "WARNING: REVIEWER MODEL TIER BELOW PROPOSER" in warning
     assert "no_info_idea_001" in warning
-    assert "proposer_001=medium" in warning
+    assert "proposer_001=high" in warning
     assert "reviewer_001=low" in warning
     warnings_path = Path(result["warnings_path"])
     assert warnings_path.is_file()

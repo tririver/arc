@@ -903,6 +903,16 @@ def test_ideas_config_template_has_no_global_reviewer() -> None:
     assert config["loops_per_variant"] == 5
 
 
+def test_ideas_worker_templates_default_to_high_model_tier() -> None:
+    domain_variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))
+    no_info_variant = json.loads((WJ / "ideas-no-info.variant.json").read_text(encoding="utf-8"))
+    reviewer = json.loads((WJ / "ideas-reviewer.template.json").read_text(encoding="utf-8"))
+
+    assert domain_variant["proposer"]["model_tier"] == "high"
+    assert no_info_variant["proposer"]["model_tier"] == "high"
+    assert reviewer["model_tier"] == "high"
+
+
 def test_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:
     batch = json.loads((WJ / "ideas-batch.template.json").read_text(encoding="utf-8"))
     variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))

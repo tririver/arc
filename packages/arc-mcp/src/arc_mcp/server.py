@@ -13,6 +13,7 @@ from arc_paper import service
 from arc_paper.batch.db import BatchDB
 from arc_paper.batch.runner import export_batch, prefetch_batch, run_batch
 from arc_paper.ids import normalize_paper_id
+from arc_paper.summary.model import DEFAULT_SUMMARY_MODEL_TIER
 from arc_typeset import md2pdf as typeset_md2pdf
 from arc_typeset import translate as typeset_translate
 from pydantic import Field
@@ -61,7 +62,7 @@ CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIR
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
 LLM_PROVIDER_DESCRIPTION = "LLM provider: auto or a built-in provider (codex-cli, claude-cli, manual)."
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
-LLM_MODEL_TIER_DESCRIPTION = "Optional LLM model tier: low, medium, high, or xhigh."
+LLM_MODEL_TIER_DESCRIPTION = "LLM model tier: low, medium, high, or xhigh. Paper summaries default to low."
 BACKGROUND_DESCRIPTION = (
     "When true, start the job and return a background job id immediately instead of waiting inline."
 )
@@ -261,7 +262,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         _paper_ids(args),
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
-        model_tier=args.get("model_tier"),
+        model_tier=args.get("model_tier", DEFAULT_SUMMARY_MODEL_TIER),
         refresh=_bool_arg(args.get("refresh"), False),
         background=_bool_arg(args.get("background"), False),
     ),
@@ -558,7 +559,7 @@ def _cached_or_start_summary_job(args: dict[str, Any]) -> dict[str, Any]:
         paper_ids,
         provider=str(args.get("provider", "auto")),
         model=args.get("model"),
-        model_tier=args.get("model_tier"),
+        model_tier=args.get("model_tier", DEFAULT_SUMMARY_MODEL_TIER),
         refresh=_bool_arg(args.get("refresh"), False),
         background=_bool_arg(args.get("background"), False),
     )
@@ -1396,7 +1397,7 @@ def _register_tools(app: Any) -> None:
         paper_ids: PaperIds = None,
         provider: LLMProvider = "auto",
         model: LLMModel = None,
-        model_tier: LLMModelTier = None,
+        model_tier: LLMModelTier = DEFAULT_SUMMARY_MODEL_TIER,
         refresh: Refresh = False,
         background: Background = False,
     ) -> Any:
@@ -1425,7 +1426,7 @@ def _register_tools(app: Any) -> None:
         paper_ids: PaperIds = None,
         provider: LLMProvider = "auto",
         model: LLMModel = None,
-        model_tier: LLMModelTier = None,
+        model_tier: LLMModelTier = DEFAULT_SUMMARY_MODEL_TIER,
         refresh: Refresh = False,
         background: Background = False,
     ) -> Any:
@@ -1543,7 +1544,7 @@ def _register_tools(app: Any) -> None:
         name: BatchName,
         provider: LLMProvider = "auto",
         model: LLMModel = None,
-        model_tier: LLMModelTier = None,
+        model_tier: LLMModelTier = DEFAULT_SUMMARY_MODEL_TIER,
         concurrency: Annotated[int, Field(description="Number of concurrent LLM summary generation workers.")] = 1,
         max_items: Annotated[int | None, Field(description="Optional cap on items to process in this run.")] = None,
         background: Background = False,

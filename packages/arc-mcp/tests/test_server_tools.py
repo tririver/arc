@@ -524,6 +524,9 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "model_tier" in by_name["llm_get_summary"].inputSchema["properties"]
     assert "model_tier" in by_name["llm_domain_build"].inputSchema["properties"]
     assert "model_tier" in by_name["llm_summary_batch_run"].inputSchema["properties"]
+    assert by_name["llm_generate_summary"].inputSchema["properties"]["model_tier"]["default"] == "low"
+    assert by_name["llm_get_summary"].inputSchema["properties"]["model_tier"]["default"] == "low"
+    assert by_name["llm_summary_batch_run"].inputSchema["properties"]["model_tier"]["default"] == "low"
     assert "summary_batch_create" in by_name
     assert "summary_batch_prefetch" in by_name
     assert "summary_batch_status" in by_name

@@ -11,6 +11,7 @@ from .batch.db import BatchDB
 from .batch.runner import export_batch, prefetch_batch, run_batch
 from .host import detect_host, select_llm_provider
 from .results import err, ok
+from .summary.model import DEFAULT_SUMMARY_MODEL_TIER
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,24 +49,32 @@ def main(argv: list[str] | None = None) -> int:
     llm_summary = _paper_command(sub, "get-llm-summary")
     llm_summary.add_argument("--provider", default="auto")
     llm_summary.add_argument("--model", default=None)
-    llm_summary.add_argument("--model-tier", choices=["xhigh", "high", "medium", "low"], default=None)
+    llm_summary.add_argument(
+        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+    )
     llm_summary_prefixed = _paper_command(sub, "llm-summary")
     llm_summary_prefixed.add_argument("--provider", default="auto")
     llm_summary_prefixed.add_argument("--model", default=None)
-    llm_summary_prefixed.add_argument("--model-tier", choices=["xhigh", "high", "medium", "low"], default=None)
+    llm_summary_prefixed.add_argument(
+        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+    )
 
     generate = sub.add_parser("generate-llm-summary")
     generate.add_argument("paper_ids", nargs="+")
     generate.add_argument("--provider", default="auto")
     generate.add_argument("--model", default=None)
-    generate.add_argument("--model-tier", choices=["xhigh", "high", "medium", "low"], default=None)
+    generate.add_argument(
+        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+    )
     generate.add_argument("--refresh", action="store_true")
     generate.add_argument("--json", action="store_true")
     llm_generate = sub.add_parser("llm-generate-summary")
     llm_generate.add_argument("paper_ids", nargs="+")
     llm_generate.add_argument("--provider", default="auto")
     llm_generate.add_argument("--model", default=None)
-    llm_generate.add_argument("--model-tier", choices=["xhigh", "high", "medium", "low"], default=None)
+    llm_generate.add_argument(
+        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+    )
     llm_generate.add_argument("--refresh", action="store_true")
     llm_generate.add_argument("--json", action="store_true")
 
@@ -178,7 +187,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("name")
     run.add_argument("--provider", default="auto")
     run.add_argument("--model", default=None)
-    run.add_argument("--model-tier", choices=["xhigh", "high", "medium", "low"], default=None)
+    run.add_argument(
+        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+    )
     run.add_argument("--concurrency", type=int, default=1)
     run.add_argument("--max-items", type=int, default=None)
     run.add_argument("--json", action="store_true")

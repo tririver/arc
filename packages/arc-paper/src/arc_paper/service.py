@@ -38,6 +38,7 @@ from .reference_inference import ReferenceInferenceError, infer_main_references
 from .results import err, ok
 from .search import FullTextSearchFile, search_parsed_full_text
 from .summary.input_pack import build_input_pack
+from .summary.model import DEFAULT_SUMMARY_MODEL_TIER
 from .summary.providers.select import select_summary_provider
 from .summary.schema import load_summary_prompt, load_summary_schema
 from .summary.store import read_latest_summary, read_summary, store_summary
@@ -1173,6 +1174,7 @@ def _generate_summary_one(
     refresh: bool,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
+    model_tier = _summary_model_tier(model=model, model_tier=model_tier)
     try:
         config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
     except Exception as exc:
@@ -1191,6 +1193,7 @@ def _generate_summary_one(
         paper_id,
         status,
         config=config,
+        model_tier=model_tier,
         progress_callback=progress_callback,
     )
 
@@ -1230,17 +1233,31 @@ def _generate_from_status(
     model_tier: str | None = None,
 ) -> dict[str, Any]:
     try:
+        model_tier = _summary_model_tier(model=model, model_tier=model_tier)
         if config is None:
             config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
         selected = select_summary_provider(config.provider)
         if selected.name == "manual":
             return status
-        summary = selected.generate_summary(status["llm_task"], model=config.model, progress_callback=progress_callback)
+        summary = selected.generate_summary(
+            status["llm_task"],
+            model=config.model,
+            model_tier=model_tier,
+            progress_callback=progress_callback,
+        )
         summary_paper_id = str(status.get("paper_id") or paper_id)
         path = store_summary(summary_paper_id, summary)
     except Exception as exc:
         return err("summary_generation_failed", str(exc))
     return ok(summary, provider=selected.name, cache="write", summary_path=str(path))
+
+
+def _summary_model_tier(*, model: str | None, model_tier: str | None) -> str | None:
+    if model_tier:
+        return model_tier
+    if model:
+        return None
+    return DEFAULT_SUMMARY_MODEL_TIER
 
 
 def _build_summary_task(paper_id: str, *, refresh: bool) -> dict[str, Any]:

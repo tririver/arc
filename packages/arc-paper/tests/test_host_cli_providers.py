@@ -75,7 +75,7 @@ def test_codex_summary_provider_uses_arc_llm_run_json(monkeypatch):
     assert calls[0]["env"] == {}
 
 
-def test_codex_cli_provider_uses_medium_default_model(monkeypatch):
+def test_codex_cli_provider_uses_low_default_model(monkeypatch):
     summary = valid_summary()
     calls = []
 
@@ -88,6 +88,7 @@ def test_codex_cli_provider_uses_medium_default_model(monkeypatch):
     CodexCliProvider(env={}).generate_summary(llm_task())
 
     assert calls[0]["model"] == "gpt-5.6-luna"
+    assert calls[0]["model_tier"] == "low"
 
 
 def test_claude_summary_provider_uses_arc_llm_run_json(monkeypatch):
@@ -110,7 +111,7 @@ def test_claude_summary_provider_uses_arc_llm_run_json(monkeypatch):
     assert calls[0]["env"] == {}
 
 
-def test_claude_cli_provider_uses_medium_default_model(monkeypatch):
+def test_claude_cli_provider_uses_low_default_model(monkeypatch):
     summary = valid_summary()
     calls = []
 
@@ -122,7 +123,8 @@ def test_claude_cli_provider_uses_medium_default_model(monkeypatch):
 
     ClaudeCliProvider(env={}).generate_summary(llm_task())
 
-    assert calls[0]["model"] == "sonnet"
+    assert calls[0]["model"] == "haiku"
+    assert calls[0]["model_tier"] == "low"
 
 
 def test_codex_summary_provider_keeps_test_prompt_provider():

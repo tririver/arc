@@ -13,6 +13,7 @@ class LLMProvider(Protocol):
         task: dict,
         *,
         model: str | None = None,
+        model_tier: str | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict:
         ...
