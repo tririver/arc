@@ -373,7 +373,7 @@ def _model_tier(value: Any, field_name: str) -> str | None:
     if text is None:
         return None
     if text not in VALID_MODEL_TIERS:
-        raise ConfigError(f"{field_name} must be one of: high, medium, low")
+        raise ConfigError(f"{field_name} must be one of: low, medium, high, xhigh")
     return text
 
 

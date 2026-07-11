@@ -87,7 +87,7 @@ def test_codex_cli_provider_uses_medium_default_model(monkeypatch):
 
     CodexCliProvider(env={}).generate_summary(llm_task())
 
-    assert calls[0]["model"] == "gpt-5.4"
+    assert calls[0]["model"] == "gpt-5.6-luna"
 
 
 def test_claude_summary_provider_uses_arc_llm_run_json(monkeypatch):

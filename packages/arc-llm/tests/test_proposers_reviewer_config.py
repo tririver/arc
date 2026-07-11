@@ -206,7 +206,7 @@ def test_worker_env_maps_runtime_without_mutating_base_env():
     assert env["ARC_CODEX_ENABLE_MCP"] == "false"
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
     assert "ARC_LLM_MODEL_TIER" not in env
-    assert env["ARC_CODEX_REASONING_EFFORT"] == "xhigh"
+    assert env["ARC_CODEX_REASONING_EFFORT"] == "high"
 
 
 def test_worker_env_false_runtime_clears_inherited_permission_flags():
@@ -242,7 +242,7 @@ def test_worker_env_maps_mcp_model_and_provider_options():
     assert env["ARC_CODEX_ENABLE_MCP"] == "true"
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "true"
     assert "ARC_LLM_MODEL_TIER" not in env
-    assert env["ARC_CODEX_REASONING_EFFORT"] == "xhigh"
+    assert env["ARC_CODEX_REASONING_EFFORT"] == "high"
     assert env["ARC_CLAUDE_EFFORT"] == "high"
 
 

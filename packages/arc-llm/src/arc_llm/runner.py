@@ -5,13 +5,14 @@ import re
 import time
 from dataclasses import dataclass
 import inspect
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record, strip_arc_llm_call_records
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
-from .model import resolve_model
+from .model import reasoning_effort_for_model_tier, resolve_model
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
@@ -75,7 +76,7 @@ def resolve_llm_config(
     process_chain: Sequence[str] | None = None,
 ) -> LLMConfig:
     if provider == "auto" and model:
-        raise ValueError("Exact model requires explicit provider; use provider=<provider> or model_tier=<low|medium|high>.")
+        raise ValueError("Exact model requires explicit provider; use provider=<provider> or model_tier=<low|medium|high|xhigh>.")
     selected = select_llm_provider(
         env=env,
         process_chain=process_chain,
@@ -286,7 +287,8 @@ def _run_with_retries(
     failures: list[LLMAttemptFailure] = []
     attempt_records: list[dict[str, Any]] = []
     for fallback_index, config in enumerate(configs):
-        selected = select_provider(config.provider, env=env, process_chain=process_chain)
+        provider_env = _env_with_tier_reasoning_default(env, config.provider, model_tier_requested)
+        selected = select_provider(config.provider, env=provider_env, process_chain=process_chain)
         for attempt in range(1, max_attempts + 1):
             try:
                 result = call(selected, config)
@@ -330,6 +332,22 @@ def _run_with_retries(
                 if _has_remaining_attempt(configs, fallback_index=fallback_index, attempt=attempt, max_attempts=max_attempts):
                     time.sleep(RETRY_INTERVAL_SECONDS)
     raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts))
+
+
+def _env_with_tier_reasoning_default(
+    env: Mapping[str, str] | None,
+    provider: str,
+    model_tier: str | None,
+) -> Mapping[str, str] | None:
+    effort = reasoning_effort_for_model_tier(provider, model_tier)
+    if effort is None:
+        return env
+    resolved = dict(env) if env is not None else dict(os.environ)
+    if provider == "codex-cli":
+        resolved.setdefault("ARC_CODEX_REASONING_EFFORT", effort)
+    elif provider == "claude-cli":
+        resolved.setdefault("ARC_CLAUDE_EFFORT", effort)
+    return resolved
 
 
 def _has_remaining_attempt(

@@ -210,7 +210,7 @@ def test_generate_llm_summary_resolves_model_tier_before_summary_provider(monkey
     assert result["ok"] is True
     assert result["meta"]["provider"] == "codex-cli"
     assert captured["provider"] == "codex-cli"
-    assert result["data"]["provenance"]["model"] == "gpt-5.5"
+    assert result["data"]["provenance"]["model"] == "gpt-5.6-sol"
 
 
 def test_cli_get_llm_summary_can_force_manual_provider(monkeypatch, tmp_path, capsys):

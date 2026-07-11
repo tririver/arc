@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.call_record import allow_arc_llm_call_record
-from arc_llm.model import VALID_MODEL_TIERS
+from arc_llm.model import VALID_MODEL_TIERS, reasoning_effort_for_model_tier
 
 
 BATCH_CONFIG_SCHEMA = "arc.llm.proposers_reviewer_batch.config.v1"
@@ -556,7 +556,7 @@ def _model_tier(value: Any, field_name: str) -> str | None:
     if not text:
         return None
     if text not in VALID_MODEL_TIERS:
-        raise ConfigError("model_tier must be one of: high, medium, low")
+        raise ConfigError("model_tier must be one of: low, medium, high, xhigh")
     return text
 
 
@@ -577,8 +577,8 @@ def _mcp_mode(value: Any, field_name: str) -> str | None:
 
 
 def _codex_effort_for_model_tier(tier: str) -> str:
-    return {"low": "low", "medium": "medium", "high": "xhigh"}[tier]
+    return str(reasoning_effort_for_model_tier("codex-cli", tier))
 
 
 def _claude_effort_for_model_tier(tier: str) -> str:
-    return {"low": "low", "medium": "medium", "high": "high"}[tier]
+    return str(reasoning_effort_for_model_tier("claude-cli", tier))

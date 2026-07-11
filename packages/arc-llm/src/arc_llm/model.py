@@ -5,14 +5,31 @@ from typing import Mapping
 
 PROVIDER_MODEL_TIERS = {
     "codex-cli": {
-        "low": "gpt-5.3-codex-spark",
-        "medium": "gpt-5.4",
-        "high": "gpt-5.5",
+        "low": "gpt-5.6-luna",
+        "medium": "gpt-5.6-luna",
+        "high": "gpt-5.6-sol",
+        "xhigh": "gpt-5.6-sol",
     },
     "claude-cli": {
         "low": "haiku",
         "medium": "sonnet",
         "high": "opus",
+        "xhigh": "opus",
+    },
+}
+
+PROVIDER_REASONING_EFFORT_TIERS = {
+    "codex-cli": {
+        "low": "medium",
+        "medium": "xhigh",
+        "high": "high",
+        "xhigh": "max",
+    },
+    "claude-cli": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "high",
     },
 }
 
@@ -28,7 +45,7 @@ DEFAULT_PROVIDER_MODELS = {
     "claude-cli": PROVIDER_MODEL_TIERS["claude-cli"][DEFAULT_MODEL_TIER],
 }
 
-VALID_MODEL_TIERS = frozenset({"low", "medium", "high"})
+VALID_MODEL_TIERS = frozenset({"low", "medium", "high", "xhigh"})
 
 
 class ModelTierError(ValueError):
@@ -44,20 +61,25 @@ def resolve_model(
 ) -> str | None:
     if explicit_model:
         return explicit_model
-    tier = _resolve_tier(model_tier)
+    tier = resolve_model_tier(model_tier)
     if tier:
         return _model_for_tier(provider_name, tier, env=env)
     return DEFAULT_PROVIDER_MODELS.get(provider_name)
 
 
-def _resolve_tier(explicit_tier: str | None) -> str | None:
+def resolve_model_tier(explicit_tier: str | None) -> str:
     tier = explicit_tier
     if tier is None or not str(tier).strip():
         return DEFAULT_MODEL_TIER
     normalized = str(tier).strip().lower()
     if normalized not in VALID_MODEL_TIERS:
-        raise ModelTierError("model_tier must be one of: high, medium, low")
+        raise ModelTierError("model_tier must be one of: low, medium, high, xhigh")
     return normalized
+
+
+def reasoning_effort_for_model_tier(provider_name: str, model_tier: str | None) -> str | None:
+    tier = resolve_model_tier(model_tier)
+    return PROVIDER_REASONING_EFFORT_TIERS.get(provider_name, {}).get(tier)
 
 
 def _model_for_tier(provider_name: str, tier: str, *, env: Mapping[str, str] | None = None) -> str | None:

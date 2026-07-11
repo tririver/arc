@@ -66,7 +66,7 @@ def _seed_command(sub, name: str) -> argparse.ArgumentParser:
 def _llm_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", default="auto")
     parser.add_argument("--model", default=None)
-    parser.add_argument("--model-tier", choices=["high", "medium", "low"], default="medium")
+    parser.add_argument("--model-tier", choices=["xhigh", "high", "medium", "low"], default="medium")
 
 
 def _dispatch(args: argparse.Namespace) -> Any:

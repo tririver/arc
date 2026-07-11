@@ -621,7 +621,7 @@ class FlakyTextProvider:
 def test_resolve_llm_config_uses_host_and_default_model(tmp_path):
     config = resolve_llm_config(env={"ARC_AGENT_HOST": "codex"}, process_chain=[])
     assert config.provider == "codex-cli"
-    assert config.model == "gpt-5.4"
+    assert config.model == "gpt-5.6-luna"
     assert config.host.host == "codex"
 
 
@@ -1096,7 +1096,7 @@ def test_env_model_does_not_override_model_tier(tmp_path, monkeypatch):
         process_chain=[],
     )
 
-    assert result["model"] == "gpt-5.5"
+    assert result["model"] == "gpt-5.6-sol"
 
 
 def test_run_json_uses_model_tier_when_exact_model_is_not_set(tmp_path, monkeypatch):
@@ -1110,7 +1110,47 @@ def test_run_json_uses_model_tier_when_exact_model_is_not_set(tmp_path, monkeypa
         process_chain=[],
     )
 
-    assert result["model"] == "gpt-5.5"
+    assert result["model"] == "gpt-5.6-sol"
+
+
+def test_run_json_passes_model_tier_reasoning_effort_to_codex(monkeypatch):
+    captured = {}
+
+    def fake_select_provider(provider, **kwargs):
+        captured.update(kwargs["env"])
+        return FakeProvider()
+
+    monkeypatch.setattr(runner, "select_provider", fake_select_provider)
+
+    run_json(
+        "prompt",
+        schema={"type": "object"},
+        model_tier="xhigh",
+        env={"ARC_AGENT_HOST": "codex"},
+        process_chain=[],
+    )
+
+    assert captured["ARC_CODEX_REASONING_EFFORT"] == "max"
+
+
+def test_explicit_codex_reasoning_effort_overrides_model_tier_default(monkeypatch):
+    captured = {}
+
+    def fake_select_provider(provider, **kwargs):
+        captured.update(kwargs["env"])
+        return FakeProvider()
+
+    monkeypatch.setattr(runner, "select_provider", fake_select_provider)
+
+    run_json(
+        "prompt",
+        schema={"type": "object"},
+        model_tier="low",
+        env={"ARC_AGENT_HOST": "codex", "ARC_CODEX_REASONING_EFFORT": "high"},
+        process_chain=[],
+    )
+
+    assert captured["ARC_CODEX_REASONING_EFFORT"] == "high"
 
 
 def test_run_json_validates_provider_output_against_schema(monkeypatch):
@@ -1139,7 +1179,7 @@ def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):
 
     result = run_text("prompt", env={"ARC_AGENT_HOST": "codex"}, process_chain=[])
 
-    assert result == "gpt-5.4:prompt"
+    assert result == "gpt-5.6-luna:prompt"
 
 
 def test_run_text_retries_selected_provider_twice_before_success(tmp_path, monkeypatch):
@@ -1152,7 +1192,7 @@ def test_run_text_retries_selected_provider_twice_before_success(tmp_path, monke
         process_chain=[],
     )
 
-    assert result == "codex-cli:gpt-5.4:prompt"
+    assert result == "codex-cli:gpt-5.6-luna:prompt"
     assert flaky.attempts == 3
 
 
@@ -1164,7 +1204,7 @@ def test_run_text_waits_ten_seconds_between_retry_attempts(monkeypatch):
 
     result = run_text("prompt", provider="codex-cli", env={}, process_chain=[])
 
-    assert result == "codex-cli:gpt-5.4:prompt"
+    assert result == "codex-cli:gpt-5.6-luna:prompt"
     assert sleep_calls == [10, 10]
 
 

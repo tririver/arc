@@ -236,6 +236,7 @@ Prefer `model_tier` for reusable workflows and package configs. Valid values:
 low
 medium
 high
+xhigh
 ```
 
 `arc-llm` maps these tiers to provider-specific model and reasoning defaults.

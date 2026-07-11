@@ -61,7 +61,7 @@ CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIR
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
 LLM_PROVIDER_DESCRIPTION = "LLM provider: auto or a built-in provider (codex-cli, claude-cli, manual)."
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
-LLM_MODEL_TIER_DESCRIPTION = "Optional LLM model tier: low, medium, or high."
+LLM_MODEL_TIER_DESCRIPTION = "Optional LLM model tier: low, medium, high, or xhigh."
 BACKGROUND_DESCRIPTION = (
     "When true, start the job and return a background job id immediately instead of waiting inline."
 )
