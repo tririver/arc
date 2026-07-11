@@ -283,10 +283,14 @@ Managed ARC workflows use two automation modes:
 - `auto`: continue with safe defaults, while preserving visible warnings.
 - `interactive`: ask for confirmation after major workflow steps.
 
-If you do not specify a mode and the managed workflow choice matters, the skill
-asks once. Direct ARC tool tasks, such as metadata lookup, citer collection, or
-paper summary batches, run automatically unless you ask to review or confirm
-steps.
+The skill asks for a mode only when a human directly invokes a managed workflow
+and explicitly names ARC in the prompt. Agent-invoked workflows, and human
+prompts that do not name ARC, run automatically within the exact requested
+scope. Automatic execution never opts into downstream workflows: a domain-only
+request stops after the domain, and an ideas-only request stops after ranked
+ideas. Direct ARC tool tasks, such as metadata lookup, citer collection, or
+paper summary batches, also run automatically unless you ask to review or
+confirm steps.
 
 ## Use ARC From The CLI
 

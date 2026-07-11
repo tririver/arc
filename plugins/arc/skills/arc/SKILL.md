@@ -11,19 +11,33 @@ or reimplementing paper/domain workflows.
 
 ## Preflight Gate
 
-Before any ARC MCP or CLI call, decide whether the user requested a managed ARC
-workflow run or a direct ARC tool task.
+Before any ARC MCP or CLI call, decide whether the request is a managed ARC
+workflow run or a direct ARC tool task. Also determine whether the current
+request came directly from a human who explicitly named ARC, rather than from
+another agent or from a human request that did not name ARC. Use the message
+provenance exposed by the host; do not classify quoted or forwarded text as a
+direct human invocation. If provenance is unavailable or ambiguous, treat the
+request as not mode-eligible and continue in `auto` without asking.
 
 Managed workflow runs follow `workflows/domain.md`, `workflows/ideas.md`,
 `workflows/check.md`, `workflows/plan.md`, or `workflows/calculate.md`, and
 create project-local workflow artifacts such as domain references, ranked
 ideas, work notes, note-check records, calculation records, reports, rankings,
 recommendations, research directions, or follow-up project directories. For
-these, read `rules/interaction.md` and obtain an explicit automation mode
-before calling ARC paper/domain/LLM tools. Do not perform preliminary calls such
-as `get_metadata`, `get_citers`, `llm_get_summary`, `domain_get_summary`, seed
-resolution, or project-directory derivation before the mode choice. There is no
-"lightweight recommendation" exception for managed workflows.
+these, read `rules/interaction.md`. Ask for an automation mode only when the
+managed workflow was invoked directly by a human whose current prompt
+explicitly names ARC. In that case, obtain the mode before calling ARC
+paper/domain/LLM tools; do not perform preliminary calls such as `get_metadata`,
+`get_citers`, `llm_get_summary`, `domain_get_summary`, seed resolution, or
+project-directory derivation before the mode choice. There is no "lightweight
+recommendation" exception for a mode-eligible managed workflow.
+
+For every other managed invocation, do not ask for an automation mode. Use
+`auto` as the execution mode and perform exactly the workflow scope requested
+by the caller. Finish at that scope boundary: an automatic domain request does
+not authorize idea generation, and automatic idea generation does not
+authorize planning or calculation. Required prerequisites named by the owning
+workflow may still run, but they do not expand the requested outcome.
 
 Direct ARC tool tasks are exempt from the automation mode gate. These include
 bounded paper facts such as title, authors, abstract, citation count, section
@@ -81,20 +95,26 @@ cancel any job because it is slow or time consuming.
 
 ### Phase 1: Setup
 
-Step 1: Decide the automation level.
+Step 1: Decide the automation level and requested scope.
 Use this step only for managed ARC workflow runs. For direct ARC tool tasks,
 skip the Workflow section and use the relevant manuals and MCP/CLI tools
 directly.
 
-For managed workflows, use an explicit user choice. If the user asks for
-automatic or non-interactive work, use `auto`. If the user asks to review or
-confirm steps, use `interactive`. If the user did not specify `auto` or
-`interactive` explicitly, do not infer the mode. Use the host's selection/menu
-tool, following `rules/interaction.md`, with these options: `Run automatically
-(Recommended)`, `Confirm major steps`, and `Discuss before running`. If no
-suitable selection/menu tool is available, use the typed fallback from
+For managed workflows invoked directly by a human whose current prompt
+explicitly names ARC, use an explicit user choice. If that human asks for
+automatic or non-interactive work, use `auto`. If they ask to review or confirm
+steps, use `interactive`. If they did not specify `auto` or `interactive`, do
+not infer the mode. Use the host's selection/menu tool, following
+`rules/interaction.md`, with these options: `Run automatically (Recommended)`,
+`Confirm major steps`, and `Discuss before running`. If no suitable
+selection/menu tool is available, use the typed fallback from
 `rules/interaction.md`. Do not treat `continue`, `resume`, or a bare approval
 to proceed as `auto`.
+
+For agent-invoked managed workflows and human prompts that do not explicitly
+name ARC, set `automation_level` to `auto` without asking. Preserve the
+caller's requested workflow boundary; `auto` suppresses routine confirmation
+questions but never opts the caller into downstream workflows.
 
 Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as
@@ -158,6 +178,9 @@ skill directory and `skill_workflow_json_dir` to
 ### Phase 2: Route Selection
 
 Resolve the user's intent and classify it into one of the four cases below.
+Choose only the case needed for the requested outcome. Run another case only
+when it is an explicit prerequisite below or the caller also requested that
+outcome. Never interpret `auto` as permission to advance to a later case.
 
 Case 1: Build domain references only.
 Read and execute `workflows/domain.md`.

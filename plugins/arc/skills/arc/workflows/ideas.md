@@ -11,7 +11,9 @@ Read `<project-dir>/context.json`. Use the exact `user_intent`.
 Use `skill_dir` from context as `<skill-dir>` in commands below.
 If `<project-dir>/context.json` is missing, or if it does not contain an
 explicit `automation_level`, return to `SKILL.md` Phase 1 Step 1 before doing
-any idea-generation work. Do not synthesize ideas manually.
+any idea-generation work. Agent-invoked or implicit ARC requests receive
+`automation_level: auto` there without a mode question.
+Do not synthesize ideas manually.
 
 ### Phase 1: Prepare Config
 
@@ -119,9 +121,15 @@ per-round reviewer reports from the `arc-llm` loop artifacts.
 
 Step 1: Print the top three ranked ideas on screen.
 
-Step 2: If the workflow is running in auto mode, use the host's selection/menu
-tool, following `rules/interaction.md`, to ask whether to proceed to
-calculation. Use these option labels exactly:
+Step 2: Stop after printing the top three ideas unless the caller explicitly
+requested planning or calculation as part of the original request. In
+particular, `auto` does not authorize either a selection question or a move to
+calculation.
+
+If the caller explicitly requested calculation after idea generation, proceed
+with ranked idea #1 in `auto` mode without asking. In `interactive` mode, use
+the host's selection/menu tool, following `rules/interaction.md`, with these
+option labels exactly:
 
 - `Proceed with ranked idea #1 (Recommended)`
 - `Proceed with ranked idea #2`
@@ -130,5 +138,5 @@ calculation. Use these option labels exactly:
 If no selection/menu tool is available, use the typed fallback from
 `rules/interaction.md` with the same three options.
 
-If the workflow is running in interactive mode, stop after printing the top
-three ideas.
+If the workflow is running in interactive mode and calculation was not
+explicitly requested, stop after printing the top three ideas.

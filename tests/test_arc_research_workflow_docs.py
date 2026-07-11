@@ -50,7 +50,7 @@ def test_arc_skill_has_preflight_gate_for_managed_workflows() -> None:
     assert "domain references" in text
     assert "ranked ideas" in text_flat
     assert "recommendations, research directions" in text_flat
-    assert "There is no \"lightweight recommendation\" exception for managed workflows." in text_flat
+    assert "There is no \"lightweight recommendation\" exception for a mode-eligible managed workflow." in text_flat
     assert "Direct ARC tool tasks are exempt from the automation mode gate" in text_flat
     assert "collecting citers or references" in text_flat
     assert "generating paper summaries or summary batches" in text_flat
@@ -176,7 +176,7 @@ def test_ideas_phase_4_uses_clean_selection_prompt_without_dry_run() -> None:
     assert "Check Planned Calls" not in text
     assert "idea workflow dry run" not in manual.lower()
     assert "### Phase 4: Select Next Action" in text
-    assert "use the host's selection/menu" in lower
+    assert "use the host's selection/menu" in " ".join(lower.split())
     assert "`Proceed with ranked idea #1 (Recommended)`" in text
     assert "`Proceed with ranked idea #2`" in text
     assert "`Proceed with ranked idea #3`" in text
@@ -304,6 +304,45 @@ def test_interaction_rules_define_automation_mode_gate_examples() -> None:
     assert "Run automatically (Recommended)" in text
     assert "Confirm major steps" in text
     assert "Discuss before running" in text
+
+
+def test_automation_mode_gate_depends_on_direct_human_arc_invocation() -> None:
+    skill = " ".join((SKILL / "SKILL.md").read_text(encoding="utf-8").split())
+    interaction = " ".join(
+        (SKILL / "rules/interaction.md").read_text(encoding="utf-8").split()
+    )
+
+    assert "directly by a human whose current prompt explicitly names ARC" in skill
+    assert "Ask for an automation mode only when both conditions are true" in interaction
+    assert "directly from a human whose prompt explicitly names ARC" in interaction
+    assert "Quoted, forwarded, or delegated text does not count" in interaction
+    assert "does not expose reliable provenance" in interaction
+    assert "provenance is unavailable or ambiguous" in skill
+    assert "For an agent-invoked managed workflow" in interaction
+    assert "a human prompt that does not explicitly name ARC" in interaction
+    assert "do not ask for a mode" in interaction
+    assert "set the execution mode to `auto`" in interaction
+    assert "Agent-delegated request" in interaction
+    assert "Direct human prompt" in interaction
+    assert "without naming ARC: do not ask for mode" in interaction
+
+
+def test_automatic_workflows_preserve_requested_scope() -> None:
+    skill = " ".join((SKILL / "SKILL.md").read_text(encoding="utf-8").split())
+    interaction = " ".join(
+        (SKILL / "rules/interaction.md").read_text(encoding="utf-8").split()
+    )
+    domain = " ".join((WF / "domain.md").read_text(encoding="utf-8").split())
+    ideas = " ".join((WF / "ideas.md").read_text(encoding="utf-8").split())
+
+    assert "perform exactly the workflow scope requested by the caller" in skill
+    assert "never opts the caller into downstream workflows" in skill
+    assert "it does not authorize a downstream workflow" in interaction
+    assert "stop after domain construction" in interaction
+    assert "stop after ranked ideas" in interaction
+    assert "`auto` does not authorize idea generation" in domain
+    assert "`auto` does not authorize either a selection question or a move to calculation" in ideas
+    assert "proceed with ranked idea #1 in `auto` mode without asking" in ideas
 
 
 def test_workflow_docs_stay_human_readable() -> None:

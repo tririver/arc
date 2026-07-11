@@ -168,11 +168,14 @@ Do not generate, attach, or copy separate single-paper LLM summaries for the
 foundation paper or best-reference paper as part of the domain build. The
 domain summary should mention both papers briefly instead.
 
-### Phase 4: Interactive Review
+### Phase 4: Scope Boundary and Interactive Review
 
 Case 1: In `interactive` mode, show the domain artifact paths and ask with the
 selection protocol using these options: `Continue with this domain
 (Recommended)`, `Rebuild domain`, and `Discuss before continuing`.
 
 Case 2: In `auto` mode, continue without asking unless a warning or failure
-occurred.
+occurred. Continue only to another workflow that the caller explicitly
+requested or that `SKILL.md` identifies as a prerequisite of the requested
+outcome. If domain construction was the requested outcome, report the domain
+artifacts and stop; `auto` does not authorize idea generation.
