@@ -50,13 +50,13 @@ def main(argv: list[str] | None = None) -> int:
     llm_summary.add_argument("--provider", default="auto")
     llm_summary.add_argument("--model", default=None)
     llm_summary.add_argument(
-        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+        "--model-tier", choices=["max", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
     )
     llm_summary_prefixed = _paper_command(sub, "llm-summary")
     llm_summary_prefixed.add_argument("--provider", default="auto")
     llm_summary_prefixed.add_argument("--model", default=None)
     llm_summary_prefixed.add_argument(
-        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+        "--model-tier", choices=["max", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
     )
 
     generate = sub.add_parser("generate-llm-summary")
@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     generate.add_argument("--provider", default="auto")
     generate.add_argument("--model", default=None)
     generate.add_argument(
-        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+        "--model-tier", choices=["max", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
     )
     generate.add_argument("--refresh", action="store_true")
     generate.add_argument("--json", action="store_true")
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     llm_generate.add_argument("--provider", default="auto")
     llm_generate.add_argument("--model", default=None)
     llm_generate.add_argument(
-        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+        "--model-tier", choices=["max", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
     )
     llm_generate.add_argument("--refresh", action="store_true")
     llm_generate.add_argument("--json", action="store_true")
@@ -188,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--provider", default="auto")
     run.add_argument("--model", default=None)
     run.add_argument(
-        "--model-tier", choices=["xhigh", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
+        "--model-tier", choices=["max", "high", "medium", "low"], default=DEFAULT_SUMMARY_MODEL_TIER
     )
     run.add_argument("--concurrency", type=int, default=1)
     run.add_argument("--max-items", type=int, default=None)

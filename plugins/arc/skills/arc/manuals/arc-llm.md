@@ -236,10 +236,13 @@ Prefer `model_tier` for reusable workflows and package configs. Valid values:
 low
 medium
 high
-xhigh
+max
 ```
 
 `arc-llm` maps these tiers to provider-specific model and reasoning defaults.
+Never select the `max` model tier automatically. Use it only when the user
+explicitly requests the `max` model tier; no workflow default or automatic task
+mapping may select it.
 Python API calls with no exact model or tier resolve to `medium`. Workflow
 `context.json` files should write the explicit string `"medium"` so CLI and MCP
 calls never pass an invalid `"auto"` tier.

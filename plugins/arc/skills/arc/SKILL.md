@@ -167,8 +167,9 @@ Include `automation_level`, `workflow`, `original_request`, `user_intent`,
 `provider`, `model_tier`, `workers`, and `refresh`.
 
 Set `provider` to `auto` unless the user pins a provider. Set `model_tier` to
-`medium` unless the user explicitly asks otherwise. See `manuals/arc-llm.md`
-for model tiers.
+`medium` unless the user explicitly asks otherwise. Never select the `max`
+model tier automatically; use it only when the user explicitly requests the
+`max` model tier. See `manuals/arc-llm.md` for model tiers.
 
 Use a stable safe `run_id`: lowercase ASCII letters, digits, and underscores,
 for example a short intent slug plus UTC timestamp. Set `skill_dir` to the ARC

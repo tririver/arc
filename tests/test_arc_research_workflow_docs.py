@@ -952,6 +952,16 @@ def test_ideas_worker_templates_default_to_high_model_tier() -> None:
     assert reviewer["model_tier"] == "high"
 
 
+def test_max_model_tier_requires_an_explicit_user_request() -> None:
+    skill = " ".join((SKILL / "SKILL.md").read_text(encoding="utf-8").split())
+    manual = " ".join((SKILL / "manuals/arc-llm.md").read_text(encoding="utf-8").split())
+
+    assert "Never select the `max` model tier automatically" in skill
+    assert "only when the user explicitly requests the `max` model tier" in skill
+    assert "Never select the `max` model tier automatically" in manual
+    assert "no workflow default or automatic task mapping may select it" in manual
+
+
 def test_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:
     batch = json.loads((WJ / "ideas-batch.template.json").read_text(encoding="utf-8"))
     variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))

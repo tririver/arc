@@ -62,7 +62,10 @@ CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIR
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
 LLM_PROVIDER_DESCRIPTION = "LLM provider: auto or a built-in provider (codex-cli, claude-cli, manual)."
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
-LLM_MODEL_TIER_DESCRIPTION = "LLM model tier: low, medium, high, or xhigh. Paper summaries default to low."
+LLM_MODEL_TIER_DESCRIPTION = (
+    "LLM model tier: low, medium, high, or max. Paper summaries default to low. "
+    "Never select max automatically; use it only when the user explicitly requests the max model tier."
+)
 BACKGROUND_DESCRIPTION = (
     "When true, start the job and return a background job id immediately instead of waiting inline."
 )
@@ -86,7 +89,10 @@ TRANSLATE_TARGET_LOCALE_DESCRIPTION = "Target locale suffix for output files. De
 TRANSLATE_PROJECT_DIR_DESCRIPTION = "Project directory to scan for same-folder Markdown/PDF report pairs."
 TRANSLATE_QUALITY_DESCRIPTION = "When true, run an additional LLM QA/revision pass after fast translation."
 TRANSLATE_OVERWRITE_DESCRIPTION = "When true, overwrite existing translated Markdown/PDF outputs."
-MODEL_TIER_DESCRIPTION = "LLM model tier for translation work. Defaults to low for speed and cost."
+MODEL_TIER_DESCRIPTION = (
+    "LLM model tier for translation work: low, medium, high, or max. Defaults to low for speed and cost. "
+    "Never select max automatically; use it only when the user explicitly requests the max model tier."
+)
 PARSE_SOURCE_PATH_DESCRIPTION = "Optional local source path. Extension may be .html, .tex, or .pdf."
 PARSE_SOURCE_DESCRIPTION = "Source adapter: auto, ar5iv, html, tex, pdf, or tex-pdf."
 PARSE_ID_DESCRIPTION = "Parsed source id to store in paper_id and use for sources cache filename."

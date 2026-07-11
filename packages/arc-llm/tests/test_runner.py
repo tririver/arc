@@ -1125,7 +1125,7 @@ def test_run_json_passes_model_tier_reasoning_effort_to_codex(monkeypatch):
     run_json(
         "prompt",
         schema={"type": "object"},
-        model_tier="xhigh",
+        model_tier="max",
         env={"ARC_AGENT_HOST": "codex"},
         process_chain=[],
     )

@@ -29,7 +29,7 @@ from ideas_marking import load_marking_scheme, marking_scheme_for_context, marks
 
 JsonRunner = Callable[..., dict[str, Any]]
 BatchRunner = Callable[..., dict[str, Any]]
-MODEL_TIER_RANKS = {"low": 1, "medium": 2, "high": 3}
+MODEL_TIER_RANKS = {"low": 1, "medium": 2, "high": 3, "max": 4}
 
 
 @dataclass(frozen=True)

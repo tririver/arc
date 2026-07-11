@@ -76,7 +76,7 @@ def resolve_llm_config(
     process_chain: Sequence[str] | None = None,
 ) -> LLMConfig:
     if provider == "auto" and model:
-        raise ValueError("Exact model requires explicit provider; use provider=<provider> or model_tier=<low|medium|high|xhigh>.")
+        raise ValueError("Exact model requires explicit provider; use provider=<provider> or model_tier=<low|medium|high|max>.")
     selected = select_llm_provider(
         env=env,
         process_chain=process_chain,

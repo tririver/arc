@@ -8,13 +8,13 @@ PROVIDER_MODEL_TIERS = {
         "low": "gpt-5.6-luna",
         "medium": "gpt-5.6-luna",
         "high": "gpt-5.6-sol",
-        "xhigh": "gpt-5.6-sol",
+        "max": "gpt-5.6-sol",
     },
     "claude-cli": {
         "low": "haiku",
         "medium": "sonnet",
         "high": "opus",
-        "xhigh": "opus",
+        "max": "opus",
     },
 }
 
@@ -23,13 +23,13 @@ PROVIDER_REASONING_EFFORT_TIERS = {
         "low": "medium",
         "medium": "xhigh",
         "high": "high",
-        "xhigh": "max",
+        "max": "max",
     },
     "claude-cli": {
         "low": "low",
         "medium": "medium",
         "high": "high",
-        "xhigh": "high",
+        "max": "high",
     },
 }
 
@@ -45,7 +45,7 @@ DEFAULT_PROVIDER_MODELS = {
     "claude-cli": PROVIDER_MODEL_TIERS["claude-cli"][DEFAULT_MODEL_TIER],
 }
 
-VALID_MODEL_TIERS = frozenset({"low", "medium", "high", "xhigh"})
+VALID_MODEL_TIERS = frozenset({"low", "medium", "high", "max"})
 
 
 class ModelTierError(ValueError):
@@ -73,7 +73,7 @@ def resolve_model_tier(explicit_tier: str | None) -> str:
         return DEFAULT_MODEL_TIER
     normalized = str(tier).strip().lower()
     if normalized not in VALID_MODEL_TIERS:
-        raise ModelTierError("model_tier must be one of: low, medium, high, xhigh")
+        raise ModelTierError("model_tier must be one of: low, medium, high, max")
     return normalized
 
 
