@@ -24,7 +24,12 @@
         ],
         "properties": {
           "domain_label": {"type": "string", "minLength": 1},
-          "representative_seed": {"type": "string", "minLength": 1},
+          "representative_seed": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?:arXiv:(?:[0-9]{4}\\.[0-9]{4,5}|[A-Za-z][A-Za-z0-9.-]{0,63}/[0-9]{7})(?:v[0-9]+)?|doi:10\\.[0-9]{4,9}/[^\\s<>\"?#]+|inspire:[0-9]+)$",
+            "description": "One exact ARC-resolvable paper ID: canonical arXiv:, doi:, or inspire: form; never a title, URL, placeholder, or guessed shorthand."
+          },
           "role_for_anchor": {"enum": ["source", "target", "either"]},
           "transferred_ingredient": {"type": "string", "minLength": 1},
           "target_capability_gap": {"type": "string", "minLength": 1},

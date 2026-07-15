@@ -56,8 +56,14 @@ def select_partner(
     verified: list[dict[str, Any]] = []
     rejected: list[dict[str, str]] = []
     seen_seeds: set[str] = set()
-    for raw in raw_candidates:
+    for index, raw in enumerate(raw_candidates):
         if not isinstance(raw, dict):
+            rejected.append(
+                {
+                    "representative_seed": f"<candidate_{index + 1}_missing>",
+                    "reason": "candidate_is_not_an_object",
+                }
+            )
             continue
         candidate = dict(raw)
         seed = str(candidate.get("representative_seed", "")).strip()
@@ -82,7 +88,8 @@ def select_partner(
         verified.append(candidate)
     if len(verified) < 3:
         raise PartnerSelectionError(
-            "fewer than three proposed representative seeds passed metadata verification"
+            "fewer than three proposed representative seeds passed ARC paper metadata verification "
+            f"({len(verified)}/6 verified); rejected seeds: {_format_rejections(rejected)}"
         )
 
     critic_prompt = _critic_prompt(anchor, verified, user_intent=user_intent)
@@ -135,7 +142,14 @@ def _selector_prompt(anchor: Mapping[str, Any], *, user_intent: str) -> str:
     return (
         "You are selecting a genuinely distinct theoretical-physics domain to pair with an anchor domain. "
         "Propose exactly six open-world candidates; do not select from a supplied list. Do not formulate complete "
-        "research ideas and do not rank the candidates. For each candidate, identify a canonical paper seed, a "
+        "research ideas and do not rank the candidates. For each candidate, identify a canonical representative "
+        "paper using one exact identifier that ARC paper tools can resolve and verify. Prefer an arXiv identifier "
+        "written exactly as arXiv:YYMM.NNNN or arXiv:YYMM.NNNNN for new-style papers, or "
+        "arXiv:archive/YYMMNNN for old-style papers. An exact doi:10.... identifier or inspire:<numeric-recid> "
+        "is also acceptable. Do not return a paper title, author name, URL, journal citation, placeholder, guessed "
+        "identifier, or field label in representative_seed. If the identifier is uncertain, choose another "
+        "canonical paper whose exact ID is known. Use six distinct representative_seed values. For each candidate, "
+        "identify a "
         "specific transferable ingredient, the target capability gap, the required translation, a bounded first "
         "calculation, and physical compatibility risks. Either transfer direction is allowed. Only the target must "
         "receive a substantive contribution; the source may supply a mature method. Reject same-subfield relabeling. "
@@ -208,6 +222,15 @@ def _default_json_runner() -> JsonRunner:
     from arc_llm import run_json
 
     return run_json
+
+
+def _format_rejections(rejected: list[dict[str, str]]) -> str:
+    if not rejected:
+        return "none recorded"
+    return "; ".join(
+        f"{item.get('representative_seed', '<missing>')!r}: {item.get('reason', 'unknown_reason')}"
+        for item in rejected
+    )
 
 
 def _require_strict_source_mode() -> None:
