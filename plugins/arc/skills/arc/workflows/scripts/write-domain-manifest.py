@@ -21,6 +21,7 @@ def build_domain_manifest(project_dir: Path) -> dict[str, Any]:
     context_path = project_dir / "context.json"
     domain_dir = project_dir / "domain"
     context = _read_object(context_path)
+    seed_by_domain = _seed_by_domain(context)
     if not domain_dir.is_dir():
         raise ManifestError(f"domain directory does not exist: {domain_dir}")
 
@@ -50,7 +51,9 @@ def build_domain_manifest(project_dir: Path) -> dict[str, Any]:
         foundation = summary.get("foundation_paper")
         if not isinstance(foundation, dict):
             foundation = {}
-        seed_paper = str(foundation.get("paper_id", "")).strip()
+        seed_paper = seed_by_domain.get(domain_id, "")
+        if not seed_paper:
+            seed_paper = str(foundation.get("paper_id", "")).strip()
         if not seed_paper:
             seed_paper = prefix
 
@@ -116,6 +119,26 @@ def _required_text(payload: dict[str, Any], key: str, path: Path) -> str:
     if not value:
         raise ManifestError(f"{path} is missing required field {key}")
     return value
+
+
+def _seed_by_domain(context: dict[str, Any]) -> dict[str, str]:
+    raw_records = context.get("domain_records", [])
+    if not isinstance(raw_records, list):
+        raise ManifestError("context.json domain_records must be an array")
+    result: dict[str, str] = {}
+    for index, record in enumerate(raw_records):
+        if not isinstance(record, dict):
+            raise ManifestError(f"context.json domain_records[{index}] must be an object")
+        domain_id = str(record.get("domain_id", "")).strip()
+        seed_paper = str(record.get("seed_paper", "")).strip()
+        if not domain_id or not seed_paper:
+            raise ManifestError(
+                f"context.json domain_records[{index}] requires domain_id and seed_paper"
+            )
+        if domain_id in result and result[domain_id] != seed_paper:
+            raise ManifestError(f"conflicting requested seeds recorded for domain {domain_id}")
+        result[domain_id] = seed_paper
+    return result
 
 
 def _relative(root: Path, path: Path) -> str:

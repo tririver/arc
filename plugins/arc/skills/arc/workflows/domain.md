@@ -171,6 +171,11 @@ domain summary should mention both papers briefly instead.
 Step 4: After all distinct domain artifacts have been copied, write the
 project-local domain handoff manifest:
 
+Before running the helper, record each successful build in
+`<project-dir>/context.json` under `domain_records` as objects containing the
+requested `seed_paper` and returned `domain_id`. Do not substitute the selected
+foundation paper for the requested seed; they may differ.
+
 ```bash
 python3 <skill-dir>/workflows/scripts/write-domain-manifest.py \
   --project-dir <project-dir> \

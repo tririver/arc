@@ -61,7 +61,7 @@ def test_pair_manifest_freezes_selected_domains_and_provenance(tmp_path: Path) -
             {
                 "schema_version": "arc.workflow.cross_domain_partner_selection.v1",
                 "anchor": {"domain_id": "anchor-id"},
-                "selected_candidate": {"representative_seed": "seed:partner"},
+                "selected_candidate": {"representative_seed": "SEED:PARTNER"},
             }
         ),
         encoding="utf-8",

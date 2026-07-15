@@ -87,6 +87,28 @@ def test_manifest_preserves_requested_seed_order(tmp_path: Path) -> None:
     assert [item["seed_paper"] for item in payload["domains"]] == ["seed:z", "seed:a"]
 
 
+def test_manifest_prefers_requested_seed_domain_records_over_foundation(tmp_path: Path) -> None:
+    module = _load_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "context.json").write_text(
+        json.dumps(
+            {
+                "seed_paper_list": ["arXiv:1234.5678"],
+                "domain_records": [
+                    {"domain_id": "domain-a", "seed_paper": "arXiv:1234.5678"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_domain(project, "a", "domain-a", "arXiv:9999.0001")
+
+    payload = module.build_domain_manifest(project)
+
+    assert payload["domains"][0]["seed_paper"] == "arXiv:1234.5678"
+
+
 def test_manifest_requires_companion_artifacts(tmp_path: Path) -> None:
     module = _load_module()
     project = tmp_path / "project"

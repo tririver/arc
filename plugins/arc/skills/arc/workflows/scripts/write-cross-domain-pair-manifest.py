@@ -58,7 +58,12 @@ def build_pair_manifest(
         None,
     )
     partner_entry = next(
-        (item for item in domains if isinstance(item, dict) and str(item.get("seed_paper", "")).strip() == partner_seed),
+        (
+            item
+            for item in domains
+            if isinstance(item, dict)
+            and _paper_id_key(str(item.get("seed_paper", ""))) == _paper_id_key(partner_seed)
+        ),
         None,
     )
     if anchor_entry is None:
@@ -120,6 +125,17 @@ def _read_object(path: Path) -> dict[str, Any]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _paper_id_key(value: str) -> str:
+    text = value.strip().lower()
+    if text.startswith("arxiv:"):
+        text = text[6:]
+    if "v" in text:
+        stem, version = text.rsplit("v", 1)
+        if version.isdigit():
+            text = stem
+    return text
 
 
 def _validated_provenance_root(record: dict[str, Any]) -> Path:
