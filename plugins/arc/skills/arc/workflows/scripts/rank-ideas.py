@@ -200,7 +200,7 @@ def _round_entry(
     }
     if cross_context is not None:
         assessment = review.get("review_payload", {}).get("cross_domain_assessment", {})
-        qualified, reasons, signature = _cross_qualification(
+        qualified, reasons, signature, compatibility = _cross_qualification(
             proposer_output,
             assessment,
             entry["marks"],
@@ -212,6 +212,7 @@ def _round_entry(
                 "qualified": qualified,
                 "qualification_reasons": reasons,
                 "cross_domain_assessment": assessment if isinstance(assessment, dict) else {},
+                "compatibility_classification": compatibility,
                 "normalized_transfer_signature": signature,
                 "normalized_central_mechanism": _normalized_central_mechanism(
                     assessment.get("transfer_signature") if isinstance(assessment, Mapping) else None
@@ -297,12 +298,12 @@ def _cross_qualification(
     *,
     cross_context: Mapping[str, Any],
     recovered: bool,
-) -> tuple[bool, list[str], str]:
+) -> tuple[bool, list[str], str, dict[str, Any]]:
     reasons: list[str] = []
     if recovered:
         reasons.append("proposer_or_reviewer_has_major_or_fatal_structured_recovery")
     if not isinstance(assessment, Mapping):
-        return False, [*reasons, "missing_cross_domain_assessment"], ""
+        return False, [*reasons, "missing_cross_domain_assessment"], "", _empty_compatibility_classification()
 
     cards = cross_context.get("domain_cards", [])
     known_domain_ids = {
@@ -337,8 +338,14 @@ def _cross_qualification(
         reasons.append("target_contribution_must_be_substantial_or_transformative")
     if assessment.get("feasibility_status") not in {"feasible", "feasible_with_named_risk"}:
         reasons.append("first_calculation_is_not_feasible")
-    if assessment.get("compatibility_failures"):
-        reasons.append("unresolved_compatibility_failures")
+    compatibility = _compatibility_classification(assessment)
+    if compatibility["blocking_failures"]:
+        reasons.append("blocking_compatibility_failures")
+    if (
+        assessment.get("feasibility_status") == "feasible_with_named_risk"
+        and not compatibility["manageable_risks"]
+    ):
+        reasons.append("feasible_with_named_risk_requires_named_manageable_risk")
     if assessment.get("disqualifying_reasons"):
         reasons.append("reviewer_reported_disqualifying_reasons")
     novelty = assessment.get("novelty_coverage")
@@ -365,7 +372,39 @@ def _cross_qualification(
     signature = _normalized_transfer_signature(assessment.get("transfer_signature"))
     if not signature:
         reasons.append("complete_transfer_signature_is_required")
-    return not reasons, reasons, signature
+    return not reasons, reasons, signature, compatibility
+
+
+def _compatibility_classification(assessment: Mapping[str, Any]) -> dict[str, Any]:
+    if "blocking_compatibility_failures" in assessment or "manageable_compatibility_risks" in assessment:
+        return {
+            "policy": "explicit_blocking_and_manageable_v2",
+            "blocking_failures": _string_list(assessment.get("blocking_compatibility_failures")),
+            "manageable_risks": _string_list(assessment.get("manageable_compatibility_risks")),
+        }
+
+    legacy = _string_list(assessment.get("compatibility_failures"))
+    if assessment.get("feasibility_status") == "feasible_with_named_risk":
+        return {
+            "policy": "legacy_compatibility_failures_as_named_risks",
+            "blocking_failures": [],
+            "manageable_risks": legacy,
+        }
+    return {
+        "policy": "legacy_compatibility_failures_as_blocking",
+        "blocking_failures": legacy,
+        "manageable_risks": [],
+    }
+
+
+def _empty_compatibility_classification() -> dict[str, Any]:
+    return {"policy": "missing_assessment", "blocking_failures": [], "manageable_risks": []}
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _normalized_transfer_signature(raw: Any) -> str:
@@ -410,6 +449,7 @@ def _cross_diagnostics(
                     "title": entry["title"],
                     "qualified": qualified,
                     "qualification_reasons": entry.get("qualification_reasons", []),
+                    "compatibility_classification": entry.get("compatibility_classification", {}),
                     "transfer_signature": entry.get("normalized_transfer_signature", ""),
                     "central_mechanism": entry.get("normalized_central_mechanism", ""),
                     "top_three": (entry["loop_id"], entry["round"]) in top_keys,

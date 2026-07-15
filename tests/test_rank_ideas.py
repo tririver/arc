@@ -385,6 +385,101 @@ def test_cross_domain_portfolio_caps_one_central_mechanism_at_two(tmp_path: Path
     assert payload["diagnostics"]["portfolio_excluded_count"] == 1
 
 
+def test_cross_domain_manageable_compatibility_risk_does_not_block_qualification(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_cross_config(run_root, ["cross_domain_idea_001"])
+    _write_cross_round(
+        run_root,
+        "cross_domain_idea_001",
+        1,
+        title="Feasible with a bounded risk",
+        total=82,
+        assessment=_cross_assessment(
+            feasibility_status="feasible_with_named_risk",
+            manageable_compatibility_risks=["The first calculation must test the translation regime."],
+        ),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["ranking"]] == ["Feasible with a bounded risk"]
+    assert payload["ranking"][0]["compatibility_classification"] == {
+        "policy": "explicit_blocking_and_manageable_v2",
+        "blocking_failures": [],
+        "manageable_risks": ["The first calculation must test the translation regime."],
+    }
+
+
+def test_cross_domain_blocking_compatibility_failure_remains_a_hard_gate(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_cross_config(run_root, ["cross_domain_idea_001"])
+    _write_cross_round(
+        run_root,
+        "cross_domain_idea_001",
+        1,
+        title="Physically incompatible",
+        total=95,
+        assessment=_cross_assessment(
+            feasibility_status="feasible_with_named_risk",
+            blocking_compatibility_failures=["The source and target regimes contradict a conservation law."],
+            manageable_compatibility_risks=["A numerical coefficient remains uncertain."],
+        ),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert payload["ranking"] == []
+    assert payload["unqualified"][0]["title"] == "Physically incompatible"
+    assert "blocking_compatibility_failures" in payload["unqualified"][0]["qualification_reasons"]
+
+
+def test_cross_domain_legacy_compatibility_field_uses_feasibility_status(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    loop_ids = ["cross_domain_idea_001", "cross_domain_idea_002"]
+    _write_cross_config(run_root, loop_ids)
+    legacy_risk = ["Legacy reviewer named a calculation-bounded compatibility risk."]
+    _write_cross_round(
+        run_root,
+        loop_ids[0],
+        1,
+        title="Legacy named risk",
+        total=82,
+        assessment=_cross_assessment(
+            feasibility_status="feasible_with_named_risk",
+            legacy_compatibility_failures=legacy_risk,
+            signature_suffix="legacy-risk",
+        ),
+    )
+    _write_cross_round(
+        run_root,
+        loop_ids[1],
+        1,
+        title="Legacy blocking failure",
+        total=90,
+        assessment=_cross_assessment(
+            feasibility_status="feasible",
+            legacy_compatibility_failures=["Legacy unresolved incompatibility."],
+            signature_suffix="legacy-blocking",
+        ),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["ranking"]] == ["Legacy named risk"]
+    assert payload["ranking"][0]["compatibility_classification"] == {
+        "policy": "legacy_compatibility_failures_as_named_risks",
+        "blocking_failures": [],
+        "manageable_risks": legacy_risk,
+    }
+    failed = payload["unqualified"][0]
+    assert failed["title"] == "Legacy blocking failure"
+    assert failed["compatibility_classification"]["policy"] == "legacy_compatibility_failures_as_blocking"
+    assert "blocking_compatibility_failures" in failed["qualification_reasons"]
+
+
 def _write_cross_config(run_root: Path, loop_ids: list[str]) -> None:
     run_root.mkdir(parents=True, exist_ok=True)
     cards = [{"domain_id": "domain-a"}, {"domain_id": "domain-b"}]
@@ -414,8 +509,11 @@ def _cross_assessment(
     target_contribution_status: str = "substantial",
     feasibility_status: str = "feasible",
     signature_suffix: str = "default",
+    blocking_compatibility_failures: list[str] | None = None,
+    manageable_compatibility_risks: list[str] | None = None,
+    legacy_compatibility_failures: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    assessment = {
         "source_domain_id": "domain-a",
         "target_domain_id": "domain-b",
         "transfer_status": transfer_status,
@@ -424,7 +522,8 @@ def _cross_assessment(
         "target_adaptation_validity": "valid",
         "resulting_new_capability": "new capability",
         "feasibility_status": feasibility_status,
-        "compatibility_failures": [],
+        "blocking_compatibility_failures": blocking_compatibility_failures or [],
+        "manageable_compatibility_risks": manageable_compatibility_risks or [],
         "novelty_coverage": {"source_domain": True, "target_domain": True, "intersection": True},
         "disqualifying_reasons": [],
         "recommended_action": "refine_current",
@@ -435,6 +534,11 @@ def _cross_assessment(
             "first_calculation": f"calculation {signature_suffix}",
         },
     }
+    if legacy_compatibility_failures is not None:
+        assessment.pop("blocking_compatibility_failures")
+        assessment.pop("manageable_compatibility_risks")
+        assessment["compatibility_failures"] = legacy_compatibility_failures
+    return assessment
 
 
 def _write_cross_round(

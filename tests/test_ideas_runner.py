@@ -679,6 +679,9 @@ def test_cross_domain_worker_schemas_are_strict_and_source_to_target(tmp_path: P
         "substantial",
         "transformative",
     ]
+    assert "blocking_compatibility_failures" in assessment["required"]
+    assert "manageable_compatibility_risks" in assessment["required"]
+    assert "compatibility_failures" not in assessment["properties"]
     assert sum(item["maximum"] for item in marking["marks"]) == 100
     prompt = proposer["prompt"]["template"]
     assert "The source domain does not need a new contribution" in prompt

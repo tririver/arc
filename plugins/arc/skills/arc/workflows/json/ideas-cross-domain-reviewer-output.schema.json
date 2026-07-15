@@ -47,7 +47,8 @@
             "target_adaptation_validity",
             "resulting_new_capability",
             "feasibility_status",
-            "compatibility_failures",
+            "blocking_compatibility_failures",
+            "manageable_compatibility_risks",
             "novelty_coverage",
             "disqualifying_reasons",
             "recommended_action",
@@ -62,7 +63,14 @@
             "target_adaptation_validity": {"type": "string", "enum": ["valid", "uncertain", "invalid"]},
             "resulting_new_capability": {"type": "string", "minLength": 1},
             "feasibility_status": {"type": "string", "enum": ["feasible", "feasible_with_named_risk", "infeasible"]},
-            "compatibility_failures": {"type": "array", "items": {"type": "string"}},
+            "blocking_compatibility_failures": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            },
+            "manageable_compatibility_risks": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            },
             "novelty_coverage": {
               "type": "object",
               "additionalProperties": false,
