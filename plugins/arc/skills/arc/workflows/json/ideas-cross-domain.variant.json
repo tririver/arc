@@ -1,0 +1,19 @@
+{
+  "schema_version": "arc.workflow.ideas.variant.v1",
+  "variant_id": "cross_domain",
+  "research_scope": "cross_domain",
+  "description": "Directed cross-domain transfer with structured domain cards, distinct exploration profiles, and hard transfer-quality review.",
+  "loop_template": "ideas-cross-domain-loop.template.json",
+  "proposer_template": "ideas-cross-domain-proposer.template.json",
+  "reviewer_template": "ideas-cross-domain-reviewer.template.json",
+  "reviewer_output_schema": "ideas-cross-domain-reviewer-output.schema.json",
+  "marking_scheme": "ideas-cross-domain-marking-scheme.json",
+  "context_policy": {
+    "require_domain_markdown": false,
+    "attach_domain_markdown": false,
+    "attach_arc_paper_tool_notes": true
+  },
+  "proposer": {
+    "model_tier": "high"
+  }
+}

@@ -1,9 +1,9 @@
 # Ideas Workflow
 
-Use this workflow for Case 2 idea generation. It runs every enabled idea
-variant as concurrent proposer-reviewer loops. Each loop has exactly one
-proposer and exactly one reviewer; the reviewer serves only that proposer and
-sends five reviewer reports per loop by default.
+Use this workflow for Case 2 idea generation. It selects the single-domain or
+cross-domain variant from the project domain manifest, then runs concurrent
+proposer-reviewer loops. Each loop has exactly one proposer and exactly one
+reviewer; the reviewer serves only that proposer and sends five reviewer reports per loop by default.
 
 ## Inputs
 
@@ -29,15 +29,26 @@ Step 2: Copy
 Step 3: Replace `<run-id>`, `<project-dir>`, `<user_intent>`, and
 `<skill-workflow-json-dir>`.
 
+Set `domain_manifest_path` to
+`<project-dir>/domain/domain-manifest.json`. One distinct `domain_id` preserves
+the established single-domain prompts and scoring. Two or more distinct
+domains select the cross-domain prompts, directed transfer profiles, reviewer
+assessment, and qualification gates. A cross-domain run must not proceed with
+a missing or invalid manifest.
+
 Step 4: Keep `variant_glob` as `ideas-*.variant.json`. The release package
-runs only enabled variants; the normal idea-generation workflow uses the
-domain variant.
+runs only enabled variants, then selects only the enabled variant applicable
+to the manifest; it must not run both the single-domain and cross-domain
+variants for the same request.
 
 Step 5: Keep the shipped proposer and reviewer `model_tier` values at `high`
 for normal idea generation unless the user requests another quality/cost tier.
 
 Step 6: Keep `loops_per_variant` at `5` unless the run should use a different
-number of concurrent instances for each setup.
+number of concurrent instances for each setup. Cross-domain runs ship with
+five distinct exploration profiles. If a different loop count is required,
+set top-level `exploration_profiles` to the same number of profile objects so
+the runner never creates duplicate loops that differ only by ID.
 
 ### Phase 2: Run Ideas
 
@@ -64,7 +75,11 @@ The workflow runner writes this generated batch config before launch:
 For proposer-reviewer artifact ownership and runner result shape, see
 `manuals/arc-llm.md`.
 Final ranked ideas must come from `ideas_runner.py` artifacts and the
-read-only ranking helper, not ad-hoc agent judgment.
+read-only ranking helper, not ad-hoc agent judgment. In cross-domain mode,
+only candidates marked as genuine transfers with a substantial target-domain
+contribution and a feasible first calculation are eligible for the formal
+ranking. The source domain may contribute a mature method or mechanism without
+itself receiving a new result.
 
 ### Phase 3: Inspect Artifacts
 
@@ -105,6 +120,13 @@ idea summary, and calculation plan. Render that handoff text as normal
 Markdown paragraphs, not a fenced code block. Follow `rules/math_typeset.md`
 for math and TeX snippets. Use PDF-friendly wrapping for long titles and
 proposer text; avoid wide tables with long prose.
+
+For cross-domain runs, use the abbreviations and score columns declared by the
+selected cross-domain marking scheme. List qualified candidates first in
+formal ranking order, never fill the top three with an unqualified candidate,
+and add an unqualified appendix with explicit reasons. The helper also writes
+`<project-dir>/ideas/<run-id>/cross-domain-diagnostics.json`; report that path
+and print any insufficient-qualified-candidate `WARNING:` messages.
 
 Step 2: After writing the project-level Markdown report, follow
 `manuals/arc-mcp.md` Markdown Report Export for

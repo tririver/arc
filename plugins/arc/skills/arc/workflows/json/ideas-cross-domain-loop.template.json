@@ -1,0 +1,15 @@
+{
+  "loop_id": "<loop-id>",
+  "max_rounds": 5,
+  "early_stop": {
+    "enabled": false
+  },
+  "caller_context": {
+    "user_intent": "<user_intent>",
+    "domain_cards": [],
+    "exploration_profile": {},
+    "arc_paper_tool_notes": "ARC paper MCP tools are available. Use ARC's local paper database before internet search for metadata, sections, cached full text, references, citers, equation context, and nearby literature. Use search_full_text for focused cached ar5iv checks. Use internet search for uncached, recent, or non-arXiv public evidence. Record source, query, and result for novelty checks in the source domain, target domain, and their intersection."
+  },
+  "proposers": [],
+  "reviewers": []
+}

@@ -168,6 +168,22 @@ Do not generate, attach, or copy separate single-paper LLM summaries for the
 foundation paper or best-reference paper as part of the domain build. The
 domain summary should mention both papers briefly instead.
 
+Step 4: After all distinct domain artifacts have been copied, write the
+project-local domain handoff manifest:
+
+```bash
+python3 <skill-dir>/workflows/scripts/write-domain-manifest.py \
+  --project-dir <project-dir> \
+  --json
+```
+
+The command must complete successfully before a requested ideas workflow
+starts. It writes `<project-dir>/domain/domain-manifest.json`, deduplicates
+domains by `domain_id`, and records project-relative paths for each summary and
+paper pack. Do not infer the number of research domains from the number of
+Markdown files or requested seeds. Print a `WARNING:` and stop before ideas if
+the manifest cannot be written or any referenced artifact is missing.
+
 ### Phase 4: Scope Boundary and Interactive Review
 
 Case 1: In `interactive` mode, show the domain artifact paths and ask with the

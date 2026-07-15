@@ -118,6 +118,13 @@ use local `packages/` automatically. For a plugin copy that should install from 
 separate local checkout, set `ARC_MCP_REPO_ROOT` to that checkout root and
 `ARC_MCP_INSTALL_SOURCE=local`.
 
+Development benchmarks that must not fall back to an installed or cached ARC
+copy can set `ARC_REQUIRE_REPO_ROOT` to the checkout root. Workflow scripts then
+prepend that checkout's package sources, verify module origins, and fail before
+LLM work if any ARC module or workflow file comes from another installation.
+Use `verify-source-runtime.py --repo-root <checkout> --output <record.json>` to
+capture module, Git working-tree, and workflow-file provenance.
+
 Check the launcher directly from a source checkout:
 
 ```bash

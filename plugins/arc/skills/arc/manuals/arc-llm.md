@@ -12,6 +12,17 @@ If a workflow script cannot import `arc_llm`, it is using the wrong Python path/
 use the ARC plugin launcher/runtime or source-tree `PYTHONPATH`/`ARC_MCP_REPO_ROOT`,
 not `pip install arc-llm` from PyPI.
 
+For a source-sensitive development run, set
+`ARC_REQUIRE_REPO_ROOT=<checkout-root>`. ARC workflow scripts will then refuse
+installed, marketplace-cached, or other-checkout ARC modules instead of using a
+fallback runtime. Record the exact source state before the run with:
+
+```bash
+python3 <skill-dir>/workflows/scripts/verify-source-runtime.py \
+  --repo-root <checkout-root> \
+  --output <project-dir>/source-provenance.json
+```
+
 ## Provider Diagnosis
 
 ### Phase 1: Check host detection.

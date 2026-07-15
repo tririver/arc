@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import shutil
 import sys
@@ -14,6 +15,14 @@ ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "plugins/arc/skills/arc/workflows"
 WJ = WF / "json"
 WS = WF / "scripts"
+SINGLE_DOMAIN_GOLDEN_SHA256 = {
+    "ideas-domain.variant.json": "5bff07665fdca9a9b9983106bba4954f090cbc2add7ab1edc324e5bd4792ef81",
+    "ideas-loop.template.json": "71fd87242edc47482d42298a7e816bd83f190ac2263b384981f85260d5bd7ae8",
+    "ideas-proposer.template.json": "e6efaa6c250231b0d75c861728f5ffb95cde202f0aaad4900cf115bc9daad70e",
+    "ideas-reviewer.template.json": "5d778af29cad459211315c3f4b1e4a8bfbecc3732e310d7d7b72be36e9050cbd",
+    "ideas-reviewer-output.schema.json": "be8504c44d47bb471488d522720cffaa610d1633b473349e65907b64010dcf0d",
+    "ideas-marking-scheme.json": "a126c2add3c15d13b4911e72687e53528e2374f6ee724ab8d53adca50beaecc1",
+}
 
 
 def _load_runner_module():
@@ -25,6 +34,15 @@ def _load_runner_module():
     finally:
         sys.dont_write_bytecode = old_dont_write_bytecode
         sys.path.remove(str(WS))
+
+
+def test_single_domain_worker_contract_files_match_pre_cross_domain_golden() -> None:
+    actual = {
+        name: hashlib.sha256((WJ / name).read_bytes()).hexdigest()
+        for name in SINGLE_DOMAIN_GOLDEN_SHA256
+    }
+
+    assert actual == SINGLE_DOMAIN_GOLDEN_SHA256
 
 
 def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path) -> None:
@@ -127,6 +145,8 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     )
     assert all(loop["cache_context"]["volatile_caller_context_keys"] == ["idea_id", "variant_id"] for loop in batch_config["loops"])
     assert all("marking_scheme" in loop["caller_context"] for loop in batch_config["loops"])
+    assert all("generation_mode" not in loop["caller_context"] for loop in batch_config["loops"])
+    assert all("domain_cards" not in loop["caller_context"] for loop in batch_config["loops"])
     mark_schema = batch_config["loops"][0]["reviewers"][0]["output_schema"]["properties"]["review_payload"][
         "properties"
     ]["marks"]
@@ -378,6 +398,291 @@ def test_domain_variant_warns_and_continues_without_domain_markdown_when_optiona
     caller_context = seen_batch_configs[0]["loops"][0]["caller_context"]
     assert "domain_markdown_files" not in caller_context
     assert "Domain markdown was unavailable" in "\n".join(caller_context["warnings"])
+
+
+def test_missing_manifest_preserves_legacy_single_domain_route(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WJ),
+        "variant_glob": "ideas-*.variant.json",
+        "loops_per_variant": 1,
+    }
+
+    parsed = runner.load_ideas_config(config)
+
+    assert parsed.research_scope == "single_domain"
+    assert [variant.variant_id for variant in parsed.variants] == ["domain"]
+    assert "domain_manifest_unavailable" in "\n".join(parsed.routing_warnings)
+
+
+def test_strict_source_mode_rejects_external_variant_directory(tmp_path: Path, monkeypatch: Any) -> None:
+    runner = _load_runner_module()
+    external = tmp_path / "installed-plugin-json"
+    external.mkdir()
+    monkeypatch.setenv("ARC_REQUIRE_REPO_ROOT", str(ROOT))
+
+    with pytest.raises(runner.ConfigError, match="requires variant_config_dir from the required checkout"):
+        runner.load_ideas_config(
+            {
+                "schema_version": "arc.workflow.ideas.config.v1",
+                "run_id": "ideas_test",
+                "run_dir": str(tmp_path / "ideas"),
+                "project_dir": str(tmp_path / "project"),
+                "user_intent": "intent",
+                "variant_config_dir": str(external),
+            }
+        )
+
+
+def test_explicit_missing_manifest_fails_instead_of_silently_using_single_domain(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+
+    with pytest.raises(runner.ConfigError, match="domain_manifest_path does not exist"):
+        runner.load_ideas_config(
+            {
+                "schema_version": "arc.workflow.ideas.config.v1",
+                "run_id": "ideas_test",
+                "run_dir": str(project_dir / "ideas"),
+                "project_dir": str(project_dir),
+                "user_intent": "intent",
+                "domain_manifest_path": "domain/missing.json",
+                "variant_config_dir": str(WJ),
+            }
+        )
+
+
+def test_duplicate_manifest_domain_ids_use_single_domain_route(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    domain_dir = project_dir / "domain"
+    domain_dir.mkdir(parents=True)
+    manifest = {
+        "schema_version": "arc.workflow.domain_manifest.v1",
+        "domains": [{"domain_id": "same"}, {"domain_id": "same"}],
+    }
+    (domain_dir / "domain-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+            "variant_glob": "ideas-*.variant.json",
+            "loops_per_variant": 1,
+        }
+    )
+
+    assert parsed.research_scope == "single_domain"
+    assert [variant.variant_id for variant in parsed.variants] == ["domain"]
+
+
+def test_invalid_domain_manifest_fails_before_materializing_ideas(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    domain_dir = project_dir / "domain"
+    domain_dir.mkdir(parents=True)
+    (domain_dir / "domain-manifest.json").write_text(
+        json.dumps({"schema_version": "wrong", "domains": [{"domain_id": "a"}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(runner.ConfigError, match="schema_version must be arc.workflow.domain_manifest.v1"):
+        runner.load_ideas_config(
+            {
+                "schema_version": "arc.workflow.ideas.config.v1",
+                "run_id": "ideas_test",
+                "run_dir": str(project_dir / "ideas"),
+                "project_dir": str(project_dir),
+                "user_intent": "intent",
+                "variant_config_dir": str(WJ),
+            }
+        )
+
+
+def test_cross_domain_manifest_routes_to_structured_profiles_and_contract(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    _write_cross_domain_manifest(project_dir)
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "transfer a useful method",
+        "variant_config_dir": str(WJ),
+        "variant_glob": "ideas-*.variant.json",
+        "loops_per_variant": 5,
+    }
+    seen_batch_configs: list[dict[str, Any]] = []
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        json_runner: Any,
+        base_env: dict[str, str] | None,
+        process_chain: list[str] | None,
+        dry_run: bool = False,
+        max_concurrent_loops: int | None = None,
+    ) -> dict[str, Any]:
+        seen_batch_configs.append(batch_config)
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(run_root),
+            "loops": [],
+        }
+
+    result = runner.run_ideas(config, batch_runner=fake_batch_runner, base_env={})
+
+    assert result["research_scope"] == "cross_domain"
+    assert result["proposal_count"] == 5
+    loops = seen_batch_configs[0]["loops"]
+    assert {loop["loop_id"] for loop in loops} == {
+        "cross_domain_idea_001",
+        "cross_domain_idea_002",
+        "cross_domain_idea_003",
+        "cross_domain_idea_004",
+        "cross_domain_idea_005",
+    }
+    profile_ids = [loop["caller_context"]["exploration_profile"]["profile_id"] for loop in loops]
+    assert profile_ids == [
+        "forward_transfer",
+        "reverse_transfer",
+        "method_transfer",
+        "observable_or_constraint_transfer",
+        "high_upside_wildcard",
+    ]
+    cards = loops[0]["caller_context"]["domain_cards"]
+    assert loops[0]["caller_context"]["generation_mode"] == "cross_domain"
+    assert [card["domain_id"] for card in cards] == ["domain-a", "domain-b"]
+    assert cards[0]["task_focus"]["research_scope"] == "scope a"
+    assert cards[1]["methodology"] == [{"name": "method b"}]
+    assert "domain_markdown_files" not in loops[0]["caller_context"]
+    assert loops[0]["cache_context"]["volatile_caller_context_keys"] == [
+        "idea_id",
+        "variant_id",
+        "exploration_profile",
+    ]
+    proposer_schema = loops[0]["proposers"][0]["output_schema"]
+    assert "domain_roles" in proposer_schema["required"]
+    assert "transfer_map" in proposer_schema["required"]
+    review_payload = loops[0]["reviewers"][0]["output_schema"]["properties"]["review_payload"]
+    assert "cross_domain_assessment" in review_payload["required"]
+    marks = review_payload["properties"]["marks"]
+    assert marks["properties"]["cross_domain_transfer_quality"]["maximum"] == 15
+    assert marks["properties"]["substantive_target_contribution"]["maximum"] == 20
+    assessment = review_payload["properties"]["cross_domain_assessment"]
+    assert assessment["properties"]["recommended_action"]["enum"] == [
+        "refine_current",
+        "rebuild_bridge",
+        "replace_idea",
+    ]
+    assert assessment["properties"]["transfer_status"]["enum"] == [
+        "genuine",
+        "partial",
+        "decorative",
+        "single_domain",
+    ]
+
+
+def test_cross_domain_nondefault_loop_count_requires_explicit_profiles(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    _write_cross_domain_manifest(project_dir)
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WJ),
+        "loops_per_variant": 2,
+    }
+
+    with pytest.raises(runner.ConfigError, match="five default exploration profiles"):
+        runner.load_ideas_config(config)
+
+    config["exploration_profiles"] = [
+        {"profile_id": "custom_forward", "mission": "Transfer A to B."},
+        {"profile_id": "custom_reverse", "mission": "Transfer B to A."},
+    ]
+    parsed = runner.load_ideas_config(config)
+    ideas = runner._materialize_ideas(parsed)  # noqa: SLF001
+
+    assert [idea.caller_context["exploration_profile"]["profile_id"] for idea in ideas] == [
+        "custom_forward",
+        "custom_reverse",
+    ]
+
+
+def test_cross_domain_rejects_manifest_summary_domain_mismatch(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    _write_cross_domain_manifest(project_dir)
+    manifest_path = project_dir / "domain" / "domain-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["domains"][0]["summary_json_path"] = manifest["domains"][1]["summary_json_path"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+        }
+    )
+
+    with pytest.raises(runner.ConfigError, match="points to summary"):
+        runner._materialize_ideas(parsed)  # noqa: SLF001
+
+
+def test_cross_domain_worker_schemas_are_strict_and_source_to_target(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    _write_cross_domain_manifest(project_dir)
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+        }
+    )
+    proposer = json.loads((WJ / "ideas-cross-domain-proposer.template.json").read_text(encoding="utf-8"))
+    reviewer = runner._loop_reviewer_payload(parsed.variants[0])["output_schema"]  # noqa: SLF001
+    marking = json.loads((WJ / "ideas-cross-domain-marking-scheme.json").read_text(encoding="utf-8"))
+
+    _assert_strict_objects(proposer["output_schema"])
+    _assert_strict_objects(reviewer)
+    roles = proposer["output_schema"]["properties"]["domain_roles"]
+    assert roles["required"] == ["source_domain_id", "target_domain_id", "supporting_domain_ids"]
+    assessment = reviewer["properties"]["review_payload"]["properties"]["cross_domain_assessment"]
+    assert "transfer_signature" in assessment["required"]
+    assert assessment["properties"]["target_contribution_status"]["enum"] == [
+        "incremental",
+        "substantial",
+        "transformative",
+    ]
+    assert sum(item["maximum"] for item in marking["marks"]) == 100
+    prompt = proposer["prompt"]["template"]
+    assert "The source domain does not need a new contribution" in prompt
+    assert "Do not demand bidirectional innovation" in prompt
 
 
 def test_ideas_warns_when_reviewer_tier_is_below_proposer(tmp_path: Path) -> None:
@@ -658,3 +963,57 @@ def _workflow_dir_with_reviewer_tier(tmp_path: Path, tier: str) -> Path:
     reviewer["model_tier"] = tier
     reviewer_path.write_text(json.dumps(reviewer, indent=2), encoding="utf-8")
     return workflow_dir
+
+
+def _write_cross_domain_manifest(project_dir: Path) -> None:
+    domain_dir = project_dir / "domain"
+    domain_dir.mkdir(parents=True)
+    domains = []
+    for suffix in ("a", "b"):
+        summary_path = domain_dir / f"{suffix}_domain_summary.json"
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "arc.domain_summary.v4",
+                    "domain_id": f"domain-{suffix}",
+                    "domain_title": f"Domain {suffix.upper()}",
+                    "overview": f"overview {suffix}",
+                    "task_focus": {"research_scope": f"scope {suffix}"},
+                    "methodology": [{"name": f"method {suffix}"}],
+                    "known_solved_cases": [{"case": f"case {suffix}"}],
+                    "open_axes_for_new_work": [{"axis": f"axis {suffix}"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        domains.append(
+            {
+                "domain_id": f"domain-{suffix}",
+                "seed_paper": f"seed:{suffix}",
+                "title": f"Domain {suffix.upper()}",
+                "summary_json_path": f"domain/{summary_path.name}",
+            }
+        )
+    (domain_dir / "domain-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.workflow.domain_manifest.v1",
+                "domain_count": 2,
+                "domains": domains,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _assert_strict_objects(schema: Any) -> None:
+    if isinstance(schema, dict):
+        if schema.get("type") == "object":
+            assert schema.get("additionalProperties") is False
+            properties = schema.get("properties", {})
+            assert set(schema.get("required", [])) == set(properties)
+        for value in schema.values():
+            _assert_strict_objects(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            _assert_strict_objects(item)

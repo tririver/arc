@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ranked_candidates"],
+  "properties": {
+    "ranked_candidates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "representative_seed",
+          "bridge_physical_feasibility",
+          "transferred_ingredient_specificity",
+          "substantive_target_opportunity",
+          "semantic_distinctness",
+          "hard_gate_passed",
+          "hard_gate_failures",
+          "reasoning"
+        ],
+        "properties": {
+          "representative_seed": {"type": "string", "minLength": 1},
+          "bridge_physical_feasibility": {"type": "integer", "minimum": 0, "maximum": 35},
+          "transferred_ingredient_specificity": {"type": "integer", "minimum": 0, "maximum": 25},
+          "substantive_target_opportunity": {"type": "integer", "minimum": 0, "maximum": 25},
+          "semantic_distinctness": {"type": "integer", "minimum": 0, "maximum": 15},
+          "hard_gate_passed": {"type": "boolean"},
+          "hard_gate_failures": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "reasoning": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

@@ -4,6 +4,7 @@
   "run_dir": "<project-dir>/ideas",
   "project_dir": "<project-dir>",
   "user_intent": "<user_intent>",
+  "domain_manifest_path": "<project-dir>/domain/domain-manifest.json",
   "variant_config_dir": "<skill-workflow-json-dir>",
   "variant_glob": "ideas-*.variant.json",
   "loops_per_variant": 5,

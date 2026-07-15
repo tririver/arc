@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -265,6 +266,212 @@ def test_rank_run_includes_unstructured_round_without_marks(tmp_path: Path) -> N
     assert entry["title"] == "Output did not satisfy the requested JSON schema."
     assert entry["marks"]["total_score"] == 0
     assert all(value == 0 for value in entry["marks"].values())
+
+
+def test_cross_domain_rank_uses_qualification_before_score(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_cross_config(run_root, ["cross_domain_idea_001", "cross_domain_idea_002"])
+    _write_cross_round(
+        run_root,
+        "cross_domain_idea_001",
+        1,
+        title="Decorative high score",
+        total=96,
+        assessment=_cross_assessment(transfer_status="decorative"),
+    )
+    _write_cross_round(
+        run_root,
+        "cross_domain_idea_001",
+        2,
+        title="Genuine lower score",
+        total=75,
+        assessment=_cross_assessment(signature_suffix="one"),
+    )
+    _write_cross_round(
+        run_root,
+        "cross_domain_idea_002",
+        1,
+        title="Incremental target",
+        total=99,
+        assessment=_cross_assessment(target_contribution_status="incremental", signature_suffix="two"),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert payload["schema_version"] == "arc.ideas.selected_rounds.v2"
+    assert payload["ranking"][0]["title"] == "Genuine lower score"
+    assert payload["ranking"][0]["round"] == 2
+    assert payload["unqualified"][0]["title"] == "Incremental target"
+    assert "target_contribution_must_be_substantial_or_transformative" in payload["unqualified"][0][
+        "qualification_reasons"
+    ]
+    assert payload["warnings"]
+    markdown = ranker.markdown_table(payload)
+    assert "# Appendix: Unqualified Cross-Domain Candidates" in markdown
+    assert "Decorative high score" not in markdown.split("# Appendix: Idea Details", 1)[0]
+
+
+def test_cross_domain_top_three_requires_distinct_transfer_signatures(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    loop_ids = [f"cross_domain_idea_{index:03d}" for index in range(1, 5)]
+    _write_cross_config(run_root, loop_ids)
+    signatures = ["same", "same", "different-a", "different-b"]
+    for index, (loop_id, signature) in enumerate(zip(loop_ids, signatures), start=1):
+        _write_cross_round(
+            run_root,
+            loop_id,
+            1,
+            title=f"Idea {index}",
+            total=90 - index,
+            assessment=_cross_assessment(signature_suffix=signature),
+        )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["top_three"]] == ["Idea 1", "Idea 3", "Idea 4"]
+    assert [entry["title"] for entry in payload["ranking"][:3]] == ["Idea 1", "Idea 3", "Idea 4"]
+    assert payload["diagnostics"]["distinct_qualified_transfer_signatures"] == 3
+
+
+def test_cross_domain_cli_writes_diagnostics(tmp_path: Path) -> None:
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_cross_config(run_root, ["cross_domain_idea_001"])
+    _write_cross_round(
+        run_root,
+        "cross_domain_idea_001",
+        1,
+        title="Qualified",
+        total=80,
+        assessment=_cross_assessment(),
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), str(run_root), "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    diagnostics_path = run_root.parent / "cross-domain-diagnostics.json"
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    assert diagnostics["schema_version"] == "arc.ideas.cross_domain_diagnostics.v1"
+    assert diagnostics["qualified_count"] == 1
+
+
+def test_cross_domain_portfolio_caps_one_central_mechanism_at_two(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    loop_ids = [f"cross_domain_idea_{index:03d}" for index in range(1, 4)]
+    _write_cross_config(run_root, loop_ids)
+    for index, loop_id in enumerate(loop_ids, start=1):
+        assessment = _cross_assessment(signature_suffix=f"result-{index}")
+        assessment["transfer_signature"]["transferred_ingredient"] = "same central ingredient"
+        _write_cross_round(
+            run_root,
+            loop_id,
+            1,
+            title=f"Mechanism idea {index}",
+            total=91 - index,
+            assessment=assessment,
+        )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["ranking"]] == ["Mechanism idea 1", "Mechanism idea 2"]
+    assert [entry["title"] for entry in payload["portfolio_excluded"]] == ["Mechanism idea 3"]
+    assert payload["diagnostics"]["portfolio_excluded_count"] == 1
+
+
+def _write_cross_config(run_root: Path, loop_ids: list[str]) -> None:
+    run_root.mkdir(parents=True, exist_ok=True)
+    cards = [{"domain_id": "domain-a"}, {"domain_id": "domain-b"}]
+    (run_root / "config.json").write_text(
+        json.dumps(
+            {
+                "loops": [
+                    {
+                        "loop_id": loop_id,
+                        "caller_context": {
+                            "variant_id": "cross_domain",
+                            "generation_mode": "cross_domain",
+                            "domain_cards": cards,
+                        },
+                    }
+                    for loop_id in loop_ids
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _cross_assessment(
+    *,
+    transfer_status: str = "genuine",
+    target_contribution_status: str = "substantial",
+    feasibility_status: str = "feasible",
+    signature_suffix: str = "default",
+) -> dict[str, Any]:
+    return {
+        "source_domain_id": "domain-a",
+        "target_domain_id": "domain-b",
+        "transfer_status": transfer_status,
+        "target_contribution_status": target_contribution_status,
+        "source_ingredient_validity": "valid",
+        "target_adaptation_validity": "valid",
+        "resulting_new_capability": "new capability",
+        "feasibility_status": feasibility_status,
+        "compatibility_failures": [],
+        "novelty_coverage": {"source_domain": True, "target_domain": True, "intersection": True},
+        "disqualifying_reasons": [],
+        "recommended_action": "refine_current",
+        "transfer_signature": {
+            "direction": "domain-a to domain-b",
+            "transferred_ingredient": f"ingredient {signature_suffix}",
+            "target_result": f"result {signature_suffix}",
+            "first_calculation": f"calculation {signature_suffix}",
+        },
+    }
+
+
+def _write_cross_round(
+    run_root: Path,
+    loop_id: str,
+    round_number: int,
+    *,
+    title: str,
+    total: int,
+    assessment: dict[str, Any],
+) -> None:
+    marks = {
+        "user_intent_relevance": 12,
+        "cross_domain_transfer_quality": 12,
+        "substantive_target_contribution": 16,
+        "novelty": 8,
+        "confidence_of_novelty": 7,
+        "scientific_value": 8,
+        "calculation_feasibility": 7,
+        "problem_well_definedness": 7,
+        "total_score": total,
+    }
+    _write_round(
+        run_root,
+        loop_id,
+        round_number,
+        title=title,
+        marks=marks,
+        proposer_extra={
+            "domain_roles": {
+                "source_domain_id": "domain-a",
+                "target_domain_id": "domain-b",
+                "supporting_domain_ids": [],
+            }
+        },
+        review_extra={"review_payload": {"marks": marks, "cross_domain_assessment": assessment}},
+    )
 
 
 def _write_round(

@@ -1,0 +1,97 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "arc.llm.review_envelope.v1"},
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message", "stop_requested"],
+      "properties": {
+        "message": {"type": "string", "minLength": 1},
+        "stop_requested": {"type": "boolean"}
+      }
+    },
+    "proposer_messages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposer_001"],
+      "properties": {
+        "proposer_001": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["message"],
+          "properties": {"message": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "review_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marks", "cross_domain_assessment", "improvement_comments", "evidence_checked", "tool_queries_used"],
+      "properties": {
+        "marks": {
+          "type": "object",
+          "$comment": "Generated from ideas-cross-domain-marking-scheme.json by ideas_runner.py."
+        },
+        "cross_domain_assessment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_domain_id",
+            "target_domain_id",
+            "transfer_status",
+            "target_contribution_status",
+            "source_ingredient_validity",
+            "target_adaptation_validity",
+            "resulting_new_capability",
+            "feasibility_status",
+            "compatibility_failures",
+            "novelty_coverage",
+            "disqualifying_reasons",
+            "recommended_action",
+            "transfer_signature"
+          ],
+          "properties": {
+            "source_domain_id": {"type": "string", "minLength": 1},
+            "target_domain_id": {"type": "string", "minLength": 1},
+            "transfer_status": {"type": "string", "enum": ["genuine", "partial", "decorative", "single_domain"]},
+            "target_contribution_status": {"type": "string", "enum": ["incremental", "substantial", "transformative"]},
+            "source_ingredient_validity": {"type": "string", "enum": ["valid", "uncertain", "invalid"]},
+            "target_adaptation_validity": {"type": "string", "enum": ["valid", "uncertain", "invalid"]},
+            "resulting_new_capability": {"type": "string", "minLength": 1},
+            "feasibility_status": {"type": "string", "enum": ["feasible", "feasible_with_named_risk", "infeasible"]},
+            "compatibility_failures": {"type": "array", "items": {"type": "string"}},
+            "novelty_coverage": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source_domain", "target_domain", "intersection"],
+              "properties": {
+                "source_domain": {"type": "boolean"},
+                "target_domain": {"type": "boolean"},
+                "intersection": {"type": "boolean"}
+              }
+            },
+            "disqualifying_reasons": {"type": "array", "items": {"type": "string"}},
+            "recommended_action": {"type": "string", "enum": ["refine_current", "rebuild_bridge", "replace_idea"]},
+            "transfer_signature": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["direction", "transferred_ingredient", "target_result", "first_calculation"],
+              "properties": {
+                "direction": {"type": "string", "minLength": 1},
+                "transferred_ingredient": {"type": "string", "minLength": 1},
+                "target_result": {"type": "string", "minLength": 1},
+                "first_calculation": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        },
+        "improvement_comments": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "evidence_checked": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "tool_queries_used": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+      }
+    }
+  }
+}

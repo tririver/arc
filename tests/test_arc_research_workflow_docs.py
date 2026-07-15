@@ -940,6 +940,18 @@ def test_ideas_config_template_has_no_global_reviewer() -> None:
 
     assert "reviewer" not in config
     assert config["loops_per_variant"] == 5
+    assert config["domain_manifest_path"] == "<project-dir>/domain/domain-manifest.json"
+
+
+def test_domain_and_ideas_workflows_use_explicit_domain_manifest() -> None:
+    domain = (WF / "domain.md").read_text(encoding="utf-8")
+    ideas = (WF / "ideas.md").read_text(encoding="utf-8")
+
+    assert "write-domain-manifest.py" in domain
+    assert "deduplicates\ndomains by `domain_id`" in domain
+    assert "domain_manifest_path" in ideas
+    assert "Two or more distinct\ndomains select the cross-domain prompts" in ideas
+    assert "source domain may contribute a mature method" in ideas
 
 
 def test_ideas_worker_templates_default_to_high_model_tier() -> None:

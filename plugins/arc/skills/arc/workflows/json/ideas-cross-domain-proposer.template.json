@@ -1,0 +1,79 @@
+{
+  "id": "proposer_001",
+  "prompt": {
+    "system": "You are an ambitious theoretical-physics researcher designing a genuine, feasible cross-domain transfer.",
+    "template": "Use the exact user_intent, caller_context.domain_cards, caller_context.exploration_profile, caller_context.marking_scheme, arc_paper_tool_notes, and prior correspondence. Propose or substantially revise exactly one directed source-to-target idea. Follow the assigned exploration profile rather than converging on the same bridge as other loops. A valid idea transfers one specific mature method, mechanism, formal structure, observable, or constraint from a source domain, adapts it to a distinct target domain, and produces a substantive target-domain result. The source domain does not need a new contribution. Do not demand bidirectional innovation. Removing the source ingredient need only remove the new capability or route, or reduce it to a routine approach; it need not make the target question impossible. Be aggressive about scientific upside while preserving physical compatibility and a bounded first calculation. A shared word, loose analogy, parallel motivation, or unadapted import is not cross-domain innovation. Before finalizing, compare several possible bridges internally and keep the strongest feasible one. State a concrete translation dictionary, assumptions, compatibility or regime checks, the new target capability, and the counterfactual without the source ingredient. If the prior bridge is decorative or cannot yield a substantive target result, rebuild the bridge or replace the idea rather than making cosmetic edits. Use caller_context.marking_scheme as a scientific quality checklist without discussing scores. Run focused novelty checks in the source domain, target domain, and their intersection, using ARC tools before internet search and search_full_text for cached full text. Record source, query, and result. Make the first calculation bounded and executable: identify the object, setup, assumptions, route, deliverable, validation, and an explicit kill criterion. Use report-ready Markdown math with valid LaTeX or UTF-8 symbols."
+  },
+  "output_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "title",
+      "idea_summary",
+      "motivation",
+      "domain_roles",
+      "target_contribution",
+      "transfer_map",
+      "bold_hypothesis",
+      "translation_assumptions",
+      "compatibility_checks",
+      "novelty_checks",
+      "calculation_plan",
+      "expected_deliverable",
+      "validation_checks",
+      "kill_criteria",
+      "risks"
+    ],
+    "properties": {
+      "title": {"type": "string", "minLength": 1},
+      "idea_summary": {"type": "string", "minLength": 1},
+      "motivation": {"type": "string", "minLength": 1},
+      "domain_roles": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_domain_id", "target_domain_id", "supporting_domain_ids"],
+        "properties": {
+          "source_domain_id": {"type": "string", "minLength": 1},
+          "target_domain_id": {"type": "string", "minLength": 1},
+          "supporting_domain_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "target_contribution": {"type": "string", "minLength": 1},
+      "transfer_map": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_ingredient", "target_adaptation", "resulting_new_capability", "counterfactual_without_source"],
+        "properties": {
+          "source_ingredient": {"type": "string", "minLength": 1},
+          "target_adaptation": {"type": "string", "minLength": 1},
+          "resulting_new_capability": {"type": "string", "minLength": 1},
+          "counterfactual_without_source": {"type": "string", "minLength": 1}
+        }
+      },
+      "bold_hypothesis": {"type": "string", "minLength": 1},
+      "translation_assumptions": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+      "compatibility_checks": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+      "novelty_checks": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_domain", "target_domain", "intersection"],
+        "properties": {
+          "source_domain": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "target_domain": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "intersection": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+        }
+      },
+      "calculation_plan": {"type": "string", "minLength": 1},
+      "expected_deliverable": {"type": "string", "minLength": 1},
+      "validation_checks": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+      "kill_criteria": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+      "risks": {"type": "array", "items": {"type": "string", "minLength": 1}}
+    }
+  },
+  "runtime": {
+    "allow_internet": true,
+    "allow_mcp": true,
+    "mcp_mode": "arc-only",
+    "codex_sandbox": "read-only"
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "schema_version": "arc.workflow.ideas.marking_scheme.v1",
+  "calibration_guidance": "Use the full numeric range. High scientific upside is welcome only when the transfer is concrete, adapted, compatible, and calculable. A plausible analogy or an incremental target application should not receive a high total.",
+  "marks": [
+    {
+      "field": "user_intent_relevance",
+      "label": "Intent Relevance",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score alignment with the user's requested scientific outcome, target, and constraints."
+    },
+    {
+      "field": "cross_domain_transfer_quality",
+      "label": "Transfer",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "15 requires a specific valid source ingredient, a nontrivial target adaptation, and a new target capability; loose analogies or decorative imports score near zero."
+    },
+    {
+      "field": "substantive_target_contribution",
+      "label": "Target Contribution",
+      "minimum": 0,
+      "maximum": 20,
+      "guidance": "Score the importance and specificity of the new target-domain result. The source domain need not receive a contribution. Substantial work begins at 14."
+    },
+    {
+      "field": "novelty",
+      "label": "Novelty",
+      "minimum": 0,
+      "maximum": 10,
+      "guidance": "Score publishable novelty of the combined source-to-target proposal if successful."
+    },
+    {
+      "field": "confidence_of_novelty",
+      "label": "Confidence",
+      "minimum": 0,
+      "maximum": 10,
+      "guidance": "Score evidence that the proposal is unclaimed after focused source-domain, target-domain, and intersection searches."
+    },
+    {
+      "field": "scientific_value",
+      "label": "Value",
+      "minimum": 0,
+      "maximum": 10,
+      "guidance": "Score scientific upside and whether target-domain experts should care about the completed result."
+    },
+    {
+      "field": "calculation_feasibility",
+      "label": "Feasibility",
+      "minimum": 0,
+      "maximum": 10,
+      "guidance": "Score whether the bounded first calculation is physically compatible, executable, validated, and paired with a useful kill criterion."
+    },
+    {
+      "field": "problem_well_definedness",
+      "label": "Well-definedness",
+      "minimum": 0,
+      "maximum": 10,
+      "guidance": "Score whether domains, translation map, setup, assumptions, observable, and deliverable are sharp enough to begin work."
+    }
+  ],
+  "total_score": {
+    "field": "total_score",
+    "label": "Total",
+    "minimum": 0,
+    "maximum": 100,
+    "guidance": "Set total_score to the closest integer after summing all marks. Eligibility is a separate hard gate and cannot be repaired by a high total."
+  },
+  "tie_break_order": [
+    "total_score",
+    "substantive_target_contribution",
+    "cross_domain_transfer_quality",
+    "scientific_value",
+    "calculation_feasibility",
+    "problem_well_definedness",
+    "confidence_of_novelty",
+    "novelty",
+    "user_intent_relevance"
+  ]
+}

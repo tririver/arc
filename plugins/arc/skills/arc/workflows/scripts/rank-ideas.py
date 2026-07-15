@@ -8,14 +8,34 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 WORKFLOW_DIR = Path(__file__).resolve().parents[1]
 if str(WORKFLOW_DIR) not in sys.path:
     sys.path.insert(0, str(WORKFLOW_DIR))
 
-from ideas_marking import normalized_marks, rank_key_from_marks, report_columns, score_fields  # noqa: E402
+from ideas_marking import (  # noqa: E402
+    load_marking_scheme,
+    normalized_marks,
+    rank_key_from_marks,
+    report_columns,
+    score_fields,
+)
+
+
+CROSS_MARKING_SCHEME = WORKFLOW_DIR / "json" / "ideas-cross-domain-marking-scheme.json"
+CROSS_REPORT_COLUMNS = [
+    ("IR", "user_intent_relevance"),
+    ("TR", "cross_domain_transfer_quality"),
+    ("TC", "substantive_target_contribution"),
+    ("N", "novelty"),
+    ("CN", "confidence_of_novelty"),
+    ("SV", "scientific_value"),
+    ("F", "calculation_feasibility"),
+    ("WD", "problem_well_definedness"),
+    ("T", "total_score"),
+]
 
 
 def main() -> None:
@@ -27,6 +47,12 @@ def main() -> None:
     args = parser.parse_args()
 
     payload = rank_run(args.run_root)
+    if payload.get("cross_domain"):
+        diagnostics_path = args.run_root.resolve().parent / "cross-domain-diagnostics.json"
+        diagnostics_path.write_text(
+            json.dumps(payload["diagnostics"], indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     if args.format == "json":
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
@@ -39,27 +65,96 @@ def rank_run(run_root: Path) -> dict[str, Any]:
     if not loops_root.is_dir():
         raise SystemExit(f"missing loops directory: {loops_root}")
 
+    cross_contexts = _cross_domain_contexts(run_root)
+    cross_domain = bool(cross_contexts)
+    scheme = load_marking_scheme(CROSS_MARKING_SCHEME) if cross_domain else None
     selected = []
+    unqualified = []
     for loop_root in sorted(path for path in loops_root.iterdir() if path.is_dir()):
-        loop_rounds = [_round_entry(loop_root, round_root) for round_root in _round_dirs(loop_root)]
+        loop_context = cross_contexts.get(loop_root.name, {})
+        loop_rounds = [
+            _round_entry(loop_root, round_root, scheme=scheme, cross_context=loop_context if cross_domain else None)
+            for round_root in _round_dirs(loop_root)
+        ]
         loop_rounds = [entry for entry in loop_rounds if entry is not None]
         if not loop_rounds:
             continue
-        best = dict(max(loop_rounds, key=_rank_key))
+        if cross_domain:
+            qualified_rounds = [entry for entry in loop_rounds if entry.get("qualified")]
+            if not qualified_rounds:
+                best_failed = dict(max(loop_rounds, key=lambda item: _rank_key(item, scheme=scheme)))
+                best_failed["rounds"] = loop_rounds
+                unqualified.append(best_failed)
+                continue
+            best = dict(max(qualified_rounds, key=lambda item: _rank_key(item, scheme=scheme)))
+        else:
+            best = dict(max(loop_rounds, key=_rank_key))
         best["rounds"] = loop_rounds
         selected.append(best)
 
-    ranking = sorted(selected, key=_rank_key, reverse=True)
+    ranking = sorted(selected, key=lambda item: _rank_key(item, scheme=scheme), reverse=True)
+    warnings: list[str] = []
+    top_three: list[dict[str, Any]] = []
+    portfolio_excluded: list[dict[str, Any]] = []
+    if cross_domain:
+        mechanism_counts: dict[str, int] = {}
+        portfolio_ranking: list[dict[str, Any]] = []
+        for entry in ranking:
+            mechanism = str(entry.get("normalized_central_mechanism", ""))
+            if mechanism and mechanism_counts.get(mechanism, 0) >= 2:
+                excluded = dict(entry)
+                excluded["portfolio_exclusion_reason"] = "central_mechanism_cap_2"
+                portfolio_excluded.append(excluded)
+                continue
+            portfolio_ranking.append(entry)
+            if mechanism:
+                mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+        ranking = portfolio_ranking
+        used_signatures: set[str] = set()
+        for entry in ranking:
+            signature = str(entry.get("normalized_transfer_signature", ""))
+            if not signature or signature in used_signatures:
+                continue
+            top_three.append(entry)
+            used_signatures.add(signature)
+            if len(top_three) == 3:
+                break
+        if len(top_three) < 3:
+            warnings.append(
+                f"WARNING: only {len(top_three)} qualified, transfer-distinct cross-domain candidates are available; "
+                "the top three were not padded with unqualified or duplicate candidates."
+            )
+        top_ids = {(entry["loop_id"], entry["round"]) for entry in top_three}
+        ranking = [*top_three, *[entry for entry in ranking if (entry["loop_id"], entry["round"]) not in top_ids]]
     for index, entry in enumerate(ranking, start=1):
         entry["rank"] = index
-
-    return {
+    payload = {
         "schema_version": "arc.ideas.selected_rounds.v1",
         "run_root": str(run_root),
         "user_intent": _run_user_intent(run_root),
-        "summary_order": selected,
+        "summary_order": ranking if cross_domain else selected,
         "ranking": ranking,
     }
+    if cross_domain:
+        payload.update(
+            {
+                "schema_version": "arc.ideas.selected_rounds.v2",
+                "cross_domain": True,
+                "top_three": top_three,
+                "unqualified": unqualified,
+                "portfolio_excluded": portfolio_excluded,
+                "warnings": warnings,
+                "diagnostics": _cross_diagnostics(
+                    run_root,
+                    ranking=ranking,
+                    top_three=top_three,
+                    unqualified=unqualified,
+                    portfolio_excluded=portfolio_excluded,
+                    warnings=warnings,
+                ),
+            }
+        )
+    return payload
 
 
 def _round_dirs(loop_root: Path) -> list[Path]:
@@ -69,7 +164,13 @@ def _round_dirs(loop_root: Path) -> list[Path]:
     return sorted(path for path in rounds_root.iterdir() if path.is_dir() and path.name.startswith("round_"))
 
 
-def _round_entry(loop_root: Path, round_root: Path) -> dict[str, Any] | None:
+def _round_entry(
+    loop_root: Path,
+    round_root: Path,
+    *,
+    scheme: Mapping[str, Any] | None = None,
+    cross_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
     proposer_output_path = _first_json(round_root / "proposer_outputs")
     review_path = _first_json(round_root / "reviews")
     if proposer_output_path is None or review_path is None:
@@ -79,23 +180,45 @@ def _round_entry(loop_root: Path, round_root: Path) -> dict[str, Any] | None:
     proposer_output_text = proposer_output_path.read_text(encoding="utf-8")
     review = _read_json(review_path)
     marks = review.get("review_payload", {}).get("marks", {})
+    recovered = _major_recovered(review) or _major_recovered(proposer_output)
     if "total_score" not in marks:
-        marks = {field: 0 for field in score_fields()}
+        marks = {field: 0 for field in score_fields(scheme)}
         marks["total_score"] = 0
-    if _major_recovered(review) or _major_recovered(proposer_output):
-        marks = {field: 0 for field in score_fields()}
+    if recovered:
+        marks = {field: 0 for field in score_fields(scheme)}
 
     relative = lambda path: str(path.relative_to(loop_root.parents[1]))
-    return {
+    entry = {
         "loop_id": loop_root.name,
         "round": _round_number(round_root),
         "title": str(proposer_output.get("title") or proposer_output.get("warning") or "Recovered / unstructured idea"),
-        "marks": normalized_marks(marks),
+        "marks": normalized_marks(marks, scheme),
         "proposer_output": proposer_output,
         "proposer_output_text": proposer_output_text,
         "proposer_output_path": relative(proposer_output_path),
         "review_path": relative(review_path),
     }
+    if cross_context is not None:
+        assessment = review.get("review_payload", {}).get("cross_domain_assessment", {})
+        qualified, reasons, signature = _cross_qualification(
+            proposer_output,
+            assessment,
+            entry["marks"],
+            cross_context=cross_context,
+            recovered=recovered,
+        )
+        entry.update(
+            {
+                "qualified": qualified,
+                "qualification_reasons": reasons,
+                "cross_domain_assessment": assessment if isinstance(assessment, dict) else {},
+                "normalized_transfer_signature": signature,
+                "normalized_central_mechanism": _normalized_central_mechanism(
+                    assessment.get("transfer_signature") if isinstance(assessment, Mapping) else None
+                ),
+            }
+        )
+    return entry
 
 def _first_json(root: Path) -> Path | None:
     if not root.is_dir():
@@ -138,6 +261,192 @@ def _run_user_intent(run_root: Path) -> str:
     return ""
 
 
+def _cross_domain_contexts(run_root: Path) -> dict[str, dict[str, Any]]:
+    candidates = [run_root / "config.json", run_root.parent / "ideas_batch_config.json"]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            payload = _read_json(path)
+        except (OSError, json.JSONDecodeError, SystemExit):
+            continue
+        loops = payload.get("loops")
+        if not isinstance(loops, list):
+            continue
+        contexts: dict[str, dict[str, Any]] = {}
+        for loop in loops:
+            if not isinstance(loop, dict):
+                continue
+            context = loop.get("caller_context")
+            if not isinstance(context, dict):
+                continue
+            if context.get("generation_mode") != "cross_domain" and context.get("variant_id") != "cross_domain":
+                continue
+            loop_id = str(loop.get("loop_id", "")).strip()
+            if loop_id:
+                contexts[loop_id] = context
+        if contexts:
+            return contexts
+    return {}
+
+
+def _cross_qualification(
+    proposer: Mapping[str, Any],
+    assessment: Any,
+    marks: Mapping[str, Any],
+    *,
+    cross_context: Mapping[str, Any],
+    recovered: bool,
+) -> tuple[bool, list[str], str]:
+    reasons: list[str] = []
+    if recovered:
+        reasons.append("proposer_or_reviewer_has_major_or_fatal_structured_recovery")
+    if not isinstance(assessment, Mapping):
+        return False, [*reasons, "missing_cross_domain_assessment"], ""
+
+    cards = cross_context.get("domain_cards", [])
+    known_domain_ids = {
+        str(card.get("domain_id", "")).strip()
+        for card in cards
+        if isinstance(card, Mapping) and str(card.get("domain_id", "")).strip()
+    }
+    source = str(assessment.get("source_domain_id", "")).strip()
+    target = str(assessment.get("target_domain_id", "")).strip()
+    if not source or not target or source == target:
+        reasons.append("source_and_target_must_be_distinct")
+    if source not in known_domain_ids or target not in known_domain_ids:
+        reasons.append("source_or_target_is_not_a_manifest_domain")
+
+    roles = proposer.get("domain_roles")
+    if not isinstance(roles, Mapping):
+        reasons.append("missing_proposer_domain_roles")
+    elif str(roles.get("source_domain_id", "")).strip() != source or str(
+        roles.get("target_domain_id", "")
+    ).strip() != target:
+        reasons.append("proposer_and_reviewer_domain_roles_disagree")
+
+    required_values = {
+        "transfer_status": "genuine",
+        "source_ingredient_validity": "valid",
+        "target_adaptation_validity": "valid",
+    }
+    for field, required in required_values.items():
+        if assessment.get(field) != required:
+            reasons.append(f"{field}_must_be_{required}")
+    if assessment.get("target_contribution_status") not in {"substantial", "transformative"}:
+        reasons.append("target_contribution_must_be_substantial_or_transformative")
+    if assessment.get("feasibility_status") not in {"feasible", "feasible_with_named_risk"}:
+        reasons.append("first_calculation_is_not_feasible")
+    if assessment.get("compatibility_failures"):
+        reasons.append("unresolved_compatibility_failures")
+    if assessment.get("disqualifying_reasons"):
+        reasons.append("reviewer_reported_disqualifying_reasons")
+    novelty = assessment.get("novelty_coverage")
+    if not isinstance(novelty, Mapping) or not all(
+        novelty.get(scope) is True for scope in ("source_domain", "target_domain", "intersection")
+    ):
+        reasons.append("source_target_and_intersection_novelty_checks_are_required")
+
+    thresholds = {
+        "cross_domain_transfer_quality": 10,
+        "substantive_target_contribution": 14,
+        "scientific_value": 6,
+        "calculation_feasibility": 6,
+        "problem_well_definedness": 6,
+    }
+    for field, minimum in thresholds.items():
+        try:
+            value = float(marks.get(field, 0))
+        except (TypeError, ValueError):
+            value = 0
+        if value < minimum:
+            reasons.append(f"{field}_below_{minimum}")
+
+    signature = _normalized_transfer_signature(assessment.get("transfer_signature"))
+    if not signature:
+        reasons.append("complete_transfer_signature_is_required")
+    return not reasons, reasons, signature
+
+
+def _normalized_transfer_signature(raw: Any) -> str:
+    if not isinstance(raw, Mapping):
+        return ""
+    fields = ("direction", "transferred_ingredient", "target_result", "first_calculation")
+    values = [re.sub(r"\s+", " ", str(raw.get(field, "")).strip().lower()) for field in fields]
+    if any(not value for value in values):
+        return ""
+    return " | ".join(values)
+
+
+def _normalized_central_mechanism(raw: Any) -> str:
+    if not isinstance(raw, Mapping):
+        return ""
+    values = [
+        re.sub(r"\s+", " ", str(raw.get(field, "")).strip().lower())
+        for field in ("direction", "transferred_ingredient")
+    ]
+    if any(not value for value in values):
+        return ""
+    return " | ".join(values)
+
+
+def _cross_diagnostics(
+    run_root: Path,
+    *,
+    ranking: list[dict[str, Any]],
+    top_three: list[dict[str, Any]],
+    unqualified: list[dict[str, Any]],
+    portfolio_excluded: list[dict[str, Any]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    top_keys = {(entry["loop_id"], entry["round"]) for entry in top_three}
+    candidates = []
+    for qualified, entries in ((True, ranking), (False, unqualified)):
+        for entry in entries:
+            candidates.append(
+                {
+                    "loop_id": entry["loop_id"],
+                    "round": entry["round"],
+                    "title": entry["title"],
+                    "qualified": qualified,
+                    "qualification_reasons": entry.get("qualification_reasons", []),
+                    "transfer_signature": entry.get("normalized_transfer_signature", ""),
+                    "central_mechanism": entry.get("normalized_central_mechanism", ""),
+                    "top_three": (entry["loop_id"], entry["round"]) in top_keys,
+                    "marks": entry["marks"],
+                }
+            )
+    for entry in portfolio_excluded:
+        candidates.append(
+            {
+                "loop_id": entry["loop_id"],
+                "round": entry["round"],
+                "title": entry["title"],
+                "qualified": True,
+                "portfolio_excluded": True,
+                "portfolio_exclusion_reason": entry["portfolio_exclusion_reason"],
+                "qualification_reasons": entry.get("qualification_reasons", []),
+                "transfer_signature": entry.get("normalized_transfer_signature", ""),
+                "central_mechanism": entry.get("normalized_central_mechanism", ""),
+                "top_three": False,
+                "marks": entry["marks"],
+            }
+        )
+    return {
+        "schema_version": "arc.ideas.cross_domain_diagnostics.v1",
+        "run_root": str(run_root),
+        "qualified_count": len(ranking),
+        "unqualified_count": len(unqualified),
+        "portfolio_excluded_count": len(portfolio_excluded),
+        "top_three_count": len(top_three),
+        "distinct_qualified_transfer_signatures": len(
+            {entry.get("normalized_transfer_signature", "") for entry in ranking}
+        ),
+        "warnings": warnings,
+        "candidates": candidates,
+    }
+
+
 def _round_number(round_root: Path) -> int:
     try:
         return int(round_root.name.split("_", 1)[1])
@@ -145,8 +454,12 @@ def _round_number(round_root: Path) -> int:
         return -1
 
 
-def _rank_key(entry: dict[str, Any]) -> tuple[float, ...]:
-    return rank_key_from_marks(entry["marks"], round_number=entry["round"])
+def _rank_key(
+    entry: dict[str, Any],
+    *,
+    scheme: Mapping[str, Any] | None = None,
+) -> tuple[float, ...]:
+    return rank_key_from_marks(entry["marks"], round_number=entry["round"], scheme=scheme)
 
 
 def markdown_table(payload: dict[str, Any]) -> str:
@@ -157,10 +470,40 @@ def markdown_table(payload: dict[str, Any]) -> str:
     ]
     for entry in payload["ranking"]:
         lines.extend(["", *_appendix_section(entry)])
+    if payload.get("cross_domain"):
+        lines.extend(["", "# Appendix: Unqualified Cross-Domain Candidates"])
+        if not payload.get("unqualified"):
+            lines.extend(["", "None."])
+        for entry in payload.get("unqualified", []):
+            lines.extend(
+                [
+                    "",
+                    f"## `{entry['loop_id']}` — {_heading_text(entry['title'])}",
+                    "",
+                    f"- Best observed round: `{entry['round']}`",
+                    "- Qualification failures:",
+                    *[f"  - {reason}" for reason in entry.get("qualification_reasons", [])],
+                ]
+            )
+        lines.extend(["", "# Appendix: Portfolio-Excluded Cross-Domain Candidates"])
+        if not payload.get("portfolio_excluded"):
+            lines.extend(["", "None."])
+        for entry in payload.get("portfolio_excluded", []):
+            lines.extend(
+                [
+                    "",
+                    f"## `{entry['loop_id']}` — {_heading_text(entry['title'])}",
+                    "",
+                    f"- Selected round: `{entry['round']}`",
+                    f"- Exclusion: `{entry['portfolio_exclusion_reason']}`",
+                ]
+            )
     return "\n".join(lines)
 
 
 def _summary_table(payload: dict[str, Any]) -> str:
+    if payload.get("cross_domain"):
+        return _cross_summary_table(payload)
     lines = [
         "# Ideas",
         "",
@@ -207,6 +550,43 @@ def _compact_round_marks_table(entry: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _cross_summary_table(payload: dict[str, Any]) -> str:
+    lines = [
+        "# Ideas",
+        "",
+        "Abbreviations:",
+        "",
+        "IR=intent relevance, TR=transfer quality, TC=target contribution, N=novelty, "
+        "CN=confidence of novelty, SV=scientific value, F=feasibility, WD=well-definedness, T=total.",
+    ]
+    for warning in payload.get("warnings", []):
+        lines.extend(["", str(warning)])
+    for entry in payload.get("summary_order", payload.get("ranking", [])):
+        lines.extend(["", *_round_marks_summary_section_cross(entry)])
+    return "\n".join(lines)
+
+
+def _round_marks_summary_section_cross(entry: dict[str, Any]) -> list[str]:
+    return [
+        f"## `{entry['loop_id']}`",
+        "",
+        _heading_text(entry["title"]),
+        "",
+        _compact_cross_marks_table(entry),
+    ]
+
+
+def _compact_cross_marks_table(entry: dict[str, Any]) -> str:
+    headers = " | ".join(label for label, _field in CROSS_REPORT_COLUMNS)
+    separators = "|".join("---:" for _ in CROSS_REPORT_COLUMNS)
+    lines = [f"| Round | {headers} |", f"|---:|{separators}|"]
+    for round_entry in entry.get("rounds", []):
+        marks = round_entry["marks"]
+        values = " | ".join(_format_mark(marks.get(field)) for _label, field in CROSS_REPORT_COLUMNS)
+        lines.append(f"| {round_entry['round']} | {values} |")
+    return "\n".join(lines)
+
+
 def _appendix_section(entry: dict[str, Any]) -> list[str]:
     return [
         f"### {entry['rank']}. {_heading_text(entry['title'])}",
@@ -227,7 +607,10 @@ def _appendix_section(entry: dict[str, Any]) -> list[str]:
 
 
 def _round_marks_table(entry: dict[str, Any]) -> str:
-    columns = report_columns()
+    if "qualified" in entry:
+        columns = [{"label": label, "field": field} for label, field in CROSS_REPORT_COLUMNS]
+    else:
+        columns = report_columns()
     mark_headers = " | ".join(column["label"] for column in columns)
     mark_separator = "|".join("---:" for _ in columns)
     lines = [

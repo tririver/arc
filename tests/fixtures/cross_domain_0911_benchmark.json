@@ -1,0 +1,34 @@
+{
+  "schema_version": "arc.test.cross_domain_ideas_benchmark.v1",
+  "repo_root": ".",
+  "source_mode": "required_repo_root",
+  "artifact_root": "arc-tests/0911-cross-domain-ab",
+  "anchor_seed": "arXiv:0911.3380",
+  "partner_selection": {
+    "mode": "ai_open_world_history_blind",
+    "partner_seed": null,
+    "candidate_count": 6,
+    "select_once_before_ideas": true,
+    "freeze_pair_for_both_arms": true,
+    "forbidden_context_paths": [
+      "0_ref",
+      "arc-tests/prev"
+    ],
+    "forbid_cache_hit_signals": true
+  },
+  "ideas_run": {
+    "loops_per_variant": 5,
+    "rounds_per_loop": 5,
+    "matched_replicates_per_arm": 2,
+    "save_prompts": true
+  },
+  "acceptance": {
+    "minimum_qualified_loops": 3,
+    "top_three_all_qualified": true,
+    "minimum_transfer_signature_clusters": 3,
+    "maximum_same_central_mechanism": 2,
+    "minimum_blind_preference_rate": 0.6,
+    "maximum_feasibility_drop": 0.25,
+    "single_domain_request_hashes_unchanged": true
+  }
+}

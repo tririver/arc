@@ -30,6 +30,43 @@ from ideas_marking import load_marking_scheme, marking_scheme_for_context, marks
 JsonRunner = Callable[..., dict[str, Any]]
 BatchRunner = Callable[..., dict[str, Any]]
 MODEL_TIER_RANKS = {"low": 1, "medium": 2, "high": 3, "max": 4}
+DEFAULT_CROSS_DOMAIN_PROFILES = [
+    {
+        "profile_id": "forward_transfer",
+        "mission": (
+            "Treat the first domain card as the source and choose the strongest distinct target from the remaining "
+            "cards. Transfer one concrete, mature source method, mechanism, formal structure, or constraint."
+        ),
+    },
+    {
+        "profile_id": "reverse_transfer",
+        "mission": (
+            "Treat the first domain card as the target and choose the strongest distinct source from the remaining "
+            "cards. Find a reverse transfer that creates a substantive new target result."
+        ),
+    },
+    {
+        "profile_id": "method_transfer",
+        "mission": (
+            "Compare both directions and choose the strongest method or formalism transfer. State the exact "
+            "translation dictionary and the target calculation it newly enables."
+        ),
+    },
+    {
+        "profile_id": "observable_or_constraint_transfer",
+        "mission": (
+            "Compare both directions and transfer an observable, consistency condition, validation strategy, "
+            "or constraint that yields a new discriminating target-domain result."
+        ),
+    },
+    {
+        "profile_id": "high_upside_wildcard",
+        "mission": (
+            "Pursue the highest-upside feasible bridge, including a challenge to a standard target assumption. "
+            "Require explicit compatibility checks, a bounded first calculation, and a kill criterion."
+        ),
+    },
+]
 
 
 @dataclass(frozen=True)
@@ -60,6 +97,7 @@ def run_ideas(
     warnings_path = run_root / "ideas_warnings.txt"
     warnings = [
         _concurrency_warning(ideas_config, len(ideas), max_concurrent=max_concurrent),
+        *ideas_config.routing_warnings,
         *_model_tier_warnings(batch_config),
         *_caller_context_warnings(ideas),
     ]
@@ -132,6 +170,8 @@ def _result(
         "status": str(batch_result.get("status", "failed")),
         "run_id": config.run_id,
         "run_root": str(run_root),
+        "research_scope": config.research_scope,
+        "domain_manifest_path": str(config.domain_manifest_path),
         "warnings": warnings,
         "warnings_summary": _batch_warnings_summary(batch_result),
         "proposal_count": len(ideas),
@@ -169,13 +209,24 @@ def _materialize_ideas(config: IdeasConfig) -> list[IdeaPlan]:
                     idea_index=idea_index,
                     loop_id=f"{variant.variant_id}_idea_{idea_index:03d}",
                     variant=variant,
-                    caller_context=_caller_context(config, variant=variant, idea_id=idea_id),
+                    caller_context=_caller_context(
+                        config,
+                        variant=variant,
+                        idea_id=idea_id,
+                        idea_index=idea_index,
+                    ),
                 )
             )
     return ideas
 
 
-def _caller_context(config: IdeasConfig, *, variant: VariantConfig, idea_id: str) -> dict[str, Any]:
+def _caller_context(
+    config: IdeasConfig,
+    *,
+    variant: VariantConfig,
+    idea_id: str,
+    idea_index: int,
+) -> dict[str, Any]:
     loop_template = _read_json(variant.loop_template)
     caller_context = copy.deepcopy(loop_template.get("caller_context", {}))
     if not isinstance(caller_context, dict):
@@ -184,7 +235,11 @@ def _caller_context(config: IdeasConfig, *, variant: VariantConfig, idea_id: str
     caller_context["user_intent"] = config.user_intent
     caller_context["variant_id"] = variant.variant_id
     caller_context["idea_id"] = idea_id
-    caller_context["marking_scheme"] = marking_scheme_for_context(load_marking_scheme(variant.path.parent))
+    caller_context["marking_scheme"] = marking_scheme_for_context(load_marking_scheme(variant.marking_scheme))
+    if variant.research_scope == "cross_domain":
+        caller_context["generation_mode"] = "cross_domain"
+        caller_context["domain_cards"] = _domain_cards(config)
+        caller_context["exploration_profile"] = _cross_domain_profile(config, idea_index=idea_index)
     if variant.context_policy.attach_domain_markdown:
         markdown_files = _domain_markdown_files(config.project_dir / "domain")
         if markdown_files:
@@ -249,6 +304,23 @@ def _relaxed_output_recovery_config() -> dict[str, Any]:
 
 
 def _idea_loop_payload(idea: IdeaPlan) -> dict[str, Any]:
+    if idea.variant.research_scope == "cross_domain":
+        static_context_keys = [
+            "user_intent",
+            "generation_mode",
+            "domain_cards",
+            "arc_paper_tool_notes",
+            "marking_scheme",
+        ]
+        volatile_context_keys = ["idea_id", "variant_id", "exploration_profile"]
+    else:
+        static_context_keys = [
+            "user_intent",
+            "domain_markdown_files",
+            "arc_paper_tool_notes",
+            "marking_scheme",
+        ]
+        volatile_context_keys = ["idea_id", "variant_id"]
     return materialize_loop(
         _read_json(idea.variant.loop_template),
         loop_id=idea.loop_id,
@@ -256,13 +328,8 @@ def _idea_loop_payload(idea: IdeaPlan) -> dict[str, Any]:
         proposers=[_proposer_payload(idea.variant)],
         reviewers=[_loop_reviewer_payload(idea.variant)],
         cache_context={
-            "static_caller_context_keys": [
-                "user_intent",
-                "domain_markdown_files",
-                "arc_paper_tool_notes",
-                "marking_scheme",
-            ],
-            "volatile_caller_context_keys": ["idea_id", "variant_id"],
+            "static_caller_context_keys": static_context_keys,
+            "volatile_caller_context_keys": volatile_context_keys,
         },
     )
 
@@ -276,15 +343,14 @@ def _merged_worker_payload(template: Mapping[str, Any], overrides: Mapping[str, 
 
 
 def _loop_reviewer_payload(variant: VariantConfig) -> dict[str, Any]:
-    workflow_dir = variant.path.parent
-    scheme = load_marking_scheme(workflow_dir)
-    payload = _read_json(workflow_dir / "ideas-reviewer.template.json")
-    payload["output_schema"] = _reviewer_output_schema(workflow_dir, scheme=scheme)
+    scheme = load_marking_scheme(variant.marking_scheme)
+    payload = _read_json(variant.reviewer_template)
+    payload["output_schema"] = _reviewer_output_schema(variant, scheme=scheme)
     return payload
 
 
-def _reviewer_output_schema(workflow_dir: Path, *, scheme: Mapping[str, Any]) -> dict[str, Any]:
-    schema = _read_json(workflow_dir / "ideas-reviewer-output.schema.json")
+def _reviewer_output_schema(variant: VariantConfig, *, scheme: Mapping[str, Any]) -> dict[str, Any]:
+    schema = _read_json(variant.reviewer_output_schema)
     schema["properties"]["review_payload"]["properties"]["marks"] = marks_schema(scheme)
     return schema
 
@@ -364,7 +430,7 @@ def _round_score_row(idea: IdeaPlan, *, batch_run_root: Path) -> dict[str, Any]:
 
 
 def _loop_round_scores(loop_root: Path, *, idea: IdeaPlan) -> tuple[dict[int, dict[str, Any]], str]:
-    scheme = load_marking_scheme(idea.variant.path.parent)
+    scheme = load_marking_scheme(idea.variant.marking_scheme)
     transcript_rounds, transcript_title = _loop_round_scores_from_transcript(loop_root, scheme=scheme)
     if transcript_rounds:
         return transcript_rounds, transcript_title
@@ -585,6 +651,81 @@ def _model_tier_text(value: Any) -> str:
 
 def _write_warnings(path: Path, warnings: list[str]) -> None:
     atomic_write_text(path, "\n".join(warnings).rstrip() + "\n")
+
+
+def _cross_domain_profile(config: IdeasConfig, *, idea_index: int) -> dict[str, str]:
+    profiles = config.exploration_profiles or DEFAULT_CROSS_DOMAIN_PROFILES
+    try:
+        return copy.deepcopy(profiles[idea_index - 1])
+    except IndexError as exc:
+        raise ConfigError(f"No cross-domain exploration profile is configured for idea {idea_index}") from exc
+
+
+def _domain_cards(config: IdeasConfig) -> list[dict[str, Any]]:
+    manifest = config.domain_manifest
+    if not isinstance(manifest, Mapping):
+        raise ConfigError("cross-domain ideas require a domain manifest")
+    domains = manifest.get("domains")
+    if not isinstance(domains, list):
+        raise ConfigError(f"{config.domain_manifest_path}.domains must be an array")
+
+    cards: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(domains):
+        if not isinstance(entry, Mapping):
+            raise ConfigError(f"{config.domain_manifest_path}.domains[{index}] must be an object")
+        domain_id = str(entry.get("domain_id", "")).strip()
+        if domain_id in seen:
+            continue
+        seen.add(domain_id)
+        summary_path = _domain_summary_path(config, entry=entry, index=index)
+        summary = _read_json(summary_path)
+        if summary.get("schema_version") != "arc.domain_summary.v4":
+            raise ConfigError(f"{summary_path}.schema_version must be arc.domain_summary.v4")
+        summary_domain_id = str(summary.get("domain_id", "")).strip()
+        if summary_domain_id != domain_id:
+            raise ConfigError(
+                f"domain manifest entry {domain_id!r} points to summary for {summary_domain_id!r}: {summary_path}"
+            )
+        cards.append(
+            {
+                "domain_id": domain_id,
+                "seed_paper": str(entry.get("seed_paper", "")).strip(),
+                "title": str(entry.get("title") or summary.get("domain_title") or domain_id).strip(),
+                "overview": summary.get("overview") or summary.get("brief_introduction", ""),
+                "task_focus": summary.get("task_focus", {}),
+                "methodology": summary.get("methodology", []),
+                "known_solved_cases": summary.get("known_solved_cases", []),
+                "open_axes_for_new_work": summary.get("open_axes_for_new_work", []),
+                "summary_json_path": str(summary_path),
+            }
+        )
+    if len(cards) < 2:
+        raise ConfigError("cross-domain ideas require at least two distinct domain cards")
+    return cards
+
+
+def _domain_summary_path(config: IdeasConfig, *, entry: Mapping[str, Any], index: int) -> Path:
+    raw = str(
+        entry.get("summary_json_path")
+        or entry.get("domain_summary_path")
+        or entry.get("summary_path")
+        or ""
+    ).strip()
+    if not raw:
+        raise ConfigError(
+            f"{config.domain_manifest_path}.domains[{index}] requires summary_json_path"
+        )
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        path = candidate
+    else:
+        project_relative = config.project_dir / candidate
+        manifest_relative = config.domain_manifest_path.parent / candidate
+        path = project_relative if project_relative.is_file() else manifest_relative
+    if not path.is_file():
+        raise ConfigError(f"domain summary does not exist: {path}")
+    return path.resolve()
 
 
 def _domain_markdown_files(domain_dir: Path) -> list[dict[str, str]]:

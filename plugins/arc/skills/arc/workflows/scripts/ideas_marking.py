@@ -99,6 +99,8 @@ def report_columns(scheme: Mapping[str, Any] | None = None) -> list[dict[str, st
 
 def _scheme_path(workflow_dir: Path | str | None) -> Path:
     root = Path(workflow_dir).expanduser() if workflow_dir is not None else Path(__file__).resolve().parent
+    if root.suffix == ".json":
+        return root
     if root.name == "scripts":
         root = root.parent / "json"
     return root / DEFAULT_MARKING_SCHEME_FILENAME

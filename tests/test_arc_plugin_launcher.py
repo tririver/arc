@@ -81,6 +81,7 @@ def test_workflow_bootstrap_failure_lists_searched_roots_and_runtimes(tmp_path):
         scripts_dir / "_arc_script_bootstrap.py",
     )
     env = {
+        "HOME": str(tmp_path / "empty-home"),
         "PYTHONPATH": "",
         "PYTHONDONTWRITEBYTECODE": "1",
         "ARC_REPO_ROOT": str(tmp_path / "missing-repo"),
