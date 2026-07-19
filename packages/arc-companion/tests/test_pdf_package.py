@@ -10,7 +10,7 @@ import pytest
 
 from arc_companion import pdf as pdf_module
 from arc_companion.package import package_project
-from arc_companion.pdf import PDFError, validate_pdf
+from arc_companion.pdf import PDFError, compile_latex, validate_pdf
 
 
 PDFINFO = """Title: fixture
@@ -62,6 +62,56 @@ def test_validate_pdf_checks_fonts_and_renders_every_page(tmp_path: Path, monkey
     render_calls = [call for call in calls if Path(call[0]).name == "pdftoppm"]
     assert [call[call.index("-f") + 1] for call in render_calls] == ["1", "2", "3"]
     assert all(Path(path).is_file() for path in report["render_paths"])
+
+
+def test_compile_latex_uses_non_hidden_unique_jobname_and_cleans_sidecars(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    tex_path = tmp_path / ".hidden-building.tex"
+    tex_path.write_text("fixture", encoding="utf-8")
+    final_pdf = tmp_path / "paper.pdf"
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr(pdf_module.shutil, "which", lambda name: f"/tools/{name}")
+
+    def runner(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        calls.append((command, cwd))
+        jobname = next(value.split("=", 1)[1] for value in command if value.startswith("-jobname="))
+        assert not jobname.startswith(".")
+        assert "/" not in jobname
+        for suffix, content in (
+            (".pdf", b"%PDF fixture"), (".aux", b"aux"), (".fdb_latexmk", b"fdb"),
+            (".fls", b"fls"), (".log", b"log"), (".xdv", b"xdv"),
+        ):
+            (cwd / f"{jobname}{suffix}").write_bytes(content)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(pdf_module.subprocess, "run", runner)
+    compile_latex(tex_path, final_pdf)
+
+    assert final_pdf.read_bytes() == b"%PDF fixture"
+    assert calls[0][1] == tmp_path
+    command = calls[0][0]
+    assert tex_path.name == command[-1]
+    assert not list(tmp_path.glob("arc-companion-hidden-building-*.*"))
+
+
+def test_compile_latex_cleans_unique_sidecars_after_failure(tmp_path: Path, monkeypatch) -> None:
+    tex_path = tmp_path / "building.tex"
+    tex_path.write_text("fixture", encoding="utf-8")
+    monkeypatch.setattr(pdf_module.shutil, "which", lambda name: f"/tools/{name}")
+
+    def runner(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        jobname = next(value.split("=", 1)[1] for value in command if value.startswith("-jobname="))
+        (cwd / f"{jobname}.aux").write_bytes(b"aux")
+        (cwd / f"{jobname}.log").write_bytes(b"log")
+        return subprocess.CompletedProcess(command, 1, stdout="failed", stderr="")
+
+    monkeypatch.setattr(pdf_module.subprocess, "run", runner)
+    with pytest.raises(PDFError, match="XeLaTeX compilation failed"):
+        compile_latex(tex_path, tmp_path / "paper.pdf")
+    assert not list(tmp_path.glob("arc-companion-building-*.*"))
 
 
 @pytest.mark.parametrize(

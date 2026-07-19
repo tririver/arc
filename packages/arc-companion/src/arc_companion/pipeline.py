@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import uuid
 from typing import Any, Callable
 
 from bs4 import BeautifulSoup
@@ -688,10 +689,11 @@ def _publish_pdf_artifact(
     pdf_path = output_dir / f"{stem}.pdf"
     manifest_path = output_dir / manifest_name
     validation_path = output_dir / validation_name
-    building_tex = output_dir / f".{stem}.building.tex"
-    building_pdf = output_dir / f".{stem}.building.pdf"
-    building_manifest = output_dir / f".{manifest_name}.building"
-    building_validation = output_dir / f".{validation_name}.building"
+    staging_stem = f"arc-companion-building-{safe_name(stem)}-{uuid.uuid4().hex[:12]}"
+    building_tex = output_dir / f"{staging_stem}.tex"
+    building_pdf = output_dir / f"{staging_stem}.pdf"
+    building_manifest = output_dir / f"{staging_stem}-manifest.json"
+    building_validation = output_dir / f"{staging_stem}-validation.json"
     staging_paths = (building_tex, building_pdf, building_manifest, building_validation)
     try:
         write_text(building_tex, tex)

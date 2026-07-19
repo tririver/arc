@@ -978,6 +978,11 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
         return value
 
     def compiler(tex_path: Path, pdf_path: Path) -> None:
+        assert tex_path.parent == project
+        assert pdf_path.parent == project
+        assert not tex_path.name.startswith(".")
+        assert not pdf_path.name.startswith(".")
+        assert tex_path.stem == pdf_path.stem
         compiler_calls.append((tex_path, tex_path.read_text(encoding="utf-8")))
         if len(compiler_calls) == 1:
             labels = [str(call["call_label"]) for call in fake.calls]

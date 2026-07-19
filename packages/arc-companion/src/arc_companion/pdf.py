@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 from typing import Callable
+import uuid
 
 
 class PDFError(RuntimeError):
@@ -15,29 +16,36 @@ def compile_latex(tex_path: Path, pdf_path: Path, *, timeout_seconds: float = 30
     executable = shutil.which("latexmk")
     if executable is None:
         raise PDFError("latexmk is required to build a companion PDF")
+    safe_source_stem = re.sub(r"[^A-Za-z0-9_-]+", "-", tex_path.stem).strip("-") or "document"
+    jobname = f"arc-companion-{safe_source_stem[:48]}-{uuid.uuid4().hex[:12]}"
     command = [
         executable,
         "-xelatex",
         "-interaction=nonstopmode",
         "-halt-on-error",
         f"-outdir={tex_path.parent}",
+        f"-jobname={jobname}",
         tex_path.name,
     ]
-    completed = subprocess.run(
-        command,
-        cwd=tex_path.parent,
-        text=True,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
-    built = tex_path.with_suffix(".pdf")
-    if completed.returncode != 0 or not built.is_file() or built.stat().st_size == 0:
-        tail = "\n".join((completed.stdout + "\n" + completed.stderr).splitlines()[-30:])
-        raise PDFError(f"XeLaTeX compilation failed:\n{tail}")
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    if built.resolve() != pdf_path.resolve():
+    built = tex_path.parent / f"{jobname}.pdf"
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=tex_path.parent,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if completed.returncode != 0 or not built.is_file() or built.stat().st_size == 0:
+            tail = "\n".join((completed.stdout + "\n" + completed.stderr).splitlines()[-30:])
+            raise PDFError(f"XeLaTeX compilation failed:\n{tail}")
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(built, pdf_path)
+    finally:
+        for sidecar in tex_path.parent.glob(f"{jobname}.*"):
+            if sidecar.is_file():
+                sidecar.unlink(missing_ok=True)
 
 
 def validate_pdf(pdf_path: Path, *, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> dict[str, object]:
