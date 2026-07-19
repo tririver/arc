@@ -137,9 +137,12 @@ def test_source_adapter_caches_bounded_related_full_text_through_parse_api() -> 
 
     assert calls[0]["paper_id"] == "arXiv:1"
     assert calls[0]["include_document"] is True
-    assert len(calls) == 17
+    assert len(calls) == 19
     assert all(call["include_document"] is False for call in calls[1:])
-    assert len(bundle.related_evidence) == 16
+    assert len(bundle.related_evidence) == 18
+    assert {item["paper_id"] for item in bundle.related_evidence} >= {
+        "0801.0000", "0801.0008", "2501.0000", "2501.0008",
+    }
     assert {item["relation"] for item in bundle.related_evidence} == {"prior", "later"}
     assert all(item["evidence_level"] == "full_text" for item in bundle.related_evidence)
     assert all(item["source_descriptor"]["provider"] == "arc-paper" for item in bundle.related_evidence)

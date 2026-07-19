@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "arc.companion.prompts.v7"
-SCHEMA_VERSION = "arc.companion.schemas.v6"
+PROMPT_VERSION = "arc.companion.prompts.v8"
+SCHEMA_VERSION = "arc.companion.schemas.v7"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v4"
 TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v3"
 TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION = (
@@ -153,10 +153,18 @@ ANNOTATION_SCHEMA: dict[str, Any] = {
     ],
     "properties": {
         "explanation": {"type": "string", "minLength": 1},
-        "prior_work": {"type": "string"},
-        "later_work": {"type": "string"},
+        "prior_work": {
+            "type": "string",
+            "description": "Optional; use an empty string unless direct registered evidence exists.",
+        },
+        "later_work": {
+            "type": "string",
+            "description": "Optional; use an empty string unless direct registered evidence exists.",
+        },
         "commentary": {"type": "string", "minLength": 1},
-        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "evidence_ids": {
+            "type": "array", "maxItems": 6, "items": {"type": "string"},
+        },
         "key_points": {"type": "array", "items": {"type": "string"}},
         "source_notes": {"type": "array", "items": {"type": "string"}},
         "evidence_requests": {
@@ -429,10 +437,15 @@ def annotation_prompt(
 ) -> str:
     return (
         "Write rigorous companion commentary for this contiguous theoretical-physics paper segment. "
-        "Return a self-contained explanation, a bounded account of relevant prior work, a bounded account "
-        "of relevant later work, and one combined commentary suitable for typesetting. Ground every related-"
-        "work claim in the supplied evidence and list only evidence IDs actually used. If evidence is absent, "
-        "leave prior_work or later_work empty rather than inventing it. Explain motivation, assumptions, "
+        "Return a self-contained explanation and one combined commentary suitable for typesetting. The "
+        "prior_work and later_work fields are strictly optional: include at most three papers in each only "
+        "when they directly illuminate a concrete claim in this exact segment. Never fill either field merely "
+        "because it exists in the schema, and never use a famous, highly cited, or field-defining paper as a "
+        "generic fallback. Empty strings are the correct output when no directly relevant evidence exists. "
+        "Ground every related-work claim in the supplied evidence and list only evidence IDs actually used. "
+        "Treat the segment's exact bibliography citation targets as the strongest prior-work relevance signal; "
+        "citation count is only a weak secondary prior. Prefer a more directly relevant paper even when it is "
+        "outside the supplied domain or less cited. Do not fill a quota. Explain motivation, assumptions, "
         "derivation logic, notation, and conceptual connections. Do not rewrite or correct the source. "
         "Use the glossary consistently and preserve every personal name in Latin spelling. "
         "When needed, use the bounded full-paper navigation context, ARC cached-paper tools, and internet search "
@@ -445,7 +458,8 @@ def annotation_prompt(
         "queries, candidate paper IDs or discovery URLs, and reason. Web snippets are discovery hints only. "
         "When EXPLICIT DOMAIN CONTEXT is present, use it as preferred navigation and a relevance signal, not as "
         "a closed corpus. A domain match never forbids or short-circuits ARC, INSPIRE, references/citers, or web "
-        "research, and a more directly relevant paper outside the domain may be preferred. "
+        "research, and a more directly relevant paper outside the domain may be preferred. The reference and "
+        "citer catalogs are discovery context, not evidence that may be cited without a registered descriptor. "
         f"Write in {language}; state uncertainty explicitly. Protected names: "
         f"{json.dumps(protected_names, ensure_ascii=False)}.\n\n"
         f"PAPER METADATA:\n{json.dumps(metadata, ensure_ascii=False)}\n\n"
@@ -470,6 +484,7 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "Source blocks and the frozen glossary are immutable. Return one patch only for a segment needing correction. "
         "Every patch field is required by the output schema: use null for each translation or companion field that "
         "must remain unchanged, and use an empty string only when intentionally clearing prior_work or later_work. "
+        "Prior and later work are optional; never add a generic or quota-filling related-work patch. "
         "Return full replacement translation blocks for a translation correction. Never alter equations, equation numbers, figures, "
         "tables, citations, references, identifiers, or evidence IDs. Translation coverage applies only to "
         "translatable natural-language blocks supplied in translation blocks. Display equations, figures, "

@@ -3051,7 +3051,7 @@ def test_evidence_keeps_optional_source_diagnostics(tmp_path: Path) -> None:
 
     evidence = _evidence(bundle)
 
-    assert evidence["schema_version"] == "arc.companion.evidence.v2"
+    assert evidence["schema_version"] == "arc.companion.evidence.v3"
     assert evidence["citers"] == []
     assert evidence["diagnostics"] == [warning]
 
@@ -3196,11 +3196,168 @@ def test_segment_evidence_preserves_descriptor_and_hashes_selected_snippets() ->
 
     selected = _evidence_for_segment(segment, by_id, {"related_papers": [paper]})
 
-    assert selected["schema_version"] == "arc.companion.segment-evidence.v2"
+    assert selected["schema_version"] == "arc.companion.segment-evidence.v3"
     record = selected["papers"][0]
     assert record["source_descriptor"]["locator"]["document_hash"] == "d" * 64
     assert record["snippets"][0]["sha256"] == text_sha256(record["snippets"][0]["text"])
     assert validate_evidence_record(record) is record
+
+
+def _related_work_record(
+    evidence_id: str,
+    *,
+    relation: str,
+    title: str,
+    abstract: str,
+    citation_count: int,
+    paper_id: str,
+    domain_role: str = "",
+) -> dict:
+    record = {
+        "evidence_id": evidence_id,
+        "relation": relation,
+        "paper_id": paper_id,
+        "title": title,
+        "authors": [],
+        "year": 2000,
+        "citation_count": citation_count,
+        "evidence_level": "abstract_only",
+        "abstract": abstract,
+        "blocks": [],
+    }
+    if domain_role:
+        record["domain_role"] = domain_role
+    record["source_descriptor"] = arc_cache_descriptor(
+        paper_id=paper_id,
+        title=title,
+        authors=[],
+        year=2000,
+        evidence_level="abstract_only",
+        content=abstract,
+    )
+    return record
+
+
+def test_segment_related_work_is_empty_when_every_relevance_score_is_zero() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {"block_id": "source", "text": "A localized conversion mechanism."}}
+    papers = [
+        _related_work_record(
+            "prior-famous", relation="prior", title="WMAP observations",
+            abstract="Microwave sky maps.", citation_count=100_000, paper_id="arXiv:0001.0001",
+        ),
+        _related_work_record(
+            "later-famous", relation="later", title="Planck observations",
+            abstract="Satellite data release.", citation_count=100_000, paper_id="arXiv:0001.0002",
+        ),
+        _related_work_record(
+            "prior-icon", relation="prior", title="Maldacena correlators",
+            abstract="Unrelated formal calculation.", citation_count=100_000, paper_id="arXiv:0001.0003",
+        ),
+    ]
+
+    selected = _evidence_for_segment(segment, by_id, {"related_papers": papers})
+
+    assert selected["papers"] == []
+
+
+def test_direct_relevance_beats_citations_and_domain_membership() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {"block_id": "source", "text": "Curvaton decay transfer produces isocurvature."}}
+    papers = [
+        _related_work_record(
+            "prior-high", relation="prior", title="Precision satellite constraints",
+            abstract="A broad observational catalog.", citation_count=500_000,
+            paper_id="arXiv:0001.0001", domain_role="foundation",
+        ),
+        _related_work_record(
+            "prior-direct", relation="prior", title="Curvaton decay transfer",
+            abstract="Isocurvature transfer from curvaton decay.", citation_count=3,
+            paper_id="arXiv:0001.0009",
+        ),
+    ]
+
+    selected = _evidence_for_segment(segment, by_id, {"related_papers": papers})
+
+    assert [item["evidence_id"] for item in selected["papers"]] == ["prior-direct"]
+
+
+def test_exact_bibliography_target_is_first_and_each_relation_is_capped_at_three() -> None:
+    citation = _inline_run("citation", "[9]", 2)
+    citation["target_id"] = "bib.bib9"
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {
+        "block_id": "source",
+        "text": "Curvaton decay transfer isocurvature.",
+        "inline_runs": [_inline_run("text", "See ", 1), citation],
+    }}
+    papers = [
+        _related_work_record(
+            f"prior-{index}", relation="prior", title=f"Curvaton decay transfer {index}",
+            abstract="Curvaton isocurvature transfer.", citation_count=100 - index,
+            paper_id=f"arXiv:0001.000{index}",
+        )
+        for index in range(1, 5)
+    ]
+    papers.append(_related_work_record(
+        "prior-exact", relation="prior", title="A specifically cited construction",
+        abstract="The cited construction.", citation_count=0, paper_id="arXiv:0001.0009",
+    ))
+    papers.extend(
+        _related_work_record(
+            f"later-{index}", relation="later", title=f"Curvaton decay transfer extension {index}",
+            abstract="A later curvaton isocurvature transfer extension.", citation_count=index,
+            paper_id=f"arXiv:2501.000{index}",
+        )
+        for index in range(1, 5)
+    )
+    evidence = {
+        "bibliography": [{"id": "bib.bib9", "label": "[9]", "arxiv_id": "0001.0009"}],
+        "related_papers": papers,
+    }
+
+    selected = _evidence_for_segment(segment, by_id, evidence)
+
+    assert selected["citation_targets"] == [{
+        "id": "bib.bib9", "label": "[9]", "arxiv_id": "0001.0009",
+    }]
+    assert selected["papers"][0]["evidence_id"] == "prior-exact"
+    assert sum(item["relation"] == "prior" for item in selected["papers"]) == 3
+    assert sum(item["relation"] == "later" for item in selected["papers"]) == 3
+
+
+def test_ninth_metadata_candidate_can_outrank_first_eight() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {"block_id": "source", "text": "Spectator conversion bispectrum."}}
+    records = [
+        {
+            "arxiv_id": f"0001.{index:04d}",
+            "title": "Generic survey",
+            "abstract": "Broad measurements.",
+            "citation_count": 100_000 - index,
+        }
+        for index in range(1, 9)
+    ] + [{
+        "arxiv_id": "0001.0009",
+        "title": "Spectator conversion bispectrum",
+        "abstract": "A bispectrum from spectator conversion.",
+        "citation_count": 1,
+    }]
+    papers = [
+        _related_work_record(
+            f"prior-{index:03d}", relation="prior", title=item["title"],
+            abstract=item["abstract"], citation_count=item["citation_count"],
+            paper_id=f"arXiv:{item['arxiv_id']}",
+        )
+        for index, item in enumerate(records, 1)
+    ]
+
+    selected = _evidence_for_segment(
+        segment, by_id, {"references": records, "related_papers": papers},
+    )
+
+    assert selected["papers"][0]["evidence_id"] == "prior-009"
+    assert selected["reference_catalog"][0]["arxiv_id"] == "0001.0009"
 
 
 def test_invalid_review_patch_fails_without_publishing_pdf(tmp_path: Path) -> None:

@@ -103,19 +103,30 @@ def _load_related_evidence(
     parse: Callable[..., dict[str, Any]],
     refresh: bool,
     recache: bool,
-    limit_per_kind: int = 8,
+    full_text_limit_per_kind: int = 24,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Cache a bounded, generic full-text evidence set through arc-paper's public API."""
+    """Cache broad metadata evidence plus a bounded full-text working set.
+
+    Source order is intentionally preserved.  Citation count is useful metadata,
+    but is not a relevance filter and must not decide which papers are visible to
+    the commentary agents.
+    """
     selected: list[tuple[str, int, dict[str, Any], str]] = []
+    output: dict[str, dict[str, Any]] = {}
     for kind, items in (("prior", references), ("later", citers)):
-        candidates = sorted(
-            enumerate(items),
-            key=lambda pair: (-_citation_count(pair[1]), pair[0]),
-        )[:limit_per_kind]
-        for rank, (_, item) in enumerate(candidates, 1):
+        for rank, item in enumerate(items, 1):
             paper_id = _arxiv_identifier(item)
-            if paper_id:
+            if not paper_id:
+                continue
+            if rank <= full_text_limit_per_kind:
                 selected.append((kind, rank, item, paper_id))
+                continue
+            abstract = str(item.get("abstract") or "").strip()
+            if abstract:
+                value = _abstract_evidence_record(
+                    kind=kind, rank=rank, item=item, paper_id=paper_id, abstract=abstract,
+                )
+                output[value["evidence_id"]] = value
 
     def load(record: tuple[str, int, dict[str, Any], str]) -> dict[str, Any]:
         kind, rank, item, paper_id = record
@@ -142,6 +153,9 @@ def _load_related_evidence(
             "evidence_id": f"{kind}-{rank:03d}",
             "relation": kind,
             "paper_id": paper_id,
+            "arxiv_id": item.get("arxiv_id") or item.get("arxiv"),
+            "doi": item.get("doi"),
+            "inspire_id": item.get("inspire_id"),
             "title": str(item.get("title") or ""),
             "authors": item.get("authors") or [],
             "year": item.get("year"),
@@ -162,7 +176,6 @@ def _load_related_evidence(
         validate_evidence_record(value)
         return value
 
-    output: dict[str, dict[str, Any]] = {}
     diagnostics: list[dict[str, str]] = []
     if selected:
         with ThreadPoolExecutor(max_workers=min(8, len(selected))) as executor:
@@ -184,27 +197,10 @@ def _load_related_evidence(
                             ),
                         })
                         continue
-                    value = {
-                        "evidence_id": f"{kind}-{rank:03d}",
-                        "relation": kind,
-                        "paper_id": paper_id,
-                        "title": str(item.get("title") or ""),
-                        "authors": item.get("authors") or [],
-                        "year": item.get("year"),
-                        "citation_count": item.get("citation_count"),
-                        "evidence_level": "abstract_only",
-                        "abstract": abstract,
-                        "blocks": [],
-                    }
-                    value["source_descriptor"] = arc_cache_descriptor(
-                        paper_id=paper_id,
-                        title=value["title"],
-                        authors=value["authors"],
-                        year=value["year"],
-                        evidence_level="abstract_only",
-                        content=abstract,
+                    value = _abstract_evidence_record(
+                        kind=kind, rank=rank, item=item, paper_id=paper_id,
+                        abstract=abstract,
                     )
-                    validate_evidence_record(value)
                     diagnostics.append({
                         "severity": "warning",
                         "code": "related_full_text_unavailable",
@@ -214,6 +210,36 @@ def _load_related_evidence(
                 output[value["evidence_id"]] = value
     ordered = [output[key] for key in sorted(output)]
     return ordered, diagnostics
+
+
+def _abstract_evidence_record(
+    *, kind: str, rank: int, item: dict[str, Any], paper_id: str, abstract: str
+) -> dict[str, Any]:
+    value = {
+        "evidence_id": f"{kind}-{rank:03d}",
+        "relation": kind,
+        "paper_id": paper_id,
+        "arxiv_id": item.get("arxiv_id") or item.get("arxiv"),
+        "doi": item.get("doi"),
+        "inspire_id": item.get("inspire_id"),
+        "title": str(item.get("title") or ""),
+        "authors": item.get("authors") or [],
+        "year": item.get("year"),
+        "citation_count": item.get("citation_count"),
+        "evidence_level": "abstract_only",
+        "abstract": abstract,
+        "blocks": [],
+    }
+    value["source_descriptor"] = arc_cache_descriptor(
+        paper_id=paper_id,
+        title=value["title"],
+        authors=value["authors"],
+        year=value["year"],
+        evidence_level="abstract_only",
+        content=abstract,
+    )
+    validate_evidence_record(value)
+    return value
 
 
 def _arxiv_identifier(item: dict[str, Any]) -> str:

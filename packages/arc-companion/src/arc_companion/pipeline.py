@@ -2226,13 +2226,27 @@ def _first_wave_preview_outputs_match(state: dict[str, Any], *, workers: int) ->
 
 def _evidence(bundle: SourceBundle) -> dict[str, Any]:
     def compact(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        fields = ("paper_id", "arxiv_id", "inspire_id", "title", "authors", "year", "citation_count")
-        return [{key: item[key] for key in fields if key in item} for item in items[:25]]
+        fields = (
+            "paper_id", "arxiv_id", "doi", "inspire_id", "title", "authors",
+            "year", "citation_count", "abstract",
+        )
+        return [{key: item[key] for key in fields if key in item} for item in items]
+
+    bibliography = [
+        {
+            key: item[key]
+            for key in ("id", "label", "text", "doi", "arxiv_id", "links")
+            if key in item
+        }
+        for item in bundle.document.get("bibliography") or []
+        if isinstance(item, dict)
+    ]
 
     return {
-        "schema_version": "arc.companion.evidence.v2",
+        "schema_version": "arc.companion.evidence.v3",
         "references": compact(bundle.references),
         "citers": compact(bundle.citers),
+        "bibliography": bibliography,
         "related_papers": list(bundle.related_evidence),
         "diagnostics": list(bundle.diagnostics),
     }
@@ -3484,23 +3498,41 @@ def _evidence_for_segment(
         for value in segment.get("block_ids") or []
     )
     source_tokens = _terms(source_text)
+    citation_targets = _segment_citation_targets(segment, blocks_by_id, evidence)
+    required_ids = set(
+        (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
+    )
     selected: list[dict[str, Any]] = []
     for relation in ("prior", "later"):
-        candidates: list[tuple[int, int, dict[str, Any]]] = []
+        candidates: list[tuple[int, int, int, int, int, dict[str, Any]]] = []
         for index, paper in enumerate(evidence.get("related_papers") or []):
             if paper.get("relation") != relation:
                 continue
+            required = str(paper.get("evidence_id") or "") in required_ids
+            exact = relation == "prior" and _paper_matches_citation_targets(paper, citation_targets)
             search_text = " ".join([
                 str(paper.get("title") or ""),
                 str(paper.get("abstract") or ""),
                 " ".join(str(block.get("text") or "") for block in paper.get("blocks") or []),
             ])
-            score = len(source_tokens & _terms(search_text))
-            candidates.append((-score, index, paper))
-        for _, _, paper in sorted(candidates)[:2]:
+            title_overlap = len(source_tokens & _terms(str(paper.get("title") or "")))
+            context_overlap = len(source_tokens & _terms(search_text))
+            directly_relevant = (
+                required
+                or exact
+                or title_overlap >= 2
+                or (title_overlap >= 1 and context_overlap >= 2)
+                or context_overlap >= 3
+            )
+            if not directly_relevant:
+                continue
+            relevance = (16 if required else 0) + (12 if exact else 0) + 4 * title_overlap + min(context_overlap, 8)
+            citation_prior = min(_citation_count_value(paper).bit_length(), 10)
+            candidates.append((-int(exact), -int(required), -relevance, -citation_prior, index, paper))
+        for _, _, _, _, _, paper in sorted(candidates)[:3]:
             compact = {key: paper.get(key) for key in (
-                "evidence_id", "relation", "paper_id", "title", "authors", "year",
-                "citation_count", "evidence_level", "abstract",
+                "evidence_id", "relation", "paper_id", "arxiv_id", "doi", "inspire_id",
+                "title", "authors", "year", "citation_count", "evidence_level", "abstract",
             )}
             remaining = 4_000
             snippets: list[dict[str, str]] = []
@@ -3538,20 +3570,127 @@ def _evidence_for_segment(
                     compact["source_descriptor"] = descriptor
                 validate_evidence_record(compact)
             selected.append(compact)
-    required_ids = set(
-        (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
-    )
-    selected_ids = {str(item.get("evidence_id") or "") for item in selected}
-    for paper in evidence.get("related_papers") or []:
-        evidence_id = str(paper.get("evidence_id") or "")
-        if evidence_id in required_ids and evidence_id not in selected_ids:
-            selected.append(paper)
-            selected_ids.add(evidence_id)
-    return {"schema_version": "arc.companion.segment-evidence.v2", "papers": selected}
+    return {
+        "schema_version": "arc.companion.segment-evidence.v3",
+        "citation_targets": citation_targets,
+        "reference_catalog": _segment_metadata_catalog(
+            evidence.get("references") or [], source_tokens, citation_targets=citation_targets,
+        ),
+        "citer_catalog": _segment_metadata_catalog(
+            evidence.get("citers") or [], source_tokens, citation_targets=[],
+        ),
+        "papers": selected,
+    }
 
 
 def _terms(text: str) -> set[str]:
-    return {token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", text)}
+    generic = {
+        "about", "after", "also", "analysis", "approach", "before", "between",
+        "field", "fields", "from", "into", "model", "models", "paper", "physics",
+        "result", "results", "study", "that", "their", "theory", "these", "this",
+        "those", "using", "with", "work",
+    }
+    return {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", text)
+        if token.casefold() not in generic
+    }
+
+
+def _segment_citation_targets(
+    segment: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+    evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    target_ids: list[str] = []
+    for block_id_value in segment.get("block_ids") or []:
+        for run in blocks_by_id.get(str(block_id_value), {}).get("inline_runs") or []:
+            if not isinstance(run, dict) or str(run.get("kind") or "") != "citation":
+                continue
+            target_id = str(run.get("target_id") or "").lstrip("#").strip()
+            if target_id and target_id not in target_ids:
+                target_ids.append(target_id)
+    bibliography = {
+        str(item.get("id") or ""): item
+        for item in evidence.get("bibliography") or []
+        if isinstance(item, dict)
+    }
+    return [
+        {key: bibliography.get(target_id, {}).get(key) for key in (
+            "id", "label", "text", "doi", "arxiv_id", "links",
+        ) if bibliography.get(target_id, {}).get(key) not in (None, "")}
+        if target_id in bibliography else {"id": target_id}
+        for target_id in target_ids
+    ]
+
+
+def _paper_matches_citation_targets(
+    paper: dict[str, Any], targets: list[dict[str, Any]],
+) -> bool:
+    paper_arxiv = _normalized_arxiv_id(paper.get("arxiv_id") or paper.get("paper_id"))
+    paper_doi = _normalized_doi(paper.get("doi"))
+    paper_title = _terms(str(paper.get("title") or ""))
+    for target in targets:
+        target_arxiv = _normalized_arxiv_id(target.get("arxiv_id"))
+        target_doi = _normalized_doi(target.get("doi"))
+        if paper_arxiv and target_arxiv and paper_arxiv == target_arxiv:
+            return True
+        if paper_doi and target_doi and paper_doi == target_doi:
+            return True
+        target_terms = _terms(str(target.get("text") or ""))
+        if paper_title and len(paper_title & target_terms) >= max(2, (len(paper_title) + 1) // 2):
+            return True
+    return False
+
+
+def _segment_metadata_catalog(
+    records: list[dict[str, Any]],
+    source_tokens: set[str],
+    *,
+    citation_targets: list[dict[str, Any]],
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    fields = (
+        "paper_id", "arxiv_id", "doi", "inspire_id", "title", "authors",
+        "year", "citation_count", "abstract",
+    )
+    ranked = []
+    for index, item in enumerate(records):
+        exact = _paper_matches_citation_targets(item, citation_targets)
+        search_text = f"{item.get('title', '')} {item.get('abstract', '')}"
+        overlap = len(source_tokens & _terms(search_text))
+        citation_prior = min(_citation_count_value(item).bit_length(), 10)
+        ranked.append((-int(exact), -overlap, -citation_prior, index, item))
+    return [
+        {key: item[key] for key in fields if key in item}
+        for _, _, _, _, item in sorted(ranked)[:limit]
+    ]
+
+
+def _citation_count_value(item: dict[str, Any]) -> int:
+    try:
+        return max(0, int(item.get("citation_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalized_arxiv_id(value: Any) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, dict):
+        value = value.get("value") or value.get("id") or ""
+    text = str(value or "").casefold().strip()
+    text = re.sub(r"^(?:arxiv:)?", "", text)
+    return re.sub(r"v\d+$", "", text)
+
+
+def _normalized_doi(value: Any) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, dict):
+        value = value.get("value") or value.get("id") or ""
+    text = str(value or "").casefold().strip()
+    return re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", text).rstrip(".,;)")
 
 
 def _load_recovered_section_reviews(
