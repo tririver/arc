@@ -50,11 +50,15 @@ def _record(relation: str = "prior") -> dict:
 
 def test_annotation_schema_and_controller_enforce_two_strict_requests() -> None:
     base = {
-        "explanation": "Explanation", "prior_work": "", "later_work": "",
+        "explanation": "Explanation", "prior_work": [], "later_work": [],
         "commentary": "Commentary", "evidence_ids": [], "key_points": [], "source_notes": [],
     }
     for count in (0, 1, 2):
         jsonschema.validate({**base, "evidence_requests": [_request() for _ in range(count)]}, ANNOTATION_SCHEMA)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({
+            **base, "prior_work": "legacy prose", "evidence_requests": [],
+        }, ANNOTATION_SCHEMA)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({**base, "evidence_requests": [_request() for _ in range(3)]}, ANNOTATION_SCHEMA)
     with pytest.raises(ValueError, match="at most two"):
@@ -298,9 +302,13 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
     requests = normalize_evidence_requests("s2", [_request()])
     unresolved = normalize_evidence_requests("s3", [_request("later")])
     annotations = {
-        "s1": {"commentary": "one", "explanation": "one", "prior_work": "", "later_work": "", "evidence_ids": [], "key_points": [], "source_notes": [], "evidence_requests": []},
-        "s2": {"commentary": "two", "explanation": "two", "prior_work": "", "later_work": "", "evidence_ids": [], "key_points": [], "source_notes": [], "evidence_requests": requests},
-        "s3": {"commentary": "three", "explanation": "three", "prior_work": "", "later_work": "unverified", "evidence_ids": [], "key_points": [], "source_notes": [], "evidence_requests": unresolved},
+        "s1": {"commentary": "one", "explanation": "one", "prior_work": [], "later_work": [], "evidence_ids": [], "key_points": [], "source_notes": [], "evidence_requests": []},
+        "s2": {"commentary": "two", "explanation": "two", "prior_work": [], "later_work": [], "evidence_ids": [], "key_points": [], "source_notes": [], "evidence_requests": requests},
+        "s3": {"commentary": "three", "explanation": "three", "prior_work": [], "later_work": [{
+            "text": "unverified", "evidence_ids": ["missing"],
+            "source_locators": [{"evidence_id": "missing", "locator": "abstract"}],
+            "request_key": unresolved[0]["request_key"],
+        }], "evidence_ids": ["missing"], "key_points": [], "source_notes": [], "evidence_requests": unresolved},
     }
     record = _record()
 
@@ -325,7 +333,7 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
                 "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
                 "request_key": requests[0]["request_key"],
             }],
-            "later_work": "", "evidence_ids": ["verified-paper"], "key_points": [],
+            "later_work": [], "evidence_ids": ["verified-paper"], "key_points": [],
             "source_notes": [], "evidence_requests": [],
         }}
 
@@ -341,7 +349,7 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
     assert calls == [(["s2"], 2)]
     assert final["s1"]["commentary"] == "one"
     assert final["s2"]["prior_work"][0]["text"] == "supported"
-    assert final["s3"]["later_work"] == ""
+    assert final["s3"]["later_work"] == []
     assert all(not item["evidence_requests"] for item in final.values())
     assert [item["evidence_id"] for item in merged["related_papers"]] == ["verified-paper"]
     audit = __import__("json").loads((tmp_path / "evidence-resolution.v1.json").read_text())
@@ -365,7 +373,7 @@ def test_rerun_ignoring_request_evidence_drops_only_that_claim(monkeypatch, tmp_
     }
     annotations = {"s1": {
         "commentary": "one", "explanation": "one", "prior_work": [first_claim],
-        "later_work": "", "evidence_ids": ["generic-prior"], "key_points": [],
+        "later_work": [], "evidence_ids": ["generic-prior"], "key_points": [],
         "source_notes": [], "evidence_requests": [request],
     }}
 
@@ -396,7 +404,7 @@ def test_rerun_ignoring_request_evidence_drops_only_that_claim(monkeypatch, tmp_
                     "request_key": request["request_key"],
                 },
             ],
-            "later_work": "", "evidence_ids": ["generic-prior"], "key_points": [],
+            "later_work": [], "evidence_ids": ["generic-prior"], "key_points": [],
             "source_notes": [], "evidence_requests": [],
         }}
 
@@ -419,7 +427,7 @@ def test_review_cannot_add_related_work_from_relation_level_id(tmp_path: Path) -
     segment = {"segment_id": "s1", "block_ids": ["b1"]}
     annotations = {"s1": {
         "commentary": "commentary", "explanation": "explanation",
-        "prior_work": "", "later_work": "", "evidence_ids": [],
+        "prior_work": [], "later_work": [], "evidence_ids": [],
         "key_points": [], "source_notes": [], "evidence_requests": [],
     }}
 
@@ -427,7 +435,11 @@ def test_review_cannot_add_related_work_from_relation_level_id(tmp_path: Path) -
         return {"patches": [{
             "segment_id": "s1", "translation_blocks": None,
             "commentary": None, "explanation": None,
-            "prior_work": "Invented prior-work fact.", "later_work": None,
+            "prior_work": [{
+                "text": "Invented prior-work fact.", "evidence_ids": ["verified-paper"],
+                "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
+                "request_key": None,
+            }], "later_work": None,
             "evidence_ids": ["verified-paper"], "reason": "invent",
         }], "issues": []}
 
@@ -436,6 +448,42 @@ def test_review_cannot_add_related_work_from_relation_level_id(tmp_path: Path) -
             [segment], {"s1": {"blocks": [{"block_id": "b1", "text": "译文"}]}},
             annotations,
             document={"blocks": [{"block_id": "b1", "type": "text", "text": "Verified paper passage."}]},
+            glossary={"entries": []}, protected_names=[],
+            evidence={"related_papers": [record]},
+            options=BuildOptions("arXiv:1", tmp_path, review_context_chars=100_000),
+            llm=reviewer, checkpoint_dir=tmp_path,
+        )
+
+
+def test_review_cannot_rewrite_text_while_reusing_a_claim_binding(tmp_path: Path) -> None:
+    record = _record()
+    claim = {
+        "text": "Verified prior statement.", "evidence_ids": ["verified-paper"],
+        "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
+        "request_key": None,
+    }
+    annotations = {"s1": {
+        "commentary": "commentary", "explanation": "explanation",
+        "prior_work": [claim], "later_work": [], "evidence_ids": ["verified-paper"],
+        "key_points": [], "source_notes": [], "evidence_requests": [],
+    }}
+
+    def reviewer(_prompt, **_kwargs):
+        return {"patches": [{
+            "segment_id": "s1", "translation_blocks": None,
+            "commentary": None, "explanation": None,
+            "prior_work": [{**claim, "text": "A materially different claim."}],
+            "later_work": None, "evidence_ids": None, "reason": "rewrite",
+        }], "issues": []}
+
+    with pytest.raises(RuntimeError, match="review added a related-work claim"):
+        _review(
+            [{"segment_id": "s1", "block_ids": ["b1"]}],
+            {"s1": {"blocks": [{"block_id": "b1", "text": "译文"}]}},
+            annotations,
+            document={"blocks": [{
+                "block_id": "b1", "type": "text", "text": "Verified paper passage.",
+            }]},
             glossary={"entries": []}, protected_names=[],
             evidence={"related_papers": [record]},
             options=BuildOptions("arXiv:1", tmp_path, review_context_chars=100_000),

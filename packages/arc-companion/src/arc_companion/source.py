@@ -103,7 +103,7 @@ def _load_related_evidence(
     parse: Callable[..., dict[str, Any]],
     refresh: bool,
     recache: bool,
-    full_text_limit_per_kind: int = 24,
+    full_text_limit_per_kind: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Cache broad metadata evidence plus a bounded full-text working set.
 

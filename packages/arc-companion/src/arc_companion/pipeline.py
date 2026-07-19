@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -63,7 +64,7 @@ from .segmentation import SegmentationError, segment_document, validate_exact_co
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
 
 
-WORKFLOW_VERSION = "arc.companion.workflow.v5"
+WORKFLOW_VERSION = "arc.companion.workflow.v6"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -78,7 +79,8 @@ TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION = (
 )
 ANNOTATION_TIER = "high"
 REVIEW_TIER = "high"
-REVIEW_VERSION = "arc.companion.review.v2"
+REVIEW_VERSION = "arc.companion.review.v3"
+ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v4"
 SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
@@ -377,13 +379,16 @@ def build_companion(
             protected_names=protected_names,
             checkpoint_dir=checkpoint_dir,
             llm=llm,
-            controller=evidence_controller or EvidenceRequestController(),
+            controller=evidence_controller or EvidenceRequestController(
+                domain_paper_ids=(domain_context or {}).get("paper_ids") or (),
+                seed_paper_ids=(bundle.paper_id,),
+            ),
         )
 
         _state(state_path, status="reviewing", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
                segment_count=len(expanded))
-        reviewed_path = checkpoint_dir / "annotations.reviewed.v2.json"
-        review_path = checkpoint_dir / "review.v2.json"
+        reviewed_path = checkpoint_dir / "annotations.reviewed.v3.json"
+        review_path = checkpoint_dir / "review.v3.json"
         if reviewed_path.is_file() and review_path.is_file() and not options.force:
             cached_reviewed = read_json(reviewed_path)
             review = read_json(review_path)
@@ -836,6 +841,7 @@ def _generate_annotations(
             )
             if (
                 isinstance(checkpoint, dict)
+                and checkpoint.get("schema_version") == ANNOTATION_CHECKPOINT_VERSION
                 and checkpoint.get("segment_id") == segment["segment_id"]
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("annotation"), dict)
@@ -935,7 +941,7 @@ def _generate_annotations(
                 write_json(
                     annotation_dir / f"{_segment_checkpoint_name(segment_id)}.json",
                     {
-                        "schema_version": "arc.companion.annotation-checkpoint.v3",
+                        "schema_version": ANNOTATION_CHECKPOINT_VERSION,
                         "round": round_number,
                         "segment_id": segment_id,
                         "input_sha256": _segment_input_hash(
@@ -1094,7 +1100,7 @@ def _normalize_related_work(
 ) -> str | list[dict[str, Any]]:
     """Preserve legacy strings while normalizing claim-level evidence bindings."""
     if not isinstance(value, list):
-        return str(value or "")
+        raise RuntimeError("related work must use claim arrays in generated annotations")
     if len(value) > 3:
         raise RuntimeError("related work may contain at most three claims")
     claims: list[dict[str, Any]] = []
@@ -1146,7 +1152,7 @@ def _drop_unsupported_second_round_related_work(
                 )
             ]
         elif not any(relation_by_id.get(evidence_id) == relation for evidence_id in used):
-            annotation[field] = ""
+            annotation[field] = []
     if any(isinstance(annotation.get(field), list) for field in ("prior_work", "later_work")):
         _sync_claim_evidence_ids(annotation)
         return
@@ -1178,7 +1184,7 @@ def _clear_unresolved_requested_work(
                 or str(claim.get("request_key") or "") not in relation_keys
             ]
         else:
-            annotation[field] = ""
+            annotation[field] = []
     _sync_claim_evidence_ids(annotation)
 
 
@@ -1201,8 +1207,7 @@ def _enforce_request_claim_bindings(
         if not resolved_keys:
             continue
         if not isinstance(value, list):
-            original = (first_draft or {}).get(field)
-            annotation[field] = str(original or "") if not isinstance(original, list) else ""
+            annotation[field] = []
             continue
         prior_bindings = {
             _claim_binding_key(claim)
@@ -1232,6 +1237,7 @@ def _enforce_request_claim_bindings(
 
 def _claim_binding_key(claim: dict[str, Any]) -> tuple[Any, ...]:
     return (
+        str(claim.get("text") or "").strip(),
         claim.get("request_key"),
         tuple(str(item) for item in claim.get("evidence_ids") or []),
         tuple(
@@ -3702,11 +3708,11 @@ def _validate_annotation_evidence(annotation: dict[str, Any], papers: list[dict[
         return
     relation_by_id = {str(item.get("evidence_id") or ""): item.get("relation") for item in papers}
     used = set(str(value) for value in annotation.get("evidence_ids") or [])
-    if str(annotation.get("prior_work") or "").strip() and not any(
+    if bool(annotation.get("prior_work")) and not any(
         relation_by_id.get(value) == "prior" for value in used
     ):
         raise RuntimeError("prior-work commentary has no cited prior-work evidence")
-    if str(annotation.get("later_work") or "").strip() and not any(
+    if bool(annotation.get("later_work")) and not any(
         relation_by_id.get(value) == "later" for value in used
     ):
         raise RuntimeError("later-work commentary has no cited later-work evidence")
@@ -3726,38 +3732,49 @@ def _evidence_for_segment(
     required_ids = set(
         (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
     )
+    related_papers = list(evidence.get("related_papers") or [])
+    pieces_by_id = {
+        str(paper.get("evidence_id") or ""): _paper_evidence_pieces(paper)
+        for paper in related_papers
+    }
+    piece_terms = [
+        terms
+        for pieces in pieces_by_id.values()
+        for _, _, terms in pieces
+        if terms
+    ]
+    idf = _inverse_document_frequencies(piece_terms)
     selected: list[dict[str, Any]] = []
     for relation in ("prior", "later"):
-        candidates: list[tuple[int, int, int, int, int, dict[str, Any]]] = []
-        for index, paper in enumerate(evidence.get("related_papers") or []):
+        candidates: list[tuple[int, int, float, int, int, dict[str, Any], dict[str, Any]]] = []
+        for index, paper in enumerate(related_papers):
             if paper.get("relation") != relation:
                 continue
             required = str(paper.get("evidence_id") or "") in required_ids
             exact = relation == "prior" and _paper_matches_citation_targets(paper, citation_targets)
-            search_text = " ".join([
-                str(paper.get("title") or ""),
-                str(paper.get("abstract") or ""),
-                " ".join(str(block.get("text") or "") for block in paper.get("blocks") or []),
-            ])
-            title_overlap = len(source_tokens & _terms(str(paper.get("title") or "")))
-            context_overlap = len(source_tokens & _terms(search_text))
-            directly_relevant = (
-                required
-                or exact
-                or title_overlap >= 2
-                or (title_overlap >= 1 and context_overlap >= 2)
-                or context_overlap >= 3
+            direct_match = _best_direct_evidence_match(
+                source_tokens,
+                pieces_by_id.get(str(paper.get("evidence_id") or ""), []),
+                idf,
             )
-            if not directly_relevant:
+            if not (required or exact or direct_match):
                 continue
-            relevance = (16 if required else 0) + (12 if exact else 0) + 4 * title_overlap + min(context_overlap, 8)
+            selection = direct_match or {
+                "reason": "controller_required" if required else "exact_bibliography_target",
+                "score": 1.0,
+                "locator": "",
+            }
             citation_prior = min(_citation_count_value(paper).bit_length(), 10)
-            candidates.append((-int(exact), -int(required), -relevance, -citation_prior, index, paper))
-        for _, _, _, _, _, paper in sorted(candidates)[:3]:
+            candidates.append((
+                -int(exact), -int(required), -float(selection["score"]),
+                -citation_prior, index, paper, selection,
+            ))
+        for _, _, _, _, _, paper, selection in sorted(candidates)[:3]:
             compact = {key: paper.get(key) for key in (
                 "evidence_id", "relation", "paper_id", "arxiv_id", "doi", "inspire_id",
                 "title", "authors", "year", "citation_count", "evidence_level", "abstract",
             )}
+            compact["selection"] = selection
             remaining = 4_000
             snippets: list[dict[str, str]] = []
             ranked_blocks = sorted(
@@ -3821,6 +3838,96 @@ def _terms(text: str) -> set[str]:
     }
 
 
+def _paper_evidence_pieces(
+    paper: dict[str, Any], *, window_words: int = 96, stride_words: int = 48,
+) -> list[tuple[str, str, set[str]]]:
+    """Return independently auditable local pieces; never concatenate a paper."""
+    pieces: list[tuple[str, str, set[str]]] = []
+    title = str(paper.get("title") or "").strip()
+    if title:
+        pieces.append(("title", title, _terms(title)))
+    abstract = str(paper.get("abstract") or "").strip()
+    if abstract:
+        pieces.append(("abstract", abstract, _terms(abstract)))
+    for block_index, block in enumerate(paper.get("blocks") or [], 1):
+        if not isinstance(block, dict):
+            continue
+        text = str(block.get("text") or "").strip()
+        if not text:
+            continue
+        locator = str(block.get("block_id") or f"block-{block_index}")
+        words = re.findall(r"\S+", text)
+        if len(words) <= window_words:
+            pieces.append((locator, text, _terms(text)))
+            continue
+        for start in range(0, len(words), stride_words):
+            excerpt = " ".join(words[start:start + window_words])
+            if excerpt:
+                pieces.append((locator, excerpt, _terms(excerpt)))
+            if start + window_words >= len(words):
+                break
+    return pieces
+
+
+def _inverse_document_frequencies(documents: list[set[str]]) -> dict[str, float]:
+    count = max(1, len(documents))
+    frequencies: dict[str, int] = {}
+    for document in documents:
+        for term in document:
+            frequencies[term] = frequencies.get(term, 0) + 1
+    return {
+        term: math.log((count + 1) / (frequency + 1)) + 1.0
+        for term, frequency in frequencies.items()
+    }
+
+
+def _best_direct_evidence_match(
+    source_terms: set[str],
+    pieces: list[tuple[str, str, set[str]]],
+    idf: dict[str, float],
+) -> dict[str, Any] | None:
+    """Require a strong match to one located piece, not diffuse whole-paper overlap."""
+    if not source_terms:
+        return None
+    source_norm = math.sqrt(sum(idf.get(term, 1.0) ** 2 for term in source_terms))
+    local_frequencies: dict[str, int] = {}
+    for _, _, terms in pieces:
+        for term in terms:
+            local_frequencies[term] = local_frequencies.get(term, 0) + 1
+    best: tuple[float, str, str, int] | None = None
+    for locator, excerpt, terms in pieces:
+        overlap = source_terms & terms
+        minimum_overlap = 2 if min(len(source_terms), len(terms)) <= 4 else 3
+        if len(overlap) < minimum_overlap:
+            continue
+        if len(pieces) > 3 and locator != "title":
+            localized = {
+                term for term in overlap
+                if local_frequencies.get(term, 0) <= max(2, math.ceil(len(pieces) * 0.25))
+            }
+            if len(localized) < 2:
+                continue
+        piece_norm = math.sqrt(sum(idf.get(term, 1.0) ** 2 for term in terms))
+        if not source_norm or not piece_norm:
+            continue
+        score = sum(idf.get(term, 1.0) ** 2 for term in overlap) / (source_norm * piece_norm)
+        # A cosine this high requires the overlap to be concentrated in the
+        # source passage and in one exact title/abstract/block window.
+        if score < 0.40:
+            continue
+        candidate = (score, locator, excerpt, len(overlap))
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
+        return None
+    score, locator, excerpt, overlap_count = best
+    return {
+        "reason": "direct_local_piece",
+        "score": round(score, 6),
+        "locator": locator,
+        "overlap_term_count": overlap_count,
+        "excerpt_sha256": text_sha256(excerpt),
+    }
 def _segment_citation_targets(
     segment: dict[str, Any],
     blocks_by_id: dict[str, dict[str, Any]],
@@ -3843,8 +3950,7 @@ def _segment_citation_targets(
         {key: bibliography.get(target_id, {}).get(key) for key in (
             "id", "label", "text", "doi", "arxiv_id", "links",
         ) if bibliography.get(target_id, {}).get(key) not in (None, "")}
-        if target_id in bibliography else {"id": target_id}
-        for target_id in target_ids
+        for target_id in target_ids if target_id in bibliography
     ]
 
 
@@ -3872,7 +3978,8 @@ def _segment_metadata_catalog(
     source_tokens: set[str],
     *,
     citation_targets: list[dict[str, Any]],
-    limit: int = 100,
+    limit: int = 40,
+    max_chars: int = 12_000,
 ) -> list[dict[str, Any]]:
     fields = (
         "paper_id", "arxiv_id", "doi", "inspire_id", "title", "authors",
@@ -3885,10 +3992,25 @@ def _segment_metadata_catalog(
         overlap = len(source_tokens & _terms(search_text))
         citation_prior = min(_citation_count_value(item).bit_length(), 10)
         ranked.append((-int(exact), -overlap, -citation_prior, index, item))
-    return [
-        {key: item[key] for key in fields if key in item}
-        for _, _, _, _, item in sorted(ranked)[:limit]
-    ]
+    output: list[dict[str, Any]] = []
+    used = 2
+    for _, _, _, _, item in sorted(ranked):
+        compact = {key: item[key] for key in fields if key in item}
+        if "abstract" in compact:
+            compact["abstract"] = str(compact["abstract"])[:1_200]
+        size = len(json.dumps(compact, ensure_ascii=False, separators=(",", ":"))) + 1
+        if output and used + size > max_chars:
+            break
+        if size > max_chars:
+            compact.pop("abstract", None)
+            size = len(json.dumps(compact, ensure_ascii=False, separators=(",", ":"))) + 1
+        if used + size > max_chars:
+            continue
+        output.append(compact)
+        used += size
+        if len(output) >= limit:
+            break
+    return output
 
 
 def _citation_count_value(item: dict[str, Any]) -> int:

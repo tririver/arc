@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "arc.companion.prompts.v8"
-SCHEMA_VERSION = "arc.companion.schemas.v7"
+PROMPT_VERSION = "arc.companion.prompts.v9"
+SCHEMA_VERSION = "arc.companion.schemas.v8"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v4"
 TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v3"
 TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION = (
@@ -166,10 +166,9 @@ RELATED_WORK_CLAIM_SCHEMA: dict[str, Any] = {
 }
 
 RELATED_WORK_SCHEMA: dict[str, Any] = {
-    "oneOf": [
-        {"type": "string"},
-        {"type": "array", "maxItems": 3, "items": RELATED_WORK_CLAIM_SCHEMA},
-    ],
+    "type": "array",
+    "maxItems": 3,
+    "items": RELATED_WORK_CLAIM_SCHEMA,
 }
 
 ANNOTATION_SCHEMA: dict[str, Any] = {
@@ -245,12 +244,12 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "commentary": {"type": ["string", "null"], "minLength": 1},
                     "explanation": {"type": ["string", "null"], "minLength": 1},
                     "prior_work": {
-                        "type": ["string", "array", "null"],
-                        "oneOf": [{"type": "null"}, *RELATED_WORK_SCHEMA["oneOf"]],
+                        "type": ["array", "null"],
+                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
                     },
                     "later_work": {
-                        "type": ["string", "array", "null"],
-                        "oneOf": [{"type": "null"}, *RELATED_WORK_SCHEMA["oneOf"]],
+                        "type": ["array", "null"],
+                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
                     },
                     "evidence_ids": {
                         "type": ["array", "null"],
@@ -478,7 +477,7 @@ def annotation_prompt(
         "Include a claim only when it directly illuminates a concrete claim in this exact segment. Never fill "
         "either field merely because it exists in the schema, and never use a famous, highly cited, or field-"
         "defining paper as a generic fallback. A same-relation paper is not generic support for another claim. "
-        "Empty strings are the correct output when no directly relevant evidence exists. Treat the segment's "
+        "Empty arrays are the correct output when no directly relevant evidence exists. Treat the segment's "
         "exact bibliography citation targets as the strongest prior-work relevance signal; citation count is only "
         "a weak secondary prior. Prefer a more directly relevant paper even when it is outside the supplied domain "
         "or less cited. Do not fill a quota. Explain motivation, assumptions, "
@@ -521,7 +520,7 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "coverage, terminology consistency, protected-name preservation, and unsupported literature claims. "
         "Source blocks and the frozen glossary are immutable. Return one patch only for a segment needing correction. "
         "Every patch field is required by the output schema: use null for each translation or companion field that "
-        "must remain unchanged, and use an empty string only when intentionally clearing prior_work or later_work. "
+        "must remain unchanged, and use an empty array only when intentionally clearing prior_work or later_work. "
         "Prior and later work are optional; never add a generic or quota-filling related-work patch. "
         "Return full replacement translation blocks for a translation correction. Never alter equations, equation numbers, figures, "
         "tables, citations, references, identifiers, or evidence IDs. Never create a new prior/later claim or bind "

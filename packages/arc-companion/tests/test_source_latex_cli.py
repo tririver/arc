@@ -103,7 +103,7 @@ def test_source_adapter_records_optional_citer_failure_as_warning() -> None:
     },)
 
 
-def test_source_adapter_caches_bounded_related_full_text_through_parse_api() -> None:
+def test_source_adapter_keeps_related_metadata_without_parsing_related_full_text() -> None:
     calls: list[dict] = []
 
     def parse(**kwargs):
@@ -120,11 +120,13 @@ def test_source_adapter_caches_bounded_related_full_text_through_parse_api() -> 
         return {"ok": True, "data": data}
 
     references = [
-        {"arxiv_id": f"0801.{index:04d}", "title": f"Prior {index}", "citation_count": index}
+        {"arxiv_id": f"0801.{index:04d}", "title": f"Prior {index}",
+         "abstract": f"Prior abstract {index}.", "citation_count": index}
         for index in range(9)
     ]
     citers = [
-        {"arxiv_id": f"2501.{index:04d}", "title": f"Later {index}", "citation_count": index}
+        {"arxiv_id": f"2501.{index:04d}", "title": f"Later {index}",
+         "abstract": f"Later abstract {index}.", "citation_count": index}
         for index in range(9)
     ]
     bundle = load_source_bundle(
@@ -137,18 +139,16 @@ def test_source_adapter_caches_bounded_related_full_text_through_parse_api() -> 
 
     assert calls[0]["paper_id"] == "arXiv:1"
     assert calls[0]["include_document"] is True
-    assert len(calls) == 19
-    assert all(call["include_document"] is False for call in calls[1:])
+    assert len(calls) == 1
     assert len(bundle.related_evidence) == 18
     assert {item["paper_id"] for item in bundle.related_evidence} >= {
         "0801.0000", "0801.0008", "2501.0000", "2501.0008",
     }
     assert {item["relation"] for item in bundle.related_evidence} == {"prior", "later"}
-    assert all(item["evidence_level"] == "full_text" for item in bundle.related_evidence)
+    assert all(item["evidence_level"] == "abstract_only" for item in bundle.related_evidence)
     assert all(item["source_descriptor"]["provider"] == "arc-paper" for item in bundle.related_evidence)
     assert all(item["source_descriptor"]["content_sha256"] for item in bundle.related_evidence)
-    assert all(item["blocks"][0]["sha256"] for item in bundle.related_evidence)
-    assert all(item["blocks"][0]["block_id"].endswith("-s1") for item in bundle.related_evidence)
+    assert all(not item["blocks"] for item in bundle.related_evidence)
 
 
 @pytest.mark.parametrize(

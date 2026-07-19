@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import threading
 
+import jsonschema
 import pytest
 
 from arc_companion import pipeline as pipeline_module
@@ -31,6 +32,7 @@ from arc_companion.pipeline import (
     build_companion,
     validate_and_expand_segments,
 )
+from arc_companion.prompts import ANNOTATION_SCHEMA
 from arc_companion.source import SourceBundle
 
 
@@ -1170,8 +1172,8 @@ def test_final_review_translation_patch_normalizes_citation_delimiters(
         "seg-review": {"blocks": [{"block_id": "cited", "text": f"参见[{token}]。"}]}
     }
     annotations = {"seg-review": {
-        "commentary": "伴读", "explanation": "解释", "prior_work": "",
-        "later_work": "", "evidence_ids": [], "key_points": [], "source_notes": [],
+        "commentary": "伴读", "explanation": "解释", "prior_work": [],
+        "later_work": [], "evidence_ids": [], "key_points": [], "source_notes": [],
     }}
 
     def llm(prompt: str, **kwargs):
@@ -2464,7 +2466,7 @@ class FakeLLM:
             self.annotation_barrier.wait(timeout=5)
             segment_id = label.rsplit("-", 1)[-1]
             return {
-                "explanation": f"解释 {segment_id}", "prior_work": "", "later_work": "",
+                "explanation": f"解释 {segment_id}", "prior_work": [], "later_work": [],
                 "commentary": f"伴读 {segment_id}", "evidence_ids": [],
                 "key_points": [], "source_notes": [],
             }
@@ -2479,7 +2481,7 @@ class FakeLLM:
                             {"block_id": "b2", "text": "令 x < y 且 y > 0。"},
                         ]},
                         "annotation": {
-                            "explanation": "解释 0001", "prior_work": "", "later_work": "",
+                            "explanation": "解释 0001", "prior_work": [], "later_work": [],
                             "commentary": "伴读 0001", "evidence_ids": [],
                             "key_points": [], "source_notes": [],
                         },
@@ -2487,7 +2489,7 @@ class FakeLLM:
                     {
                         "segment_id": "seg-0002", "translation": {"blocks": []},
                         "annotation": {
-                            "explanation": "解释 0002", "prior_work": "", "later_work": "",
+                            "explanation": "解释 0002", "prior_work": [], "later_work": [],
                             "commentary": "伴读 0002", "evidence_ids": [],
                             "key_points": [], "source_notes": [],
                         },
@@ -2641,6 +2643,85 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert len(fake.calls) == call_count
 
 
+def test_build_passes_explicit_domain_and_seed_ids_to_default_evidence_controller(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    fake = FakeLLM()
+    captured: dict[str, tuple[str, ...]] = {}
+
+    class CapturingController:
+        def __init__(self, *, domain_paper_ids=(), seed_paper_ids=()):
+            captured["domain"] = tuple(domain_paper_ids)
+            captured["seed"] = tuple(seed_paper_ids)
+
+    monkeypatch.setattr(pipeline_module, "EvidenceRequestController", CapturingController)
+    monkeypatch.setattr(pipeline_module, "load_domain_context", lambda **_kwargs: {
+        "schema_version": "arc.companion.domain-context.v1",
+        "paper_ids": ["arXiv:1111.1111", "arXiv:2222.2222"],
+        "domains": [],
+    })
+
+    result = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id, project_dir=tmp_path / "controller-context",
+            domain_id="provided-domain",
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=fake,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF-1.7 fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result["ok"], result
+    assert captured == {
+        "domain": ("arXiv:1111.1111", "arXiv:2222.2222"),
+        "seed": (bundle.paper_id,),
+    }
+
+
+def test_legacy_string_annotation_checkpoint_is_rerun_and_upgraded(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    fake = FakeLLM()
+    fake.annotation_barrier = threading.Barrier(1)
+    segment = {
+        "segment_id": "seg-0001", "block_ids": ["b1", "b2"],
+        "start_block_id": "b1", "end_block_id": "b2",
+    }
+    checkpoint_dir = tmp_path / "legacy-checkpoint"
+    kwargs = dict(
+        options=BuildOptions(bundle.paper_id, tmp_path, workers=1), bundle=bundle,
+        evidence={"related_papers": []}, domain_context=None, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir, llm=fake,
+    )
+
+    first = pipeline_module._generate_annotations([segment], **kwargs)
+    checkpoint_path = (
+        checkpoint_dir / "annotations"
+        / f"{_segment_checkpoint_name('seg-0001')}.json"
+    )
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint["schema_version"] = "arc.companion.annotation-checkpoint.v3"
+    checkpoint["annotation"]["prior_work"] = "legacy unbound prose"
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    calls_before = len([
+        call for call in fake.calls
+        if str(call["call_label"]).startswith("companion-annotation-")
+    ])
+
+    second = pipeline_module._generate_annotations([segment], **kwargs)
+
+    calls_after = len([
+        call for call in fake.calls
+        if str(call["call_label"]).startswith("companion-annotation-")
+    ])
+    upgraded = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert first["seg-0001"]["prior_work"] == []
+    assert second["seg-0001"]["prior_work"] == []
+    assert calls_after == calls_before + 1
+    assert upgraded["schema_version"] == pipeline_module.ANNOTATION_CHECKPOINT_VERSION
+
+
 def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
     tmp_path: Path,
 ) -> None:
@@ -2665,7 +2746,7 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
     annotations = {
         segment["segment_id"]: {
             "commentary": "伴读" + ("乙" * 2_000), "explanation": "解释",
-            "prior_work": "", "later_work": "", "evidence_ids": [],
+            "prior_work": [], "later_work": [], "evidence_ids": [],
             "key_points": [], "source_notes": [], "evidence_requests": [],
         }
         for segment in segments
@@ -3261,6 +3342,65 @@ def test_segment_related_work_is_empty_when_every_relevance_score_is_zero() -> N
     assert selected["papers"] == []
 
 
+def test_long_generic_full_text_does_not_become_direct_related_work() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {
+        "block_id": "source",
+        "text": (
+            "We analyze a theoretical model and derive general observational results "
+            "for parameters, fields, perturbations, correlations, and measurements."
+        ),
+        "inline_runs": [{
+            "kind": "citation", "content": "Figure 1", "target_id": "S1.F1",
+        }],
+    }}
+    generic_text = " ".join(
+        "This paper analyzes a theoretical model with fields parameters perturbations "
+        "observational results correlations and measurements in a general framework."
+        for _ in range(80)
+    )
+    paper = _related_work_record(
+        "prior-famous", relation="prior", title="Broad overview and constraints",
+        abstract="", citation_count=1_000_000, paper_id="arXiv:0001.0001",
+    )
+    paper["evidence_level"] = "full_text"
+    paper["blocks"] = [{
+        "block_id": "long-section", "text": generic_text,
+        "sha256": text_sha256(generic_text),
+    }]
+    paper["source_descriptor"] = arc_cache_descriptor(
+        paper_id=paper["paper_id"], title=paper["title"], authors=[], year=2000,
+        evidence_level="full_text", content=paper["blocks"], document_hash="e" * 64,
+    )
+
+    selected = _evidence_for_segment(
+        segment, by_id,
+        {"bibliography": [{"id": "bib.real", "label": "[1]"}], "related_papers": [paper]},
+    )
+
+    assert selected["citation_targets"] == []
+    assert selected["papers"] == []
+
+
+def test_metadata_catalog_has_item_and_character_budgets() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {"block_id": "source", "text": "specific conversion signal"}}
+    references = [{
+        "arxiv_id": f"0001.{index:04d}",
+        "title": f"Candidate {index} specific conversion",
+        "abstract": "x" * 5_000,
+        "citation_count": index,
+    } for index in range(100)]
+
+    selected = _evidence_for_segment(
+        segment, by_id, {"references": references, "related_papers": []},
+    )
+
+    catalog = selected["reference_catalog"]
+    assert len(catalog) <= 40
+    assert len(json.dumps(catalog, ensure_ascii=False, separators=(",", ":"))) <= 12_000
+
+
 def test_direct_relevance_beats_citations_and_domain_membership() -> None:
     segment = {"segment_id": "seg", "block_ids": ["source"]}
     by_id = {"source": {"block_id": "source", "text": "Curvaton decay transfer produces isocurvature."}}
@@ -3280,6 +3420,44 @@ def test_direct_relevance_beats_citations_and_domain_membership() -> None:
     selected = _evidence_for_segment(segment, by_id, {"related_papers": papers})
 
     assert [item["evidence_id"] for item in selected["papers"]] == ["prior-direct"]
+
+
+def test_selected_candidate_can_be_bound_in_production_claim_schema() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {
+        "block_id": "source", "text": "spectator conversion creates a bispectrum",
+    }}
+    text = "The spectator conversion creates a bispectrum."
+    record = {
+        "evidence_id": "prior-direct", "relation": "prior",
+        "paper_id": "arXiv:0001.0009", "title": "Spectator conversion bispectrum",
+        "authors": [], "year": 2000, "citation_count": 1,
+        "evidence_level": "full_text", "abstract": "",
+        "blocks": [{"block_id": "S2", "text": text, "sha256": text_sha256(text)}],
+    }
+    record["source_descriptor"] = arc_cache_descriptor(
+        paper_id=record["paper_id"], title=record["title"], authors=[], year=2000,
+        evidence_level="full_text", content=record["blocks"], document_hash="f" * 64,
+    )
+
+    selected = _evidence_for_segment(segment, by_id, {"related_papers": [record]})
+    chosen = selected["papers"][0]
+    annotation = {
+        "explanation": "Explanation", "commentary": "Commentary",
+        "prior_work": [{
+            "text": "The prior paper studies this conversion.",
+            "evidence_ids": [chosen["evidence_id"]],
+            "source_locators": [{
+                "evidence_id": chosen["evidence_id"],
+                "locator": chosen["snippets"][0]["block_id"],
+            }],
+            "request_key": None,
+        }],
+        "later_work": [], "evidence_ids": [chosen["evidence_id"]],
+        "key_points": [], "source_notes": [], "evidence_requests": [],
+    }
+
+    jsonschema.validate(annotation, ANNOTATION_SCHEMA)
 
 
 def test_exact_bibliography_target_is_first_and_each_relation_is_capped_at_three() -> None:
@@ -3407,7 +3585,7 @@ def test_generation_failure_drains_both_lanes_and_retry_only_runs_missing_segmen
                 raise RuntimeError(f"intentional early failure: {label}")
             if label.startswith("companion-annotation-"):
                 return {
-                    "explanation": "later segment survived", "prior_work": "", "later_work": "",
+                    "explanation": "later segment survived", "prior_work": [], "later_work": [],
                     "commentary": "later segment survived", "evidence_ids": [],
                     "key_points": [], "source_notes": [],
                 }
@@ -3451,7 +3629,7 @@ def test_generation_failure_drains_both_lanes_and_retry_only_runs_missing_segmen
         if label.startswith("companion-annotation-"):
             retry_generation_calls.append(label)
             return {
-                "explanation": "retry explanation", "prior_work": "", "later_work": "",
+                "explanation": "retry explanation", "prior_work": [], "later_work": [],
                 "commentary": "retry commentary", "evidence_ids": [],
                 "key_points": [], "source_notes": [],
             }
