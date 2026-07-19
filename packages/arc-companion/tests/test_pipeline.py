@@ -156,6 +156,9 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
             assert pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION in prompt
             assert Path(kwargs["artifact_dir"]).name == "retry-1"
             assert kwargs["env"] is None
+            assert kwargs["model_tier"] == pipeline_module.TRANSLATION_RETRY_TIER == "medium"
+        else:
+            assert kwargs["model_tier"] == pipeline_module.TRANSLATION_TIER == "low"
         valid = segment_id == "seg-0001" or (segment_id == "seg-0002" and is_retry)
         text = f"译文 {required_tokens[segment_id]}。" if valid else "缺少控制器令牌。"
         return {"blocks": [{"block_id": block_id_value, "text": text}]}

@@ -65,6 +65,7 @@ Default model routing is:
 - medium for segmentation and local boundary refinement;
 - medium for the comprehensive terminology glossary;
 - low for per-unit translation;
+- medium for the single failure-only opaque-token translation correction;
 - high for per-unit companion commentary; and
 - high for section and whole-document review.
 
@@ -79,16 +80,17 @@ patches may change translations and commentaries only.
 
 If a generated translation changes, drops, or reorders an opaque inline
 formula, citation, or link token,
-the controller gives only that unit one correction attempt. The correction
+the controller gives only that unit one medium-tier correction attempt; ordinary
+translation remains low-tier. The correction
 prompt includes the precise validation error, the previous output, and the
 required byte-exact token sequence for every block. The corrected output must
 pass the same strict validation; the controller never repairs, normalizes, or
 relaxes formula, citation, or link tokens. Only a validated result is checkpointed,
 and a second mismatch is reported with the lane's aggregated failures. The
 correction runs offline because all required data is already frozen. Its prompt
-has a separate failure-only version embedded in the correction provenance, so
-changing correction guidance does not invalidate already valid content
-checkpoints through the global prompt fingerprint.
+has a separate failure-only version and model tier embedded in the correction
+provenance. Changing this exceptional repair path does not invalidate already
+valid content checkpoints through the global prompt fingerprint.
 
 The controller first submits exactly the first `min(workers, unit_count)`
 source-order units to both lanes. As soon as translation and commentary have

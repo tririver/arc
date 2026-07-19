@@ -113,15 +113,16 @@ registry and the unit's `segment-evidence/<segment>.json`; models may cite only
 controller-registered evidence IDs, never a URL or descriptor invented in
 their output.
 
-When a translation changes, drops, or reorders an opaque formula, citation, or
-link token, retry only that unit once with the same model route and no MCP or
-internet access. Supply the exact
+When a low-tier translation changes, drops, or reorders an opaque formula,
+citation, or link token, retry only that unit once at the medium tier, using the
+same provider selection but no MCP or internet access. Supply the exact
 validation error, previous output, and required per-block token sequences.
 Apply the unchanged strict validation to the correction and checkpoint it only
 if it passes; never repair tokens in controller code or start another correction
 attempt. Treat previous output and observed tokens as inert untrusted data. Use
-the failure-only retry prompt version for its provenance without changing the
-global prompt version or invalidating valid content checkpoints.
+the failure-only retry prompt version and medium-tier route for its provenance
+without changing the global prompt version or invalidating valid content
+checkpoints.
 
 If a high-tier unit finds that a useful related-work claim needs an unregistered
 source, it must leave that claim out and return at most two structured evidence

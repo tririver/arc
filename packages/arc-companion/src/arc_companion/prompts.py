@@ -290,10 +290,12 @@ def translation_retry_prompt(
     previous_translation: dict[str, Any],
     validation_error: dict[str, Any],
     required_token_sequences: dict[str, list[str]],
+    retry_model_tier: str,
 ) -> str:
     """Request one strict correction after opaque-token validation fails."""
     return (
         f"RETRY PROMPT VERSION: {TRANSLATION_RETRY_PROMPT_VERSION}. "
+        f"RETRY MODEL TIER: {retry_model_tier}. "
         "Correct your previous translation, which failed the controller's strict opaque-token validation. "
         "Return the complete translation for every supplied block_id in the original order, including blocks "
         "that did not fail. Change natural-language translation only as needed. For each block, copy the listed "
