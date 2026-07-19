@@ -177,11 +177,17 @@ def test_citation_delimiter_normalizer_keeps_correct_and_relocates_empty_pair() 
     assert pipeline_module._normalize_translation_citation_delimiters(
         block, f"参见{token}[]。",
     ) == f"参见[{token}]。"
+    assert pipeline_module._normalize_translation_citation_delimiters(
+        block, f"参见{token}]。",
+    ) == f"参见[{token}]。"
+    assert pipeline_module._normalize_translation_citation_delimiters(
+        block, f"参见{token}。",
+    ) == f"参见[{token}]。"
 
 
 @pytest.mark.parametrize(
     "text_template",
-    ("参见{}。", "参见[额外]{}。", "参见{}[额外]。", "参见[]{}[]。"),
+    ("参见[额外]{}。", "参见{}[额外]。", "参见[]{}[]。"),
 )
 def test_citation_delimiter_normalizer_rejects_missing_ambiguous_or_nonempty_brackets(
     text_template: str,
@@ -211,10 +217,173 @@ def test_slot_repair_relocates_citation_brackets_without_changing_residue() -> N
         protected_names=[],
     )
 
-    assert result["blocks"][0]["text"] == f"参见[{token}]。"
-    assert pipeline_module._translation_natural_residue(result["blocks"][0]["text"]) == (
+    assembled = result["blocks"][0]["text"]
+    assert assembled == f"参见{token}[]。"
+    normalized = pipeline_module._normalize_translation_citation_delimiters(block, assembled)
+    assert normalized == f"参见[{token}]。"
+    assert pipeline_module._translation_natural_residue(normalized) == (
         "参见[]。"
     )
+
+
+def test_offset_slot_repair_preserves_seg0016_residue_exactly() -> None:
+    block = {
+        "block_id": "S2.SS1.p9.18", "type": "text", "text": "A x B y C z.",
+        "inline_runs": [
+            _inline_run("text", "A ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", " B ", 3),
+            _inline_run("math", "y", 4, tex="y"),
+            _inline_run("text", " C ", 5),
+            _inline_run("math", "z", 6, tex="z"),
+            _inline_run("text", ".", 7),
+        ],
+    }
+    tokens = pipeline_module._opaque_inline_tokens(block)
+    prior_text = f"分别表{tokens[2]}示和{tokens[0]}，最后{tokens[1]}。"
+    prior_residue = pipeline_module._translation_natural_residue(prior_text)
+    previous = {"blocks": [{"block_id": block["block_id"], "text": prior_text}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    boundaries = [3, 5, 8, len(prior_residue)]
+    start = 0
+    slots = []
+    for slot_id, end in zip(slot_ids, boundaries):
+        slots.append({"slot_id": slot_id, "start_offset": start, "end_offset": end})
+        start = end
+
+    repaired = pipeline_module._apply_translation_slot_repairs(
+        previous, [block], {"repairs": [{"block_id": block["block_id"], "slots": slots}]},
+        protected_names=[],
+    )
+
+    assert pipeline_module._translation_natural_residue(
+        repaired["blocks"][0]["text"]
+    ) == prior_residue
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(
+        repaired["blocks"][0]["text"]
+    ) == tokens
+
+    slots[1] = {**slots[1], "start_offset": slots[1]["start_offset"] + 1}
+    with pytest.raises(RuntimeError, match="exactly partition prior residue"):
+        pipeline_module._apply_translation_slot_repairs(
+            previous,
+            [block],
+            {"repairs": [{"block_id": block["block_id"], "slots": slots}]},
+            protected_names=[],
+        )
+
+
+def test_seg0007_slot_repair_then_synthesizes_source_owned_citation_brackets() -> None:
+    block = {
+        "block_id": "S1.p13.14", "type": "text", "text": "Value x [7].",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", " [", 3),
+            _inline_run("citation", "7", 4),
+            _inline_run("text", "].", 5),
+        ],
+    }
+    previous = {"blocks": [{"block_id": block["block_id"], "text": "值并参见。"}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    spans = [(0, 1), (1, 4), (4, 5)]
+    repaired = pipeline_module._apply_translation_slot_repairs(
+        previous,
+        [block],
+        {"repairs": [{"block_id": block["block_id"], "slots": [
+            {"slot_id": slot_id, "start_offset": start, "end_offset": end}
+            for slot_id, (start, end) in zip(slot_ids, spans)
+        ]}]},
+        protected_names=[],
+    )
+    tokens = pipeline_module._opaque_inline_tokens(block)
+    assembled = repaired["blocks"][0]["text"]
+    assert assembled == f"值{tokens[0]}并参见{tokens[1]}。"
+    normalized, methods = pipeline_module._normalize_translation_citation_delimiters_for_segment(
+        repaired, {block["block_id"]: block},
+    )
+    assert normalized["blocks"][0]["text"] == f"值{tokens[0]}并参见[{tokens[1]}]。"
+    assert methods == {block["block_id"]: "synthesized"}
+
+
+def test_v3_medium_repair_supersedes_old_marker_once_and_persists_response(
+    tmp_path: Path,
+) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    segment = {"segment_id": "seg-0016", "block_ids": ["body"]}
+    translation = {"blocks": [{"block_id": "body", "text": "译文。"}]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    input_sha256 = "fixture-input"
+    old_marker = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    old_marker.parent.mkdir(parents=True)
+    old_marker.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-attempt.v1",
+        "prompt_version": "arc.companion.translation-retry-prompt.v2",
+        "segment_id": segment["segment_id"],
+        "input_sha256": input_sha256,
+    }), encoding="utf-8")
+    calls: list[str] = []
+
+    def repair_llm(prompt: str, **kwargs):
+        calls.append(str(kwargs["call_label"]))
+        assert "start_offset" in json.dumps(kwargs["schema"])
+        assert "Never return, retype, translate, or edit residue text" in prompt
+        slot_ids = pipeline_module._translation_repair_slot_ids(block)
+        return {"repairs": [{"block_id": "body", "slots": [
+            {"slot_id": slot_ids[0], "start_offset": 0, "end_offset": 2},
+            {"slot_id": slot_ids[1], "start_offset": 2, "end_offset": 3},
+        ]}]}
+
+    repaired, provenance = pipeline_module._repair_translation_token_placement(
+        segment,
+        translation,
+        blocks_by_id={"body": block},
+        protected_names=[],
+        options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+        checkpoint_dir=checkpoint_dir,
+        artifact_dir=tmp_path / "llm",
+        input_sha256=input_sha256,
+        llm=repair_llm,
+    )
+    assert calls == ["companion-translation-seg-0016-retry-1"]
+    assert pipeline_module._translation_natural_residue(
+        repaired["blocks"][0]["text"]
+    ) == "译文。"
+    assert provenance["attempt"] == 1
+    persisted_path = pipeline_module._translation_token_repair_draft_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    persisted = json.loads(persisted_path.read_text(encoding="utf-8"))
+    assert persisted["raw_response"]["repairs"][0]["slots"][0]["end_offset"] == 2
+    assert json.loads(old_marker.read_text(encoding="utf-8"))["schema_version"] == (
+        "arc.companion.translation-token-attempt.v2"
+    )
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("persisted structural repair must resume without another model call")
+
+    resumed, resumed_provenance = pipeline_module._repair_translation_token_placement(
+        segment,
+        translation,
+        blocks_by_id={"body": block},
+        protected_names=[],
+        options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+        checkpoint_dir=checkpoint_dir,
+        artifact_dir=tmp_path / "llm",
+        input_sha256=input_sha256,
+        llm=forbidden_llm,
+    )
+    assert resumed == repaired
+    assert resumed_provenance == provenance
 
 
 def test_checkpoint_citation_delimiter_repair_revalidates_and_records_provenance(
@@ -243,6 +412,7 @@ def test_checkpoint_citation_delimiter_repair_revalidates_and_records_provenance
         "attempt": 0,
         "normalizer_version": pipeline_module.TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION,
         "repaired_block_ids": ["cited"],
+        "methods_by_block_id": {"cited": "relocated"},
     }
     assert json.loads(checkpoint_path.read_text(encoding="utf-8")) == repaired
 

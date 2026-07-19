@@ -74,7 +74,7 @@ TRANSLATION_TIER = "low"
 TRANSLATION_RETRY_TIER = "medium"
 TRANSLATION_COVERAGE_REPAIR_TIER = "medium"
 TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION = (
-    "arc.companion.translation-citation-delimiters.v1"
+    "arc.companion.translation-citation-delimiters.v2"
 )
 ANNOTATION_TIER = "high"
 REVIEW_TIER = "high"
@@ -1109,8 +1109,37 @@ def _matching_translation_token_attempt(
     value = read_json(path) if path.is_file() else None
     if (
         isinstance(value, dict)
+        and value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
+        and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
+    ):
+        return value
+    return None
+
+
+def _translation_token_repair_draft_path(
+    checkpoint_dir: Path, segment_id: str,
+) -> Path:
+    return (
+        checkpoint_dir
+        / "translation-token-repair-drafts"
+        / f"{_segment_checkpoint_name(segment_id)}.json"
+    )
+
+
+def _matching_translation_token_repair_draft(
+    checkpoint_dir: Path, segment_id: str, input_sha256: str,
+) -> dict[str, Any] | None:
+    path = _translation_token_repair_draft_path(checkpoint_dir, segment_id)
+    value = read_json(path) if path.is_file() else None
+    if (
+        isinstance(value, dict)
+        and value.get("schema_version") == "arc.companion.translation-token-repair-draft.v1"
+        and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
+        and value.get("segment_id") == segment_id
+        and value.get("input_sha256") == input_sha256
+        and isinstance(value.get("translation"), dict)
     ):
         return value
     return None
@@ -1187,6 +1216,13 @@ def _repair_translation_token_placement(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the single lifetime-bounded token-placement repair for a segment input."""
     segment_id = str(segment["segment_id"])
+    persisted = _matching_translation_token_repair_draft(
+        checkpoint_dir, segment_id, input_sha256,
+    )
+    if persisted is not None:
+        repaired = persisted["translation"]
+        _validate_translation(segment, repaired, blocks_by_id, protected_names)
+        return repaired, dict(persisted["repair_provenance"])
     if _matching_translation_token_attempt(checkpoint_dir, segment_id, input_sha256):
         raise RuntimeError(
             f"translation token placement repair attempt already consumed for {segment_id}"
@@ -1205,7 +1241,7 @@ def _repair_translation_token_placement(
         for source_block in source_blocks
     ]
     write_json(_translation_token_attempt_path(checkpoint_dir, segment_id), {
-        "schema_version": "arc.companion.translation-token-attempt.v1",
+        "schema_version": "arc.companion.translation-token-attempt.v2",
         "segment_id": segment_id,
         "input_sha256": input_sha256,
         "status": "started",
@@ -1238,7 +1274,7 @@ def _repair_translation_token_placement(
         protected_names=protected_names,
     )
     _validate_translation(segment, repaired, blocks_by_id, protected_names)
-    return repaired, {
+    provenance = {
         "kind": "token-placement",
         "attempt": 1,
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
@@ -1248,6 +1284,17 @@ def _repair_translation_token_placement(
         "model_tier": TRANSLATION_RETRY_TIER,
         "repaired_block_ids": [block_id(block) for block in source_blocks],
     }
+    write_json(_translation_token_repair_draft_path(checkpoint_dir, segment_id), {
+        "schema_version": "arc.companion.translation-token-repair-draft.v1",
+        "segment_id": segment_id,
+        "input_sha256": input_sha256,
+        "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+        "raw_response": value,
+        "translation": repaired,
+        "repair_provenance": provenance,
+    })
+    return repaired, provenance
 
 
 def _generate_translations(
@@ -1474,12 +1521,12 @@ def _generate_translations(
                 llm=llm,
             )
             repair_provenance.append(provenance)
-        translation, normalized_citation_ids = (
+        translation, normalized_citations = (
             _normalize_translation_citation_delimiters_for_segment(translation, by_id)
         )
-        if normalized_citation_ids:
+        if normalized_citations:
             repair_provenance.append(
-                _citation_delimiter_normalization_provenance(normalized_citation_ids)
+                _citation_delimiter_normalization_provenance(normalized_citations)
             )
         _validate_translation(segment, translation, by_id, protected_names)
         return segment_id, translation, {
@@ -1704,10 +1751,10 @@ def _review(
         if translation_changed:
             replacement = {"blocks": list(patch.get("translation_blocks") or [])}
             segment = next(item for item in segments if item["segment_id"] == segment_id)
-            replacement, changed_ids = _normalize_translation_citation_delimiters_for_segment(
+            replacement, changed = _normalize_translation_citation_delimiters_for_segment(
                 replacement, by_id
             )
-            if changed_ids:
+            if changed:
                 citation_normalized.add(segment_id)
             _validate_translation(segment, replacement, by_id, protected_names)
             reviewed_translations[segment_id] = replacement
@@ -2136,6 +2183,11 @@ def _translation_slot_repair_context(
         "block_id": block_id(source_block),
         "previous_invalid_text": previous_text,
         "prior_natural_language_residue": residue,
+        "residue_length": len(residue),
+        "indexed_residue": [
+            {"offset": index, "character": character}
+            for index, character in enumerate(residue)
+        ],
         "expected_slot_count": len(expected_tokens) + 1,
         "slot_ids": _translation_repair_slot_ids(source_block),
         "missing_protected_names": _minimal_missing_name_insertions(
@@ -2197,10 +2249,6 @@ def _apply_translation_slot_repair_block(
     ]
     if actual_slot_ids != expected_slot_ids or len(actual_slot_ids) != len(raw_slots):
         raise RuntimeError("translation slot repair changed slot coverage or order")
-    slots = [str(item.get("text") or "") for item in raw_slots]
-    if any("[[ARC_INLINE:" in text or _OPAQUE_INLINE_PATTERN.search(text) for text in slots):
-        raise RuntimeError("translation slot repair supplied controller-owned opaque content")
-
     previous_blocks = previous_translation.get("blocks") if isinstance(previous_translation, dict) else None
     if not isinstance(previous_blocks, list):
         raise RuntimeError("translation slot repair has no prior block list")
@@ -2213,15 +2261,41 @@ def _apply_translation_slot_repair_block(
         raise RuntimeError("translation slot repair cannot find the prior failed block")
     previous_text = str(previous_blocks[failed_index].get("text") or "")
     residue = _translation_natural_residue(previous_text)
-    missing_names = _minimal_missing_name_insertions(
-        _missing_protected_names([source_block], residue, protected_names)
-    )
-    joined = "".join(slots)
-    if missing_names:
-        if not _is_exact_name_insertion_delta(joined, residue, missing_names):
-            raise RuntimeError("translation slot repair changed prior natural language beyond name insertion")
-    elif joined != residue:
-        raise RuntimeError("translation slot repair retranslated or changed prior natural language")
+    if all("start_offset" in item and "end_offset" in item for item in raw_slots):
+        spans = [
+            (item.get("start_offset"), item.get("end_offset")) for item in raw_slots
+        ]
+        if any(
+            not isinstance(start, int) or not isinstance(end, int)
+            for start, end in spans
+        ):
+            raise RuntimeError("translation slot repair returned non-integer residue offsets")
+        cursor = 0
+        slots: list[str] = []
+        for start, end in spans:
+            if start != cursor or end < start or end > len(residue):
+                raise RuntimeError("translation slot repair offsets do not exactly partition prior residue")
+            slots.append(residue[start:end])
+            cursor = end
+        if cursor != len(residue):
+            raise RuntimeError("translation slot repair offsets do not cover prior residue")
+    else:
+        # Compatibility for already-persisted v1 repair payloads. New model
+        # calls are schema-constrained to offsets and cannot enter this branch.
+        slots = [str(item.get("text") or "") for item in raw_slots]
+        if any("[[ARC_INLINE:" in text or _OPAQUE_INLINE_PATTERN.search(text) for text in slots):
+            raise RuntimeError("translation slot repair supplied controller-owned opaque content")
+        missing_names = _minimal_missing_name_insertions(
+            _missing_protected_names([source_block], residue, protected_names)
+        )
+        joined = "".join(slots)
+        if missing_names:
+            if not _is_exact_name_insertion_delta(joined, residue, missing_names):
+                raise RuntimeError(
+                    "translation slot repair changed prior natural language beyond name insertion"
+                )
+        elif joined != residue:
+            raise RuntimeError("translation slot repair retranslated or changed prior natural language")
 
     expected_tokens = _opaque_inline_tokens(source_block)
     assembled = "".join(
@@ -2229,7 +2303,10 @@ def _apply_translation_slot_repair_block(
         for index, slot in enumerate(slots)
         for part in ([slot, expected_tokens[index]] if index < len(expected_tokens) else [slot])
     )
-    assembled = _normalize_translation_citation_delimiters(source_block, assembled)
+    if all("start_offset" in item for item in raw_slots) and (
+        _translation_natural_residue(assembled) != residue
+    ):
+        raise RuntimeError("translation slot repair changed prior natural language")
     repaired_blocks = list(previous_blocks)
     repaired_blocks[failed_index] = {**previous_blocks[failed_index], "text": assembled}
     return {**previous_translation, "blocks": repaired_blocks}
@@ -2238,8 +2315,13 @@ def _apply_translation_slot_repair_block(
 def _normalize_translation_citation_delimiters(
     source_block: dict[str, Any], translated_text: str,
 ) -> str:
-    """Relocate, but never add or delete, source-owned ASCII citation brackets."""
-    original_residue = _translation_natural_residue(translated_text)
+    """Canonicalize source-owned ASCII citation wrappers around immutable tokens.
+
+    A model may omit either delimiter or leave an empty pair on one side of a
+    citation token. The source run sequence determines whether the wrapper is
+    required, so the controller can repair these structural characters without
+    asking the model to rewrite translated prose.
+    """
     source_text = str(_translation_input_block(source_block).get("text") or "")
     opaque_runs = [
         run
@@ -2272,30 +2354,31 @@ def _normalize_translation_citation_delimiters(
             and normalized[end] == "]"
         ):
             continue
-        brackets_before = index >= 2 and normalized[index - 2:index] == "[]"
-        brackets_after = normalized[end:end + 2] == "[]"
-        if brackets_before == brackets_after:
+        prefix_pair = index >= 2 and normalized[index - 2:index] == "[]"
+        suffix_pair = normalized[end:end + 2] == "[]"
+        prefix_single = index > 0 and normalized[index - 1] == "["
+        suffix_single = end < len(normalized) and normalized[end] == "]"
+        bad_prefix = index > 0 and normalized[index - 1] == "]" and not prefix_pair
+        bad_suffix = end < len(normalized) and normalized[end] == "[" and not suffix_pair
+        if bad_prefix or bad_suffix or (prefix_pair and suffix_pair):
             raise RuntimeError(
-                "citation delimiter normalization requires one adjacent empty bracket pair"
+                "citation delimiter normalization found ambiguous adjacent brackets"
             )
-        if brackets_before:
-            normalized = normalized[:index - 2] + "[" + token + "]" + normalized[end:]
-        else:
-            normalized = normalized[:index] + "[" + token + "]" + normalized[end + 2:]
-    if _translation_natural_residue(normalized) != original_residue:
-        raise RuntimeError("citation delimiter normalization changed natural-language residue")
+        prefix_start = index - (2 if prefix_pair else 1 if prefix_single else 0)
+        suffix_end = end + (2 if suffix_pair else 1 if suffix_single else 0)
+        normalized = normalized[:prefix_start] + "[" + token + "]" + normalized[suffix_end:]
     return normalized
 
 
 def _normalize_translation_citation_delimiters_for_segment(
     translation: dict[str, Any],
     blocks_by_id: dict[str, dict[str, Any]],
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], dict[str, str]]:
     """Normalize token-valid blocks in any candidate without masking token repair."""
     raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
     if not isinstance(raw_blocks, list):
-        return translation, []
-    changed_ids: list[str] = []
+        return translation, {}
+    changed: dict[str, str] = {}
     normalized_blocks: list[Any] = []
     for item in raw_blocks:
         if not isinstance(item, dict):
@@ -2309,27 +2392,63 @@ def _normalize_translation_citation_delimiters_for_segment(
         ):
             normalized_blocks.append(item)
             continue
+        method = _citation_delimiter_normalization_method(source_block, previous_text)
         normalized_text = _normalize_translation_citation_delimiters(
             source_block, previous_text
         )
         if normalized_text == previous_text:
             normalized_blocks.append(item)
             continue
-        changed_ids.append(item_id)
+        changed[item_id] = method
         normalized_blocks.append({**item, "text": normalized_text})
-    if not changed_ids:
-        return translation, []
-    return {**translation, "blocks": normalized_blocks}, changed_ids
+    if not changed:
+        return translation, {}
+    return {**translation, "blocks": normalized_blocks}, changed
+
+
+def _citation_delimiter_normalization_method(
+    source_block: dict[str, Any], translated_text: str,
+) -> str:
+    """Classify a source-owned wrapper repair for audit provenance."""
+    source_text = str(_translation_input_block(source_block).get("text") or "")
+    method = "relocated"
+    opaque_runs = [
+        run for run in source_block.get("inline_runs") or []
+        if isinstance(run, dict) and str(run.get("kind") or "") != "text"
+    ]
+    for run, token in zip(opaque_runs, _opaque_inline_tokens(source_block)):
+        if str(run.get("kind") or "").casefold() != "citation":
+            continue
+        source_index = source_text.find(token)
+        source_end = source_index + len(token)
+        if not (
+            source_index > 0 and source_end < len(source_text)
+            and source_text[source_index - 1] == "[" and source_text[source_end] == "]"
+        ):
+            continue
+        index = translated_text.find(token)
+        end = index + len(token)
+        if index > 0 and end < len(translated_text) and (
+            translated_text[index - 1] == "[" and translated_text[end] == "]"
+        ):
+            continue
+        if not (
+            (index >= 2 and translated_text[index - 2:index] == "[]")
+            or translated_text[end:end + 2] == "[]"
+        ):
+            method = "synthesized"
+    return method
 
 
 def _citation_delimiter_normalization_provenance(
-    changed_ids: list[str],
+    changed: dict[str, str],
 ) -> dict[str, Any]:
     return {
         "kind": "citation-delimiter-normalization",
         "attempt": 0,
         "normalizer_version": TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION,
-        "repaired_block_ids": changed_ids,
+        "repaired_block_ids": list(changed),
+        "methods_by_block_id": changed,
     }
 
 
@@ -2352,12 +2471,12 @@ def _repair_reviewed_translation_checkpoint(
         translation = translations.get(segment_id)
         if not isinstance(translation, dict):
             raise RuntimeError(f"review checkpoint has no translation for {segment_id}")
-        repaired, changed_ids = _normalize_translation_citation_delimiters_for_segment(
+        repaired, changed = _normalize_translation_citation_delimiters_for_segment(
             translation, blocks_by_id
         )
         _validate_translation(segment, repaired, blocks_by_id, protected_names)
         repaired_translations[segment_id] = repaired
-        if changed_ids:
+        if changed:
             changed_segments.append(segment_id)
     if not changed_segments:
         return checkpoint, []
@@ -2385,15 +2504,15 @@ def _repair_translation_checkpoint_citation_delimiters(
         item_id = str(item.get("block_id") or "")
         if blocks_by_id.get(item_id) is None:
             raise RuntimeError(f"translation checkpoint contains unknown block {item_id}")
-    repaired_translation, changed_ids = _normalize_translation_citation_delimiters_for_segment(
+    repaired_translation, changed = _normalize_translation_citation_delimiters_for_segment(
         translation, blocks_by_id
     )
     _validate_translation(segment, repaired_translation, blocks_by_id, protected_names)
-    if not changed_ids:
+    if not changed:
         return checkpoint
     generation_provenance = dict(checkpoint.get("generation_provenance") or {})
     repairs = list(generation_provenance.get("repairs") or [])
-    repairs.append(_citation_delimiter_normalization_provenance(changed_ids))
+    repairs.append(_citation_delimiter_normalization_provenance(changed))
     repaired_checkpoint = {
         **checkpoint,
         "generation_provenance": {**generation_provenance, "repairs": repairs},
