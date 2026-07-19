@@ -1810,6 +1810,8 @@ def _fingerprint(
                 or bundle.parsed.get("document_hash")
                 or sha256_json(bundle.document)
             ),
+            "rich_parser_version": bundle.document.get("parser_version"),
+            "generation_projection_hash": sha256_json(_generation_document(bundle.document)),
             "asset_manifest_hash": (
                 integrity.get("asset_manifest_hash")
                 or bundle.document.get("asset_manifest_hash")
@@ -2680,6 +2682,22 @@ def _source_only_role_from_block(block: dict[str, Any]) -> str:
 
 def _front_matter_excluded_block_ids(document: dict[str, Any]) -> set[str]:
     front = document.get("front_matter") or {}
+    structural_ids: set[str] = set()
+    recorded_ids = front.get("block_ids") or {}
+    if isinstance(recorded_ids, dict):
+        for key in ("title", "authors", "affiliations"):
+            values = recorded_ids.get(key) or []
+            if not isinstance(values, list):
+                values = [values]
+            structural_ids.update(str(value) for value in values if value)
+    structural_ids.update(
+        block_id(block)
+        for block in document.get("blocks") or []
+        if str(block.get("source_role") or "").casefold() in {
+            "front_matter", "front_matter_title", "front_matter_authors",
+            "front_matter_affiliations",
+        }
+    )
     protected: set[str] = set()
     for key in ("title", "authors", "affiliations"):
         value = front.get(key)
@@ -2688,7 +2706,7 @@ def _front_matter_excluded_block_ids(document: dict[str, Any]) -> set[str]:
             text = _normalized_front_text(item)
             if text:
                 protected.add(text)
-    return {
+    return structural_ids | {
         block_id(block)
         for block in document.get("blocks") or []
         if _normalized_front_text(block.get("text") or block.get("title")) in protected

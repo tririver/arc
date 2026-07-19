@@ -471,6 +471,48 @@ def test_html_renderer_preserves_inline_structure_without_front_or_reference_dup
     assert validate_tex_fidelity(tex, document, manifest) == []
 
 
+def test_structural_combined_creator_block_renders_author_and_affiliation_once(tmp_path: Path) -> None:
+    document = {
+        "front_matter": {
+            "title": "Structured Title",
+            "authors": ["An Author"],
+            "affiliations": ["An Institute"],
+            "block_ids": {
+                "title": ["title"],
+                "authors": ["creator"],
+                "affiliations": ["creator"],
+            },
+        },
+        "blocks": [
+            {
+                "block_id": "title", "kind": "heading", "text": "Structured Title",
+                "source_role": "front_matter_title",
+            },
+            {
+                "block_id": "creator", "kind": "prose", "text": "An Author An Institute",
+                "source_role": "front_matter",
+                "front_matter_roles": ["front_matter_authors", "front_matter_affiliations"],
+            },
+            {"block_id": "body", "kind": "prose", "text": "Body text."},
+        ],
+        "integrity": {"status": "complete"},
+    }
+    segments = [{"segment_id": "body", "block_ids": ["body"]}]
+
+    tex, _ = render_companion_tex(
+        document,
+        segments,
+        {"body": {"commentary": "Note."}},
+        output_dir=tmp_path,
+        language="en",
+    )
+
+    assert tex.count("Structured Title") == 1
+    assert tex.count("An Author") == 1
+    assert tex.count("An Institute") == 1
+    assert "An Author An Institute" not in tex
+
+
 def test_source_only_toc_acknowledgments_and_references_render_once_with_toc_structure(tmp_path: Path) -> None:
     document = {
         "front_matter": {},

@@ -1535,6 +1535,68 @@ def test_generation_document_excludes_front_matter_and_all_source_only_sections(
     assert [item["block_id"] for item in _generation_document(document)["blocks"]] == ["abstract", "body"]
 
 
+def test_generation_document_prefers_structural_front_matter_ids_and_roles() -> None:
+    document = {
+        "parser_version": 4,
+        "front_matter": {
+            "title": "Metadata spelling may differ",
+            "authors": ["Metadata author spelling"],
+            "affiliations": ["Metadata affiliation spelling"],
+            "block_ids": {
+                "title": ["front-title"],
+                "authors": ["front-authors"],
+                "affiliations": ["front-affiliations"],
+            },
+        },
+        "blocks": [
+            {"block_id": "front-title", "kind": "prose", "text": "Source title"},
+            {
+                "block_id": "front-authors", "kind": "prose", "text": "Source authors",
+                "source_role": "front_matter_authors",
+            },
+            {
+                "block_id": "front-affiliations", "kind": "prose", "text": "Combined source affiliations",
+                "source_role": "front_matter_affiliations",
+            },
+            {
+                "block_id": "toc", "kind": "list", "text": "1 Body",
+                "source_role": "table_of_contents",
+            },
+            {"block_id": "ack", "kind": "prose", "text": "Thanks", "source_role": "acknowledgments"},
+            {"block_id": "ref", "kind": "bibliography", "text": "Reference", "source_role": "references"},
+            {"block_id": "body", "kind": "prose", "text": "Generative body"},
+        ],
+    }
+
+    projected = _generation_document(document)
+
+    assert [block["block_id"] for block in projected["blocks"]] == ["body"]
+
+
+def test_fingerprint_changes_when_generation_projection_changes_with_same_document_hash(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path)
+    evidence = {"references": [], "citers": []}
+    first = _fingerprint(bundle, options, evidence=evidence)
+    changed_document = {
+        **bundle.document,
+        "blocks": [
+            {**block, "source_role": "front_matter_title"} if block["block_id"] == "b2" else block
+            for block in bundle.document["blocks"]
+        ],
+    }
+    changed = SourceBundle(
+        paper_id=bundle.paper_id,
+        parsed=bundle.parsed,
+        document=changed_document,
+        metadata=bundle.metadata,
+        references=bundle.references,
+        citers=bundle.citers,
+    )
+
+    assert _fingerprint(changed, options, evidence=evidence) != first
+
+
 def _bundle(tmp_path: Path) -> SourceBundle:
     image = tmp_path / "cached.png"
     image.write_bytes(b"valid-png-fixture")

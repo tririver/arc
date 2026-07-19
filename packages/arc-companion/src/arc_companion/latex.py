@@ -1439,6 +1439,31 @@ def _entity_caption(entity: dict[str, Any], *, rendered_links: list[dict[str, st
 def _front_matter_block_roles(
     blocks: list[dict[str, Any]], front: dict[str, Any]
 ) -> dict[str, str]:
+    structural_role_map = {
+        "front_matter_title": "title",
+        "front_matter_authors": "author",
+        "front_matter_affiliations": "affiliation",
+        "front_matter_abstract": "abstract",
+    }
+    roles = {
+        block_id(block): structural_role_map[str(block.get("source_role") or "").casefold()]
+        for block in blocks
+        if str(block.get("source_role") or "").casefold() in structural_role_map
+    }
+    for block in blocks:
+        front_roles = {
+            structural_role_map[value]
+            for value in block.get("front_matter_roles") or []
+            if value in structural_role_map
+        }
+        if "title" in front_roles:
+            roles[block_id(block)] = "title"
+        elif "author" in front_roles:
+            # A combined author/affiliation source line is replaced by the
+            # exact extracted author on the title page and affiliation below.
+            roles[block_id(block)] = "author"
+        elif "affiliation" in front_roles:
+            roles[block_id(block)] = "affiliation"
     candidates: list[tuple[str, str]] = []
     title = _front_value(front.get("title")) if front.get("title") else ""
     if title:
@@ -1454,9 +1479,10 @@ def _front_matter_block_roles(
     abstract = _front_value(front.get("abstract")) if front.get("abstract") else ""
     if abstract:
         candidates.append(("abstract", abstract))
-    roles: dict[str, str] = {}
     used: set[tuple[str, str]] = set()
     for block in blocks:
+        if block_id(block) in roles:
+            continue
         if block.get("section_id"):
             continue
         text = " ".join(str(block.get("text") or block.get("title") or "").split())

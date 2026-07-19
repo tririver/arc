@@ -129,13 +129,96 @@ def test_rich_html_parse_stores_versioned_document_without_removing_legacy_field
         if block.get("source_role")
     }
     assert set(value for value in roles.values()) == {
-        "table_of_contents", "acknowledgments", "references",
+        "front_matter_title", "table_of_contents", "acknowledgments", "references",
     }
     assert roles["thanks"] == "acknowledgments"
     assert roles["bib.bib1"] == "references"
     toc_blocks = [block for block in document["blocks"] if block.get("source_role") == "table_of_contents"]
     assert [block["kind"] for block in toc_blocks] == ["heading", "list"]
     assert toc_blocks[1]["items"][0]["children"][0]["items"][0]["text"] == "1.1 Detail"
+
+
+def test_legacy_centered_preamble_has_structural_front_matter_roles_and_ids() -> None:
+    parsed = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <div class="ltx_logical-block"><div class="ltx_para">
+            <p id="front.title" class="ltx_p ltx_align_center">
+              <span class="ltx_text ltx_font_bold" style="font-size:120%">A Legacy Title</span>
+            </p>
+            <p id="front.authors" class="ltx_p ltx_align_center">
+              First Author<sup>1</sup> and Second Author<sup>2</sup>
+            </p>
+            <p id="front.affiliations" class="ltx_p ltx_align_center">
+              <sup>1</sup> First Institute<br/><sup>2</sup> Second Institute
+            </p>
+          </div></div>
+          <div class="ltx_para"><p class="ltx_p ltx_align_center"><b>Abstract</b></p></div>
+          <div class="ltx_para"><p id="abstract.body" class="ltx_p">Abstract text.</p></div>
+          <nav class="ltx_TOC"><h6 class="ltx_title_contents">Contents</h6></nav>
+          <section id="S1"><h2>1 Body</h2><p id="body">Body text.</p></section>
+        </article>
+        """,
+        source_id="legacy-front",
+    )
+    document = parsed["document"]
+
+    assert document["parser_version"] == service.RICH_PARSER_VERSION == 4
+    assert document["front_matter"] == {
+        "title": "A Legacy Title",
+        "authors": ["First Author 1 and Second Author 2"],
+        "affiliations": ["1 First Institute 2 Second Institute"],
+        "abstract": "",
+        "block_ids": {
+            "title": ["front.title"],
+            "authors": ["front.authors"],
+            "affiliations": ["front.affiliations"],
+            "abstract": [],
+        },
+    }
+    roles = {block["block_id"]: block.get("source_role") for block in document["blocks"]}
+    assert roles["front.title"] == "front_matter_title"
+    assert roles["front.authors"] == "front_matter_authors"
+    assert roles["front.affiliations"] == "front_matter_affiliations"
+    assert roles["body"] is None
+
+
+def test_centered_body_text_without_emphasized_preamble_is_not_front_matter() -> None:
+    document = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <p id="center.one" class="ltx_p ltx_align_center">Centered epigraph</p>
+          <p id="center.two" class="ltx_p ltx_align_center">A second centered line</p>
+          <section id="S1"><h2>Body</h2></section>
+        </article>
+        """,
+        source_id="centered-body",
+    )["document"]
+
+    assert document["front_matter"]["title"] == ""
+    assert not any(str(block.get("source_role") or "").startswith("front_matter") for block in document["blocks"])
+
+
+def test_semantic_front_matter_descendants_mark_combined_atomic_block() -> None:
+    document = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">Structured Title</h1>
+          <p id="creator-line">
+            <span class="ltx_personname">An Author</span>
+            <span class="ltx_role_affiliation">An Institute</span>
+          </p>
+          <section id="S1"><h2>Body</h2></section>
+        </article>
+        """,
+        source_id="semantic-front",
+    )["document"]
+
+    creator = next(block for block in document["blocks"] if block["block_id"] == "creator-line")
+    assert creator["source_role"] == "front_matter"
+    assert creator["front_matter_roles"] == ["front_matter_authors", "front_matter_affiliations"]
+    assert document["front_matter"]["block_ids"]["authors"] == ["creator-line"]
+    assert document["front_matter"]["block_ids"]["affiliations"] == ["creator-line"]
 
 
 def test_inline_runs_separate_text_math_citations_and_links_with_stable_tokens():
@@ -543,6 +626,48 @@ def test_explicit_rich_request_is_reused_and_version_bump_leaves_light_untouched
     assert provider.asset_calls == 2
     assert provider.html_calls == 2
     assert light_path.read_bytes() == before
+
+
+def test_outer_current_rich_cache_rejects_stale_inner_document_version(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    source_id = "arXiv:0911.3380"
+    light = parse_source_input(html_text=RICH_HTML, source_id=source_id, include_document=False)
+    write_json(parsed_source_cache_path(source_id), light)
+    rich_path = rich_document_cache_path(
+        source_id, light["source_hash"], service.RICH_PARSER_VERSION
+    )
+    write_json(
+        rich_path,
+        {
+            "paper_id": source_id,
+            "source_hash": light["source_hash"],
+            "rich_parser_version": service.RICH_PARSER_VERSION,
+            "document": {
+                "schema_version": DOCUMENT_SCHEMA_VERSION,
+                "parser_version": service.RICH_PARSER_VERSION - 1,
+            },
+        },
+    )
+
+    class RecordingAr5iv:
+        html_calls = 0
+
+        def get_html(self, paper_id, *, refresh=False):
+            self.html_calls += 1
+            return RICH_HTML
+
+        def cache_assets(self, paper_id, html, *, refresh=False):
+            return []
+
+    provider = RecordingAr5iv()
+    monkeypatch.setattr(service, "_ar5iv", provider)
+
+    rebuilt = service.get_parsed_source(source_id, include_document=True)
+
+    assert rebuilt["ok"] is True
+    assert rebuilt["data"]["document"]["parser_version"] == service.RICH_PARSER_VERSION
+    assert provider.html_calls == 1
+    assert read_json(rich_path)["document"]["parser_version"] == service.RICH_PARSER_VERSION
 
 
 def test_concurrent_explicit_rich_requests_build_once(monkeypatch, tmp_path):

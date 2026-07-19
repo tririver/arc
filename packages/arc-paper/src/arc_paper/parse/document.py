@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 
 DOCUMENT_SCHEMA_VERSION = "arc.paper.document.v2"
+RICH_DOCUMENT_PARSER_VERSION = 4
 _HEADING_NAMES = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _ATOMIC_NAMES = _HEADING_NAMES | {"p", "ul", "ol", "pre", "blockquote"}
 _ASSET_ATTRIBUTES = (("img", "src"), ("source", "src"), ("object", "data"))
@@ -40,7 +41,16 @@ def build_document(
     bibliography = _bibliography(root)
     footnotes = _footnotes(root)
     links = _links(root, source_url=source_url)
-    blocks = _blocks(root, figures=figures, tables=tables, bibliography=bibliography, equations=enriched_equations)
+    front_matter, front_matter_nodes = _front_matter(root)
+    blocks = _blocks(
+        root,
+        figures=figures,
+        tables=tables,
+        bibliography=bibliography,
+        equations=enriched_equations,
+        front_matter_nodes=front_matter_nodes,
+    )
+    front_matter["block_ids"] = _front_matter_block_ids(blocks)
     integrity = _integrity(
         root,
         blocks=blocks,
@@ -64,13 +74,14 @@ def build_document(
 
     return {
         "schema_version": DOCUMENT_SCHEMA_VERSION,
+        "parser_version": RICH_DOCUMENT_PARSER_VERSION,
         "source": {
             "paper_id": paper_id,
             "provider": "ar5iv" if "ar5iv.labs.arxiv.org" in source_url else "html",
             "url": source_url,
             "html_sha256": hashlib.sha256(html.encode("utf-8")).hexdigest(),
         },
-        "front_matter": _front_matter(root),
+        "front_matter": front_matter,
         "blocks": blocks,
         "equations": enriched_equations,
         "figures": figures,
@@ -113,20 +124,126 @@ def _academic_root(soup: BeautifulSoup) -> Tag | BeautifulSoup:
     return soup
 
 
-def _front_matter(root: Tag | BeautifulSoup) -> dict[str, Any]:
+def _front_matter(root: Tag | BeautifulSoup) -> tuple[dict[str, Any], dict[int, str]]:
+    """Extract semantic and legacy LaTeXML front matter.
+
+    Older TeX sources often reach ar5iv as an unlabelled centered preamble:
+    a visually emphasized title, an author line, and one combined affiliation
+    paragraph.  The bounded fallback below recognizes that presentation
+    structure only before the abstract/TOC/first section; it does not use
+    paper-, person-, institution-, or field-specific text.
+    """
+
     title = root.select_one(".ltx_title_document, h1.ltx_title, h1")
     abstract = root.select_one(".ltx_abstract")
-    authors = [
-        _text(item)
-        for item in root.select(".ltx_creator_author, .ltx_personname, .ltx_author_name")
-        if _text(item)
+    author_nodes = [
+        item
+        for item in root.select(".ltx_personname, .ltx_author_name")
+        if isinstance(item, Tag) and _text(item)
     ]
-    affiliations = [_text(item) for item in root.select(".ltx_role_affiliation, .ltx_affiliation") if _text(item)]
-    return {
+    if not author_nodes:
+        author_nodes = [
+            item for item in root.select(".ltx_creator_author")
+            if isinstance(item, Tag) and _text(item)
+        ]
+    affiliation_nodes = [
+        item
+        for item in root.select(".ltx_role_affiliation, .ltx_affiliation")
+        if isinstance(item, Tag) and _text(item)
+    ]
+    if not author_nodes:
+        author_nodes = [
+            item for item in root.select(".ltx_authors")
+            if (
+                isinstance(item, Tag)
+                and _text(item)
+                and not item.select_one(".ltx_role_affiliation, .ltx_affiliation")
+            )
+        ]
+
+    roles: dict[int, str] = {}
+    if isinstance(title, Tag):
+        roles[id(title)] = "front_matter_title"
+    for item in author_nodes:
+        roles[id(item)] = "front_matter_authors"
+    for item in affiliation_nodes:
+        roles[id(item)] = "front_matter_affiliations"
+
+    if not isinstance(title, Tag) or not author_nodes:
+        legacy = _legacy_centered_front_matter(root)
+        if not isinstance(title, Tag) and legacy.get("title"):
+            title = legacy["title"][0]
+            roles[id(title)] = "front_matter_title"
+        if not author_nodes and legacy.get("authors"):
+            author_nodes = list(legacy["authors"])
+            for item in author_nodes:
+                roles[id(item)] = "front_matter_authors"
+        if not affiliation_nodes and legacy.get("affiliations"):
+            affiliation_nodes = list(legacy["affiliations"])
+            for item in affiliation_nodes:
+                roles[id(item)] = "front_matter_affiliations"
+
+    front = {
         "title": _text(title),
-        "authors": _dedupe(authors),
-        "affiliations": _dedupe(affiliations),
+        "authors": _dedupe([_text(item) for item in author_nodes]),
+        "affiliations": _dedupe([_text(item) for item in affiliation_nodes]),
         "abstract": _text(abstract),
+    }
+    return front, roles
+
+
+def _legacy_centered_front_matter(root: Tag | BeautifulSoup) -> dict[str, list[Tag]]:
+    candidates: list[Tag] = []
+    for node in root.find_all(("h1", "p")):
+        if not isinstance(node, Tag) or _inside_site_chrome(node):
+            continue
+        if node.find_parent(("section", "nav")) is not None:
+            break
+        classes = {str(value).casefold() for value in node.get("class") or []}
+        text = _text(node)
+        if _normalized_front_label(text) == "abstract":
+            break
+        if "ltx_align_center" in classes and text:
+            candidates.append(node)
+        elif candidates:
+            break
+
+    if len(candidates) < 2 or not _looks_like_legacy_title(candidates[0]):
+        return {}
+    return {
+        "title": candidates[:1],
+        "authors": candidates[1:2],
+        "affiliations": candidates[2:],
+    }
+
+
+def _looks_like_legacy_title(node: Tag) -> bool:
+    if node.name == "h1":
+        return True
+    emphasized = node.select_one(".ltx_font_bold, b, strong")
+    if isinstance(emphasized, Tag):
+        return True
+    return any("font-size" in str(item.get("style") or "").casefold() for item in node.find_all(True))
+
+
+def _normalized_front_label(value: str) -> str:
+    return re.sub(r"[^a-z]+", "", value.casefold())
+
+
+def _front_matter_block_ids(blocks: list[dict[str, Any]]) -> dict[str, list[str]]:
+    by_role = {
+        "title": "front_matter_title",
+        "authors": "front_matter_authors",
+        "affiliations": "front_matter_affiliations",
+        "abstract": "front_matter_abstract",
+    }
+    return {
+        key: [
+            str(block["block_id"])
+            for block in blocks
+            if block.get("source_role") == role or role in (block.get("front_matter_roles") or [])
+        ]
+        for key, role in by_role.items()
     }
 
 
@@ -137,6 +254,7 @@ def _blocks(
     tables: list[dict[str, Any]],
     bibliography: list[dict[str, Any]],
     equations: list[dict[str, Any]],
+    front_matter_nodes: dict[int, str],
 ) -> list[dict[str, Any]]:
     special_by_node_id: dict[int, tuple[str, str]] = {}
     for selector, kind, items in (
@@ -195,12 +313,35 @@ def _blocks(
             source_id=(special[1] if special else str(node.get("id") or "")),
             section_id=str(section.get("id") or "") if isinstance(section, Tag) else "",
         )
-        source_role = _structural_source_role(node, kind=kind)
+        front_roles = _front_matter_source_roles(node, front_matter_nodes)
+        source_role = (
+            front_roles[0] if len(front_roles) == 1
+            else ("front_matter" if front_roles else _structural_source_role(node, kind=kind))
+        )
         if source_role:
             block["source_role"] = source_role
+        if front_roles:
+            block["front_matter_roles"] = front_roles
         blocks.append(block)
     _propagate_source_only_section_roles(blocks)
     return blocks
+
+
+def _front_matter_source_roles(node: Tag, front_matter_nodes: dict[int, str]) -> list[str]:
+    roles: list[str] = []
+
+    def add(candidate: Tag) -> None:
+        if (role := front_matter_nodes.get(id(candidate))) and role not in roles:
+            roles.append(role)
+
+    add(node)
+    for candidate in node.find_all(True):
+        if isinstance(candidate, Tag):
+            add(candidate)
+    for candidate in node.parents:
+        if isinstance(candidate, Tag):
+            add(candidate)
+    return roles
 
 
 def _structural_source_role(node: Tag, *, kind: str) -> str:

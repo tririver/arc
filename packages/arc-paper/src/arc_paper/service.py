@@ -32,7 +32,7 @@ from .ids import normalize_paper_id
 from .ids import paper_ids_safe_dir_name as _paper_ids_safe_dir_name
 from .parse.ar5iv_html import get_section as parsed_get_section
 from .parse.equations import find_equation_context
-from .parse.document import DOCUMENT_SCHEMA_VERSION
+from .parse.document import DOCUMENT_SCHEMA_VERSION, RICH_DOCUMENT_PARSER_VERSION
 from .parse.source import PARSER_VERSION as SOURCE_PARSER_VERSION
 from .parse.source import parse_source_input
 from .parse.source import parse_source_input_with_warnings
@@ -55,7 +55,7 @@ _ar5iv = Ar5ivProvider()
 _arxiv_source = ArxivSourceProvider()
 ProgressCallback = Callable[[dict[str, Any]], None]
 LEGACY_PARSED_SOURCE_KEYS = ("paper_id", "parser_version", "source_hash", "toc", "sections", "equations")
-RICH_PARSER_VERSION = 2
+RICH_PARSER_VERSION = RICH_DOCUMENT_PARSER_VERSION
 
 
 def extract_paper_ids(text: str) -> dict[str, Any]:
@@ -1299,12 +1299,14 @@ def _read_rich_document(parsed: dict[str, Any]) -> dict[str, Any] | None:
             and cached.get("rich_parser_version") == RICH_PARSER_VERSION
             and isinstance(document, dict)
             and document.get("schema_version") == DOCUMENT_SCHEMA_VERSION
+            and document.get("parser_version") == RICH_PARSER_VERSION
         ):
             return document
     legacy_document = parsed.get("document")
     if (
         isinstance(legacy_document, dict)
         and legacy_document.get("schema_version") == DOCUMENT_SCHEMA_VERSION
+        and legacy_document.get("parser_version") == RICH_PARSER_VERSION
     ):
         write_json(
             _rich_cache_path(parsed),
