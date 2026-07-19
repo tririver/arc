@@ -480,7 +480,7 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
             return EvidenceResolution(
                 records=(record,), evidence_ids_by_segment={"s2": ("verified-paper",)},
                 supported_request_keys=(requests[0]["request_key"],),
-                audit={"schema_version": "arc.companion.evidence-resolution.v1", "requests": material, "lanes": {}, "accepted": [{
+                audit={"schema_version": "arc.companion.evidence-resolution.v2", "requests": material, "lanes": {}, "accepted": [{
                     "request_key": requests[0]["request_key"], "evidence_id": "verified-paper",
                 }], "rejected": []},
             )
@@ -514,7 +514,7 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
     assert final["s3"]["later_work"] == []
     assert all(not item["evidence_requests"] for item in final.values())
     assert [item["evidence_id"] for item in merged["related_papers"]] == ["verified-paper"]
-    audit = __import__("json").loads((tmp_path / "evidence-resolution.v1.json").read_text())
+    audit = __import__("json").loads((tmp_path / "evidence-resolution.v2.json").read_text())
     assert audit["rerun_segments"] == ["s2"]
     assert audit["final_claim_evidence_ids"]["s2"] == ["verified-paper"]
     assert audit["final_claim_bindings"]["s2"][0]["source_locators"] == [
@@ -545,7 +545,7 @@ def test_rerun_ignoring_request_evidence_drops_only_that_claim(monkeypatch, tmp_
                 records=(resolved,), evidence_ids_by_segment={"s1": ("verified-paper",)},
                 supported_request_keys=(request["request_key"],),
                 audit={
-                    "schema_version": "arc.companion.evidence-resolution.v1",
+                    "schema_version": "arc.companion.evidence-resolution.v2",
                     "requests": material, "lanes": {}, "rejected": [],
                     "accepted": [{
                         "request_key": request["request_key"],

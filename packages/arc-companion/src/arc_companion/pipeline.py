@@ -25,6 +25,7 @@ from .evidence import (
     validate_evidence_record,
 )
 from .evidence_requests import (
+    EVIDENCE_RESOLUTION_VERSION,
     EvidenceRequestController,
     EvidenceResolution,
     normalize_evidence_requests,
@@ -988,8 +989,8 @@ def _resolve_and_rerun_evidence_requests(
         for request in annotations[str(segment["segment_id"])].get("evidence_requests") or []
     ]
     if not requests:
-        write_json(checkpoint_dir / "evidence-resolution.v1.json", {
-            "schema_version": "arc.companion.evidence-resolution.v1",
+        write_json(checkpoint_dir / "evidence-resolution.v2.json", {
+            "schema_version": EVIDENCE_RESOLUTION_VERSION,
             "requests": [],
             "lanes": {},
             "accepted": [],
@@ -1018,7 +1019,7 @@ def _resolve_and_rerun_evidence_requests(
     audit = dict(resolution.audit)
     audit["round"] = 1
     audit["rerun_segments"] = sorted(resolution.evidence_ids_by_segment)
-    write_json(checkpoint_dir / "evidence-resolution.v1.json", audit)
+    write_json(checkpoint_dir / "evidence-resolution.v2.json", audit)
 
     merged_evidence = {
         **evidence,
@@ -1039,7 +1040,7 @@ def _resolve_and_rerun_evidence_requests(
                 if item["segment_id"] == segment_id and item["request_key"] in supported
             },
             "requests": [item for item in requests if item["segment_id"] == segment_id],
-            "audit_path": str(checkpoint_dir / "evidence-resolution.v1.json"),
+            "audit_path": str(checkpoint_dir / "evidence-resolution.v2.json"),
         }
         for segment_id in rerun_ids
     }
@@ -1090,7 +1091,7 @@ def _resolve_and_rerun_evidence_requests(
     audit["round"] = 2
     audit["final_claim_evidence_ids"] = claim_bindings
     audit["final_claim_bindings"] = claim_binding_records
-    write_json(checkpoint_dir / "evidence-resolution.v1.json", audit)
+    write_json(checkpoint_dir / "evidence-resolution.v2.json", audit)
     return annotations, merged_evidence
 
 
