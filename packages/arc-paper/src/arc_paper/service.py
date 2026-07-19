@@ -55,7 +55,7 @@ _ar5iv = Ar5ivProvider()
 _arxiv_source = ArxivSourceProvider()
 ProgressCallback = Callable[[dict[str, Any]], None]
 LEGACY_PARSED_SOURCE_KEYS = ("paper_id", "parser_version", "source_hash", "toc", "sections", "equations")
-RICH_PARSER_VERSION = 1
+RICH_PARSER_VERSION = 2
 
 
 def extract_paper_ids(text: str) -> dict[str, Any]:

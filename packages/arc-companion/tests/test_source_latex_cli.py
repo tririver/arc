@@ -215,9 +215,14 @@ def test_companion_docs_describe_bounded_full_text_evidence_and_package_contents
 
     assert "related-paper full texts cached through existing `arc-paper` APIs" in manual
     assert "concurrent translations and 24 concurrent companion commentaries" in manual
+    assert "first_round_preview.pdf" in manual
+    assert "before evidence resolution or\nreview starts" in manual
+    assert "Table-of-contents blocks, acknowledgment sections, and\nreference-list headings" in manual
     assert "lanes drain all\n  submitted units before reporting their aggregated failures" in manual
     assert "targeted reference and citer full text cached through `arc-paper`" in readme
     assert "default is 24 concurrent translations plus 24 concurrent commentaries" in workflow
+    assert "preview before evidence resolution and review" in workflow
+    assert "source-only table-of-contents blocks" in workflow
     assert "fix the scheduler in `packages/arc-companion`" in workflow
 
 
@@ -372,7 +377,8 @@ def test_heading_and_nested_list_fields_render_without_falling_back_to_prose(tmp
         output_dir=tmp_path,
         language="en",
     )
-    assert r"\subsection{Detailed result}" in tex
+    assert r"\subsection*{Detailed result}" in tex
+    assert r"\addcontentsline{toc}{subsection}{Detailed result}" in tex
     assert r"\begin{enumerate}" in tex
     assert r"\item First" in tex
     assert r"\begin{itemize}" in tex
@@ -443,6 +449,82 @@ def test_html_renderer_preserves_inline_structure_without_front_or_reference_dup
     assert r"\(x_i\)" in tex
     assert r"\hyperref[bib1]{[1]}" in tex
     assert r"\href{https://example.test/a\_b?x=1\&y=2}{site}" in tex
+    assert validate_tex_fidelity(tex, document, manifest) == []
+
+
+def test_source_only_toc_acknowledgments_and_references_render_once_with_toc_structure(tmp_path: Path) -> None:
+    document = {
+        "front_matter": {},
+        "blocks": [
+            {
+                "block_id": "toc-title", "kind": "heading", "level": 6,
+                "text": "Contents", "title": "Contents", "source_role": "table_of_contents",
+                "html": '<h6 class="ltx_title_contents">Contents</h6>',
+            },
+            {
+                "block_id": "toc-list", "kind": "list", "source_role": "table_of_contents",
+                "text": "1 Main 1.1 Detail", "list_kind": "ordered", "items": [],
+                "html": (
+                    '<ol class="ltx_toclist"><li><a href="#S1">1 Main</a>'
+                    '<ol class="ltx_toclist"><li><a href="#S1.SS1">1.1 Detail</a></li></ol>'
+                    '</li></ol>'
+                ),
+            },
+            {
+                "block_id": "S1", "kind": "heading", "level": 2, "section_id": "S1",
+                "text": "1 Main", "title": "Main", "html": '<h2 id="S1">1 Main</h2>',
+            },
+            {
+                "block_id": "body", "source_id": "S1.SS1", "kind": "prose",
+                "section_id": "S1", "text": "Body text.",
+            },
+            {
+                "block_id": "ack-title", "kind": "heading", "section_id": "Sx",
+                "text": "Acknowledgments", "title": "Acknowledgments", "source_role": "acknowledgments",
+            },
+            {
+                "block_id": "ack-body", "kind": "prose", "section_id": "Sx",
+                "text": "We thank our colleagues.", "source_role": "acknowledgments",
+            },
+            {
+                "block_id": "refs-title", "kind": "heading", "section_id": "bib",
+                "text": "References", "title": "References", "source_role": "references",
+            },
+            {
+                "block_id": "bib1", "kind": "bibliography", "section_id": "bib",
+                "text": "[1] Reference work.", "source_role": "references",
+            },
+        ],
+        "bibliography": [{"id": "bib1", "label": "[1]", "text": "[1] Reference work."}],
+        "links": [
+            {"href": "#S1", "target_id": "S1", "text": "1 Main"},
+            {"href": "#S1.SS1", "target_id": "S1.SS1", "text": "1.1 Detail"},
+        ],
+        "integrity": {"status": "complete"},
+    }
+    segments = [{
+        "segment_id": "body", "start_block_id": "S1", "end_block_id": "body",
+        "block_ids": ["S1", "body"], "title": "Main",
+    }]
+
+    tex, manifest = render_companion_tex(
+        document,
+        segments,
+        {"body": {"commentary": "Body note", "explanation": "Body note"}},
+        translations={"body": {"blocks": [
+            {"block_id": "S1", "text": "主节"}, {"block_id": "body", "text": "正文。"},
+        ]}},
+        output_dir=tmp_path,
+        language="zh-CN",
+    )
+
+    assert tex.count(r"\paragraph*{Contents}") == 1
+    assert tex.count("We thank our colleagues") == 1
+    assert tex.count("Reference work") == 1
+    assert tex.count(r"\begin{enumerate}") >= 2
+    assert r"\hyperref[S1]{1 Main}" in tex
+    assert r"\hyperref[S1.SS1]{1.1 Detail}" in tex
+    assert manifest["companion_layers"]["semantic_segment_ids"] == ["body"]
     assert validate_tex_fidelity(tex, document, manifest) == []
 
 

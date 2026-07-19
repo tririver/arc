@@ -263,6 +263,38 @@ def build_companion(
             "schema_version": "arc.companion.annotations-first-round.v1",
             "annotations": raw_annotations,
         })
+        stem = f"{safe_name(bundle.paper_id)}_companion_{safe_name(options.annotation_language)}"
+        preview = _publish_pdf_artifact(
+            document=bundle.document,
+            segments=expanded,
+            annotations=raw_annotations,
+            translations=translations,
+            glossary=glossary,
+            metadata=bundle.metadata,
+            language=options.annotation_language,
+            output_dir=project_dir,
+            stem=f"{stem}_first_round_preview",
+            manifest_name="first-round-preview-source-manifest.json",
+            validation_name="first-round-preview-validation.json",
+            compiler=compiler,
+            pdf_validator=pdf_validator,
+        )
+        _state(
+            state_path,
+            status="preview_ready",
+            paper_id=bundle.paper_id,
+            fingerprint=fingerprint,
+            notice=notice,
+            segment_count=len(expanded),
+            preview_tex=preview["tex_path"],
+            preview_pdf=preview["pdf_path"],
+            preview_tex_sha256=preview["tex_sha256"],
+            preview_pdf_sha256=preview["pdf_sha256"],
+            preview_source_manifest_path=preview["manifest_path"],
+            preview_source_manifest_sha256=preview["manifest_sha256"],
+            preview_validation_path=preview["validation_path"],
+            preview_validation_sha256=preview["validation_sha256"],
+        )
         raw_annotations, evidence = _resolve_and_rerun_evidence_requests(
             expanded,
             raw_annotations,
@@ -320,34 +352,25 @@ def build_companion(
 
         _state(state_path, status="typesetting", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
                segment_count=len(expanded))
-        tex, source_manifest = render_companion_tex(
-            bundle.document,
-            expanded,
-            reviewed,
-            output_dir=project_dir,
-            language=options.annotation_language,
-            metadata=bundle.metadata,
+        final_artifact = _publish_pdf_artifact(
+            document=bundle.document,
+            segments=expanded,
+            annotations=reviewed,
             translations=reviewed_translations,
             glossary=glossary,
+            metadata=bundle.metadata,
+            language=options.annotation_language,
+            output_dir=project_dir,
+            stem=stem,
+            manifest_name="source-manifest.json",
+            validation_name="validation.json",
+            compiler=compiler,
+            pdf_validator=pdf_validator,
         )
-        fidelity_errors = validate_tex_fidelity(tex, bundle.document, source_manifest)
-        if fidelity_errors:
-            raise LatexError("source fidelity validation failed: " + "; ".join(fidelity_errors))
-        stem = f"{safe_name(bundle.paper_id)}_companion_{safe_name(options.annotation_language)}"
-        tex_path = project_dir / f"{stem}.tex"
-        pdf_path = project_dir / f"{stem}.pdf"
-        building_tex = project_dir / f".{stem}.building.tex"
-        building_pdf = project_dir / f".{stem}.building.pdf"
-        write_text(building_tex, tex)
-        compiler(building_tex, building_pdf)
-        pdf_report = pdf_validator(building_pdf)
-        os.replace(building_tex, tex_path)
-        os.replace(building_pdf, pdf_path)
-        write_json(project_dir / "source-manifest.json", source_manifest)
-        write_json(project_dir / "validation.json", {"ok": True, "pdf": pdf_report, "fidelity_errors": []})
-
-        manifest_path = project_dir / "source-manifest.json"
-        validation_path = project_dir / "validation.json"
+        tex_path = Path(final_artifact["tex_path"])
+        pdf_path = Path(final_artifact["pdf_path"])
+        manifest_path = Path(final_artifact["manifest_path"])
+        validation_path = Path(final_artifact["validation_path"])
 
         final_state = _state(
             state_path,
@@ -358,10 +381,10 @@ def build_companion(
             segment_count=len(expanded),
             output_tex=str(tex_path),
             output_pdf=str(pdf_path),
-            output_tex_sha256=_sha256_existing_file(tex_path),
-            output_pdf_sha256=_sha256_existing_file(pdf_path),
-            source_manifest_sha256=_sha256_existing_file(manifest_path),
-            validation_sha256=_sha256_existing_file(validation_path),
+            output_tex_sha256=final_artifact["tex_sha256"],
+            output_pdf_sha256=final_artifact["pdf_sha256"],
+            source_manifest_sha256=final_artifact["manifest_sha256"],
+            validation_sha256=final_artifact["validation_sha256"],
             source_manifest_path=str(manifest_path),
             validation_path=str(validation_path),
             checkpoint_dir=str(checkpoint_dir),
@@ -430,6 +453,77 @@ def read_status(project_dir: Path) -> dict[str, Any]:
     if not path.is_file():
         return err("companion_state_not_found", f"No companion state found in {project_dir}")
     return ok(read_json(path))
+
+
+def _publish_pdf_artifact(
+    *,
+    document: dict[str, Any],
+    segments: list[dict[str, Any]],
+    annotations: dict[str, dict[str, Any]],
+    translations: dict[str, dict[str, Any]],
+    glossary: dict[str, Any],
+    metadata: dict[str, Any],
+    language: str,
+    output_dir: Path,
+    stem: str,
+    manifest_name: str,
+    validation_name: str,
+    compiler: Callable[[Path, Path], None],
+    pdf_validator: Callable[[Path], dict[str, object]],
+) -> dict[str, Any]:
+    """Render, validate, and atomically publish one preview or final PDF artifact."""
+    tex, source_manifest = render_companion_tex(
+        document,
+        segments,
+        annotations,
+        output_dir=output_dir,
+        language=language,
+        metadata=metadata,
+        translations=translations,
+        glossary=glossary,
+    )
+    fidelity_errors = validate_tex_fidelity(tex, document, source_manifest)
+    if fidelity_errors:
+        raise LatexError("source fidelity validation failed: " + "; ".join(fidelity_errors))
+
+    tex_path = output_dir / f"{stem}.tex"
+    pdf_path = output_dir / f"{stem}.pdf"
+    manifest_path = output_dir / manifest_name
+    validation_path = output_dir / validation_name
+    building_tex = output_dir / f".{stem}.building.tex"
+    building_pdf = output_dir / f".{stem}.building.pdf"
+    building_manifest = output_dir / f".{manifest_name}.building"
+    building_validation = output_dir / f".{validation_name}.building"
+    staging_paths = (building_tex, building_pdf, building_manifest, building_validation)
+    try:
+        write_text(building_tex, tex)
+        compiler(building_tex, building_pdf)
+        pdf_report = pdf_validator(building_pdf)
+        write_json(building_manifest, source_manifest)
+        write_json(
+            building_validation,
+            {"ok": True, "pdf": pdf_report, "fidelity_errors": []},
+        )
+        os.replace(building_tex, tex_path)
+        os.replace(building_pdf, pdf_path)
+        os.replace(building_manifest, manifest_path)
+        os.replace(building_validation, validation_path)
+    except BaseException:
+        for path in staging_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "tex_path": str(tex_path),
+        "pdf_path": str(pdf_path),
+        "manifest_path": str(manifest_path),
+        "validation_path": str(validation_path),
+        "tex_sha256": _sha256_existing_file(tex_path),
+        "pdf_sha256": _sha256_existing_file(pdf_path),
+        "manifest_sha256": _sha256_existing_file(manifest_path),
+        "validation_sha256": _sha256_existing_file(validation_path),
+        "pdf": pdf_report,
+    }
 
 
 def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf) -> dict[str, Any]:
@@ -1266,8 +1360,11 @@ def _full_paper_context(
     max_chars: int = FULL_PAPER_CONTEXT_CHARS,
 ) -> dict[str, Any]:
     """Build bounded navigation and source anchors without preservation-only HTML."""
-    blocks = list(document.get("blocks") or [])
-    excluded_front_ids = _front_matter_excluded_block_ids(document)
+    excluded_generation_ids = _generation_excluded_block_ids(document)
+    blocks = [
+        block for block in document.get("blocks") or []
+        if block_id(block) not in excluded_generation_ids
+    ]
     positions = {block_id(block): index for index, block in enumerate(blocks)}
     member_ids = [str(value) for value in segment.get("block_ids") or []]
     member_positions = [positions[value] for value in member_ids if value in positions]
@@ -1276,8 +1373,6 @@ def _full_paper_context(
     heading_kinds = {"heading", "section", "subsection", "subsubsection"}
     navigation: list[dict[str, Any]] = []
     for index, block in enumerate(blocks):
-        if block_id(block) in excluded_front_ids:
-            continue
         kind = str(block.get("type") or block.get("kind") or "").casefold()
         if kind not in heading_kinds:
             continue
@@ -1422,8 +1517,8 @@ def _validate_translation(
 
 
 def _generation_document(document: dict[str, Any]) -> dict[str, Any]:
-    """Remove non-generative front matter while preserving it for final rendering."""
-    excluded = _front_matter_excluded_block_ids(document)
+    """Remove source-only material while preserving it for final rendering."""
+    excluded = _generation_excluded_block_ids(document)
     return {
         **document,
         "blocks": [
@@ -1431,6 +1526,57 @@ def _generation_document(document: dict[str, Any]) -> dict[str, Any]:
             if block_id(block) not in excluded
         ],
     }
+
+
+def _generation_excluded_block_ids(document: dict[str, Any]) -> set[str]:
+    return _front_matter_excluded_block_ids(document) | _source_only_block_ids(document)
+
+
+def _source_only_block_ids(document: dict[str, Any]) -> set[str]:
+    """Identify structurally preserved blocks that must never enter LLM generation."""
+    blocks = list(document.get("blocks") or [])
+    excluded: set[str] = set()
+    source_only_sections: set[str] = set()
+    for block in blocks:
+        role = str(block.get("source_role") or "").casefold()
+        kind = str(block.get("type") or block.get("kind") or "").casefold()
+        inferred_role = role or _source_only_role_from_block(block)
+        if inferred_role or kind in {"bibliography", "bibliography_item", "reference"}:
+            excluded.add(block_id(block))
+            section_id = str(block.get("section_id") or "")
+            if section_id and inferred_role in {"acknowledgments", "references"}:
+                source_only_sections.add(section_id)
+    for block in blocks:
+        if str(block.get("section_id") or "") in source_only_sections:
+            excluded.add(block_id(block))
+    return excluded
+
+
+def _source_only_role_from_block(block: dict[str, Any]) -> str:
+    html = str(block.get("html") or "").casefold()
+    if re.search(r'(?:class|role)=["\'][^"\']*(?:ltx_toc|ltx_title_contents|doc-toc)', html):
+        return "table_of_contents"
+    if re.search(r'class=["\'][^"\']*acknowledg', html):
+        return "acknowledgments"
+    if re.search(r'class=["\'][^"\']*(?:bibliograph|reference)', html):
+        return "references"
+    kind = str(block.get("type") or block.get("kind") or "").casefold()
+    if kind not in {"heading", "section", "subsection", "subsubsection"}:
+        return ""
+    title = re.sub(
+        r"[^\w\u4e00-\u9fff]+",
+        " ",
+        str(block.get("title") or block.get("text") or "").casefold(),
+    ).strip()
+    if title in {"contents", "table of contents", "目录"}:
+        return "table_of_contents"
+    if title in {
+        "acknowledgment", "acknowledgments", "acknowledgement", "acknowledgements", "致谢",
+    }:
+        return "acknowledgments"
+    if title in {"references", "reference list", "bibliography", "literature cited", "参考文献"}:
+        return "references"
+    return ""
 
 
 def _front_matter_excluded_block_ids(document: dict[str, Any]) -> set[str]:

@@ -8,6 +8,7 @@ import threading
 from arc_companion import pipeline as pipeline_module
 from arc_companion.cli import _emit
 from arc_companion.evidence import arc_cache_descriptor, text_sha256, validate_evidence_record
+from arc_companion.evidence_requests import EvidenceResolution
 from arc_companion.pipeline import (
     BuildOptions,
     _evidence,
@@ -67,7 +68,7 @@ def test_translation_uses_and_validates_ordered_opaque_inline_tokens() -> None:
         raise AssertionError("reordered math tokens must be rejected")
 
 
-def test_generation_document_excludes_title_authors_and_affiliations_only() -> None:
+def test_generation_document_excludes_front_matter_and_all_source_only_sections() -> None:
     document = {
         "front_matter": {
             "title": "Paper Title",
@@ -80,10 +81,23 @@ def test_generation_document_excludes_title_authors_and_affiliations_only() -> N
             {"block_id": "author", "text": "Ada Author"},
             {"block_id": "aff", "text": "Theory Institute"},
             {"block_id": "abstract", "text": "Abstract remains generative."},
+            {
+                "block_id": "toc-title", "kind": "heading", "text": "Contents",
+                "html": '<h6 class="ltx_title_contents">Contents</h6>',
+            },
+            {
+                "block_id": "toc-list", "kind": "list", "text": "1 Body",
+                "html": '<ol class="ltx_toclist"><li><a href="#S1">1 Body</a></li></ol>',
+            },
+            {"block_id": "body", "kind": "prose", "section_id": "S1", "text": "Body."},
+            {"block_id": "ack-title", "kind": "heading", "section_id": "Sx", "text": "Acknowledgments"},
+            {"block_id": "ack-body", "kind": "prose", "section_id": "Sx", "text": "We thank Ada."},
+            {"block_id": "refs-title", "kind": "heading", "section_id": "bib", "text": "References"},
+            {"block_id": "ref-1", "kind": "bibliography", "section_id": "bib", "text": "[1] Work."},
         ],
     }
 
-    assert [item["block_id"] for item in _generation_document(document)["blocks"]] == ["abstract"]
+    assert [item["block_id"] for item in _generation_document(document)["blocks"]] == ["abstract", "body"]
 
 
 def _bundle(tmp_path: Path) -> SourceBundle:
@@ -319,6 +333,102 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert len(fake.calls) == call_count
 
 
+def test_first_round_preview_is_published_before_evidence_resolution_and_review(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    fake = FakeLLM()
+    project = tmp_path / "preview-order"
+    compiler_calls: list[tuple[Path, str]] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        if label == "companion-final-review":
+            assert (project / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
+            assert (project / "first-round-preview-source-manifest.json").is_file()
+            assert (project / "first-round-preview-validation.json").is_file()
+        value = fake(prompt, **kwargs)
+        if label == "companion-annotation-seg-0001":
+            value = {**value, "evidence_requests": [{
+                "relation": "context",
+                "needed_claim": "context claim",
+                "queries": ["context query"],
+                "candidate_paper_ids": [],
+                "candidate_urls": [],
+                "reason": "verify context before review",
+            }]}
+        return value
+
+    def compiler(tex_path: Path, pdf_path: Path) -> None:
+        compiler_calls.append((tex_path, tex_path.read_text(encoding="utf-8")))
+        pdf_path.write_bytes(b"%PDF-1.7 fixture")
+
+    class Controller:
+        def resolve(self, requests, *, existing_records=()):
+            assert list(requests)
+            assert (project / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
+            state = json.loads((project / "state.json").read_text(encoding="utf-8"))
+            assert state["status"] == "preview_ready"
+            assert state["preview_pdf_sha256"]
+            return EvidenceResolution(
+                records=(),
+                evidence_ids_by_segment={},
+                supported_request_keys=(),
+                audit={"requests": [], "lanes": {}, "accepted": [], "rejected": []},
+            )
+
+    result = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project, review_context_chars=1),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm,
+        compiler=compiler,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+        evidence_controller=Controller(),
+    )
+
+    assert result["ok"], result
+    assert len(compiler_calls) == 2
+    assert "解释 0001" in compiler_calls[0][1]
+    assert "审校后的解释" not in compiler_calls[0][1]
+    assert "审校后的解释" in compiler_calls[1][1]
+    state = result["data"]
+    for key in (
+        "preview_tex", "preview_pdf", "preview_source_manifest_path", "preview_validation_path",
+    ):
+        assert Path(state[key]).is_file()
+    for key in (
+        "preview_tex_sha256", "preview_pdf_sha256",
+        "preview_source_manifest_sha256", "preview_validation_sha256",
+    ):
+        assert state[key]
+
+
+def test_first_round_preview_failure_stops_before_evidence_and_review(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    fake = FakeLLM()
+
+    result = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "preview-failure"),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=fake,
+        compiler=lambda *_: (_ for _ in ()).throw(RuntimeError("preview compile failed")),
+        pdf_validator=lambda _: (_ for _ in ()).throw(AssertionError("must not validate")),
+    )
+
+    assert not result["ok"]
+    assert "preview compile failed" in result["error"]["message"]
+    assert not any("review" in str(call["call_label"]) for call in fake.calls)
+    assert json.loads(
+        (tmp_path / "preview-failure" / "state.json").read_text(encoding="utf-8")
+    )["status"] == "failed"
+
+
+def test_non_json_status_prefers_ready_preview_path(capsys) -> None:
+    _emit(
+        {"ok": True, "data": {"status": "preview_ready", "preview_pdf": "/run/preview.pdf"}, "meta": {}},
+        json_output=False,
+    )
+    assert capsys.readouterr().out == "/run/preview.pdf\n"
+
+
 def test_segment_ranges_must_cover_blocks_once_in_order() -> None:
     blocks = [{"block_id": value} for value in ("a", "b", "c")]
     valid = validate_and_expand_segments(
@@ -516,17 +626,26 @@ def test_invalid_review_patch_fails_without_publishing_pdf(tmp_path: Path) -> No
             return {"patches": [{"segment_id": "source-b1", "commentary": "tamper", "reason": "bad"}], "issues": []}
         return original(prompt, **kwargs)
 
+    compiled: list[Path] = []
+
+    def preview_compiler(tex_path: Path, pdf_path: Path) -> None:
+        compiled.append(tex_path)
+        pdf_path.write_bytes(b"%PDF-1.7 fixture")
+
     result = build_companion(
         BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "bad"),
         source_loader=lambda *args, **kwargs: bundle,
         llm=bad_llm,
-        compiler=lambda *_: (_ for _ in ()).throw(AssertionError("must not compile")),
+        compiler=preview_compiler,
         pdf_validator=lambda _: {},
     )
     assert not result["ok"]
     assert "invalid or duplicate annotation patch" in result["error"]["message"]
     assert final_prompts and '"source_blocks"' in final_prompts[0]
     assert json.loads((tmp_path / "bad" / "state.json").read_text())["status"] == "failed"
+    assert len(compiled) == 1
+    assert (tmp_path / "bad" / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
+    assert not (tmp_path / "bad" / "arXiv-1234.5678_companion_zh-CN.pdf").exists()
 
 
 def test_generation_failure_drains_both_lanes_and_retry_only_runs_missing_segments(tmp_path: Path) -> None:
@@ -637,7 +756,7 @@ def test_invalid_segmentation_is_not_cached(tmp_path: Path) -> None:
         "phase": "window",
         "window_id": "w-0001",
         "start_ordinal": 1,
-        "end_ordinal": 6,
+            "end_ordinal": 5,
         "attempt": 3,
         "refinement": False,
     }
@@ -705,7 +824,7 @@ def test_complete_resume_requires_matching_output_hashes(tmp_path: Path) -> None
     )
     assert second["ok"]
     assert second["meta"]["resumed"] is False
-    assert compile_count == 2
+    assert compile_count == 4
 
 
 def test_non_failed_state_clears_stale_error(tmp_path: Path) -> None:

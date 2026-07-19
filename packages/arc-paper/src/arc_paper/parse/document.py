@@ -187,17 +187,65 @@ def _blocks(
         used_ids[preferred] += 1
         block_id = preferred if used_ids[preferred] == 1 else f"{preferred}--{used_ids[preferred]}"
         section = node.find_parent("section")
-        blocks.append(
-            _block_record(
-                node,
-                block_id=block_id,
-                order=order,
-                kind=kind,
-                source_id=(special[1] if special else str(node.get("id") or "")),
-                section_id=str(section.get("id") or "") if isinstance(section, Tag) else "",
-            )
+        block = _block_record(
+            node,
+            block_id=block_id,
+            order=order,
+            kind=kind,
+            source_id=(special[1] if special else str(node.get("id") or "")),
+            section_id=str(section.get("id") or "") if isinstance(section, Tag) else "",
         )
+        source_role = _structural_source_role(node, kind=kind)
+        if source_role:
+            block["source_role"] = source_role
+        blocks.append(block)
+    _propagate_source_only_section_roles(blocks)
     return blocks
+
+
+def _structural_source_role(node: Tag, *, kind: str) -> str:
+    if kind == "bibliography":
+        return "references"
+    class_tokens: set[str] = set()
+    for candidate in (node, *(item for item in node.parents if isinstance(item, Tag))):
+        class_tokens.update(str(value).casefold() for value in candidate.get("class") or [])
+        if str(candidate.get("role") or "").casefold() == "doc-toc":
+            return "table_of_contents"
+    if any(value == "toc" or value.startswith("ltx_toc") for value in class_tokens) or "ltx_title_contents" in class_tokens:
+        return "table_of_contents"
+    if any("acknowledg" in value for value in class_tokens):
+        return "acknowledgments"
+    if any("bibliograph" in value or "reference" in value for value in class_tokens):
+        return "references"
+    return ""
+
+
+def _propagate_source_only_section_roles(blocks: list[dict[str, Any]]) -> None:
+    section_roles: dict[str, str] = {}
+    for block in blocks:
+        role = str(block.get("source_role") or "") or _source_only_heading_role(block)
+        if role:
+            block["source_role"] = role
+            section_id = str(block.get("section_id") or "")
+            if section_id:
+                section_roles[section_id] = role
+    for block in blocks:
+        role = section_roles.get(str(block.get("section_id") or ""))
+        if role:
+            block["source_role"] = role
+
+
+def _source_only_heading_role(block: dict[str, Any]) -> str:
+    if str(block.get("kind") or "").casefold() != "heading":
+        return ""
+    title = re.sub(r"[^\w\u4e00-\u9fff]+", " ", str(block.get("title") or block.get("text") or "").casefold()).strip()
+    if title in {"contents", "table of contents", "目录"}:
+        return "table_of_contents"
+    if title in {"acknowledgment", "acknowledgments", "acknowledgement", "acknowledgements", "致谢"}:
+        return "acknowledgments"
+    if title in {"references", "reference list", "bibliography", "literature cited", "参考文献"}:
+        return "references"
+    return ""
 
 
 def _block_record(

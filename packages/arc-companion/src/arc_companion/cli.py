@@ -120,7 +120,13 @@ def _emit(result: dict[str, Any], *, json_output: bool) -> None:
         return
     if result.get("ok"):
         data = result.get("data") or {}
-        print(data.get("output_pdf") or data.get("archive_path") or data.get("status") or data)
+        print(
+            data.get("output_pdf")
+            or data.get("preview_pdf")
+            or data.get("archive_path")
+            or data.get("status")
+            or data
+        )
         return
     error = result.get("error") or {}
     message = str(error.get("message") or "companion command failed")

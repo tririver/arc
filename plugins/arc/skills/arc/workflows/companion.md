@@ -134,13 +134,22 @@ reconstruct missing source text, equation numbers, tables, figures, or
 bibliography with an LLM.
 
 Render every semantic unit in this order: original, translation, companion.
+Before segmentation, exclude durable source-only table-of-contents blocks,
+acknowledgment sections, and reference-list headings and entries from every LLM
+lane, evidence input, and review payload. Keep title, author, and affiliation
+blocks under the same existing non-generative front-matter policy. Render all
+of this excluded material exactly once from the pinned source; preserve nested
+TOC hierarchy and internal links instead of regenerating or translating them.
 The renderer copies displayed formulas from the pinned source into the
 translation for local readability but omits their equation numbers. It does not
 repeat figures, tables, or other floating objects. Preserve every original
 formula, visible equation number, figure, table, caption, citation, and
 bibliography entry unchanged in the original track. Use distinct light
-background colors for original text, translation, and companion commentary,
-following the visual rhythm of the reference design.
+background colors for translation and companion commentary, following the
+visual rhythm of the reference design. Keep original text on the plain page
+without a background or left rule. Render paper headings with unnumbered
+LaTeX section commands, preserving their source number and hierarchy through
+explicit table-of-contents entries rather than adding a second number.
 
 ### Step 2: Handle interruption or failure
 
@@ -149,15 +158,20 @@ refinements, translations, and commentaries are cached independently; the
 final merged segmentation is cached only after exact coverage validation.
 Translation and commentary lanes finish every submitted unit before aggregating
 failures, preserving all successful checkpoints; a retry submits only missing
-or stale units. If a traceback and checkpoint inventory show that an early
+or stale units. After both first-round lanes finish, the pipeline must render,
+source-fidelity check, compile, and PDF-validate the persistent first-round
+preview before evidence resolution and review. Inspect its `preview_pdf` path
+from build state when early visual QA is requested. Treat it as diagnostic and
+never as the final deliverable. Preview validation failure must stop the run at
+that boundary. If a traceback and checkpoint inventory show that an early
 failure cancelled unrelated units, reproduce it with a minimal package test and
 fix the scheduler in `packages/arc-companion`, never only in the current run
 directory.
 Checkpoints are keyed by source, asset, evidence, glossary, language, model,
 prompt, schema, and workflow hashes, so only failed or stale work runs again.
 Print every returned `WARNING:`. A segmentation warning must name the affected
-window or local refinement and the rejected cut condition. Do not publish or
-report a partial PDF.
+window or local refinement and the rejected cut condition. Do not report the
+first-round preview as the completed companion PDF.
 
 Inspect progress without changing the run:
 

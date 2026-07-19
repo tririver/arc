@@ -357,15 +357,11 @@ def _preamble(*, title: Any, authors: str, language: str) -> str:
 }}}}}}}}
 \usepackage[margin=25mm]{{geometry}}
 \hypersetup{{hidelinks}}
-\definecolor{{ArcSourceBackground}}{{HTML}}{{F1F5F7}}
-\definecolor{{ArcSourceRule}}{{HTML}}{{8096A3}}
 \definecolor{{ArcTranslationBackground}}{{HTML}}{{F0F7F3}}
 \definecolor{{ArcTranslationRule}}{{HTML}}{{6E9B89}}
 \definecolor{{ArcCompanionBackground}}{{HTML}}{{FAF3E8}}
 \definecolor{{ArcCompanionRule}}{{HTML}}{{A8735D}}
-\newtcolorbox{{arcsource}}[1][]{{enhanced,breakable,sharp corners,boxrule=0pt,
-  leftrule=1.2pt,colback=ArcSourceBackground,colframe=ArcSourceRule,
-  left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=8pt,#1}}
+\newenvironment{{arcsource}}{{\par\begingroup}}{{\par\endgroup}}
 \newtcolorbox{{arctranslation}}[1][]{{enhanced,breakable,sharp corners,boxrule=0pt,
   leftrule=1.2pt,colback=ArcTranslationBackground,colframe=ArcTranslationRule,
   left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=8pt,#1}}
@@ -436,7 +432,17 @@ def _render_block(
             or block.get("text")
         )
         rendered_title = _render_html_fragment(block.get("html"), rendered_links=rendered_links, contents_only=True)
-        return _anchors(block) + f"\\{command}{{{rendered_title or escape_tex(title)}}}\n"
+        title_tex = rendered_title or escape_tex(title)
+        # Source headings already carry the paper's own section number (when
+        # numbered).  A numbered LaTeX command would prepend a second number,
+        # e.g. ``0.1 1 Introduction`` for an ar5iv h2 rendered as a subsection.
+        # Keep the source text verbatim while registering the starred heading
+        # explicitly so its hierarchy remains available to the TOC/bookmarks.
+        return (
+            _anchors(block)
+            + f"\\{command}*{{{title_tex}}}\n"
+            + f"\\addcontentsline{{toc}}{{{command}}}{{{title_tex}}}\n"
+        )
     if kind in {"equation", "math", "display_math"}:
         entity = _entity_for(block, equations)
         return _anchors(block) + _render_equation(entity or block)

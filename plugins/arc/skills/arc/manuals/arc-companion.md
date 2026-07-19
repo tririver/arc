@@ -77,6 +77,15 @@ followed by a high-tier consolidation review, with complete unit coverage and a
 bounded source anchor for every unit in the consolidation payload. Review
 patches may change translations and commentaries only.
 
+As soon as both first-round lanes finish, and before evidence resolution or
+review starts, the controller renders and fully validates a persistent
+`<paper-safe>_companion_<language>_first_round_preview.pdf`. Its TeX, source
+manifest, validation report, paths, and hashes remain available through
+`arc-companion status`. This diagnostic preview uses the unreviewed first-round
+translation and commentary and is not the final deliverable. A source-fidelity,
+LaTeX, or PDF-validation failure stops the run at this boundary so layout and
+source-structure problems are found before further LLM work.
+
 ## Generation Access and Portability
 
 Each per-unit translation and commentary call receives bounded `FULL-PAPER
@@ -253,8 +262,15 @@ such as a non-integer, duplicate, out-of-window, oversized, or
 incomplete-coverage result. Failure stops before annotation and cannot publish
 a successful TeX, PDF, manifest, or validation result.
 
-These rules do not change the public CLI, accepted paper identifiers, or
-`arc-paper` source contract. They also do not weaken source fidelity:
+These rules do not change the public CLI or accepted paper identifiers. The
+rich `arc-paper` source contract marks structurally source-only blocks with a
+durable `source_role`. Table-of-contents blocks, acknowledgment sections, and
+reference-list headings and entries are excluded before segmentation, glossary,
+translation, commentary, evidence selection, and review. They remain pinned
+source blocks and render exactly once in the original track; nested TOC levels
+and links come from the preserved block HTML. Title, author, and affiliation
+blocks remain excluded from generation under the existing front-matter rule.
+These classifications do not weaken source fidelity:
 segmentation chooses only presentation boundaries, while original-track LaTeX,
 equation numbers, tables, figures, bibliography, links, and asset hashes still
 come exclusively from the pinned `arc-paper` document.
@@ -268,10 +284,16 @@ their visible labels, order, and text. No BibTeX reordering is allowed.
 
 The front matter uses a minimal title page followed by the three-column
 glossary; it does not include a "version note" page. Each semantic unit then
-uses the fixed order original, translation, companion commentary. These three
-text tracks have distinct, subtle light background colors, with typography,
-spacing, and rules following the reference companion design and remaining
-suitable for printing.
+uses the fixed order original, translation, companion commentary. The original
+track stays on the plain page without a background or left rule. Translation
+and companion tracks retain distinct, subtle light backgrounds, with
+typography, spacing, and rules following the reference companion design and
+remaining suitable for printing.
+
+Paper headings use the number already present in the pinned source and render
+with unnumbered LaTeX section commands. Register each heading explicitly at
+its source hierarchy in the table of contents so LaTeX does not prepend a
+second number while TOC entries, PDF bookmarks, and source anchors remain.
 
 The renderer copies displayed formulas from the pinned source into the
 translation so it can be read locally, but does not copy their equation

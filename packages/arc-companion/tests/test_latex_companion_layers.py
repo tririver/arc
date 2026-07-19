@@ -12,7 +12,7 @@ from arc_companion.latex import (
 )
 
 
-def test_renderer_orders_colored_layers_and_repeats_only_unnumbered_equations(tmp_path: Path) -> None:
+def test_renderer_orders_layers_and_repeats_only_unnumbered_equations(tmp_path: Path) -> None:
     image = tmp_path / "source-image.png"
     image.write_bytes(b"fixture image")
     digest = hashlib.sha256(image.read_bytes()).hexdigest()
@@ -79,7 +79,8 @@ def test_renderer_orders_colored_layers_and_repeats_only_unnumbered_equations(tm
     assert "随后是公式" in tex
     assert "术语表" in tex and "equation" in tex and "方程" in tex
     assert "本版说明" not in tex
-    assert "ArcSourceBackground" in tex
+    assert "ArcSourceBackground" not in tex
+    assert r"\newenvironment{arcsource}{\par\begingroup}{\par\endgroup}" in tex
     assert "ArcTranslationBackground" in tex
     assert "ArcCompanionBackground" in tex
     assert validate_tex_fidelity(tex, document, manifest) == []

@@ -38,6 +38,14 @@ RICH_HTML = """
     <article class="ltx_document">
       <h1 class="ltx_title">A rich paper</h1>
       <div class="ltx_authors">Ada Author</div>
+      <nav class="ltx_TOC" role="doc-toc">
+        <h6 class="ltx_title ltx_title_contents">Contents</h6>
+        <ol class="ltx_toclist">
+          <li class="ltx_tocentry"><a class="ltx_ref" href="#S1">1 Introduction</a>
+            <ol class="ltx_toclist"><li><a href="#S1.SS1">1.1 Detail</a></li></ol>
+          </li>
+        </ol>
+      </nav>
       <section id="S1">
         <h2>1 Introduction</h2>
         <p id="p1">Before <a class="ltx_ref" href="#bib.bib1">[1]</a>.</p>
@@ -57,6 +65,10 @@ RICH_HTML = """
           <tr><td rowspan="2">mass</td><td>1</td></tr>
           <tr><td>2</td></tr>
         </table>
+      </section>
+      <section id="Sx1">
+        <h2>Acknowledgements</h2>
+        <p id="thanks">We thank our colleagues.</p>
       </section>
       <section class="ltx_bibliography" id="bib">
         <h2>References</h2>
@@ -111,6 +123,19 @@ def test_rich_html_parse_stores_versioned_document_without_removing_legacy_field
         "source_column": 0,
     }
     assert document["bibliography"][0]["id"] == "bib.bib1"
+    roles = {
+        block["block_id"]: block.get("source_role")
+        for block in document["blocks"]
+        if block.get("source_role")
+    }
+    assert set(value for value in roles.values()) == {
+        "table_of_contents", "acknowledgments", "references",
+    }
+    assert roles["thanks"] == "acknowledgments"
+    assert roles["bib.bib1"] == "references"
+    toc_blocks = [block for block in document["blocks"] if block.get("source_role") == "table_of_contents"]
+    assert [block["kind"] for block in toc_blocks] == ["heading", "list"]
+    assert toc_blocks[1]["items"][0]["children"][0]["items"][0]["text"] == "1.1 Detail"
 
 
 def test_inline_runs_separate_text_math_citations_and_links_with_stable_tokens():
