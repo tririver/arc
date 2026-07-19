@@ -77,14 +77,18 @@ followed by a high-tier consolidation review, with complete unit coverage and a
 bounded source anchor for every unit in the consolidation payload. Review
 patches may change translations and commentaries only.
 
-As soon as both first-round lanes finish, and before evidence resolution or
-review starts, the controller renders and fully validates a persistent
+The controller first submits exactly the first `min(workers, unit_count)`
+source-order units to both lanes. As soon as translation and commentary have
+both finished for that first wave, and before any remaining unit is submitted,
+the controller renders and fully validates a persistent prefix
 `<paper-safe>_companion_<language>_first_round_preview.pdf`. Its TeX, source
 manifest, validation report, paths, and hashes remain available through
 `arc-companion status`. This diagnostic preview uses the unreviewed first-round
-translation and commentary and is not the final deliverable. A source-fidelity,
-LaTeX, or PDF-validation failure stops the run at this boundary so layout and
-source-structure problems are found before further LLM work.
+translation and commentary for that first wave and is not the final
+deliverable. Only after it passes does the controller submit the remaining
+units. A source-fidelity, LaTeX, or PDF-validation failure stops the run at this
+boundary so layout and source-structure problems are found before further LLM
+work.
 
 ## Generation Access and Portability
 

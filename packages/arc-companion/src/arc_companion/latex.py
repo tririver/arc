@@ -321,11 +321,14 @@ def validate_tex_fidelity(tex: str, document: dict[str, Any], manifest: dict[str
     if manifest.get("expected_links") != expected_links:
         errors.append("source link manifest does not match the current document")
     rendered_links = [dict(item) for item in manifest.get("rendered_links") or []]
+    allow_unresolved_targets = (
+        (document.get("preview_scope") or {}).get("kind") == "source_prefix"
+    )
     for expected in expected_links:
         if not _consume_matching_link(expected, rendered_links):
             errors.append(f"source link was not rendered: {expected.get('href')}")
         target = expected.get("target_id")
-        if target and f"\\label{{{_safe_label(target)}}}" not in tex:
+        if target and not allow_unresolved_targets and f"\\label{{{_safe_label(target)}}}" not in tex:
             errors.append(f"internal link target was not rendered: {target}")
     expected_tables = [_table_audit_record(item) for item in document.get("tables") or []]
     if manifest.get("tables") != expected_tables:
@@ -1289,6 +1292,14 @@ def _render_html_node(node: Any, *, rendered_links: list[dict[str, str]]) -> str
             raise LatexError("inline MathML has no TeX annotation or alttext")
         display = str(node.get("display") or "").lower() == "block"
         return anchor + (f"\\[{tex}\\]" if display else f"\\({tex}\\)")
+    if name in {"ul", "ol"}:
+        environment = "enumerate" if name == "ol" else "itemize"
+        items = "".join(
+            _render_html_node(child, rendered_links=rendered_links)
+            for child in node.children
+            if isinstance(child, Tag) and child.name == "li"
+        )
+        return anchor + f"\\begin{{{environment}}}\n{items}\\end{{{environment}}}\n"
     children = "".join(_render_html_node(child, rendered_links=rendered_links) for child in node.children)
     if name == "a":
         href = str(node.get("href") or "").strip()
@@ -1320,14 +1331,6 @@ def _render_html_node(node: Any, *, rendered_links: list[dict[str, str]]) -> str
         return anchor + f"\\begin{{quote}}\n{children}\n\\end{{quote}}\n"
     if name == "pre":
         return anchor + f"\\begin{{quote}}\\ttfamily {children}\\end{{quote}}\n"
-    if name in {"ul", "ol"}:
-        environment = "enumerate" if name == "ol" else "itemize"
-        items = "".join(
-            _render_html_node(child, rendered_links=rendered_links)
-            for child in node.children
-            if isinstance(child, Tag) and child.name == "li"
-        )
-        return anchor + f"\\begin{{{environment}}}\n{items}\\end{{{environment}}}\n"
     if name == "li":
         return anchor + f"\\item {children}\n"
     if name == "p":

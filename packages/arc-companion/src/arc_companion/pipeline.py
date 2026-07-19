@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 from typing import Any, Callable
 
+from bs4 import BeautifulSoup
+
 from .glossary import generate_glossary
 from .domain import load_domain_context
 from .evidence import (
@@ -65,6 +67,7 @@ REVIEW_TIER = "high"
 REVIEW_VERSION = "arc.companion.review.v2"
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
+FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v1"
 
 
 class CompanionLaneError(RuntimeError):
@@ -162,6 +165,7 @@ def build_companion(
             and previous_state.get("status") == "complete"
             and previous_state.get("fingerprint") == fingerprint
             and _completion_outputs_match(previous_state)
+            and _first_wave_preview_outputs_match(previous_state, workers=options.workers)
         ):
             resumed_state = {**previous_state, "diagnostics": list(diagnostics)}
             _state(state_path, **resumed_state)
@@ -230,51 +234,36 @@ def build_companion(
             segment_count=len(expanded),
             checkpoint_dir=str(checkpoint_dir),
         )
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            lane_futures = {
-                "translation": executor.submit(
-                _generate_translations,
-                expanded,
-                options=options,
-                bundle=bundle,
-                glossary=glossary,
-                protected_names=protected_names,
-                checkpoint_dir=checkpoint_dir,
-                llm=llm,
-                ),
-                "annotation": executor.submit(
-                _generate_annotations,
-                expanded,
-                options=options,
-                bundle=bundle,
-                evidence=evidence,
-                domain_context=domain_context,
-                glossary=glossary,
-                protected_names=protected_names,
-                checkpoint_dir=checkpoint_dir,
-                llm=llm,
-                ),
-            }
-            lane_results: dict[str, dict[str, dict[str, Any]]] = {}
-            lane_failures: dict[str, BaseException] = {}
-            for lane, future in lane_futures.items():
-                try:
-                    lane_results[lane] = future.result()
-                except Exception as exc:
-                    lane_failures[lane] = exc
-            if lane_failures:
-                raise CompanionGenerationError(lane_failures)
-            translations = lane_results["translation"]
-            raw_annotations = lane_results["annotation"]
-
-        write_json(checkpoint_dir / "annotations.first-round.v1.json", {
-            "schema_version": "arc.companion.annotations-first-round.v1",
+        first_wave_count = min(options.workers, len(expanded))
+        first_wave = expanded[:first_wave_count]
+        remaining = expanded[first_wave_count:]
+        first_wave_results = _generate_first_round_lanes(
+            first_wave,
+            options=options,
+            bundle=bundle,
+            evidence=evidence,
+            domain_context=domain_context,
+            glossary=glossary,
+            protected_names=protected_names,
+            checkpoint_dir=checkpoint_dir,
+            llm=llm,
+        )
+        translations = first_wave_results["translation"]
+        raw_annotations = first_wave_results["annotation"]
+        write_json(checkpoint_dir / "translations.first-wave.v1.json", {
+            "schema_version": "arc.companion.translations-first-wave.v1",
+            "segment_ids": [str(item["segment_id"]) for item in first_wave],
+            "translations": translations,
+        })
+        write_json(checkpoint_dir / "annotations.first-wave.v1.json", {
+            "schema_version": "arc.companion.annotations-first-wave.v1",
+            "segment_ids": [str(item["segment_id"]) for item in first_wave],
             "annotations": raw_annotations,
         })
         stem = f"{safe_name(bundle.paper_id)}_companion_{safe_name(options.annotation_language)}"
         preview = _publish_pdf_artifact(
-            document=bundle.document,
-            segments=expanded,
+            document=_first_wave_preview_document(bundle.document, first_wave),
+            segments=first_wave,
             annotations=raw_annotations,
             translations=translations,
             glossary=glossary,
@@ -294,6 +283,9 @@ def build_companion(
             fingerprint=fingerprint,
             notice=notice,
             segment_count=len(expanded),
+            preview_segment_count=first_wave_count,
+            preview_segment_ids=[str(item["segment_id"]) for item in first_wave],
+            first_wave_preview_version=FIRST_WAVE_PREVIEW_VERSION,
             preview_tex=preview["tex_path"],
             preview_pdf=preview["pdf_path"],
             preview_tex_sha256=preview["tex_sha256"],
@@ -303,6 +295,25 @@ def build_companion(
             preview_validation_path=preview["validation_path"],
             preview_validation_sha256=preview["validation_sha256"],
         )
+        if remaining:
+            remaining_results = _generate_first_round_lanes(
+                remaining,
+                options=options,
+                bundle=bundle,
+                evidence=evidence,
+                domain_context=domain_context,
+                glossary=glossary,
+                protected_names=protected_names,
+                checkpoint_dir=checkpoint_dir,
+                llm=llm,
+            )
+            translations = {**translations, **remaining_results["translation"]}
+            raw_annotations = {**raw_annotations, **remaining_results["annotation"]}
+
+        write_json(checkpoint_dir / "annotations.first-round.v1.json", {
+            "schema_version": "arc.companion.annotations-first-round.v1",
+            "annotations": raw_annotations,
+        })
         raw_annotations, evidence = _resolve_and_rerun_evidence_requests(
             expanded,
             raw_annotations,
@@ -461,6 +472,148 @@ def read_status(project_dir: Path) -> dict[str, Any]:
     if not path.is_file():
         return err("companion_state_not_found", f"No companion state found in {project_dir}")
     return ok(read_json(path))
+
+
+def _generate_first_round_lanes(
+    segments: list[dict[str, Any]],
+    *,
+    options: BuildOptions,
+    bundle: SourceBundle,
+    evidence: dict[str, Any],
+    domain_context: dict[str, Any] | None,
+    glossary: dict[str, Any],
+    protected_names: list[str],
+    checkpoint_dir: Path,
+    llm: Callable[..., dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Drain translation and annotation concurrently for one scheduled wave."""
+    if not segments:
+        return {"translation": {}, "annotation": {}}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        lane_futures = {
+            "translation": executor.submit(
+                _generate_translations,
+                segments,
+                options=options,
+                bundle=bundle,
+                glossary=glossary,
+                protected_names=protected_names,
+                checkpoint_dir=checkpoint_dir,
+                llm=llm,
+            ),
+            "annotation": executor.submit(
+                _generate_annotations,
+                segments,
+                options=options,
+                bundle=bundle,
+                evidence=evidence,
+                domain_context=domain_context,
+                glossary=glossary,
+                protected_names=protected_names,
+                checkpoint_dir=checkpoint_dir,
+                llm=llm,
+            ),
+        }
+        lane_results: dict[str, dict[str, dict[str, Any]]] = {}
+        lane_failures: dict[str, BaseException] = {}
+        for lane, future in lane_futures.items():
+            try:
+                lane_results[lane] = future.result()
+            except Exception as exc:
+                lane_failures[lane] = exc
+        if lane_failures:
+            raise CompanionGenerationError(lane_failures)
+    return lane_results
+
+
+def _first_wave_preview_document(
+    document: dict[str, Any], segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return a source-faithful prefix ending at the first wave's last block."""
+    if not segments:
+        raise ValueError("the first preview wave must contain at least one segment")
+    blocks = list(document.get("blocks") or [])
+    positions = {block_id(block): index for index, block in enumerate(blocks)}
+    wave_block_ids = [
+        str(value)
+        for segment in segments
+        for value in segment.get("block_ids") or []
+    ]
+    try:
+        last_index = max(positions[value] for value in wave_block_ids)
+    except (KeyError, ValueError) as exc:
+        raise ValueError("first preview wave does not map to source blocks") from exc
+    prefix_blocks = blocks[:last_index + 1]
+
+    block_lookup_keys = (
+        "entity_id", "source_id", "equation_id", "figure_id", "table_id", "id", "block_id",
+    )
+    entity_lookup_keys = (
+        "id", "block_id", "source_id", "entity_id", "equation_id", "figure_id", "table_id",
+    )
+
+    def matching_entities(items: list[dict[str, Any]], kinds: set[str]) -> list[dict[str, Any]]:
+        index: dict[str, int] = {}
+        for index_number, item in enumerate(items):
+            for key in entity_lookup_keys:
+                if item.get(key):
+                    index[str(item[key])] = index_number
+        selected: set[int] = set()
+        for block in prefix_blocks:
+            kind = str(block.get("kind") or block.get("type") or "").casefold()
+            if kind not in kinds:
+                continue
+            for key in block_lookup_keys:
+                value = block.get(key)
+                if value is not None and str(value) in index:
+                    selected.add(index[str(value)])
+                    break
+        return [item for index_number, item in enumerate(items) if index_number in selected]
+
+    equations = matching_entities(
+        list(document.get("equations") or []), {"equation", "math", "display_math"},
+    )
+    figures = matching_entities(
+        list(document.get("figures") or []), {"figure", "image"},
+    )
+    tables = matching_entities(list(document.get("tables") or []), {"table"})
+    asset_ids: set[str] = set()
+    for block in prefix_blocks:
+        values = block.get("asset_ids") or (
+            [block.get("asset_id")] if block.get("asset_id") else []
+        )
+        asset_ids.update(str(value) for value in values if value)
+    for figure in figures:
+        values = figure.get("asset_ids") or (
+            [figure.get("asset_id")] if figure.get("asset_id") else []
+        )
+        asset_ids.update(str(value) for value in values if value)
+
+    preview_document = dict(document)
+    preview_document["blocks"] = prefix_blocks
+    preview_document["equations"] = equations
+    preview_document["figures"] = figures
+    preview_document["tables"] = tables
+    preview_document["assets"] = [
+        item
+        for item in document.get("assets") or []
+        if str(item.get("asset_id") or item.get("id") or "") in asset_ids
+    ]
+    preview_document["bibliography"] = []
+    prefix_links: list[dict[str, str]] = []
+    for block in prefix_blocks:
+        soup = BeautifulSoup(str(block.get("html") or ""), "html.parser")
+        for anchor in soup.find_all("a"):
+            href = str(anchor.get("href") or "").strip()
+            if href:
+                prefix_links.append({
+                    "href": href,
+                    "target_id": href[1:] if href.startswith("#") else "",
+                    "text": " ".join(anchor.get_text(" ", strip=True).split()),
+                })
+    preview_document["links"] = prefix_links
+    preview_document["preview_scope"] = {"kind": "source_prefix"}
+    return preview_document
 
 
 def _publish_pdf_artifact(
@@ -1256,6 +1409,40 @@ def _completion_outputs_match(state: dict[str, Any]) -> bool:
         ("output_pdf", "output_pdf_sha256"),
         ("source_manifest_path", "source_manifest_sha256"),
         ("validation_path", "validation_sha256"),
+    )
+    for path_key, hash_key in checks:
+        value = state.get(path_key)
+        expected = str(state.get(hash_key) or "")
+        if not value or not expected:
+            return False
+        path = Path(str(value))
+        if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
+            return False
+    return True
+
+
+def _first_wave_preview_outputs_match(state: dict[str, Any], *, workers: int) -> bool:
+    if state.get("first_wave_preview_version") != FIRST_WAVE_PREVIEW_VERSION:
+        return False
+    try:
+        segment_count = int(state.get("segment_count"))
+        preview_segment_count = int(state.get("preview_segment_count"))
+    except (TypeError, ValueError):
+        return False
+    segment_ids = state.get("preview_segment_ids")
+    if (
+        segment_count < 1
+        or preview_segment_count != min(workers, segment_count)
+        or not isinstance(segment_ids, list)
+        or len(segment_ids) != preview_segment_count
+        or any(not str(value) for value in segment_ids)
+    ):
+        return False
+    checks = (
+        ("preview_tex", "preview_tex_sha256"),
+        ("preview_pdf", "preview_pdf_sha256"),
+        ("preview_source_manifest_path", "preview_source_manifest_sha256"),
+        ("preview_validation_path", "preview_validation_sha256"),
     )
     for path_key, hash_key in checks:
         value = state.get(path_key)

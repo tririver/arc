@@ -14,6 +14,7 @@ from arc_companion.pipeline import (
     _evidence,
     _fingerprint,
     _evidence_for_segment,
+    _first_wave_preview_document,
     _full_paper_context,
     _generation_document,
     _translation_input_block,
@@ -332,10 +333,32 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert resumed["ok"] and resumed["meta"]["resumed"] is True
     assert len(fake.calls) == call_count
 
+    state_path = tmp_path / "run" / "state.json"
+    stale_preview_state = json.loads(state_path.read_text(encoding="utf-8"))
+    stale_preview_state.pop("first_wave_preview_version")
+    state_path.write_text(json.dumps(stale_preview_state), encoding="utf-8")
+    regenerated_preview = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "run",
+            language_was_defaulted=True,
+            workers=12,
+            review_context_chars=1,
+        ),
+        source_loader=source_loader,
+        llm=fake,
+        compiler=compiler,
+        pdf_validator=lambda path: {},
+    )
+    assert regenerated_preview["ok"] and regenerated_preview["meta"]["resumed"] is False
+    assert regenerated_preview["data"]["first_wave_preview_version"]
+    assert len(fake.calls) == call_count
+
 
 def test_first_round_preview_is_published_before_evidence_resolution_and_review(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
+    fake.annotation_barrier = threading.Barrier(1)
     project = tmp_path / "preview-order"
     compiler_calls: list[tuple[Path, str]] = []
 
@@ -359,6 +382,12 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
 
     def compiler(tex_path: Path, pdf_path: Path) -> None:
         compiler_calls.append((tex_path, tex_path.read_text(encoding="utf-8")))
+        if len(compiler_calls) == 1:
+            labels = [str(call["call_label"]) for call in fake.calls]
+            assert "companion-translation-seg-0001" in labels
+            assert "companion-annotation-seg-0001" in labels
+            assert "companion-translation-seg-0002" not in labels
+            assert "companion-annotation-seg-0002" not in labels
         pdf_path.write_bytes(b"%PDF-1.7 fixture")
 
     class Controller:
@@ -376,7 +405,12 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
             )
 
     result = build_companion(
-        BuildOptions(paper_id=bundle.paper_id, project_dir=project, review_context_chars=1),
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=project,
+            review_context_chars=1,
+            workers=1,
+        ),
         source_loader=lambda *args, **kwargs: bundle,
         llm=llm,
         compiler=compiler,
@@ -387,9 +421,14 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
     assert result["ok"], result
     assert len(compiler_calls) == 2
     assert "解释 0001" in compiler_calls[0][1]
+    assert "解释 0002" not in compiler_calls[0][1]
+    assert r"\tag{7}" in compiler_calls[0][1]
+    assert "Figure 2: A plot" not in compiler_calls[0][1]
     assert "审校后的解释" not in compiler_calls[0][1]
     assert "审校后的解释" in compiler_calls[1][1]
     state = result["data"]
+    assert state["preview_segment_count"] == 1
+    assert state["preview_segment_ids"] == ["seg-0001"]
     for key in (
         "preview_tex", "preview_pdf", "preview_source_manifest_path", "preview_validation_path",
     ):
@@ -401,12 +440,82 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
         assert state[key]
 
 
+def test_first_wave_preview_preserves_rich_entities_and_exact_link_occurrences() -> None:
+    repeated_link = '<a href="https://example.test/paper">paper</a>'
+    document = {
+        "blocks": [
+            {
+                "block_id": "kept", "kind": "heading", "html": '<h2 id="kept">Kept</h2>',
+            },
+            {
+                "block_id": "eq-block", "source_id": "eq-source", "kind": "equation",
+                "html": f'<div>{repeated_link}<a href="#later">later</a></div>',
+            },
+            {
+                "block_id": "fig-block", "entity_id": "fig-entity", "kind": "figure",
+                "html": f"<figure>{repeated_link}</figure>",
+            },
+            {
+                "block_id": "tab-block", "source_id": "tab-source", "kind": "table",
+                "html": '<table><tr><td><a href="#kept">kept</a></td></tr></table>',
+            },
+            {
+                "block_id": "later", "source_id": "later-equation", "kind": "equation",
+                "html": f'<div>{repeated_link}<a href="#later">later</a></div>',
+            },
+        ],
+        "equations": [
+            {"id": "eq-source", "tex": ["x=1"]},
+            {"id": "later-equation", "tex": ["y=2"]},
+        ],
+        "figures": [{"id": "fig-entity", "asset_ids": ["asset-kept"]}],
+        "tables": [{"id": "tab-source", "rows": []}],
+        "assets": [
+            {"asset_id": "asset-kept", "cache_path": "/cache/kept"},
+            {"asset_id": "asset-later", "cache_path": "/cache/later"},
+        ],
+        "bibliography": [{"id": "ref-later", "label": "[1]"}],
+        "links": [
+            {"id": "link-1", "href": "https://example.test/paper", "target_id": "", "text": "paper"},
+            {"id": "link-2", "href": "https://example.test/paper", "target_id": "", "text": "paper"},
+            {"id": "link-3", "href": "#kept", "target_id": "kept", "text": "kept"},
+            {"id": "link-later-1", "href": "https://example.test/paper", "target_id": "", "text": "paper"},
+            {"id": "link-later-2", "href": "#later", "target_id": "later", "text": "later"},
+        ],
+    }
+    preview = _first_wave_preview_document(document, [{
+        "segment_id": "first",
+        "block_ids": ["kept", "eq-block", "fig-block", "tab-block"],
+    }])
+
+    assert [item["block_id"] for item in preview["blocks"]] == [
+        "kept", "eq-block", "fig-block", "tab-block",
+    ]
+    assert [item["id"] for item in preview["equations"]] == ["eq-source"]
+    assert [item["id"] for item in preview["figures"]] == ["fig-entity"]
+    assert [item["id"] for item in preview["tables"]] == ["tab-source"]
+    assert [item["asset_id"] for item in preview["assets"]] == ["asset-kept"]
+    assert preview["links"] == [
+        {"href": "https://example.test/paper", "target_id": "", "text": "paper"},
+        {"href": "#later", "target_id": "later", "text": "later"},
+        {"href": "https://example.test/paper", "target_id": "", "text": "paper"},
+        {"href": "#kept", "target_id": "kept", "text": "kept"},
+    ]
+    assert preview["bibliography"] == []
+    assert preview["preview_scope"] == {"kind": "source_prefix"}
+
+
 def test_first_round_preview_failure_stops_before_evidence_and_review(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
+    fake.annotation_barrier = threading.Barrier(1)
 
     result = build_companion(
-        BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "preview-failure"),
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "preview-failure",
+            workers=1,
+        ),
         source_loader=lambda *args, **kwargs: bundle,
         llm=fake,
         compiler=lambda *_: (_ for _ in ()).throw(RuntimeError("preview compile failed")),
@@ -416,6 +525,9 @@ def test_first_round_preview_failure_stops_before_evidence_and_review(tmp_path: 
     assert not result["ok"]
     assert "preview compile failed" in result["error"]["message"]
     assert not any("review" in str(call["call_label"]) for call in fake.calls)
+    assert not any(
+        str(call["call_label"]).endswith("seg-0002") for call in fake.calls
+    )
     assert json.loads(
         (tmp_path / "preview-failure" / "state.json").read_text(encoding="utf-8")
     )["status"] == "failed"

@@ -216,12 +216,13 @@ def test_companion_docs_describe_bounded_full_text_evidence_and_package_contents
     assert "related-paper full texts cached through existing `arc-paper` APIs" in manual
     assert "concurrent translations and 24 concurrent companion commentaries" in manual
     assert "first_round_preview.pdf" in manual
-    assert "before evidence resolution or\nreview starts" in manual
+    assert "first `min(workers, unit_count)`" in manual
+    assert "before any remaining unit is submitted" in manual
     assert "Table-of-contents blocks, acknowledgment sections, and\nreference-list headings" in manual
     assert "lanes drain all\n  submitted units before reporting their aggregated failures" in manual
     assert "targeted reference and citer full text cached through `arc-paper`" in readme
     assert "default is 24 concurrent translations plus 24 concurrent commentaries" in workflow
-    assert "preview before evidence resolution and review" in workflow
+    assert "preview before submitting any remaining unit" in workflow
     assert "source-only table-of-contents blocks" in workflow
     assert "fix the scheduler in `packages/arc-companion`" in workflow
 

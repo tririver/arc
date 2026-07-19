@@ -158,12 +158,14 @@ refinements, translations, and commentaries are cached independently; the
 final merged segmentation is cached only after exact coverage validation.
 Translation and commentary lanes finish every submitted unit before aggregating
 failures, preserving all successful checkpoints; a retry submits only missing
-or stale units. After both first-round lanes finish, the pipeline must render,
+or stale units. Submit exactly the first `min(workers, unit_count)` source-order
+units to both lanes as the first wave. Once both lanes finish that wave, the
+pipeline must immediately render the source prefix through its final block,
 source-fidelity check, compile, and PDF-validate the persistent first-round
-preview before evidence resolution and review. Inspect its `preview_pdf` path
-from build state when early visual QA is requested. Treat it as diagnostic and
-never as the final deliverable. Preview validation failure must stop the run at
-that boundary. If a traceback and checkpoint inventory show that an early
+preview before submitting any remaining unit, resolving evidence, or reviewing.
+Inspect its `preview_pdf` path from build state when early visual QA is
+requested. Treat it as diagnostic and never as the final deliverable. Preview
+validation failure must stop the run at that boundary. If a traceback and checkpoint inventory show that an early
 failure cancelled unrelated units, reproduce it with a minimal package test and
 fix the scheduler in `packages/arc-companion`, never only in the current run
 directory.
