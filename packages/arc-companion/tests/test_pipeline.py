@@ -306,7 +306,34 @@ def test_seg0007_slot_repair_then_synthesizes_source_owned_citation_brackets() -
     assert methods == {block["block_id"]: "synthesized"}
 
 
-def test_v3_medium_repair_supersedes_old_marker_once_and_persists_response(
+def test_seg0007_adjacent_math_marker_is_not_an_ambiguous_citation_bracket() -> None:
+    block = {
+        "block_id": "S1.p13.14", "type": "text", "text": "term f [7].",
+        "inline_runs": [
+            _inline_run("text", "term ", 1),
+            _inline_run("math", "f", 2, tex="f_{NL}"),
+            _inline_run("text", "[", 3),
+            _inline_run("citation", "7", 4),
+            _inline_run("text", "].", 5),
+        ],
+    }
+    math_token, citation_token = pipeline_module._opaque_inline_tokens(block)
+    repaired = {"blocks": [{
+        "block_id": block["block_id"],
+        "text": f"产生一个{math_token}{citation_token}项。",
+    }]}
+
+    normalized, methods = pipeline_module._normalize_translation_citation_delimiters_for_segment(
+        repaired, {block["block_id"]: block},
+    )
+
+    assert normalized["blocks"][0]["text"] == (
+        f"产生一个{math_token}[{citation_token}]项。"
+    )
+    assert methods == {block["block_id"]: "synthesized"}
+
+
+def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
     tmp_path: Path,
 ) -> None:
     block = {
@@ -335,12 +362,12 @@ def test_v3_medium_repair_supersedes_old_marker_once_and_persists_response(
 
     def repair_llm(prompt: str, **kwargs):
         calls.append(str(kwargs["call_label"]))
-        assert "start_offset" in json.dumps(kwargs["schema"])
-        assert "Never return, retype, translate, or edit residue text" in prompt
+        assert '"text"' in json.dumps(kwargs["schema"])
+        assert "minimally rewrite only MUTABLE CLAUSES" in prompt
         slot_ids = pipeline_module._translation_repair_slot_ids(block)
         return {"repairs": [{"block_id": "body", "slots": [
-            {"slot_id": slot_ids[0], "start_offset": 0, "end_offset": 2},
-            {"slot_id": slot_ids[1], "start_offset": 2, "end_offset": 3},
+            {"slot_id": slot_ids[0], "text": "译文"},
+            {"slot_id": slot_ids[1], "text": "。"},
         ]}]}
 
     repaired, provenance = pipeline_module._repair_translation_token_placement(
@@ -363,7 +390,7 @@ def test_v3_medium_repair_supersedes_old_marker_once_and_persists_response(
         checkpoint_dir, segment["segment_id"],
     )
     persisted = json.loads(persisted_path.read_text(encoding="utf-8"))
-    assert persisted["raw_response"]["repairs"][0]["slots"][0]["end_offset"] == 2
+    assert persisted["raw_response"]["repairs"][0]["slots"][0]["text"] == "译文"
     assert json.loads(old_marker.read_text(encoding="utf-8"))["schema_version"] == (
         "arc.companion.translation-token-attempt.v2"
     )
@@ -384,6 +411,136 @@ def test_v3_medium_repair_supersedes_old_marker_once_and_persists_response(
     )
     assert resumed == repaired
     assert resumed_provenance == provenance
+
+
+def test_v3_final_checkpoint_requires_v4_upgrade() -> None:
+    checkpoint = {
+        "generation_provenance": {"repairs": [{
+            "kind": "token-placement",
+            "prompt_version": "arc.companion.translation-retry-prompt.v3",
+        }]},
+        "translation": {"blocks": []},
+    }
+    assert pipeline_module._translation_checkpoint_requires_v4_upgrade(checkpoint)
+    checkpoint["generation_provenance"]["repairs"][0]["prompt_version"] = (
+        pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION
+    )
+    assert not pipeline_module._translation_checkpoint_requires_v4_upgrade(checkpoint)
+
+
+def test_v4_repairs_seg0007_and_seg0016_semantic_roles_in_mutable_clauses() -> None:
+    seg7 = {
+        "block_id": "S1.p13.14", "type": "text", "text": "contributes O to f [7].",
+        "inline_runs": [
+            _inline_run("text", "contributes ", 1),
+            _inline_run("math", "O", 2, tex="{\\cal O}(\\epsilon^2)"),
+            _inline_run("text", " to ", 3),
+            _inline_run("math", "f", 4, tex="f_{NL}"),
+            _inline_run("text", " [", 5),
+            _inline_run("citation", "7", 6),
+            _inline_run("text", "].", 7),
+        ],
+    }
+    o_token, f_token, citation = pipeline_module._opaque_inline_tokens(seg7)
+    prior7 = {"blocks": [{
+        "block_id": seg7["block_id"],
+        "text": f"这会对{o_token}产生一个{f_token}{citation}项。",
+    }]}
+    ids7 = pipeline_module._translation_repair_slot_ids(seg7)
+    repaired7 = pipeline_module._apply_translation_slot_repairs(
+        prior7, [seg7], {"repairs": [{"block_id": seg7["block_id"], "slots": [
+            {"slot_id": ids7[0], "text": "这会产生一个"},
+            {"slot_id": ids7[1], "text": "项，并贡献给"},
+            {"slot_id": ids7[2], "text": ""},
+            {"slot_id": ids7[3], "text": "。"},
+        ]}]}, protected_names=[], allow_clause_rewrite=True,
+    )
+    normalized7, _ = pipeline_module._normalize_translation_citation_delimiters_for_segment(
+        repaired7, {seg7["block_id"]: seg7},
+    )
+    assert normalized7["blocks"][0]["text"] == (
+        f"这会产生一个{o_token}项，并贡献给{f_token}[{citation}]。"
+    )
+
+    seg16 = {
+        "block_id": "S2.SS1.p9.18", "type": "text", "text": "replace p with q using r.",
+        "inline_runs": [
+            _inline_run("text", "replace ", 1), _inline_run("math", "p", 2, tex="p"),
+            _inline_run("text", " with ", 3), _inline_run("math", "q", 4, tex="q"),
+            _inline_run("text", " using ", 5), _inline_run("math", "r", 6, tex="r"),
+            _inline_run("text", ".", 7),
+        ],
+    }
+    p_token, q_token, relation = pipeline_module._opaque_inline_tokens(seg16)
+    prior16 = {"blocks": [{
+        "block_id": seg16["block_id"],
+        "text": f"利用关系{relation}将{p_token}替换{q_token}为。本段保持不变。",
+    }]}
+    ids16 = pipeline_module._translation_repair_slot_ids(seg16)
+    repaired16 = pipeline_module._apply_translation_slot_repairs(
+        prior16, [seg16], {"repairs": [{"block_id": seg16["block_id"], "slots": [
+            {"slot_id": ids16[0], "text": "把"},
+            {"slot_id": ids16[1], "text": "替换为"},
+            {"slot_id": ids16[2], "text": "，所用关系为"},
+            {"slot_id": ids16[3], "text": "。本段保持不变。"},
+        ]}]}, protected_names=[], allow_clause_rewrite=True,
+    )
+    assert repaired16["blocks"][0]["text"] == (
+        f"把{p_token}替换为{q_token}，所用关系为{relation}。本段保持不变。"
+    )
+
+
+def test_v4_rejects_changes_outside_token_bearing_clause() -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x. Stable sentence.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1), _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ". Stable sentence.", 3),
+        ],
+    }
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    prior = {"blocks": [{"block_id": "body", "text": f"数值{token}。稳定句。"}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    with pytest.raises(RuntimeError, match="outside mutable clauses"):
+        pipeline_module._apply_translation_slot_repairs(
+            prior, [block], {"repairs": [{"block_id": "body", "slots": [
+                {"slot_id": slot_ids[0], "text": "值为"},
+                {"slot_id": slot_ids[1], "text": "。稳定句被改。"},
+            ]}]}, protected_names=[], allow_clause_rewrite=True,
+        )
+
+
+def test_v4_keeps_unaffected_token_bearing_clause_byte_exact() -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "A x. B y.",
+        "inline_runs": [
+            _inline_run("text", "A ", 1), _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ". B ", 3), _inline_run("math", "y", 4, tex="y"),
+            _inline_run("text", ".", 5),
+        ],
+    }
+    token1, token2 = pipeline_module._opaque_inline_tokens(block)
+    primary = {"blocks": [{"block_id": "body", "text": f"稳定{token1}句。第二句缺失。"}]}
+    v3 = {"blocks": [{"block_id": "body", "text": f"稳定{token1}句。第二{token2}句需修。"}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    with pytest.raises(RuntimeError, match="outside mutable clauses"):
+        pipeline_module._apply_translation_slot_repairs(
+            v3, [block], {"repairs": [{"block_id": "body", "slots": [
+                {"slot_id": slot_ids[0], "text": "稳定内容被改"},
+                {"slot_id": slot_ids[1], "text": "句。第二"},
+                {"slot_id": slot_ids[2], "text": "句已修。"},
+            ]}]}, protected_names=[], allow_clause_rewrite=True,
+            primary_translation=primary,
+        )
+    with pytest.raises(RuntimeError, match="outside mutable clauses"):
+        pipeline_module._apply_translation_slot_repairs(
+            v3, [block], {"repairs": [{"block_id": "body", "slots": [
+                {"slot_id": slot_ids[0], "text": "稳"},
+                {"slot_id": slot_ids[1], "text": "定句。第二"},
+                {"slot_id": slot_ids[2], "text": "句需修。"},
+            ]}]}, protected_names=[], allow_clause_rewrite=True,
+            primary_translation=primary,
+        )
 
 
 def test_checkpoint_citation_delimiter_repair_revalidates_and_records_provenance(

@@ -1145,6 +1145,46 @@ def _matching_translation_token_repair_draft(
     return None
 
 
+def _legacy_v3_translation_candidate(
+    checkpoint_dir: Path, segment_id: str, input_sha256: str,
+) -> dict[str, Any] | None:
+    draft_path = _translation_token_repair_draft_path(checkpoint_dir, segment_id)
+    draft = read_json(draft_path) if draft_path.is_file() else None
+    if (
+        isinstance(draft, dict)
+        and draft.get("prompt_version") == "arc.companion.translation-retry-prompt.v3"
+        and draft.get("segment_id") == segment_id
+        and draft.get("input_sha256") == input_sha256
+        and isinstance(draft.get("translation"), dict)
+    ):
+        return draft["translation"]
+    checkpoint_path = (
+        checkpoint_dir / "translations" / f"{_segment_checkpoint_name(segment_id)}.json"
+    )
+    checkpoint = read_json(checkpoint_path) if checkpoint_path.is_file() else None
+    if not isinstance(checkpoint, dict) or checkpoint.get("input_sha256") != input_sha256:
+        return None
+    repairs = (checkpoint.get("generation_provenance") or {}).get("repairs") or []
+    if any(
+        isinstance(item, dict)
+        and item.get("prompt_version") == "arc.companion.translation-retry-prompt.v3"
+        and item.get("kind") == "token-placement"
+        for item in repairs
+    ) and isinstance(checkpoint.get("translation"), dict):
+        return checkpoint["translation"]
+    return None
+
+
+def _translation_checkpoint_requires_v4_upgrade(checkpoint: dict[str, Any]) -> bool:
+    repairs = (checkpoint.get("generation_provenance") or {}).get("repairs") or []
+    return any(
+        isinstance(item, dict)
+        and item.get("prompt_version") == "arc.companion.translation-retry-prompt.v3"
+        and item.get("kind") == "token-placement"
+        for item in repairs
+    )
+
+
 def _translation_primary_draft_payload(
     segment: dict[str, Any],
     translation: dict[str, Any],
@@ -1229,7 +1269,14 @@ def _repair_translation_token_placement(
         )
     token_errors = _translation_opaque_token_errors(segment, translation, blocks_by_id)
     source_blocks = [blocks_by_id[item.block_id] for item in token_errors]
+    legacy_candidate = _legacy_v3_translation_candidate(
+        checkpoint_dir, segment_id, input_sha256,
+    )
+    repair_input = legacy_candidate or translation
     previous_by_id = {
+        str(item.get("block_id") or ""): item for item in repair_input["blocks"]
+    }
+    primary_by_id = {
         str(item.get("block_id") or ""): item for item in translation["blocks"]
     }
     repair_contexts = [
@@ -1237,6 +1284,10 @@ def _repair_translation_token_placement(
             source_block,
             str(previous_by_id[block_id(source_block)].get("text") or ""),
             protected_names=protected_names,
+            primary_text=(
+                str(primary_by_id[block_id(source_block)].get("text") or "")
+                if legacy_candidate is not None else None
+            ),
         )
         for source_block in source_blocks
     ]
@@ -1268,10 +1319,12 @@ def _repair_translation_token_placement(
         allow_internet=False,
     )
     repaired = _apply_translation_slot_repairs(
-        translation,
+        repair_input,
         source_blocks,
         value,
         protected_names=protected_names,
+        allow_clause_rewrite=legacy_candidate is not None,
+        primary_translation=translation if legacy_candidate is not None else None,
     )
     _validate_translation(segment, repaired, blocks_by_id, protected_names)
     provenance = {
@@ -1335,6 +1388,9 @@ def _generate_translations(
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("translation"), dict)
             ):
+                if _translation_checkpoint_requires_v4_upgrade(checkpoint):
+                    pending.append(segment)
+                    continue
                 checkpoint = _repair_translation_checkpoint_citation_delimiters(
                     path, segment, by_id, protected_names=protected_names,
                 )
@@ -2162,10 +2218,17 @@ def _translation_slot_repair_context(
     previous_text: str,
     *,
     protected_names: list[str],
+    primary_text: str | None = None,
 ) -> dict[str, Any]:
     """Build an inert placement-only context without asking for retranslation."""
     expected_tokens = _opaque_inline_tokens(source_block)
     residue = _translation_natural_residue(previous_text)
+    affected_tokens = _translation_repair_affected_tokens(
+        source_block, primary_text, previous_text,
+    ) if primary_text is not None else set(expected_tokens)
+    regions, immutable_fragments = _translation_repair_regions(
+        previous_text, affected_tokens=affected_tokens,
+    )
     source_runs: list[dict[str, Any]] = []
     for index, run in enumerate(source_block.get("inline_runs") or [], start=1):
         if not isinstance(run, dict):
@@ -2188,6 +2251,12 @@ def _translation_slot_repair_context(
             {"offset": index, "character": character}
             for index, character in enumerate(residue)
         ],
+        "mutable_clause_regions": [item for item in regions if item["mutable"]],
+        "immutable_fragments": immutable_fragments,
+        "affected_token_ordinals": [
+            index for index, token in enumerate(expected_tokens, start=1)
+            if token in affected_tokens
+        ],
         "expected_slot_count": len(expected_tokens) + 1,
         "slot_ids": _translation_repair_slot_ids(source_block),
         "missing_protected_names": _minimal_missing_name_insertions(
@@ -2195,6 +2264,90 @@ def _translation_slot_repair_context(
         ),
         "source_run_sequence": source_runs,
     }
+
+
+def _translation_repair_regions(
+    previous_text: str,
+    *,
+    affected_tokens: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Split a candidate into clause-sized mutable and byte-stable regions."""
+    token_by_sentinel: dict[str, str] = {}
+    def replace_token(match: re.Match[str]) -> str:
+        sentinel = f"\ue000{len(token_by_sentinel)}\ue001"
+        token_by_sentinel[sentinel] = match.group(0)
+        return sentinel
+    masked = _OPAQUE_INLINE_CANDIDATE_PATTERN.sub(replace_token, previous_text)
+    chunks = [
+        value for value in re.split(r"(?<=[。！？；;.!?：:，,])", masked)
+        if value
+    ]
+    regions: list[dict[str, Any]] = []
+    immutable: list[str] = []
+    for index, chunk in enumerate(chunks):
+        tokens = [token for sentinel, token in token_by_sentinel.items() if sentinel in chunk]
+        residue = chunk
+        interleaved = chunk
+        for sentinel, token in token_by_sentinel.items():
+            residue = residue.replace(sentinel, "")
+            interleaved = interleaved.replace(sentinel, token)
+        mutable = bool(tokens) if affected_tokens is None else any(
+            token in affected_tokens for token in tokens
+        )
+        regions.append({
+            "region_id": f"clause-{index + 1:04d}",
+            "mutable": mutable,
+            "prior_residue": residue,
+            "prior_interleaved": interleaved,
+        })
+        if not mutable and interleaved:
+            immutable.append(interleaved)
+    return regions, immutable
+
+
+def _translation_repair_affected_tokens(
+    source_block: dict[str, Any], primary_text: str, v3_text: str,
+) -> set[str]:
+    """Identify missing, reordered, or v3-moved tokens that make clauses mutable."""
+    expected = _opaque_inline_tokens(source_block)
+    expected_index = {token: index for index, token in enumerate(expected)}
+    primary_tokens = [
+        match.group(0) for match in _OPAQUE_INLINE_CANDIDATE_PATTERN.finditer(primary_text)
+        if match.group(0) in expected_index
+    ]
+    actual_indices = [expected_index[token] for token in primary_tokens]
+    lengths = [1] * len(actual_indices)
+    predecessors = [-1] * len(actual_indices)
+    for index in range(len(actual_indices)):
+        for prior in range(index):
+            if actual_indices[prior] < actual_indices[index] and (
+                lengths[prior] + 1 > lengths[index]
+            ):
+                lengths[index] = lengths[prior] + 1
+                predecessors[index] = prior
+    stable: set[str] = set()
+    if lengths:
+        cursor = max(range(len(lengths)), key=lengths.__getitem__)
+        while cursor >= 0:
+            stable.add(primary_tokens[cursor])
+            cursor = predecessors[cursor]
+    primary_offsets = _translation_token_residue_offsets(primary_text)
+    v3_offsets = _translation_token_residue_offsets(v3_text)
+    return {
+        token for token in expected
+        if token not in stable or primary_offsets.get(token) != v3_offsets.get(token)
+    }
+
+
+def _translation_token_residue_offsets(text: str) -> dict[str, int]:
+    offsets: dict[str, int] = {}
+    cursor = 0
+    residue_offset = 0
+    for match in _OPAQUE_INLINE_CANDIDATE_PATTERN.finditer(text):
+        residue_offset += len(text[cursor:match.start()])
+        offsets.setdefault(match.group(0), residue_offset)
+        cursor = match.end()
+    return offsets
 
 
 def _translation_repair_slot_ids(source_block: dict[str, Any]) -> list[str]:
@@ -2210,6 +2363,8 @@ def _apply_translation_slot_repairs(
     repair: dict[str, Any],
     *,
     protected_names: list[str],
+    allow_clause_rewrite: bool = False,
+    primary_translation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Patch every token-mismatched block in one bounded repair call."""
     raw_repairs = repair.get("repairs") if isinstance(repair, dict) else None
@@ -2222,9 +2377,19 @@ def _apply_translation_slot_repairs(
     if actual_ids != expected_ids or len(actual_ids) != len(raw_repairs):
         raise RuntimeError("translation slot repair changed failing block coverage or order")
     result = previous_translation
+    primary_by_id = {
+        str(item.get("block_id") or ""): item
+        for item in (primary_translation or {}).get("blocks") or []
+        if isinstance(item, dict)
+    }
     for source_block, block_repair in zip(source_blocks, raw_repairs):
         result = _apply_translation_slot_repair_block(
             result, source_block, block_repair, protected_names=protected_names,
+            allow_clause_rewrite=allow_clause_rewrite,
+            primary_text=(
+                str(primary_by_id.get(block_id(source_block), {}).get("text") or "")
+                if primary_translation is not None else None
+            ),
         )
     return result
 
@@ -2235,6 +2400,8 @@ def _apply_translation_slot_repair_block(
     repair: dict[str, Any],
     *,
     protected_names: list[str],
+    allow_clause_rewrite: bool = False,
+    primary_text: str | None = None,
 ) -> dict[str, Any]:
     """Patch one failed block while preserving prior natural language and all other blocks."""
     block_id_value = block_id(source_block)
@@ -2294,7 +2461,7 @@ def _apply_translation_slot_repair_block(
                 raise RuntimeError(
                     "translation slot repair changed prior natural language beyond name insertion"
                 )
-        elif joined != residue:
+        elif not allow_clause_rewrite and joined != residue:
             raise RuntimeError("translation slot repair retranslated or changed prior natural language")
 
     expected_tokens = _opaque_inline_tokens(source_block)
@@ -2303,6 +2470,13 @@ def _apply_translation_slot_repair_block(
         for index, slot in enumerate(slots)
         for part in ([slot, expected_tokens[index]] if index < len(expected_tokens) else [slot])
     )
+    if allow_clause_rewrite:
+        affected_tokens = _translation_repair_affected_tokens(
+            source_block, primary_text, previous_text,
+        ) if primary_text is not None else None
+        _validate_translation_repair_immutable_fragments(
+            previous_text, assembled, affected_tokens=affected_tokens,
+        )
     if all("start_offset" in item for item in raw_slots) and (
         _translation_natural_residue(assembled) != residue
     ):
@@ -2310,6 +2484,25 @@ def _apply_translation_slot_repair_block(
     repaired_blocks = list(previous_blocks)
     repaired_blocks[failed_index] = {**previous_blocks[failed_index], "text": assembled}
     return {**previous_translation, "blocks": repaired_blocks}
+
+
+def _validate_translation_repair_immutable_fragments(
+    previous_text: str, repaired_text: str,
+    *,
+    affected_tokens: set[str] | None = None,
+) -> None:
+    """Require every clause without an opaque token to survive byte-exact and ordered."""
+    _, immutable = _translation_repair_regions(
+        previous_text, affected_tokens=affected_tokens,
+    )
+    cursor = 0
+    for fragment in immutable:
+        position = repaired_text.find(fragment, cursor)
+        if position < 0:
+            raise RuntimeError(
+                "translation structural repair changed text outside mutable clauses"
+            )
+        cursor = position + len(fragment)
 
 
 def _normalize_translation_citation_delimiters(
@@ -2358,8 +2551,23 @@ def _normalize_translation_citation_delimiters(
         suffix_pair = normalized[end:end + 2] == "[]"
         prefix_single = index > 0 and normalized[index - 1] == "["
         suffix_single = end < len(normalized) and normalized[end] == "]"
-        bad_prefix = index > 0 and normalized[index - 1] == "]" and not prefix_pair
-        bad_suffix = end < len(normalized) and normalized[end] == "[" and not suffix_pair
+        opaque_matches = list(_OPAQUE_INLINE_PATTERN.finditer(normalized))
+        adjacent_previous_token = any(
+            match.end() == index and match.group(0) != token
+            for match in opaque_matches
+        )
+        adjacent_next_token = any(
+            match.start() == end and match.group(0) != token
+            for match in opaque_matches
+        )
+        bad_prefix = (
+            index > 0 and normalized[index - 1] == "]" and not prefix_pair
+            and not adjacent_previous_token
+        )
+        bad_suffix = (
+            end < len(normalized) and normalized[end] == "[" and not suffix_pair
+            and not adjacent_next_token
+        )
         if bad_prefix or bad_suffix or (prefix_pair and suffix_pair):
             raise RuntimeError(
                 "citation delimiter normalization found ambiguous adjacent brackets"
