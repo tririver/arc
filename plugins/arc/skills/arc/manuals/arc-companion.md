@@ -132,6 +132,14 @@ units. A source-fidelity, LaTeX, or PDF-validation failure stops the run at this
 boundary so layout and source-structure problems are found before further LLM
 work.
 
+For an explicit visual-QA pause, add `--stop-after-preview`. A successful build
+then returns with status `preview_ready` immediately after those validations,
+without submitting remaining units, resolving evidence requests, or starting
+review. Inspect the recorded `preview_pdf`, correct ARC if the diagnostic PDF
+does not meet the contract, then rerun the same command without
+`--stop-after-preview`; valid checkpoints are reused and generation continues
+from this boundary.
+
 ## Generation Access and Portability
 
 Each per-unit translation and commentary call receives bounded `FULL-PAPER
@@ -170,10 +178,15 @@ text. When explanation is useful, choose the most relevant emphasis:
   excluding differences that reduce to convention, notation, normalization,
   or an equivalent formulation; or
 - intermediate mathematics omitted from a derivation that is not evident to
-  the intended reader.
+  the intended reader; or
+- a materially useful current understanding or development that directly
+  changes how the passage should be understood and is supported by registered,
+  verifiable evidence.
 
 These are priorities, not mandatory fields. Do not force all of them into one
-segment, repeat the source, or invent a distinction solely to create commentary.
+segment, repeat the source, chase novelty, present an ordinary reformulation as
+progress, or invent a distinction solely to create commentary. Never present a
+purported update from model memory or from an unregistered search result.
 
 MCP and internet access are optional. A host without either capability uses the
 same portable prompt with the current segment, frozen glossary, bounded full-

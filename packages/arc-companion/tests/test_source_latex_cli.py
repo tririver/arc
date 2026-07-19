@@ -332,6 +332,24 @@ def test_cli_disables_mcp_independently_from_internet(tmp_path: Path, monkeypatc
     assert captured["options"].allow_internet is True
 
 
+def test_cli_passes_stop_after_preview(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_build(options):
+        captured["options"] = options
+        return {"ok": True, "data": {"status": "preview_ready"}, "meta": {}}
+
+    monkeypatch.setattr(cli, "build_companion", fake_build)
+    assert cli.main([
+        "build",
+        "local:david-tong-qft-notes",
+        "--project-dir",
+        str(tmp_path),
+        "--stop-after-preview",
+    ]) == 0
+    assert captured["options"].stop_after_preview is True
+
+
 def test_cli_prints_structured_evidence_warnings(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         cli,
@@ -371,11 +389,15 @@ def test_companion_docs_describe_bounded_full_text_evidence_and_package_contents
     assert "first_round_preview.pdf" in manual
     assert "first `min(workers, unit_count)`" in manual
     assert "before any remaining unit is submitted" in manual
+    assert "`--stop-after-preview`" in manual
+    assert "materially useful current understanding or development" in manual
     assert "Table-of-contents blocks, acknowledgment sections, and\nreference-list headings" in manual
     assert "lanes drain all\n  submitted units before reporting their aggregated failures" in manual
     assert "targeted reference and citer full text cached through `arc-paper`" in readme
     assert "default is 24 concurrent translations plus 24 concurrent commentaries" in workflow
     assert "preview before submitting any remaining unit" in workflow
+    assert "`--stop-after-preview`" in workflow
+    assert "registered,\nverifiable evidence supports it" in workflow
     assert "source-only table-of-contents blocks" in workflow
     assert "fix the scheduler in `packages/arc-companion`" in workflow
 

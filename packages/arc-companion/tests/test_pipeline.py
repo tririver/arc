@@ -3184,6 +3184,75 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
         assert state[key]
 
 
+def test_stop_after_preview_returns_before_remaining_work_and_resumes(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    fake = FakeLLM()
+    fake.annotation_barrier = threading.Barrier(1)
+    project = tmp_path / "preview-gate"
+    compiler_calls: list[Path] = []
+    validation_calls: list[Path] = []
+
+    def compiler(tex_path: Path, pdf_path: Path) -> None:
+        compiler_calls.append(tex_path)
+        pdf_path.write_bytes(b"%PDF-1.7 fixture")
+
+    def pdf_validator(path: Path) -> dict[str, object]:
+        validation_calls.append(path)
+        return {"bytes": path.stat().st_size}
+
+    class UnexpectedEvidenceController:
+        def resolve(self, *_args, **_kwargs):
+            raise AssertionError("preview gate must stop before evidence resolution")
+
+    gated = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=project,
+            workers=1,
+            review_context_chars=1,
+            stop_after_preview=True,
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=fake,
+        compiler=compiler,
+        pdf_validator=pdf_validator,
+        evidence_controller=UnexpectedEvidenceController(),
+    )
+
+    assert gated["ok"], gated
+    assert gated["data"]["status"] == "preview_ready"
+    assert gated["data"]["preview_segment_ids"] == ["seg-0001"]
+    assert Path(gated["data"]["preview_pdf"]).is_file()
+    assert len(compiler_calls) == len(validation_calls) == 1
+    first_labels = [str(call["call_label"]) for call in fake.calls]
+    assert "companion-translation-seg-0001" in first_labels
+    assert "companion-annotation-seg-0001" in first_labels
+    assert not any(label.endswith("seg-0002") for label in first_labels)
+    assert not any("review" in label for label in first_labels)
+
+    resumed = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=project,
+            workers=1,
+            review_context_chars=1,
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=fake,
+        compiler=compiler,
+        pdf_validator=pdf_validator,
+    )
+
+    assert resumed["ok"], resumed
+    assert resumed["data"]["status"] == "complete"
+    assert Path(resumed["data"]["output_pdf"]).is_file()
+    all_labels = [str(call["call_label"]) for call in fake.calls]
+    assert all_labels.count("companion-translation-seg-0001") == 1
+    assert all_labels.count("companion-annotation-seg-0001") == 1
+    assert "companion-annotation-seg-0002" in all_labels
+    assert any("review" in label for label in all_labels)
+
+
 def test_first_wave_preview_preserves_rich_entities_and_exact_link_occurrences() -> None:
     repeated_link = '<a href="https://example.test/paper">paper</a>'
     document = {

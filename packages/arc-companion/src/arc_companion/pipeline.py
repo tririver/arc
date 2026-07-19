@@ -68,7 +68,7 @@ from .segmentation import SegmentationError, segment_document, validate_exact_co
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
 
 
-WORKFLOW_VERSION = "arc.companion.workflow.v7"
+WORKFLOW_VERSION = "arc.companion.workflow.v8"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -198,6 +198,7 @@ class BuildOptions:
     allow_mcp: bool = True
     allow_internet: bool = True
     context_paper_ids: tuple[str, ...] = ()
+    stop_after_preview: bool = False
 
     def __post_init__(self) -> None:
         if not self.paper_id.strip():
@@ -378,7 +379,7 @@ def build_companion(
             compiler=compiler,
             pdf_validator=pdf_validator,
         )
-        _state(
+        preview_state = _state(
             state_path,
             status="preview_ready",
             paper_id=bundle.paper_id,
@@ -397,6 +398,13 @@ def build_companion(
             preview_validation_path=preview["validation_path"],
             preview_validation_sha256=preview["validation_sha256"],
         )
+        if options.stop_after_preview:
+            return ok(
+                preview_state,
+                resumed=False,
+                notice=notice,
+                diagnostics=list(diagnostics),
+            )
         if remaining:
             remaining_results = _generate_first_round_lanes(
                 remaining,

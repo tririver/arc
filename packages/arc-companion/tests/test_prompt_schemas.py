@@ -120,5 +120,10 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     assert "alternative presentation" in generation
     assert "equivalent formulation as an inconsistency" in generation
     assert "intermediate mathematics" in generation
+    assert "materially useful current understanding or development" in generation
+    assert "registered, verifiable evidence" in generation
+    assert "Do not chase novelty" in generation
     assert "empty explanation/commentary is valid" in reviews
     assert "notation, convention, normalization" in reviews
+    assert "materially useful current understanding or developments" in reviews
+    assert "registered, verifiable evidence" in reviews

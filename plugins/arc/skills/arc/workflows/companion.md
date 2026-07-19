@@ -115,7 +115,11 @@ supplied references; cautiously flag deeper incompatibilities between sources
 while treating mere convention, notation, normalization, and equivalent
 formulations as differences rather than inconsistencies; or fill in non-evident
 intermediate mathematics. Do not repeat or paraphrase an already clear source
-passage. Keep stable evidence identifiers only in structured evidence fields
+passage. Optionally mention a current understanding or development only when it
+materially changes how this exact passage should be understood and registered,
+verifiable evidence supports it. Do not chase novelty, call an ordinary
+reformulation progress, or rely on model memory for an update. Keep stable
+evidence identifiers only in structured evidence fields
 and manifests; never
 show controller IDs or hashes to the reader. Reader-facing citations use the
 source title plus a section or other human-readable location when available,
@@ -219,7 +223,12 @@ source-fidelity check, compile, and PDF-validate the persistent first-round
 preview before submitting any remaining unit, resolving evidence, or reviewing.
 Inspect its `preview_pdf` path from build state when early visual QA is
 requested. Treat it as diagnostic and never as the final deliverable. Preview
-validation failure must stop the run at that boundary. If a traceback and checkpoint inventory show that an early
+validation failure must stop the run at that boundary. When explicit visual QA
+is required before continuing, add `--stop-after-preview`; the successful
+command returns with status `preview_ready` without submitting remaining units,
+resolving evidence, or reviewing. Inspect the PDF and, after any ARC correction,
+rerun the same command without that flag to resume from valid checkpoints. If a
+traceback and checkpoint inventory show that an early
 failure cancelled unrelated units, reproduce it with a minimal package test and
 fix the scheduler in `packages/arc-companion`, never only in the current run
 directory.

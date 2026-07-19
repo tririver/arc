@@ -64,6 +64,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     build.add_argument("--force", action="store_true")
+    build.add_argument(
+        "--stop-after-preview",
+        action="store_true",
+        help=(
+            "return successfully after the first wave's preview passes source, "
+            "compile, and PDF validation; rerun without this flag to resume"
+        ),
+    )
     build.add_argument("--json", action="store_true")
 
     status = sub.add_parser("status", help="Show checkpoint/build status")
@@ -106,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
                 allow_mcp=not args.no_mcp,
                 allow_internet=not args.no_internet,
                 context_paper_ids=tuple(args.context_paper_id),
+                stop_after_preview=args.stop_after_preview,
             )
         except ValueError as exc:
             result = {"ok": False, "data": None, "error": {"code": "invalid_options", "message": str(exc)}, "errors": []}
