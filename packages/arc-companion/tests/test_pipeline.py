@@ -3356,8 +3356,8 @@ def test_long_generic_full_text_does_not_become_direct_related_work() -> None:
     }}
     generic_text = " ".join(
         "This paper analyzes a theoretical model with fields parameters perturbations "
-        "observational results correlations and measurements in a general framework."
-        for _ in range(80)
+        f"observational results correlations and measurements in topic{index}."
+        for index in range(80)
     )
     paper = _related_work_record(
         "prior-famous", relation="prior", title="Broad overview and constraints",
@@ -3399,6 +3399,30 @@ def test_metadata_catalog_has_item_and_character_budgets() -> None:
     catalog = selected["reference_catalog"]
     assert len(catalog) <= 40
     assert len(json.dumps(catalog, ensure_ascii=False, separators=(",", ":"))) <= 12_000
+
+
+def test_terms_scattered_across_long_full_text_do_not_create_direct_relevance() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {
+        "block_id": "source",
+        "text": "Spectator conversion bispectrum transfer vertex coupling.",
+    }}
+    paper = _related_work_record(
+        "prior-scattered", relation="prior", title="A broad review",
+        abstract="An unrelated overview.", citation_count=1, paper_id="arXiv:0001.0042",
+    )
+    paper["evidence_level"] = "full_text"
+    paper["blocks"] = [
+        {"block_id": "p1", "text": "Spectator telescope calibration and noise."},
+        {"block_id": "p2", "text": "Conversion of detector units in a catalog."},
+        {"block_id": "p3", "text": "Bispectrum appears in an unrelated appendix."},
+        {"block_id": "p4", "text": "Transfer scheduling for archived observations."},
+        {"block_id": "p5", "text": "Vertex indexing in a database table."},
+    ]
+
+    selected = _evidence_for_segment(segment, by_id, {"related_papers": [paper]})
+
+    assert selected["papers"] == []
 
 
 def test_direct_relevance_beats_citations_and_domain_membership() -> None:
@@ -3463,11 +3487,15 @@ def test_selected_candidate_can_be_bound_in_production_claim_schema() -> None:
 def test_exact_bibliography_target_is_first_and_each_relation_is_capped_at_three() -> None:
     citation = _inline_run("citation", "[9]", 2)
     citation["target_id"] = "bib.bib9"
+    citation["href"] = "#bib.bib9"
+    internal = _inline_run("citation", "Figure 1", 3)
+    internal["target_id"] = "S1.F1"
+    internal["href"] = "#S1.F1"
     segment = {"segment_id": "seg", "block_ids": ["source"]}
     by_id = {"source": {
         "block_id": "source",
         "text": "Curvaton decay transfer isocurvature.",
-        "inline_runs": [_inline_run("text", "See ", 1), citation],
+        "inline_runs": [_inline_run("text", "See ", 1), citation, internal],
     }}
     papers = [
         _related_work_record(

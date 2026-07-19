@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .evidence import arc_cache_descriptor, text_sha256, validate_evidence_record
+from .evidence import arc_cache_descriptor, validate_evidence_record
 
 
 class SourceError(RuntimeError):
@@ -79,9 +78,6 @@ def load_source_bundle(
     related_evidence, related_diagnostics = _load_related_evidence(
         references,
         citers,
-        parse=parse,
-        refresh=refresh,
-        recache=recache,
     )
     diagnostics.extend(related_diagnostics)
     return SourceBundle(
@@ -99,117 +95,24 @@ def load_source_bundle(
 def _load_related_evidence(
     references: list[dict[str, Any]],
     citers: list[dict[str, Any]],
-    *,
-    parse: Callable[..., dict[str, Any]],
-    refresh: bool,
-    recache: bool,
-    full_text_limit_per_kind: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Cache broad metadata evidence plus a bounded full-text working set.
+    """Register verified abstracts without parsing or downloading related papers.
 
-    Source order is intentionally preserved.  Citation count is useful metadata,
-    but is not a relevance filter and must not decide which papers are visible to
-    the commentary agents.
+    The high-agent catalogs retain lightweight metadata for discovery.  Missing
+    local evidence is resolved later through the bounded evidence-request loop;
+    ordinary companion startup must not parse a citation-count shortlist.
     """
-    selected: list[tuple[str, int, dict[str, Any], str]] = []
-    output: dict[str, dict[str, Any]] = {}
+    output: list[dict[str, Any]] = []
     for kind, items in (("prior", references), ("later", citers)):
         for rank, item in enumerate(items, 1):
             paper_id = _arxiv_identifier(item)
-            if not paper_id:
-                continue
-            if rank <= full_text_limit_per_kind:
-                selected.append((kind, rank, item, paper_id))
-                continue
             abstract = str(item.get("abstract") or "").strip()
-            if abstract:
-                value = _abstract_evidence_record(
-                    kind=kind, rank=rank, item=item, paper_id=paper_id, abstract=abstract,
-                )
-                output[value["evidence_id"]] = value
-
-    def load(record: tuple[str, int, dict[str, Any], str]) -> dict[str, Any]:
-        kind, rank, item, paper_id = record
-        result = parse(
-            source="ar5iv",
-            paper_id=paper_id,
-            include_document=False,
-            refresh=refresh,
-            recache=recache,
-        )
-        parsed = None
-        if isinstance(result, dict) and result.get("ok") and isinstance(result.get("data"), dict):
-            parsed = result["data"]
-        sections = list(parsed.get("sections") or []) if isinstance(parsed, dict) else []
-        compact_blocks = [
-            _compact_evidence_section(section, index=index)
-            for index, section in enumerate(sections, 1)
-            if _evidence_text(section)
-        ]
-        evidence_level = "full_text" if compact_blocks else "abstract_only"
-        abstract = str(item.get("abstract") or "")
-        document_hash = str((parsed or {}).get("source_hash") or "")
-        value = {
-            "evidence_id": f"{kind}-{rank:03d}",
-            "relation": kind,
-            "paper_id": paper_id,
-            "arxiv_id": item.get("arxiv_id") or item.get("arxiv"),
-            "doi": item.get("doi"),
-            "inspire_id": item.get("inspire_id"),
-            "title": str(item.get("title") or ""),
-            "authors": item.get("authors") or [],
-            "year": item.get("year"),
-            "citation_count": item.get("citation_count"),
-            "evidence_level": evidence_level,
-            "abstract": abstract,
-            "blocks": compact_blocks,
-        }
-        value["source_descriptor"] = arc_cache_descriptor(
-            paper_id=paper_id,
-            title=value["title"],
-            authors=value["authors"],
-            year=value["year"],
-            evidence_level=evidence_level,
-            content=compact_blocks if compact_blocks else abstract,
-            document_hash=document_hash,
-        )
-        validate_evidence_record(value)
-        return value
-
-    diagnostics: list[dict[str, str]] = []
-    if selected:
-        with ThreadPoolExecutor(max_workers=min(8, len(selected))) as executor:
-            futures = {executor.submit(load, record): record for record in selected}
-            for future in as_completed(futures):
-                kind, rank, item, paper_id = futures[future]
-                try:
-                    value = future.result()
-                except Exception as exc:
-                    abstract = str(item.get("abstract") or "")
-                    if not abstract.strip():
-                        diagnostics.append({
-                            "severity": "warning",
-                            "code": "related_evidence_unavailable",
-                            "source": "arc-paper",
-                            "message": (
-                                f"No recordable full text or verified abstract is available for "
-                                f"{paper_id}: {exc}"
-                            ),
-                        })
-                        continue
-                    value = _abstract_evidence_record(
-                        kind=kind, rank=rank, item=item, paper_id=paper_id,
-                        abstract=abstract,
-                    )
-                    diagnostics.append({
-                        "severity": "warning",
-                        "code": "related_full_text_unavailable",
-                        "source": "arc-paper",
-                        "message": f"Unable to cache related full text for {paper_id}: {exc}",
-                    })
-                output[value["evidence_id"]] = value
-    ordered = [output[key] for key in sorted(output)]
-    return ordered, diagnostics
+            if not paper_id or not abstract:
+                continue
+            output.append(_abstract_evidence_record(
+                kind=kind, rank=rank, item=item, paper_id=paper_id, abstract=abstract,
+            ))
+    return output, []
 
 
 def _abstract_evidence_record(
@@ -253,28 +156,6 @@ def _arxiv_identifier(item: dict[str, Any]) -> str:
         return text
     paper_id = str(item.get("paper_id") or "").strip()
     return paper_id if "arxiv" in paper_id.casefold() else ""
-
-
-def _citation_count(item: dict[str, Any]) -> int:
-    try:
-        return int(item.get("citation_count") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _evidence_text(block: dict[str, Any]) -> str:
-    return str(block.get("text") or block.get("title") or block.get("caption") or "").strip()
-
-
-def _compact_evidence_section(section: dict[str, Any], *, index: int) -> dict[str, str]:
-    """Project a lightweight parsed section into an auditable evidence block."""
-    text = _evidence_text(section)[:2_000]
-    return {
-        "block_id": str(section.get("section_id") or f"section-{index}"),
-        "type": "section",
-        "text": text,
-        "sha256": text_sha256(text),
-    }
 
 
 def validate_complete_document(document: dict[str, Any]) -> None:

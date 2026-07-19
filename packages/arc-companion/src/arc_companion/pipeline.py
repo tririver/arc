@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -3729,52 +3730,34 @@ def _evidence_for_segment(
     )
     source_tokens = _terms(source_text)
     citation_targets = _segment_citation_targets(segment, blocks_by_id, evidence)
+    related_papers = list(evidence.get("related_papers") or [])
+    idf = _related_paper_idf(related_papers)
     required_ids = set(
         (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
     )
-    related_papers = list(evidence.get("related_papers") or [])
-    pieces_by_id = {
-        str(paper.get("evidence_id") or ""): _paper_evidence_pieces(paper)
-        for paper in related_papers
-    }
-    piece_terms = [
-        terms
-        for pieces in pieces_by_id.values()
-        for _, _, terms in pieces
-        if terms
-    ]
-    idf = _inverse_document_frequencies(piece_terms)
     selected: list[dict[str, Any]] = []
     for relation in ("prior", "later"):
-        candidates: list[tuple[int, int, float, int, int, dict[str, Any], dict[str, Any]]] = []
+        candidates: list[tuple[int, int, float, int, int, dict[str, Any]]] = []
         for index, paper in enumerate(related_papers):
             if paper.get("relation") != relation:
                 continue
             required = str(paper.get("evidence_id") or "") in required_ids
             exact = relation == "prior" and _paper_matches_citation_targets(paper, citation_targets)
-            direct_match = _best_direct_evidence_match(
-                source_tokens,
-                pieces_by_id.get(str(paper.get("evidence_id") or ""), []),
-                idf,
-            )
-            if not (required or exact or direct_match):
+            local_relevance = _strongest_local_relevance(paper, source_tokens, idf)
+            if not (required or exact or local_relevance is not None):
                 continue
-            selection = direct_match or {
-                "reason": "controller_required" if required else "exact_bibliography_target",
-                "score": 1.0,
-                "locator": "",
-            }
+            relevance = (
+                (16 if required else 0)
+                + (12 if exact else 0)
+                + (local_relevance or 0.0)
+            )
             citation_prior = min(_citation_count_value(paper).bit_length(), 10)
-            candidates.append((
-                -int(exact), -int(required), -float(selection["score"]),
-                -citation_prior, index, paper, selection,
-            ))
-        for _, _, _, _, _, paper, selection in sorted(candidates)[:3]:
+            candidates.append((-int(exact), -int(required), -relevance, -citation_prior, index, paper))
+        for _, _, _, _, _, paper in sorted(candidates)[:3]:
             compact = {key: paper.get(key) for key in (
                 "evidence_id", "relation", "paper_id", "arxiv_id", "doi", "inspire_id",
                 "title", "authors", "year", "citation_count", "evidence_level", "abstract",
             )}
-            compact["selection"] = selection
             remaining = 4_000
             snippets: list[dict[str, str]] = []
             ranked_blocks = sorted(
@@ -3826,10 +3809,22 @@ def _evidence_for_segment(
 
 def _terms(text: str) -> set[str]:
     generic = {
-        "about", "after", "also", "analysis", "approach", "before", "between",
-        "field", "fields", "from", "into", "model", "models", "paper", "physics",
-        "result", "results", "study", "that", "their", "theory", "these", "this",
-        "those", "using", "with", "work",
+        "about", "absent", "after", "also", "although", "analysis", "and", "another",
+        "approach", "are", "around", "been", "before", "being", "between", "both",
+        "but", "cal", "can", "cannot", "cdots", "could", "delimited-", "different",
+        "displaystyle", "does", "dot", "each", "either", "equiv", "equiv-", "field",
+        "fields", "first", "for", "form", "frac",
+        "from", "further", "general", "have", "here", "however", "into", "italic-",
+        "greater-than", "its", "langle", "later", "left", "less-than", "may", "model",
+        "models", "more", "most", "not", "one",
+        "only", "other", "our", "over", "paper", "partial_", "perm", "physics", "prime",
+        "proportional-to", "rangle", "rather", "result", "results",
+        "right", "same", "second", "should", "sim", "similar-to", "since", "some",
+        "study", "subscript",
+        "such", "sum_", "superscript", "than", "that", "the", "their", "then", "theory",
+        "there", "these", "they", "this", "those", "through", "times", "tilde",
+        "two", "under", "using", "very", "was", "were", "where", "which", "while",
+        "via", "with", "within", "without", "work", "would",
     }
     return {
         token.casefold()
@@ -3838,96 +3833,6 @@ def _terms(text: str) -> set[str]:
     }
 
 
-def _paper_evidence_pieces(
-    paper: dict[str, Any], *, window_words: int = 96, stride_words: int = 48,
-) -> list[tuple[str, str, set[str]]]:
-    """Return independently auditable local pieces; never concatenate a paper."""
-    pieces: list[tuple[str, str, set[str]]] = []
-    title = str(paper.get("title") or "").strip()
-    if title:
-        pieces.append(("title", title, _terms(title)))
-    abstract = str(paper.get("abstract") or "").strip()
-    if abstract:
-        pieces.append(("abstract", abstract, _terms(abstract)))
-    for block_index, block in enumerate(paper.get("blocks") or [], 1):
-        if not isinstance(block, dict):
-            continue
-        text = str(block.get("text") or "").strip()
-        if not text:
-            continue
-        locator = str(block.get("block_id") or f"block-{block_index}")
-        words = re.findall(r"\S+", text)
-        if len(words) <= window_words:
-            pieces.append((locator, text, _terms(text)))
-            continue
-        for start in range(0, len(words), stride_words):
-            excerpt = " ".join(words[start:start + window_words])
-            if excerpt:
-                pieces.append((locator, excerpt, _terms(excerpt)))
-            if start + window_words >= len(words):
-                break
-    return pieces
-
-
-def _inverse_document_frequencies(documents: list[set[str]]) -> dict[str, float]:
-    count = max(1, len(documents))
-    frequencies: dict[str, int] = {}
-    for document in documents:
-        for term in document:
-            frequencies[term] = frequencies.get(term, 0) + 1
-    return {
-        term: math.log((count + 1) / (frequency + 1)) + 1.0
-        for term, frequency in frequencies.items()
-    }
-
-
-def _best_direct_evidence_match(
-    source_terms: set[str],
-    pieces: list[tuple[str, str, set[str]]],
-    idf: dict[str, float],
-) -> dict[str, Any] | None:
-    """Require a strong match to one located piece, not diffuse whole-paper overlap."""
-    if not source_terms:
-        return None
-    source_norm = math.sqrt(sum(idf.get(term, 1.0) ** 2 for term in source_terms))
-    local_frequencies: dict[str, int] = {}
-    for _, _, terms in pieces:
-        for term in terms:
-            local_frequencies[term] = local_frequencies.get(term, 0) + 1
-    best: tuple[float, str, str, int] | None = None
-    for locator, excerpt, terms in pieces:
-        overlap = source_terms & terms
-        minimum_overlap = 2 if min(len(source_terms), len(terms)) <= 4 else 3
-        if len(overlap) < minimum_overlap:
-            continue
-        if len(pieces) > 3 and locator != "title":
-            localized = {
-                term for term in overlap
-                if local_frequencies.get(term, 0) <= max(2, math.ceil(len(pieces) * 0.25))
-            }
-            if len(localized) < 2:
-                continue
-        piece_norm = math.sqrt(sum(idf.get(term, 1.0) ** 2 for term in terms))
-        if not source_norm or not piece_norm:
-            continue
-        score = sum(idf.get(term, 1.0) ** 2 for term in overlap) / (source_norm * piece_norm)
-        # A cosine this high requires the overlap to be concentrated in the
-        # source passage and in one exact title/abstract/block window.
-        if score < 0.40:
-            continue
-        candidate = (score, locator, excerpt, len(overlap))
-        if best is None or candidate[0] > best[0]:
-            best = candidate
-    if best is None:
-        return None
-    score, locator, excerpt, overlap_count = best
-    return {
-        "reason": "direct_local_piece",
-        "score": round(score, 6),
-        "locator": locator,
-        "overlap_term_count": overlap_count,
-        "excerpt_sha256": text_sha256(excerpt),
-    }
 def _segment_citation_targets(
     segment: dict[str, Any],
     blocks_by_id: dict[str, dict[str, Any]],
@@ -3950,8 +3855,79 @@ def _segment_citation_targets(
         {key: bibliography.get(target_id, {}).get(key) for key in (
             "id", "label", "text", "doi", "arxiv_id", "links",
         ) if bibliography.get(target_id, {}).get(key) not in (None, "")}
-        for target_id in target_ids if target_id in bibliography
+        for target_id in target_ids
+        if target_id in bibliography
     ]
+
+
+def _related_paper_idf(papers: list[dict[str, Any]]) -> dict[str, float]:
+    """Compute corpus rarity without joining a candidate's separate evidence pieces."""
+    document_frequency: Counter[str] = Counter()
+    for paper in papers:
+        terms: set[str] = set()
+        for _, piece in _paper_evidence_pieces(paper):
+            terms.update(_terms(piece))
+        document_frequency.update(terms)
+    count = max(1, len(papers))
+    return {
+        term: 1.0 + math.log((count + 1) / (frequency + 1))
+        for term, frequency in document_frequency.items()
+    }
+
+
+def _paper_evidence_pieces(paper: dict[str, Any]) -> list[tuple[str, str]]:
+    pieces = [
+        ("title", str(paper.get("title") or "")),
+        ("abstract", str(paper.get("abstract") or "")),
+    ]
+    pieces.extend(
+        ("block", str(block.get("text") or ""))
+        for block in paper.get("blocks") or []
+        if isinstance(block, dict)
+    )
+    return [(kind, text) for kind, text in pieces if text.strip()]
+
+
+def _strongest_local_relevance(
+    paper: dict[str, Any],
+    source_terms: set[str],
+    idf: dict[str, float],
+) -> float | None:
+    """Return strong relevance from one auditable piece, never an entire-paper union."""
+    if not source_terms:
+        return None
+    unseen_weight = max(idf.values(), default=1.0) + 0.5
+
+    def weight(terms: set[str]) -> float:
+        return sum(idf.get(term, unseen_weight) for term in terms)
+
+    source_weight = weight(source_terms)
+    best: float | None = None
+    for kind, text in _paper_evidence_pieces(paper):
+        piece_terms = _terms(text)
+        shared = source_terms & piece_terms
+        if len(shared) < 2:
+            continue
+        shared_weight = weight(shared)
+        piece_weight = weight(piece_terms)
+        if shared_weight < 1.5 or source_weight <= 0 or piece_weight <= 0:
+            continue
+        source_coverage = shared_weight / source_weight
+        piece_coverage = shared_weight / piece_weight
+        cosine = shared_weight / math.sqrt(source_weight * piece_weight)
+        if kind == "title":
+            eligible = source_coverage >= 0.03 and piece_coverage >= 0.50
+            score = 4.0 + 4.0 * piece_coverage + 2.0 * cosine
+        else:
+            eligible = (
+                source_coverage >= 0.12
+                and piece_coverage >= 0.10
+                and cosine >= 0.15
+            )
+            score = 3.0 * cosine + source_coverage + piece_coverage
+        if eligible and (best is None or score > best):
+            best = score
+    return best
 
 
 def _paper_matches_citation_targets(
