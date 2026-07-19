@@ -116,6 +116,165 @@ def test_lane_failure_does_not_cancel_other_lanes() -> None:
     assert result.audit["lanes"]["arc"]["status"] == "complete"
 
 
+class _DiscoveryFixture:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.metadata = {
+            "arXiv:1111.1111": {
+                "paper_id": "arXiv:1111.1111", "arxiv_id": "1111.1111",
+                "title": "Broad domain survey", "abstract": "A broad mechanism survey.",
+                "authors": [], "year": 2011,
+            },
+            "arXiv:2222.2222": {
+                "paper_id": "arXiv:2222.2222", "arxiv_id": "2222.2222",
+                "doi": "10.1000/direct", "inspire_recid": "22",
+                "title": "Specific mechanism calculation",
+                "abstract": "A specific mechanism calculation proves the concrete historical claim.",
+                "authors": [], "year": 2022,
+            },
+            "doi:10.1000/direct": {
+                "paper_id": "arXiv:2222.2222", "arxiv_id": "2222.2222",
+                "doi": "10.1000/direct", "inspire_recid": "22",
+                "title": "Specific mechanism calculation",
+                "abstract": "A specific mechanism calculation proves the concrete historical claim.",
+                "authors": [], "year": 2022,
+            },
+            "inspire:22": {
+                "paper_id": "arXiv:2222.2222", "arxiv_id": "2222.2222",
+                "doi": "10.1000/direct", "inspire_recid": "22",
+                "title": "Specific mechanism calculation",
+                "abstract": "A specific mechanism calculation proves the concrete historical claim.",
+                "authors": [], "year": 2022,
+            },
+        }
+
+    def search_arc_full_text(self, paper_ids, query):
+        self.calls.append(("arc_search", tuple(paper_ids), query))
+        return [{
+            "paper_id": "arXiv:1111.1111", "title": "Broad domain survey",
+            "snippet": "broad mechanism",
+        }]
+
+    def get_parsed_source(self, paper_id):
+        self.calls.append(("parsed", paper_id))
+        metadata = self.metadata.get(paper_id)
+        if not metadata:
+            return None
+        return {
+            **metadata, "source_hash": "a" * 64,
+            "sections": [{
+                "section_id": "S1",
+                "text": metadata["abstract"],
+            }],
+        }
+
+    def get_metadata(self, paper_id):
+        self.calls.append(("metadata", paper_id))
+        return self.metadata.get(paper_id)
+
+    def get_references(self, paper_id):
+        self.calls.append(("references", paper_id))
+        return [{"paper_id": "doi:10.1000/direct", **self.metadata["doi:10.1000/direct"]}]
+
+    def get_citers(self, paper_id):
+        self.calls.append(("citers", paper_id))
+        return []
+
+    def search_inspire(self, query):
+        self.calls.append(("inspire_search", query))
+        return [{"paper_id": "doi:10.1000/direct", **self.metadata["doi:10.1000/direct"]}]
+
+    def search_web(self, query):
+        self.calls.append(("web_search", query))
+        return [{
+            "url": "https://inspirehep.net/literature/22",
+            "paper_id": "inspire:22",
+            "snippet": "specific mechanism calculation",
+        }]
+
+
+def test_default_lanes_consume_queries_and_expand_beyond_domain_without_short_circuit() -> None:
+    adapter = _DiscoveryFixture()
+    normalized = normalize_evidence_requests("seg-1", [_request()])
+    controller = EvidenceRequestController(
+        adapter=adapter,
+        domain_paper_ids=["arXiv:1111.1111"],
+        seed_paper_ids=["arXiv:9999.9999"],
+    )
+
+    result = controller.resolve(normalized)
+
+    assert ("arc_search", ("arXiv:1111.1111", "arXiv:1234.5678"), "specific mechanism") in adapter.calls
+    assert ("inspire_search", "specific mechanism") in adapter.calls
+    assert ("web_search", "specific mechanism") in adapter.calls
+    assert ("references", "arXiv:9999.9999") in adapter.calls
+    assert ("citers", "arXiv:9999.9999") in adapter.calls
+    # The more claim-specific paper discovered outside the domain is ranked
+    # ahead of the broad domain hit; domain membership is only a soft signal.
+    assert result.records[0]["paper_id"] == "arXiv:2222.2222"
+    assert {record["paper_id"] for record in result.records} == {
+        "arXiv:1111.1111", "arXiv:2222.2222",
+    }
+    assert all(result.audit["lanes"][name]["status"] == "complete" for name in ("arc", "inspire", "web"))
+
+
+def test_arxiv_doi_and_inspire_aliases_register_once_across_three_lanes() -> None:
+    adapter = _DiscoveryFixture()
+    request = _request()
+    request["candidate_paper_ids"] = ["arXiv:2222.2222"]
+    normalized = normalize_evidence_requests("seg-1", [request])
+
+    result = EvidenceRequestController(
+        adapter=adapter, seed_paper_ids=["arXiv:9999.9999"],
+    ).resolve(normalized)
+
+    matching = [record for record in result.records if record["paper_id"] == "arXiv:2222.2222"]
+    assert len(matching) == 1
+    assert matching[0]["evidence_level"] == "full_text"
+    accepted = [item for item in result.audit["accepted"] if "2222.2222" in item["identity"]]
+    assert {item["lane"] for item in accepted} == {"arc", "inspire", "web"}
+    assert len({item["evidence_id"] for item in accepted}) == 1
+
+
+def test_same_canonical_paper_keeps_prior_and_later_relation_bindings_separate() -> None:
+    prior, later = normalize_evidence_requests("seg-1", [_request("prior"), _request("later")])
+    prior_record = _record("prior")
+    later_record = _record("later")
+    later_record["evidence_id"] = "verified-paper-later"
+
+    result = EvidenceRequestController({
+        "arc": lambda requests: [
+            {"request_key": prior["request_key"], "record": prior_record,
+             "canonical_aliases": ["arXiv:1234.5678"]},
+            {"request_key": later["request_key"], "record": later_record,
+             "canonical_aliases": ["doi:10.1000/alias", "arXiv:1234.5678"]},
+        ],
+        "inspire": lambda requests: [],
+        "web": lambda requests: [],
+    }).resolve([prior, later])
+
+    assert len(result.records) == 2
+    assert result.evidence_ids_by_segment["seg-1"] == (
+        "verified-paper", "verified-paper-later",
+    )
+    assert {record["relation"] for record in result.records} == {"prior", "later"}
+
+
+def test_unmapped_web_snippet_is_discovery_only() -> None:
+    adapter = _DiscoveryFixture()
+    adapter.search_web = lambda query: [{
+        "url": "https://example.test/result", "snippet": "unsupported technical assertion",
+    }]
+    normalized = normalize_evidence_requests("seg-1", [_request()])
+    result = EvidenceRequestController(adapter=adapter).resolve(normalized)
+
+    assert all(record["source_descriptor"]["source_type"] == "arc_cache" for record in result.records)
+    assert any(
+        item["lane"] == "web" and item["reason"] == "discovery_only_not_claim_evidence"
+        for item in result.audit["rejected"]
+    )
+
+
 def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypatch, tmp_path: Path) -> None:
     segments = [
         {"segment_id": "s1", "block_ids": ["b1"]},
