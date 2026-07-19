@@ -1729,7 +1729,9 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert section_prompts and all('"source_blocks"' in prompt for prompt in section_prompts)
     final_prompt = next(str(call["prompt"]) for call in fake.calls if call["call_label"] == "companion-final-review")
     assert '"section_reviews"' in final_prompt
-    assert '"reviewed_segments"' in final_prompt
+    assert '"reviewed_segments"' not in final_prompt
+    assert '"reviewed_segment_ids"' in final_prompt
+    assert '"patch_proposals"' in final_prompt
     assert '"source_anchors"' in final_prompt
     assert '"source_excerpt"' in final_prompt
     assert '"segment_id": "seg-0001"' in final_prompt
@@ -1792,6 +1794,135 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert regenerated_preview["ok"] and regenerated_preview["meta"]["resumed"] is False
     assert regenerated_preview["data"]["first_wave_preview_version"]
     assert len(fake.calls) == call_count
+
+
+def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
+    tmp_path: Path,
+) -> None:
+    blocks = [
+        {"block_id": f"b{index}", "type": "text", "text": "source " + ("x" * 5_000)}
+        for index in range(12)
+    ]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+    }
+    segments = [
+        {"segment_id": f"seg-{index:04d}", "block_ids": [f"b{index}"], "title": "Body"}
+        for index in range(12)
+    ]
+    translations = {
+        segment["segment_id"]: {"blocks": [{
+            "block_id": segment["block_ids"][0], "text": "译文" + ("甲" * 5_000),
+        }]}
+        for segment in segments
+    }
+    annotations = {
+        segment["segment_id"]: {
+            "commentary": "伴读" + ("乙" * 2_000), "explanation": "解释",
+            "prior_work": "", "later_work": "", "evidence_ids": [],
+            "key_points": [], "source_notes": [], "evidence_requests": [],
+        }
+        for segment in segments
+    }
+    section_calls: list[str] = []
+    final_prompt_lengths: list[int] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        if label.startswith("companion-section-review-"):
+            section_calls.append(label)
+            assert "Display equations" in prompt
+            portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+            return {
+                "findings": [{
+                    "segment_id": item["segment"]["segment_id"],
+                    "issue": "technical issue " + ("z" * 2_000),
+                } for item in portion["segments"]],
+                "reviewed_segments": [{
+                    "segment_id": item["segment"]["segment_id"],
+                    "translation": item["translation"],
+                    "annotation": item["annotation"],
+                } for item in portion["segments"]],
+            }
+        assert label == "companion-final-review"
+        final_prompt_lengths.append(len(prompt))
+        assert '"reviewed_segments"' not in prompt
+        assert '"patch_proposals"' in prompt
+        assert "PRIOR SECTION FINDINGS" not in prompt
+        assert "controller-owned or source-only blocks" in prompt
+        return {"patches": [{
+            "segment_id": "seg-0000", "translation_blocks": None,
+            "commentary": "审校后的伴读", "explanation": None,
+            "prior_work": None, "later_work": None, "evidence_ids": None,
+            "reason": "technical precision",
+        }], "issues": []}
+
+    options = BuildOptions(
+        paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=4,
+        review_context_chars=20_000,
+    )
+    reviewed_translations, reviewed_annotations, audit = _review(
+        segments, translations, annotations,
+        document=document, glossary={"entries": []}, protected_names=[],
+        evidence={"related_papers": []}, options=options, llm=llm,
+        checkpoint_dir=tmp_path / "checkpoints",
+    )
+
+    assert reviewed_translations == translations
+    assert reviewed_annotations["seg-0000"]["commentary"] == "审校后的伴读"
+    assert audit["reviewed_segment_ids"] == [item["segment_id"] for item in segments]
+    assert final_prompt_lengths[0] < 40_000
+    first_section_call_count = len(section_calls)
+    assert first_section_call_count > 1
+    assert len(list((tmp_path / "checkpoints" / "section-reviews").glob("*.json"))) == (
+        first_section_call_count
+    )
+
+    section_checkpoint_paths = sorted(
+        (tmp_path / "checkpoints" / "section-reviews").glob("*.json")
+    )
+    recovered_sections = []
+    for path in section_checkpoint_paths:
+        checkpoint = json.loads(path.read_text())
+        recovered_sections.append({
+            "section_index": checkpoint["section_index"],
+            "reviewed_segment_ids": checkpoint["reviewed_segment_ids"],
+            **checkpoint["review"],
+        })
+        path.unlink()
+    recovered_path = (
+        tmp_path / "checkpoints" /
+        "section-reviews.recovered-from-failed-final.v1.json"
+    )
+    recovered_path.write_text(json.dumps({
+        "schema_version": "arc.companion.recovered-section-reviews.v1",
+        "reviewed_segment_ids": [item["segment_id"] for item in segments],
+        "section_reviews": recovered_sections,
+    }), encoding="utf-8")
+
+    _review(
+        segments, translations, annotations,
+        document=document, glossary={"entries": []}, protected_names=[],
+        evidence={"related_papers": []}, options=options, llm=llm,
+        checkpoint_dir=tmp_path / "checkpoints",
+    )
+    assert len(section_calls) == first_section_call_count
+    assert len(list((tmp_path / "checkpoints" / "section-reviews").glob("*.json"))) == (
+        first_section_call_count
+    )
+
+    recovered_path.unlink()
+    changed_translations = {**translations, "seg-0000": {"blocks": [
+        {"block_id": "b0", "text": "不同译文"}
+    ]}}
+    _review(
+        segments, changed_translations, annotations,
+        document=document, glossary={"entries": []}, protected_names=[],
+        evidence={"related_papers": []}, options=options, llm=llm,
+        checkpoint_dir=tmp_path / "checkpoints",
+    )
+    assert len(section_calls) > first_section_call_count
 
 
 def test_first_round_preview_is_published_before_evidence_resolution_and_review(tmp_path: Path) -> None:

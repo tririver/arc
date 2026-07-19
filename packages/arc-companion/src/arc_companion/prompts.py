@@ -468,7 +468,10 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "Every patch field is required by the output schema: use null for each translation or companion field that "
         "must remain unchanged, and use an empty string only when intentionally clearing prior_work or later_work. "
         "Return full replacement translation blocks for a translation correction. Never alter equations, equation numbers, figures, "
-        "tables, citations, references, identifiers, or evidence IDs. An empty patches list is valid. "
+        "tables, citations, references, identifiers, or evidence IDs. Translation coverage applies only to "
+        "translatable natural-language blocks supplied in translation blocks. Display equations, figures, "
+        "tables, bibliography, and other controller-owned or source-only blocks are intentionally absent and "
+        "must not be invented as translation blocks. An empty patches list is valid. "
         f"All replacements must be in {language}.\n\nCOMPANION:\n"
         f"{json.dumps(payload, ensure_ascii=False)}{extra}"
     )
@@ -480,6 +483,10 @@ def section_review_prompt(payload: dict[str, Any], *, language: str) -> str:
         "technical, translation, coverage, terminology, protected-name, and evidence-grounding issues. "
         "Do not propose changes to source blocks or the frozen glossary. Return reviewed_segments containing "
         "exactly every input segment_id plus complete reviewed translation and annotation values (unchanged when correct) "
-        "so the final reviewer has the full content and the controller can verify coverage. "
+        "so the controller can verify section coverage and project only concrete differences to the final reviewer. "
+        "Translation coverage applies only to translatable natural-language blocks already represented in the "
+        "input translation. Display equations, figures, tables, bibliography, and other controller-owned or "
+        "source-only blocks are intentionally absent; never report their absence as missing translation and never "
+        "add them to translation blocks. "
         f"Write findings in {language}.\n\nPORTION:\n{json.dumps(payload, ensure_ascii=False)}"
     )

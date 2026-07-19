@@ -79,6 +79,7 @@ TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION = (
 ANNOTATION_TIER = "high"
 REVIEW_TIER = "high"
 REVIEW_VERSION = "arc.companion.review.v2"
+SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v1"
@@ -1554,17 +1555,50 @@ def _review(
     hierarchical = len(json.dumps(payload, ensure_ascii=False)) > options.review_context_chars
     if hierarchical:
         chunks = _review_chunks(payload["segments"], options.review_context_chars // 2)
+        recovered_reviews = (
+            {} if options.force else _load_recovered_section_reviews(checkpoint_dir, chunks)
+        )
 
         def inspect(index: int, chunk: list[dict[str, Any]]) -> dict[str, Any]:
-            return _llm_call(
-                llm,
-                section_review_prompt({"segments": chunk}, language=options.annotation_language),
-                SECTION_REVIEW_SCHEMA,
-                options=options,
-                artifact_dir=checkpoint_dir / "llm" / "section-review" / str(index),
-                call_label=f"companion-section-review-{index}",
-                model_tier=REVIEW_TIER,
+            prompt = section_review_prompt(
+                {"segments": chunk}, language=options.annotation_language
             )
+            input_sha256 = sha256_json({
+                "prompt": prompt,
+                "schema": SECTION_REVIEW_SCHEMA,
+                "model_tier": REVIEW_TIER,
+            })
+            path = checkpoint_dir / "section-reviews" / f"{index:04d}.json"
+            if path.is_file() and not options.force:
+                checkpoint = read_json(path)
+                if (
+                    isinstance(checkpoint, dict)
+                    and checkpoint.get("schema_version") == SECTION_REVIEW_CHECKPOINT_VERSION
+                    and checkpoint.get("input_sha256") == input_sha256
+                    and isinstance(checkpoint.get("review"), dict)
+                ):
+                    return checkpoint["review"]
+            value = recovered_reviews.get(index)
+            if value is None:
+                value = _llm_call(
+                    llm,
+                    prompt,
+                    SECTION_REVIEW_SCHEMA,
+                    options=options,
+                    artifact_dir=checkpoint_dir / "llm" / "section-review" / str(index),
+                    call_label=f"companion-section-review-{index}",
+                    model_tier=REVIEW_TIER,
+                )
+            write_json(path, {
+                "schema_version": SECTION_REVIEW_CHECKPOINT_VERSION,
+                "section_index": index,
+                "input_sha256": input_sha256,
+                "reviewed_segment_ids": sorted(
+                    str(item["segment"]["segment_id"]) for item in chunk
+                ),
+                "review": value,
+            })
+            return value
 
         with ThreadPoolExecutor(max_workers=min(options.workers, len(chunks))) as executor:
             futures = {executor.submit(inspect, index, chunk): index for index, chunk in enumerate(chunks)}
@@ -1599,9 +1633,11 @@ def _review(
             findings.extend(chunk_findings)
             section_reviews.append({
                 "section_index": index,
-                "reviewed_segments": reviewed_segments,
                 "reviewed_segment_ids": sorted(reviewed_ids),
                 "findings": chunk_findings,
+                "patch_proposals": _section_review_patch_proposals(
+                    chunks[index], reviewed_segments, chunk_findings
+                ),
             })
         all_segment_ids = {str(item["segment_id"]) for item in segments}
         if review_coverage != all_segment_ids:
@@ -1610,26 +1646,45 @@ def _review(
 
     final_payload = {**payload, "glossary": glossary, "protected_names": protected_names}
     if hierarchical:
+        final_context_budget = max(40_000, options.review_context_chars)
+        source_anchors = _review_source_anchors(
+            segments,
+            blocks_by_id=by_id,
+            document=document,
+            total_chars=min(30_000, max(8_000, final_context_budget // 5)),
+        )
+        bounded_glossary = _bounded_glossary_projection(
+            glossary, total_chars=min(20_000, max(8_000, final_context_budget // 6))
+        )
+        projection_budget = max(
+            10_000,
+            final_context_budget
+            - len(json.dumps(source_anchors, ensure_ascii=False))
+            - len(json.dumps(bounded_glossary, ensure_ascii=False))
+            - 10_000,
+        )
         final_payload = {
-            "section_reviews": section_reviews,
-            "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
-            "source_anchors": _review_source_anchors(
-                segments,
-                blocks_by_id=by_id,
-                document=document,
-                total_chars=min(50_000, max(10_000, options.review_context_chars // 3)),
+            "section_reviews": _bounded_section_review_projection(
+                section_reviews, total_chars=projection_budget
             ),
-            "glossary": glossary,
+            "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
+            "source_anchors": source_anchors,
+            "glossary": bounded_glossary,
             "protected_names": protected_names,
             "instruction": (
                 "Consolidate section findings into non-conflicting translation and/or annotation patches. "
                 "Use the bounded source anchor for every segment as a direct source-awareness check; "
-                "section reviews contain the complete source-aware local review."
+                "section reviews contain bounded findings and proposed corrections from the complete "
+                "source-aware local review."
             ),
         }
     review = _llm_call(
         llm,
-        review_prompt(final_payload, language=options.annotation_language, findings=findings),
+        review_prompt(
+            final_payload,
+            language=options.annotation_language,
+            findings=None if hierarchical else findings,
+        ),
         REVIEW_SCHEMA,
         options=options,
         artifact_dir=checkpoint_dir / "llm" / "final-review",
@@ -2850,6 +2905,161 @@ def _evidence_for_segment(
 
 def _terms(text: str) -> set[str]:
     return {token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", text)}
+
+
+def _load_recovered_section_reviews(
+    checkpoint_dir: Path,
+    chunks: list[list[dict[str, Any]]],
+) -> dict[int, dict[str, Any]]:
+    """Import a controller-recovered failed-final payload within this fingerprint."""
+    path = checkpoint_dir / "section-reviews.recovered-from-failed-final.v1.json"
+    if not path.is_file():
+        return {}
+    recovered = read_json(path)
+    if (
+        not isinstance(recovered, dict)
+        or recovered.get("schema_version") != "arc.companion.recovered-section-reviews.v1"
+        or not isinstance(recovered.get("section_reviews"), list)
+    ):
+        raise RuntimeError("invalid recovered section-review checkpoint")
+    expected_all = {str(item["segment"]["segment_id"]) for chunk in chunks for item in chunk}
+    if set(str(value) for value in recovered.get("reviewed_segment_ids") or []) != expected_all:
+        raise RuntimeError("recovered section reviews do not match current segment coverage")
+    imported: dict[int, dict[str, Any]] = {}
+    for item in recovered["section_reviews"]:
+        if not isinstance(item, dict):
+            raise RuntimeError("recovered section review is malformed")
+        index = int(item.get("section_index", -1))
+        if index < 0 or index >= len(chunks) or index in imported:
+            raise RuntimeError("recovered section review has an invalid section index")
+        expected_ids = {
+            str(value["segment"]["segment_id"]) for value in chunks[index]
+        }
+        reviewed_segments = item.get("reviewed_segments")
+        reviewed_ids = {
+            str(value.get("segment_id") or "")
+            for value in reviewed_segments or []
+            if isinstance(value, dict)
+        }
+        if (
+            not isinstance(reviewed_segments, list)
+            or reviewed_ids != expected_ids
+            or set(str(value) for value in item.get("reviewed_segment_ids") or [])
+            != expected_ids
+            or not isinstance(item.get("findings"), list)
+        ):
+            raise RuntimeError(f"recovered section review {index} does not match its chunk")
+        imported[index] = {
+            "findings": item["findings"],
+            "reviewed_segments": reviewed_segments,
+        }
+    if set(imported) != set(range(len(chunks))):
+        raise RuntimeError("recovered section reviews do not cover every section")
+    return imported
+
+
+def _section_review_patch_proposals(
+    chunk: list[dict[str, Any]],
+    reviewed_segments: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project full section-review echoes into final-review-compatible deltas."""
+    original_by_id = {
+        str(item["segment"]["segment_id"]): item for item in chunk
+    }
+    proposals: list[dict[str, Any]] = []
+    patchable_annotation_fields = (
+        "commentary", "explanation", "prior_work", "later_work", "evidence_ids"
+    )
+    finding_ids = {str(item.get("segment_id") or "") for item in findings}
+    for reviewed in reviewed_segments:
+        segment_id = str(reviewed.get("segment_id") or "")
+        if segment_id not in finding_ids:
+            continue
+        original = original_by_id[segment_id]
+        proposal: dict[str, Any] = {
+            "segment_id": segment_id,
+            "translation_blocks": None,
+            "commentary": None,
+            "explanation": None,
+            "prior_work": None,
+            "later_work": None,
+            "evidence_ids": None,
+            "reason": "section reviewer proposed a correction",
+        }
+        if reviewed.get("translation") != original.get("translation"):
+            proposal["translation_blocks"] = list(
+                (reviewed.get("translation") or {}).get("blocks") or []
+            )
+        reviewed_annotation = reviewed.get("annotation") or {}
+        original_annotation = original.get("annotation") or {}
+        for field in patchable_annotation_fields:
+            if reviewed_annotation.get(field) != original_annotation.get(field):
+                proposal[field] = reviewed_annotation.get(field)
+        if any(
+            proposal[field] is not None
+            for field in ("translation_blocks", *patchable_annotation_fields)
+        ):
+            proposals.append(proposal)
+    return proposals
+
+
+def _bounded_section_review_projection(
+    section_reviews: list[dict[str, Any]],
+    *,
+    total_chars: int,
+) -> list[dict[str, Any]]:
+    """Keep coverage, bounded findings, and as many complete proposals as fit."""
+    projected: list[dict[str, Any]] = []
+    for section in section_reviews:
+        projected.append({
+            "section_index": int(section["section_index"]),
+            "reviewed_segment_ids": list(section.get("reviewed_segment_ids") or []),
+            "findings": [],
+            "omitted_finding_count": 0,
+            "patch_proposals": [],
+            "omitted_patch_proposal_count": 0,
+        })
+    budget = max(total_chars, len(json.dumps(projected, ensure_ascii=False)))
+    for source, target in zip(section_reviews, projected):
+        for finding in source.get("findings") or []:
+            issue = str(finding.get("issue") or "")
+            compact = {
+                "segment_id": str(finding.get("segment_id") or ""),
+                "issue": issue[:500],
+                "issue_sha256": hashlib.sha256(issue.encode("utf-8")).hexdigest(),
+                "truncated": len(issue) > 500,
+            }
+            target["findings"].append(compact)
+            if len(json.dumps(projected, ensure_ascii=False)) <= budget:
+                continue
+            target["findings"].pop()
+            target["omitted_finding_count"] += 1
+    for source, target in zip(section_reviews, projected):
+        for proposal in source.get("patch_proposals") or []:
+            target["patch_proposals"].append(proposal)
+            if len(json.dumps(projected, ensure_ascii=False)) <= budget:
+                continue
+            target["patch_proposals"].pop()
+            target["omitted_patch_proposal_count"] += 1
+    return projected
+
+
+def _bounded_glossary_projection(
+    glossary: dict[str, Any],
+    *,
+    total_chars: int,
+) -> dict[str, Any]:
+    """Keep complete glossary entries atomically within final-review context."""
+    entries = list(glossary.get("entries") or []) if isinstance(glossary, dict) else []
+    projected = {"entries": [], "omitted_entry_count": 0}
+    for entry in entries:
+        projected["entries"].append(entry)
+        if len(json.dumps(projected, ensure_ascii=False)) <= total_chars:
+            continue
+        projected["entries"].pop()
+        projected["omitted_entry_count"] += 1
+    return projected
 
 
 def _review_chunks(items: list[dict[str, Any]], target_chars: int) -> list[list[dict[str, Any]]]:
