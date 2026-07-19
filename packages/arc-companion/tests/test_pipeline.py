@@ -398,6 +398,12 @@ def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
     def forbidden_llm(prompt: str, **kwargs):
         raise AssertionError("persisted structural repair must resume without another model call")
 
+    old_marker.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-attempt.v2",
+        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+        "status": "started",
+    }), encoding="utf-8")
     resumed, resumed_provenance = pipeline_module._repair_translation_token_placement(
         segment,
         translation,
@@ -411,6 +417,12 @@ def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
     )
     assert resumed == repaired
     assert resumed_provenance == provenance
+    recovered_marker = json.loads(old_marker.read_text(encoding="utf-8"))
+    assert recovered_marker["status"] == "validated"
+    assert recovered_marker["validated_translation_sha256"] == pipeline_module.sha256_json(
+        repaired
+    )
+    assert recovered_marker["raw_response"] == persisted["raw_response"]
 
 
 def test_v3_final_checkpoint_requires_v4_upgrade() -> None:
@@ -677,7 +689,13 @@ def test_started_token_repair_retries_medium_and_corrupt_draft_recovers(
     repair_draft = pipeline_module._translation_token_repair_draft_path(
         checkpoint_dir, segment["segment_id"],
     )
-    repair_draft.write_text("{broken", encoding="utf-8")
+    repair_draft.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-repair-draft.v1",
+        "segment_id": segment["segment_id"], "input_sha256": "resume-input",
+        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "translation": [], "repair_provenance": None,
+        "raw_response": {"damaged": True},
+    }), encoding="utf-8")
 
     def forbidden_llm(prompt: str, **kwargs):
         raise AssertionError("validated raw response must recover a corrupt draft")
@@ -746,6 +764,114 @@ def test_v4_upgrade_without_primary_draft_blocks_before_low_model(tmp_path: Path
         )
     assert calls == []
     assert "requires its stored primary draft" in str(exc_info.value.failures[0][1])
+
+
+@pytest.mark.parametrize("marker_kind", ["unreadable", "malformed-current"])
+def test_token_attempt_marker_fails_closed_before_low_model(
+    tmp_path: Path, marker_kind: str,
+) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:0911.3380", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-marker", "block_ids": ["body"]}
+    context = pipeline_module._full_paper_context(
+        document, segment, blocks_by_id={"body": block},
+    )
+    input_sha256 = pipeline_module._segment_input_hash(
+        segment, {"body": block}, glossary={"entries": []},
+        extra={"names": [], "paper_context": context,
+               "runtime_access": pipeline_module._generation_runtime_policy()},
+    )
+    checkpoint_dir = tmp_path / "checkpoints"
+    marker_path = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    marker_path.parent.mkdir(parents=True)
+    if marker_kind == "unreadable":
+        marker_path.write_text("{broken", encoding="utf-8")
+    else:
+        marker_path.write_text(json.dumps({
+            "schema_version": "arc.companion.translation-token-attempt.v2",
+            "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+            "segment_id": segment["segment_id"],
+            "input_sha256": input_sha256 + "-wrong",
+            "status": "started",
+        }), encoding="utf-8")
+    calls: list[str] = []
+
+    def forbidden_llm(prompt: str, **kwargs):
+        calls.append(str(kwargs.get("model_tier")))
+        raise AssertionError("invalid token marker must fail before any model call")
+
+    with pytest.raises(CompanionLaneError) as exc_info:
+        _generate_translations(
+            [segment],
+            options=BuildOptions(
+                paper_id=bundle.paper_id, project_dir=tmp_path, workers=1,
+            ),
+            bundle=bundle, glossary={"entries": []}, protected_names=[],
+            checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
+        )
+    assert calls == []
+    assert "marker" in str(exc_info.value.failures[0][1])
+    assert "refusing a primary model call" in str(exc_info.value.failures[0][1])
+
+
+def test_damaged_current_repair_draft_without_validated_raw_fails_closed(
+    tmp_path: Path,
+) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    segment = {"segment_id": "seg-damaged", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    repair_draft = pipeline_module._translation_token_repair_draft_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    repair_draft.parent.mkdir(parents=True)
+    repair_draft.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-repair-draft.v1",
+        "segment_id": segment["segment_id"], "input_sha256": "damaged-input",
+        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "translation": [], "repair_provenance": None,
+        "raw_response": {"repairs": []},
+    }), encoding="utf-8")
+    calls = 0
+
+    def forbidden_llm(prompt: str, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("damaged current draft must not trigger a model")
+
+    with pytest.raises(RuntimeError, match="draft is corrupt"):
+        pipeline_module._repair_translation_token_placement(
+            segment,
+            {"blocks": [{"block_id": "body", "text": "译文。"}]},
+            blocks_by_id={"body": block}, protected_names=[],
+            options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+            checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+            input_sha256="damaged-input", llm=forbidden_llm,
+        )
+    assert calls == 0
 
 
 def test_citation_followed_by_identical_opaque_occurrence_uses_ordinals() -> None:

@@ -1126,6 +1126,38 @@ def _matching_translation_token_attempt(
     return None
 
 
+def _guard_translation_token_attempt_before_primary(
+    checkpoint_dir: Path, segment_id: str, input_sha256: str,
+) -> dict[str, Any] | None:
+    """Fail closed on an unreadable or malformed current marker before low work."""
+    path = _translation_token_attempt_path(checkpoint_dir, segment_id)
+    if not path.is_file():
+        return None
+    value = _read_checkpoint_json(path)
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"translation token repair marker is unreadable for {segment_id}; "
+            "refusing a primary model call"
+        )
+    is_current = (
+        value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
+        or value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
+    )
+    if not is_current:
+        return None
+    if not (
+        value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
+        and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
+        and value.get("segment_id") == segment_id
+        and value.get("input_sha256") == input_sha256
+    ):
+        raise RuntimeError(
+            f"translation token repair marker has malformed current identity for {segment_id}; "
+            "refusing a primary model call"
+        )
+    return value
+
+
 def _translation_token_repair_draft_path(
     checkpoint_dir: Path, segment_id: str,
 ) -> Path:
@@ -1149,9 +1181,40 @@ def _matching_translation_token_repair_draft(
         and value.get("input_sha256") == input_sha256
         and isinstance(value.get("translation"), dict)
         and isinstance(value.get("repair_provenance"), dict)
+        and isinstance(value.get("raw_response"), dict)
     ):
         return value
     return None
+
+
+def _write_validated_translation_token_marker(
+    checkpoint_dir: Path,
+    segment_id: str,
+    input_sha256: str,
+    *,
+    repaired: dict[str, Any],
+    raw_response: dict[str, Any],
+    repaired_block_ids: list[str],
+    prior_marker: dict[str, Any] | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    write_json(_translation_token_attempt_path(checkpoint_dir, segment_id), {
+        "schema_version": "arc.companion.translation-token-attempt.v2",
+        "segment_id": segment_id,
+        "input_sha256": input_sha256,
+        "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+        "model_tier": TRANSLATION_RETRY_TIER,
+        "block_ids": repaired_block_ids,
+        "status": "validated",
+        "started_at": str((prior_marker or {}).get("started_at") or now),
+        "response_received_at": str(
+            (prior_marker or {}).get("response_received_at") or now
+        ),
+        "validated_at": now,
+        "validated_translation_sha256": sha256_json(repaired),
+        "raw_response": raw_response,
+    })
 
 
 def _legacy_v3_translation_candidate(
@@ -1274,6 +1337,20 @@ def _repair_translation_token_placement(
     if persisted is not None:
         repaired = persisted["translation"]
         _validate_translation(segment, repaired, blocks_by_id, protected_names)
+        prior_marker = _read_checkpoint_json(
+            _translation_token_attempt_path(checkpoint_dir, segment_id)
+        )
+        _write_validated_translation_token_marker(
+            checkpoint_dir,
+            segment_id,
+            input_sha256,
+            repaired=repaired,
+            raw_response=persisted["raw_response"],
+            repaired_block_ids=list(
+                persisted["repair_provenance"].get("repaired_block_ids") or []
+            ),
+            prior_marker=prior_marker if isinstance(prior_marker, dict) else None,
+        )
         return repaired, dict(persisted["repair_provenance"])
     attempt_path = _translation_token_attempt_path(checkpoint_dir, segment_id)
     raw_attempt = _read_checkpoint_json(attempt_path)
@@ -1418,13 +1495,15 @@ def _repair_translation_token_placement(
     marker = _matching_translation_token_attempt(
         checkpoint_dir, segment_id, input_sha256,
     ) or marker_base
-    write_json(attempt_path, {
-        **marker,
-        "status": "validated",
-        "validated_at": datetime.now(timezone.utc).isoformat(),
-        "validated_translation_sha256": sha256_json(repaired),
-        "raw_response": value,
-    })
+    _write_validated_translation_token_marker(
+        checkpoint_dir,
+        segment_id,
+        input_sha256,
+        repaired=repaired,
+        raw_response=value,
+        repaired_block_ids=[block_id(block) for block in source_blocks],
+        prior_marker=marker,
+    )
     return repaired, provenance
 
 
@@ -1493,7 +1572,7 @@ def _generate_translations(
         attempt = _matching_translation_coverage_attempt(
             checkpoint_dir, segment_id, input_hashes[segment_id]
         )
-        token_attempt = _matching_translation_token_attempt(
+        token_attempt = _guard_translation_token_attempt_before_primary(
             checkpoint_dir, segment_id, input_hashes[segment_id]
         )
         candidate_provenance: dict[str, Any] | None = None
