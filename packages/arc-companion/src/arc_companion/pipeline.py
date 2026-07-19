@@ -391,6 +391,22 @@ def build_companion(
                 or cached_reviewed.get("schema_version") != REVIEW_VERSION
             ):
                 raise RuntimeError("invalid review checkpoint")
+            cached_reviewed, normalized_cached_segments = (
+                _repair_reviewed_translation_checkpoint(
+                    reviewed_path,
+                    expanded,
+                    {block_id(block): block for block in bundle.document.get("blocks") or []},
+                    protected_names=protected_names,
+                )
+            )
+            if normalized_cached_segments:
+                review = {
+                    **review,
+                    "citation_delimiter_normalized_cached_segment_ids": (
+                        normalized_cached_segments
+                    ),
+                }
+                write_json(review_path, review)
             reviewed = cached_reviewed.get("annotations")
             reviewed_translations = cached_reviewed.get("translations")
             if (
@@ -1271,7 +1287,9 @@ def _generate_translations(
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("translation"), dict)
             ):
-                _validate_translation(segment, checkpoint["translation"], by_id, protected_names)
+                checkpoint = _repair_translation_checkpoint_citation_delimiters(
+                    path, segment, by_id, protected_names=protected_names,
+                )
                 output[segment["segment_id"]] = checkpoint["translation"]
                 continue
         pending.append(segment)
@@ -1455,6 +1473,14 @@ def _generate_translations(
                 llm=llm,
             )
             repair_provenance.append(provenance)
+        translation, normalized_citation_ids = (
+            _normalize_translation_citation_delimiters_for_segment(translation, by_id)
+        )
+        if normalized_citation_ids:
+            repair_provenance.append(
+                _citation_delimiter_normalization_provenance(normalized_citation_ids)
+            )
+        _validate_translation(segment, translation, by_id, protected_names)
         return segment_id, translation, {
             "candidate": candidate_provenance or {},
             "repairs": repair_provenance,
@@ -1614,6 +1640,7 @@ def _review(
     reviewed = {key: dict(value) for key, value in annotations.items()}
     valid_ids = set(reviewed)
     patched: set[str] = set()
+    citation_normalized: set[str] = set()
     for patch in review.get("patches") or []:
         segment_id = str(patch.get("segment_id") or "")
         if segment_id not in valid_ids or segment_id in patched:
@@ -1622,6 +1649,11 @@ def _review(
         if translation_changed:
             replacement = {"blocks": list(patch.get("translation_blocks") or [])}
             segment = next(item for item in segments if item["segment_id"] == segment_id)
+            replacement, changed_ids = _normalize_translation_citation_delimiters_for_segment(
+                replacement, by_id
+            )
+            if changed_ids:
+                citation_normalized.add(segment_id)
             _validate_translation(segment, replacement, by_id, protected_names)
             reviewed_translations[segment_id] = replacement
         annotation_fields = ("commentary", "explanation", "prior_work", "later_work", "evidence_ids")
@@ -1651,6 +1683,7 @@ def _review(
         "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
         "issues": [str(item) for item in review.get("issues") or []],
         "patched_segment_ids": sorted(patched),
+        "citation_delimiter_normalized_segment_ids": sorted(citation_normalized),
     }
 
 
@@ -2197,6 +2230,85 @@ def _normalize_translation_citation_delimiters(
     return normalized
 
 
+def _normalize_translation_citation_delimiters_for_segment(
+    translation: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Normalize token-valid blocks in any candidate without masking token repair."""
+    raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
+    if not isinstance(raw_blocks, list):
+        return translation, []
+    changed_ids: list[str] = []
+    normalized_blocks: list[Any] = []
+    for item in raw_blocks:
+        if not isinstance(item, dict):
+            normalized_blocks.append(item)
+            continue
+        item_id = str(item.get("block_id") or "")
+        source_block = blocks_by_id.get(item_id)
+        previous_text = str(item.get("text") or "")
+        if source_block is None or _OPAQUE_INLINE_PATTERN.findall(previous_text) != (
+            _opaque_inline_tokens(source_block)
+        ):
+            normalized_blocks.append(item)
+            continue
+        normalized_text = _normalize_translation_citation_delimiters(
+            source_block, previous_text
+        )
+        if normalized_text == previous_text:
+            normalized_blocks.append(item)
+            continue
+        changed_ids.append(item_id)
+        normalized_blocks.append({**item, "text": normalized_text})
+    if not changed_ids:
+        return translation, []
+    return {**translation, "blocks": normalized_blocks}, changed_ids
+
+
+def _citation_delimiter_normalization_provenance(
+    changed_ids: list[str],
+) -> dict[str, Any]:
+    return {
+        "kind": "citation-delimiter-normalization",
+        "attempt": 0,
+        "normalizer_version": TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION,
+        "repaired_block_ids": changed_ids,
+    }
+
+
+def _repair_reviewed_translation_checkpoint(
+    checkpoint_path: Path,
+    segments: list[dict[str, Any]],
+    blocks_by_id: dict[str, dict[str, Any]],
+    *,
+    protected_names: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate and atomically migrate cached final-review translations."""
+    checkpoint = read_json(checkpoint_path)
+    translations = checkpoint.get("translations") if isinstance(checkpoint, dict) else None
+    if not isinstance(translations, dict):
+        raise RuntimeError("review checkpoint has no translation mapping")
+    changed_segments: list[str] = []
+    repaired_translations = dict(translations)
+    for segment in segments:
+        segment_id = str(segment["segment_id"])
+        translation = translations.get(segment_id)
+        if not isinstance(translation, dict):
+            raise RuntimeError(f"review checkpoint has no translation for {segment_id}")
+        repaired, changed_ids = _normalize_translation_citation_delimiters_for_segment(
+            translation, blocks_by_id
+        )
+        _validate_translation(segment, repaired, blocks_by_id, protected_names)
+        repaired_translations[segment_id] = repaired
+        if changed_ids:
+            changed_segments.append(segment_id)
+    if not changed_segments:
+        return checkpoint, []
+    repaired_checkpoint = {**checkpoint, "translations": repaired_translations}
+    write_json(checkpoint_path, repaired_checkpoint)
+    return repaired_checkpoint, changed_segments
+
+
 def _repair_translation_checkpoint_citation_delimiters(
     checkpoint_path: Path,
     segment: dict[str, Any],
@@ -2210,32 +2322,21 @@ def _repair_translation_checkpoint_citation_delimiters(
     raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
     if not isinstance(raw_blocks, list):
         raise RuntimeError("translation checkpoint has no block list")
-    changed_ids: list[str] = []
-    repaired_blocks: list[dict[str, Any]] = []
     for item in raw_blocks:
         if not isinstance(item, dict):
             raise RuntimeError("translation checkpoint contains a malformed block")
         item_id = str(item.get("block_id") or "")
-        source_block = blocks_by_id.get(item_id)
-        if source_block is None:
+        if blocks_by_id.get(item_id) is None:
             raise RuntimeError(f"translation checkpoint contains unknown block {item_id}")
-        previous_text = str(item.get("text") or "")
-        repaired_text = _normalize_translation_citation_delimiters(source_block, previous_text)
-        if repaired_text != previous_text:
-            changed_ids.append(item_id)
-        repaired_blocks.append({**item, "text": repaired_text})
-    repaired_translation = {**translation, "blocks": repaired_blocks}
+    repaired_translation, changed_ids = _normalize_translation_citation_delimiters_for_segment(
+        translation, blocks_by_id
+    )
     _validate_translation(segment, repaired_translation, blocks_by_id, protected_names)
     if not changed_ids:
         return checkpoint
     generation_provenance = dict(checkpoint.get("generation_provenance") or {})
     repairs = list(generation_provenance.get("repairs") or [])
-    repairs.append({
-        "kind": "citation-delimiter-normalization",
-        "attempt": 0,
-        "normalizer_version": TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION,
-        "repaired_block_ids": changed_ids,
-    })
+    repairs.append(_citation_delimiter_normalization_provenance(changed_ids))
     repaired_checkpoint = {
         **checkpoint,
         "generation_provenance": {**generation_provenance, "repairs": repairs},

@@ -21,9 +21,11 @@ from arc_companion.pipeline import (
     _full_paper_context,
     _generation_document,
     _generate_translations,
+    _review,
     _translation_input_block,
     _validate_translation,
     _protected_names,
+    _repair_reviewed_translation_checkpoint,
     _segment_checkpoint_name,
     _state,
     build_companion,
@@ -243,6 +245,243 @@ def test_checkpoint_citation_delimiter_repair_revalidates_and_records_provenance
         "repaired_block_ids": ["cited"],
     }
     assert json.loads(checkpoint_path.read_text(encoding="utf-8")) == repaired
+
+
+def _citation_translation_bundle(blocks: list[dict]) -> SourceBundle:
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    return SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+
+
+def test_primary_translation_candidate_normalizes_citation_delimiters(
+    tmp_path: Path,
+) -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    bundle = _citation_translation_bundle([block])
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        calls.append(str(kwargs["call_label"]))
+        return {"blocks": [{"block_id": "cited", "text": f"参见{token}[]。"}]}
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    result = _generate_translations(
+        [{"segment_id": "seg-primary", "block_ids": ["cited"]}],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=llm,
+    )
+
+    assert calls == ["companion-translation-seg-primary"]
+    assert result["seg-primary"]["blocks"][0]["text"] == f"参见[{token}]。"
+    checkpoint = json.loads(next((checkpoint_dir / "translations").glob("*.json")).read_text())
+    assert [item["kind"] for item in checkpoint["generation_provenance"]["repairs"]] == [
+        "citation-delimiter-normalization"
+    ]
+    draft = json.loads(next((checkpoint_dir / "translation-drafts").glob("*.json")).read_text())
+    assert draft["translation"]["blocks"][0]["text"] == f"参见{token}[]。"
+
+
+def test_cached_translation_candidate_normalizes_and_rewrites_checkpoint(
+    tmp_path: Path,
+) -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    bundle = _citation_translation_bundle([block])
+    segment = {"segment_id": "seg-cached", "block_ids": ["cited"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+
+    _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir,
+        llm=lambda prompt, **kwargs: {
+            "blocks": [{"block_id": "cited", "text": f"参见[{token}]。"}]
+        },
+    )
+    checkpoint_path = next((checkpoint_dir / "translations").glob("*.json"))
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["translation"]["blocks"][0]["text"] = f"参见{token}[]。"
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("a valid cached checkpoint must not call the model")
+
+    result = _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
+    )
+
+    assert result["seg-cached"]["blocks"][0]["text"] == f"参见[{token}]。"
+    rewritten = json.loads(checkpoint_path.read_text())
+    assert rewritten["translation"] == result["seg-cached"]
+    assert rewritten["generation_provenance"]["repairs"][-1]["kind"] == (
+        "citation-delimiter-normalization"
+    )
+    _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
+    )
+    idempotent = json.loads(checkpoint_path.read_text())
+    assert len(idempotent["generation_provenance"]["repairs"]) == 1
+
+
+def test_coverage_repair_candidate_normalizes_citation_delimiters(
+    tmp_path: Path,
+) -> None:
+    kept = {"block_id": "kept", "type": "text", "text": "Keep this."}
+    cited = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(cited)[0]
+    bundle = _citation_translation_bundle([kept, cited])
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        if label.endswith("coverage-repair-1"):
+            slot_ids = pipeline_module._translation_coverage_slot_ids(cited)
+            return {"repairs": [{"block_id": "cited", "slots": [
+                {"slot_id": slot_ids[0], "text": "参见"},
+                {"slot_id": slot_ids[1], "text": "[]。"},
+            ]}]}
+        return {"blocks": [{"block_id": "kept", "text": "保留。"}]}
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    result = _generate_translations(
+        [{"segment_id": "seg-coverage", "block_ids": ["kept", "cited"]}],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=llm,
+    )
+
+    assert calls == [
+        "companion-translation-seg-coverage",
+        "companion-translation-seg-coverage-coverage-repair-1",
+    ]
+    assert result["seg-coverage"]["blocks"][1]["text"] == f"参见[{token}]。"
+    checkpoint = json.loads(next((checkpoint_dir / "translations").glob("*.json")).read_text())
+    assert [item["kind"] for item in checkpoint["generation_provenance"]["repairs"]] == [
+        "coverage", "citation-delimiter-normalization"
+    ]
+
+
+def test_final_review_translation_patch_normalizes_citation_delimiters(
+    tmp_path: Path,
+) -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    segment = {"segment_id": "seg-review", "block_ids": ["cited"]}
+    translations = {
+        "seg-review": {"blocks": [{"block_id": "cited", "text": f"参见[{token}]。"}]}
+    }
+    annotations = {"seg-review": {
+        "commentary": "伴读", "explanation": "解释", "prior_work": "",
+        "later_work": "", "evidence_ids": [], "key_points": [], "source_notes": [],
+    }}
+
+    def llm(prompt: str, **kwargs):
+        assert kwargs["call_label"] == "companion-final-review"
+        return {"patches": [{
+            "segment_id": "seg-review",
+            "translation_blocks": [
+                {"block_id": "cited", "text": f"审校后{token}[]。"}
+            ],
+            "commentary": None, "explanation": None, "prior_work": None,
+            "later_work": None, "evidence_ids": None, "reason": "fix wording",
+        }], "issues": []}
+
+    reviewed, _, audit = _review(
+        [segment], translations, annotations,
+        document=_citation_translation_bundle([block]).document,
+        glossary={"entries": []}, protected_names=[], evidence={"related_papers": []},
+        options=BuildOptions(
+            paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
+            review_context_chars=100_000,
+        ),
+        llm=llm, checkpoint_dir=tmp_path / "checkpoints",
+    )
+
+    assert reviewed["seg-review"]["blocks"][0]["text"] == f"审校后[{token}]。"
+    assert audit["citation_delimiter_normalized_segment_ids"] == ["seg-review"]
+
+
+def test_cached_reviewed_translation_checkpoint_is_normalized_and_rewritten(
+    tmp_path: Path,
+) -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    segment = {"segment_id": "seg-reviewed", "block_ids": ["cited"]}
+    checkpoint_path = tmp_path / "annotations.reviewed.v2.json"
+    checkpoint_path.write_text(json.dumps({
+        "schema_version": pipeline_module.REVIEW_VERSION,
+        "translations": {"seg-reviewed": {"blocks": [
+            {"block_id": "cited", "text": f"缓存{token}[]。"}
+        ]}},
+        "annotations": {"seg-reviewed": {}},
+    }), encoding="utf-8")
+
+    repaired, changed = _repair_reviewed_translation_checkpoint(
+        checkpoint_path, [segment], {"cited": block}, protected_names=[],
+    )
+
+    assert changed == ["seg-reviewed"]
+    assert repaired["translations"]["seg-reviewed"]["blocks"][0]["text"] == (
+        f"缓存[{token}]。"
+    )
+    assert json.loads(checkpoint_path.read_text()) == repaired
+    idempotent, changed_again = _repair_reviewed_translation_checkpoint(
+        checkpoint_path, [segment], {"cited": block}, protected_names=[],
+    )
+    assert changed_again == []
+    assert idempotent == repaired
+
+
+def test_duplicate_coverage_candidates_are_discarded_before_citation_normalization(
+    tmp_path: Path,
+) -> None:
+    cited = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(cited)[0]
+    bundle = _citation_translation_bundle([cited])
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        if label.endswith("coverage-repair-1"):
+            slot_ids = pipeline_module._translation_coverage_slot_ids(cited)
+            return {"repairs": [{"block_id": "cited", "slots": [
+                {"slot_id": slot_ids[0], "text": "参见["},
+                {"slot_id": slot_ids[1], "text": "]。"},
+            ]}]}
+        return {"blocks": [
+            {"block_id": "cited", "text": f"将丢弃[额外]{token}。"},
+            {"block_id": "cited", "text": f"也将丢弃{token}。"},
+        ]}
+
+    result = _generate_translations(
+        [{"segment_id": "seg-duplicate", "block_ids": ["cited"]}],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=tmp_path / "checkpoints", llm=llm,
+    )
+
+    assert calls == [
+        "companion-translation-seg-duplicate",
+        "companion-translation-seg-duplicate-coverage-repair-1",
+    ]
+    assert result["seg-duplicate"]["blocks"][0]["text"] == f"参见[{token}]。"
 
 
 def test_slot_repair_allows_only_exact_missing_name_insertion() -> None:
