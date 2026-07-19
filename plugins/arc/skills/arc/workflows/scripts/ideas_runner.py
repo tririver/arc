@@ -13,6 +13,7 @@ from _arc_script_bootstrap import bootstrap_arc_pythonpath
 
 bootstrap_arc_pythonpath()
 
+from arc_domain.summary import mathematical_opportunities_validation_error
 from arc_llm.proposers_reviewer.artifacts import atomic_write_json, atomic_write_text
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 from arc_llm.proposers_reviewer.template_materializer import (
@@ -238,7 +239,18 @@ def _caller_context(
     caller_context["marking_scheme"] = marking_scheme_for_context(load_marking_scheme(variant.marking_scheme))
     if variant.research_scope == "cross_domain":
         caller_context["generation_mode"] = "cross_domain"
-        caller_context["domain_cards"] = _domain_cards(config)
+        domain_cards = _domain_cards(config)
+        caller_context["domain_cards"] = domain_cards
+        legacy_domain_ids = [
+            str(card.get("domain_id", ""))
+            for card in domain_cards
+            if not card.get("summary_capabilities", {}).get("mathematical_opportunities")
+        ]
+        if legacy_domain_ids:
+            caller_context.setdefault("warnings", []).append(
+                "legacy_domain_summary_without_mathematical_opportunities: "
+                + ", ".join(legacy_domain_ids)
+            )
         caller_context["exploration_profile"] = _cross_domain_profile(config, idea_index=idea_index)
     if variant.context_policy.attach_domain_markdown:
         markdown_files = _domain_markdown_files(config.project_dir / "domain")
@@ -680,8 +692,21 @@ def _domain_cards(config: IdeasConfig) -> list[dict[str, Any]]:
         seen.add(domain_id)
         summary_path = _domain_summary_path(config, entry=entry, index=index)
         summary = _read_json(summary_path)
-        if summary.get("schema_version") != "arc.domain_summary.v4":
-            raise ConfigError(f"{summary_path}.schema_version must be arc.domain_summary.v4")
+        summary_version = str(summary.get("schema_version", "")).strip()
+        if summary_version not in {"arc.domain_summary.v4", "arc.domain_summary.v5"}:
+            raise ConfigError(
+                f"{summary_path}.schema_version must be arc.domain_summary.v4 or arc.domain_summary.v5"
+            )
+        supports_mathematical_opportunities = summary_version == "arc.domain_summary.v5"
+        mathematical_opportunities: dict[str, Any] = {"well_defined_problems": []}
+        if supports_mathematical_opportunities:
+            raw_opportunities = summary.get("mathematical_opportunities")
+            validation_error = mathematical_opportunities_validation_error(raw_opportunities)
+            if validation_error is not None:
+                raise ConfigError(
+                    f"{summary_path}.mathematical_opportunities is invalid for v5: {validation_error}"
+                )
+            mathematical_opportunities = copy.deepcopy(dict(raw_opportunities))
         summary_domain_id = str(summary.get("domain_id", "")).strip()
         if summary_domain_id != domain_id:
             raise ConfigError(
@@ -697,6 +722,11 @@ def _domain_cards(config: IdeasConfig) -> list[dict[str, Any]]:
                 "methodology": summary.get("methodology", []),
                 "known_solved_cases": summary.get("known_solved_cases", []),
                 "open_axes_for_new_work": summary.get("open_axes_for_new_work", []),
+                "mathematical_opportunities": mathematical_opportunities,
+                "summary_schema_version": summary_version,
+                "summary_capabilities": {
+                    "mathematical_opportunities": supports_mathematical_opportunities,
+                },
                 "summary_json_path": str(summary_path),
             }
         )

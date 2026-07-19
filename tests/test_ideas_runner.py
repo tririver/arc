@@ -15,10 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "plugins/arc/skills/arc/workflows"
 WJ = WF / "json"
 WS = WF / "scripts"
-SINGLE_DOMAIN_GOLDEN_SHA256 = {
-    "ideas-domain.variant.json": "5bff07665fdca9a9b9983106bba4954f090cbc2add7ab1edc324e5bd4792ef81",
-    "ideas-loop.template.json": "4880f3cafc76163dc4c348c7716167e0fcdfbf82a975c24fc1e2b5f4fc2c3e99",
-    "ideas-proposer.template.json": "e6efaa6c250231b0d75c861728f5ffb95cde202f0aaad4900cf115bc9daad70e",
+UNCHANGED_GENERIC_REVIEW_CONTRACT_SHA256 = {
     "ideas-reviewer.template.json": "5d778af29cad459211315c3f4b1e4a8bfbecc3732e310d7d7b72be36e9050cbd",
     "ideas-reviewer-output.schema.json": "be8504c44d47bb471488d522720cffaa610d1633b473349e65907b64010dcf0d",
     "ideas-marking-scheme.json": "a126c2add3c15d13b4911e72687e53528e2374f6ee724ab8d53adca50beaecc1",
@@ -36,13 +33,74 @@ def _load_runner_module():
         sys.path.remove(str(WS))
 
 
-def test_single_domain_worker_contract_files_match_expected_golden() -> None:
+def test_generic_review_contract_files_remain_unchanged() -> None:
     actual = {
         name: hashlib.sha256((WJ / name).read_bytes()).hexdigest()
-        for name in SINGLE_DOMAIN_GOLDEN_SHA256
+        for name in UNCHANGED_GENERIC_REVIEW_CONTRACT_SHA256
     }
 
-    assert actual == SINGLE_DOMAIN_GOLDEN_SHA256
+    assert actual == UNCHANGED_GENERIC_REVIEW_CONTRACT_SHA256
+
+
+def test_single_domain_variant_uses_mathematical_feasibility_contract() -> None:
+    variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))
+    proposer = json.loads((WJ / variant["proposer_template"]).read_text(encoding="utf-8"))
+    reviewer = json.loads((WJ / variant["reviewer_template"]).read_text(encoding="utf-8"))
+    reviewer_schema = json.loads((WJ / variant["reviewer_output_schema"]).read_text(encoding="utf-8"))
+    marking = json.loads((WJ / variant["marking_scheme"]).read_text(encoding="utf-8"))
+
+    proposer_prompt = proposer["prompt"]["template"]
+    reviewer_prompt = reviewer["prompt"]["template"]
+    assert "target-domain importance" in proposer_prompt
+    assert "well-defined mathematical problem" in proposer_prompt
+    assert "systematic analytic, numerical, symbolic, or hybrid method" in proposer_prompt
+    assert "mature method from another field" in proposer_prompt
+    assert "kill criterion" in proposer_prompt
+    assert "easy but low-value mathematical exercise" in reviewer_prompt
+    assert "blocking_feasibility_failures" in reviewer_prompt
+    assert "external_method_status" in reviewer_prompt
+    assert proposer["output_schema"]["required"] == [
+        "title",
+        "idea_summary",
+        "motivation",
+        "novelty_checks",
+        "calculation_plan",
+        "validation_checks",
+        "risks",
+    ]
+
+    assessment = reviewer_schema["properties"]["review_payload"]["properties"]["idea_assessment"]
+    assert set(assessment["required"]) == set(assessment["properties"])
+    assert assessment["properties"]["feasibility_status"]["enum"] == [
+        "feasible",
+        "feasible_with_named_risk",
+        "infeasible",
+    ]
+    assert assessment["properties"]["external_method_status"]["enum"] == [
+        "not_used",
+        "valid",
+        "uncertain",
+        "invalid",
+    ]
+
+    assert [item["field"] for item in marking["marks"]] == [
+        "user_intent_relevance",
+        "novelty",
+        "confidence_of_novelty",
+        "scientific_value",
+        "planning",
+        "problem_well_definedness",
+    ]
+    assert sum(item["maximum"] for item in marking["marks"]) == 100
+    assert marking["tie_break_order"] == [
+        "total_score",
+        "user_intent_relevance",
+        "novelty",
+        "confidence_of_novelty",
+        "scientific_value",
+        "planning",
+        "problem_well_definedness",
+    ]
 
 
 def test_all_ideas_loop_templates_default_to_three_rounds() -> None:
@@ -593,6 +651,10 @@ def test_cross_domain_manifest_routes_to_structured_profiles_and_contract(tmp_pa
     assert [card["domain_id"] for card in cards] == ["domain-a", "domain-b"]
     assert cards[0]["task_focus"]["research_scope"] == "scope a"
     assert cards[1]["methodology"] == [{"name": "method b"}]
+    assert cards[0]["summary_schema_version"] == "arc.domain_summary.v4"
+    assert cards[0]["summary_capabilities"] == {"mathematical_opportunities": False}
+    assert cards[0]["mathematical_opportunities"] == {"well_defined_problems": []}
+    assert "legacy_domain_summary_without_mathematical_opportunities" in "\n".join(result["warnings"])
     assert "domain_markdown_files" not in loops[0]["caller_context"]
     assert loops[0]["cache_context"]["volatile_caller_context_keys"] == [
         "idea_id",
@@ -619,6 +681,113 @@ def test_cross_domain_manifest_routes_to_structured_profiles_and_contract(tmp_pa
         "decorative",
         "single_domain",
     ]
+
+
+def test_cross_domain_cards_accept_mixed_v4_v5_summaries(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    _write_cross_domain_manifest(project_dir)
+    manifest = json.loads((project_dir / "domain/domain-manifest.json").read_text(encoding="utf-8"))
+    v5_path = project_dir / manifest["domains"][1]["summary_json_path"]
+    v5 = json.loads(v5_path.read_text(encoding="utf-8"))
+    v5["schema_version"] = "arc.domain_summary.v5"
+    v5["mathematical_opportunities"] = {
+        "well_defined_problems": [
+            {
+                "problem": "Compute a controlled target observable.",
+                "importance": "It resolves a central target-domain uncertainty.",
+                "mathematical_object": "A target-domain correlation function.",
+                "assumptions_and_regime": ["Controlled perturbative regime."],
+                "success_criterion": "Obtain the leading correction with an error bound.",
+                "available_systematic_methods": [
+                    {
+                        "method": "Matched asymptotic expansion",
+                        "origin": "external_search_lead",
+                        "source_area": "Applied mathematics",
+                        "required_adaptation": "Map the target scales to inner and outer regions.",
+                        "applicability_conditions": ["Separated scales."],
+                        "validation_checks": ["Recover the known limiting solution."],
+                    }
+                ],
+                "bounded_first_calculation": "Compute the leading matched coefficient.",
+                "feasibility": {
+                    "ready_inputs": ["Known leading-order solution."],
+                    "blocking_unknowns": [],
+                    "kill_criterion": "No overlap region exists.",
+                },
+                "target_domain_papers": ["paper-b"],
+                "evidence_status": "source_grounded_inference",
+            }
+        ]
+    }
+    v5_path.write_text(json.dumps(v5), encoding="utf-8")
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+        }
+    )
+
+    ideas = runner._materialize_ideas(parsed)  # noqa: SLF001
+    cards = ideas[0].caller_context["domain_cards"]
+
+    assert cards[0]["summary_capabilities"]["mathematical_opportunities"] is False
+    assert cards[1]["summary_schema_version"] == "arc.domain_summary.v5"
+    assert cards[1]["summary_capabilities"]["mathematical_opportunities"] is True
+    assert cards[1]["mathematical_opportunities"] == v5["mathematical_opportunities"]
+
+
+@pytest.mark.parametrize("schema_version", ["", "arc.domain_summary.v3", "arc.domain_summary.v6"])
+def test_cross_domain_cards_reject_unknown_summary_schema(tmp_path: Path, schema_version: str) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    _write_cross_domain_manifest(project_dir)
+    manifest = json.loads((project_dir / "domain/domain-manifest.json").read_text(encoding="utf-8"))
+    summary_path = project_dir / manifest["domains"][0]["summary_json_path"]
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["schema_version"] = schema_version
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+        }
+    )
+
+    with pytest.raises(runner.ConfigError, match="arc.domain_summary.v4 or arc.domain_summary.v5"):
+        runner._materialize_ideas(parsed)  # noqa: SLF001
+
+
+def test_cross_domain_cards_reject_incomplete_v5_summary(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    _write_cross_domain_manifest(project_dir)
+    manifest = json.loads((project_dir / "domain/domain-manifest.json").read_text(encoding="utf-8"))
+    summary_path = project_dir / manifest["domains"][0]["summary_json_path"]
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["schema_version"] = "arc.domain_summary.v5"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+        }
+    )
+
+    with pytest.raises(runner.ConfigError, match="mathematical_opportunities is invalid for v5"):
+        runner._materialize_ideas(parsed)  # noqa: SLF001
 
 
 def test_cross_domain_nondefault_loop_count_requires_explicit_profiles(tmp_path: Path) -> None:

@@ -81,6 +81,15 @@ contribution and a feasible first calculation are eligible for the formal
 ranking. The source domain may contribute a mature method or mechanism without
 itself receiving a new result.
 
+In single-domain mode, prioritize an important target-domain problem that is
+mathematically well-defined and has an executable systematic route. A mature
+method from another field may be imported when its structure, required
+adaptation, applicability conditions, validation checks, and kill criterion are
+made concrete; only the target domain needs a substantive result. Feasibility
+is a qualification gate, while problem importance is scored strongly rather
+than used as a binary gate. Do not promote a convenient but low-value exercise,
+or an important problem without ready inputs and a bounded first calculation.
+
 ### Phase 3: Inspect Artifacts
 
 Report these paths:
@@ -127,6 +136,14 @@ formal ranking order, never fill the top three with an unqualified candidate,
 and add an unqualified appendix with explicit reasons. The helper also writes
 `<project-dir>/ideas/<run-id>/cross-domain-diagnostics.json`; report that path
 and print any insufficient-qualified-candidate `WARNING:` messages.
+
+For new single-domain runs, formal ranking likewise contains only candidates
+that pass the mathematical-definition and feasibility gate. Do not pad the top
+three with infeasible candidates. Add explicit failures to the unqualified
+appendix, write `<project-dir>/ideas/<run-id>/single-domain-diagnostics.json`,
+and print any insufficient-qualified-candidate `WARNING:` messages. Historical
+artifacts without `idea_assessment` remain readable under the visibly reported
+`legacy_no_feasibility_gate` policy.
 
 Step 2: After writing the project-level Markdown report, follow
 `manuals/arc-mcp.md` Markdown Report Export for

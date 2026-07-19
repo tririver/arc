@@ -1,0 +1,70 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "controller", "proposer_messages", "review_payload"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "arc.llm.review_envelope.v1"},
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message", "stop_requested"],
+      "properties": {
+        "message": {"type": "string"},
+        "stop_requested": {"type": "boolean"}
+      }
+    },
+    "proposer_messages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposer_001"],
+      "properties": {
+        "proposer_001": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["message"],
+          "properties": {"message": {"type": "string"}}
+        }
+      }
+    },
+    "review_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marks", "idea_assessment", "reviewer_benchmark", "improvement_comments", "evidence_checked", "tool_queries_used"],
+      "properties": {
+        "marks": {
+          "type": "object",
+          "$comment": "Generated from ideas-domain-marking-scheme.json by ideas_runner.py."
+        },
+        "idea_assessment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["problem_importance", "importance_rationale", "mathematical_well_definedness", "feasibility_status", "bounded_first_calculation_ready", "blocking_feasibility_failures", "manageable_feasibility_risks", "external_method_status", "external_method_rationale"],
+          "properties": {
+            "problem_importance": {"type": "string", "enum": ["high", "substantive", "limited", "unclear"]},
+            "importance_rationale": {"type": "string"},
+            "mathematical_well_definedness": {"type": "string", "enum": ["well_defined", "partially_defined", "not_well_defined"]},
+            "feasibility_status": {"type": "string", "enum": ["feasible", "feasible_with_named_risk", "infeasible"]},
+            "bounded_first_calculation_ready": {"type": "boolean"},
+            "blocking_feasibility_failures": {"type": "array", "items": {"type": "string"}},
+            "manageable_feasibility_risks": {"type": "array", "items": {"type": "string"}},
+            "external_method_status": {"type": "string", "enum": ["not_used", "valid", "uncertain", "invalid"]},
+            "external_method_rationale": {"type": "string"}
+          }
+        },
+        "reviewer_benchmark": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["same_direction_alternative", "preserves_proposer_direction", "comparison"],
+          "properties": {
+            "same_direction_alternative": {"type": "string"},
+            "preserves_proposer_direction": {"type": "boolean"},
+            "comparison": {"type": "string"}
+          }
+        },
+        "improvement_comments": {"type": "array", "items": {"type": "string"}},
+        "evidence_checked": {"type": "array", "items": {"type": "string"}},
+        "tool_queries_used": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

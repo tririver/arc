@@ -25,13 +25,20 @@ def _load_module():
     return module
 
 
-def _write_domain(project: Path, prefix: str, domain_id: str, seed: str) -> None:
+def _write_domain(
+    project: Path,
+    prefix: str,
+    domain_id: str,
+    seed: str,
+    *,
+    schema_version: str = "arc.domain_summary.v4",
+) -> None:
     domain = project / "domain"
     domain.mkdir(parents=True, exist_ok=True)
     (domain / f"{prefix}_domain_summary.json").write_text(
         json.dumps(
             {
-                "schema_version": "arc.domain_summary.v4",
+                "schema_version": schema_version,
                 "domain_id": domain_id,
                 "domain_title": f"Domain {domain_id}",
                 "foundation_paper": {"paper_id": seed},
@@ -85,6 +92,28 @@ def test_manifest_preserves_requested_seed_order(tmp_path: Path) -> None:
     payload = module.build_domain_manifest(project)
 
     assert [item["seed_paper"] for item in payload["domains"]] == ["seed:z", "seed:a"]
+
+
+def test_manifest_indexes_mixed_v4_v5_summaries_without_rewriting_them(tmp_path: Path) -> None:
+    module = _load_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "context.json").write_text(
+        json.dumps({"seed_paper_list": ["seed:a", "seed:b"]}),
+        encoding="utf-8",
+    )
+    _write_domain(project, "a", "domain-a", "seed:a", schema_version="arc.domain_summary.v4")
+    _write_domain(project, "b", "domain-b", "seed:b", schema_version="arc.domain_summary.v5")
+
+    payload = module.build_domain_manifest(project)
+
+    assert [item["domain_id"] for item in payload["domains"]] == ["domain-a", "domain-b"]
+    assert json.loads((project / "domain/a_domain_summary.json").read_text())["schema_version"] == (
+        "arc.domain_summary.v4"
+    )
+    assert json.loads((project / "domain/b_domain_summary.json").read_text())["schema_version"] == (
+        "arc.domain_summary.v5"
+    )
 
 
 def test_manifest_prefers_requested_seed_domain_records_over_foundation(tmp_path: Path) -> None:

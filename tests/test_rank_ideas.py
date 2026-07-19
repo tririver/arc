@@ -268,6 +268,192 @@ def test_rank_run_includes_unstructured_round_without_marks(tmp_path: Path) -> N
     assert all(value == 0 for value in entry["marks"].values())
 
 
+def test_single_domain_rank_uses_feasibility_gate_before_score(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_single_config(run_root, ["domain_idea_001", "domain_idea_002"], requires_assessment=True)
+    _write_single_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Important but blocked",
+        total=96,
+        assessment=_single_assessment(
+            problem_importance="high",
+            feasibility_status="infeasible",
+            bounded_first_calculation_ready=False,
+            blocking_feasibility_failures=["Required boundary data do not exist."],
+        ),
+    )
+    _write_single_round(
+        run_root,
+        "domain_idea_001",
+        2,
+        title="Feasible lower score",
+        total=78,
+        assessment=_single_assessment(problem_importance="substantive"),
+    )
+    _write_single_round(
+        run_root,
+        "domain_idea_002",
+        1,
+        title="Unverified imported method",
+        total=99,
+        assessment=_single_assessment(external_method_status="uncertain"),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert payload["schema_version"] == "arc.ideas.selected_rounds.v3"
+    assert payload["ranking"][0]["title"] == "Feasible lower score"
+    assert payload["ranking"][0]["round"] == 2
+    blocked_round = next(entry for entry in payload["ranking"][0]["rounds"] if entry["round"] == 1)
+    assert "first_calculation_is_not_feasible" in blocked_round["qualification_reasons"]
+    assert "bounded_first_calculation_is_not_ready" in blocked_round["qualification_reasons"]
+    assert "blocking_feasibility_failures" in blocked_round["qualification_reasons"]
+    assert payload["unqualified"][0]["title"] == "Unverified imported method"
+    assert "external_method_must_be_not_used_or_valid" in payload["unqualified"][0]["qualification_reasons"]
+    assert payload["warnings"]
+    markdown = ranker.markdown_table(payload)
+    assert "# Appendix: Unqualified Single-Domain Candidates" in markdown
+    assert "Important but blocked" not in markdown.split("# Appendix: Idea Details", 1)[0]
+
+
+def test_single_domain_importance_is_scored_but_not_a_hard_gate(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_single_config(run_root, ["domain_idea_001", "domain_idea_002"], requires_assessment=True)
+    _write_single_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Limited but feasible",
+        total=61,
+        assessment=_single_assessment(problem_importance="limited"),
+    )
+    _write_single_round(
+        run_root,
+        "domain_idea_002",
+        1,
+        title="Higher-value feasible idea",
+        total=85,
+        assessment=_single_assessment(problem_importance="high"),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["ranking"]] == [
+        "Higher-value feasible idea",
+        "Limited but feasible",
+    ]
+    assert [entry["title"] for entry in payload["summary_order"]] == [
+        "Higher-value feasible idea",
+        "Limited but feasible",
+    ]
+    assert payload["unqualified"] == []
+    assert {entry["problem_importance"] for entry in payload["diagnostics"]["candidates"]} == {
+        "high",
+        "limited",
+    }
+
+
+def test_single_domain_named_risk_requires_manageable_risk(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_single_config(run_root, ["domain_idea_001", "domain_idea_002"], requires_assessment=True)
+    _write_single_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Named manageable risk",
+        total=80,
+        assessment=_single_assessment(
+            feasibility_status="feasible_with_named_risk",
+            manageable_feasibility_risks=["A convergence test may require a finer grid."],
+        ),
+    )
+    _write_single_round(
+        run_root,
+        "domain_idea_002",
+        1,
+        title="Unnamed risk",
+        total=90,
+        assessment=_single_assessment(feasibility_status="feasible_with_named_risk"),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["ranking"]] == ["Named manageable risk"]
+    assert "feasible_with_named_risk_requires_named_manageable_risk" in payload["unqualified"][0][
+        "qualification_reasons"
+    ]
+
+
+def test_single_domain_partially_defined_problem_can_remain_qualified_for_refinement(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_single_config(run_root, ["domain_idea_001"], requires_assessment=True)
+    _write_single_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Defined enough for a bounded first calculation",
+        total=72,
+        assessment=_single_assessment(mathematical_well_definedness="partially_defined"),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["ranking"]] == [
+        "Defined enough for a bounded first calculation"
+    ]
+    assert payload["unqualified"] == []
+
+
+def test_single_domain_cli_writes_diagnostics(tmp_path: Path) -> None:
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_single_config(run_root, ["domain_idea_001"], requires_assessment=True)
+    _write_single_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Qualified",
+        total=80,
+        assessment=_single_assessment(),
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), str(run_root), "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    diagnostics = json.loads((run_root.parent / "single-domain-diagnostics.json").read_text(encoding="utf-8"))
+    assert diagnostics["schema_version"] == "arc.ideas.single_domain_diagnostics.v1"
+    assert diagnostics["qualified_count"] == 1
+
+
+def test_legacy_single_domain_artifacts_remain_rankable_with_warning(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
+    _write_single_config(run_root, ["domain_idea_001"], requires_assessment=False)
+    _write_round(
+        run_root,
+        "domain_idea_001",
+        1,
+        title="Legacy idea",
+        marks=_single_marks(70),
+    )
+
+    payload = ranker.rank_run(run_root)
+
+    assert [entry["title"] for entry in payload["ranking"]] == ["Legacy idea"]
+    assert payload["ranking"][0]["qualification_policy"] == "legacy_no_feasibility_gate"
+    assert "legacy_no_feasibility_gate" in payload["warnings"][0]
+
+
 def test_cross_domain_rank_uses_qualification_before_score(tmp_path: Path) -> None:
     ranker = _load_rank_module()
     run_root = tmp_path / "ideas" / "run_001" / "idea_loops"
@@ -478,6 +664,89 @@ def test_cross_domain_legacy_compatibility_field_uses_feasibility_status(tmp_pat
     assert failed["title"] == "Legacy blocking failure"
     assert failed["compatibility_classification"]["policy"] == "legacy_compatibility_failures_as_blocking"
     assert "blocking_compatibility_failures" in failed["qualification_reasons"]
+
+
+def _write_single_config(run_root: Path, loop_ids: list[str], *, requires_assessment: bool) -> None:
+    run_root.mkdir(parents=True, exist_ok=True)
+    review_required = ["marks", "idea_assessment"] if requires_assessment else ["marks"]
+    (run_root / "config.json").write_text(
+        json.dumps(
+            {
+                "loops": [
+                    {
+                        "loop_id": loop_id,
+                        "caller_context": {"variant_id": "domain"},
+                        "reviewers": [
+                            {
+                                "output_schema": {
+                                    "properties": {
+                                        "review_payload": {"required": review_required}
+                                    }
+                                }
+                            }
+                        ],
+                    }
+                    for loop_id in loop_ids
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _single_marks(total: int) -> dict[str, int]:
+    return {
+        "user_intent_relevance": 20,
+        "novelty": 10,
+        "confidence_of_novelty": 10,
+        "scientific_value": 10,
+        "planning": 10,
+        "problem_well_definedness": 10,
+        "total_score": total,
+    }
+
+
+def _single_assessment(
+    *,
+    problem_importance: str = "substantive",
+    mathematical_well_definedness: str = "well_defined",
+    feasibility_status: str = "feasible",
+    bounded_first_calculation_ready: bool = True,
+    blocking_feasibility_failures: list[str] | None = None,
+    manageable_feasibility_risks: list[str] | None = None,
+    external_method_status: str = "not_used",
+) -> dict[str, Any]:
+    return {
+        "problem_importance": problem_importance,
+        "importance_rationale": "The target-domain payoff is evidence-backed.",
+        "mathematical_well_definedness": mathematical_well_definedness,
+        "feasibility_status": feasibility_status,
+        "bounded_first_calculation_ready": bounded_first_calculation_ready,
+        "blocking_feasibility_failures": blocking_feasibility_failures or [],
+        "manageable_feasibility_risks": manageable_feasibility_risks or [],
+        "external_method_status": external_method_status,
+        "external_method_rationale": "No external method is needed.",
+    }
+
+
+def _write_single_round(
+    run_root: Path,
+    loop_id: str,
+    round_number: int,
+    *,
+    title: str,
+    total: int,
+    assessment: dict[str, Any],
+) -> None:
+    marks = _single_marks(total)
+    _write_round(
+        run_root,
+        loop_id,
+        round_number,
+        title=title,
+        marks=marks,
+        review_extra={"review_payload": {"marks": marks, "idea_assessment": assessment}},
+    )
 
 
 def _write_cross_config(run_root: Path, loop_ids: list[str]) -> None:

@@ -882,6 +882,60 @@ def test_domain_get_summary_is_cache_only(monkeypatch):
     assert result["error"]["code"] == "domain_summary_not_available"
 
 
+def test_domain_get_summary_preserves_v5_capabilities(monkeypatch):
+    cached = {
+        "ok": True,
+        "data": {
+            "domain_id": "domain-a",
+            "summary_schema_version": "arc.domain_summary.v5",
+            "summary_capabilities": {"mathematical_opportunities": True},
+            "summary": {
+                "schema_version": "arc.domain_summary.v5",
+                "mathematical_opportunities": {"well_defined_problems": []},
+            },
+        },
+        "errors": [],
+        "meta": {},
+    }
+    monkeypatch.setattr(
+        server.domain_service,
+        "get_domain_summary",
+        lambda seed_paper=None, intent="", domain_id=None: cached,
+    )
+
+    result = server.call_tool("domain_get_summary", {"seed_paper": "0911.3380", "intent": "inflation"})
+
+    assert result == cached
+
+
+def test_llm_domain_get_summary_reuses_legacy_v4_cache_without_rebuild(monkeypatch):
+    cached = {
+        "ok": True,
+        "data": {
+            "domain_id": "domain-a",
+            "summary_schema_version": "arc.domain_summary.v4",
+            "summary_capabilities": {"mathematical_opportunities": False},
+            "summary": {"schema_version": "arc.domain_summary.v4"},
+        },
+        "errors": [],
+        "meta": {},
+    }
+    monkeypatch.setattr(
+        server.domain_service,
+        "get_domain_summary",
+        lambda seed_paper=None, intent="", domain_id=None: cached,
+    )
+
+    def forbidden_build(*args, **kwargs):
+        raise AssertionError("valid legacy cache must not trigger a paid rebuild")
+
+    monkeypatch.setattr(server.domain_service, "build_domain", forbidden_build)
+
+    result = server.call_tool("llm_domain_get_summary", {"seed_paper": "0911.3380", "intent": "inflation"})
+
+    assert result == cached
+
+
 def test_cancel_job_requires_explicit_tool_call(monkeypatch):
     monkeypatch.setenv("ARC_MCP_INLINE_WAIT_SEC", "0.001")
 

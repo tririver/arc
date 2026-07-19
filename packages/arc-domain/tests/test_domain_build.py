@@ -213,18 +213,7 @@ def test_domain_llm_helpers_pass_model_tier_to_run_json(monkeypatch, tmp_path):
             }
         if schema["$id"] == "arc.domain-intent-ranking-v1":
             return {"ranked_paper_ids": [FOUNDATION], "reasoning": "ok"}
-        return {
-            "schema_version": "arc.domain_summary.v4",
-            "domain_title": "Domain",
-            "brief_introduction": "Brief",
-            "task_focus": {"user_intent": "intent", "research_scope": "scope", "priority_rules": []},
-            "foundation_paper": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "test"},
-            "best_reference_paper": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "test"},
-            "methodology": [],
-            "known_solved_cases": [],
-            "open_axes_for_new_work": [],
-            "warnings": [],
-        }
+        return _summary_payload()
 
     monkeypatch.setattr(foundation, "run_json", fake_run_json)
     monkeypatch.setattr(network, "run_json", fake_run_json)
@@ -258,7 +247,7 @@ def test_domain_llm_helpers_pass_model_tier_to_run_json(monkeypatch, tmp_path):
     assert captured == [
         ("arc.domain-foundation-candidate-audit-v1", "auto", None, "high"),
         ("arc.domain-intent-ranking-v1", "auto", None, "high"),
-        ("arc.domain-summary-v4", "auto", None, "high"),
+        ("arc.domain-summary-v5", "auto", None, "high"),
     ]
 
 
@@ -300,8 +289,115 @@ def test_summarize_domain_valid_json_no_relaxed_warning(monkeypatch, tmp_path):
     assert "validate_schema" not in captured
     assert captured["output_recovery"] == "warn"
     assert summary["summary_method"] == "llm"
+    assert summary["schema_version"] == "arc.domain_summary.v5"
+    assert summary["mathematical_opportunities"]["well_defined_problems"]
     assert "relaxed_payload" not in summary
     assert "domain_summary_relaxed" not in json.dumps(read_json(paths.status, {}))
+
+
+def test_summarize_domain_recovers_v4_shape_without_inventing_opportunities(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("summary_v4_recovery_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text('{"nodes":[]}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers":[]}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        json.dumps({"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "selected"}}),
+        encoding="utf-8",
+    )
+    payload = _summary_payload()
+    payload["schema_version"] = "arc.domain_summary.v4"
+    payload.pop("mathematical_opportunities")
+    monkeypatch.setattr(domain_summary, "run_json", lambda *args, **kwargs: payload)
+
+    summary = domain_summary.summarize_domain(paths=paths, provider="auto")["summary"]
+
+    assert summary["schema_version"] == "arc.domain_summary.v5"
+    assert summary["summary_method"] == "llm_relaxed"
+    assert summary["methodology"]
+    assert summary["open_axes_for_new_work"]
+    assert summary["mathematical_opportunities"] == {"well_defined_problems": []}
+    assert any("domain_summary_schema_relaxed" in warning for warning in summary["warnings"])
+
+
+def test_summarize_domain_relaxed_v5_preserves_mathematical_opportunities(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("summary_v5_recovery_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text('{"nodes":[]}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers":[]}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        json.dumps({"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "selected"}}),
+        encoding="utf-8",
+    )
+    payload = _summary_payload()
+    payload["unexpected"] = "relaxed"
+    monkeypatch.setattr(domain_summary, "run_json", lambda *args, **kwargs: payload)
+
+    summary = domain_summary.summarize_domain(paths=paths, provider="auto")["summary"]
+    problems = summary["mathematical_opportunities"]["well_defined_problems"]
+
+    assert summary["summary_method"] == "llm_relaxed"
+    assert len(problems) == 1
+    assert problems[0]["problem"] == "Determine the first unsolved residue constraint."
+    assert [method["origin"] for method in problems[0]["available_systematic_methods"]] == [
+        "in_domain",
+        "external_search_lead",
+    ]
+    assert summary["relaxed_payload"]["unexpected"] == "relaxed"
+
+
+def test_summarize_domain_filters_unknown_target_papers_and_drops_unsupported_cards(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("summary_target_evidence_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text('{"nodes":[]}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers":[]}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        json.dumps({"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "selected"}}),
+        encoding="utf-8",
+    )
+    payload = _summary_payload()
+    supported = payload["mathematical_opportunities"]["well_defined_problems"][0]
+    supported["target_domain_papers"] = [FOUNDATION, "arXiv:9999.99999"]
+    unsupported = json.loads(json.dumps(supported))
+    unsupported["problem"] = "Unsupported opportunity"
+    unsupported["target_domain_papers"] = ["arXiv:8888.88888"]
+    payload["mathematical_opportunities"]["well_defined_problems"].append(unsupported)
+    monkeypatch.setattr(domain_summary, "run_json", lambda *args, **kwargs: payload)
+
+    summary = domain_summary.summarize_domain(paths=paths, provider="auto")["summary"]
+    problems = summary["mathematical_opportunities"]["well_defined_problems"]
+
+    assert summary["summary_method"] == "llm_relaxed"
+    assert len(problems) == 1
+    assert problems[0]["target_domain_papers"] == [FOUNDATION]
+    assert any("unknown_target_domain_papers_filtered" in warning for warning in summary["warnings"])
+    assert any("dropped_without_target_evidence" in warning for warning in summary["warnings"])
+
+
+def test_summarize_domain_relaxed_drops_incomplete_opportunity_without_inventing_evidence_status(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    paths = DomainPaths.for_domain("summary_incomplete_opportunity_test")
+    paths.domain_dir.mkdir(parents=True)
+    paths.domain_graph.write_text('{"nodes":[]}', encoding="utf-8")
+    paths.evidence_pack.write_text('{"papers":[]}', encoding="utf-8")
+    paths.foundation_selection.write_text(
+        json.dumps({"selected_foundation": {"paper_id": FOUNDATION, "title": "Foundation", "reason": "selected"}}),
+        encoding="utf-8",
+    )
+    payload = _summary_payload()
+    payload["unexpected"] = "relaxed"
+    payload["mathematical_opportunities"]["well_defined_problems"][0].pop("evidence_status")
+    monkeypatch.setattr(domain_summary, "run_json", lambda *args, **kwargs: payload)
+
+    summary = domain_summary.summarize_domain(paths=paths, provider="auto")["summary"]
+
+    assert summary["mathematical_opportunities"] == {"well_defined_problems": []}
+    assert any("invalid_mathematical_opportunity_dropped" in warning for warning in summary["warnings"])
 
 
 def test_summarize_domain_accepts_extra_keys_with_warning(monkeypatch, tmp_path):
@@ -348,6 +444,8 @@ def test_summarize_domain_accepts_extra_keys_with_warning(monkeypatch, tmp_path)
     status = read_json(paths.status, {})
 
     assert summary["summary_method"] == "llm_relaxed"
+    assert summary["schema_version"] == "arc.domain_summary.v5"
+    assert summary["mathematical_opportunities"] == {"well_defined_problems": []}
     assert summary["domain_title"] == "DeepSeek Domain"
     assert summary["task_focus"]["priority_rules"] == ["satisfy user intent first"]
     assert summary["relaxed_payload"]["sufficient"] is True
@@ -399,6 +497,7 @@ def test_summarize_domain_accepts_plain_text_recovery_with_warning(monkeypatch, 
     markdown = paths.domain_summary_markdown.read_text(encoding="utf-8")
 
     assert summary["summary_method"] == "llm_relaxed_text"
+    assert summary["mathematical_opportunities"] == {"well_defined_problems": []}
     assert raw_text in summary["brief_introduction"]
     assert raw_text in markdown
     assert any("domain_summary_structured_recovery" in item for item in summary["warnings"])
@@ -515,13 +614,96 @@ def test_build_domain_marks_summary_unavailable_when_summary_returns_no_summary(
     assert result["data"]["warnings"][0]["code"] == "domain_summary_llm_failed"
 
 
-def test_get_domain_summary_rejects_cached_deterministic_fallback(monkeypatch, tmp_path):
+def test_get_domain_summary_accepts_v4_as_read_only_legacy_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = domain_id_for(SEED, "intent")
+    paths = DomainPaths.for_domain(domain_id)
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    cached = {"schema_version": "arc.domain_summary.v4", "summary_method": "llm", "domain_title": "Legacy"}
+    paths.domain_summary.write_text(json.dumps(cached), encoding="utf-8")
+    before = paths.domain_summary.read_text(encoding="utf-8")
+
+    result = service.get_domain_summary(domain_id=domain_id)
+
+    assert result["ok"] is True
+    assert result["data"]["summary"] == cached
+    assert result["data"]["summary_schema_version"] == "arc.domain_summary.v4"
+    assert result["data"]["summary_capabilities"] == {"mathematical_opportunities": False}
+    assert paths.domain_summary.read_text(encoding="utf-8") == before
+
+
+def test_get_domain_summary_reports_v5_mathematical_opportunity_capability(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = domain_id_for(SEED, "intent")
+    paths = DomainPaths.for_domain(domain_id)
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    cached = {
+        "schema_version": "arc.domain_summary.v5",
+        "summary_method": "llm",
+        "mathematical_opportunities": {"well_defined_problems": []},
+    }
+    paths.domain_summary.write_text(json.dumps(cached), encoding="utf-8")
+
+    result = service.get_domain_summary(domain_id=domain_id)
+
+    assert result["ok"] is True
+    assert result["data"]["summary_schema_version"] == "arc.domain_summary.v5"
+    assert result["data"]["summary_capabilities"] == {"mathematical_opportunities": True}
+
+
+@pytest.mark.parametrize(
+    "mathematical_opportunities",
+    [None, [], {}, {"well_defined_problems": {}}, {"well_defined_problems": [{}]}],
+)
+def test_get_domain_summary_rejects_malformed_v5_mathematical_opportunities(
+    monkeypatch,
+    tmp_path,
+    mathematical_opportunities,
+):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = domain_id_for(SEED, f"malformed-{mathematical_opportunities}")
+    paths = DomainPaths.for_domain(domain_id)
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    cached = {
+        "schema_version": "arc.domain_summary.v5",
+        "summary_method": "llm",
+        "mathematical_opportunities": mathematical_opportunities,
+    }
+    paths.domain_summary.write_text(json.dumps(cached), encoding="utf-8")
+
+    result = service.get_domain_summary(domain_id=domain_id)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "domain_summary_invalid"
+    assert "invalid mathematical_opportunities contract" in result["error"]["message"]
+
+
+@pytest.mark.parametrize("schema_version", [None, "arc.domain_summary.v3", "arc.domain_summary.v6"])
+def test_get_domain_summary_rejects_missing_or_unknown_schema(monkeypatch, tmp_path, schema_version):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = domain_id_for(SEED, f"intent-{schema_version}")
+    paths = DomainPaths.for_domain(domain_id)
+    paths.domain_dir.mkdir(parents=True, exist_ok=True)
+    cached = {"summary_method": "llm"}
+    if schema_version is not None:
+        cached["schema_version"] = schema_version
+    paths.domain_summary.write_text(json.dumps(cached), encoding="utf-8")
+
+    result = service.get_domain_summary(domain_id=domain_id)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "domain_summary_invalid"
+    assert "unsupported schema version" in result["error"]["message"]
+
+
+@pytest.mark.parametrize("schema_version", ["arc.domain_summary.v4", "arc.domain_summary.v5"])
+def test_get_domain_summary_rejects_cached_deterministic_fallback(monkeypatch, tmp_path, schema_version):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
     domain_id = domain_id_for(SEED, "intent")
     paths = DomainPaths.for_domain(domain_id)
     paths.domain_dir.mkdir(parents=True, exist_ok=True)
     paths.domain_summary.write_text(
-        '{"schema_version": "arc.domain_summary.v4", "summary_method": "deterministic_fallback"}',
+        json.dumps({"schema_version": schema_version, "summary_method": "deterministic_fallback"}),
         encoding="utf-8",
     )
 
@@ -1278,6 +1460,12 @@ def test_domain_summary_contract_uses_best_reference_and_new_sections():
     assert "foundation paper" in prompt.lower()
     assert "known solved cases" in prompt.lower()
     assert "open axes" in prompt.lower()
+    assert "mathematical_opportunities.well_defined_problems" in prompt
+    assert "at most 6" in prompt
+    assert "at most 3" in prompt
+    assert "external_search_lead" in prompt
+    assert "not complete proposals" in prompt.lower()
+    assert "do not invent external citations" in prompt.lower()
     assert "llm_summary" not in prompt
     assert "discover additional axes" in prompt.lower()
     assert "idea examples" not in prompt.lower()
@@ -1285,6 +1473,7 @@ def test_domain_summary_contract_uses_best_reference_and_new_sections():
     assert "open questions" not in prompt.lower()
     assert "report_remarks" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
     assert "foundation_paper" in domain_summary.DOMAIN_SUMMARY_SCHEMA["required"]
+    assert "mathematical_opportunities" in domain_summary.DOMAIN_SUMMARY_SCHEMA["required"]
     assert "research_directions_and_questions" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
     assert "idea_examples" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
     assert "open_questions" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
@@ -1293,6 +1482,23 @@ def test_domain_summary_contract_uses_best_reference_and_new_sections():
     assert "research_guidance" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
     assert "reading_guide" not in domain_summary.DOMAIN_SUMMARY_SCHEMA["properties"]
     assert not hasattr(domain_summary, "_fallback_summary")
+
+
+def test_domain_summary_provider_schema_is_openai_strict():
+    schema = to_provider_json_schema(domain_summary.DOMAIN_SUMMARY_SCHEMA)
+
+    assert schema["$id"] == "arc.domain-summary-v5"
+    assert schema["properties"]["schema_version"]["const"] == "arc.domain_summary.v5"
+    problems = schema["properties"]["mathematical_opportunities"]["properties"]["well_defined_problems"]
+    assert problems["maxItems"] == 6
+    methods = problems["items"]["properties"]["available_systematic_methods"]
+    assert methods["maxItems"] == 3
+    assert methods["items"]["properties"]["origin"]["enum"] == ["in_domain", "external_search_lead"]
+    assert problems["items"]["properties"]["evidence_status"]["enum"] == [
+        "source_explicit",
+        "source_grounded_inference",
+    ]
+    _assert_openai_strict(schema)
 
 
 def test_domain_summary_prompt_compacts_large_evidence_and_warnings():
@@ -1417,6 +1623,7 @@ def test_domain_summary_markdown_omits_report_remarks_guidance_and_warnings():
                 "reason": "Clear methodology.",
             },
             "methodology": [{"claim": "Use residues.", "papers": ["arXiv:2401.00002"]}],
+            "mathematical_opportunities": _summary_payload()["mathematical_opportunities"],
             "task_focus": {
                 "user_intent": "Compute a tree-level scalar correlator.",
                 "research_scope": "Example domain seeded by a paper.",
@@ -1458,11 +1665,34 @@ def test_domain_summary_markdown_omits_report_remarks_guidance_and_warnings():
     assert "missing conclusion text" not in markdown
     assert "## Task Focus for Idea Generation" in markdown
     assert "Compute a tree-level scalar correlator." in markdown
+    assert "## Mathematical Opportunities" in markdown
+    assert "Determine the first unsolved residue constraint." in markdown
+    assert "Importance: It separates competing analytic structures." in markdown
+    assert "Creative telescoping (external search lead)" in markdown
+    assert "External-search methods are leads" in markdown
+    assert "Bounded first calculation: Compute the first three nontrivial residues." in markdown
+    assert "Kill criterion: Stop if the recurrence fails at the third residue." in markdown
+    assert "Evidence status: source_grounded_inference" in markdown
     assert "## Known Solved Cases" in markdown
     assert "Do not propose the same seed correlator as new." in markdown
     assert "## Open Axes for New Work" in markdown
     assert "These axes are examples, not a complete list" in markdown
     assert "discover additional axes" in markdown
+
+
+def test_domain_summary_markdown_accepts_legacy_v4_without_empty_opportunity_section():
+    markdown = domain_summary.render_summary_markdown(
+        {
+            "schema_version": "arc.domain_summary.v4",
+            "domain_title": "Legacy Domain",
+            "brief_introduction": "Legacy briefing.",
+            "methodology": [{"claim": "Use a legacy method.", "papers": []}],
+        }
+    )
+
+    assert markdown.startswith("# Legacy Domain")
+    assert "Use a legacy method." in markdown
+    assert "## Mathematical Opportunities" not in markdown
 
 
 def _install_fake_paper_query(monkeypatch):
@@ -1481,7 +1711,7 @@ def _install_fake_domain_summary(monkeypatch):
 
 def _summary_payload():
     return {
-        "schema_version": "arc.domain_summary.v4",
+        "schema_version": "arc.domain_summary.v5",
         "domain_title": "Example Domain",
         "brief_introduction": "Compact intro.",
         "task_focus": {
@@ -1500,6 +1730,43 @@ def _summary_payload():
             "reason": "Clear methodology.",
         },
         "methodology": [{"claim": "Use residues.", "papers": ["arXiv:2401.00002"]}],
+        "mathematical_opportunities": {
+            "well_defined_problems": [
+                {
+                    "problem": "Determine the first unsolved residue constraint.",
+                    "importance": "It separates competing analytic structures.",
+                    "mathematical_object": "A meromorphic correlator residue.",
+                    "assumptions_and_regime": ["tree level", "fixed external weights"],
+                    "success_criterion": "Derive a closed constraint and reproduce a known limit.",
+                    "available_systematic_methods": [
+                        {
+                            "method": "Residue recursion",
+                            "origin": "in_domain",
+                            "source_area": "Analytic correlators",
+                            "required_adaptation": "Extend the recursion to the new residue family.",
+                            "applicability_conditions": ["isolated simple poles"],
+                            "validation_checks": ["recover the four-point limit"],
+                        },
+                        {
+                            "method": "Creative telescoping",
+                            "origin": "external_search_lead",
+                            "source_area": "Symbolic summation",
+                            "required_adaptation": "Map the residue sum to a holonomic sequence.",
+                            "applicability_conditions": ["a finite recurrence exists"],
+                            "validation_checks": ["compare low-order residues"],
+                        },
+                    ],
+                    "bounded_first_calculation": "Compute the first three nontrivial residues.",
+                    "feasibility": {
+                        "ready_inputs": ["known seed correlator"],
+                        "blocking_unknowns": ["large-order convergence"],
+                        "kill_criterion": "Stop if the recurrence fails at the third residue.",
+                    },
+                    "target_domain_papers": [FOUNDATION],
+                    "evidence_status": "source_grounded_inference",
+                }
+            ]
+        },
         "known_solved_cases": [
             {
                 "solved_case": "Known solved case.",

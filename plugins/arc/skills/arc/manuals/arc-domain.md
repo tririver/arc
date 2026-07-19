@@ -121,8 +121,15 @@ The domain cache contains:
 - `domain_summary.json`: compact field briefing.
 - `domain_summary.md`: Markdown rendering of the compact field briefing. It
   starts with task-focus guidance, brief foundation and best-reference paper
-  mentions, methodology, known solved cases, and open axes for new work. It
-  omits warnings; workflows should append summary warnings to project `self-reflect.md` and `context/domain/warnings.md`, and print visible `WARNING:` messages immediately.
+  mentions, methodology, mathematical opportunities when present, known solved
+  cases, and open axes for new work. Render
+  `mathematical_opportunities.well_defined_problems` under
+  `## Mathematical Opportunities`. Each entry is a bounded,
+  evidence-grounded opportunity card for downstream reasoning, not a complete
+  proposal or a novelty claim. A method marked `external_search_lead` is only
+  a lead for later literature search and validation; it is not a citation,
+  novelty, or applicability claim. The Markdown omits warnings; workflows
+  should append summary warnings to project `self-reflect.md` and `context/domain/warnings.md`, and print visible `WARNING:` messages immediately.
 
 Discover the active cache path:
 

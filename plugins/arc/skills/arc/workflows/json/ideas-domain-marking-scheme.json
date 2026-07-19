@@ -1,0 +1,56 @@
+{
+  "schema_version": "arc.workflow.ideas.marking_scheme.v1",
+  "calibration_guidance": "Use the full numeric range. Do not assign mid-high scores merely because an idea is plausible. A total above 85 means the idea is strong across importance, novelty, definition, and execution. A mathematically convenient but scientifically limited exercise, or an important idea without a feasible first calculation, should not receive a high total.",
+  "marks": [
+    {
+      "field": "user_intent_relevance",
+      "label": "Intent Relevance",
+      "minimum": 0,
+      "maximum": 25,
+      "guidance": "Score alignment with the full user intent and whether the proposal addresses an important target-domain problem rather than an easy nearby exercise. 25: directly targets the full intent and a consequential domain problem. 20: mostly matches with minor drift. 15: relevant but misses an important constraint or payoff. 10: only partially relevant. 5: weak topical overlap. 0: wrong problem or domain."
+    },
+    {
+      "field": "novelty",
+      "label": "Novelty",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score how publishable the target-domain result would be if completed. A mature external method is not itself a novelty penalty; judge the new mapping, adaptation, or result. 15: confidently top-journal publishable. 10: marginally top-journal or clearly strong-field-journal publishable. 5: specialized or marginal contribution. 0: not publishable even if completed."
+    },
+    {
+      "field": "confidence_of_novelty",
+      "label": "Confidence",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score evidence that the work has not already been done. Search ARC and the web. For imported methods, check the source field, target field, and their intersection. 15: focused search found no close prior work. 10: no direct work found but nearby literature is dense or incomplete. 5: close work creates significant risk. 0: essentially equivalent work exists."
+    },
+    {
+      "field": "scientific_value",
+      "label": "Value",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score the importance of the solved problem and the substantive target-domain payoff. 15: a leading researcher should regard the result as must-read. 10: useful and clearly worth knowing. 5: limited or incremental value, including technically neat but unimportant exercises. 0: the result would not be worth reading."
+    },
+    {
+      "field": "planning",
+      "label": "Planning",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether a systematic method gives an executable route from ready inputs to outputs, with applicability checks, a bounded first calculation, validation, and a kill criterion. 15: concrete and agent-executable. 10: clear route with named manageable risks. 5: broad or missing key prerequisites. 0: infeasible, blocked, or essentially absent."
+    },
+    {
+      "field": "problem_well_definedness",
+      "label": "Well-definedness",
+      "minimum": 0,
+      "maximum": 15,
+      "guidance": "Score whether the mathematical object, assumptions and regime, relevant boundary or initial conditions, target quantity, and success criterion are specified. 15: calculation can be set up directly. 10: mostly defined with a few reasonable choices. 5: key objects, limits, or observables are under-specified. 0: no clear calculable question."
+    }
+  ],
+  "total_score": {
+    "field": "total_score",
+    "label": "Total",
+    "minimum": 0,
+    "maximum": 100,
+    "guidance": "Set total_score to the closest integer after summing all listed marks. Rank ideas on one common scale; qualification is enforced separately from this score."
+  },
+  "tie_break_order": ["total_score", "user_intent_relevance", "novelty", "confidence_of_novelty", "scientific_value", "planning", "problem_well_definedness"]
+}

@@ -53,6 +53,12 @@ def main() -> None:
             json.dumps(payload["diagnostics"], indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+    elif payload.get("single_domain_qualification"):
+        diagnostics_path = args.run_root.resolve().parent / "single-domain-diagnostics.json"
+        diagnostics_path.write_text(
+            json.dumps(payload["diagnostics"], indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     if args.format == "json":
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
@@ -67,19 +73,31 @@ def rank_run(run_root: Path) -> dict[str, Any]:
 
     cross_contexts = _cross_domain_contexts(run_root)
     cross_domain = bool(cross_contexts)
+    single_contexts = {} if cross_domain else _single_domain_contexts(run_root)
+    single_domain_qualification = any(
+        context.get("requires_idea_assessment") is True for context in single_contexts.values()
+    )
+    legacy_single_domain = bool(single_contexts) and not single_domain_qualification
     scheme = load_marking_scheme(CROSS_MARKING_SCHEME) if cross_domain else None
     selected = []
     unqualified = []
     for loop_root in sorted(path for path in loops_root.iterdir() if path.is_dir()):
         loop_context = cross_contexts.get(loop_root.name, {})
+        single_context = single_contexts.get(loop_root.name, {})
         loop_rounds = [
-            _round_entry(loop_root, round_root, scheme=scheme, cross_context=loop_context if cross_domain else None)
+            _round_entry(
+                loop_root,
+                round_root,
+                scheme=scheme,
+                cross_context=loop_context if cross_domain else None,
+                single_context=single_context if single_contexts else None,
+            )
             for round_root in _round_dirs(loop_root)
         ]
         loop_rounds = [entry for entry in loop_rounds if entry is not None]
         if not loop_rounds:
             continue
-        if cross_domain:
+        if cross_domain or single_domain_qualification:
             qualified_rounds = [entry for entry in loop_rounds if entry.get("qualified")]
             if not qualified_rounds:
                 best_failed = dict(max(loop_rounds, key=lambda item: _rank_key(item, scheme=scheme)))
@@ -126,6 +144,18 @@ def rank_run(run_root: Path) -> dict[str, Any]:
             )
         top_ids = {(entry["loop_id"], entry["round"]) for entry in top_three}
         ranking = [*top_three, *[entry for entry in ranking if (entry["loop_id"], entry["round"]) not in top_ids]]
+    elif single_domain_qualification:
+        top_three = ranking[:3]
+        if len(top_three) < 3:
+            warnings.append(
+                f"WARNING: only {len(top_three)} qualified single-domain candidates are available; "
+                "the top three were not padded with infeasible candidates."
+            )
+    elif legacy_single_domain:
+        warnings.append(
+            "WARNING: legacy single-domain reviews do not contain idea_assessment; "
+            "ranking used the legacy_no_feasibility_gate policy."
+        )
     for index, entry in enumerate(ranking, start=1):
         entry["rank"] = index
     payload = {
@@ -154,6 +184,26 @@ def rank_run(run_root: Path) -> dict[str, Any]:
                 ),
             }
         )
+    elif single_domain_qualification:
+        payload.update(
+            {
+                "schema_version": "arc.ideas.selected_rounds.v3",
+                "single_domain_qualification": True,
+                "summary_order": ranking,
+                "top_three": top_three,
+                "unqualified": unqualified,
+                "warnings": warnings,
+                "diagnostics": _single_domain_diagnostics(
+                    run_root,
+                    ranking=ranking,
+                    top_three=top_three,
+                    unqualified=unqualified,
+                    warnings=warnings,
+                ),
+            }
+        )
+    elif warnings:
+        payload["warnings"] = warnings
     return payload
 
 
@@ -170,6 +220,7 @@ def _round_entry(
     *,
     scheme: Mapping[str, Any] | None = None,
     cross_context: Mapping[str, Any] | None = None,
+    single_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     proposer_output_path = _first_json(round_root / "proposer_outputs")
     review_path = _first_json(round_root / "reviews")
@@ -219,6 +270,21 @@ def _round_entry(
                 ),
             }
         )
+    elif single_context is not None:
+        assessment = review.get("review_payload", {}).get("idea_assessment")
+        if single_context.get("requires_idea_assessment") is True or isinstance(assessment, Mapping):
+            qualified, reasons, feasibility = _single_domain_qualification(assessment, recovered=recovered)
+            entry.update(
+                {
+                    "qualified": qualified,
+                    "qualification_policy": "single_domain_feasibility_gate_v1",
+                    "qualification_reasons": reasons,
+                    "idea_assessment": assessment if isinstance(assessment, dict) else {},
+                    "feasibility_classification": feasibility,
+                }
+            )
+        else:
+            entry["qualification_policy"] = "legacy_no_feasibility_gate"
     return entry
 
 def _first_json(root: Path) -> Path | None:
@@ -289,6 +355,112 @@ def _cross_domain_contexts(run_root: Path) -> dict[str, dict[str, Any]]:
         if contexts:
             return contexts
     return {}
+
+
+def _single_domain_contexts(run_root: Path) -> dict[str, dict[str, Any]]:
+    candidates = [run_root / "config.json", run_root.parent / "ideas_batch_config.json"]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            payload = _read_json(path)
+        except (OSError, json.JSONDecodeError, SystemExit):
+            continue
+        loops = payload.get("loops")
+        if not isinstance(loops, list):
+            continue
+        contexts: dict[str, dict[str, Any]] = {}
+        for loop in loops:
+            if not isinstance(loop, dict):
+                continue
+            context = loop.get("caller_context")
+            if not isinstance(context, dict) or context.get("variant_id") != "domain":
+                continue
+            loop_id = str(loop.get("loop_id", "")).strip()
+            if not loop_id:
+                continue
+            contexts[loop_id] = {
+                **context,
+                "requires_idea_assessment": _loop_requires_idea_assessment(loop),
+            }
+        if contexts:
+            return contexts
+    return {}
+
+
+def _loop_requires_idea_assessment(loop: Mapping[str, Any]) -> bool:
+    reviewers = loop.get("reviewers")
+    if not isinstance(reviewers, list) or not reviewers or not isinstance(reviewers[0], Mapping):
+        return False
+    schema = reviewers[0].get("output_schema")
+    if not isinstance(schema, Mapping):
+        return False
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return False
+    review_payload = properties.get("review_payload", {})
+    required = review_payload.get("required") if isinstance(review_payload, Mapping) else None
+    return isinstance(required, list) and "idea_assessment" in required
+
+
+def _single_domain_qualification(
+    assessment: Any,
+    *,
+    recovered: bool,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    reasons: list[str] = []
+    if recovered:
+        reasons.append("proposer_or_reviewer_has_major_or_fatal_structured_recovery")
+    if not isinstance(assessment, Mapping):
+        return False, [*reasons, "missing_idea_assessment"], _empty_single_feasibility_classification()
+
+    feasibility_status = str(assessment.get("feasibility_status", ""))
+    well_definedness = str(assessment.get("mathematical_well_definedness", ""))
+    external_method_status = str(assessment.get("external_method_status", ""))
+    blocking_failures = _string_list(assessment.get("blocking_feasibility_failures"))
+    manageable_risks = _string_list(assessment.get("manageable_feasibility_risks"))
+
+    if feasibility_status not in {"feasible", "feasible_with_named_risk"}:
+        reasons.append("first_calculation_is_not_feasible")
+    if assessment.get("bounded_first_calculation_ready") is not True:
+        reasons.append("bounded_first_calculation_is_not_ready")
+    if blocking_failures:
+        reasons.append("blocking_feasibility_failures")
+    if feasibility_status == "feasible_with_named_risk" and not manageable_risks:
+        reasons.append("feasible_with_named_risk_requires_named_manageable_risk")
+    if well_definedness == "not_well_defined" or well_definedness not in {
+        "well_defined",
+        "partially_defined",
+    }:
+        reasons.append("mathematical_problem_is_not_well_defined")
+    if external_method_status not in {"not_used", "valid"}:
+        reasons.append("external_method_must_be_not_used_or_valid")
+
+    return (
+        not reasons,
+        reasons,
+        {
+            "policy": "explicit_blocking_and_manageable_v1",
+            "feasibility_status": feasibility_status,
+            "well_definedness": well_definedness,
+            "bounded_first_calculation_ready": assessment.get("bounded_first_calculation_ready") is True,
+            "blocking_failures": blocking_failures,
+            "manageable_risks": manageable_risks,
+            "external_method_status": external_method_status,
+        },
+    )
+
+
+def _empty_single_feasibility_classification() -> dict[str, Any]:
+    return {
+        "policy": "missing_assessment",
+        "feasibility_status": "",
+        "well_definedness": "",
+        "bounded_first_calculation_ready": False,
+        "blocking_failures": [],
+        "manageable_risks": [],
+        "external_method_status": "",
+    }
 
 
 def _cross_qualification(
@@ -487,6 +659,49 @@ def _cross_diagnostics(
     }
 
 
+def _single_domain_diagnostics(
+    run_root: Path,
+    *,
+    ranking: list[dict[str, Any]],
+    top_three: list[dict[str, Any]],
+    unqualified: list[dict[str, Any]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    top_keys = {(entry["loop_id"], entry["round"]) for entry in top_three}
+    candidates = []
+    for qualified, entries in ((True, ranking), (False, unqualified)):
+        for entry in entries:
+            assessment = entry.get("idea_assessment", {})
+            candidates.append(
+                {
+                    "loop_id": entry["loop_id"],
+                    "round": entry["round"],
+                    "title": entry["title"],
+                    "qualified": qualified,
+                    "qualification_policy": entry.get("qualification_policy", ""),
+                    "qualification_reasons": entry.get("qualification_reasons", []),
+                    "problem_importance": (
+                        assessment.get("problem_importance", "") if isinstance(assessment, Mapping) else ""
+                    ),
+                    "importance_rationale": (
+                        assessment.get("importance_rationale", "") if isinstance(assessment, Mapping) else ""
+                    ),
+                    "feasibility_classification": entry.get("feasibility_classification", {}),
+                    "top_three": (entry["loop_id"], entry["round"]) in top_keys,
+                    "marks": entry["marks"],
+                }
+            )
+    return {
+        "schema_version": "arc.ideas.single_domain_diagnostics.v1",
+        "run_root": str(run_root),
+        "qualified_count": len(ranking),
+        "unqualified_count": len(unqualified),
+        "top_three_count": len(top_three),
+        "warnings": warnings,
+        "candidates": candidates,
+    }
+
+
 def _round_number(round_root: Path) -> int:
     try:
         return int(round_root.name.split("_", 1)[1])
@@ -538,6 +753,21 @@ def markdown_table(payload: dict[str, Any]) -> str:
                     f"- Exclusion: `{entry['portfolio_exclusion_reason']}`",
                 ]
             )
+    elif payload.get("single_domain_qualification"):
+        lines.extend(["", "# Appendix: Unqualified Single-Domain Candidates"])
+        if not payload.get("unqualified"):
+            lines.extend(["", "None."])
+        for entry in payload.get("unqualified", []):
+            lines.extend(
+                [
+                    "",
+                    f"## `{entry['loop_id']}` — {_heading_text(entry['title'])}",
+                    "",
+                    f"- Best observed round: `{entry['round']}`",
+                    "- Qualification failures:",
+                    *[f"  - {reason}" for reason in entry.get("qualification_reasons", [])],
+                ]
+            )
     return "\n".join(lines)
 
 
@@ -552,6 +782,8 @@ def _summary_table(payload: dict[str, Any]) -> str:
         "IR=intent relevance, N=novelty, CN=confidence of novelty, SV=scientific value, "
         "PL=planning, WD=well-definedness, T=total.",
     ]
+    for warning in payload.get("warnings", []):
+        lines.extend(["", str(warning)])
     for entry in payload.get("summary_order", payload.get("ranking", [])):
         lines.extend(["", *_round_marks_summary_section(entry)])
     if lines and lines[-1] == "":
@@ -647,7 +879,7 @@ def _appendix_section(entry: dict[str, Any]) -> list[str]:
 
 
 def _round_marks_table(entry: dict[str, Any]) -> str:
-    if "qualified" in entry:
+    if "cross_domain_assessment" in entry:
         columns = [{"label": label, "field": field} for label, field in CROSS_REPORT_COLUMNS]
     else:
         columns = report_columns()

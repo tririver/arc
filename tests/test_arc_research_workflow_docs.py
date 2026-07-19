@@ -1054,13 +1054,18 @@ def test_ideas_proposer_schemas_are_codex_strict() -> None:
     assert "calculation_plan" in schema["required"]
 
 
-def test_build_domain_report_instructions_include_task_focus_solved_cases_and_open_axes() -> None:
+def test_build_domain_report_instructions_include_mathematical_opportunities() -> None:
     text = (WF / "domain.md").read_text(encoding="utf-8")
 
     assert "Task Focus for Idea Generation" in text
     assert "Key Papers" in text
     assert "foundation_paper" in text
     assert "best_reference_paper" in text
+    assert "Mathematical Opportunities" in text
+    assert "mathematical_opportunities.well_defined_problems" in text
+    assert "important" in text
+    assert "feasible" in text
+    assert "external_search_lead" in text
     assert "Known Solved Cases" in text
     assert "Open Axes for New Work" in text
     assert "these axes are examples" in text

@@ -45,7 +45,7 @@ def test_0911_benchmark_budget_and_acceptance_are_frozen() -> None:
         "maximum_same_central_mechanism": 2,
         "minimum_blind_preference_rate": 0.6,
         "maximum_feasibility_drop": 0.25,
-        "single_domain_prompt_contract_unchanged": True,
+        "require_single_domain_prompt_regression_tests": True,
     }
 
 

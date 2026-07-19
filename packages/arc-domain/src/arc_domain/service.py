@@ -13,11 +13,15 @@ from .network import build_network as _build_network
 from .paper_pack import build_paper_json_pack as _build_paper_json_pack
 from .render import render_network_html
 from .results import err, ok
+from .summary import mathematical_opportunities_validation_error
 from .summary import summarize_domain as _summarize_domain
 
 
 CONFIG_SCHEMA_VERSION = "arc.domain_config.v1"
 INPUT_FINGERPRINT_SCHEMA_VERSION = "arc.domain_input_fingerprint.v1"
+SUPPORTED_DOMAIN_SUMMARY_SCHEMA_VERSIONS = frozenset(
+    {"arc.domain_summary.v4", "arc.domain_summary.v5"}
+)
 
 
 def init_domain(seed_paper: str, *, intent: str = "", domain_id: str | None = None) -> dict[str, Any]:
@@ -299,10 +303,33 @@ def get_domain_summary(seed_paper: str | None = None, *, intent: str = "", domai
                 "domain_summary_invalid",
                 f"Cached deterministic fallback summary is invalid for {paths.domain_id}; rerun domain summarization.",
             )
+        schema_version = str(summary.get("schema_version") or "")
+        if schema_version not in SUPPORTED_DOMAIN_SUMMARY_SCHEMA_VERSIONS:
+            return err(
+                "domain_summary_invalid",
+                (
+                    f"Cached domain summary for {paths.domain_id} has unsupported schema version "
+                    f"{schema_version or '<missing>'}; rerun domain summarization."
+                ),
+            )
+        if schema_version == "arc.domain_summary.v5":
+            opportunities = summary.get("mathematical_opportunities")
+            if mathematical_opportunities_validation_error(opportunities) is not None:
+                return err(
+                    "domain_summary_invalid",
+                    (
+                        f"Cached v5 domain summary for {paths.domain_id} has an invalid "
+                        "mathematical_opportunities contract; rerun domain summarization."
+                    ),
+                )
         return ok(
             {
                 "domain_id": paths.domain_id,
                 "summary": summary,
+                "summary_schema_version": schema_version,
+                "summary_capabilities": {
+                    "mathematical_opportunities": schema_version == "arc.domain_summary.v5",
+                },
                 "path": str(paths.domain_summary),
                 "markdown_path": str(paths.domain_summary_markdown) if paths.domain_summary_markdown.exists() else None,
             }

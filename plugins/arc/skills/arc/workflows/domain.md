@@ -116,6 +116,21 @@ is the methodology entry point.
 
 Render `methodology` under `## Methodology`.
 
+For a v5 domain summary, render
+`mathematical_opportunities.well_defined_problems` under:
+
+```text
+## Mathematical Opportunities
+```
+
+Treat each entry as a bounded, evidence-grounded opportunity card that gives a
+downstream ideas workflow a scientifically important mathematical problem and
+a feasible way to begin assessing it. These cards are research interfaces,
+not complete proposals, and must not be presented as novelty findings. Methods marked
+`external_search_lead` are leads for later literature search and validation,
+not claims that the method is novel, applicable, or supported by a cited
+source.
+
 Render `known_solved_cases` under:
 
 ```text

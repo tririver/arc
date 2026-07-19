@@ -4,6 +4,9 @@
   "description": "Proposer receives ARC domain Markdown, ARC paper-tool guidance, internet access, and ARC-only MCP access.",
   "loop_template": "ideas-loop.template.json",
   "proposer_template": "ideas-proposer.template.json",
+  "reviewer_template": "ideas-domain-reviewer.template.json",
+  "reviewer_output_schema": "ideas-domain-reviewer-output.schema.json",
+  "marking_scheme": "ideas-domain-marking-scheme.json",
   "context_policy": {
     "require_domain_markdown": false,
     "attach_domain_markdown": true,

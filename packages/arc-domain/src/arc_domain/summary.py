@@ -27,11 +27,13 @@ SUMMARY_GRAPH_EDGE_LIMIT = 200
 SUMMARY_PROMPT_CHAR_LIMIT = 900_000
 SUMMARY_FALLBACK_ABSTRACT_CHAR_LIMIT = 800
 SUMMARY_FALLBACK_CONCLUSION_CHAR_LIMIT = 800
+SUMMARY_MATHEMATICAL_OPPORTUNITY_LIMIT = 6
+SUMMARY_SYSTEMATIC_METHOD_LIMIT = 3
 
 
 DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "arc.domain-summary-v4",
+    "$id": "arc.domain-summary-v5",
     "type": "object",
     "additionalProperties": False,
     "required": [
@@ -42,12 +44,13 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
         "foundation_paper",
         "best_reference_paper",
         "methodology",
+        "mathematical_opportunities",
         "known_solved_cases",
         "open_axes_for_new_work",
         "warnings",
     ],
     "properties": {
-        "schema_version": {"type": "string", "const": "arc.domain_summary.v4"},
+        "schema_version": {"type": "string", "const": "arc.domain_summary.v5"},
         "domain_title": {"type": "string"},
         "brief_introduction": {"type": "string"},
         "task_focus": {
@@ -89,6 +92,102 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "claim": {"type": "string"},
                     "papers": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "mathematical_opportunities": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["well_defined_problems"],
+            "properties": {
+                "well_defined_problems": {
+                    "type": "array",
+                    "maxItems": SUMMARY_MATHEMATICAL_OPPORTUNITY_LIMIT,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "problem",
+                            "importance",
+                            "mathematical_object",
+                            "assumptions_and_regime",
+                            "success_criterion",
+                            "available_systematic_methods",
+                            "bounded_first_calculation",
+                            "feasibility",
+                            "target_domain_papers",
+                            "evidence_status",
+                        ],
+                        "properties": {
+                            "problem": {"type": "string"},
+                            "importance": {"type": "string"},
+                            "mathematical_object": {"type": "string"},
+                            "assumptions_and_regime": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "success_criterion": {"type": "string"},
+                            "available_systematic_methods": {
+                                "type": "array",
+                                "maxItems": SUMMARY_SYSTEMATIC_METHOD_LIMIT,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": [
+                                        "method",
+                                        "origin",
+                                        "source_area",
+                                        "required_adaptation",
+                                        "applicability_conditions",
+                                        "validation_checks",
+                                    ],
+                                    "properties": {
+                                        "method": {"type": "string"},
+                                        "origin": {
+                                            "type": "string",
+                                            "enum": ["in_domain", "external_search_lead"],
+                                        },
+                                        "source_area": {"type": "string"},
+                                        "required_adaptation": {"type": "string"},
+                                        "applicability_conditions": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "validation_checks": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                    },
+                                },
+                            },
+                            "bounded_first_calculation": {"type": "string"},
+                            "feasibility": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["ready_inputs", "blocking_unknowns", "kill_criterion"],
+                                "properties": {
+                                    "ready_inputs": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "blocking_unknowns": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "kill_criterion": {"type": "string"},
+                                },
+                            },
+                            "target_domain_papers": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {"type": "string"},
+                            },
+                            "evidence_status": {
+                                "type": "string",
+                                "enum": ["source_explicit", "source_grounded_inference"],
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -138,6 +237,15 @@ DOMAIN_SUMMARY_SCHEMA: dict[str, Any] = {
 def _schema_error(payload: dict[str, Any], schema: dict[str, Any]) -> str | None:
     try:
         validate_json_schema(instance=payload, schema=schema)
+        return None
+    except (JsonSchemaValidationError, JsonSchemaError) as exc:
+        return str(exc)
+
+
+def mathematical_opportunities_validation_error(value: Any) -> str | None:
+    schema = DOMAIN_SUMMARY_SCHEMA["properties"]["mathematical_opportunities"]
+    try:
+        validate_json_schema(instance=value, schema=schema)
         return None
     except (JsonSchemaValidationError, JsonSchemaError) as exc:
         return str(exc)
@@ -224,7 +332,7 @@ def summarize_domain(
         selection=selection,
     )
     summary["summary_method"] = method
-    summary["schema_version"] = "arc.domain_summary.v4"
+    summary["schema_version"] = "arc.domain_summary.v5"
     summary["domain_id"] = paths.domain_id
     summary["created_at"] = now_iso()
     write_json(paths.domain_summary, summary)
@@ -281,7 +389,7 @@ def _normalize_domain_summary_output(
     evidence: dict[str, Any],
     selection: dict[str, Any],
 ) -> tuple[dict[str, Any], str, list[str]]:
-    del paths, graph, evidence
+    del paths
     warnings: list[str] = []
     if isinstance(raw, dict):
         raw_dict = dict(raw)
@@ -294,7 +402,20 @@ def _normalize_domain_summary_output(
     schema_error = _schema_error(raw, DOMAIN_SUMMARY_SCHEMA)
     recovery_warning = _call_record_warning(raw)
     if schema_error is None and recovery_warning is None:
-        return raw, "llm", []
+        mathematical_opportunities, evidence_warnings = _mathematical_opportunities_from_relaxed(
+            raw,
+            allowed_paper_ids=_allowed_target_domain_paper_ids(
+                graph=graph,
+                evidence=evidence,
+                selection=selection,
+            ),
+        )
+        if not evidence_warnings:
+            return raw, "llm", []
+        normalized = dict(raw)
+        normalized["mathematical_opportunities"] = mathematical_opportunities
+        normalized["warnings"] = [*raw.get("warnings", []), *evidence_warnings]
+        return normalized, "llm_relaxed", evidence_warnings
 
     if schema_error is not None:
         warnings.append("domain_summary_schema_relaxed:" + _compact_text(schema_error, SUMMARY_REASON_CHAR_LIMIT))
@@ -317,8 +438,17 @@ def _normalize_domain_summary_output(
     )
     raw_warnings = raw_without_record.get("warnings")
     normalized_warnings = [str(item) for item in raw_warnings if item] if isinstance(raw_warnings, list) else []
+    mathematical_opportunities, evidence_warnings = _mathematical_opportunities_from_relaxed(
+        raw_without_record,
+        allowed_paper_ids=_allowed_target_domain_paper_ids(
+            graph=graph,
+            evidence=evidence,
+            selection=selection,
+        ),
+    )
+    warnings.extend(evidence_warnings)
     normalized = {
-        "schema_version": "arc.domain_summary.v4",
+        "schema_version": "arc.domain_summary.v5",
         "domain_title": str(
             raw_without_record.get("domain_title")
             or raw_without_record.get("domain")
@@ -330,6 +460,7 @@ def _normalize_domain_summary_output(
         "foundation_paper": foundation,
         "best_reference_paper": best_reference,
         "methodology": _methodology_from_relaxed(raw_without_record),
+        "mathematical_opportunities": mathematical_opportunities,
         "known_solved_cases": _solved_cases_from_relaxed(raw_without_record),
         "open_axes_for_new_work": _open_axes_from_relaxed(raw_without_record),
         "warnings": [*normalized_warnings, *warnings],
@@ -388,6 +519,71 @@ def _task_focus_from_relaxed(raw: dict[str, Any], *, selection: dict[str, Any]) 
 def _methodology_from_relaxed(raw: dict[str, Any]) -> list[dict[str, Any]]:
     source = raw.get("methodology") or raw.get("core_methodology") or []
     return _items_as_claims(source, claim_key="claim")
+
+
+def _mathematical_opportunities_from_relaxed(
+    raw: dict[str, Any],
+    *,
+    allowed_paper_ids: set[str],
+) -> tuple[dict[str, Any], list[str]]:
+    source = raw.get("mathematical_opportunities")
+    if isinstance(source, dict):
+        problems = source.get("well_defined_problems")
+    elif isinstance(source, list):
+        problems = source
+    else:
+        problems = []
+
+    normalized = []
+    warnings = []
+    item_schema = DOMAIN_SUMMARY_SCHEMA["properties"]["mathematical_opportunities"]["properties"][
+        "well_defined_problems"
+    ]["items"]
+    for item in _listify(problems):
+        if not isinstance(item, dict):
+            warnings.append("domain_summary_invalid_mathematical_opportunity_dropped")
+            continue
+        if _schema_error(item, item_schema) is not None:
+            warnings.append("domain_summary_invalid_mathematical_opportunity_dropped")
+            continue
+        papers = [str(value).strip() for value in item["target_domain_papers"] if str(value).strip()]
+        supported_papers = [paper_id for paper_id in papers if paper_id in allowed_paper_ids]
+        unknown_papers = [paper_id for paper_id in papers if paper_id not in allowed_paper_ids]
+        if unknown_papers:
+            warnings.append(
+                "domain_summary_unknown_target_domain_papers_filtered:" + ",".join(unknown_papers)
+            )
+        if not supported_papers:
+            warnings.append("domain_summary_mathematical_opportunity_dropped_without_target_evidence")
+            continue
+        normalized_item = dict(item)
+        normalized_item["target_domain_papers"] = supported_papers
+        normalized.append(normalized_item)
+    return (
+        {"well_defined_problems": normalized[:SUMMARY_MATHEMATICAL_OPPORTUNITY_LIMIT]},
+        warnings,
+    )
+
+
+def _allowed_target_domain_paper_ids(
+    *,
+    graph: dict[str, Any],
+    evidence: dict[str, Any],
+    selection: dict[str, Any],
+) -> set[str]:
+    graph_nodes = graph.get("nodes") if isinstance(graph.get("nodes"), list) else []
+    evidence_papers = evidence.get("papers") if isinstance(evidence.get("papers"), list) else []
+    paper_ids = {
+        str(item.get("paper_id") or item.get("id") or "").strip()
+        for item in [*graph_nodes, *evidence_papers]
+        if isinstance(item, dict)
+    }
+    for key in ("selected_foundation", "best_reference_paper"):
+        item = selection.get(key)
+        if isinstance(item, dict):
+            paper_ids.add(str(item.get("paper_id") or item.get("id") or "").strip())
+    paper_ids.add(str(graph.get("foundation_paper") or "").strip())
+    return {paper_id for paper_id in paper_ids if paper_id}
 
 
 def _solved_cases_from_relaxed(raw: dict[str, Any]) -> list[dict[str, Any]]:
@@ -557,6 +753,27 @@ def _render_summary_prompt(compact_evidence: dict[str, Any]) -> str:
                 "is the concise methodology entry point. Do not include separate single-paper summary attachments."
             ),
             "Explain the domain, key papers, and core methodology.",
+            (
+                "Add mathematical_opportunities.well_defined_problems as an evidence-grounded inventory of at most "
+                f"{SUMMARY_MATHEMATICAL_OPPORTUNITY_LIMIT} important and genuinely feasible mathematical problems. "
+                "Each card must identify the mathematical object, assumptions and regime, a decisive success criterion, "
+                "a bounded first calculation, ready inputs, blocking unknowns, and an explicit kill criterion. "
+                "Prioritize scientific importance and tractability together rather than routine gap filling."
+            ),
+            (
+                "For each mathematical opportunity, list at most "
+                f"{SUMMARY_SYSTEMATIC_METHOD_LIMIT} available_systematic_methods. Mark a method as in_domain only when "
+                "the supplied target-domain evidence supports it. Mark a method as external_search_lead only as a "
+                "promising literature-search lead, and state the source area, required adaptation, applicability "
+                "conditions, and validation checks. An external_search_lead is not evidence that the method is novel, "
+                "applicable, or supported by a cited external paper. Do not invent external citations."
+            ),
+            (
+                "Every opportunity must cite supplied target-domain paper ids and use evidence_status source_explicit "
+                "or source_grounded_inference. Do not invent exact equations, citations, novelty claims, or feasibility "
+                "claims unsupported by the evidence. Return an empty well_defined_problems array when the evidence is "
+                "insufficient. These cards are bounded research interfaces for downstream reasoning, not complete proposals."
+            ),
             (
                 "Add known solved cases. Use them as examples of what a strong research idea looks like: "
                 "a concrete observable, a controlled setup, a tractable first calculation, and clear validation limits. "
@@ -741,6 +958,64 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
             lines.append(f"- {item.get('claim', '')}")
             _append_papers(lines, item.get("papers"))
         lines.append("")
+    opportunities = summary.get("mathematical_opportunities") or {}
+    problems = opportunities.get("well_defined_problems") if isinstance(opportunities, dict) else []
+    if problems:
+        lines.extend(
+            [
+                "## Mathematical Opportunities",
+                "",
+                (
+                    "These evidence-grounded cards are bounded research interfaces, not complete proposals or "
+                    "verified novelty findings. External-search methods are leads that require literature and "
+                    "applicability checks."
+                ),
+                "",
+            ]
+        )
+        for item in problems:
+            lines.append(f"- {item.get('problem', '')}")
+            if importance := item.get("importance"):
+                lines.append(f"  Importance: {importance}")
+            if mathematical_object := item.get("mathematical_object"):
+                lines.append(f"  Mathematical object: {mathematical_object}")
+            _append_named_values(lines, "Assumptions and regime", item.get("assumptions_and_regime"))
+            if success_criterion := item.get("success_criterion"):
+                lines.append(f"  Success criterion: {success_criterion}")
+            methods = item.get("available_systematic_methods") or []
+            if methods:
+                lines.append("  Available systematic methods:")
+                for method in methods:
+                    origin = str(method.get("origin") or "")
+                    origin_label = "external search lead" if origin == "external_search_lead" else "in domain"
+                    lines.append(f"    - {method.get('method', '')} ({origin_label})")
+                    if source_area := method.get("source_area"):
+                        lines.append(f"      Source area: {source_area}")
+                    if adaptation := method.get("required_adaptation"):
+                        lines.append(f"      Required adaptation: {adaptation}")
+                    _append_named_values(
+                        lines,
+                        "Applicability conditions",
+                        method.get("applicability_conditions"),
+                        indent="      ",
+                    )
+                    _append_named_values(
+                        lines,
+                        "Validation checks",
+                        method.get("validation_checks"),
+                        indent="      ",
+                    )
+            if first_calculation := item.get("bounded_first_calculation"):
+                lines.append(f"  Bounded first calculation: {first_calculation}")
+            feasibility = item.get("feasibility") if isinstance(item.get("feasibility"), dict) else {}
+            _append_named_values(lines, "Ready inputs", feasibility.get("ready_inputs"))
+            _append_named_values(lines, "Blocking unknowns", feasibility.get("blocking_unknowns"))
+            if kill_criterion := feasibility.get("kill_criterion"):
+                lines.append(f"  Kill criterion: {kill_criterion}")
+            _append_named_values(lines, "Target-domain papers", item.get("target_domain_papers"))
+            if evidence_status := item.get("evidence_status"):
+                lines.append(f"  Evidence status: {evidence_status}")
+        lines.append("")
     solved_cases = summary.get("known_solved_cases") or []
     if solved_cases:
         lines.extend(
@@ -813,6 +1088,12 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
 def _append_papers(lines: list[str], papers: Any) -> None:
     if papers:
         lines.append(f"  Papers: {', '.join(str(item) for item in papers if item)}")
+
+
+def _append_named_values(lines: list[str], label: str, values: Any, *, indent: str = "  ") -> None:
+    rendered = ", ".join(str(item) for item in _listify(values) if item)
+    if rendered:
+        lines.append(f"{indent}{label}: {rendered}")
 
 
 def _append_key_paper(lines: list[str], label: str, paper: dict[str, Any]) -> None:
