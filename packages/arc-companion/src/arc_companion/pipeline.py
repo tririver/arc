@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from bs4 import BeautifulSoup
 
+from .context_sources import load_context_evidence
 from .glossary import generate_glossary
 from .domain import load_domain_context
 from .evidence import (
@@ -61,6 +62,7 @@ from .projection import (
     prompt_safe_value as _project_prompt_safe_value,
     translation_input_block as _project_translation_input_block,
 )
+from .reader_text import clean_reader_annotation, clean_reader_translation
 from .results import err, ok
 from .segmentation import SegmentationError, segment_document, validate_exact_coverage
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
@@ -79,6 +81,10 @@ TRANSLATION_COVERAGE_REPAIR_TIER = "medium"
 TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION = (
     "arc.companion.translation-citation-delimiters.v2"
 )
+TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION = (
+    "arc.companion.translation-protected-names.v2"
+)
+TRANSLATION_TOKEN_REPAIR_VERSION = "arc.companion.translation-token-repair.v3"
 ANNOTATION_TIER = "high"
 REVIEW_TIER = "high"
 REVIEW_VERSION = "arc.companion.review.v3"
@@ -87,6 +93,31 @@ SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v1"
+FINAL_RENDER_VERSION = "arc.companion.final-render.v3"
+CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
+CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
+CONTEXT_SEGMENT_CHARS_TOTAL = 12_000
+
+_MCP_CONFIG_ENV_KEYS = (
+    "ARC_CODEX_PROFILE",
+    "ARC_CODEX_PROFILE_V2",
+    "ARC_CODEX_CONFIG",
+    "ARC_CODEX_CONFIG_JSON",
+    "ARC_CODEX_MCP_MODE",
+    "ARC_CODEX_ARC_MCP_COMMAND",
+    "ARC_CODEX_ARC_MCP_ENV_JSON",
+    "ARC_CLAUDE_MCP_MODE",
+    "ARC_CLAUDE_MCP_CONFIG",
+    "ARC_CLAUDE_MCP_CONFIG_JSON",
+    "ARC_CLAUDE_STRICT_MCP_CONFIG",
+    "ARC_CLAUDE_ARC_ONLY_ALLOW_EXTRA_CONFIGS",
+    "ARC_CLAUDE_ARC_MCP_COMMAND",
+    "ARC_CLAUDE_ARC_MCP_ARGS_JSON",
+    "ARC_CLAUDE_ARC_MCP_ENV_JSON",
+    "ARC_CLAUDE_ARC_MCP_CONFIG_PATH",
+    "ARC_CLAUDE_TOOLS",
+    "ARC_CLAUDE_ALLOWED_TOOLS",
+)
 
 
 class CompanionLaneError(RuntimeError):
@@ -164,6 +195,9 @@ class BuildOptions:
     review_context_chars: int = DEFAULT_REVIEW_CONTEXT_CHARS
     domain_id: str | None = None
     domain_manifest: Path | None = None
+    allow_mcp: bool = True
+    allow_internet: bool = True
+    context_paper_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.paper_id.strip():
@@ -174,6 +208,14 @@ class BuildOptions:
             raise ValueError("refresh and recache are mutually exclusive")
         if self.domain_id and self.domain_manifest is not None:
             raise ValueError("domain_id and domain_manifest are mutually exclusive")
+        normalized_context_ids = tuple(
+            dict.fromkeys(str(value).strip() for value in self.context_paper_ids if str(value).strip())
+        )
+        if len(normalized_context_ids) != len(self.context_paper_ids):
+            raise ValueError("context_paper_ids must be non-empty and unique")
+        if self.paper_id.strip() in normalized_context_ids:
+            raise ValueError("the source paper cannot also be a context paper")
+        object.__setattr__(self, "context_paper_ids", normalized_context_ids)
 
 
 def build_companion(
@@ -208,7 +250,10 @@ def build_companion(
         bundle = source_loader(options.paper_id, refresh=options.refresh, recache=options.recache)
         generation_document = _generation_document(bundle.document)
         diagnostics = bundle.diagnostics
-        evidence = _evidence(bundle)
+        context_evidence = (
+            load_context_evidence(options.context_paper_ids) if options.context_paper_ids else []
+        )
+        evidence = _evidence(bundle, context_evidence=context_evidence)
         domain_context = load_domain_context(
             domain_id=options.domain_id,
             domain_manifest=options.domain_manifest,
@@ -322,6 +367,7 @@ def build_companion(
             segments=first_wave,
             annotations=raw_annotations,
             translations=translations,
+            evidence=evidence,
             glossary=glossary,
             metadata=bundle.metadata,
             language=options.annotation_language,
@@ -424,6 +470,31 @@ def build_companion(
                 or set(reviewed_translations) != set(reviewed)
             ):
                 raise RuntimeError("review checkpoint does not match current segments")
+            cached_reader_evidence = _reader_evidence_by_segment(
+                expanded,
+                document=bundle.document,
+                evidence=evidence,
+                annotations=reviewed,
+            )
+            reviewed = {
+                str(segment_id): clean_reader_annotation(
+                    annotation,
+                    evidence_records=cached_reader_evidence.get(str(segment_id), []),
+                    language=options.annotation_language,
+                )
+                for segment_id, annotation in reviewed.items()
+            }
+            reviewed_translations = {
+                str(segment_id): clean_reader_translation(translation)
+                for segment_id, translation in reviewed_translations.items()
+            }
+            if (
+                reviewed != cached_reviewed.get("annotations")
+                or reviewed_translations != cached_reviewed.get("translations")
+            ):
+                cached_reviewed["annotations"] = reviewed
+                cached_reviewed["translations"] = reviewed_translations
+                write_json(reviewed_path, cached_reviewed)
         else:
             reviewed_translations, reviewed, review = _review(
                 expanded,
@@ -451,6 +522,7 @@ def build_companion(
             segments=expanded,
             annotations=reviewed,
             translations=reviewed_translations,
+            evidence=evidence,
             glossary=glossary,
             metadata=bundle.metadata,
             language=options.annotation_language,
@@ -460,6 +532,7 @@ def build_companion(
             validation_name="validation.json",
             compiler=compiler,
             pdf_validator=pdf_validator,
+            augmentation_scope="substantive",
         )
         tex_path = Path(final_artifact["tex_path"])
         pdf_path = Path(final_artifact["pdf_path"])
@@ -481,6 +554,7 @@ def build_companion(
             validation_sha256=final_artifact["validation_sha256"],
             source_manifest_path=str(manifest_path),
             validation_path=str(validation_path),
+            final_render_version=FINAL_RENDER_VERSION,
             checkpoint_dir=str(checkpoint_dir),
             diagnostics=list(diagnostics),
         )
@@ -706,8 +780,16 @@ def _publish_pdf_artifact(
     validation_name: str,
     compiler: Callable[[Path, Path], None],
     pdf_validator: Callable[[Path], dict[str, object]],
+    evidence: dict[str, Any] | None = None,
+    augmentation_scope: str = "all",
 ) -> dict[str, Any]:
     """Render, validate, and atomically publish one preview or final PDF artifact."""
+    evidence_by_segment = _reader_evidence_by_segment(
+        segments,
+        document=document,
+        evidence=evidence or {},
+        annotations=annotations,
+    )
     tex, source_manifest = render_companion_tex(
         document,
         segments,
@@ -717,6 +799,8 @@ def _publish_pdf_artifact(
         metadata=metadata,
         translations=translations,
         glossary=glossary,
+        evidence_by_segment=evidence_by_segment,
+        augmentation_scope=augmentation_scope,
     )
     fidelity_errors = validate_tex_fidelity(tex, document, source_manifest)
     if fidelity_errors:
@@ -761,6 +845,49 @@ def _publish_pdf_artifact(
         "validation_sha256": _sha256_existing_file(validation_path),
         "pdf": pdf_report,
     }
+
+
+def _reader_evidence_by_segment(
+    segments: list[dict[str, Any]],
+    *,
+    document: dict[str, Any],
+    evidence: dict[str, Any],
+    annotations: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Attach reader-facing source labels without changing evidence identity."""
+    blocks_by_id = {
+        block_id(block): block for block in document.get("blocks") or []
+    }
+    full_by_id = {
+        str(record.get("evidence_id") or ""): record
+        for record in evidence.get("related_papers") or []
+        if isinstance(record, dict) and record.get("evidence_id")
+    }
+    result: dict[str, list[dict[str, Any]]] = {}
+    for segment in segments:
+        selected = _evidence_for_segment(segment, blocks_by_id, evidence).get("papers") or []
+        records: list[dict[str, Any]] = []
+        for compact in selected:
+            evidence_id = str(compact.get("evidence_id") or "")
+            full = full_by_id.get(evidence_id)
+            if full is None:
+                records.append(dict(compact))
+                continue
+            record = dict(full)
+            record["selected_snippets"] = list(compact.get("snippets") or [])
+            records.append(record)
+        segment_id = str(segment.get("segment_id") or "")
+        present = {str(record.get("evidence_id") or "") for record in records}
+        cited = (
+            (annotations or {}).get(segment_id, {}).get("evidence_ids") or []
+        )
+        for evidence_id in cited:
+            full = full_by_id.get(str(evidence_id))
+            if full is not None and str(evidence_id) not in present:
+                records.append(dict(full))
+                present.add(str(evidence_id))
+        result[segment_id] = records
+    return result
 
 
 def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf) -> dict[str, Any]:
@@ -834,14 +961,16 @@ def _generate_annotations(
         )
         if path.is_file() and not options.force:
             checkpoint = read_json(path)
-            paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
+            paper_context = _full_paper_context(
+                bundle.document, segment, blocks_by_id=by_id, options=options
+            )
             expected_hash = _segment_input_hash(
                 segment, by_id, glossary=glossary,
                 extra={
                     "evidence": segment_evidence,
                     "names": protected_names,
                     "paper_context": paper_context,
-                    "runtime_access": _generation_runtime_policy(),
+                    "runtime_access": _generation_runtime_policy(options),
                     "domain_context": domain_context,
                     "round": round_number,
                     "first_draft": (first_drafts or {}).get(str(segment["segment_id"])),
@@ -854,16 +983,21 @@ def _generate_annotations(
                 and checkpoint.get("segment_id") == segment["segment_id"]
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("annotation"), dict)
-                and checkpoint["annotation"].get("commentary")
             ):
-                output[segment["segment_id"]] = checkpoint["annotation"]
+                output[segment["segment_id"]] = clean_reader_annotation(
+                    checkpoint["annotation"],
+                    evidence_records=segment_evidence["papers"],
+                    language=options.annotation_language,
+                )
                 continue
         pending.append(segment)
 
     def generate(segment: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         selected = [_annotation_input_block(by_id[value], bundle.document) for value in segment["block_ids"]]
         segment_evidence = segment_evidence_by_id[str(segment["segment_id"])]
-        paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
+        paper_context = _full_paper_context(
+            bundle.document, segment, blocks_by_id=by_id, options=options
+        )
         value = _llm_call(
             llm,
             annotation_prompt(
@@ -895,11 +1029,9 @@ def _generate_annotations(
             allow_mcp=True,
             allow_internet=True,
         )
-        if not str(value.get("commentary") or "").strip():
-            raise RuntimeError(f"empty commentary for {segment['segment_id']}")
         normalized = {
-            "commentary": str(value["commentary"]),
-            "explanation": str(value.get("explanation") or value["commentary"]),
+            "commentary": str(value.get("commentary") or ""),
+            "explanation": str(value.get("explanation") or ""),
             "prior_work": _normalize_related_work(
                 value.get("prior_work"),
                 known_evidence_ids=(
@@ -936,6 +1068,11 @@ def _generate_annotations(
                 if round_number == 1 else []
             ),
         }
+        normalized = clean_reader_annotation(
+            normalized,
+            evidence_records=segment_evidence["papers"],
+            language=options.annotation_language,
+        )
         if round_number > 1:
             _drop_unsupported_second_round_related_work(normalized, segment_evidence["papers"])
         _validate_annotation_evidence(normalized, segment_evidence["papers"])
@@ -966,9 +1103,9 @@ def _generate_annotations(
                                 "evidence": segment_evidence_by_id[str(segment_id)],
                                 "names": protected_names,
                                 "paper_context": _full_paper_context(
-                                    bundle.document, segment, blocks_by_id=by_id
+                                    bundle.document, segment, blocks_by_id=by_id, options=options
                                 ),
-                                "runtime_access": _generation_runtime_policy(),
+                                "runtime_access": _generation_runtime_policy(options),
                                 "domain_context": domain_context,
                                 "round": round_number,
                                 "first_draft": (first_drafts or {}).get(str(segment_id)),
@@ -1205,6 +1342,8 @@ def _drop_unsupported_second_round_related_work(
         relation for relation, field in (("prior", "prior_work"), ("later", "later_work"))
         if str(annotation.get(field) or "").strip()
     }
+    if str(annotation.get("explanation") or annotation.get("commentary") or "").strip():
+        used_relations.add("context")
     annotation["evidence_ids"] = [
         value for value in used if relation_by_id.get(value) in used_relations
     ]
@@ -1521,6 +1660,20 @@ def _translation_checkpoint_requires_v4_upgrade(checkpoint: dict[str, Any]) -> b
     )
 
 
+def _translation_checkpoint_requires_protected_name_upgrade(
+    checkpoint: dict[str, Any],
+) -> bool:
+    """Rebuild deterministic name repairs made under an older matching policy."""
+    repairs = (checkpoint.get("generation_provenance") or {}).get("repairs") or []
+    return any(
+        isinstance(item, dict)
+        and item.get("kind") == "protected-name-normalization"
+        and item.get("normalizer_version")
+        != TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION
+        for item in repairs
+    )
+
+
 def _translation_primary_draft_payload(
     segment: dict[str, Any],
     translation: dict[str, Any],
@@ -1546,6 +1699,7 @@ def _translation_primary_draft_payload(
 def _seed_translation_coverage_draft(
     segment: dict[str, Any],
     *,
+    options: BuildOptions,
     bundle: SourceBundle,
     glossary: dict[str, Any],
     protected_names: list[str],
@@ -1554,7 +1708,9 @@ def _seed_translation_coverage_draft(
 ) -> Path:
     """Seed an auditable repair-only candidate without invoking the primary model."""
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
-    paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
+    paper_context = _full_paper_context(
+        bundle.document, segment, blocks_by_id=by_id, options=options
+    )
     input_sha256 = _segment_input_hash(
         segment,
         by_id,
@@ -1562,7 +1718,7 @@ def _seed_translation_coverage_draft(
         extra={
             "names": protected_names,
             "paper_context": paper_context,
-            "runtime_access": _generation_runtime_policy(),
+            "runtime_access": _generation_runtime_policy(options),
         },
     )
     path = _translation_draft_path(checkpoint_dir, str(segment["segment_id"]))
@@ -1753,6 +1909,7 @@ def _repair_translation_token_placement(
     provenance = {
         "kind": "token-placement",
         "attempt": 1,
+        "repair_method": "model-offsets-controller-slices",
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
         "citation_delimiter_normalizer_version": (
             TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION
@@ -1802,9 +1959,12 @@ def _generate_translations(
     pending: list[dict[str, Any]] = []
     input_hashes: dict[str, str] = {}
     v4_upgrade_ids: set[str] = set()
+    protected_name_upgrade_ids: set[str] = set()
     for segment in segments:
         path = translation_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json"
-        paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
+        paper_context = _full_paper_context(
+            bundle.document, segment, blocks_by_id=by_id, options=options
+        )
         expected_hash = _segment_input_hash(
             segment,
             by_id,
@@ -1812,7 +1972,7 @@ def _generate_translations(
             extra={
                 "names": protected_names,
                 "paper_context": paper_context,
-                "runtime_access": _generation_runtime_policy(),
+                "runtime_access": _generation_runtime_policy(options),
             },
         )
         input_hashes[str(segment["segment_id"])] = expected_hash
@@ -1824,8 +1984,13 @@ def _generate_translations(
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("translation"), dict)
             ):
+                segment_id = str(segment["segment_id"])
                 if _translation_checkpoint_requires_v4_upgrade(checkpoint):
-                    v4_upgrade_ids.add(str(segment["segment_id"]))
+                    v4_upgrade_ids.add(segment_id)
+                    pending.append(segment)
+                    continue
+                if _translation_checkpoint_requires_protected_name_upgrade(checkpoint):
+                    protected_name_upgrade_ids.add(segment_id)
                     pending.append(segment)
                     continue
                 checkpoint = _repair_translation_checkpoint_citation_delimiters(
@@ -1841,7 +2006,9 @@ def _generate_translations(
         segment_id = str(segment["segment_id"])
         selected = [by_id[value] for value in segment["block_ids"]]
         translatable = [_translation_input_block(block) for block in selected if _is_translatable(block)]
-        paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
+        paper_context = _full_paper_context(
+            bundle.document, segment, blocks_by_id=by_id, options=options
+        )
         artifact_dir = (
             checkpoint_dir / "llm" / "translations" / _segment_checkpoint_name(segment_id)
         )
@@ -1852,6 +2019,7 @@ def _generate_translations(
         )
         candidate_provenance: dict[str, Any] | None = None
         translation: dict[str, Any] | None = None
+        restored_name_ids: list[str] = []
         if (
             isinstance(draft, dict)
             and draft.get("schema_version") == "arc.companion.translation-primary-draft.v1"
@@ -1861,12 +2029,18 @@ def _generate_translations(
         ):
             draft_translation = draft["translation"]
             try:
+                draft_translation, restored_name_ids = (
+                    _restore_translation_protected_names(
+                        segment, draft_translation, by_id, protected_names
+                    )
+                )
                 _validate_translation(segment, draft_translation, by_id, protected_names)
             except TranslationCoverageError:
                 translation = draft_translation
             except TranslationOpaqueTokenError:
                 translation = draft_translation
             except RuntimeError:
+                # Only coverage-invalid drafts have a bounded specialized resume path.
                 pass
             else:
                 if not options.force:
@@ -1884,6 +2058,14 @@ def _generate_translations(
             raise RuntimeError(
                 f"v4 translation upgrade for {segment_id} requires its stored primary draft; "
                 "refusing to rerun the low translation model"
+            )
+        if segment_id in protected_name_upgrade_ids and (
+            translation is None
+            or str((candidate_provenance or {}).get("origin") or "") != "primary-model"
+        ):
+            raise RuntimeError(
+                f"protected-name translation upgrade for {segment_id} requires its stored "
+                "primary draft; refusing to rerun the low translation model"
             )
         if translatable:
             if translation is None:
@@ -1924,7 +2106,23 @@ def _generate_translations(
             translation = {"blocks": []}
             candidate_provenance = {"origin": "controller-empty"}
         assert translation is not None
+        try:
+            translation, newly_restored_ids = _restore_translation_protected_names(
+                segment, translation, by_id, protected_names
+            )
+        except TranslationCoverageError:
+            newly_restored_ids = []
+        restored_name_ids = list(dict.fromkeys([
+            *restored_name_ids, *newly_restored_ids,
+        ]))
         repair_provenance: list[dict[str, Any]] = []
+        if restored_name_ids:
+            repair_provenance.append({
+                "kind": "protected-name-normalization",
+                "attempt": 0,
+                "normalizer_version": TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION,
+                "repaired_block_ids": restored_name_ids,
+            })
         try:
             _validate_translation(segment, translation, by_id, protected_names)
         except TranslationCoverageError:
@@ -1972,6 +2170,7 @@ def _generate_translations(
                     model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
                     allow_mcp=False,
                     allow_internet=False,
+                    force_offline=True,
                 )
                 translation = _apply_translation_coverage_repairs(
                     normalized, segment, missing_blocks, value, by_id
@@ -2008,7 +2207,20 @@ def _generate_translations(
                     )
                     repair_provenance.append(provenance)
             if missing_blocks:
-                _validate_translation(segment, translation, by_id, protected_names)
+                # Model-backed coverage repair is self-contained; never chain another model repair.
+                translation, coverage_name_ids = _restore_translation_protected_names(
+                    segment, translation, by_id, protected_names
+                )
+                if coverage_name_ids:
+                    repair_provenance.append({
+                        "kind": "protected-name-normalization",
+                        "attempt": 0,
+                        "normalizer_version": (
+                            TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION
+                        ),
+                        "repaired_block_ids": coverage_name_ids,
+                    })
+                    _validate_translation(segment, translation, by_id, protected_names)
         except TranslationOpaqueTokenError:
             translation, provenance = _repair_translation_token_placement(
                 segment,
@@ -2022,12 +2234,12 @@ def _generate_translations(
                 llm=llm,
             )
             repair_provenance.append(provenance)
-        translation, normalized_citations = (
+        translation, normalized_citation_ids = (
             _normalize_translation_citation_delimiters_for_segment(translation, by_id)
         )
-        if normalized_citations:
+        if normalized_citation_ids:
             repair_provenance.append(
-                _citation_delimiter_normalization_provenance(normalized_citations)
+                _citation_delimiter_normalization_provenance(normalized_citation_ids)
             )
         _validate_translation(segment, translation, by_id, protected_names)
         return segment_id, translation, {
@@ -2060,9 +2272,9 @@ def _generate_translations(
                             extra={
                                 "names": protected_names,
                                 "paper_context": _full_paper_context(
-                                    bundle.document, segment, blocks_by_id=by_id
+                                    bundle.document, segment, blocks_by_id=by_id, options=options
                                 ),
-                                "runtime_access": _generation_runtime_policy(),
+                                "runtime_access": _generation_runtime_policy(options),
                             },
                         ),
                         "generation_provenance": provenance,
@@ -2087,7 +2299,22 @@ def _review(
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    translations = {
+        str(segment_id): clean_reader_translation(translation)
+        for segment_id, translation in translations.items()
+    }
     by_id = {block_id(block): block for block in document.get("blocks") or []}
+    reader_evidence = _reader_evidence_by_segment(
+        segments, document=document, evidence=evidence, annotations=annotations
+    )
+    annotations = {
+        str(segment_id): clean_reader_annotation(
+            annotation,
+            evidence_records=reader_evidence.get(str(segment_id), []),
+            language=options.annotation_language,
+        )
+        for segment_id, annotation in annotations.items()
+    }
     payload = {
         "segments": [
             {
@@ -2095,6 +2322,9 @@ def _review(
                 "source_blocks": [_annotation_input_block(by_id[value], document) for value in segment["block_ids"]],
                 "translation": translations[segment["segment_id"]],
                 "annotation": annotations[segment["segment_id"]],
+                "context_evidence": _review_context_evidence(
+                    segment, blocks_by_id=by_id, evidence=evidence
+                ),
             }
             for segment in segments
         ]
@@ -2199,15 +2429,20 @@ def _review(
             segments,
             blocks_by_id=by_id,
             document=document,
-            total_chars=min(30_000, max(8_000, final_context_budget // 5)),
+            total_chars=min(24_000, max(8_000, final_context_budget // 6)),
+        )
+        context_evidence_anchors = _review_context_evidence_anchors(
+            payload["segments"],
+            total_chars=min(24_000, max(8_000, final_context_budget // 6)),
         )
         bounded_glossary = _bounded_glossary_projection(
-            glossary, total_chars=min(20_000, max(8_000, final_context_budget // 6))
+            glossary, total_chars=min(20_000, max(8_000, final_context_budget // 7))
         )
         projection_budget = max(
             10_000,
             final_context_budget
             - len(json.dumps(source_anchors, ensure_ascii=False))
+            - len(json.dumps(context_evidence_anchors, ensure_ascii=False))
             - len(json.dumps(bounded_glossary, ensure_ascii=False))
             - 10_000,
         )
@@ -2217,6 +2452,7 @@ def _review(
             ),
             "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
             "source_anchors": source_anchors,
+            "context_evidence_anchors": context_evidence_anchors,
             "glossary": bounded_glossary,
             "protected_names": protected_names,
             "instruction": (
@@ -2251,12 +2487,14 @@ def _review(
         original_annotation = dict(reviewed[segment_id])
         translation_changed = patch.get("translation_blocks") is not None
         if translation_changed:
-            replacement = {"blocks": list(patch.get("translation_blocks") or [])}
+            replacement = clean_reader_translation(
+                {"blocks": list(patch.get("translation_blocks") or [])}
+            )
             segment = next(item for item in segments if item["segment_id"] == segment_id)
-            replacement, changed = _normalize_translation_citation_delimiters_for_segment(
+            replacement, changed_ids = _normalize_translation_citation_delimiters_for_segment(
                 replacement, by_id
             )
-            if changed:
+            if changed_ids:
                 citation_normalized.add(segment_id)
             _validate_translation(segment, replacement, by_id, protected_names)
             reviewed_translations[segment_id] = replacement
@@ -2275,14 +2513,22 @@ def _review(
                 reviewed[segment_id][field] = _normalize_related_work(patch[field])
             else:
                 text = str(patch[field])
-                if field in {"commentary", "explanation"} and not text.strip():
-                    raise RuntimeError(f"review returned empty {field} patch: {segment_id}")
                 reviewed[segment_id][field] = text
         if any(field in changed_annotation_fields for field in ("prior_work", "later_work")):
             _sync_claim_evidence_ids(reviewed[segment_id])
         segment = next(item for item in segments if item["segment_id"] == segment_id)
         _validate_annotation_evidence(
-            reviewed[segment_id], _evidence_for_segment(segment, by_id, evidence)["papers"]
+            clean_reader_annotation(
+                reviewed[segment_id],
+                evidence_records=reader_evidence.get(segment_id, []),
+                language=options.annotation_language,
+            ),
+            _evidence_for_segment(segment, by_id, evidence)["papers"]
+        )
+        reviewed[segment_id] = clean_reader_annotation(
+            reviewed[segment_id],
+            evidence_records=reader_evidence.get(segment_id, []),
+            language=options.annotation_language,
         )
         _assert_review_did_not_add_related_work(original_annotation, reviewed[segment_id])
         patched.add(segment_id)
@@ -2331,8 +2577,15 @@ def _llm_call(
     model_tier: str,
     allow_mcp: bool = False,
     allow_internet: bool = False,
+    force_offline: bool = False,
 ) -> dict[str, Any]:
-    runtime_env = _llm_runtime_env(allow_mcp=allow_mcp, allow_internet=allow_internet)
+    force_offline = force_offline or (not allow_mcp and not allow_internet)
+    runtime_env = _llm_runtime_env(
+        allow_mcp=not force_offline and allow_mcp and options.allow_mcp,
+        allow_internet=not force_offline and allow_internet and options.allow_internet,
+        force_disable_mcp=force_offline or not options.allow_mcp,
+        force_disable_internet=force_offline or not options.allow_internet,
+    )
     return llm(
         prompt,
         schema=schema,
@@ -2346,25 +2599,51 @@ def _llm_call(
     )
 
 
-def _generation_runtime_policy() -> dict[str, bool | str]:
-    return {"allow_mcp": True, "allow_internet": True, "mcp_mode": "arc-only"}
+def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str, bool | str]:
+    allow_mcp = True if options is None else options.allow_mcp
+    allow_internet = True if options is None else options.allow_internet
+    policy: dict[str, bool | str] = {
+        "allow_mcp": allow_mcp,
+        "allow_internet": allow_internet,
+    }
+    if allow_mcp:
+        policy["mcp_mode"] = "arc-only"
+    return policy
 
 
-def _llm_runtime_env(*, allow_mcp: bool, allow_internet: bool) -> dict[str, str]:
+def _llm_runtime_env(
+    *,
+    allow_mcp: bool,
+    allow_internet: bool,
+    force_disable_mcp: bool = False,
+    force_disable_internet: bool = False,
+) -> dict[str, str] | None:
     """Map portable access intent onto both supported host runtimes."""
+    if not allow_mcp and not allow_internet and not force_disable_mcp and not force_disable_internet:
+        return None
     env = dict(os.environ)
-    internet_value = "true" if allow_internet else "false"
-    env["ARC_CODEX_ALLOW_INTERNET"] = internet_value
-    env["ARC_CLAUDE_ALLOW_INTERNET"] = internet_value
-    mcp_value = "true" if allow_mcp else "false"
-    env["ARC_CODEX_ENABLE_MCP"] = mcp_value
-    env["ARC_CLAUDE_ALLOW_MCP"] = mcp_value
+    if allow_internet or force_disable_internet:
+        value = "true" if allow_internet else "false"
+        env["ARC_CODEX_ALLOW_INTERNET"] = value
+        env["ARC_CLAUDE_ALLOW_INTERNET"] = value
+    if allow_mcp or force_disable_mcp:
+        value = "true" if allow_mcp else "false"
+        env["ARC_CODEX_ENABLE_MCP"] = value
+        env["ARC_CLAUDE_ALLOW_MCP"] = value
     if allow_mcp:
         env["ARC_CODEX_MCP_MODE"] = "arc-only"
         env["ARC_CLAUDE_MCP_MODE"] = "arc-only"
-    else:
-        env.pop("ARC_CODEX_MCP_MODE", None)
-        env.pop("ARC_CLAUDE_MCP_MODE", None)
+    elif force_disable_mcp:
+        for key in _MCP_CONFIG_ENV_KEYS:
+            env.pop(key, None)
+        # These controls map to provider-native isolation flags.  Merely setting
+        # allow-MCP=false is insufficient when a parent profile/config injects
+        # servers or tools before the provider evaluates that boolean.
+        env["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
+        env["ARC_CLAUDE_BARE"] = "true"
+        claude_web_tools = "WebSearch,WebFetch" if allow_internet else ""
+        env["ARC_CLAUDE_TOOLS"] = claude_web_tools
+        env["ARC_CLAUDE_ALLOWED_TOOLS"] = claude_web_tools
     return env
 
 
@@ -2409,11 +2688,16 @@ def _fingerprint(
             "runtime_access": {
                 "segmentation": {"allow_mcp": False, "allow_internet": False},
                 "glossary": {"allow_mcp": False, "allow_internet": False},
-                "translation": _generation_runtime_policy(),
-                "annotation": _generation_runtime_policy(),
+                "translation": _generation_runtime_policy(options),
+                "annotation": _generation_runtime_policy(options),
                 "review": {"allow_mcp": False, "allow_internet": False},
             },
             "full_paper_context_version": FULL_PAPER_CONTEXT_VERSION,
+            "context_selection": {
+                "version": CONTEXT_SELECTION_VERSION,
+                "chars_per_source": CONTEXT_SEGMENT_CHARS_PER_SOURCE,
+                "chars_total": CONTEXT_SEGMENT_CHARS_TOTAL,
+            },
             "metadata_hash": sha256_json(bundle.metadata),
             "evidence_hash": sha256_json(evidence),
             "domain_context_hash": sha256_json(domain_context) if domain_context is not None else None,
@@ -2465,6 +2749,8 @@ def _sha256_existing_file(path: Path) -> str:
 
 
 def _completion_outputs_match(state: dict[str, Any]) -> bool:
+    if state.get("final_render_version") != FINAL_RENDER_VERSION:
+        return False
     checks = (
         ("output_tex", "output_tex_sha256"),
         ("output_pdf", "output_pdf_sha256"),
@@ -2516,7 +2802,9 @@ def _first_wave_preview_outputs_match(state: dict[str, Any], *, workers: int) ->
     return True
 
 
-def _evidence(bundle: SourceBundle) -> dict[str, Any]:
+def _evidence(
+    bundle: SourceBundle, *, context_evidence: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     def compact(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         fields = (
             "paper_id", "arxiv_id", "doi", "inspire_id", "title", "authors",
@@ -2539,7 +2827,7 @@ def _evidence(bundle: SourceBundle) -> dict[str, Any]:
         "references": compact(bundle.references),
         "citers": compact(bundle.citers),
         "bibliography": bibliography,
-        "related_papers": list(bundle.related_evidence),
+        "related_papers": [*bundle.related_evidence, *(context_evidence or [])],
         "diagnostics": list(bundle.diagnostics),
     }
 
@@ -2695,10 +2983,7 @@ def _apply_translation_coverage_repairs(
     ]
     return {
         **normalized_translation,
-        "blocks": [
-            preserved[value] if value in preserved else additions[value]
-            for value in expected_ids
-        ],
+        "blocks": [preserved.get(value) or additions[value] for value in expected_ids],
     }
 
 
@@ -2986,8 +3271,8 @@ def _apply_translation_slot_repair_block(
         if cursor != len(residue):
             raise RuntimeError("translation slot repair offsets do not cover prior residue")
     else:
-        # Compatibility for already-persisted v1 repair payloads. New model
-        # calls are schema-constrained to offsets and cannot enter this branch.
+        # Compatibility for direct callers with v1 payloads. New model calls
+        # are schema-constrained to offsets and cannot enter this branch.
         slots = [str(item.get("text") or "") for item in raw_slots]
         if any("[[ARC_INLINE:" in text or _OPAQUE_INLINE_PATTERN.search(text) for text in slots):
             raise RuntimeError("translation slot repair supplied controller-owned opaque content")
@@ -3076,13 +3361,7 @@ def _validate_translation_repair_slot_boundaries(
 def _normalize_translation_citation_delimiters(
     source_block: dict[str, Any], translated_text: str,
 ) -> str:
-    """Canonicalize source-owned ASCII citation wrappers around immutable tokens.
-
-    A model may omit either delimiter or leave an empty pair on one side of a
-    citation token. The source run sequence determines whether the wrapper is
-    required, so the controller can repair these structural characters without
-    asking the model to rewrite translated prose.
-    """
+    """Canonicalize source-owned ASCII citation wrappers around immutable tokens."""
     source_text = str(_translation_input_block(source_block).get("text") or "")
     opaque_runs = [
         run
@@ -3252,12 +3531,12 @@ def _repair_reviewed_translation_checkpoint(
         translation = translations.get(segment_id)
         if not isinstance(translation, dict):
             raise RuntimeError(f"review checkpoint has no translation for {segment_id}")
-        repaired, changed = _normalize_translation_citation_delimiters_for_segment(
+        repaired, changed_ids = _normalize_translation_citation_delimiters_for_segment(
             translation, blocks_by_id
         )
         _validate_translation(segment, repaired, blocks_by_id, protected_names)
         repaired_translations[segment_id] = repaired
-        if changed:
+        if changed_ids:
             changed_segments.append(segment_id)
     if not changed_segments:
         return checkpoint, []
@@ -3285,15 +3564,15 @@ def _repair_translation_checkpoint_citation_delimiters(
         item_id = str(item.get("block_id") or "")
         if blocks_by_id.get(item_id) is None:
             raise RuntimeError(f"translation checkpoint contains unknown block {item_id}")
-    repaired_translation, changed = _normalize_translation_citation_delimiters_for_segment(
+    repaired_translation, changed_ids = _normalize_translation_citation_delimiters_for_segment(
         translation, blocks_by_id
     )
     _validate_translation(segment, repaired_translation, blocks_by_id, protected_names)
-    if not changed:
+    if not changed_ids:
         return checkpoint
     generation_provenance = dict(checkpoint.get("generation_provenance") or {})
     repairs = list(generation_provenance.get("repairs") or [])
-    repairs.append(_citation_delimiter_normalization_provenance(changed))
+    repairs.append(_citation_delimiter_normalization_provenance(changed_ids))
     repaired_checkpoint = {
         **checkpoint,
         "generation_provenance": {**generation_provenance, "repairs": repairs},
@@ -3313,7 +3592,9 @@ def _opaque_inline_token(run: dict[str, Any]) -> str:
 
 
 _OPAQUE_INLINE_PATTERN = re.compile(r"\[\[ARC_INLINE:[^\]\s]+:[0-9a-f]{64}\]\]")
-_OPAQUE_INLINE_CANDIDATE_PATTERN = re.compile(r"\[\[ARC_INLINE:[^\]\r\n]{0,512}\]\]")
+_OPAQUE_INLINE_CANDIDATE_PATTERN = re.compile(
+    r"\[\s*\[ARC_INLINE:[^\]\r\n]{0,512}\]\s*\]"
+)
 
 
 def _opaque_inline_tokens(block: dict[str, Any]) -> list[str]:
@@ -3330,6 +3611,7 @@ def _full_paper_context(
     *,
     blocks_by_id: dict[str, dict[str, Any]],
     max_chars: int = FULL_PAPER_CONTEXT_CHARS,
+    options: BuildOptions | None = None,
 ) -> dict[str, Any]:
     """Build bounded navigation and source anchors without preservation-only HTML."""
     excluded_generation_ids = _generation_excluded_block_ids(document)
@@ -3391,7 +3673,7 @@ def _full_paper_context(
         },
         "section_navigation": navigation,
         "neighboring_source_anchors": neighbors,
-        "access": _generation_runtime_policy(),
+        "access": _generation_runtime_policy(options),
     }
     _shrink_paper_context(context, max_chars=max_chars)
     return context
@@ -3468,6 +3750,43 @@ def _validate_translation(
                 actual_tokens=actual_tokens,
             )
         _validate_names_in_generated([source], text, protected_names, label=block_id(source))
+
+
+def _restore_translation_protected_names(
+    segment: dict[str, Any],
+    translation: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+    protected_names: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Deterministically retain source eponyms without relaxing validation."""
+    expected_blocks, raw_blocks = _translation_preflight(
+        segment, translation, blocks_by_id
+    )
+    changed_ids: list[str] = []
+    restored_blocks: list[dict[str, Any]] = []
+    for source, translated in zip(expected_blocks, raw_blocks):
+        text = str(translated.get("text") or "")
+        missing = _minimal_missing_name_insertions(
+            _missing_protected_names([source], text, protected_names)
+        )
+        if missing:
+            text = _append_protected_name_annotation(text, missing)
+            changed_ids.append(block_id(source))
+        restored_blocks.append({**translated, "text": text})
+    if not changed_ids:
+        return translation, []
+    return {**translation, "blocks": restored_blocks}, changed_ids
+
+
+def _append_protected_name_annotation(text: str, names: list[str]) -> str:
+    """Append one minimal Latin-name annotation before terminal punctuation."""
+    if not names:
+        return text
+    annotation = f"（{'、'.join(names)}）"
+    match = re.search(r"([。！？!?；;：:,，]+\s*)$", text)
+    if match:
+        return text[:match.start()] + annotation + text[match.start():]
+    return text + annotation
 
 
 def _translation_preflight(
@@ -3706,7 +4025,10 @@ def _missing_protected_names(
     source = "\n".join(_natural_text_for_name_validation(block) for block in source_blocks)
     return [
         name for name in protected_names
-        if re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", source, re.IGNORECASE)
+        # A protected name is a canonical Latin spelling, not a case-folded
+        # keyword.  Exact source case prevents roots such as ``May``, ``Young``,
+        # or ``Lie`` from matching ordinary prose while retaining true eponyms.
+        if re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", source)
         and not re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", generated)
     ]
 
@@ -3836,11 +4158,14 @@ def _evidence_for_segment(
                 text = str(block.get("text") or "")[:remaining]
                 if not text:
                     continue
-                snippets.append({
+                snippet = {
                     "block_id": str(block.get("block_id") or ""),
                     "text": text,
                     "sha256": text_sha256(text),
-                })
+                }
+                if str(block.get("section_title") or "").strip():
+                    snippet["section_title"] = str(block["section_title"]).strip()
+                snippets.append(snippet)
                 remaining -= len(text)
                 if remaining <= 0:
                     break
@@ -3862,6 +4187,76 @@ def _evidence_for_segment(
                     compact["source_descriptor"] = descriptor
                 validate_evidence_record(compact)
             selected.append(compact)
+    context_papers = [
+        paper for paper in evidence.get("related_papers") or []
+        if paper.get("relation") == "context"
+    ]
+    if context_papers:
+        per_source_budget = min(
+            CONTEXT_SEGMENT_CHARS_PER_SOURCE,
+            max(1, CONTEXT_SEGMENT_CHARS_TOTAL // len(context_papers)),
+        )
+        for paper in context_papers:
+            compact = {key: paper.get(key) for key in (
+                "evidence_id", "relation", "paper_id", "title", "authors", "year",
+                "evidence_level", "abstract", "context_role", "context_index",
+            )}
+            ranked_blocks = sorted(
+                enumerate(paper.get("blocks") or []),
+                key=lambda pair: (
+                    -len(source_tokens & _terms(str(pair[1].get("text") or ""))),
+                    pair[0],
+                ),
+            )
+            remaining = per_source_budget
+            snippets: list[dict[str, str]] = []
+            for _, block in ranked_blocks:
+                text = str(block.get("text") or "")[:remaining]
+                if not text:
+                    continue
+                snippet = {
+                    "block_id": str(block.get("block_id") or ""),
+                    "text": text,
+                    "sha256": text_sha256(text),
+                }
+                if str(block.get("section_title") or "").strip():
+                    snippet["section_title"] = str(block["section_title"]).strip()
+                snippets.append(snippet)
+                remaining -= len(text)
+                if remaining <= 0:
+                    break
+            if not snippets:
+                continue
+            descriptor = paper.get("source_descriptor") or {}
+            locator = descriptor.get("locator") or {}
+            compact["snippets"] = snippets
+            compact["context_selection"] = {
+                "version": CONTEXT_SELECTION_VERSION,
+                "query_sha256": text_sha256(source_text),
+                "chars_per_source": CONTEXT_SEGMENT_CHARS_PER_SOURCE,
+                "chars_total": CONTEXT_SEGMENT_CHARS_TOTAL,
+                "selected_chars": sum(len(item["text"]) for item in snippets),
+            }
+            compact["source_descriptor"] = arc_cache_descriptor(
+                paper_id=str(paper.get("paper_id") or descriptor.get("canonical_locator") or ""),
+                title=str(paper.get("title") or ""),
+                authors=paper.get("authors") or [],
+                year=paper.get("year"),
+                evidence_level="full_text",
+                content=snippets,
+                document_hash=str(locator.get("document_hash") or ""),
+            )
+            validate_evidence_record(compact)
+            selected.append(compact)
+    required_ids = set(
+        (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
+    )
+    selected_ids = {str(item.get("evidence_id") or "") for item in selected}
+    for paper in evidence.get("related_papers") or []:
+        evidence_id = str(paper.get("evidence_id") or "")
+        if evidence_id in required_ids and evidence_id not in selected_ids:
+            selected.append(paper)
+            selected_ids.add(evidence_id)
     return {
         "schema_version": "arc.companion.segment-evidence.v3",
         "citation_targets": citation_targets,
@@ -4286,6 +4681,22 @@ def _bounded_glossary_projection(
     return projected
 
 
+
+
+def _review_context_evidence(
+    segment: dict[str, Any],
+    *,
+    blocks_by_id: dict[str, dict[str, Any]],
+    evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return the exact bounded context records used for this segment."""
+    return [
+        item
+        for item in _evidence_for_segment(segment, blocks_by_id, evidence)["papers"]
+        if item.get("relation") == "context"
+    ]
+
+
 def _review_chunks(items: list[dict[str, Any]], target_chars: int) -> list[list[dict[str, Any]]]:
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
@@ -4334,6 +4745,46 @@ def _review_source_anchors(
             "source_excerpt": excerpt,
         })
     return anchors
+
+
+def _review_context_evidence_anchors(
+    segment_payloads: list[dict[str, Any]], *, total_chars: int
+) -> list[dict[str, Any]]:
+    """Keep auditable per-segment context descriptors in the final review budget."""
+    per_segment = max(1, total_chars // max(1, len(segment_payloads)))
+    output: list[dict[str, Any]] = []
+    for item in segment_payloads:
+        segment = item.get("segment") or {}
+        records: list[dict[str, Any]] = []
+        remaining = per_segment
+        for evidence_item in item.get("context_evidence") or []:
+            snippets: list[dict[str, str]] = []
+            for snippet in evidence_item.get("snippets") or []:
+                if remaining <= 0:
+                    break
+                text = str(snippet.get("text") or "")[:remaining]
+                if not text:
+                    continue
+                snippets.append({
+                    "block_id": str(snippet.get("block_id") or ""),
+                    "text": text,
+                    "sha256": text_sha256(text),
+                })
+                remaining -= len(text)
+            descriptor = evidence_item.get("source_descriptor")
+            records.append({
+                "evidence_id": str(evidence_item.get("evidence_id") or ""),
+                "paper_id": str(evidence_item.get("paper_id") or ""),
+                "source_descriptor": descriptor if isinstance(descriptor, dict) else {},
+                "snippets": snippets,
+                "selection": evidence_item.get("context_selection") or {},
+            })
+        output.append({
+            "segment_id": str(segment.get("segment_id") or ""),
+            "context_evidence": records,
+            "excerpt_budget_chars": per_segment,
+        })
+    return output
 
 
 def _state(path: Path, **values: Any) -> dict[str, Any]:

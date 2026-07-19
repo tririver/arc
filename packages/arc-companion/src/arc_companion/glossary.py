@@ -11,7 +11,7 @@ from .segmentation import build_block_inventory, build_segmentation_windows
 from .source import block_id
 
 
-GLOSSARY_VERSION = "arc.companion.glossary.v3"
+GLOSSARY_VERSION = "arc.companion.glossary.v4"
 ABSOLUTE_GLOSSARY_LIMIT = 200
 
 
@@ -109,6 +109,7 @@ def generate_glossary(
     entries = _normalize_entries(consolidated.get("entries") or [], blocks)
     entries = _deduplicate(entries)
     entries = entries[:glossary_entry_limit(page_count)]
+    _restore_protected_names(entries, protected_names)
     _validate_protected_names(entries, protected_names)
     output = {
         "schema_version": GLOSSARY_VERSION,
@@ -179,6 +180,48 @@ def _validate_protected_names(entries: list[dict[str, Any]], protected_names: li
             raise RuntimeError(
                 f"glossary translated or dropped protected personal names in {source!r}: {missing}"
             )
+
+
+def _restore_protected_names(
+    entries: list[dict[str, Any]], protected_names: list[str]
+) -> None:
+    """Retain a translated term while restoring source-matched Latin names.
+
+    Glossary models sometimes produce a perfectly standard translation but omit
+    the Latin spelling that ARC protects (for example, ``Poisson bracket`` to
+    ``泊松括号``).  Repair that deterministic presentation detail before the
+    strict validator runs.  Names suggested by a model but absent from the
+    source are discarded so substring coincidences cannot create annotations.
+    """
+    for entry in entries:
+        source = str(entry.get("source_term") or "")
+        candidates = _unique_strings([
+            *(entry.get("protected_names") or []),
+            *protected_names,
+        ])
+        matched = [
+            name for name in candidates
+            if name and _contains_latin_name(source, name)
+        ]
+        entry["protected_names"] = matched
+
+        target = str(entry.get("target_term") or "").strip()
+        missing = [name for name in matched if not _contains_latin_name(target, name)]
+        if not missing:
+            continue
+
+        # Prefer a containing full name over separately repeating its parts.
+        # Re-check against the growing annotation because one insertion may
+        # satisfy several protected lexical units (e.g. ``Ada Lovelace``).
+        annotations: list[str] = []
+        augmented = target
+        for name in sorted(missing, key=lambda value: (-len(value), value.casefold())):
+            if _contains_latin_name(augmented, name):
+                continue
+            annotations.append(name)
+            augmented = f"{augmented} {name}"
+        if annotations:
+            entry["target_term"] = f"{target}（{'、'.join(annotations)}）"
 
 
 def _contains_latin_name(text: str, name: str) -> bool:

@@ -11,6 +11,7 @@ import unicodedata
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .io import sha256_file, sha256_json
+from .reader_text import clean_reader_annotation, clean_reader_text, is_machine_summary_label
 from .source import asset_path, block_id
 
 
@@ -41,6 +42,8 @@ def escape_tex(value: Any) -> str:
             math_atoms.clear()
 
     for char in text:
+        if ord(char) < 32 and char not in "\n\r\t":
+            continue
         atom = _unicode_math_atom(char)
         if atom is not None:
             math_atoms.append(atom)
@@ -124,7 +127,11 @@ def render_companion_tex(
     metadata: dict[str, Any] | None = None,
     translations: dict[str, dict[str, Any]] | None = None,
     glossary: dict[str, Any] | list[dict[str, Any]] | None = None,
+    evidence_by_segment: dict[str, list[dict[str, Any]]] | None = None,
+    augmentation_scope: str = "all",
 ) -> tuple[str, dict[str, Any]]:
+    if augmentation_scope not in {"all", "substantive"}:
+        raise ValueError(f"unsupported companion augmentation scope: {augmentation_scope}")
     blocks = document.get("blocks") or []
     figures = _index_entities(document.get("figures") or [])
     tables = _index_entities(document.get("tables") or [])
@@ -132,6 +139,7 @@ def render_companion_tex(
     assets = _index_entities(document.get("assets") or [])
     translation_mode = translations is not None
     translations = translations or {}
+    evidence_by_segment = evidence_by_segment or {}
 
     copied_assets: list[dict[str, Any]] = []
     rendered_links: list[dict[str, str]] = []
@@ -144,6 +152,11 @@ def render_companion_tex(
         for block in blocks
         if block_id(block) not in bibliography_blocks and front_roles.get(block_id(block)) not in {"title", "author"}
     }
+    excluded_augmentation_ids = (
+        _non_substantive_augmentation_block_ids(document)
+        if augmentation_scope == "substantive"
+        else set()
+    )
     segment_by_block: dict[str, str] = {}
     renderable_by_segment: dict[str, list[str]] = {}
     segment_records = {str(item["segment_id"]): item for item in segments}
@@ -157,8 +170,11 @@ def render_companion_tex(
                 end=str(segment.get("end_block_id") or ""),
             )
         visible_ids = [value for value in member_ids if value in renderable_ids]
-        renderable_by_segment[segment_id] = visible_ids
-        for value in visible_ids:
+        augmentation_ids = [
+            value for value in visible_ids if value not in excluded_augmentation_ids
+        ]
+        renderable_by_segment[segment_id] = augmentation_ids
+        for value in augmentation_ids:
             previous = segment_by_block.setdefault(value, segment_id)
             if previous != segment_id:
                 raise LatexError(f"source block {value} belongs to more than one segment")
@@ -179,18 +195,15 @@ def render_companion_tex(
         body.append(_source_block_marker(bid, source_hash))
         segment_id = segment_by_block.get(bid)
         if segment_id and first_by_segment.get(segment_id) == bid:
-            segment = segment_records[segment_id]
-            body.append(_render_unit_heading(segment_id, segment, language=language))
+            body.append(_render_unit_heading())
         if bid in renderable_ids:
             is_table = _kind(block) == "table"
             if segment_id and not is_table and not source_box_open:
-                body.append(_box_begin("arcsource", _labels(language)["source"]))
+                body.append(_box_begin("arcsource"))
                 source_box_open = True
             if is_table and source_box_open:
                 body.append("\\end{arcsource}\n")
                 source_box_open = False
-            if is_table and segment_id:
-                body.append(f"\\noindent\\textbf{{{escape_tex(_labels(language)['source'])}}}\\par\n")
             body.append(_render_block(
                 block,
                 equations=equations,
@@ -209,7 +222,10 @@ def render_companion_tex(
                 if translation is not None:
                     translation_tex, translation_audit = _render_translation(
                         segment_id,
-                        segment_records[segment_id],
+                        {
+                            **segment_records[segment_id],
+                            "block_ids": renderable_by_segment[segment_id],
+                        },
                         translation,
                         document=document,
                         equations=equations,
@@ -221,14 +237,24 @@ def render_companion_tex(
                 annotation = annotations.get(segment_id)
                 if not annotation:
                     raise LatexError(f"missing annotation for segment {segment_id}")
-                body.append(_render_annotation(segment_id, annotation, language=language))
+                body.append(_render_annotation(
+                    segment_id,
+                    annotation,
+                    language=language,
+                    evidence_records=evidence_by_segment.get(segment_id) or [],
+                ))
                 rendered_annotation_ids.append(segment_id)
         elif segment_id and last_by_segment.get(segment_id) == bid:
             # Defensive only: renderable segment endpoints are handled above.
             annotation = annotations.get(segment_id)
             if not annotation:
                 raise LatexError(f"missing annotation for segment {segment_id}")
-            body.append(_render_annotation(segment_id, annotation, language=language))
+            body.append(_render_annotation(
+                segment_id,
+                annotation,
+                language=language,
+                evidence_records=evidence_by_segment.get(segment_id) or [],
+            ))
             rendered_annotation_ids.append(segment_id)
 
     bibliography = document.get("bibliography") or []
@@ -260,6 +286,7 @@ def render_companion_tex(
         + "\n".join(body)
         + "\n\\end{document}\n"
     )
+    tex = _remove_disallowed_c0(tex)
     manifest = {
         "document_sha256": sha256_json(document),
         "document_hash": str(document.get("document_hash") or (document.get("integrity") or {}).get("document_hash") or ""),
@@ -272,6 +299,12 @@ def render_companion_tex(
         "tables": [_table_audit_record(item) for item in document.get("tables") or []],
         "assets": copied_assets,
         "companion_layers": {
+            "augmentation_scope": augmentation_scope,
+            "excluded_augmentation_block_ids": [
+                block_id(block)
+                for block in blocks
+                if block_id(block) in excluded_augmentation_ids
+            ],
             "translation_mode": translation_mode,
             "semantic_segment_ids": semantic_segment_ids,
             "preservation_only_segment_ids": preservation_only_segment_ids,
@@ -483,7 +516,8 @@ def _render_block(
         return _anchors(block) + str(text) + "\n\n"
     if block.get("html"):
         return _anchors(block) + _render_html_fragment(block["html"], rendered_links=rendered_links)
-    return _anchors(block) + escape_tex(block.get("text") or block.get("title") or "") + "\n\n"
+    visible_text = clean_reader_text(block.get("text") or block.get("title") or "")
+    return _anchors(block) + escape_tex(visible_text) + "\n\n"
 
 
 def _render_equation(
@@ -533,9 +567,29 @@ def _render_equation(
 
 
 def _equation_environment(tex: str, *, number: Any, label: Any) -> str:
+    tex = _disambiguate_math_row_starts(tex)
+    if number not in {None, ""}:
+        tex = _strip_equation_identity(tex, strip_numbers=True, strip_labels=False)
     tag = f"\n\\tag{{{escape_tex(_clean_tag(number))}}}" if number not in {None, ""} else ""
     label_tex = f"\n\\label{{{_safe_label(label)}}}" if label else ""
     return f"\\begin{{equation*}}\n{tex}{tag}{label_tex}\n\\end{{equation*}}\n"
+
+
+def _disambiguate_math_row_starts(tex: str) -> str:
+    """Keep a bracketed row from being parsed as ``\\`` spacing.
+
+    TeX ignores whitespace while looking for the optional argument to a math
+    row terminator, so ``\\ [x]`` is parsed as a requested vertical length
+    rather than as a new row beginning with ``[x]``.  An empty group is
+    invisible but stops that optional-argument scan.  Compact, intentional
+    spacing such as ``\\[2pt]`` is left unchanged.
+    """
+    return re.sub(r"\\\\(?P<space>\s+)(?=\[)", r"\\\\{}\g<space>", tex)
+
+
+def _remove_disallowed_c0(value: str) -> str:
+    """Drop C0 controls that XeLaTeX cannot accept, preserving layout whitespace."""
+    return "".join(char for char in value if ord(char) >= 32 or char in "\n\r\t")
 
 
 def _render_figure(
@@ -781,7 +835,18 @@ def _positive_span(value: Any) -> int:
     return span
 
 
-def _render_annotation(segment_id: str, annotation: dict[str, Any], *, language: str) -> str:
+def _render_annotation(
+    segment_id: str,
+    annotation: dict[str, Any],
+    *,
+    language: str,
+    evidence_records: list[dict[str, Any]] | None = None,
+) -> str:
+    annotation = clean_reader_annotation(
+        annotation,
+        evidence_records=evidence_records or [],
+        language=language,
+    )
     labels = _labels(language)
     sections: list[str] = []
     explanation = annotation.get("explanation")
@@ -794,7 +859,13 @@ def _render_annotation(segment_id: str, annotation: dict[str, Any], *, language:
     if later:
         sections.append(_annotation_section(labels["later"], later))
     if not sections:
-        sections.append(_render_rich_text(annotation.get("commentary") or ""))
+        commentary = str(annotation.get("commentary") or "").strip()
+        if not commentary:
+            return (
+                _layer_marker("COMPANION", "BEGIN", segment_id)
+                + _layer_marker("COMPANION", "END", segment_id)
+            )
+        sections.append(_render_rich_text(commentary))
     return (
         _layer_marker("COMPANION", "BEGIN", segment_id)
         +
@@ -868,7 +939,7 @@ _OPAQUE_INLINE_PATTERN = re.compile(r"\[\[ARC_INLINE:([^\]\s]+):([0-9a-f]{64})\]
 
 
 def _render_translated_inline_runs(value: Any, source: dict[str, Any]) -> str:
-    text = str(value or "")
+    text = clean_reader_text(value)
     runs = {
         (str(run.get("token_id") or ""), str(run.get("content_hash") or "")): run
         for run in source.get("inline_runs") or []
@@ -910,9 +981,7 @@ def _annotation_section(title: str, value: Any) -> str:
         for item in value:
             if isinstance(item, dict):
                 text = item.get("text") or item.get("summary") or item.get("claim") or item.get("title") or ""
-                evidence = item.get("evidence_ids") or ([item.get("evidence_id")] if item.get("evidence_id") else [])
-                suffix = f" [{', '.join(str(entry) for entry in evidence)}]" if evidence else ""
-                rendered.append(_render_rich_text(f"{text}{suffix}"))
+                rendered.append(_render_rich_text(text))
             else:
                 rendered.append(_render_rich_text(item))
         content = "\\begin{itemize}\n" + "\n".join(f"\\item {item}" for item in rendered) + "\n\\end{itemize}"
@@ -923,7 +992,7 @@ def _annotation_section(title: str, value: Any) -> str:
 
 def _render_rich_text(value: Any) -> str:
     """Escape prose while retaining explicit TeX math delimiters."""
-    text = str(value or "")
+    text = clean_reader_text(value)
     pattern = re.compile(r"(\\\[(?:.|\n)*?\\\]|\\\((?:.|\n)*?\\\)|\$\$(?:.|\n)*?\$\$|(?<!\\)\$(?:\\.|[^$\n])+?(?<!\\)\$)")
     result: list[str] = []
     position = 0
@@ -1152,18 +1221,16 @@ def _layer_region(tex: str, layer: str, segment_id: str) -> str | None:
     return tex[start:finish]
 
 
-def _render_unit_heading(segment_id: str, segment: dict[str, Any], *, language: str) -> str:
-    title = str(segment.get("title") or "").strip()
-    prefix = _labels(language)["unit"]
-    suffix = f": {escape_tex(title)}" if title else ""
-    return (
-        "\\par\\bigskip\\noindent\\rule{\\linewidth}{0.7pt}\\par\n"
-        f"\\subsection*{{{escape_tex(prefix)} {escape_tex(segment_id)}{suffix}}}\n"
+def _render_unit_heading() -> str:
+    """Separate semantic units visually without exposing controller labels."""
+    return "\\par\\bigskip\\noindent\\rule{\\linewidth}{0.7pt}\\par\n"
+
+
+def _box_begin(environment: str, label: str | None = None) -> str:
+    heading = (
+        f"\\noindent\\textbf{{{escape_tex(label)}}}\\par\n" if label else ""
     )
-
-
-def _box_begin(environment: str, label: str) -> str:
-    return f"\\begin{{{environment}}}\n\\noindent\\textbf{{{escape_tex(label)}}}\\par\n"
+    return f"\\begin{{{environment}}}\n{heading}"
 
 
 def _render_reading_guide(*, language: str, include_translation: bool) -> str:
@@ -1286,10 +1353,32 @@ def _render_html_node(
 ) -> str:
     if isinstance(node, NavigableString):
         text = re.sub(r"\s+", " ", str(node))
+        # Markdown-derived rich blocks escape raw HTML containers into text
+        # nodes (for example ``&lt;details&gt;``).  Apply the same reader
+        # cleanup used by plain-text blocks here, while restoring the boundary
+        # whitespace that ``clean_reader_text`` intentionally trims at the
+        # whole-field level.  Math is handled by the parent ``math`` branch and
+        # therefore never passes through this prose cleanup.
+        leading_space = text.startswith(" ")
+        trailing_space = text.endswith(" ")
+        text = clean_reader_text(text)
+        if not text:
+            return ""
+        if leading_space:
+            text = " " + text
+        if trailing_space:
+            text += " "
         return escape_tex(text)
     if not isinstance(node, Tag):
         return ""
     name = str(node.name or "").lower()
+    if name == "summary":
+        if is_machine_summary_label(node.get_text(" ", strip=True)):
+            return ""
+        return "".join(
+            _render_html_node(child, rendered_links=rendered_links)
+            for child in node.children
+        )
     if name in {"script", "style", "annotation", "semantics", "svg"}:
         return ""
     anchor = _anchor_for_id(node.get("id"))
@@ -1496,6 +1585,169 @@ def _front_matter_block_roles(
                 used.add(key)
                 break
     return roles
+
+
+def _non_substantive_augmentation_block_ids(document: dict[str, Any]) -> set[str]:
+    """Identify source blocks that should not receive translation/commentary.
+
+    This is deliberately a render-only classification.  It never changes the
+    document, segmentation, prompts, or checkpoint hashes.  Explicit ARC
+    structure wins; conservative shape-based inference only fills gaps in
+    Markdown-derived books whose contents entries do not carry per-block roles.
+    """
+    blocks = list(document.get("blocks") or [])
+    if not blocks:
+        return set()
+    positions = {block_id(block): index for index, block in enumerate(blocks)}
+    excluded: set[str] = set()
+
+    excluded_roles = {
+        "acknowledgement", "acknowledgements", "acknowledgment", "acknowledgments",
+        "bibliography", "copyright", "front_matter_affiliations",
+        "front_matter_authors", "front_matter_title", "publication",
+        "publication_details", "references", "table_of_contents", "toc",
+    }
+    for block in blocks:
+        role = str(block.get("source_role") or "").casefold()
+        if role in excluded_roles:
+            excluded.add(block_id(block))
+
+    front = document.get("front_matter") or {}
+    structured_ids = front.get("block_ids") or {}
+    if isinstance(structured_ids, dict):
+        excluded_front_keys = {
+            "affiliation", "affiliations", "author", "authors", "copyright",
+            "institution", "institutions", "publication", "publisher", "title",
+        }
+        for key, values in structured_ids.items():
+            if str(key).casefold() not in excluded_front_keys:
+                continue
+            if not isinstance(values, list):
+                values = [values]
+            excluded.update(str(value) for value in values if str(value) in positions)
+
+    front_roles = _front_matter_block_roles(blocks, front)
+    excluded.update(
+        bid for bid, role in front_roles.items()
+        if role in {"title", "author", "affiliation"}
+    )
+
+    toc_indices = [
+        index for index, block in enumerate(blocks)
+        if str(block.get("source_role") or "").casefold() in {"table_of_contents", "toc"}
+    ]
+    if toc_indices:
+        toc_start = min(toc_indices)
+        inferred_body_start = _body_start_after_contents(blocks, toc_indices)
+        if inferred_body_start is not None:
+            excluded.update(block_id(block) for block in blocks[toc_start:inferred_body_start])
+        else:
+            excluded.update(block_id(blocks[index]) for index in toc_indices)
+
+        # Before the contents, suppress metadata-like and list-oriented route
+        # sections while retaining prose chapters such as a preface or foreword.
+        for group in _section_groups(blocks[:toc_start]):
+            if any(front_roles.get(block_id(block)) == "abstract" for block in group):
+                continue
+            if _is_non_substantive_leading_group(group):
+                excluded.update(block_id(block) for block in group)
+
+    return excluded
+
+
+def _body_start_after_contents(
+    blocks: list[dict[str, Any]], toc_indices: list[int]
+) -> int | None:
+    """Return the first actual section represented by a contents entry."""
+    positions: dict[str, int] = {}
+    for index, block in enumerate(blocks):
+        for key in ("block_id", "source_id", "section_id", "id"):
+            value = block.get(key)
+            if value:
+                positions.setdefault(str(value), index)
+
+    linked_targets: list[int] = []
+    for index in toc_indices:
+        soup = BeautifulSoup(str(blocks[index].get("html") or ""), "html.parser")
+        for anchor in soup.find_all("a"):
+            href = str(anchor.get("href") or "")
+            if href.startswith("#") and href[1:] in positions:
+                target = positions[href[1:]]
+                if target > index:
+                    linked_targets.append(target)
+    if linked_targets:
+        return min(linked_targets)
+
+    last_toc = max(toc_indices)
+    headings = [
+        (index, _heading_signature(block))
+        for index, block in enumerate(blocks[last_toc + 1:], start=last_toc + 1)
+        if _is_heading(block) and _heading_signature(block)
+    ]
+    # Markdown OCR commonly loses TOC roles on the entry lines.  The first
+    # heading that reappears later marks the real chapter (including Preface).
+    for offset, (_, signature) in enumerate(headings):
+        for later_index, later_signature in headings[offset + 1:]:
+            if signature == later_signature:
+                return later_index
+    return None
+
+
+def _heading_signature(block: dict[str, Any]) -> str:
+    text = unicodedata.normalize(
+        "NFKC", str(block.get("title") or block.get("text") or "")
+    ).casefold()
+    text = re.sub(r"\.{2,}\s*\d+\s*$", "", text)
+    text = re.sub(r"\s+\d+\s*$", "", text)
+    return " ".join(re.findall(r"\w+", text, flags=re.UNICODE))
+
+
+def _is_heading(block: dict[str, Any]) -> bool:
+    return bool(
+        _kind(block) in {"heading", "section", "subsection", "subsubsection"}
+        or block.get("heading_level")
+        or isinstance(block.get("heading"), dict)
+    )
+
+
+def _section_groups(blocks: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_section = object()
+    for block in blocks:
+        section = block.get("section_id")
+        if current and section != current_section:
+            groups.append(current)
+            current = []
+        current.append(block)
+        current_section = section
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _is_non_substantive_leading_group(group: list[dict[str, Any]]) -> bool:
+    if not group:
+        return False
+    # Equations and floats are strong evidence that this is substantive source.
+    if any(_kind(block) in {"equation", "math", "display_math", "figure", "image", "table"} for block in group):
+        return False
+    prose = [block for block in group if not _is_heading(block)]
+    list_like = [
+        block for block in prose
+        if block.get("list_kind")
+        or _kind(block) in {"list", "ordered_list", "unordered_list"}
+        or re.match(r"^\s*(?:[-*+•]|\d+[.)])\s+", str(block.get("text") or ""))
+    ]
+    if len(list_like) >= 2:
+        return True
+    prose_lengths = [
+        len(" ".join(str(block.get("text") or "").split())) for block in prose
+    ]
+    prose_chars = sum(prose_lengths)
+    # Retain prose-rich prefatory chapters without relying on language-specific
+    # labels such as "Preface" or "Foreword".
+    return prose_chars < 180 or max(prose_lengths, default=0) < 100
 
 
 def _anchors(item: dict[str, Any]) -> str:

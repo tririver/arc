@@ -158,6 +158,23 @@ External access has different authority in the two generation tracks:
   Claims without captured, verifiable provenance are removed before
   publication rather than attributed from model memory.
 
+Commentary is selected by reader value, not by a requirement to explain every
+segment. An evident passage may have empty explanation and commentary fields;
+generation and review must not fill them with paraphrase or generic teaching
+text. When explanation is useful, choose the most relevant emphasis:
+
+- why the material is needed and how it advances the argument, giving this
+  priority at section and chapter openings;
+- a useful alternative presentation supported by the supplied references;
+- a cautiously stated, substantive incompatibility with another source, while
+  excluding differences that reduce to convention, notation, normalization,
+  or an equivalent formulation; or
+- intermediate mathematics omitted from a derivation that is not evident to
+  the intended reader.
+
+These are priorities, not mandatory fields. Do not force all of them into one
+segment, repeat the source, or invent a distinction solely to create commentary.
+
 MCP and internet access are optional. A host without either capability uses the
 same portable prompt with the current segment, frozen glossary, bounded full-
 paper navigation context, and prepared evidence pack. Generation therefore
@@ -203,11 +220,22 @@ domain context is a preferred relevance signal, not a closed corpus, and never
 disables ARC, INSPIRE, references/citers, or web lookup.
 
 Each commentary separates passage explanation from supported prior and
-subsequent work. Related-work statements cite stable evidence identifiers.
+subsequent work. Stable evidence identifiers remain in structured evidence
+fields and manifests and are never printed as reader-facing hashes or
+controller labels. The rendered citation uses the source title and a section
+or other human-readable location when available, falling back to the source
+title.
 When full text is unavailable, the evidence ledger may supply a verified
 abstract marked `abstract_only`; when neither full text nor an abstract
 supports a statement, that statement must be omitted. Companion-only citations
 are rendered separately and never alter the source paper's bibliography.
+
+Review normalization removes reader-visible HTML/Markdown container syntax
+from source and translation presentation copies while preserving meaningful
+body text and discarding machine-only container summaries. The renderer
+repeats this cleanup defensively and converts legacy inline evidence-ID markers
+into the same human-readable source citations. Immutable source blocks and
+structured evidence bindings remain unchanged for audit.
 
 The controller stores the global registry in `evidence.json` and each unit's
 selection in `segment-evidence/<segment>.json`. Every registered item keeps its
@@ -339,6 +367,10 @@ and companion tracks retain distinct, subtle light backgrounds, with
 typography, spacing, and rules following the reference companion design and
 remaining suitable for printing.
 
+Visual layer styling replaces controller-facing unit headers. Do not print a
+unit label or its segment ID, or an `Original` field, before each source
+passage.
+
 Paper headings use the number already present in the pinned source and render
 with unnumbered LaTeX section commands. Register each heading explicitly at
 its source hierarchy in the table of contents so LaTeX does not prepend a
@@ -361,7 +393,8 @@ Runtime tools:
 
 `validate` checks ordered source coverage, entity hashes and labels, internal
 links, PDF metadata, searchable text, fonts, glossary and protected-name
-consistency, complete translation/commentary coverage, formula-number omission
+consistency, complete translation and annotation-record coverage (while
+permitting intentionally empty commentary prose), formula-number omission
 in translation, and absence of cloned floats. A failed check leaves the run
 artifacts for diagnosis but never publishes a successful deliverable.
 

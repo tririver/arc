@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from arc_companion.glossary import generate_glossary, glossary_entry_limit
+from arc_companion.glossary import (
+    GLOSSARY_VERSION,
+    _validate_protected_names,
+    generate_glossary,
+    glossary_entry_limit,
+)
 
 
 def _document() -> dict:
@@ -52,7 +58,7 @@ def test_glossary_is_consolidated_ordered_and_resumable(tmp_path: Path) -> None:
     assert len(calls) == count
 
 
-def test_glossary_rejects_translated_personal_name(tmp_path: Path) -> None:
+def test_glossary_restores_translated_personal_name_and_keeps_strict_validation(tmp_path: Path) -> None:
     def call_model(prompt, schema, artifact_dir, call_label):
         return {"entries": [{
             "source_term": "Feynman diagram",
@@ -63,11 +69,114 @@ def test_glossary_rejects_translated_personal_name(tmp_path: Path) -> None:
             "first_block_id": "b1",
         }]}
 
+    glossary = generate_glossary(
+        _document(), language="zh-CN", protected_names=["Feynman"],
+        checkpoint_dir=tmp_path, workers=12, force=False, call_model=call_model,
+    )
+
+    assert glossary["entries"][0]["target_term"] == "费曼图（Feynman）"
+    assert glossary["entries"][0]["protected_names"] == ["Feynman"]
     with pytest.raises(RuntimeError, match="protected personal names"):
-        generate_glossary(
-            _document(), language="zh-CN", protected_names=["Feynman"],
-            checkpoint_dir=tmp_path, workers=12, force=False, call_model=call_model,
-        )
+        _validate_protected_names([{
+            "source_term": "Feynman diagram",
+            "target_term": "费曼图",
+            "protected_names": ["Feynman"],
+        }], ["Feynman"])
+
+
+def test_glossary_restores_poisson_without_replacing_standard_translation(tmp_path: Path) -> None:
+    document = {"blocks": [{
+        "block_id": "b1", "type": "text",
+        "text": "The Poisson bracket structure controls the classical algebra.",
+    }]}
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        return {"entries": [{
+            "source_term": "Poisson bracket structure",
+            "target_term": "泊松括号结构",
+            "brief_explanation": "经典可观测量的代数结构",
+            "aliases": [],
+            "protected_names": [],
+            "first_block_id": "b1",
+        }]}
+
+    glossary = generate_glossary(
+        document, language="zh-CN", protected_names=["Poisson"],
+        checkpoint_dir=tmp_path, workers=1, force=False, call_model=call_model,
+    )
+
+    entry = glossary["entries"][0]
+    assert entry["target_term"] == "泊松括号结构（Poisson）"
+    assert entry["protected_names"] == ["Poisson"]
+
+
+def test_glossary_does_not_repeat_protected_name_already_in_target(tmp_path: Path) -> None:
+    def call_model(prompt, schema, artifact_dir, call_label):
+        return {"entries": [{
+            "source_term": "Feynman diagram",
+            "target_term": "Feynman 图",
+            "brief_explanation": "微扰项的图形表示",
+            "aliases": [],
+            "protected_names": [],
+            "first_block_id": "b1",
+        }]}
+
+    glossary = generate_glossary(
+        _document(), language="zh-CN", protected_names=["Feynman"],
+        checkpoint_dir=tmp_path, workers=1, force=False, call_model=call_model,
+    )
+
+    entry = glossary["entries"][0]
+    assert entry["target_term"] == "Feynman 图"
+    assert entry["protected_names"] == ["Feynman"]
+
+
+def test_glossary_protected_name_repair_uses_complete_lexical_boundaries(tmp_path: Path) -> None:
+    document = {"blocks": [{
+        "block_id": "b1", "type": "text",
+        "text": "A Poissonian point process is used.",
+    }]}
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        return {"entries": [{
+            "source_term": "Poissonian point process",
+            "target_term": "泊松点过程",
+            "brief_explanation": "独立计数过程",
+            "aliases": [],
+            "protected_names": ["Poisson"],
+            "first_block_id": "b1",
+        }]}
+
+    glossary = generate_glossary(
+        document, language="zh-CN", protected_names=["Poisson"],
+        checkpoint_dir=tmp_path, workers=1, force=False, call_model=call_model,
+    )
+
+    entry = glossary["entries"][0]
+    assert entry["target_term"] == "泊松点过程"
+    assert entry["protected_names"] == []
+
+
+def test_glossary_version_invalidates_pre_repair_final_cache(tmp_path: Path) -> None:
+    stale = {
+        "schema_version": "arc.companion.glossary.v3",
+        "source_sha256": "irrelevant",
+        "entries": [],
+    }
+    (tmp_path / "glossary.json").write_text(json.dumps(stale), encoding="utf-8")
+    calls: list[str] = []
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        calls.append(call_label)
+        return {"entries": []}
+
+    result = generate_glossary(
+        _document(), language="zh-CN", protected_names=[],
+        checkpoint_dir=tmp_path, workers=1, force=False, call_model=call_model,
+    )
+
+    assert calls
+    assert result["schema_version"] == GLOSSARY_VERSION
 
 
 def test_glossary_protected_name_matching_uses_complete_lexical_boundaries(tmp_path: Path) -> None:

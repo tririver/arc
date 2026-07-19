@@ -486,7 +486,7 @@ def test_parse_markdown_records_sections_equations_and_line_anchors(tmp_path):
 
     parsed = parse_source_input(source_path=markdown_path, source_id="notes")
 
-    assert parsed["parser_version"] == 14
+    assert parsed["parser_version"] == 18
     assert parsed["toc"] == [
         {"id": "sec_0001", "title": "Notes", "level": 1},
         {"id": "sec_0002", "title": "Details", "level": 2},
@@ -498,6 +498,18 @@ def test_parse_markdown_records_sections_equations_and_line_anchors(tmp_path):
     assert parsed["equations"][0]["markdown_line_end"] == 6
     assert parsed["equations"][0]["before"] == "Before the equation."
     assert parsed["equations"][0]["after"] == "After the equation."
+
+
+def test_parse_markdown_preserves_escaped_tilde_while_cleaning_strikethrough(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\n\nA \\~x label and ~~obsolete~~ text.\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_source_input(source_path=markdown_path, source_id="notes")
+
+    assert parsed["sections"][0]["text"] == "# Notes A ~x label and obsolete text."
 
 
 def test_parse_markdown_pdf_uses_combined_hash_and_pdf_mapping(monkeypatch, tmp_path):
@@ -517,3 +529,228 @@ def test_parse_markdown_pdf_uses_combined_hash_and_pdf_mapping(monkeypatch, tmp_
     assert parsed["equations"][0]["printed_equation_number"] == "1.2"
     assert parsed["sections"][0]["pdf_page_start"] == 1
     assert parsed["sections"][0]["pdf_page_end"] == 1
+
+
+def test_source_tags_with_spacing_are_authoritative_for_markdown_and_tex(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\nBefore.\n$$ x = y \\tag {2.20} $$\nAfter.\n", encoding="utf-8")
+    tex_path = tmp_path / "notes.tex"
+    tex_path.write_text(
+        "\\section{Notes}\nBefore.\n\\begin{equation}\nx = y \\tag {2.20}\n\\end{equation}\nAfter.\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(source, "extract_pdf_pages", lambda path: ["Before.\nx = y (9.9)\nAfter."])
+
+    for parsed in (
+        parse_source_input(markdown_path=markdown_path, pdf_path=pdf_path, source_id="markdown"),
+        parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="tex"),
+    ):
+        equation = parsed["equations"][0]
+        assert equation["printed_equation_number"] == "2.20"
+        assert equation["printed_equation_numbers"] == ["2.20"]
+
+
+def test_source_number_directive_is_authoritative_and_removed_from_normalized_latex(
+    monkeypatch, tmp_path
+):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\nBefore.\n$$\nx = y\n% arc:equation-number 2.20, 2.21\n$$\nAfter.\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(source, "extract_pdf_pages", lambda path: ["Before.\nx = y (9.9)\nAfter."])
+
+    equation = parse_source_input(markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes")[
+        "equations"
+    ][0]
+
+    assert equation["printed_equation_number"] == "2.20"
+    assert equation["printed_equation_numbers"] == ["2.20", "2.21"]
+    assert equation["equation"] == "x = y"
+    assert "arc:" not in equation["normalized_latex"]
+
+
+def test_unnumbered_directive_prevents_pdf_inference_and_wins_conflicts(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\nBefore.\n$$\nx = y \\tag{2.20}\n% arc:equation-number 2.21\n% arc:unnumbered\n$$\nAfter.\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(source, "extract_pdf_pages", lambda path: ["Before.\nx = y (9.9)\nAfter."])
+
+    equation = parse_source_input(markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes")[
+        "equations"
+    ][0]
+
+    assert "printed_equation_number" not in equation
+    assert "printed_equation_numbers" not in equation
+    assert equation["equation"] == "x = y"
+    assert equation["normalized_latex"] == "x = y"
+    assert r"\tag" not in equation["equation"]
+    assert "arc:" not in equation["normalized_latex"]
+    assert {warning["code"] for warning in equation["parser_warnings"]} == {
+        "conflicting_equation_number_directives"
+    }
+
+
+def test_markdown_ocr_trailing_number_is_normalized_and_removed_from_formula(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\n$$\nx = y (2. 1 8)\n$$\n", encoding="utf-8")
+
+    equation = parse_source_input(markdown_path=markdown_path, source_id="notes")["equations"][0]
+
+    assert equation["equation"] == "x = y"
+    assert equation["normalized_latex"] == "x = y"
+    assert equation["printed_equation_number"] == "2.18"
+    assert equation["printed_equation_numbers"] == ["2.18"]
+
+
+def test_markdown_compact_parenthesized_value_is_not_treated_as_an_ocr_number(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\n$$\nf(x) = (2.18)\n$$\n", encoding="utf-8")
+
+    equation = parse_source_input(markdown_path=markdown_path, source_id="notes")["equations"][0]
+
+    assert equation["equation"] == "f(x) = (2.18)"
+    assert equation["normalized_latex"] == "f(x) = (2.18)"
+    assert "printed_equation_number" not in equation
+    assert "printed_equation_numbers" not in equation
+
+
+def test_markdown_standalone_trailing_number_has_layout_evidence(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\n$$\nx = y\n(2.18)\n$$\n", encoding="utf-8")
+
+    equation = parse_source_input(markdown_path=markdown_path, source_id="notes")["equations"][0]
+
+    assert equation["equation"] == "x = y"
+    assert equation["printed_equation_number"] == "2.18"
+
+
+def test_pdf_mapping_uses_source_number_anchors_as_monotonic_bounds(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "\n".join(
+            [
+                "# Notes",
+                "First context.",
+                "$$ a = b \\tag{1.1} $$",
+                "Middle context.",
+                "$$ x = y $$",
+                "Middle follows.",
+                "Last context.",
+                "$$ c = d \\tag{1.3} $$",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "First context.\na = b (1.1)",
+            "Middle context.\nx = y (1.2)\nMiddle follows.",
+            "Last context.\nc = d (1.3)",
+            "Middle context.\nx = y\nMiddle follows.\nextra matching text",
+        ],
+    )
+
+    equations = parse_source_input(markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes")[
+        "equations"
+    ]
+
+    assert [equation.get("pdf_page") for equation in equations] == [1, 2, 3]
+    assert equations[1]["printed_equation_number"] == "1.2"
+
+
+def test_source_number_does_not_anchor_to_wrong_page_without_formula_or_context(
+    monkeypatch, tmp_path
+):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\nTarget context before.\n$$ H = p^2 + m^2 \\tag{1.1} $$\nTarget context after.\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "Unrelated discussion.\nz = w (1.1)\nMore unrelated discussion.",
+            "Target context before.\nH = p^2 + m^2\nTarget context after.",
+        ],
+    )
+
+    equation = parse_source_input(
+        markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes"
+    )["equations"][0]
+
+    assert equation["pdf_page"] == 2
+    assert equation["printed_equation_number"] == "1.1"
+
+
+def test_pdf_number_binding_does_not_read_the_next_page(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\nBefore exact.\n$$ x = y $$\nAfter exact.\n", encoding="utf-8")
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: ["Before exact.\nx = y\nAfter exact.", "x = y (7.7)"],
+    )
+
+    equation = parse_source_input(markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes")[
+        "equations"
+    ][0]
+
+    assert equation["pdf_page"] == 1
+    assert "printed_equation_number" not in equation
+
+
+def test_pdf_number_binding_rejects_numbered_formula_above_unnumbered_formula(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\nThe target expression starts here.\n$$ H = p^2 + m^2 $$\nThe target discussion continues here.\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "Earlier numbered result.\n"
+            "H = p^2 + m^2 (5.8)\n"
+            "The target expression starts here.\n"
+            "H = p^2 + m^2\n"
+            "The target discussion continues here."
+        ],
+    )
+
+    equation = parse_source_input(markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes")[
+        "equations"
+    ][0]
+
+    assert equation["pdf_page"] == 1
+    assert "printed_equation_number" not in equation
+
+
+def test_pdf_text_extraction_preserves_internal_blank_pages(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    completed = source.subprocess.CompletedProcess(
+        args=["pdftotext"], returncode=0, stdout="first\f   \fthird\f", stderr=""
+    )
+    monkeypatch.setattr(source.subprocess, "run", lambda *args, **kwargs: completed)
+
+    assert source.extract_pdf_pages(pdf_path) == ["first", "", "third"]

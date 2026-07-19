@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from .ar5iv_html import parse_html
+from .markdown_document import build_markdown_document
 
 
-PARSER_VERSION = 14
+PARSER_VERSION = 18
+PDF_PAGE_MATCH_MIN_SCORE = 8
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
 EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"
@@ -78,7 +80,10 @@ def parse_source_input(
         return parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"])
     if resolved["markdown_path"]:
         return parse_markdown_document(
-            Path(resolved["markdown_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]
+            Path(resolved["markdown_path"]),
+            paper_id=paper_id,
+            pdf_path=resolved["pdf_path"],
+            include_document=include_document,
         )
     if resolved["pdf_path"]:
         return parse_pdf_document(Path(resolved["pdf_path"]), paper_id=paper_id)
@@ -121,9 +126,14 @@ def parse_source_input_with_warnings(
     if resolved["markdown_path"]:
         if resolved["pdf_path"]:
             return parse_markdown_document_with_warnings(
-                Path(resolved["markdown_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]
+                Path(resolved["markdown_path"]),
+                paper_id=paper_id,
+                pdf_path=resolved["pdf_path"],
+                include_document=include_document,
             )
-        return parse_markdown_document(Path(resolved["markdown_path"]), paper_id=paper_id), []
+        return parse_markdown_document(
+            Path(resolved["markdown_path"]), paper_id=paper_id, include_document=include_document
+        ), []
     if resolved["pdf_path"]:
         return parse_pdf_document_with_warnings(Path(resolved["pdf_path"]), paper_id=paper_id)
     raise ValueError("parse_source_input requires an HTML, TeX, Markdown, PDF, or ar5iv source")
@@ -200,8 +210,11 @@ def _extract_pdf_pages_with_warning(path: str | Path) -> tuple[list[str], dict[s
             "message": "PDF input was provided but pdftotext could not run; PDF was not used.",
             "pdf_path": str(path),
         }
-    pages = [page.strip() for page in completed.stdout.split("\f") if page.strip()]
-    if not pages:
+    raw_pages = completed.stdout.split("\f")
+    if raw_pages and not raw_pages[-1].strip():
+        raw_pages.pop()
+    pages = [page.strip() for page in raw_pages]
+    if not any(pages):
         return [], {
             "code": "pdf_not_used",
             "message": "PDF input was provided but pdftotext returned no text; PDF was not used.",
@@ -256,17 +269,30 @@ def _tex_document_from_pages(
 
 
 def parse_markdown_document(
-    path: Path, *, paper_id: str, pdf_path: str | Path | None = None
+    path: Path,
+    *,
+    paper_id: str,
+    pdf_path: str | Path | None = None,
+    include_document: bool = True,
 ) -> dict[str, Any]:
     lines = path.read_text(encoding="utf-8").splitlines()
     pdf_pages = extract_pdf_pages(pdf_path) if pdf_path else []
     return _markdown_document_from_pages(
-        path, paper_id=paper_id, pdf_path=pdf_path, lines=lines, pdf_pages=pdf_pages
+        path,
+        paper_id=paper_id,
+        pdf_path=pdf_path,
+        lines=lines,
+        pdf_pages=pdf_pages,
+        include_document=include_document,
     )
 
 
 def parse_markdown_document_with_warnings(
-    path: Path, *, paper_id: str, pdf_path: str | Path | None = None
+    path: Path,
+    *,
+    paper_id: str,
+    pdf_path: str | Path | None = None,
+    include_document: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     pdf_pages: list[str] = []
@@ -277,7 +303,12 @@ def parse_markdown_document_with_warnings(
             warnings.append(warning)
     return (
         _markdown_document_from_pages(
-            path, paper_id=paper_id, pdf_path=pdf_path, lines=lines, pdf_pages=pdf_pages
+            path,
+            paper_id=paper_id,
+            pdf_path=pdf_path,
+            lines=lines,
+            pdf_pages=pdf_pages,
+            include_document=include_document,
         ),
         warnings,
     )
@@ -290,20 +321,33 @@ def _markdown_document_from_pages(
     pdf_path: str | Path | None,
     lines: list[str],
     pdf_pages: list[str],
+    include_document: bool,
 ) -> dict[str, Any]:
     sections = _markdown_sections(path, lines)
     equations = _markdown_equations(path, lines, sections)
     if pdf_pages:
         _enrich_equations_from_pdf(equations, pdf_pages)
         _fill_section_pdf_pages(sections, equations)
-    return {
+    source_hash = _combined_hash([path, Path(pdf_path)] if pdf_path else [path])
+    parsed = {
         "paper_id": paper_id,
         "parser_version": PARSER_VERSION,
-        "source_hash": _combined_hash([path, Path(pdf_path)] if pdf_path else [path]),
+        "source_hash": source_hash,
         "toc": [{"id": item["section_id"], "title": item["title"], "level": item["level"]} for item in sections],
         "sections": sections,
         "equations": equations,
     }
+    if include_document:
+        parsed["document"] = build_markdown_document(
+            lines,
+            paper_id=paper_id,
+            source_path=path,
+            source_hash=source_hash,
+            sections=sections,
+            equations=equations,
+            pdf_path=pdf_path,
+        )
+    return parsed
 
 
 def parse_pdf_document(path: Path, *, paper_id: str) -> dict[str, Any]:
@@ -538,9 +582,7 @@ def _markdown_equations(
             "confidence": "high",
             "parser_warnings": [],
         }
-        tag = re.search(r"\\tag\*?\{([^{}]+)\}", raw_tex)
-        if tag:
-            record["printed_equation_number"] = tag.group(1).strip()
+        _set_source_equation_numbers(record, raw_tex)
         equations.append(record)
         index = end + 1
     return equations
@@ -599,7 +641,8 @@ def _markdown_context_line(line: str) -> str:
 def _clean_markdown_text(text: str) -> str:
     cleaned = re.sub(r"!?(?:\[([^\]]*)\])\([^)]*\)", r"\1", text)
     cleaned = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", cleaned)
-    cleaned = re.sub(r"[*_`~]", "", cleaned)
+    cleaned = re.sub(r"[*_`]|(?<!\\)~", "", cleaned)
+    cleaned = cleaned.replace(r"\~", "~")
     return _clean_text(cleaned)
 
 
@@ -615,7 +658,7 @@ def _tex_equation_record(
     raw_tex = "\n".join(lines[start : end + 1])
     equation = _normalize_latex(raw_tex, environment)
     section = _section_for_line(sections, start + 1)
-    return {
+    record = {
         "id": f"eq_{equation_index + 1:05d}",
         "equation": equation,
         "before": _nearby_text_before(lines, start),
@@ -631,6 +674,8 @@ def _tex_equation_record(
         "confidence": "high",
         "parser_warnings": [],
     }
+    _set_source_equation_numbers(record, raw_tex)
+    return record
 
 
 def _pdf_sections(path: Path, pages: list[str]) -> list[dict[str, Any]]:
@@ -826,23 +871,248 @@ def _neighbor_pdf_text(lines: list[str], index: int, direction: int) -> str:
 
 
 def _enrich_equations_from_pdf(equations: list[dict[str, Any]], pages: list[str]) -> None:
+    anchors = _monotonic_tag_anchors(equations, pages)
+    anchor_pages = {equation_index: page for equation_index, page in anchors}
+    for equation_index, page in anchor_pages.items():
+        equations[equation_index]["pdf_page"] = page
+
+    previous_page = 1
+    for equation_index, equation in enumerate(equations):
+        if equation_index in anchor_pages:
+            previous_page = anchor_pages[equation_index]
+            continue
+        lower_page, upper_page = _page_bounds_for_equation(
+            equation_index, anchors, page_count=len(pages), previous_page=previous_page
+        )
+        best_page = _best_pdf_page_in_bounds(equation, pages, lower_page, upper_page)
+        if best_page is None:
+            continue
+        equation["pdf_page"] = best_page
+        previous_page = best_page
+
     for equation in equations:
-        best_page = None
-        best_score = 0
-        for page_index, page in enumerate(pages, start=1):
-            score = _pdf_match_score(equation, page)
-            if score > best_score:
-                best_score = score
-                best_page = (page_index, page)
-        if best_page and best_score >= 4:
-            equation["pdf_page"] = best_page[0]
-            number_context = best_page[1]
-            if best_page[0] < len(pages):
-                number_context = f"{number_context}\n{pages[best_page[0]]}"
-            number, numbers = _best_equation_number_match(number_context, equation)
-            if number:
-                equation["printed_equation_number"] = number
-                equation["printed_equation_numbers"] = numbers or [number]
+        page_number = equation.get("pdf_page")
+        raw_tex = str(equation.get("raw_tex") or "")
+        if (
+            not isinstance(page_number, int)
+            or _source_equation_numbers(raw_tex)
+            or _source_equation_is_unnumbered(raw_tex)
+        ):
+            continue
+        number, numbers = _best_equation_number_match(pages[page_number - 1], equation)
+        if number:
+            equation["printed_equation_number"] = number
+            equation["printed_equation_numbers"] = numbers or [number]
+
+
+def _set_source_equation_numbers(record: dict[str, Any], raw_tex: str) -> None:
+    directive_numbers, unnumbered, directive_warnings = _source_equation_number_directives(raw_tex)
+    record.setdefault("parser_warnings", []).extend(directive_warnings)
+    if unnumbered:
+        record.pop("printed_equation_number", None)
+        record.pop("printed_equation_numbers", None)
+        equation = _remove_explicit_equation_tags(str(record.get("equation") or ""))
+        record["equation"] = equation
+        record["normalized_latex"] = equation
+        return
+    numbers = _source_equation_numbers(raw_tex)
+    if not numbers:
+        return
+    record["printed_equation_number"] = numbers[0]
+    record["printed_equation_numbers"] = numbers
+    if not directive_numbers and not _explicit_equation_tags(raw_tex):
+        equation = str(record.get("equation") or "")
+        equation = _remove_recognized_ocr_trailing_equation_number(equation)
+        record["equation"] = equation
+        record["normalized_latex"] = equation
+
+
+def _explicit_equation_tags(raw_tex: str) -> list[str]:
+    numbers = [match.strip() for match in re.findall(r"\\tag\*?\s*\{([^{}]+)\}", raw_tex)]
+    return list(dict.fromkeys(number for number in numbers if number))
+
+
+def _remove_explicit_equation_tags(equation: str) -> str:
+    """Remove visible TeX tags when an explicit unnumbered directive wins."""
+    return re.sub(r"\s*\\tag\*?\s*\{[^{}]+\}", "", equation).strip()
+
+
+def _source_equation_numbers(raw_tex: str) -> list[str]:
+    directive_numbers, unnumbered, _ = _source_equation_number_directives(raw_tex)
+    if unnumbered:
+        return []
+    if directive_numbers:
+        return directive_numbers
+    tags = _explicit_equation_tags(raw_tex)
+    if tags:
+        return tags
+    match = _ocr_trailing_equation_number_match(raw_tex)
+    if not match:
+        return []
+    suffix = re.sub(r"\s+", "", match.group(2))
+    return [f"{match.group(1)}.{suffix}"] if suffix else []
+
+
+def _ocr_trailing_equation_number_match(text: str) -> re.Match[str] | None:
+    """Return a trailing OCR equation number only with layout evidence.
+
+    A compact value such as ``f(x)=(2.18)`` is valid formula content and is
+    therefore left untouched.  A standalone number, a visibly right-separated
+    number, or OCR-spaced digits such as ``(2. 1 8)`` provide enough evidence
+    to treat the suffix as a printed equation number.
+    """
+    match = re.search(
+        r"\(\s*(\d+)\s*\.\s*((?:\d\s*)+)\)\s*(?:\$\$|\\\]|\\end\{[^{}]+\*?\})?\s*$",
+        text,
+    )
+    if not match:
+        return None
+    line_prefix = text[: match.start()].rsplit("\n", 1)[-1]
+    standalone = not line_prefix.strip()
+    layout_gap = bool(re.search(r"[ \t]{2,}$", line_prefix))
+    ocr_spaced_digits = bool(re.search(r"\d\s+\d", match.group(0)))
+    return match if standalone or layout_gap or ocr_spaced_digits else None
+
+
+def _remove_recognized_ocr_trailing_equation_number(equation: str) -> str:
+    """Remove a suffix after the raw source has passed the layout check."""
+    return re.sub(r"\s*\(\s*\d+\s*\.\s*(?:\d\s*)+\)\s*$", "", equation).rstrip()
+
+
+def _source_equation_is_unnumbered(raw_tex: str) -> bool:
+    _, unnumbered, _ = _source_equation_number_directives(raw_tex)
+    return unnumbered
+
+
+def _source_equation_number_directives(
+    raw_tex: str,
+) -> tuple[list[str], bool, list[dict[str, str]]]:
+    """Read portable equation-number overrides from TeX comments.
+
+    ``% arc:equation-number 2.3`` supplies authoritative printed numbers, while
+    ``% arc:unnumbered`` prevents approximate PDF number inference.  An
+    unnumbered directive wins conflicting declarations so that the parser does
+    not invent a printed number.
+    """
+    numbers: list[str] = []
+    unnumbered = False
+    warnings: list[dict[str, str]] = []
+    for line in raw_tex.splitlines():
+        comment = _tex_comment(line).strip()
+        if re.fullmatch(r"arc:unnumbered", comment, flags=re.IGNORECASE):
+            unnumbered = True
+            continue
+        match = re.fullmatch(r"arc:equation-number\s+(.+?)\s*", comment, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidates = [part for part in re.split(r"[\s,]+", match.group(1)) if part]
+        invalid = [number for number in candidates if not re.fullmatch(EQUATION_NUMBER_PATTERN, number)]
+        if not candidates or invalid:
+            warnings.append(
+                {
+                    "code": "invalid_equation_number_directive",
+                    "message": "Ignored an arc:equation-number directive with an invalid printed number.",
+                }
+            )
+            continue
+        numbers.extend(candidates)
+    numbers = list(dict.fromkeys(numbers))
+    if unnumbered and (numbers or _explicit_equation_tags(raw_tex)):
+        warnings.append(
+            {
+                "code": "conflicting_equation_number_directives",
+                "message": "arc:unnumbered overrides conflicting source equation numbers.",
+            }
+        )
+        numbers = []
+    return numbers, unnumbered, warnings
+
+
+def _monotonic_tag_anchors(
+    equations: list[dict[str, Any]], pages: list[str]
+) -> list[tuple[int, int]]:
+    pages_by_number: dict[str, list[int]] = {}
+    for page_index, page in enumerate(pages, start=1):
+        for number, _ in _printed_equation_number_candidates(page):
+            page_numbers = pages_by_number.setdefault(number, [])
+            if page_index not in page_numbers:
+                page_numbers.append(page_index)
+
+    candidates: list[tuple[int, int]] = []
+    for equation_index, equation in enumerate(equations):
+        tags = _source_equation_numbers(str(equation.get("raw_tex") or ""))
+        tag_pages = {pages_by_number[tag][0] for tag in tags if len(pages_by_number.get(tag, [])) == 1}
+        if tags and len(tag_pages) == 1:
+            page = tag_pages.pop()
+            if _source_number_anchor_has_content_evidence(equation, pages[page - 1]):
+                candidates.append((equation_index, page))
+    return _longest_nondecreasing_anchors(candidates)
+
+
+def _source_number_anchor_has_content_evidence(equation: dict[str, Any], page: str) -> bool:
+    """Require formula or exact nearby prose evidence in addition to a tag."""
+    page_tokens = set(_search_tokens(page))
+    equation_tokens = set(_search_tokens(_label_focused_equation_text(equation)))
+    # Two non-numeric symbol tokens are enough when the printed number is
+    # already unique.  This retains short rows (for example a single aligned
+    # Mandelstam relation) whose surrounding Markdown context is empty.
+    if _token_overlap_score(equation_tokens, page_tokens) >= 2:
+        return True
+    page_context = _context_match_text(page)
+    for field in ("before", "after"):
+        context = _context_match_text(str(equation.get(field) or ""))
+        if _is_long_context(context) and _has_exact_context_fragment(context, page_context):
+            return True
+    return False
+
+
+def _longest_nondecreasing_anchors(candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not candidates:
+        return []
+    lengths = [1] * len(candidates)
+    previous = [-1] * len(candidates)
+    for index, (_, page) in enumerate(candidates):
+        for prior_index in range(index):
+            if candidates[prior_index][1] <= page and lengths[prior_index] + 1 > lengths[index]:
+                lengths[index] = lengths[prior_index] + 1
+                previous[index] = prior_index
+    current = max(range(len(candidates)), key=lengths.__getitem__)
+    selected: list[tuple[int, int]] = []
+    while current >= 0:
+        selected.append(candidates[current])
+        current = previous[current]
+    return list(reversed(selected))
+
+
+def _page_bounds_for_equation(
+    equation_index: int,
+    anchors: list[tuple[int, int]],
+    *,
+    page_count: int,
+    previous_page: int,
+) -> tuple[int, int]:
+    lower_page = max(1, previous_page)
+    upper_page = page_count
+    for anchor_index, anchor_page in anchors:
+        if anchor_index < equation_index:
+            lower_page = max(lower_page, anchor_page)
+        elif anchor_index > equation_index:
+            upper_page = anchor_page
+            break
+    return lower_page, upper_page
+
+
+def _best_pdf_page_in_bounds(
+    equation: dict[str, Any], pages: list[str], lower_page: int, upper_page: int
+) -> int | None:
+    best_page: int | None = None
+    best_score = 0
+    for page_number in range(lower_page, upper_page + 1):
+        score = _pdf_match_score(equation, pages[page_number - 1])
+        if score > best_score:
+            best_score = score
+            best_page = page_number
+    return best_page if best_score >= PDF_PAGE_MATCH_MIN_SCORE else None
 
 
 def _pdf_match_score(equation: dict[str, Any], page: str) -> int:
@@ -890,6 +1160,10 @@ def _best_equation_number_match(page: str, equation: dict[str, Any]) -> tuple[st
         before_score = _token_overlap_score(before_tokens, set(_search_tokens(before_window)))
         after_score = _token_overlap_score(after_tokens, set(_search_tokens(after_window)))
         equation_score = _token_overlap_score(equation_tokens, set(_search_tokens(equation_window)))
+        if equation_score <= 0 or not _ordered_exact_context_evidence(
+            equation, before_window=before_window, after_window=after_window
+        ):
+            continue
         bracket_bonus = 50 if before_score >= 6 and after_score >= 6 else 0
         if has_label_focus:
             score = bracket_bonus + (before_score * 2) + (after_score * 4) + (equation_score * 10)
@@ -899,7 +1173,40 @@ def _best_equation_number_match(page: str, equation: dict[str, Any]) -> tuple[st
             best_score = score
             best_number = number
             best_index = candidate_index
+    if best_score < 0:
+        return None, []
     return best_number, _printed_equation_number_sequence(candidates, best_index, equation)
+
+
+def _ordered_exact_context_evidence(
+    equation: dict[str, Any], *, before_window: str, after_window: str
+) -> bool:
+    before = _context_match_text(str(equation.get("before") or ""))
+    if _is_long_context(before):
+        return _has_exact_context_fragment(before, _context_match_text(before_window))
+    after = _context_match_text(str(equation.get("after") or ""))
+    if _is_long_context(after):
+        return _has_exact_context_fragment(after, _context_match_text(after_window))
+    return False
+
+
+def _is_long_context(text: str) -> bool:
+    return len(text) >= 8
+
+
+def _context_match_text(text: str) -> str:
+    without_commands = re.sub(r"\\[A-Za-z]+\*?", "", str(text or ""))
+    return "".join(_search_tokens(without_commands))
+
+
+def _has_exact_context_fragment(context: str, window: str, *, maximum_fragment_length: int = 16) -> bool:
+    fragment_length = min(maximum_fragment_length, len(context))
+    if fragment_length < 8 or len(window) < fragment_length:
+        return False
+    return any(
+        context[index : index + fragment_length] in window
+        for index in range(len(context) - fragment_length + 1)
+    )
 
 
 def _printed_equation_number_candidates(text: str) -> list[tuple[str, int]]:
@@ -1189,6 +1496,17 @@ def _strip_comment(line: str) -> str:
         if char != "\\":
             escaped = False
     return "".join(out)
+
+
+def _tex_comment(line: str) -> str:
+    escaped = False
+    for index, char in enumerate(line):
+        if char == "%" and not escaped:
+            return line[index + 1 :]
+        escaped = char == "\\" and not escaped
+        if char != "\\":
+            escaped = False
+    return ""
 
 
 def _clean_text(text: str) -> str:

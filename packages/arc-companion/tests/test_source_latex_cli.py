@@ -15,9 +15,41 @@ from arc_companion.latex import (
 )
 from arc_companion.package import package_project
 from arc_companion.source import SourceError, load_source_bundle, validate_complete_document
+from arc_paper.parse.source import parse_source_input
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_markdown_rich_block_escaped_details_are_reader_clean(tmp_path: Path) -> None:
+    markdown_path = tmp_path / "book.md"
+    markdown_path.write_text(
+        "# Chapter\n\n<details>\n<summary>natural_image</summary>\n"
+        "Meaningful geometric description.\n</details>\n\n"
+        "<details><summary>Proof sketch</summary>Argument body.</details>\n",
+        encoding="utf-8",
+    )
+    parsed = parse_source_input(source_path=markdown_path, source_id="local:test-book")
+    block = next(
+        item for item in parsed["document"]["blocks"]
+        if "Meaningful geometric description" in str(item.get("text") or "")
+    )
+
+    rendered = _render_html_fragment(block["html"], rendered_links=[])
+
+    assert "Meaningful geometric description" in rendered
+    assert "details" not in rendered
+    assert "summary" not in rendered
+    assert "natural" not in rendered
+
+    proof_block = next(
+        item for item in parsed["document"]["blocks"]
+        if "Proof sketch" in str(item.get("text") or "")
+    )
+    proof_rendered = _render_html_fragment(proof_block["html"], rendered_links=[])
+    assert "Proof sketch" in proof_rendered
+    assert "Argument body" in proof_rendered
+    assert "details" not in proof_rendered and "summary" not in proof_rendered
 
 
 def test_source_adapter_requests_complete_ar5iv_document() -> None:
@@ -41,6 +73,97 @@ def test_source_adapter_requests_complete_ar5iv_document() -> None:
     )
     assert bundle.paper_id == "arXiv:1"
     assert calls == {"source": "ar5iv", "paper_id": "arXiv:1", "include_document": True, "refresh": False, "recache": True}
+
+
+@pytest.mark.parametrize("source_id", ["local:david-tong-qft-notes", "isbn:9780521850827"])
+def test_source_adapter_reads_non_arxiv_sources_only_from_local_cache(source_id: str) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    def forbidden(name):
+        def fail(*args, **kwargs):
+            calls.append((name, kwargs))
+            raise AssertionError(f"{name} must not be called for a cached local source")
+
+        return fail
+
+    def get_cached(requested_id, **kwargs):
+        calls.append(("cached", {"source_id": requested_id, **kwargs}))
+        return {"ok": True, "data": {
+            "paper_id": source_id,
+            "document": {
+                "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
+                "integrity": {"status": "complete"},
+            },
+        }}
+
+    bundle = load_source_bundle(
+        source_id,
+        parsed_getter=get_cached,
+        parse=forbidden("parse"),
+        metadata_getter=forbidden("metadata"),
+        references_getter=forbidden("references"),
+        citers_getter=forbidden("citers"),
+    )
+
+    assert calls == [("cached", {"source_id": source_id, "include_document": True})]
+    assert bundle.paper_id == source_id
+    assert bundle.metadata == {"_arc_companion_metadata_source": "unavailable"}
+    assert bundle.references == []
+    assert bundle.citers == []
+    assert bundle.related_evidence == ()
+
+
+@pytest.mark.parametrize("source_id", ["doi:10.1000/example", "inspire:12345"])
+def test_resolvable_colon_ids_are_not_mistaken_for_local_only_sources(source_id: str) -> None:
+    parse_calls = []
+
+    def parse(**kwargs):
+        parse_calls.append(kwargs)
+        return {"ok": True, "data": {"paper_id": source_id, "document": {
+            "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
+            "integrity": {"status": "complete"},
+        }}}
+
+    bundle = load_source_bundle(
+        source_id,
+        parsed_getter=lambda *args, **kwargs: {"ok": False, "error": {"message": "not cached"}},
+        parse=parse,
+        metadata_getter=lambda *args, **kwargs: {"ok": True, "data": {"title": "Remote"}},
+        references_getter=lambda *args, **kwargs: {"ok": True, "data": []},
+        citers_getter=lambda *args, **kwargs: {"ok": True, "data": []},
+    )
+
+    assert bundle.metadata["title"] == "Remote"
+    assert parse_calls[0]["paper_id"] == source_id
+
+
+def test_any_identifier_uses_an_existing_rich_cache_entry_and_audits_metadata_fallback() -> None:
+    def cached(*args, **kwargs):
+        return {"ok": True, "data": {
+            "paper_id": "doi:10.1000/cached",
+            "document": {
+                "metadata": {"authors": ["A. Author"], "year": 2024},
+                "toc": [{"title": "Cached document title"}],
+                "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
+                "integrity": {"status": "complete"},
+            },
+        }}
+
+    bundle = load_source_bundle(
+        "doi:10.1000/cached", parsed_getter=cached,
+        parse=lambda **kwargs: pytest.fail("rich cache must avoid parsing"),
+        metadata_getter=lambda *args, **kwargs: pytest.fail("rich cache must avoid metadata fetch"),
+        references_getter=lambda *args, **kwargs: pytest.fail("rich cache must avoid reference fetch"),
+        citers_getter=lambda *args, **kwargs: pytest.fail("rich cache must avoid citer fetch"),
+    )
+
+    assert bundle.metadata["title"] == "Cached document title"
+    assert bundle.metadata["authors"] == ["A. Author"]
+    assert bundle.metadata["_arc_companion_metadata_source"] == {
+        "authors": "document.metadata",
+        "year": "document.metadata",
+        "title": "document.toc",
+    }
 
 
 @pytest.mark.parametrize(
@@ -186,6 +309,27 @@ def test_cli_explicit_language_has_no_notice(tmp_path: Path, monkeypatch, capsys
     monkeypatch.setattr(cli, "build_companion", lambda options: {"ok": True, "data": {"status": "complete"}, "meta": {}})
     assert cli.main(["build", "arXiv:1", "--project-dir", str(tmp_path), "--annotation-language", "en"]) == 0
     assert "默认使用中文" not in capsys.readouterr().err
+
+
+def test_cli_disables_mcp_independently_from_internet(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_build(options):
+        captured["options"] = options
+        return {"ok": True, "data": {"status": "complete"}, "meta": {}}
+
+    monkeypatch.setattr(cli, "build_companion", fake_build)
+    assert cli.main([
+        "build",
+        "local:david-tong-qft-notes",
+        "--project-dir",
+        str(tmp_path),
+        "--annotation-language",
+        "zh-CN",
+        "--no-mcp",
+    ]) == 0
+    assert captured["options"].allow_mcp is False
+    assert captured["options"].allow_internet is True
 
 
 def test_cli_prints_structured_evidence_warnings(tmp_path: Path, monkeypatch, capsys) -> None:

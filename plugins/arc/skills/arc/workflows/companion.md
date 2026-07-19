@@ -104,14 +104,27 @@ segmentation, glossary generation, and review remain tool-disabled.
 Translation may use external access only to resolve standard terminology or
 disambiguate the supplied source context. Its translation must remain a
 complete, source-faithful rendering of the supplied blocks and must never add,
-replace, or correct source content from an external page. Commentary explains
-the passage and discusses supported prior and subsequent work using stable
-evidence identifiers. Every external commentary claim must have captured
+replace, or correct source content from an external page. Commentary is
+optional for an already evident passage and discusses supported prior and
+subsequent work only when this adds reader value. Never manufacture an
+explanation merely to fill every unit. When explanation is useful, select the
+relevant emphasis rather than mechanically covering a checklist: explain the
+material's motivation and role in the argument, with motivation preferred at a
+section or chapter opening; compare a useful alternative presentation in the
+supplied references; cautiously flag deeper incompatibilities between sources
+while treating mere convention, notation, normalization, and equivalent
+formulations as differences rather than inconsistencies; or fill in non-evident
+intermediate mathematics. Do not repeat or paraphrase an already clear source
+passage. Keep stable evidence identifiers only in structured evidence fields
+and manifests; never
+show controller IDs or hashes to the reader. Reader-facing citations use the
+source title plus a section or other human-readable location when available,
+and at minimum the source title. Every external commentary claim must have captured
 provenance before review and typesetting; omit a claim whose source cannot be
 captured and verified. Register such material in the global `evidence.json`
-registry and the unit's `segment-evidence/<segment>.json`; models may cite only
-controller-registered evidence IDs, never a URL or descriptor invented in
-their output.
+registry and the unit's `segment-evidence/<segment>.json`; models may bind
+claims only to controller-registered evidence IDs in structured output, never
+to a URL or descriptor invented in their output.
 
 Require each new primary low-tier translation call to check exact block
 coverage/order, byte-exact opaque-token coverage/order, cross-block token
@@ -164,7 +177,17 @@ of both tracks and render with the deterministic LaTeX pipeline. Never
 reconstruct missing source text, equation numbers, tables, figures, or
 bibliography with an LLM.
 
+During review normalization and again during deterministic rendering, unwrap
+reader-visible HTML/Markdown containers while preserving their meaningful body
+text, discard machine-only container summaries, and replace legacy inline
+evidence-ID markers with human-readable source-title and section/location
+citations. Keep the original source blocks and structured evidence bindings
+unchanged for audit.
+
 Render every semantic unit in this order: original, translation, companion.
+Use the layer styling itself to distinguish them; do not print a controller
+unit heading (including its segment ID) or an `Original` field before each
+source passage.
 Before segmentation, exclude durable source-only table-of-contents blocks,
 acknowledgment sections, and reference-list headings and entries from every LLM
 lane, evidence input, and review payload. Keep title, author, and affiliation
@@ -223,7 +246,8 @@ arc-companion validate --project-dir <project-dir> --json
 Require exact ordered source-block coverage, original visible equation
 numbers, table grids and spans, figure asset hashes and captions, bibliography
 labels and order, resolved internal references, protected personal names,
-translation and commentary coverage, and a readable searchable PDF with valid
+translation and annotation-record coverage (with intentionally empty commentary
+prose permitted), and a readable searchable PDF with valid
 fonts and no detected clipping or overlap. Also require repeated translation
 formulas to omit equation numbers and require the translation track not to
 repeat floating objects.

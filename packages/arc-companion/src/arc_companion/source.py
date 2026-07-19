@@ -32,14 +32,51 @@ def load_source_bundle(
     metadata_getter: Callable[..., dict[str, Any]] | None = None,
     references_getter: Callable[..., dict[str, Any]] | None = None,
     citers_getter: Callable[..., dict[str, Any]] | None = None,
+    parsed_getter: Callable[..., dict[str, Any]] | None = None,
 ) -> SourceBundle:
-    if parse is None or metadata_getter is None or references_getter is None or citers_getter is None:
+    if (
+        parse is None
+        or metadata_getter is None
+        or references_getter is None
+        or citers_getter is None
+        or parsed_getter is None
+    ):
         from arc_paper import service
 
         parse = parse or service.parse_source
         metadata_getter = metadata_getter or service.get_metadata
         references_getter = references_getter or service.get_references
         citers_getter = citers_getter or service.get_citers
+        parsed_getter = parsed_getter or service.get_parsed_source
+
+    cached_result = parsed_getter(paper_id, include_document=True)
+    cached_available = bool(
+        isinstance(cached_result, dict)
+        and cached_result.get("ok")
+        and isinstance(cached_result.get("data"), dict)
+        and isinstance(cached_result["data"].get("document"), dict)
+    )
+    if _is_explicit_local_source_id(paper_id) or cached_available:
+        parsed = _unwrap(cached_result, "complete cached source")
+        if not isinstance(parsed, dict):
+            raise SourceError("arc-paper returned a non-object parsed source")
+        document = parsed.get("document")
+        if not isinstance(document, dict):
+            raise SourceError(
+                "arc-paper did not return document; recache this source with the current parser"
+            )
+        validate_complete_document(document)
+        metadata = _cached_source_metadata(parsed)
+        references = _cached_source_list(parsed, "references")
+        citers = _cached_source_list(parsed, "citers")
+        return SourceBundle(
+            paper_id=str(parsed.get("paper_id") or paper_id),
+            parsed=parsed,
+            document=document,
+            metadata=metadata,
+            references=references,
+            citers=citers,
+        )
 
     result = parse(
         source="ar5iv",
@@ -90,6 +127,74 @@ def load_source_bundle(
         diagnostics=tuple(diagnostics),
         related_evidence=tuple(related_evidence),
     )
+
+
+def _is_explicit_local_source_id(source_id: str) -> bool:
+    """Recognize namespaces whose public contract is local-cache-only.
+
+    DOI and INSPIRE identifiers also contain a colon, but are resolvable remote
+    identifiers and must not be accidentally reclassified as local documents.
+    Other identifier forms still take the cache-only path when an actual rich
+    cache entry was found by ``load_source_bundle``.
+    """
+    namespace, separator, _ = source_id.strip().partition(":")
+    return bool(separator) and namespace.casefold() in {"local", "isbn"}
+
+
+def _cached_source_metadata(parsed: dict[str, Any]) -> dict[str, Any]:
+    metadata = parsed.get("metadata")
+    output = dict(metadata) if isinstance(metadata, dict) else {}
+    document = parsed.get("document") if isinstance(parsed.get("document"), dict) else {}
+    document_metadata = (
+        document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    )
+    provenance: dict[str, str] = {
+        key: "parsed.metadata"
+        for key, value in output.items()
+        if key != "_arc_companion_metadata_source" and value is not None
+    }
+    fields = ("title", "authors", "year", "abstract", "page_count")
+    for key in fields:
+        if output.get(key) is not None:
+            continue
+        for owner, label in (
+            (parsed, "parsed"),
+            (document_metadata, "document.metadata"),
+            (document, "document"),
+        ):
+            if owner.get(key) is not None:
+                output[key] = owner[key]
+                provenance[key] = label
+                break
+    if not str(output.get("title") or "").strip():
+        for owner, label in ((parsed, "parsed.toc"), (document, "document.toc")):
+            toc = owner.get("toc")
+            if not isinstance(toc, list):
+                continue
+            title = next(
+                (
+                    str(item.get("title") or "").strip()
+                    for item in toc
+                    if isinstance(item, dict) and str(item.get("title") or "").strip()
+                ),
+                "",
+            )
+            if title:
+                output["title"] = title
+                provenance["title"] = label
+                break
+    if provenance and set(provenance.values()) == {"parsed.metadata"}:
+        output["_arc_companion_metadata_source"] = "parsed.metadata"
+    else:
+        output["_arc_companion_metadata_source"] = provenance or "unavailable"
+    return output
+
+
+def _cached_source_list(parsed: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = parsed.get(key)
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
 
 
 def _load_related_evidence(

@@ -88,9 +88,9 @@ RICH_HTML = """
 def test_rich_html_parse_stores_versioned_document_without_removing_legacy_fields():
     parsed = parse_source_input(html_text=RICH_HTML, source_id="rich-paper")
 
-    assert PARSER_VERSION == 14
+    assert PARSER_VERSION == 18
     assert LEGACY_PARSED_SOURCE_KEYS <= set(parsed)
-    assert parsed["parser_version"] == 14
+    assert parsed["parser_version"] == 18
 
     document = parsed["document"]
     assert document["schema_version"] == "arc.paper.document.v2"
@@ -423,6 +423,222 @@ def test_parse_include_document_exposes_cached_document(monkeypatch, tmp_path):
     assert read_json(rich_path)["document"] == result["data"]["document"]
 
 
+def test_markdown_rich_document_reuses_shared_contract_and_source_anchors(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "\n".join(
+            [
+                "# Field Notes",
+                "A paragraph with inline $E = mc^2$ and an [external link](https://example.test).",
+                "",
+                "- first premise",
+                "- second premise",
+                "",
+                "$$",
+                "x = y \\tag{2.1}",
+                "$$",
+                "",
+                "Closing text.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parsed = parse_source_input(
+        markdown_path=markdown_path,
+        source_id="markdown-rich",
+        include_document=True,
+    )
+    document = parsed["document"]
+
+    assert document["schema_version"] == DOCUMENT_SCHEMA_VERSION
+    expected_source = {
+        "paper_id": "markdown-rich",
+        "provider": "markdown",
+        "format": "markdown",
+        "path": str(markdown_path),
+        "source_sha256": parsed["source_hash"],
+    }
+    assert {key: document["source"][key] for key in expected_source} == expected_source
+    assert document["integrity"]["status"] == "complete"
+    assert document["integrity"]["renderable"] is True
+    assert [item["kind"] for item in document["blocks"]] == [
+        "heading",
+        "prose",
+        "list",
+        "equation",
+        "prose",
+    ]
+    assert document["blocks"][1]["source_span"] == {
+        "format": "markdown",
+        "path": str(markdown_path),
+        "line_start": 2,
+        "line_end": 2,
+    }
+    assert [run["kind"] for run in document["blocks"][1]["inline_runs"]] == [
+        "text",
+        "math",
+        "text",
+        "link",
+        "text",
+    ]
+    equation = document["equations"][0]
+    assert equation["id"] == parsed["equations"][0]["id"]
+    assert equation["tex"] == [r"x = y \tag{2.1}"]
+    assert equation["printed_equation_number"] == "2.1"
+    assert equation["markdown_line_start"] == 7
+
+
+def test_markdown_unnumbered_override_is_consistent_in_legacy_and_rich_views(tmp_path):
+    markdown_path = tmp_path / "unnumbered.md"
+    markdown_path.write_text(
+        "# Notes\n$$\nx = y \\tag{2.1}\n% arc:unnumbered\n$$\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_source_input(
+        markdown_path=markdown_path,
+        source_id="markdown-unnumbered-rich",
+        include_document=True,
+    )
+
+    legacy = parsed["equations"][0]
+    rich = parsed["document"]["equations"][0]
+    assert legacy["equation"] == "x = y"
+    assert legacy["normalized_latex"] == "x = y"
+    assert "printed_equation_number" not in legacy
+    assert rich["tex"] == ["x = y"]
+    assert rich["printed_equation_number"] == ""
+    assert rich["printed_equation_numbers"] == []
+
+
+def test_markdown_images_and_pipe_tables_are_loss_aware_rich_blocks(tmp_path):
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "diagram.png").write_bytes(b"diagram-bytes")
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "\n".join(
+            [
+                "# Notes",
+                "![Interaction diagram](images/diagram.png)",
+                "",
+                "| Quantity | Value |",
+                "| :--- | ---: |",
+                "| mass | $m^2$ |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parsed = parse_source_input(
+        markdown_path=markdown_path,
+        source_id="markdown-media",
+        include_document=True,
+    )
+    document = parsed["document"]
+
+    assert [block["kind"] for block in document["blocks"]] == [
+        "heading",
+        "figure",
+        "table",
+    ]
+    assert len(document["figures"]) == len(document["assets"]) == 1
+    figure = document["figures"][0]
+    assert figure["caption"] == "Interaction diagram"
+    assert figure["source_span"] == {
+        "format": "markdown",
+        "path": str(markdown_path),
+        "line_start": 2,
+        "line_end": 2,
+    }
+    asset = document["assets"][0]
+    assert asset["original_url"] == "images/diagram.png"
+    assert asset["relative_path"] == "images/diagram.png"
+    assert asset["cache_path"] == str((images / "diagram.png").resolve())
+    assert asset["status"] == "cached"
+    assert asset["source_span"]["line_start"] == 2
+    table = document["tables"][0]
+    assert table["grid"][0][0]["text"] == "Quantity"
+    assert table["grid"][1][1]["text"] == "m^2"
+    assert table["source_span"]["line_start"] == 4
+    assert table["source_span"]["line_end"] == 6
+    assert document["integrity"]["status"] == "complete"
+
+
+def test_missing_markdown_image_is_retained_and_marks_integrity_partial(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("![Missing](images/not-there.png)\n", encoding="utf-8")
+
+    document = parse_source_input(
+        markdown_path=markdown_path,
+        source_id="markdown-missing-media",
+        include_document=True,
+    )["document"]
+
+    assert len(document["figures"]) == len(document["assets"]) == 1
+    assert document["assets"][0]["status"] == "missing"
+    assert document["integrity"]["status"] == "partial"
+    assert document["integrity"]["renderable"] is False
+    assert {item["code"] for item in document["integrity"]["diagnostics"]} >= {
+        "asset_missing",
+        "figure_asset_missing",
+    }
+
+
+def test_markdown_pdf_rich_document_keeps_pdf_mapping_and_uses_rich_cache(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\nBefore exact context.\n$$ x = y \\tag{1.2} $$\nAfter exact context.\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        "arc_paper.parse.source._extract_pdf_pages_with_warning",
+        lambda path: (["Before exact context.\nx = y (1.2)\nAfter exact context."], None),
+    )
+
+    result = service.parse_source(
+        source="markdown-pdf",
+        markdown_path=markdown_path,
+        pdf_path=pdf_path,
+        source_id="markdown-pdf-rich",
+        include_document=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["document"]["source"]["provider"] == "markdown-pdf"
+    assert result["data"]["equations"][0]["pdf_page"] == 1
+    assert result["data"]["document"]["equations"][0]["pdf_page"] == 1
+    assert result["data"]["document"]["integrity"]["status"] == "complete"
+    light = read_json(parsed_source_cache_path("markdown-pdf-rich"))
+    assert set(light) == LEGACY_PARSED_SOURCE_KEYS
+    rich_path = rich_document_cache_path(
+        "markdown-pdf-rich", light["source_hash"], service.RICH_PARSER_VERSION
+    )
+    assert read_json(rich_path)["document"] == result["data"]["document"]
+    cached = service.get_parsed_source("markdown-pdf-rich", include_document=True)
+    assert cached["ok"] is True
+    assert cached["meta"]["rich_cache_path"] == str(rich_path)
+
+
+def test_markdown_without_include_document_stays_lightweight(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\nText.\n", encoding="utf-8")
+
+    parsed = parse_source_input(
+        markdown_path=markdown_path,
+        source_id="markdown-light",
+        include_document=False,
+    )
+
+    assert set(parsed) == LEGACY_PARSED_SOURCE_KEYS
+
+
 def test_recache_upgrades_v12_ar5iv_cache_without_refreshing_source(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
     path = parsed_source_cache_path("arXiv:0911.3380")
@@ -458,9 +674,9 @@ def test_recache_upgrades_v12_ar5iv_cache_without_refreshing_source(monkeypatch,
 
     assert result["ok"] is True
     assert provider.calls == [False]
-    assert result["data"]["parser_version"] == 14
+    assert result["data"]["parser_version"] == 18
     assert result["data"]["document"]["schema_version"] == DOCUMENT_SCHEMA_VERSION
-    assert read_json(path)["parser_version"] == 14
+    assert read_json(path)["parser_version"] == 18
 
 
 def test_refresh_and_recache_are_mutually_exclusive(monkeypatch, tmp_path):
@@ -489,7 +705,7 @@ def test_equation_annotations_are_bound_to_parser_version_and_equation_fingerpri
     marked = service.mark_parsed_equation("rich-paper", equation_id, reason="Verify the sign.")
 
     assert marked["ok"] is True
-    assert marked["data"]["parser_version"] == 14
+    assert marked["data"]["parser_version"] == 18
     assert marked["data"]["equation_fingerprint"]
     assert service.get_parsed_source_equation("rich-paper", equation_id)["data"]["annotations"] == [marked["data"]]
 
@@ -668,6 +884,79 @@ def test_outer_current_rich_cache_rejects_stale_inner_document_version(monkeypat
     assert rebuilt["data"]["document"]["parser_version"] == service.RICH_PARSER_VERSION
     assert provider.html_calls == 1
     assert read_json(rich_path)["document"]["parser_version"] == service.RICH_PARSER_VERSION
+
+
+def test_markdown_stale_rich_cache_is_ignored_after_version_bump(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\nCurrent text.\n", encoding="utf-8")
+    monkeypatch.setattr(service, "RICH_PARSER_VERSION", 2)
+    first = service.parse_source(
+        markdown_path=markdown_path,
+        source_id="markdown-versioned",
+        include_document=True,
+    )
+    light_path = parsed_source_cache_path("markdown-versioned")
+    light_before = light_path.read_bytes()
+    old_path = rich_document_cache_path(
+        "markdown-versioned", first["data"]["source_hash"], 2
+    )
+    stale = read_json(old_path)
+    stale["document"]["front_matter"]["title"] = "STALE DOCUMENT"
+    write_json(old_path, stale)
+
+    monkeypatch.setattr(service, "RICH_PARSER_VERSION", 3)
+    rebuilt = service.parse_source(
+        markdown_path=markdown_path,
+        source_id="markdown-versioned",
+        include_document=True,
+    )
+
+    assert rebuilt["ok"] is True
+    assert rebuilt["data"]["document"]["front_matter"]["title"] == "Notes"
+    assert rich_document_cache_path(
+        "markdown-versioned", rebuilt["data"]["source_hash"], 3
+    ).exists()
+    assert light_path.read_bytes() == light_before
+
+
+def test_local_markdown_lookup_rebuilds_stale_rich_cache_from_verified_provenance(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\nCurrent text.\n", encoding="utf-8")
+    source_id = "markdown-versioned-lookup"
+    current_version = service.RICH_PARSER_VERSION
+    parsed = parse_source_input(
+        markdown_path=markdown_path,
+        source_id=source_id,
+        include_document=True,
+    )
+    service._write_parsed_caches(parsed, include_document=False)
+    light_path = parsed_source_cache_path(source_id)
+    light_before = light_path.read_bytes()
+    stale_version = current_version - 1
+    stale_document = dict(parsed["document"])
+    stale_document["parser_version"] = stale_version
+    stale_path = rich_document_cache_path(source_id, parsed["source_hash"], stale_version)
+    write_json(
+        stale_path,
+        {
+            "paper_id": source_id,
+            "source_hash": parsed["source_hash"],
+            "rich_parser_version": stale_version,
+            "document": stale_document,
+        },
+    )
+
+    result = service.get_parsed_source(source_id, include_document=True)
+
+    assert result["ok"] is True
+    assert result["data"]["document"]["parser_version"] == current_version
+    current_path = rich_document_cache_path(source_id, parsed["source_hash"], current_version)
+    assert read_json(current_path)["document"]["parser_version"] == current_version
+    assert light_path.read_bytes() == light_before
 
 
 def test_concurrent_explicit_rich_requests_build_once(monkeypatch, tmp_path):

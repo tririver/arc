@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections import Counter
 from typing import Any
@@ -23,6 +24,7 @@ def build_document(
     source_url: str = "",
     assets: list[dict[str, Any]] | None = None,
     equations: list[dict[str, Any]] | None = None,
+    source_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the loss-aware ar5iv document contract.
 
@@ -62,9 +64,21 @@ def build_document(
         bibliography=bibliography,
         links=links,
     )
-    document_hash = hashlib.sha256(
-        (html + "\n" + "\n".join(str(item.get("sha256") or "") for item in asset_records)).encode("utf-8")
-    ).hexdigest()
+    source_record = {
+        "paper_id": paper_id,
+        "provider": "ar5iv" if "ar5iv.labs.arxiv.org" in source_url else "html",
+        "url": source_url,
+        "html_sha256": hashlib.sha256(html.encode("utf-8")).hexdigest(),
+        **(source_metadata or {}),
+    }
+    hash_material = html + "\n" + "\n".join(
+        str(item.get("sha256") or "") for item in asset_records
+    )
+    if source_metadata:
+        hash_material += "\n" + json.dumps(
+            source_record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    document_hash = hashlib.sha256(hash_material.encode("utf-8")).hexdigest()
     asset_manifest_hash = hashlib.sha256(
         "\n".join(
             f"{item.get('source_url', '')}\t{item.get('sha256', '')}\t{item.get('status', '')}"
@@ -75,12 +89,7 @@ def build_document(
     return {
         "schema_version": DOCUMENT_SCHEMA_VERSION,
         "parser_version": RICH_DOCUMENT_PARSER_VERSION,
-        "source": {
-            "paper_id": paper_id,
-            "provider": "ar5iv" if "ar5iv.labs.arxiv.org" in source_url else "html",
-            "url": source_url,
-            "html_sha256": hashlib.sha256(html.encode("utf-8")).hexdigest(),
-        },
+        "source": source_record,
         "front_matter": front_matter,
         "blocks": blocks,
         "equations": enriched_equations,
@@ -129,7 +138,7 @@ def _front_matter(root: Tag | BeautifulSoup) -> tuple[dict[str, Any], dict[int, 
 
     Older TeX sources often reach ar5iv as an unlabelled centered preamble:
     a visually emphasized title, an author line, and one combined affiliation
-    paragraph.  The bounded fallback below recognizes that presentation
+    paragraph. The bounded fallback below recognizes that presentation
     structure only before the abstract/TOC/first section; it does not use
     paper-, person-, institution-, or field-specific text.
     """
@@ -407,6 +416,9 @@ def _block_record(
         "text": _text(node),
         "html": str(node),
     }
+    source_span = _source_span(node)
+    if source_span:
+        record["source_span"] = source_span
     record["inline_runs"] = _inline_runs(node, block_id=block_id)
     if kind == "heading":
         tag = _text(node.select_one(":scope > .ltx_tag, .ltx_tag"))
@@ -430,6 +442,24 @@ def _block_record(
             }
         )
     return record
+
+
+def _source_span(node: Tag) -> dict[str, Any] | None:
+    source_format = str(node.get("data-source-format") or "").strip()
+    source_path = str(node.get("data-source-path") or "").strip()
+    try:
+        line_start = int(str(node.get("data-source-line-start") or ""))
+        line_end = int(str(node.get("data-source-line-end") or ""))
+    except ValueError:
+        return None
+    if not source_format or line_start < 1 or line_end < line_start:
+        return None
+    return {
+        "format": source_format,
+        "path": source_path,
+        "line_start": line_start,
+        "line_end": line_end,
+    }
 
 
 def _inline_runs(node: Tag, *, block_id: str) -> list[dict[str, Any]]:
@@ -594,11 +624,17 @@ def _equations(root: Tag | BeautifulSoup, compatibility: list[dict[str, Any]]) -
             tex = _text(annotation) if isinstance(annotation, Tag) else str(math.get("alttext") or "").strip()
             if tex:
                 tex_values.append(tex)
-        numbers = [
+        dom_numbers = [
             _text(tag).strip("() ")
             for tag in node.select(".ltx_tag_equation, .ltx_eqn_eqno, .ltx_tag")
             if _text(tag).strip("() ")
         ]
+        compatibility_numbers = [
+            str(value).strip()
+            for value in item.get("printed_equation_numbers") or []
+            if str(value).strip()
+        ]
+        numbers = compatibility_numbers or dom_numbers
         labels = [str(tag.get("id") or "") for tag in node.select(".ltx_eqn_table, .ltx_eqn_row") if tag.get("id")]
         enriched = dict(item)
         enriched.update(
@@ -710,16 +746,18 @@ def _figures(
                 record = asset_by_url.get(urljoin(source_url, raw_url))
                 if record and record.get("asset_id"):
                     asset_ids.append(str(record["asset_id"]))
-        result.append(
-            {
-                "id": str(node.get("id") or f"figure-{order:06d}"),
-                "order": order,
-                "tag": _text(node.select_one(".ltx_tag_figure, .ltx_tag")),
-                "caption": _text(node.select_one("figcaption, .ltx_caption")),
-                "asset_ids": _dedupe(asset_ids),
-                "html": str(node),
-            }
-        )
+        item = {
+            "id": str(node.get("id") or f"figure-{order:06d}"),
+            "order": order,
+            "tag": _text(node.select_one(".ltx_tag_figure, .ltx_tag")),
+            "caption": _text(node.select_one("figcaption, .ltx_caption")),
+            "asset_ids": _dedupe(asset_ids),
+            "html": str(node),
+        }
+        source_span = _source_span(node)
+        if source_span:
+            item["source_span"] = source_span
+        result.append(item)
     return result
 
 
@@ -770,17 +808,19 @@ def _tables(root: Tag | BeautifulSoup) -> list[dict[str, Any]]:
             ]
             for row in range(max_row + 1)
         ]
-        result.append(
-            {
-                "id": str(node.get("id") or f"table-{order:06d}"),
-                "order": order,
-                "tag": _text(node.select_one(".ltx_tag_table, .ltx_tag")),
-                "caption": _text(node.select_one("figcaption, .ltx_caption")),
-                "rows": rows,
-                "grid": grid,
-                "html": str(node),
-            }
-        )
+        item = {
+            "id": str(node.get("id") or f"table-{order:06d}"),
+            "order": order,
+            "tag": _text(node.select_one(".ltx_tag_table, .ltx_tag")),
+            "caption": _text(node.select_one("figcaption, .ltx_caption")),
+            "rows": rows,
+            "grid": grid,
+            "html": str(node),
+        }
+        source_span = _source_span(node)
+        if source_span:
+            item["source_span"] = source_span
+        result.append(item)
     return result
 
 

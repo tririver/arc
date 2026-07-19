@@ -448,10 +448,17 @@ def get_parsed_source(source_id: str, *, include_document: bool = False) -> dict
             except (ProviderError, ValueError, OSError) as exc:
                 return err("parsed_source_upgrade_failed", str(exc))
         else:
-            return err(
-                "parsed_source_document_not_found",
-                f"No complete parsed document found for {source_id}; recache an HTML source first.",
-            )
+            with parsed_source_lock(lookup_id, namespace=f"rich-v{RICH_PARSER_VERSION}"):
+                document = _read_rich_document(parsed)
+                if document is None:
+                    document = _rebuild_local_rich_document_from_stale_cache(parsed)
+            if document is None:
+                return err(
+                    "parsed_source_document_not_found",
+                    f"No complete parsed document found for {source_id}; recache the local source first.",
+                )
+            parsed = _parsed_source_with_document(parsed, document)
+            rich_path = _rich_cache_path(parsed)
     return ok(
         _parsed_source_view(parsed, include_document=include_document),
         provider="local-cache",
@@ -1323,6 +1330,53 @@ def _read_rich_document(parsed: dict[str, Any]) -> dict[str, Any] | None:
         )
         return legacy_document
     return None
+
+
+def _rebuild_local_rich_document_from_stale_cache(parsed: dict[str, Any]) -> dict[str, Any] | None:
+    """Rebuild a version-stale local Markdown document from cached provenance."""
+
+    current_path = _rich_cache_path(parsed)
+    source_hash = str(parsed.get("source_hash") or "")
+    candidates = sorted(
+        current_path.parent.parent.glob(f"v*/{source_hash}.json"),
+        key=_rich_cache_version,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if candidate == current_path:
+            continue
+        stale = read_json(candidate)
+        if not isinstance(stale, dict):
+            continue
+        if stale.get("paper_id") != parsed.get("paper_id") or stale.get("source_hash") != source_hash:
+            continue
+        document = stale.get("document")
+        source = document.get("source") if isinstance(document, dict) else None
+        if not isinstance(source, dict) or source.get("format") != "markdown":
+            continue
+        markdown_path = Path(str(source.get("path") or ""))
+        raw_pdf_path = str(source.get("pdf_path") or "")
+        pdf_path = Path(raw_pdf_path) if raw_pdf_path else None
+        if not markdown_path.is_file() or (pdf_path is not None and not pdf_path.is_file()):
+            continue
+        if source_input_hash(markdown_path=markdown_path, pdf_path=pdf_path) != source_hash:
+            continue
+        rebuilt = parse_source_input(
+            markdown_path=markdown_path,
+            pdf_path=pdf_path,
+            source_id=str(parsed.get("paper_id") or ""),
+            include_document=True,
+        )
+        if rebuilt.get("source_hash") != source_hash or not isinstance(rebuilt.get("document"), dict):
+            continue
+        _write_rich_cache(rebuilt)
+        return rebuilt["document"]
+    return None
+
+
+def _rich_cache_version(path: Path) -> int:
+    match = re.fullmatch(r"v(\d+)", path.parent.name)
+    return int(match.group(1)) if match else -1
 
 
 def _write_parsed_caches(

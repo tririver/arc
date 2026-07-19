@@ -165,6 +165,23 @@ def test_annotation_claims_require_registered_relation_matching_ids() -> None:
         )
 
 
+def test_context_evidence_requires_each_exact_title_in_reader_explanation() -> None:
+    context = _arc_record(relation="context", evidence_id="context-001")
+    annotation = {
+        "explanation": "This follows the RECORDED\n paper presentation.",
+        "commentary": "",
+        "prior_work": "",
+        "later_work": "",
+        "evidence_ids": ["context-001"],
+    }
+
+    assert validate_annotation_citations(annotation, [context]) == ["context-001"]
+
+    missing_title = {**annotation, "explanation": "This follows a reference presentation."}
+    with pytest.raises(EvidenceProvenanceError, match="exact source title"):
+        validate_annotation_citations(missing_title, [context])
+
+
 def test_claim_level_bindings_require_support_for_each_claim() -> None:
     prior = _arc_record()
     annotation = {

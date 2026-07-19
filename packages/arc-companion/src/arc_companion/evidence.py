@@ -366,14 +366,53 @@ def validate_annotation_citations(annotation: Any, records: Iterable[Any]) -> li
                         f"{field} claim {index} must locate every cited evidence item"
                     )
                 claim_bound_ids.extend(claim_ids)
+    if _has_claims(annotation.get("explanation")) or _has_claims(annotation.get("commentary")):
+        used_relations.add("context")
     unused = [value for value in ids if str(registry[value]["relation"]) not in used_relations]
     if unused:
         raise EvidenceProvenanceError(f"annotation cites evidence that supports no recorded claim: {unused}")
-    if has_claim_level_bindings and set(ids) != set(claim_bound_ids):
+    context_ids = {
+        value for value in ids if str(registry[value]["relation"]) == "context"
+    }
+    reader_context = _normalized_reader_context(annotation)
+    missing_context_titles = [
+        value
+        for value in context_ids
+        if not _normalized_title_present(registry[value].get("title"), reader_context)
+    ]
+    if missing_context_titles:
+        raise EvidenceProvenanceError(
+            "context evidence is not cited by exact source title in explanation/commentary: "
+            f"{missing_context_titles}"
+        )
+    if has_claim_level_bindings and set(ids) != set(claim_bound_ids) | context_ids:
         raise EvidenceProvenanceError(
             "annotation evidence_ids must equal the union of claim-level evidence IDs"
         )
     return ids
+
+
+def _normalized_reader_context(annotation: dict[str, Any]) -> str:
+    values: list[str] = []
+    for field in ("explanation", "commentary"):
+        value = annotation.get(field)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    values.append(item)
+                elif isinstance(item, dict):
+                    values.extend(
+                        str(item.get(key) or "")
+                        for key in ("text", "summary", "claim", "title")
+                    )
+    return " ".join(" ".join(values).split()).casefold()
+
+
+def _normalized_title_present(title: Any, reader_context: str) -> bool:
+    normalized = " ".join(str(title or "").split()).casefold()
+    return bool(normalized and normalized in reader_context)
 
 
 def _evidence_source_locators(record: dict[str, Any]) -> set[str]:

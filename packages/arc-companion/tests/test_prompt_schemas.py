@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import jsonschema
+
 from arc_llm.json_schema import to_provider_json_schema
 
 from arc_companion.prompts import (
@@ -13,6 +15,9 @@ from arc_companion.prompts import (
     TRANSLATION_COVERAGE_REPAIR_SCHEMA,
     TRANSLATION_SCHEMA,
     TRANSLATION_SLOT_REPAIR_SCHEMA,
+    annotation_prompt,
+    review_prompt,
+    section_review_prompt,
 )
 
 
@@ -63,3 +68,57 @@ def test_review_patch_uses_null_for_unchanged_optional_replacements() -> None:
         "evidence_ids",
     ):
         assert "null" in patch["properties"][field]["type"]
+
+
+def test_annotation_and_review_schemas_allow_intentionally_empty_explanation() -> None:
+    annotation = {
+        "explanation": "",
+        "prior_work": [],
+        "later_work": [],
+        "context_claims": [],
+        "commentary": "",
+        "evidence_ids": [],
+        "key_points": [],
+        "source_notes": [],
+        "evidence_requests": [],
+    }
+    jsonschema.validate(annotation, ANNOTATION_SCHEMA)
+
+    patch = {
+        "segment_id": "seg-1",
+        "translation_blocks": None,
+        "commentary": "",
+        "explanation": "",
+        "prior_work": None,
+        "later_work": None,
+        "evidence_ids": None,
+        "reason": "remove commentary that only repeats an evident passage",
+    }
+    jsonschema.validate({"patches": [patch], "issues": []}, REVIEW_SCHEMA)
+
+
+def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> None:
+    generation = annotation_prompt(
+        {"segment_id": "seg-1", "block_ids": ["b1"]},
+        [{"block_id": "b1", "text": "A direct statement."}],
+        language="zh-CN",
+        metadata={},
+        evidence={"papers": []},
+        glossary={"entries": []},
+        protected_names=[],
+        paper_context={},
+    )
+    reviews = " ".join(
+        (
+            review_prompt({"segments": []}, language="zh-CN"),
+            section_review_prompt({"segments": []}, language="zh-CN"),
+        )
+    )
+
+    assert "Explanation is optional" in generation
+    assert "opening of a section or chapter" in generation
+    assert "alternative presentation" in generation
+    assert "equivalent formulation as an inconsistency" in generation
+    assert "intermediate mathematics" in generation
+    assert "empty explanation/commentary is valid" in reviews
+    assert "notation, convention, normalization" in reviews

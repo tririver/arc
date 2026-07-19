@@ -44,6 +44,25 @@ def main(argv: list[str] | None = None) -> int:
     domain = build.add_mutually_exclusive_group()
     domain.add_argument("--domain-id", default=None)
     domain.add_argument("--domain-manifest", default=None)
+    build.add_argument(
+        "--no-mcp",
+        action="store_true",
+        help="disable MCP access for every companion LLM call",
+    )
+    build.add_argument(
+        "--no-internet",
+        action="store_true",
+        help="disable internet access independently of MCP access",
+    )
+    build.add_argument(
+        "--context-paper-id",
+        action="append",
+        default=[],
+        help=(
+            "repeatable arc-paper ID loaded only from the local cache as bounded "
+            "explanatory context"
+        ),
+    )
     build.add_argument("--force", action="store_true")
     build.add_argument("--json", action="store_true")
 
@@ -84,6 +103,9 @@ def main(argv: list[str] | None = None) -> int:
                 force=args.force,
                 domain_id=args.domain_id,
                 domain_manifest=Path(args.domain_manifest) if args.domain_manifest else None,
+                allow_mcp=not args.no_mcp,
+                allow_internet=not args.no_internet,
+                context_paper_ids=tuple(args.context_paper_id),
             )
         except ValueError as exc:
             result = {"ok": False, "data": None, "error": {"code": "invalid_options", "message": str(exc)}, "errors": []}

@@ -185,7 +185,8 @@ ANNOTATION_SCHEMA: dict[str, Any] = {
         "evidence_requests",
     ],
     "properties": {
-        "explanation": {"type": "string", "minLength": 1},
+        "explanation": {"type": "string"},
+        "commentary": {"type": "string"},
         "prior_work": RELATED_WORK_SCHEMA,
         "later_work": RELATED_WORK_SCHEMA,
         "context_claims": {
@@ -194,7 +195,6 @@ ANNOTATION_SCHEMA: dict[str, Any] = {
                 "Audited context claims used in explanation/commentary; empty unless context evidence is used."
             ),
         },
-        "commentary": {"type": "string", "minLength": 1},
         "evidence_ids": {
             "type": "array", "maxItems": 6, "items": {"type": "string"},
         },
@@ -248,8 +248,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
                         **TRANSLATION_SCHEMA["properties"]["blocks"],
                         "type": ["array", "null"],
                     },
-                    "commentary": {"type": ["string", "null"], "minLength": 1},
-                    "explanation": {"type": ["string", "null"], "minLength": 1},
+                    "commentary": {"type": ["string", "null"]},
+                    "explanation": {"type": ["string", "null"]},
                     "prior_work": {
                         "type": ["array", "null"],
                         "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
@@ -475,9 +475,19 @@ def annotation_prompt(
     evidence_resolution: dict[str, Any] | None = None,
 ) -> str:
     return (
-        "Write rigorous companion commentary for this contiguous theoretical-physics paper segment. "
-        "Return a self-contained explanation and one combined commentary suitable for typesetting. The "
-        "prior_work and later_work fields are strictly optional. Return each non-empty field as at most three claim "
+        "Write rigorous, reader-useful companion commentary for this contiguous theoretical-physics segment. "
+        "Explanation is optional: if the passage is already evident to the intended reader and none of the "
+        "criteria below adds material value, return empty strings for explanation and commentary instead of "
+        "paraphrasing, summarizing, praising, or manufacturing a teaching note. When an explanation is useful, "
+        "choose only the most relevant of these priorities: (1) explain why this material is needed and what role "
+        "it plays in the argument, giving motivation first at the opening of a section or chapter; (2) compare a "
+        "genuinely useful alternative presentation in the supplied references; (3) cautiously identify a deeper "
+        "incompatibility with another source, but do not report a mere convention, notation, normalization, or "
+        "equivalent formulation as an inconsistency; (4) supply omitted intermediate mathematics when the "
+        "derivation is not evident. Do not force all four directions into every segment and do not repeat the "
+        "source. Return optional explanation and commentary strings, a bounded account of relevant prior work, "
+        "and a bounded account of relevant later work. The prior_work and later_work fields are strictly optional. "
+        "Return each non-empty field as at most three claim "
         "objects, each with text, the evidence_ids used for that exact claim, source_locators pairing every "
         "evidence_id with an exact supplied block/snippet locator (or 'abstract'), and request_key (null for "
         "an initially supported claim). The top-level evidence_ids must equal the union of claim evidence_ids. "
@@ -489,6 +499,8 @@ def annotation_prompt(
         "a weak secondary prior. Prefer a more directly relevant paper even when it is outside the supplied domain "
         "or less cited. Do not fill a quota. Explain motivation, assumptions, "
         "derivation logic, notation, and conceptual connections. Do not rewrite or correct the source. "
+        "Never put an evidence ID, hash, or controller label in reader-facing prose; refer to a source by its "
+        "title and section/location when useful. "
         "Use the glossary consistently and preserve every personal name in Latin spelling. "
         "When needed, use the bounded full-paper navigation context, ARC cached-paper tools, and internet search "
         "to inspect the full paper or verify terminology and related-work context. Treat external material as "
@@ -500,6 +512,12 @@ def annotation_prompt(
         "on a resolved request must carry that request_key and bind one of that request's newly registered evidence "
         "IDs and its exact locator; otherwise omit that claim and preserve unrelated claims. A request must state the claim, relation, "
         "queries, candidate paper IDs or discovery URLs, and reason. Web snippets are discovery hints only. "
+        "Evidence whose relation is context is an explicitly selected local reference: use it only to support "
+        "the explanation or conceptual connections in the combined commentary. It must never be presented as "
+        "prior work, later work, chronology, or historical priority. Record its evidence_id only in the "
+        "structured evidence_ids field when it materially supports such explanatory context. For every context "
+        "evidence_id you record, cite that source's exact supplied title in explanation or commentary and add its "
+        "supplied section/location when available; do not print the identifier itself. "
         "When EXPLICIT DOMAIN CONTEXT is present, use it as preferred navigation and a relevance signal, not as "
         "a closed corpus. A domain match never forbids or short-circuits ARC, INSPIRE, references/citers, or web "
         "research, and a more directly relevant paper outside the domain may be preferred. The reference and "
@@ -528,8 +546,15 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "Review this complete source/translation/companion paper for technical accuracy, exact translation "
         "coverage, terminology consistency, protected-name preservation, and unsupported literature claims. "
         "Source blocks and the frozen glossary are immutable. Return one patch only for a segment needing correction. "
+        "Do not fill an intentionally empty explanation merely to achieve commentary coverage. Remove repetitive "
+        "or obvious explanation that adds no value for the intended reader. Preserve useful emphasis on motivation "
+        "at section or chapter openings, alternative presentations, deeper non-conventional incompatibilities, and "
+        "non-evident intermediate derivations. A difference that is only convention, notation, normalization, or an "
+        "equivalent formulation is not an inconsistency. "
+        "An empty explanation/commentary is valid when the passage needs no reader aid. "
         "Every patch field is required by the output schema: use null for each translation or companion field that "
-        "must remain unchanged, and use an empty array only when intentionally clearing prior_work or later_work. "
+        "must remain unchanged. Use an empty string when intentionally clearing explanation/commentary, and an "
+        "empty array only when intentionally clearing prior_work or later_work. "
         "Prior and later work are optional; never add a generic or quota-filling related-work patch. "
         "Return full replacement translation blocks for a translation correction. Never alter equations, equation numbers, figures, "
         "tables, citations, references, identifiers, or evidence IDs. Never create a new prior/later claim or bind "
@@ -538,6 +563,8 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "translatable natural-language blocks supplied in translation blocks. Display equations, figures, "
         "tables, bibliography, and other controller-owned or source-only blocks are intentionally absent and "
         "must not be invented as translation blocks. An empty patches list is valid. "
+        "For each segment, verify context-supported explanatory claims against that segment's bounded "
+        "context_evidence and source_descriptor; context evidence never establishes chronology or priority. "
         f"All replacements must be in {language}.\n\nCOMPANION:\n"
         f"{json.dumps(payload, ensure_ascii=False)}{extra}"
     )
@@ -547,6 +574,13 @@ def section_review_prompt(payload: dict[str, Any], *, language: str) -> str:
     return (
         "Review this portion of a source/translation/companion theoretical-physics paper. Identify concrete "
         "technical, translation, coverage, terminology, protected-name, and evidence-grounding issues. "
+        "Verify explanatory claims against each segment's actual bounded context_evidence and "
+        "source_descriptor; do not use context evidence for chronology or priority. "
+        "An empty explanation/commentary is valid when the passage needs no reader aid; never add filler solely "
+        "for completeness. Retain or propose explanation only when it materially clarifies motivation (especially "
+        "at section or chapter openings), a useful alternative presentation, a deeper non-conventional source "
+        "incompatibility, or non-evident intermediate mathematics. Treat notation, convention, normalization, and "
+        "equivalent formulations as differences rather than inconsistencies. "
         "Do not propose changes to source blocks or the frozen glossary. Do not add any prior/later fact or new "
         "claim-evidence binding during review. Return reviewed_segments containing "
         "exactly every input segment_id plus complete reviewed translation and annotation values (unchanged when correct) "
