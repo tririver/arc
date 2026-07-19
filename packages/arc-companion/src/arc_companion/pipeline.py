@@ -1102,11 +1102,19 @@ def _translation_token_attempt_path(checkpoint_dir: Path, segment_id: str) -> Pa
     )
 
 
+def _read_checkpoint_json(path: Path) -> Any | None:
+    """Read a checkpoint without letting a torn/corrupt file trigger fresh model work."""
+    try:
+        return read_json(path) if path.is_file() else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def _matching_translation_token_attempt(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
 ) -> dict[str, Any] | None:
     path = _translation_token_attempt_path(checkpoint_dir, segment_id)
-    value = read_json(path) if path.is_file() else None
+    value = _read_checkpoint_json(path)
     if (
         isinstance(value, dict)
         and value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
@@ -1132,7 +1140,7 @@ def _matching_translation_token_repair_draft(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
 ) -> dict[str, Any] | None:
     path = _translation_token_repair_draft_path(checkpoint_dir, segment_id)
-    value = read_json(path) if path.is_file() else None
+    value = _read_checkpoint_json(path)
     if (
         isinstance(value, dict)
         and value.get("schema_version") == "arc.companion.translation-token-repair-draft.v1"
@@ -1140,6 +1148,7 @@ def _matching_translation_token_repair_draft(
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
         and isinstance(value.get("translation"), dict)
+        and isinstance(value.get("repair_provenance"), dict)
     ):
         return value
     return None
@@ -1149,7 +1158,7 @@ def _legacy_v3_translation_candidate(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
 ) -> dict[str, Any] | None:
     draft_path = _translation_token_repair_draft_path(checkpoint_dir, segment_id)
-    draft = read_json(draft_path) if draft_path.is_file() else None
+    draft = _read_checkpoint_json(draft_path)
     if (
         isinstance(draft, dict)
         and draft.get("prompt_version") == "arc.companion.translation-retry-prompt.v3"
@@ -1161,7 +1170,7 @@ def _legacy_v3_translation_candidate(
     checkpoint_path = (
         checkpoint_dir / "translations" / f"{_segment_checkpoint_name(segment_id)}.json"
     )
-    checkpoint = read_json(checkpoint_path) if checkpoint_path.is_file() else None
+    checkpoint = _read_checkpoint_json(checkpoint_path)
     if not isinstance(checkpoint, dict) or checkpoint.get("input_sha256") != input_sha256:
         return None
     repairs = (checkpoint.get("generation_provenance") or {}).get("repairs") or []
@@ -1256,6 +1265,9 @@ def _repair_translation_token_placement(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the single lifetime-bounded token-placement repair for a segment input."""
     segment_id = str(segment["segment_id"])
+    repair_draft_path = _translation_token_repair_draft_path(
+        checkpoint_dir, segment_id,
+    )
     persisted = _matching_translation_token_repair_draft(
         checkpoint_dir, segment_id, input_sha256,
     )
@@ -1263,12 +1275,40 @@ def _repair_translation_token_placement(
         repaired = persisted["translation"]
         _validate_translation(segment, repaired, blocks_by_id, protected_names)
         return repaired, dict(persisted["repair_provenance"])
-    if _matching_translation_token_attempt(checkpoint_dir, segment_id, input_sha256):
+    attempt_path = _translation_token_attempt_path(checkpoint_dir, segment_id)
+    raw_attempt = _read_checkpoint_json(attempt_path)
+    if attempt_path.is_file() and raw_attempt is None:
         raise RuntimeError(
-            f"translation token placement repair attempt already consumed for {segment_id}"
+            f"translation token repair marker is corrupt for {segment_id}; "
+            "refusing a new model call"
+        )
+    attempt = _matching_translation_token_attempt(
+        checkpoint_dir, segment_id, input_sha256,
+    )
+    raw_repair_draft = _read_checkpoint_json(repair_draft_path)
+    if (
+        repair_draft_path.is_file()
+        and (
+            raw_repair_draft is None
+            or (
+                isinstance(raw_repair_draft, dict)
+                and raw_repair_draft.get("prompt_version")
+                == TRANSLATION_RETRY_PROMPT_VERSION
+                and raw_repair_draft.get("segment_id") == segment_id
+                and raw_repair_draft.get("input_sha256") == input_sha256
+            )
+        )
+        and attempt is None
+    ):
+        raise RuntimeError(
+            f"translation token repair draft is corrupt for {segment_id}; refusing a new model call"
         )
     token_errors = _translation_opaque_token_errors(segment, translation, blocks_by_id)
     source_blocks = [blocks_by_id[item.block_id] for item in token_errors]
+    if not source_blocks:
+        raise RuntimeError(
+            f"translation token repair has no structurally failing blocks for {segment_id}"
+        )
     legacy_candidate = _legacy_v3_translation_candidate(
         checkpoint_dir, segment_id, input_sha256,
     )
@@ -1291,33 +1331,61 @@ def _repair_translation_token_placement(
         )
         for source_block in source_blocks
     ]
-    write_json(_translation_token_attempt_path(checkpoint_dir, segment_id), {
+    marker_base = {
         "schema_version": "arc.companion.translation-token-attempt.v2",
         "segment_id": segment_id,
         "input_sha256": input_sha256,
-        "status": "started",
-        "started_at": datetime.now(timezone.utc).isoformat(),
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
         "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
         "model_tier": TRANSLATION_RETRY_TIER,
         "block_ids": [block_id(block) for block in source_blocks],
-    })
-    value = _llm_call(
-        llm,
-        translation_retry_prompt(
-            segment,
-            repair_contexts,
-            validation_errors=[item.prompt_payload() for item in token_errors],
-            retry_model_tier=TRANSLATION_RETRY_TIER,
-        ),
-        TRANSLATION_SLOT_REPAIR_SCHEMA,
-        options=options,
-        artifact_dir=artifact_dir / "retry-1",
-        call_label=f"companion-translation-{segment_id}-retry-1",
-        model_tier=TRANSLATION_RETRY_TIER,
-        allow_mcp=False,
-        allow_internet=False,
-    )
+    }
+    value: dict[str, Any] | None = None
+    if attempt is not None:
+        status = str(attempt.get("status") or "")
+        if status in {"response_received", "validated"}:
+            raw_response = attempt.get("raw_response")
+            if not isinstance(raw_response, dict):
+                raise RuntimeError(
+                    f"translation token repair marker lacks its auditable response for {segment_id}"
+                )
+            value = raw_response
+        elif status != "started":
+            raise RuntimeError(
+                f"translation token repair marker has invalid status {status!r} for {segment_id}"
+            )
+    if value is None:
+        started_at = (
+            str(attempt.get("started_at") or "") if attempt is not None else ""
+        ) or datetime.now(timezone.utc).isoformat()
+        write_json(attempt_path, {
+            **marker_base,
+            "status": "started",
+            "started_at": started_at,
+        })
+        value = _llm_call(
+            llm,
+            translation_retry_prompt(
+                segment,
+                repair_contexts,
+                validation_errors=[item.prompt_payload() for item in token_errors],
+                retry_model_tier=TRANSLATION_RETRY_TIER,
+            ),
+            TRANSLATION_SLOT_REPAIR_SCHEMA,
+            options=options,
+            artifact_dir=artifact_dir / "retry-1",
+            call_label=f"companion-translation-{segment_id}-retry-1",
+            model_tier=TRANSLATION_RETRY_TIER,
+            allow_mcp=False,
+            allow_internet=False,
+        )
+        write_json(attempt_path, {
+            **marker_base,
+            "status": "response_received",
+            "started_at": started_at,
+            "response_received_at": datetime.now(timezone.utc).isoformat(),
+            "raw_response": value,
+        })
     repaired = _apply_translation_slot_repairs(
         repair_input,
         source_blocks,
@@ -1337,7 +1405,7 @@ def _repair_translation_token_placement(
         "model_tier": TRANSLATION_RETRY_TIER,
         "repaired_block_ids": [block_id(block) for block in source_blocks],
     }
-    write_json(_translation_token_repair_draft_path(checkpoint_dir, segment_id), {
+    write_json(repair_draft_path, {
         "schema_version": "arc.companion.translation-token-repair-draft.v1",
         "segment_id": segment_id,
         "input_sha256": input_sha256,
@@ -1346,6 +1414,16 @@ def _repair_translation_token_placement(
         "raw_response": value,
         "translation": repaired,
         "repair_provenance": provenance,
+    })
+    marker = _matching_translation_token_attempt(
+        checkpoint_dir, segment_id, input_sha256,
+    ) or marker_base
+    write_json(attempt_path, {
+        **marker,
+        "status": "validated",
+        "validated_at": datetime.now(timezone.utc).isoformat(),
+        "validated_translation_sha256": sha256_json(repaired),
+        "raw_response": value,
     })
     return repaired, provenance
 
@@ -1366,6 +1444,7 @@ def _generate_translations(
     output: dict[str, dict[str, Any]] = {}
     pending: list[dict[str, Any]] = []
     input_hashes: dict[str, str] = {}
+    v4_upgrade_ids: set[str] = set()
     for segment in segments:
         path = translation_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json"
         paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
@@ -1381,7 +1460,7 @@ def _generate_translations(
         )
         input_hashes[str(segment["segment_id"])] = expected_hash
         if path.is_file() and not options.force:
-            checkpoint = read_json(path)
+            checkpoint = _read_checkpoint_json(path)
             if (
                 isinstance(checkpoint, dict)
                 and checkpoint.get("segment_id") == segment["segment_id"]
@@ -1389,6 +1468,7 @@ def _generate_translations(
                 and isinstance(checkpoint.get("translation"), dict)
             ):
                 if _translation_checkpoint_requires_v4_upgrade(checkpoint):
+                    v4_upgrade_ids.add(str(segment["segment_id"]))
                     pending.append(segment)
                     continue
                 checkpoint = _repair_translation_checkpoint_citation_delimiters(
@@ -1409,7 +1489,7 @@ def _generate_translations(
             checkpoint_dir / "llm" / "translations" / _segment_checkpoint_name(segment_id)
         )
         draft_path = _translation_draft_path(checkpoint_dir, segment_id)
-        draft = read_json(draft_path) if draft_path.is_file() else None
+        draft = _read_checkpoint_json(draft_path)
         attempt = _matching_translation_coverage_attempt(
             checkpoint_dir, segment_id, input_hashes[segment_id]
         )
@@ -1446,6 +1526,14 @@ def _generate_translations(
         if token_attempt is not None and translation is None:
             raise RuntimeError(
                 f"translation token placement repair attempt already consumed for {segment_id}"
+            )
+        if segment_id in v4_upgrade_ids and (
+            translation is None
+            or str((candidate_provenance or {}).get("origin") or "") != "primary-model"
+        ):
+            raise RuntimeError(
+                f"v4 translation upgrade for {segment_id} requires its stored primary draft; "
+                "refusing to rerun the low translation model"
             )
         if translatable:
             if translation is None:
@@ -2223,12 +2311,21 @@ def _translation_slot_repair_context(
     """Build an inert placement-only context without asking for retranslation."""
     expected_tokens = _opaque_inline_tokens(source_block)
     residue = _translation_natural_residue(previous_text)
-    affected_tokens = _translation_repair_affected_tokens(
+    affected_ordinals = _translation_repair_affected_ordinals(
         source_block, primary_text, previous_text,
-    ) if primary_text is not None else set(expected_tokens)
-    regions, immutable_fragments = _translation_repair_regions(
-        previous_text, affected_tokens=affected_tokens,
-    )
+    ) if primary_text is not None else set(range(1, len(expected_tokens) + 1))
+    prior_tokens, prior_slots = _translation_token_delimited_slots(previous_text)
+    if primary_text is not None and prior_tokens != expected_tokens:
+        raise RuntimeError("legacy translation tokens do not match source occurrences")
+    slot_regions = [
+        _translation_slot_boundary_record(
+            slot,
+            slot_ordinal=index,
+            token_count=len(expected_tokens),
+            affected_ordinals=affected_ordinals,
+        )
+        for index, slot in enumerate(prior_slots)
+    ] if prior_tokens == expected_tokens else []
     source_runs: list[dict[str, Any]] = []
     for index, run in enumerate(source_block.get("inline_runs") or [], start=1):
         if not isinstance(run, dict):
@@ -2251,101 +2348,142 @@ def _translation_slot_repair_context(
             {"offset": index, "character": character}
             for index, character in enumerate(residue)
         ],
-        "mutable_clause_regions": [item for item in regions if item["mutable"]],
-        "immutable_fragments": immutable_fragments,
-        "affected_token_ordinals": [
-            index for index, token in enumerate(expected_tokens, start=1)
-            if token in affected_tokens
+        "token_delimited_slot_regions": slot_regions,
+        "immutable_fragments": [
+            fragment
+            for item in slot_regions
+            for fragment in (item["immutable_prefix"], item["immutable_suffix"])
+            if fragment
         ],
+        "affected_token_ordinals": sorted(affected_ordinals),
         "expected_slot_count": len(expected_tokens) + 1,
         "slot_ids": _translation_repair_slot_ids(source_block),
         "missing_protected_names": _minimal_missing_name_insertions(
             _missing_protected_names([source_block], residue, protected_names)
         ),
         "source_run_sequence": source_runs,
-    }
+}
 
 
-def _translation_repair_regions(
-    previous_text: str,
+def _translation_token_delimited_slots(text: str) -> tuple[list[str], list[str]]:
+    """Return opaque occurrences and the exact natural slots around them."""
+    matches = list(_OPAQUE_INLINE_CANDIDATE_PATTERN.finditer(text))
+    tokens = [match.group(0) for match in matches]
+    slots: list[str] = []
+    cursor = 0
+    for match in matches:
+        slots.append(text[cursor:match.start()])
+        cursor = match.end()
+    slots.append(text[cursor:])
+    return tokens, slots
+
+
+def _translation_slot_boundary_record(
+    text: str,
     *,
-    affected_tokens: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Split a candidate into clause-sized mutable and byte-stable regions."""
-    token_by_sentinel: dict[str, str] = {}
-    def replace_token(match: re.Match[str]) -> str:
-        sentinel = f"\ue000{len(token_by_sentinel)}\ue001"
-        token_by_sentinel[sentinel] = match.group(0)
-        return sentinel
-    masked = _OPAQUE_INLINE_CANDIDATE_PATTERN.sub(replace_token, previous_text)
-    chunks = [
-        value for value in re.split(r"(?<=[。！？；;.!?：:，,])", masked)
-        if value
-    ]
-    regions: list[dict[str, Any]] = []
-    immutable: list[str] = []
-    for index, chunk in enumerate(chunks):
-        tokens = [token for sentinel, token in token_by_sentinel.items() if sentinel in chunk]
-        residue = chunk
-        interleaved = chunk
-        for sentinel, token in token_by_sentinel.items():
-            residue = residue.replace(sentinel, "")
-            interleaved = interleaved.replace(sentinel, token)
-        mutable = bool(tokens) if affected_tokens is None else any(
-            token in affected_tokens for token in tokens
-        )
-        regions.append({
-            "region_id": f"clause-{index + 1:04d}",
-            "mutable": mutable,
-            "prior_residue": residue,
-            "prior_interleaved": interleaved,
-        })
-        if not mutable and interleaved:
-            immutable.append(interleaved)
-    return regions, immutable
-
-
-def _translation_repair_affected_tokens(
-    source_block: dict[str, Any], primary_text: str, v3_text: str,
-) -> set[str]:
-    """Identify missing, reordered, or v3-moved tokens that make clauses mutable."""
-    expected = _opaque_inline_tokens(source_block)
-    expected_index = {token: index for index, token in enumerate(expected)}
-    primary_tokens = [
-        match.group(0) for match in _OPAQUE_INLINE_CANDIDATE_PATTERN.finditer(primary_text)
-        if match.group(0) in expected_index
-    ]
-    actual_indices = [expected_index[token] for token in primary_tokens]
-    lengths = [1] * len(actual_indices)
-    predecessors = [-1] * len(actual_indices)
-    for index in range(len(actual_indices)):
-        for prior in range(index):
-            if actual_indices[prior] < actual_indices[index] and (
-                lengths[prior] + 1 > lengths[index]
-            ):
-                lengths[index] = lengths[prior] + 1
-                predecessors[index] = prior
-    stable: set[str] = set()
-    if lengths:
-        cursor = max(range(len(lengths)), key=lengths.__getitem__)
-        while cursor >= 0:
-            stable.add(primary_tokens[cursor])
-            cursor = predecessors[cursor]
-    primary_offsets = _translation_token_residue_offsets(primary_text)
-    v3_offsets = _translation_token_residue_offsets(v3_text)
+    slot_ordinal: int,
+    token_count: int,
+    affected_ordinals: set[int],
+) -> dict[str, Any]:
+    """Lock exact slot boundaries outside clauses touching affected occurrences."""
+    left_affected = slot_ordinal > 0 and slot_ordinal in affected_ordinals
+    right_affected = (
+        slot_ordinal < token_count and slot_ordinal + 1 in affected_ordinals
+    )
+    immutable_prefix = text
+    immutable_suffix = ""
+    mutable_mode = "none"
+    if left_affected and right_affected:
+        immutable_prefix = ""
+        mutable_mode = "full"
+    elif left_affected:
+        match = re.search(r"[。！？；;.!?：:，,]", text)
+        boundary = match.end() if match is not None else len(text)
+        immutable_prefix = ""
+        immutable_suffix = text[boundary:]
+        mutable_mode = "prefix"
+    elif right_affected:
+        matches = list(re.finditer(r"[。！？；;.!?：:，,]", text))
+        boundary = matches[-1].end() if matches else 0
+        immutable_prefix = text[:boundary]
+        mutable_mode = "suffix"
     return {
-        token for token in expected
-        if token not in stable or primary_offsets.get(token) != v3_offsets.get(token)
+        "slot_id": f"slot-{slot_ordinal:04d}",
+        "slot_ordinal": slot_ordinal,
+        "left_token_ordinal": slot_ordinal if slot_ordinal > 0 else None,
+        "right_token_ordinal": slot_ordinal + 1 if slot_ordinal < token_count else None,
+        "mutable_mode": mutable_mode,
+        "prior_text": text,
+        "immutable_prefix": immutable_prefix,
+        "immutable_suffix": immutable_suffix,
     }
 
 
-def _translation_token_residue_offsets(text: str) -> dict[str, int]:
-    offsets: dict[str, int] = {}
+def _translation_repair_affected_ordinals(
+    source_block: dict[str, Any], primary_text: str, v3_text: str,
+) -> set[int]:
+    """Identify affected source token occurrences with duplicate-safe LCS alignment."""
+    expected = _opaque_inline_tokens(source_block)
+    primary_tokens, _ = _translation_token_delimited_slots(primary_text)
+    v3_tokens, _ = _translation_token_delimited_slots(v3_text)
+    if v3_tokens != expected:
+        raise RuntimeError("legacy v3 candidate has invalid opaque token occurrences")
+    primary_offsets = _translation_token_residue_offsets_by_occurrence(primary_text)
+    v3_offsets = _translation_token_residue_offsets_by_occurrence(v3_text)
+    scores = [
+        [(0, 0)] * (len(primary_tokens) + 1) for _ in range(len(expected) + 1)
+    ]
+    choices = [[""] * (len(primary_tokens) + 1) for _ in range(len(expected) + 1)]
+    for expected_index in range(1, len(expected) + 1):
+        for primary_index in range(1, len(primary_tokens) + 1):
+            candidates = [
+                (scores[expected_index - 1][primary_index], "up"),
+                (scores[expected_index][primary_index - 1], "left"),
+            ]
+            if expected[expected_index - 1] == primary_tokens[primary_index - 1]:
+                prior_count, prior_cost = scores[expected_index - 1][primary_index - 1]
+                candidates.append((
+                    (
+                        prior_count + 1,
+                        prior_cost + abs(
+                            v3_offsets[expected_index - 1]
+                            - primary_offsets[primary_index - 1]
+                        ),
+                    ),
+                    "match",
+                ))
+            score, choice = max(
+                candidates,
+                key=lambda item: (item[0][0], -item[0][1], item[1] == "match"),
+            )
+            scores[expected_index][primary_index] = score
+            choices[expected_index][primary_index] = choice
+    stable_pairs: dict[int, int] = {}
+    expected_index, primary_index = len(expected), len(primary_tokens)
+    while expected_index and primary_index:
+        choice = choices[expected_index][primary_index]
+        if choice == "match":
+            stable_pairs[expected_index] = primary_index
+            expected_index -= 1
+            primary_index -= 1
+        elif choice == "up":
+            expected_index -= 1
+        else:
+            primary_index -= 1
+    return {
+        ordinal for ordinal in range(1, len(expected) + 1)
+        if ordinal not in stable_pairs
+        or primary_offsets[stable_pairs[ordinal] - 1] != v3_offsets[ordinal - 1]
+    }
+
+
+def _translation_token_residue_offsets_by_occurrence(text: str) -> list[int]:
+    offsets: list[int] = []
     cursor = 0
     residue_offset = 0
     for match in _OPAQUE_INLINE_CANDIDATE_PATTERN.finditer(text):
         residue_offset += len(text[cursor:match.start()])
-        offsets.setdefault(match.group(0), residue_offset)
+        offsets.append(residue_offset)
         cursor = match.end()
     return offsets
 
@@ -2471,11 +2609,14 @@ def _apply_translation_slot_repair_block(
         for part in ([slot, expected_tokens[index]] if index < len(expected_tokens) else [slot])
     )
     if allow_clause_rewrite:
-        affected_tokens = _translation_repair_affected_tokens(
+        affected_ordinals = _translation_repair_affected_ordinals(
             source_block, primary_text, previous_text,
-        ) if primary_text is not None else None
-        _validate_translation_repair_immutable_fragments(
-            previous_text, assembled, affected_tokens=affected_tokens,
+        ) if primary_text is not None else set(range(1, len(expected_tokens) + 1))
+        _validate_translation_repair_slot_boundaries(
+            previous_text,
+            slots,
+            expected_tokens=expected_tokens,
+            affected_ordinals=affected_ordinals,
         )
     if all("start_offset" in item for item in raw_slots) and (
         _translation_natural_residue(assembled) != residue
@@ -2486,23 +2627,49 @@ def _apply_translation_slot_repair_block(
     return {**previous_translation, "blocks": repaired_blocks}
 
 
-def _validate_translation_repair_immutable_fragments(
-    previous_text: str, repaired_text: str,
+def _validate_translation_repair_slot_boundaries(
+    previous_text: str,
+    repaired_slots: list[str],
     *,
-    affected_tokens: set[str] | None = None,
+    expected_tokens: list[str],
+    affected_ordinals: set[int],
 ) -> None:
-    """Require every clause without an opaque token to survive byte-exact and ordered."""
-    _, immutable = _translation_repair_regions(
-        previous_text, affected_tokens=affected_tokens,
-    )
-    cursor = 0
-    for fragment in immutable:
-        position = repaired_text.find(fragment, cursor)
-        if position < 0:
+    """Enforce byte-exact immutable boundaries per token-occurrence-anchored slot."""
+    prior_tokens, prior_slots = _translation_token_delimited_slots(previous_text)
+    if prior_tokens != expected_tokens or len(repaired_slots) != len(prior_slots):
+        raise RuntimeError("translation structural repair changed token occurrence anchors")
+    immutable_fragments: set[str] = set()
+    for index, (prior_slot, repaired_slot) in enumerate(zip(prior_slots, repaired_slots)):
+        boundary = _translation_slot_boundary_record(
+            prior_slot,
+            slot_ordinal=index,
+            token_count=len(expected_tokens),
+            affected_ordinals=affected_ordinals,
+        )
+        prefix = str(boundary["immutable_prefix"])
+        suffix = str(boundary["immutable_suffix"])
+        immutable_fragments.update(value for value in (prefix, suffix) if value)
+        if prefix and not repaired_slot.startswith(prefix):
             raise RuntimeError(
-                "translation structural repair changed text outside mutable clauses"
+                "translation structural repair changed text outside mutable clauses or token slots"
             )
-        cursor = position + len(fragment)
+        if suffix and not repaired_slot.endswith(suffix):
+            raise RuntimeError(
+                "translation structural repair changed text outside mutable clauses or token slots"
+            )
+        if boundary["mutable_mode"] == "none" and repaired_slot != prior_slot:
+            raise RuntimeError(
+                "translation structural repair changed text outside mutable clauses or token slots"
+            )
+    prior_natural = "".join(prior_slots)
+    repaired_natural = "".join(repaired_slots)
+    for fragment in immutable_fragments:
+        if not fragment.strip(" \t\r\n。！？；;.!?：:，,"):
+            continue
+        if repaired_natural.count(fragment) != prior_natural.count(fragment):
+            raise RuntimeError(
+                "translation structural repair moved or copied immutable boundary text"
+            )
 
 
 def _normalize_translation_citation_delimiters(
@@ -2522,12 +2689,15 @@ def _normalize_translation_citation_delimiters(
         if isinstance(run, dict) and str(run.get("kind") or "") != "text"
     ]
     expected_tokens = _opaque_inline_tokens(source_block)
+    source_matches = list(_OPAQUE_INLINE_PATTERN.finditer(source_text))
+    if [match.group(0) for match in source_matches] != expected_tokens:
+        raise RuntimeError("citation delimiter normalization cannot align source occurrences")
     normalized = translated_text
-    for run, token in zip(opaque_runs, expected_tokens):
+    for occurrence_index, (run, token) in enumerate(zip(opaque_runs, expected_tokens)):
         if str(run.get("kind") or "").casefold() != "citation":
             continue
-        source_index = source_text.find(token)
-        source_end = source_index + len(token)
+        source_index = source_matches[occurrence_index].start()
+        source_end = source_matches[occurrence_index].end()
         source_wraps_token = (
             source_index > 0
             and source_end < len(source_text)
@@ -2536,10 +2706,13 @@ def _normalize_translation_citation_delimiters(
         )
         if not source_wraps_token:
             continue
-        if normalized.count(token) != 1:
-            raise RuntimeError("citation delimiter normalization requires exactly one token")
-        index = normalized.find(token)
-        end = index + len(token)
+        opaque_matches = list(_OPAQUE_INLINE_PATTERN.finditer(normalized))
+        if [match.group(0) for match in opaque_matches] != expected_tokens:
+            raise RuntimeError(
+                "citation delimiter normalization requires exact token occurrences"
+            )
+        target = opaque_matches[occurrence_index]
+        index, end = target.start(), target.end()
         if (
             index > 0
             and end < len(normalized)
@@ -2551,14 +2724,13 @@ def _normalize_translation_citation_delimiters(
         suffix_pair = normalized[end:end + 2] == "[]"
         prefix_single = index > 0 and normalized[index - 1] == "["
         suffix_single = end < len(normalized) and normalized[end] == "]"
-        opaque_matches = list(_OPAQUE_INLINE_PATTERN.finditer(normalized))
-        adjacent_previous_token = any(
-            match.end() == index and match.group(0) != token
-            for match in opaque_matches
+        adjacent_previous_token = (
+            occurrence_index > 0
+            and opaque_matches[occurrence_index - 1].end() == index
         )
-        adjacent_next_token = any(
-            match.start() == end and match.group(0) != token
-            for match in opaque_matches
+        adjacent_next_token = (
+            occurrence_index + 1 < len(opaque_matches)
+            and opaque_matches[occurrence_index + 1].start() == end
         )
         bad_prefix = (
             index > 0 and normalized[index - 1] == "]" and not prefix_pair

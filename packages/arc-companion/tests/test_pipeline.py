@@ -363,7 +363,7 @@ def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
     def repair_llm(prompt: str, **kwargs):
         calls.append(str(kwargs["call_label"]))
         assert '"text"' in json.dumps(kwargs["schema"])
-        assert "minimally rewrite only MUTABLE CLAUSES" in prompt
+        assert "mutable portion of TOKEN-DELIMITED SLOT REGIONS" in prompt
         slot_ids = pipeline_module._translation_repair_slot_ids(block)
         return {"repairs": [{"block_id": "body", "slots": [
             {"slot_id": slot_ids[0], "text": "译文"},
@@ -474,7 +474,7 @@ def test_v4_repairs_seg0007_and_seg0016_semantic_roles_in_mutable_clauses() -> N
     p_token, q_token, relation = pipeline_module._opaque_inline_tokens(seg16)
     prior16 = {"blocks": [{
         "block_id": seg16["block_id"],
-        "text": f"利用关系{relation}将{p_token}替换{q_token}为。本段保持不变。",
+        "text": f"将{p_token}替换{q_token}为，利用关系{relation}。本段保持不变。",
     }]}
     ids16 = pipeline_module._translation_repair_slot_ids(seg16)
     repaired16 = pipeline_module._apply_translation_slot_repairs(
@@ -541,6 +541,228 @@ def test_v4_keeps_unaffected_token_bearing_clause_byte_exact() -> None:
             ]}]}, protected_names=[], allow_clause_rewrite=True,
             primary_translation=primary,
         )
+
+
+def test_v4_duplicate_tokens_use_occurrence_anchored_immutable_slots() -> None:
+    duplicate = _inline_run("math", "x", 2, tex="x")
+    block = {
+        "block_id": "body", "type": "text", "text": "A x. B x.",
+        "inline_runs": [
+            _inline_run("text", "A ", 1), duplicate,
+            _inline_run("text", ". B ", 3), duplicate,
+            _inline_run("text", ".", 5),
+        ],
+    }
+    token1, token2 = pipeline_module._opaque_inline_tokens(block)
+    assert token1 == token2
+    primary_text = f"稳定{token1}句。第二句缺失。"
+    v3_text = f"稳定{token1}句。第二{token2}句需修。"
+    assert pipeline_module._translation_repair_affected_ordinals(
+        block, primary_text, v3_text,
+    ) == {2}
+    prior = {"blocks": [{"block_id": "body", "text": v3_text}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    with pytest.raises(RuntimeError, match="moved or copied"):
+        pipeline_module._apply_translation_slot_repairs(
+            prior, [block], {"repairs": [{"block_id": "body", "slots": [
+                {"slot_id": slot_ids[0], "text": "稳定"},
+                {"slot_id": slot_ids[1], "text": "句。稳定句。第二已修"},
+                {"slot_id": slot_ids[2], "text": "句需修。"},
+            ]}]}, protected_names=[], allow_clause_rewrite=True,
+            primary_translation={"blocks": [{"block_id": "body", "text": primary_text}]},
+        )
+
+
+def test_token_repair_persists_response_before_apply_and_reuses_failed_response(
+    tmp_path: Path,
+) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    segment = {"segment_id": "seg-audit", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    calls = 0
+
+    def invalid_repair(prompt: str, **kwargs):
+        nonlocal calls
+        calls += 1
+        slot_id = pipeline_module._translation_repair_slot_ids(block)[0]
+        return {"repairs": [{"block_id": "body", "slots": [
+            {"slot_id": slot_id, "text": "译文"},
+        ]}]}
+
+    arguments = dict(
+        segment=segment,
+        translation={"blocks": [{"block_id": "body", "text": "译文。"}]},
+        blocks_by_id={"body": block}, protected_names=[],
+        options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        input_sha256="audit-input",
+    )
+    with pytest.raises(RuntimeError, match="slot repair"):
+        pipeline_module._repair_translation_token_placement(
+            **arguments, llm=invalid_repair,
+        )
+    marker_path = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["status"] == "response_received"
+    assert marker["raw_response"]["repairs"][0]["slots"][0]["text"] == "译文"
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("response_received must reuse the auditable raw response")
+
+    with pytest.raises(RuntimeError, match="slot repair"):
+        pipeline_module._repair_translation_token_placement(
+            **arguments, llm=forbidden_llm,
+        )
+    assert calls == 1
+
+
+def test_started_token_repair_retries_medium_and_corrupt_draft_recovers(
+    tmp_path: Path,
+) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    segment = {"segment_id": "seg-resume", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    attempt_path = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    attempt_path.parent.mkdir(parents=True)
+    attempt_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-attempt.v2",
+        "segment_id": segment["segment_id"], "input_sha256": "resume-input",
+        "status": "started", "started_at": "2026-01-01T00:00:00+00:00",
+        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": pipeline_module.TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+        "model_tier": pipeline_module.TRANSLATION_RETRY_TIER,
+        "block_ids": ["body"],
+    }), encoding="utf-8")
+    calls: list[str] = []
+
+    def repair_llm(prompt: str, **kwargs):
+        calls.append(str(kwargs["model_tier"]))
+        slot_ids = pipeline_module._translation_repair_slot_ids(block)
+        return {"repairs": [{"block_id": "body", "slots": [
+            {"slot_id": slot_ids[0], "text": "译文"},
+            {"slot_id": slot_ids[1], "text": "。"},
+        ]}]}
+
+    arguments = dict(
+        segment=segment,
+        translation={"blocks": [{"block_id": "body", "text": "译文。"}]},
+        blocks_by_id={"body": block}, protected_names=[],
+        options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        input_sha256="resume-input",
+    )
+    repaired, _ = pipeline_module._repair_translation_token_placement(
+        **arguments, llm=repair_llm,
+    )
+    assert calls == ["medium"]
+    assert json.loads(attempt_path.read_text(encoding="utf-8"))["status"] == "validated"
+    repair_draft = pipeline_module._translation_token_repair_draft_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    repair_draft.write_text("{broken", encoding="utf-8")
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("validated raw response must recover a corrupt draft")
+
+    recovered, _ = pipeline_module._repair_translation_token_placement(
+        **arguments, llm=forbidden_llm,
+    )
+    assert recovered == repaired
+    assert json.loads(repair_draft.read_text(encoding="utf-8"))["translation"] == repaired
+
+
+def test_v4_upgrade_without_primary_draft_blocks_before_low_model(tmp_path: Path) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:0911.3380", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-upgrade", "block_ids": ["body"]}
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1)
+    context = pipeline_module._full_paper_context(
+        document, segment, blocks_by_id={"body": block},
+    )
+    input_sha256 = pipeline_module._segment_input_hash(
+        segment, {"body": block}, glossary={"entries": []},
+        extra={"names": [], "paper_context": context,
+               "runtime_access": pipeline_module._generation_runtime_policy()},
+    )
+    checkpoint_dir = tmp_path / "checkpoints"
+    final_path = (
+        checkpoint_dir / "translations"
+        / f"{pipeline_module._segment_checkpoint_name(segment['segment_id'])}.json"
+    )
+    final_path.parent.mkdir(parents=True)
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    final_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-checkpoint.v2",
+        "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+        "generation_provenance": {"repairs": [{
+            "kind": "token-placement",
+            "prompt_version": "arc.companion.translation-retry-prompt.v3",
+        }]},
+        "translation": {"blocks": [{"block_id": "body", "text": f"译文{token}。"}]},
+    }), encoding="utf-8")
+    calls: list[str] = []
+
+    def forbidden_llm(prompt: str, **kwargs):
+        calls.append(str(kwargs.get("model_tier")))
+        raise AssertionError("v4 upgrade must not fall back to low")
+
+    with pytest.raises(CompanionLaneError) as exc_info:
+        _generate_translations(
+            [segment], options=options, bundle=bundle, glossary={"entries": []},
+            protected_names=[], checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
+        )
+    assert calls == []
+    assert "requires its stored primary draft" in str(exc_info.value.failures[0][1])
+
+
+def test_citation_followed_by_identical_opaque_occurrence_uses_ordinals() -> None:
+    duplicate_citation = _inline_run("citation", "7", 2)
+    block = {
+        "block_id": "cited", "type": "text", "text": "[7]7",
+        "inline_runs": [
+            _inline_run("text", "[", 1), duplicate_citation,
+            _inline_run("text", "]", 3), duplicate_citation,
+        ],
+    }
+    first, second = pipeline_module._opaque_inline_tokens(block)
+    assert first == second
+    normalized = pipeline_module._normalize_translation_citation_delimiters(
+        block, f"{first}{second}",
+    )
+    assert normalized == f"[{first}]{second}"
 
 
 def test_checkpoint_citation_delimiter_repair_revalidates_and_records_provenance(
@@ -1776,7 +1998,7 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
     assert {segment_id for segment_id, _ in exc_info.value.failures} == {
         "seg-0003", "seg-0004",
     }
-    assert all("attempt already consumed" in str(error) for _, error in exc_info.value.failures)
+    assert all("slot repair" in str(error) for _, error in exc_info.value.failures)
 
 
 def test_non_token_translation_validation_errors_do_not_retry(tmp_path: Path) -> None:
