@@ -2728,21 +2728,20 @@ def _annotation_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _protected_names(bundle: SourceBundle, *, glossary: dict[str, Any] | None = None) -> list[str]:
     """Protect seed/glossary names only; reference and citer authors stay evidence-local."""
-    values: list[str] = []
-
-    def collect(authors: Any) -> None:
-        if isinstance(authors, str):
-            values.append(authors)
-        elif isinstance(authors, dict):
-            name = authors.get("name") or authors.get("full_name")
-            if name:
-                values.append(str(name))
-        elif isinstance(authors, list):
-            for author in authors:
-                collect(author)
-
-    collect(bundle.metadata.get("authors"))
-    collect((bundle.document.get("front_matter") or {}).get("authors"))
+    metadata_names = _author_name_values(
+        bundle.metadata.get("authors") or bundle.metadata.get("author")
+    )
+    if metadata_names:
+        values = metadata_names
+    else:
+        front_names = _author_name_values(
+            (bundle.document.get("front_matter") or {}).get("authors")
+        )
+        values = [
+            name
+            for value in front_names
+            for name in _clean_front_matter_author_line(value)
+        ]
     if glossary:
         for entry in glossary.get("entries") or []:
             values.extend(str(value) for value in entry.get("protected_names") or [])
@@ -2753,8 +2752,44 @@ def _protected_names(bundle: SourceBundle, *, glossary: dict[str, Any] | None = 
             unique.setdefault(text.casefold(), text)
             # Also protect surname/name roots when a full author name is listed.
             for token in re.findall(r"[A-Za-z][A-Za-z'’-]{2,}", text):
-                unique.setdefault(token.casefold(), token)
+                if token.casefold() not in _AUTHOR_CONNECTOR_TOKENS and token[:1].isupper():
+                    unique.setdefault(token.casefold(), token)
     return sorted(unique.values(), key=lambda value: (value.casefold(), value))
+
+
+_AUTHOR_CONNECTOR_TOKENS = frozenset({"al", "and", "et"})
+
+
+def _author_name_values(authors: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(authors, str):
+        if authors.strip():
+            values.append(authors)
+    elif isinstance(authors, dict):
+        name = authors.get("name") or authors.get("full_name")
+        if name and str(name).strip():
+            values.append(str(name))
+    elif isinstance(authors, list):
+        for author in authors:
+            values.extend(_author_name_values(author))
+    return values
+
+
+def _clean_front_matter_author_line(value: str) -> list[str]:
+    """Recover names from a flattened legacy author line without protecting prose."""
+    text = re.sub(r"[*†‡§]+", " ", value)
+    text = re.sub(
+        r"(?:(?<=\s)|(?<=[A-Za-z.]))\d+(?:\s*[,;]\s*\d+)*(?=\s|$)",
+        " ",
+        text,
+    )
+    text = re.sub(r"\bet\s+al\.?\b", " ", text, flags=re.IGNORECASE)
+    parts = re.split(r"\s+(?:and|&)\s+", text, flags=re.IGNORECASE)
+    return [
+        cleaned
+        for part in parts
+        if (cleaned := re.sub(r"\s+", " ", part).strip(" ,;"))
+    ]
 
 
 def _validate_names_in_generated(

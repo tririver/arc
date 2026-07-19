@@ -2302,6 +2302,63 @@ def test_global_protected_names_exclude_reference_and_citer_authors(tmp_path: Pa
     assert "May" not in names
 
 
+def test_protected_names_prefer_structured_metadata_over_combined_front_line(tmp_path: Path) -> None:
+    base = _bundle(tmp_path)
+    document = {
+        **base.document,
+        "front_matter": {
+            **base.document["front_matter"],
+            "authors": ["Xingang Chen 1,2 and Yi Wang 3,4"],
+        },
+    }
+    bundle = SourceBundle(
+        paper_id=base.paper_id,
+        parsed=base.parsed,
+        document=document,
+        metadata={
+            **base.metadata,
+            "authors": [{"full_name": "Chen, Xingang"}, {"full_name": "Wang, Yi"}],
+        },
+        references=base.references,
+        citers=base.citers,
+    )
+
+    names = _protected_names(bundle)
+
+    assert "Chen, Xingang" in names
+    assert "Wang, Yi" in names
+    assert {"Chen", "Xingang", "Wang"} <= set(names)
+    assert "Xingang Chen 1,2 and Yi Wang 3,4" not in names
+    assert "and" not in names
+
+
+def test_protected_names_clean_combined_front_line_when_metadata_authors_missing(tmp_path: Path) -> None:
+    base = _bundle(tmp_path)
+    document = {
+        **base.document,
+        "front_matter": {
+            **base.document["front_matter"],
+            "authors": ["Xingang Chen 1,2 and Yi Wang 3,4"],
+        },
+    }
+    bundle = SourceBundle(
+        paper_id=base.paper_id,
+        parsed=base.parsed,
+        document=document,
+        metadata={"title": "No structured authors"},
+        references=base.references,
+        citers=base.citers,
+    )
+
+    names = _protected_names(bundle)
+
+    assert "Xingang Chen" in names
+    assert "Yi Wang" in names
+    assert {"Xingang", "Chen", "Wang"} <= set(names)
+    assert "and" not in names
+    assert not any(any(character.isdigit() for character in name) for name in names)
+
+
 def test_full_paper_context_is_bounded_navigable_and_excludes_raw_html(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     document = {
