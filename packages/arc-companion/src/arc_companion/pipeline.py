@@ -32,6 +32,7 @@ from .pdf import compile_latex, validate_pdf
 from .prompts import (
     ANNOTATION_SCHEMA,
     TRANSLATION_SCHEMA,
+    TRANSLATION_SLOT_REPAIR_SCHEMA,
     REVIEW_SCHEMA,
     SECTION_REVIEW_SCHEMA,
     PROMPT_VERSION,
@@ -123,8 +124,8 @@ class TranslationOpaqueTokenError(RuntimeError):
             "retry_model_tier": TRANSLATION_RETRY_TIER,
             "segment_id": self.segment_id,
             "block_id": self.block_id,
-            "expected_tokens": self.expected_tokens,
-            "actual_tokens": self.actual_tokens,
+            "expected_token_count": len(self.expected_tokens),
+            "actual_token_count": len(self.actual_tokens),
             "message": str(self),
         }
 
@@ -1108,27 +1109,29 @@ def _generate_translations(
         translation = {"blocks": blocks}
         try:
             _validate_translation(segment, translation, by_id, protected_names)
-        except TranslationOpaqueTokenError as exc:
-            required_token_sequences = {
-                block_id(block): _opaque_inline_tokens(block)
-                for block in selected
-                if _is_translatable(block)
+        except TranslationOpaqueTokenError:
+            token_errors = _translation_opaque_token_errors(segment, translation, by_id)
+            source_blocks = [by_id[item.block_id] for item in token_errors]
+            previous_by_id = {
+                str(item.get("block_id") or ""): item for item in translation["blocks"]
             }
+            repair_contexts = [
+                _translation_slot_repair_context(
+                    source_block,
+                    str(previous_by_id[block_id(source_block)].get("text") or ""),
+                    protected_names=protected_names,
+                )
+                for source_block in source_blocks
+            ]
             value = _llm_call(
                 llm,
                 translation_retry_prompt(
                     segment,
-                    translatable,
-                    language=options.annotation_language,
-                    glossary=glossary,
-                    protected_names=protected_names,
-                    paper_context=paper_context,
-                    previous_translation=translation,
-                    validation_error=exc.prompt_payload(),
-                    required_token_sequences=required_token_sequences,
+                    repair_contexts,
+                    validation_errors=[item.prompt_payload() for item in token_errors],
                     retry_model_tier=TRANSLATION_RETRY_TIER,
                 ),
-                TRANSLATION_SCHEMA,
+                TRANSLATION_SLOT_REPAIR_SCHEMA,
                 options=options,
                 artifact_dir=artifact_dir / "retry-1",
                 call_label=f"companion-translation-{segment['segment_id']}-retry-1",
@@ -1136,7 +1139,12 @@ def _generate_translations(
                 allow_mcp=False,
                 allow_internet=False,
             )
-            translation = {"blocks": list(value.get("blocks") or [])}
+            translation = _apply_translation_slot_repairs(
+                translation,
+                source_blocks,
+                value,
+                protected_names=protected_names,
+            )
             _validate_translation(segment, translation, by_id, protected_names)
         return segment["segment_id"], translation
 
@@ -1547,11 +1555,141 @@ def _translation_input_block(block: dict[str, Any]) -> dict[str, Any]:
     return _project_translation_input_block(block)
 
 
+def _translation_slot_repair_context(
+    source_block: dict[str, Any],
+    previous_text: str,
+    *,
+    protected_names: list[str],
+) -> dict[str, Any]:
+    """Build an inert placement-only context without asking for retranslation."""
+    expected_tokens = _opaque_inline_tokens(source_block)
+    residue = _translation_natural_residue(previous_text)
+    source_runs: list[dict[str, Any]] = []
+    for index, run in enumerate(source_block.get("inline_runs") or [], start=1):
+        if not isinstance(run, dict):
+            continue
+        kind = str(run.get("kind") or "")
+        record: dict[str, Any] = {"order": index, "kind": kind}
+        if kind == "text":
+            record["source_text"] = str(run.get("content") or "")
+        else:
+            record["source_content"] = str(run.get("tex") or run.get("content") or "")
+            if kind == "link" and run.get("href"):
+                record["href"] = str(run["href"])
+        source_runs.append(record)
+    return {
+        "block_id": block_id(source_block),
+        "previous_invalid_text": previous_text,
+        "prior_natural_language_residue": residue,
+        "expected_slot_count": len(expected_tokens) + 1,
+        "slot_ids": _translation_repair_slot_ids(source_block),
+        "missing_protected_names": _minimal_missing_name_insertions(
+            _missing_protected_names([source_block], residue, protected_names)
+        ),
+        "source_run_sequence": source_runs,
+    }
+
+
+def _translation_repair_slot_ids(source_block: dict[str, Any]) -> list[str]:
+    return [
+        f"{block_id(source_block)}.repair-slot-{index:04d}"
+        for index in range(len(_opaque_inline_tokens(source_block)) + 1)
+    ]
+
+
+def _apply_translation_slot_repairs(
+    previous_translation: dict[str, Any],
+    source_blocks: list[dict[str, Any]],
+    repair: dict[str, Any],
+    *,
+    protected_names: list[str],
+) -> dict[str, Any]:
+    """Patch every token-mismatched block in one bounded repair call."""
+    raw_repairs = repair.get("repairs") if isinstance(repair, dict) else None
+    if not isinstance(raw_repairs, list):
+        raise RuntimeError("translation slot repair has no repairs list")
+    expected_ids = [block_id(block) for block in source_blocks]
+    actual_ids = [
+        str(item.get("block_id") or "") for item in raw_repairs if isinstance(item, dict)
+    ]
+    if actual_ids != expected_ids or len(actual_ids) != len(raw_repairs):
+        raise RuntimeError("translation slot repair changed failing block coverage or order")
+    result = previous_translation
+    for source_block, block_repair in zip(source_blocks, raw_repairs):
+        result = _apply_translation_slot_repair_block(
+            result, source_block, block_repair, protected_names=protected_names,
+        )
+    return result
+
+
+def _apply_translation_slot_repair_block(
+    previous_translation: dict[str, Any],
+    source_block: dict[str, Any],
+    repair: dict[str, Any],
+    *,
+    protected_names: list[str],
+) -> dict[str, Any]:
+    """Patch one failed block while preserving prior natural language and all other blocks."""
+    block_id_value = block_id(source_block)
+    if not isinstance(repair, dict) or str(repair.get("block_id") or "") != block_id_value:
+        raise RuntimeError("translation slot repair changed the failing block_id")
+    raw_slots = repair.get("slots")
+    if not isinstance(raw_slots, list):
+        raise RuntimeError("translation slot repair has no slot list")
+    expected_slot_ids = _translation_repair_slot_ids(source_block)
+    actual_slot_ids = [
+        str(item.get("slot_id") or "") for item in raw_slots if isinstance(item, dict)
+    ]
+    if actual_slot_ids != expected_slot_ids or len(actual_slot_ids) != len(raw_slots):
+        raise RuntimeError("translation slot repair changed slot coverage or order")
+    slots = [str(item.get("text") or "") for item in raw_slots]
+    if any("[[ARC_INLINE:" in text or _OPAQUE_INLINE_PATTERN.search(text) for text in slots):
+        raise RuntimeError("translation slot repair supplied controller-owned opaque content")
+
+    previous_blocks = previous_translation.get("blocks") if isinstance(previous_translation, dict) else None
+    if not isinstance(previous_blocks, list):
+        raise RuntimeError("translation slot repair has no prior block list")
+    failed_index = next(
+        (index for index, item in enumerate(previous_blocks)
+         if isinstance(item, dict) and str(item.get("block_id") or "") == block_id_value),
+        None,
+    )
+    if failed_index is None:
+        raise RuntimeError("translation slot repair cannot find the prior failed block")
+    previous_text = str(previous_blocks[failed_index].get("text") or "")
+    residue = _translation_natural_residue(previous_text)
+    missing_names = _minimal_missing_name_insertions(
+        _missing_protected_names([source_block], residue, protected_names)
+    )
+    joined = "".join(slots)
+    if missing_names:
+        if not _is_exact_name_insertion_delta(joined, residue, missing_names):
+            raise RuntimeError("translation slot repair changed prior natural language beyond name insertion")
+    elif joined != residue:
+        raise RuntimeError("translation slot repair retranslated or changed prior natural language")
+
+    expected_tokens = _opaque_inline_tokens(source_block)
+    assembled = "".join(
+        part
+        for index, slot in enumerate(slots)
+        for part in ([slot, expected_tokens[index]] if index < len(expected_tokens) else [slot])
+    )
+    repaired_blocks = list(previous_blocks)
+    repaired_blocks[failed_index] = {**previous_blocks[failed_index], "text": assembled}
+    return {**previous_translation, "blocks": repaired_blocks}
+
+
+def _translation_natural_residue(previous_text: str) -> str:
+    """Remove any bounded controller-marker candidate, including mutated tokens."""
+    return _OPAQUE_INLINE_CANDIDATE_PATTERN.sub("", previous_text)
+
+
 def _opaque_inline_token(run: dict[str, Any]) -> str:
     return _project_opaque_inline_token(run)
 
 
 _OPAQUE_INLINE_PATTERN = re.compile(r"\[\[ARC_INLINE:[^\]\s]+:[0-9a-f]{64}\]\]")
+_OPAQUE_INLINE_CANDIDATE_PATTERN = re.compile(r"\[\[ARC_INLINE:[^\]\r\n]{0,512}\]\]")
 
 
 def _opaque_inline_tokens(block: dict[str, Any]) -> list[str]:
@@ -1693,6 +1831,27 @@ def _validate_translation(
     blocks_by_id: dict[str, dict[str, Any]],
     protected_names: list[str],
 ) -> None:
+    expected_blocks, raw_blocks = _translation_preflight(segment, translation, blocks_by_id)
+    for source, translated in zip(expected_blocks, raw_blocks):
+        text = str(translated.get("text") or "").strip()
+        expected_tokens = _opaque_inline_tokens(source)
+        actual_tokens = _OPAQUE_INLINE_PATTERN.findall(text)
+        if actual_tokens != expected_tokens:
+            raise TranslationOpaqueTokenError(
+                segment_id=str(segment["segment_id"]),
+                block_id_value=block_id(source),
+                expected_tokens=expected_tokens,
+                actual_tokens=actual_tokens,
+            )
+        _validate_names_in_generated([source], text, protected_names, label=block_id(source))
+
+
+def _translation_preflight(
+    segment: dict[str, Any],
+    translation: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate segment-wide non-token invariants before any repair is allowed."""
     expected_blocks = [blocks_by_id[value] for value in segment.get("block_ids") or [] if _is_translatable(blocks_by_id[value])]
     expected_ids = [block_id(block) for block in expected_blocks]
     raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
@@ -1705,18 +1864,33 @@ def _validate_translation(
         )
     for source, translated in zip(expected_blocks, raw_blocks):
         text = str(translated.get("text") or "").strip()
-        if not text:
+        source_has_natural_text = bool(_natural_text_for_name_validation(source).strip())
+        if source_has_natural_text and not _translation_natural_residue(text).strip():
             raise RuntimeError(f"translation {segment['segment_id']} returned empty block {block_id(source)}")
+    return expected_blocks, raw_blocks
+
+
+def _translation_opaque_token_errors(
+    segment: dict[str, Any],
+    translation: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+) -> list[TranslationOpaqueTokenError]:
+    """Collect every token mismatch after ordinary coverage/non-empty checks passed."""
+    expected_blocks, raw_blocks = _translation_preflight(segment, translation, blocks_by_id)
+    errors: list[TranslationOpaqueTokenError] = []
+    for source, translated in zip(expected_blocks, raw_blocks):
+        if not isinstance(translated, dict):
+            continue
         expected_tokens = _opaque_inline_tokens(source)
-        actual_tokens = _OPAQUE_INLINE_PATTERN.findall(text)
+        actual_tokens = _OPAQUE_INLINE_PATTERN.findall(str(translated.get("text") or ""))
         if actual_tokens != expected_tokens:
-            raise TranslationOpaqueTokenError(
+            errors.append(TranslationOpaqueTokenError(
                 segment_id=str(segment["segment_id"]),
                 block_id_value=block_id(source),
                 expected_tokens=expected_tokens,
                 actual_tokens=actual_tokens,
-            )
-        _validate_names_in_generated([source], text, protected_names, label=block_id(source))
+            ))
+    return errors
 
 
 def _generation_document(document: dict[str, Any]) -> dict[str, Any]:
@@ -1846,14 +2020,61 @@ def _protected_names(bundle: SourceBundle, *, glossary: dict[str, Any] | None = 
 def _validate_names_in_generated(
     source_blocks: list[dict[str, Any]], generated: str, protected_names: list[str], *, label: str
 ) -> None:
-    source = json.dumps(source_blocks, ensure_ascii=False)
-    missing = [
-        name for name in protected_names
-        if re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", source, re.IGNORECASE)
-        and not re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", generated, re.IGNORECASE)
-    ]
+    missing = _missing_protected_names(source_blocks, generated, protected_names)
     if missing:
         raise RuntimeError(f"generated text {label} translated or dropped protected names: {missing[:8]}")
+
+
+def _missing_protected_names(
+    source_blocks: list[dict[str, Any]], generated: str, protected_names: list[str],
+) -> list[str]:
+    source = "\n".join(_natural_text_for_name_validation(block) for block in source_blocks)
+    return [
+        name for name in protected_names
+        if re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", source, re.IGNORECASE)
+        and not re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", generated)
+    ]
+
+
+def _natural_text_for_name_validation(block: dict[str, Any]) -> str:
+    """Exclude controller-owned math/citation/link content from name checks."""
+    inline_runs = [item for item in block.get("inline_runs") or [] if isinstance(item, dict)]
+    if inline_runs:
+        return "\n".join(
+            str(run.get("content") or "")
+            for run in inline_runs
+            if str(run.get("kind") or "") == "text"
+        )
+    return str(block.get("text") or "")
+
+
+def _is_exact_name_insertion_delta(value: str, residue: str, names: list[str]) -> bool:
+    """Accept only exact, boundary-delimited insertions of each requested Latin name."""
+    def remove(current: str, remaining: tuple[str, ...]) -> bool:
+        if not remaining:
+            return current == residue
+        name = remaining[0]
+        matches = list(re.finditer(
+            rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", current,
+        ))
+        return any(
+            remove(current[:match.start()] + current[match.end():], remaining[1:])
+            for match in matches
+        )
+
+    return remove(value, tuple(names))
+
+
+def _minimal_missing_name_insertions(missing_names: list[str]) -> list[str]:
+    """Prefer a full missing name when its insertion also restores protected name roots."""
+    return [
+        name for name in missing_names
+        if not any(
+            other != name
+            and re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", other, re.IGNORECASE)
+            for other in missing_names
+        )
+    ]
 
 
 def _validated_evidence_ids(values: Any, evidence: dict[str, Any]) -> list[str]:

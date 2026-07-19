@@ -104,10 +104,386 @@ def test_translation_rejects_an_extra_opaque_link_occurrence() -> None:
         raise AssertionError("a duplicated rendered link token must be rejected")
 
 
+def test_slot_repair_preserves_natural_text_and_assembles_twenty_two_mixed_tokens() -> None:
+    inline_runs = [_inline_run("text", "Start ", 1)]
+    for number in range(1, 23):
+        kind = ("math", "citation", "link")[(number - 1) % 3]
+        run = _inline_run(kind, f"opaque-{number}", number * 2, tex=f"x_{{{number}}}")
+        if kind == "link":
+            run["href"] = f"https://example.test/{number}"
+        inline_runs.extend([run, _inline_run("text", f" text-{number} ", number * 2 + 1)])
+    block = {
+        "block_id": "dense", "type": "text", "text": "Dense mixed inline content.",
+        "inline_runs": inline_runs,
+    }
+    residue_slots = [f"译文-{index}" for index in range(23)]
+    previous = {
+        "blocks": [
+            {"block_id": "unchanged", "text": "必须逐字节保留。"},
+            {"block_id": "dense", "text": "".join(residue_slots)},
+        ]
+    }
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    repaired = {
+        "block_id": "dense",
+        "slots": [
+            {"slot_id": slot_id, "text": text}
+            for slot_id, text in zip(slot_ids, residue_slots)
+        ],
+    }
+
+    assembled = pipeline_module._apply_translation_slot_repairs(
+        previous, [block], {"repairs": [repaired]}, protected_names=[],
+    )
+    assert assembled["blocks"][0] == previous["blocks"][0]
+    text = assembled["blocks"][1]["text"]
+    expected_tokens = pipeline_module._opaque_inline_tokens(block)
+    assert len(expected_tokens) == 22
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(text) == expected_tokens
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.sub("", text) == "".join(residue_slots)
+    _validate_translation(
+        {"segment_id": "seg-dense", "block_ids": ["dense"]},
+        {"blocks": [assembled["blocks"][1]]},
+        {"dense": block},
+        [],
+    )
+
+
+def test_slot_repair_allows_only_exact_missing_name_insertion() -> None:
+    block = {
+        "block_id": "runs", "type": "text", "text": "Ada Lovelace uses x.",
+        "inline_runs": [
+            _inline_run("text", "Ada Lovelace uses ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    previous = {"blocks": [{"block_id": "runs", "text": "艾达使用。"}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    repaired = {
+        "block_id": "runs",
+        "slots": [
+            {"slot_id": slot_ids[0], "text": "艾达Ada Lovelace使用"},
+            {"slot_id": slot_ids[1], "text": "。"},
+        ],
+    }
+    context = pipeline_module._translation_slot_repair_context(
+        block, "艾达使用。", protected_names=["Ada", "Lovelace", "Ada Lovelace"],
+    )
+    assert context["missing_protected_names"] == ["Ada Lovelace"]
+    result = pipeline_module._apply_translation_slot_repairs(
+        previous, [block], {"repairs": [repaired]},
+        protected_names=["Ada", "Lovelace", "Ada Lovelace"],
+    )
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.sub("", result["blocks"][0]["text"]) == "艾达Ada Lovelace使用。"
+
+    rephrased = {
+        "block_id": "runs",
+        "slots": [
+            {"slot_id": slot_ids[0], "text": "Ada Lovelace重新翻译"},
+            {"slot_id": slot_ids[1], "text": "。"},
+        ],
+    }
+    try:
+        pipeline_module._apply_translation_slot_repairs(
+            previous, [block], {"repairs": [rephrased]},
+            protected_names=["Ada", "Lovelace", "Ada Lovelace"],
+        )
+    except RuntimeError as exc:
+        assert "beyond name insertion" in str(exc)
+    else:
+        raise AssertionError("protected-name repair must not permit retranslation")
+
+
+def test_slot_repair_rejects_bad_slot_coverage_opaque_content_and_rephrasing() -> None:
+    block = {
+        "block_id": "slots", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    previous = {"blocks": [{"block_id": "slots", "text": "旧译文。"}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    valid_slots = [
+        {"slot_id": slot_ids[0], "text": "旧译文"},
+        {"slot_id": slot_ids[1], "text": "。"},
+    ]
+    invalid_slots = {
+        "missing": valid_slots[:-1],
+        "duplicate": [valid_slots[0], valid_slots[0], valid_slots[1]],
+        "out-of-order": list(reversed(valid_slots)),
+        "opaque": [{"slot_id": slot_ids[0], "text": token}, valid_slots[1]],
+        "rephrased": [
+            {"slot_id": slot_ids[0], "text": "新译文"}, valid_slots[1],
+        ],
+    }
+    for label, slots in invalid_slots.items():
+        try:
+            pipeline_module._apply_translation_slot_repairs(
+                previous,
+                [block],
+                {"repairs": [{"block_id": "slots", "slots": slots}]},
+                protected_names=[],
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"{label} slot repair must be rejected")
+
+
+def test_slot_repair_strips_a_bounded_mutated_marker_candidate() -> None:
+    block = {
+        "block_id": "mutated", "type": "text", "text": "A x B.",
+        "inline_runs": [
+            _inline_run("text", "A ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", " B.", 3),
+        ],
+    }
+    previous = {
+        "blocks": [{"block_id": "mutated", "text": "甲[[ARC_INLINE:broken token value]]乙"}]
+    }
+    context = pipeline_module._translation_slot_repair_context(
+        block, previous["blocks"][0]["text"], protected_names=[],
+    )
+    assert context["prior_natural_language_residue"] == "甲乙"
+    slots = [
+        {"slot_id": context["slot_ids"][0], "text": "甲"},
+        {"slot_id": context["slot_ids"][1], "text": "乙"},
+    ]
+    result = pipeline_module._apply_translation_slot_repairs(
+        previous, [block], {"repairs": [{"block_id": "mutated", "slots": slots}]},
+        protected_names=[],
+    )
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(result["blocks"][0]["text"]) == (
+        pipeline_module._opaque_inline_tokens(block)
+    )
+    assert "broken token value" not in result["blocks"][0]["text"]
+
+
+def test_protected_name_validation_ignores_opaque_runs_but_checks_text_runs() -> None:
+    opaque_name = _inline_run("link", "Maldacena", 2)
+    opaque_name["href"] = "https://example.test/maldacena"
+    opaque_block = {
+        "block_id": "opaque-name", "type": "text", "text": "See Maldacena.",
+        "inline_runs": [
+            _inline_run("text", "See ", 1), opaque_name, _inline_run("text", ".", 3),
+        ],
+    }
+    token = pipeline_module._opaque_inline_tokens(opaque_block)[0]
+    _validate_translation(
+        {"segment_id": "opaque-name", "block_ids": ["opaque-name"]},
+        {"blocks": [{"block_id": "opaque-name", "text": f"参见{token}。"}]},
+        {"opaque-name": opaque_block},
+        ["Maldacena"],
+    )
+    opaque_context = pipeline_module._translation_slot_repair_context(
+        opaque_block, "参见。", protected_names=["Maldacena"],
+    )
+    assert opaque_context["missing_protected_names"] == []
+
+    text_block = {
+        "block_id": "text-name", "type": "text", "text": "Maldacena uses x.",
+        "inline_runs": [
+            _inline_run("text", "Maldacena uses ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    text_token = pipeline_module._opaque_inline_tokens(text_block)[0]
+    try:
+        _validate_translation(
+            {"segment_id": "text-name", "block_ids": ["text-name"]},
+            {"blocks": [{"block_id": "text-name", "text": f"使用{text_token}。"}]},
+            {"text-name": text_block},
+            ["Maldacena"],
+        )
+    except RuntimeError as exc:
+        assert "protected names" in str(exc)
+    else:
+        raise AssertionError("a protected name in natural text must remain present")
+
+    wrong_case_context = pipeline_module._translation_slot_repair_context(
+        text_block, f"maldacena 使用{text_token}。", protected_names=["Maldacena"],
+    )
+    assert wrong_case_context["missing_protected_names"] == ["Maldacena"]
+
+    cross_run_block = {
+        "block_id": "cross-run", "type": "text", "text": "Malda x cena.",
+        "inline_runs": [
+            _inline_run("text", "Malda", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", "cena", 3),
+        ],
+    }
+    assert pipeline_module._translation_slot_repair_context(
+        cross_run_block, "译文", protected_names=["Maldacena"],
+    )["missing_protected_names"] == []
+
+
+def test_name_insertion_delta_ignores_existing_non_boundary_substrings() -> None:
+    block = {
+        "block_id": "name-substring", "type": "text", "text": "Ada uses x.",
+        "inline_runs": [
+            _inline_run("text", "Ada uses ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    previous = {"blocks": [{"block_id": "name-substring", "text": "Adage。"}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    result = pipeline_module._apply_translation_slot_repairs(
+        previous,
+        [block],
+        {"repairs": [{
+            "block_id": "name-substring",
+            "slots": [
+                {"slot_id": slot_ids[0], "text": "Adage。"},
+                {"slot_id": slot_ids[1], "text": "Ada"},
+            ],
+        }]},
+        protected_names=["Ada"],
+    )
+    assert "Adage" in result["blocks"][0]["text"]
+    assert pipeline_module._natural_text_for_name_validation(block) == "Ada uses \n."
+    _validate_translation(
+        {"segment_id": "name-substring", "block_ids": ["name-substring"]},
+        result, {"name-substring": block}, ["Ada"],
+    )
+
+
+def test_one_repair_call_handles_multiple_mismatched_blocks_and_preserves_valid_block(tmp_path: Path) -> None:
+    blocks = []
+    tokens = {}
+    for number, kind in ((1, "math"), (2, "citation"), (3, "link")):
+        run = _inline_run(kind, f"owned-{number}", 2, tex=f"x_{number}")
+        if kind == "link":
+            run["href"] = "https://example.test/owned"
+        block = {
+            "block_id": f"b{number}", "type": "text", "text": f"Text {number}.",
+            "inline_runs": [
+                _inline_run("text", f"Text {number} ", 1), run, _inline_run("text", ".", 3),
+            ],
+        }
+        blocks.append(block)
+        tokens[f"b{number}"] = pipeline_module._opaque_inline_tokens(block)[0]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [], "tables": [],
+        "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        if label.endswith("retry-1"):
+            assert "GLOSSARY:" not in prompt
+            assert "Target language:" not in prompt
+            return {"repairs": [
+                {"block_id": "b1", "slots": [
+                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[0])[0], "text": "甲"},
+                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[0])[1], "text": ""},
+                ]},
+                {"block_id": "b2", "slots": [
+                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[1])[0], "text": ""},
+                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[1])[1], "text": "乙"},
+                ]},
+            ]}
+        return {"blocks": [
+            {"block_id": "b1", "text": "甲"},
+            {"block_id": "b2", "text": "乙"},
+            {"block_id": "b3", "text": f"保留{tokens['b3']}原文"},
+        ]}
+
+    result = _generate_translations(
+        [{"segment_id": "seg-0001", "block_ids": ["b1", "b2", "b3"]}],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=tmp_path / "checkpoints", llm=llm,
+    )
+    assert calls == ["companion-translation-seg-0001", "companion-translation-seg-0001-retry-1"]
+    assert result["seg-0001"]["blocks"][2]["text"] == f"保留{tokens['b3']}原文"
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(
+        result["seg-0001"]["blocks"][0]["text"]
+    ) == [tokens["b1"]]
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(
+        result["seg-0001"]["blocks"][1]["text"]
+    ) == [tokens["b2"]]
+
+
+def test_segment_preflight_rejects_later_token_only_block_before_repair(tmp_path: Path) -> None:
+    blocks = []
+    for number in (1, 2):
+        blocks.append({
+            "block_id": f"b{number}", "type": "text", "text": f"Text {number} x.",
+            "inline_runs": [
+                _inline_run("text", f"Text {number} ", 1),
+                _inline_run("math", f"x_{number}", 2, tex=f"x_{number}"),
+                _inline_run("text", ".", 3),
+            ],
+        })
+    token_b2 = pipeline_module._opaque_inline_tokens(blocks[1])[0]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [], "tables": [],
+        "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        calls.append(str(kwargs["call_label"]))
+        return {"blocks": [
+            {"block_id": "b1", "text": "首块缺少 token。"},
+            {"block_id": "b2", "text": token_b2},
+        ]}
+
+    try:
+        _generate_translations(
+            [{"segment_id": "seg-0001", "block_ids": ["b1", "b2"]}],
+            options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+            bundle=bundle, glossary={"entries": []}, protected_names=[],
+            checkpoint_dir=tmp_path / "checkpoints", llm=llm,
+        )
+    except CompanionLaneError as exc:
+        assert "returned empty block b2" in str(exc)
+    else:
+        raise AssertionError("token-only natural text must fail segment preflight")
+    assert calls == ["companion-translation-seg-0001"]
+
+
+def test_segment_preflight_allows_controller_owned_link_or_citation_only_blocks() -> None:
+    for kind in ("link", "citation"):
+        run = _inline_run(kind, "Maldacena" if kind == "link" else "17", 1)
+        if kind == "link":
+            run["href"] = "https://example.test/maldacena"
+        block = {
+            "block_id": f"{kind}-only", "type": "text", "text": str(run["content"]),
+            "inline_runs": [run],
+        }
+        token = pipeline_module._opaque_inline_tokens(block)[0]
+        _validate_translation(
+            {"segment_id": f"seg-{kind}", "block_ids": [block["block_id"]]},
+            {"blocks": [{"block_id": block["block_id"], "text": token}]},
+            {block["block_id"]: block},
+            ["Maldacena"],
+        )
+
+
 def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp_path: Path) -> None:
     blocks = []
     segments = []
     required_tokens: dict[str, str] = {}
+    repair_slot_ids: dict[str, list[str]] = {}
     for number in range(1, 5):
         block_id_value = f"b{number}"
         math_run = _inline_run("math", f"x_{number}", 2, tex=f"x_{number}")
@@ -125,6 +501,7 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
         segment_id = f"seg-{number:04d}"
         segments.append({"segment_id": segment_id, "block_ids": [block_id_value]})
         required_tokens[segment_id] = pipeline_module._opaque_inline_tokens(block)[0]
+        repair_slot_ids[segment_id] = pipeline_module._translation_repair_slot_ids(block)
 
     document = {
         "schema_version": "arc.paper.document.v1",
@@ -152,15 +529,28 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
         if is_retry:
             assert "VALIDATION ERROR" in prompt
             assert "opaque_inline_token_mismatch" in prompt
-            assert required_tokens[segment_id] in prompt
+            assert required_tokens[segment_id] not in prompt
             assert pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION in prompt
             assert Path(kwargs["artifact_dir"]).name == "retry-1"
             assert kwargs["env"] is None
             assert kwargs["model_tier"] == pipeline_module.TRANSLATION_RETRY_TIER == "medium"
+            slots = [
+                {"slot_id": repair_slot_ids[segment_id][0], "text": "缺少控制器令牌"},
+                {"slot_id": repair_slot_ids[segment_id][1], "text": "。"},
+            ]
+            if segment_id == "seg-0003":
+                slots = slots[:-1]
+            elif segment_id == "seg-0004":
+                slots[0]["text"] = required_tokens[segment_id]
+            return {"repairs": [{"block_id": block_id_value, "slots": slots}]}
         else:
             assert kwargs["model_tier"] == pipeline_module.TRANSLATION_TIER == "low"
-        valid = segment_id == "seg-0001" or (segment_id == "seg-0002" and is_retry)
-        text = f"译文 {required_tokens[segment_id]}。" if valid else "缺少控制器令牌。"
+            assert "perform this exact checklist" in prompt
+            assert "every protected personal name" in prompt
+        text = (
+            f"译文 {required_tokens[segment_id]}。"
+            if segment_id == "seg-0001" else "缺少控制器令牌。"
+        )
         return {"blocks": [{"block_id": block_id_value, "text": text}]}
 
     checkpoint_dir = tmp_path / "checkpoints"
@@ -179,7 +569,7 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
     except CompanionLaneError as exc:
         assert exc.lane == "translation"
         assert {segment_id for segment_id, _ in exc.failures} == {"seg-0003", "seg-0004"}
-        assert all("opaque inline tokens" in str(error) for _, error in exc.failures)
+        assert all("slot repair" in str(error) for _, error in exc.failures)
     else:
         raise AssertionError("persistently invalid translations must fail the lane")
 

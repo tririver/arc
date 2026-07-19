@@ -78,19 +78,46 @@ followed by a high-tier consolidation review, with complete unit coverage and a
 bounded source anchor for every unit in the consolidation payload. Review
 patches may change translations and commentaries only.
 
-If a generated translation changes, drops, or reorders an opaque inline
-formula, citation, or link token,
-the controller gives only that unit one medium-tier correction attempt; ordinary
-translation remains low-tier. The correction
-prompt includes the precise validation error, the previous output, and the
-required byte-exact token sequence for every block. The corrected output must
-pass the same strict validation; the controller never repairs, normalizes, or
-relaxes formula, citation, or link tokens. Only a validated result is checkpointed,
-and a second mismatch is reported with the lane's aggregated failures. The
-correction runs offline because all required data is already frozen. Its prompt
-has a separate failure-only version and model tier embedded in the correction
-provenance. Changing this exceptional repair path does not invalidate already
-valid content checkpoints through the global prompt fingerprint.
+Every new primary low-tier translation prompt ends with an explicit controller
+checklist for exact block coverage/order, byte-exact opaque-token coverage/order,
+cross-block token isolation, and protected-name spelling. This reinforces the
+existing deterministic validator without changing its contract. Previously
+validated translation checkpoints already satisfy that validator and remain
+reusable; the instruction-only checklist does not force wholesale regeneration.
+
+If a generated translation changes, drops, or reorders opaque inline formula,
+citation, or link tokens, the controller collects all mismatched blocks in that
+segment into one shared medium-tier placement correction; ordinary translation
+remains low-tier and every valid block stays unchanged.
+The correction runs offline and receives the prior invalid block text, its
+natural-language residue after opaque markers are removed, source-run context,
+and exactly `N+1` stable slots for `N` source-owned tokens. It may only partition
+that residue among the slots: their concatenation must remain byte-for-byte
+identical. The sole exception is exact insertion of specifically missing
+protected names; removing those inserted names must recover the prior residue.
+Well-formed and bounded malformed `[[ARC_INLINE:...]]` candidates are removed
+from the prior text before slot comparison, so a damaged marker cannot make
+repair impossible or survive as visible prose. The controller interleaves the original immutable tokens and reruns the same
+strict whole-block validator. Every other translated block remains byte-for-byte
+unchanged. Only a validated result is checkpointed, and there is never a second
+correction attempt. The failure-only prompt version and medium tier are recorded
+separately, so this exceptional path can change without invalidating valid
+content checkpoints through the global prompt fingerprint.
+
+Protected-name checks inspect natural text runs only. Names visible solely
+inside controller-owned formula, citation, or link runs are already preserved
+by token interleaving and never trigger a duplicate name insertion. Text runs
+remain separated during this check so adjacent runs cannot accidentally form a
+name, and generated Latin spelling is case-sensitive. A name-only repair is
+accepted only when removing one exact, boundary-delimited insertion of each
+requested name recovers the prior residue.
+
+Before any slot repair, one shared segment preflight validates complete ordered
+block coverage and object shape. It requires non-empty translated residue only
+when the source block has non-empty natural text runs, falling back to block
+text when inline runs are absent. A pure controller-owned link/citation block
+may therefore be token-only, while a later natural-text block that is empty or
+token-only blocks repair even when an earlier block has a token mismatch.
 
 The controller first submits exactly the first `min(workers, unit_count)`
 source-order units to both lanes. As soon as translation and commentary have

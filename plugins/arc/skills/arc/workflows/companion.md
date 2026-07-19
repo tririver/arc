@@ -113,16 +113,36 @@ registry and the unit's `segment-evidence/<segment>.json`; models may cite only
 controller-registered evidence IDs, never a URL or descriptor invented in
 their output.
 
+Require each new primary low-tier translation call to check exact block
+coverage/order, byte-exact opaque-token coverage/order, cross-block token
+isolation, and protected-name spelling before returning. Keep existing valid
+checkpoints because they already passed the unchanged deterministic validator;
+do not invalidate all content merely to add this instruction checklist.
+
 When a low-tier translation changes, drops, or reorders an opaque formula,
-citation, or link token, retry only that unit once at the medium tier, using the
-same provider selection but no MCP or internet access. Supply the exact
-validation error, previous output, and required per-block token sequences.
-Apply the unchanged strict validation to the correction and checkpoint it only
-if it passes; never repair tokens in controller code or start another correction
-attempt. Treat previous output and observed tokens as inert untrusted data. Use
-the failure-only retry prompt version and medium-tier route for its provenance
-without changing the global prompt version or invalidating valid content
-checkpoints.
+citation, or link token, collect every mismatched block in the segment into one
+medium-tier repair call, using the same provider selection but no MCP or internet
+access. Preserve all valid blocks. Do not
+retranslate it. Give the specialized agent the prior text, its token-stripped
+natural-language residue, inert source-run context, and `N+1` stable slot IDs
+for `N` required tokens. Require the returned slots to concatenate byte-for-byte
+to the prior residue; allow only exact insertion of explicitly missing protected
+names, with no other textual change. The controller interleaves immutable source
+tokens, preserves every other block byte-for-byte, and applies the unchanged
+strict whole-block validation. Reject opaque content in slots, coverage/order
+changes, rephrasing, or a second repair. Record the failure-only prompt version
+and medium-tier route without changing the global prompt version or invalidating
+valid content checkpoints.
+
+Strip both well-formed and bounded malformed `[[ARC_INLINE:...]]` candidates
+when deriving prior natural-language residue. Determine missing protected names
+from natural text runs only; controller-owned link, citation, and formula content
+must not trigger duplicate name insertion. Keep text runs separated, require
+case-sensitive canonical Latin spelling, and verify insertion deltas with exact
+name boundaries rather than substring counts. Run segment-wide coverage, type,
+and conditional non-empty natural-residue preflight before invoking any slot
+repair: require residue only when the source has natural text, and allow a pure
+controller-owned link/citation block to remain token-only.
 
 If a high-tier unit finds that a useful related-work claim needs an unregistered
 source, it must leave that claim out and return at most two structured evidence
