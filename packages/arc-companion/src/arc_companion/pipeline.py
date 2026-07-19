@@ -32,16 +32,20 @@ from .latex import LatexError, render_companion_tex, validate_tex_fidelity
 from .pdf import compile_latex, validate_pdf
 from .prompts import (
     ANNOTATION_SCHEMA,
+    TRANSLATION_COVERAGE_REPAIR_SCHEMA,
     TRANSLATION_SCHEMA,
     TRANSLATION_SLOT_REPAIR_SCHEMA,
     REVIEW_SCHEMA,
     SECTION_REVIEW_SCHEMA,
     PROMPT_VERSION,
     SCHEMA_VERSION,
+    TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
+    TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
     TRANSLATION_RETRY_PROMPT_VERSION,
     annotation_prompt,
     review_prompt,
     section_review_prompt,
+    translation_coverage_repair_prompt,
     translation_prompt,
     translation_retry_prompt,
 )
@@ -67,6 +71,7 @@ SEGMENTATION_TIER = "medium"
 GLOSSARY_TIER = "medium"
 TRANSLATION_TIER = "low"
 TRANSLATION_RETRY_TIER = "medium"
+TRANSLATION_COVERAGE_REPAIR_TIER = "medium"
 ANNOTATION_TIER = "high"
 REVIEW_TIER = "high"
 REVIEW_VERSION = "arc.companion.review.v2"
@@ -129,6 +134,10 @@ class TranslationOpaqueTokenError(RuntimeError):
             "actual_token_count": len(self.actual_tokens),
             "message": str(self),
         }
+
+
+class TranslationCoverageError(RuntimeError):
+    """A translation candidate does not map exactly once to every expected block."""
 
 
 @dataclass(frozen=True)
@@ -1038,6 +1047,89 @@ def _clear_unresolved_requested_work(
         annotation["later_work"] = ""
 
 
+def _translation_draft_path(checkpoint_dir: Path, segment_id: str) -> Path:
+    return checkpoint_dir / "translation-drafts" / f"{_segment_checkpoint_name(segment_id)}.json"
+
+
+def _translation_coverage_attempt_path(checkpoint_dir: Path, segment_id: str) -> Path:
+    return (
+        checkpoint_dir
+        / "translation-coverage-attempts"
+        / f"{_segment_checkpoint_name(segment_id)}.json"
+    )
+
+
+def _matching_translation_coverage_attempt(
+    checkpoint_dir: Path, segment_id: str, input_sha256: str,
+) -> dict[str, Any] | None:
+    path = _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+    value = read_json(path) if path.is_file() else None
+    if (
+        isinstance(value, dict)
+        and value.get("segment_id") == segment_id
+        and value.get("input_sha256") == input_sha256
+    ):
+        return value
+    return None
+
+
+def _translation_primary_draft_payload(
+    segment: dict[str, Any],
+    translation: dict[str, Any],
+    *,
+    input_sha256: str,
+    origin: str,
+) -> dict[str, Any]:
+    model_generated = origin == "primary-model"
+    return {
+        "schema_version": "arc.companion.translation-primary-draft.v1",
+        "segment_id": str(segment["segment_id"]),
+        "input_sha256": input_sha256,
+        "candidate_provenance": {
+            "origin": origin,
+            "prompt_version": PROMPT_VERSION if model_generated else None,
+            "response_schema_version": SCHEMA_VERSION if model_generated else None,
+            "model_tier": TRANSLATION_TIER if model_generated else None,
+        },
+        "translation": translation,
+    }
+
+
+def _seed_translation_coverage_draft(
+    segment: dict[str, Any],
+    *,
+    bundle: SourceBundle,
+    glossary: dict[str, Any],
+    protected_names: list[str],
+    checkpoint_dir: Path,
+    translation: dict[str, Any] | None = None,
+) -> Path:
+    """Seed an auditable repair-only candidate without invoking the primary model."""
+    by_id = {block_id(block): block for block in bundle.document["blocks"]}
+    paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
+    input_sha256 = _segment_input_hash(
+        segment,
+        by_id,
+        glossary=glossary,
+        extra={
+            "names": protected_names,
+            "paper_context": paper_context,
+            "runtime_access": _generation_runtime_policy(),
+        },
+    )
+    path = _translation_draft_path(checkpoint_dir, str(segment["segment_id"]))
+    write_json(
+        path,
+        _translation_primary_draft_payload(
+            segment,
+            translation or {"blocks": []},
+            input_sha256=input_sha256,
+            origin="controller-seed",
+        ),
+    )
+    return path
+
+
 def _generate_translations(
     segments: list[dict[str, Any]],
     *,
@@ -1053,6 +1145,7 @@ def _generate_translations(
     translation_dir.mkdir(parents=True, exist_ok=True)
     output: dict[str, dict[str, Any]] = {}
     pending: list[dict[str, Any]] = []
+    input_hashes: dict[str, str] = {}
     for segment in segments:
         path = translation_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json"
         paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
@@ -1066,6 +1159,7 @@ def _generate_translations(
                 "runtime_access": _generation_runtime_policy(),
             },
         )
+        input_hashes[str(segment["segment_id"])] = expected_hash
         if path.is_file() and not options.force:
             checkpoint = read_json(path)
             if (
@@ -1079,37 +1173,146 @@ def _generate_translations(
                 continue
         pending.append(segment)
 
-    def generate(segment: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def generate(
+        segment: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        segment_id = str(segment["segment_id"])
         selected = [by_id[value] for value in segment["block_ids"]]
         translatable = [_translation_input_block(block) for block in selected if _is_translatable(block)]
         paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
+        artifact_dir = (
+            checkpoint_dir / "llm" / "translations" / _segment_checkpoint_name(segment_id)
+        )
+        draft_path = _translation_draft_path(checkpoint_dir, segment_id)
+        draft = read_json(draft_path) if draft_path.is_file() else None
+        attempt = _matching_translation_coverage_attempt(
+            checkpoint_dir, segment_id, input_hashes[segment_id]
+        )
+        candidate_provenance: dict[str, Any] | None = None
+        translation: dict[str, Any] | None = None
+        if (
+            isinstance(draft, dict)
+            and draft.get("schema_version") == "arc.companion.translation-primary-draft.v1"
+            and draft.get("segment_id") == segment_id
+            and draft.get("input_sha256") == input_hashes[segment_id]
+            and isinstance(draft.get("translation"), dict)
+        ):
+            draft_translation = draft["translation"]
+            try:
+                _validate_translation(segment, draft_translation, by_id, protected_names)
+            except TranslationCoverageError:
+                translation = draft_translation
+            except RuntimeError:
+                pass
+            else:
+                if not options.force:
+                    translation = draft_translation
+            if translation is not None:
+                candidate_provenance = dict(draft.get("candidate_provenance") or {})
+        if attempt is not None and translation is None:
+            raise RuntimeError(
+                f"translation coverage repair attempt already consumed for {segment_id}"
+            )
         if translatable:
-            artifact_dir = (
-                checkpoint_dir / "llm" / "translations" / _segment_checkpoint_name(segment["segment_id"])
-            )
-            value = _llm_call(
-                llm,
-                translation_prompt(
+            if translation is None:
+                translation = _llm_call(
+                    llm,
+                    translation_prompt(
+                        segment,
+                        translatable,
+                        language=options.annotation_language,
+                        glossary=glossary,
+                        protected_names=protected_names,
+                        paper_context=paper_context,
+                    ),
+                    TRANSLATION_SCHEMA,
+                    options=options,
+                    artifact_dir=artifact_dir,
+                    call_label=f"companion-translation-{segment_id}",
+                    model_tier=TRANSLATION_TIER,
+                    allow_mcp=True,
+                    allow_internet=True,
+                )
+                draft = _translation_primary_draft_payload(
                     segment,
-                    translatable,
-                    language=options.annotation_language,
-                    glossary=glossary,
-                    protected_names=protected_names,
-                    paper_context=paper_context,
-                ),
-                TRANSLATION_SCHEMA,
-                options=options,
-                artifact_dir=artifact_dir,
-                call_label=f"companion-translation-{segment['segment_id']}",
-                model_tier=TRANSLATION_TIER,
-                allow_mcp=True,
-                allow_internet=True,
-            )
-            blocks = list(value.get("blocks") or [])
+                    translation,
+                    input_sha256=input_hashes[segment_id],
+                    origin="primary-model",
+                )
+                write_json(draft_path, draft)
+                candidate_provenance = dict(draft["candidate_provenance"])
         else:
-            blocks = []
-        translation = {"blocks": blocks}
+            translation = {"blocks": []}
+            candidate_provenance = {"origin": "controller-empty"}
+        assert translation is not None
+        repair_provenance: list[dict[str, Any]] = []
         try:
+            _validate_translation(segment, translation, by_id, protected_names)
+        except TranslationCoverageError:
+            normalized, missing_blocks, diagnostics = _normalize_translation_coverage(
+                segment, translation, by_id
+            )
+            if missing_blocks:
+                if attempt is not None:
+                    raise RuntimeError(
+                        f"translation coverage repair attempt already consumed for {segment_id}"
+                    )
+                repair_contexts = [
+                    _translation_coverage_repair_context(block) for block in missing_blocks
+                ]
+                attempt_path = _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+                write_json(attempt_path, {
+                    "schema_version": "arc.companion.translation-coverage-attempt.v1",
+                    "segment_id": segment_id,
+                    "input_sha256": input_hashes[segment_id],
+                    "status": "started",
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "prompt_version": TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
+                    "response_schema_version": TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
+                    "model_tier": TRANSLATION_COVERAGE_REPAIR_TIER,
+                    "missing_block_ids": [block_id(block) for block in missing_blocks],
+                })
+                value = _llm_call(
+                    llm,
+                    translation_coverage_repair_prompt(
+                        segment,
+                        repair_contexts,
+                        language=options.annotation_language,
+                        glossary=glossary,
+                        protected_names=protected_names,
+                        paper_context={
+                            **paper_context,
+                            "access": {"allow_mcp": False, "allow_internet": False},
+                        },
+                        repair_model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
+                    ),
+                    TRANSLATION_COVERAGE_REPAIR_SCHEMA,
+                    options=options,
+                    artifact_dir=artifact_dir / "coverage-repair-1",
+                    call_label=f"companion-translation-{segment_id}-coverage-repair-1",
+                    model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
+                    allow_mcp=False,
+                    allow_internet=False,
+                )
+                translation = _apply_translation_coverage_repairs(
+                    normalized, segment, missing_blocks, value, by_id
+                )
+                repair_provenance.append({
+                    "kind": "coverage",
+                    "attempt": 1,
+                    "prompt_version": TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
+                    "response_schema_version": TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
+                    "model_tier": TRANSLATION_COVERAGE_REPAIR_TIER,
+                    "repaired_block_ids": [block_id(block) for block in missing_blocks],
+                    "normalization": diagnostics,
+                })
+            else:
+                translation = normalized
+                repair_provenance.append({
+                    "kind": "coverage-normalization",
+                    "attempt": 0,
+                    "normalization": diagnostics,
+                })
             _validate_translation(segment, translation, by_id, protected_names)
         except TranslationOpaqueTokenError:
             token_errors = _translation_opaque_token_errors(segment, translation, by_id)
@@ -1148,7 +1351,17 @@ def _generate_translations(
                 protected_names=protected_names,
             )
             _validate_translation(segment, translation, by_id, protected_names)
-        return segment["segment_id"], translation
+            repair_provenance.append({
+                "kind": "token-placement",
+                "attempt": 1,
+                "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+                "model_tier": TRANSLATION_RETRY_TIER,
+                "repaired_block_ids": [block_id(block) for block in source_blocks],
+            })
+        return segment_id, translation, {
+            "candidate": candidate_provenance or {},
+            "repairs": repair_provenance,
+        }
 
     with ThreadPoolExecutor(max_workers=min(options.workers, max(1, len(pending)))) as executor:
         futures = {executor.submit(generate, segment): segment for segment in pending}
@@ -1156,7 +1369,7 @@ def _generate_translations(
         for future in as_completed(futures):
             segment = futures[future]
             try:
-                segment_id, value = future.result()
+                segment_id, value, provenance = future.result()
             except Exception as exc:
                 failures.append((str(segment["segment_id"]), exc))
                 continue
@@ -1166,7 +1379,7 @@ def _generate_translations(
                 write_json(
                     translation_dir / f"{_segment_checkpoint_name(segment_id)}.json",
                     {
-                        "schema_version": "arc.companion.translation-checkpoint.v1",
+                        "schema_version": "arc.companion.translation-checkpoint.v2",
                         "segment_id": segment_id,
                         "input_sha256": _segment_input_hash(
                             segment,
@@ -1180,6 +1393,7 @@ def _generate_translations(
                                 "runtime_access": _generation_runtime_policy(),
                             },
                         ),
+                        "generation_provenance": provenance,
                         "translation": value,
                     },
                 )
@@ -1373,19 +1587,21 @@ def _generation_runtime_policy() -> dict[str, bool | str]:
     return {"allow_mcp": True, "allow_internet": True, "mcp_mode": "arc-only"}
 
 
-def _llm_runtime_env(*, allow_mcp: bool, allow_internet: bool) -> dict[str, str] | None:
+def _llm_runtime_env(*, allow_mcp: bool, allow_internet: bool) -> dict[str, str]:
     """Map portable access intent onto both supported host runtimes."""
-    if not allow_mcp and not allow_internet:
-        return None
     env = dict(os.environ)
-    if allow_internet:
-        env["ARC_CODEX_ALLOW_INTERNET"] = "true"
-        env["ARC_CLAUDE_ALLOW_INTERNET"] = "true"
+    internet_value = "true" if allow_internet else "false"
+    env["ARC_CODEX_ALLOW_INTERNET"] = internet_value
+    env["ARC_CLAUDE_ALLOW_INTERNET"] = internet_value
+    mcp_value = "true" if allow_mcp else "false"
+    env["ARC_CODEX_ENABLE_MCP"] = mcp_value
+    env["ARC_CLAUDE_ALLOW_MCP"] = mcp_value
     if allow_mcp:
-        env["ARC_CODEX_ENABLE_MCP"] = "true"
-        env["ARC_CLAUDE_ALLOW_MCP"] = "true"
         env["ARC_CODEX_MCP_MODE"] = "arc-only"
         env["ARC_CLAUDE_MCP_MODE"] = "arc-only"
+    else:
+        env.pop("ARC_CODEX_MCP_MODE", None)
+        env.pop("ARC_CLAUDE_MCP_MODE", None)
     return env
 
 
@@ -1555,6 +1771,156 @@ def _is_translatable(block: dict[str, Any]) -> bool:
 
 def _translation_input_block(block: dict[str, Any]) -> dict[str, Any]:
     return _project_translation_input_block(block)
+
+
+def _translation_coverage_slot_ids(source_block: dict[str, Any]) -> list[str]:
+    return [
+        f"{block_id(source_block)}.coverage-slot-{index:04d}"
+        for index in range(len(_opaque_inline_tokens(source_block)) + 1)
+    ]
+
+
+def _translation_coverage_repair_context(source_block: dict[str, Any]) -> dict[str, Any]:
+    """Describe N+1 natural-language slots without delegating opaque content."""
+    projected_text = str(_translation_input_block(source_block).get("text") or "")
+    expected_tokens = _opaque_inline_tokens(source_block)
+    source_slots: list[str] = []
+    cursor = 0
+    for token in expected_tokens:
+        index = projected_text.find(token, cursor)
+        if index < 0:
+            raise RuntimeError("coverage repair cannot locate a source opaque token")
+        source_slots.append(projected_text[cursor:index])
+        cursor = index + len(token)
+    source_slots.append(projected_text[cursor:])
+    opaque_boundaries = []
+    for run in source_block.get("inline_runs") or []:
+        if not isinstance(run, dict) or str(run.get("kind") or "") == "text":
+            continue
+        record = {
+            "kind": str(run.get("kind") or ""),
+            "source_content": str(run.get("tex") or run.get("content") or ""),
+        }
+        if run.get("href"):
+            record["href"] = str(run["href"])
+        opaque_boundaries.append(record)
+    return {
+        "block_id": block_id(source_block),
+        "slot_ids": _translation_coverage_slot_ids(source_block),
+        "source_natural_language_slots": source_slots,
+        "opaque_boundaries": opaque_boundaries,
+    }
+
+
+def _normalize_translation_coverage(
+    segment: dict[str, Any],
+    translation: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Keep only uniquely mapped expected blocks and restore canonical source order."""
+    expected_blocks = [
+        blocks_by_id[value]
+        for value in segment.get("block_ids") or []
+        if _is_translatable(blocks_by_id[value])
+    ]
+    expected_ids = [block_id(block) for block in expected_blocks]
+    raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
+    raw_blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    candidates: dict[str, list[dict[str, Any]]] = {value: [] for value in expected_ids}
+    unknown_ids: list[str] = []
+    malformed_count = 0
+    for item in raw_blocks:
+        if not isinstance(item, dict):
+            malformed_count += 1
+            continue
+        item_id = str(item.get("block_id") or "")
+        if item_id in candidates:
+            candidates[item_id].append(item)
+        else:
+            unknown_ids.append(item_id)
+    unique = {
+        value: items[0]
+        for value, items in candidates.items()
+        if len(items) == 1
+    }
+    missing_blocks = [
+        block for block in expected_blocks if block_id(block) not in unique
+    ]
+    normalized = {
+        **translation,
+        "blocks": [unique[value] for value in expected_ids if value in unique],
+    }
+    diagnostics = {
+        "expected_block_ids": expected_ids,
+        "preserved_block_ids": [value for value in expected_ids if value in unique],
+        "missing_block_ids": [block_id(block) for block in missing_blocks],
+        "duplicate_block_ids": [
+            value for value in expected_ids if len(candidates[value]) > 1
+        ],
+        "discarded_unknown_block_ids": unknown_ids,
+        "discarded_malformed_count": malformed_count,
+    }
+    return normalized, missing_blocks, diagnostics
+
+
+def _apply_translation_coverage_repairs(
+    normalized_translation: dict[str, Any],
+    segment: dict[str, Any],
+    missing_blocks: list[dict[str, Any]],
+    repair: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Interleave controller-owned tokens into newly translated missing blocks."""
+    raw_repairs = repair.get("repairs") if isinstance(repair, dict) else None
+    if not isinstance(raw_repairs, list):
+        raise RuntimeError("translation coverage repair has no repairs list")
+    expected_missing_ids = [block_id(block) for block in missing_blocks]
+    actual_missing_ids = [
+        str(item.get("block_id") or "") for item in raw_repairs if isinstance(item, dict)
+    ]
+    if actual_missing_ids != expected_missing_ids or len(raw_repairs) != len(actual_missing_ids):
+        raise RuntimeError("translation coverage repair changed missing block coverage or order")
+    additions: dict[str, dict[str, str]] = {}
+    for source_block, block_repair in zip(missing_blocks, raw_repairs):
+        raw_slots = block_repair.get("slots") if isinstance(block_repair, dict) else None
+        if not isinstance(raw_slots, list):
+            raise RuntimeError("translation coverage repair has no slot list")
+        expected_slot_ids = _translation_coverage_slot_ids(source_block)
+        actual_slot_ids = [
+            str(item.get("slot_id") or "") for item in raw_slots if isinstance(item, dict)
+        ]
+        if actual_slot_ids != expected_slot_ids or len(raw_slots) != len(actual_slot_ids):
+            raise RuntimeError("translation coverage repair changed slot coverage or order")
+        slots = [str(item.get("text") or "") for item in raw_slots]
+        if any("[[ARC_INLINE:" in text or _OPAQUE_INLINE_PATTERN.search(text) for text in slots):
+            raise RuntimeError("translation coverage repair supplied controller-owned opaque content")
+        expected_tokens = _opaque_inline_tokens(source_block)
+        assembled = "".join(
+            part
+            for index, slot in enumerate(slots)
+            for part in ([slot, expected_tokens[index]] if index < len(expected_tokens) else [slot])
+        )
+        additions[block_id(source_block)] = {
+            "block_id": block_id(source_block),
+            "text": assembled,
+        }
+    preserved = {
+        str(item.get("block_id") or ""): item
+        for item in normalized_translation.get("blocks") or []
+        if isinstance(item, dict)
+    }
+    expected_ids = [
+        block_id(blocks_by_id[value])
+        for value in segment.get("block_ids") or []
+        if _is_translatable(blocks_by_id[value])
+    ]
+    return {
+        **normalized_translation,
+        "blocks": [
+            preserved[value] if value in preserved else additions[value]
+            for value in expected_ids
+        ],
+    }
 
 
 def _translation_slot_repair_context(
@@ -1861,7 +2227,7 @@ def _translation_preflight(
         raise RuntimeError(f"translation {segment['segment_id']} has no block list")
     actual_ids = [str(item.get("block_id") or "") for item in raw_blocks if isinstance(item, dict)]
     if actual_ids != expected_ids or len(actual_ids) != len(raw_blocks):
-        raise RuntimeError(
+        raise TranslationCoverageError(
             f"translation {segment['segment_id']} does not cover every translatable block exactly once"
         )
     for source, translated in zip(expected_blocks, raw_blocks):

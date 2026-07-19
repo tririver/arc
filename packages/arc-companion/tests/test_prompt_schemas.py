@@ -10,7 +10,9 @@ from arc_companion.prompts import (
     GLOSSARY_SCHEMA,
     REVIEW_SCHEMA,
     SECTION_REVIEW_SCHEMA,
+    TRANSLATION_COVERAGE_REPAIR_SCHEMA,
     TRANSLATION_SCHEMA,
+    TRANSLATION_SLOT_REPAIR_SCHEMA,
 )
 
 
@@ -35,6 +37,8 @@ def test_all_companion_schemas_satisfy_codex_strict_object_contract() -> None:
         CUT_SCHEMA,
         GLOSSARY_SCHEMA,
         TRANSLATION_SCHEMA,
+        TRANSLATION_COVERAGE_REPAIR_SCHEMA,
+        TRANSLATION_SLOT_REPAIR_SCHEMA,
         ANNOTATION_SCHEMA,
         REVIEW_SCHEMA,
         SECTION_REVIEW_SCHEMA,

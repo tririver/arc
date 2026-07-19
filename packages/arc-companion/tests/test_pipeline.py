@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import threading
 
+import pytest
+
 from arc_companion import pipeline as pipeline_module
 from arc_companion.cli import _emit
 from arc_companion.evidence import arc_cache_descriptor, text_sha256, validate_evidence_record
@@ -418,6 +420,355 @@ def test_one_repair_call_handles_multiple_mismatched_blocks_and_preserves_valid_
     ) == [tokens["b2"]]
 
 
+def test_coverage_normalization_preserves_unique_blocks_and_repairs_duplicates() -> None:
+    blocks = [
+        {"block_id": value, "type": "text", "text": f"Source {value}."}
+        for value in ("b1", "b2", "b3")
+    ]
+    by_id = {str(block["block_id"]): block for block in blocks}
+    segment = {"segment_id": "seg-0063", "block_ids": ["b1", "b2", "b3"]}
+    kept_b1 = {"block_id": "b1", "text": "  已有一  ", "audit": {"raw": True}}
+    kept_b3 = {"block_id": "b3", "text": "已有三"}
+    candidate = {"blocks": [
+        kept_b3,
+        {"block_id": "unknown", "text": "discard"},
+        kept_b1,
+        {"block_id": "b2", "text": "ambiguous-a"},
+        {"block_id": "b2", "text": "ambiguous-b"},
+    ]}
+
+    normalized, missing, diagnostics = pipeline_module._normalize_translation_coverage(
+        segment, candidate, by_id,
+    )
+    assert normalized["blocks"] == [kept_b1, kept_b3]
+    assert normalized["blocks"][0] is kept_b1
+    assert normalized["blocks"][1] is kept_b3
+    assert [block["block_id"] for block in missing] == ["b2"]
+    assert diagnostics["duplicate_block_ids"] == ["b2"]
+    assert diagnostics["discarded_unknown_block_ids"] == ["unknown"]
+
+    repaired = pipeline_module._apply_translation_coverage_repairs(
+        normalized,
+        segment,
+        missing,
+        {"repairs": [{
+            "block_id": "b2",
+            "slots": [{
+                "slot_id": pipeline_module._translation_coverage_slot_ids(blocks[1])[0],
+                "text": "新增二",
+            }],
+        }]},
+        by_id,
+    )
+    assert repaired["blocks"][0] is kept_b1
+    assert repaired["blocks"][2] is kept_b3
+    assert [item["block_id"] for item in repaired["blocks"]] == ["b1", "b2", "b3"]
+    _validate_translation(segment, repaired, by_id, [])
+
+
+def test_coverage_repair_translates_all_omissions_with_controller_owned_dense_tokens(
+    tmp_path: Path,
+) -> None:
+    math_run = _inline_run("math", "x", 2, tex="x")
+    citation_run = _inline_run("citation", "[7]", 4)
+    blocks = [
+        {"block_id": "kept", "type": "text", "text": "Kept source."},
+        {
+            "block_id": "dense", "type": "text", "text": "Before x after [7] end.",
+            "inline_runs": [
+                _inline_run("text", "Before ", 1), math_run,
+                _inline_run("text", " after ", 3), citation_run,
+                _inline_run("text", " end.", 5),
+            ],
+        },
+        {"block_id": "missing", "type": "text", "text": "Another omitted block."},
+    ]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-0063", "block_ids": ["kept", "dense", "missing"]}
+    kept = {"block_id": "kept", "text": "  逐字节保留  "}
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        if label.endswith("coverage-repair-1"):
+            env = kwargs["env"]
+            assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+            assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+            assert env["ARC_CODEX_ALLOW_INTERNET"] == "false"
+            assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
+            assert kwargs["model_tier"] == "medium"
+            assert pipeline_module.TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION in prompt
+            assert '"access": {"allow_mcp": false, "allow_internet": false}' in prompt
+            assert all(token not in prompt for token in pipeline_module._opaque_inline_tokens(blocks[1]))
+            return {"repairs": [
+                {"block_id": "dense", "slots": [
+                    {"slot_id": value, "text": text}
+                    for value, text in zip(
+                        pipeline_module._translation_coverage_slot_ids(blocks[1]),
+                        ["之前", "之后", "结束。"],
+                    )
+                ]},
+                {"block_id": "missing", "slots": [{
+                    "slot_id": pipeline_module._translation_coverage_slot_ids(blocks[2])[0],
+                    "text": "另一个遗漏块。",
+                }]},
+            ]}
+        return {"blocks": [kept]}
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    result = _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=llm,
+    )["seg-0063"]
+
+    assert calls == [
+        "companion-translation-seg-0063",
+        "companion-translation-seg-0063-coverage-repair-1",
+    ]
+    assert result["blocks"][0] is kept
+    assert result["blocks"][0]["text"] == "  逐字节保留  "
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(result["blocks"][1]["text"]) == (
+        pipeline_module._opaque_inline_tokens(blocks[1])
+    )
+    final = json.loads(next((checkpoint_dir / "translations").glob("*.json")).read_text())
+    assert final["generation_provenance"]["repairs"][0]["kind"] == "coverage"
+    draft = json.loads(next((checkpoint_dir / "translation-drafts").glob("*.json")).read_text())
+    assert draft["translation"] == {"blocks": [kept]}
+
+
+def test_coverage_draft_resumes_repair_after_interruption_before_attempt(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    block = {"block_id": "body", "type": "text", "text": "Missing source."}
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-0063", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    original_write_json = pipeline_module.write_json
+
+    def interrupted_write(path, value):
+        if "translation-coverage-attempts" in Path(path).parts:
+            raise RuntimeError("simulated interruption before attempt marker")
+        original_write_json(path, value)
+
+    monkeypatch.setattr(pipeline_module, "write_json", interrupted_write)
+    first_calls: list[str] = []
+
+    def primary_llm(prompt: str, **kwargs):
+        first_calls.append(str(kwargs["call_label"]))
+        return {"blocks": []}
+
+    with pytest.raises(CompanionLaneError):
+        _generate_translations(
+            [segment],
+            options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+            bundle=bundle, glossary={"entries": []}, protected_names=[],
+            checkpoint_dir=checkpoint_dir, llm=primary_llm,
+        )
+    assert first_calls == ["companion-translation-seg-0063"]
+    assert list((checkpoint_dir / "translation-drafts").glob("*.json"))
+    assert not list((checkpoint_dir / "translation-coverage-attempts").glob("*.json"))
+    assert not list((checkpoint_dir / "translations").glob("*.json"))
+
+    monkeypatch.setattr(pipeline_module, "write_json", original_write_json)
+    resume_calls: list[str] = []
+
+    def repair_llm(prompt: str, **kwargs):
+        resume_calls.append(str(kwargs["call_label"]))
+        return {"repairs": [{"block_id": "body", "slots": [{
+            "slot_id": pipeline_module._translation_coverage_slot_ids(block)[0],
+            "text": "补齐译文。",
+        }]}]}
+
+    result = _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=repair_llm,
+    )
+    assert resume_calls == ["companion-translation-seg-0063-coverage-repair-1"]
+    assert result["seg-0063"]["blocks"][0]["text"] == "补齐译文。"
+
+
+def test_started_coverage_attempt_is_lifetime_bounded_and_never_checkpoints_failure(
+    tmp_path: Path,
+) -> None:
+    block = {"block_id": "body", "type": "text", "text": "Ada reports the result."}
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-0063", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    calls: list[str] = []
+
+    def invalid_llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        if label.endswith("coverage-repair-1"):
+            return {"repairs": [{"block_id": "body", "slots": [{
+                "slot_id": pipeline_module._translation_coverage_slot_ids(block)[0],
+                "text": "省略姓名的译文。",
+            }]}]}
+        return {"blocks": []}
+
+    with pytest.raises(CompanionLaneError):
+        _generate_translations(
+            [segment],
+            options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+            bundle=bundle, glossary={"entries": []}, protected_names=["Ada"],
+            checkpoint_dir=checkpoint_dir, llm=invalid_llm,
+        )
+    assert calls == [
+        "companion-translation-seg-0063",
+        "companion-translation-seg-0063-coverage-repair-1",
+    ]
+    assert list((checkpoint_dir / "translation-coverage-attempts").glob("*.json"))
+    assert not list((checkpoint_dir / "translations").glob("*.json"))
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("consumed coverage repair must not invoke any model")
+
+    with pytest.raises(CompanionLaneError) as exc_info:
+        _generate_translations(
+            [segment],
+            options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+            bundle=bundle, glossary={"entries": []}, protected_names=["Ada"],
+            checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
+        )
+    assert "attempt already consumed" in str(exc_info.value)
+
+
+def test_controller_seeded_empty_draft_enters_repair_only(tmp_path: Path) -> None:
+    block = {"block_id": "body", "type": "text", "text": "Seeded source."}
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-0063", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    draft_path = pipeline_module._seed_translation_coverage_draft(
+        segment,
+        bundle=bundle,
+        glossary={"entries": []},
+        protected_names=[],
+        checkpoint_dir=checkpoint_dir,
+    )
+    provenance = json.loads(draft_path.read_text())["candidate_provenance"]
+    assert provenance == {
+        "origin": "controller-seed",
+        "prompt_version": None,
+        "response_schema_version": None,
+        "model_tier": None,
+    }
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        calls.append(str(kwargs["call_label"]))
+        return {"repairs": [{"block_id": "body", "slots": [{
+            "slot_id": pipeline_module._translation_coverage_slot_ids(block)[0],
+            "text": "种子补译。",
+        }]}]}
+
+    result = _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=llm,
+    )
+    assert calls == ["companion-translation-seg-0063-coverage-repair-1"]
+    assert result["seg-0063"]["blocks"][0]["text"] == "种子补译。"
+
+
+def test_offline_runtime_env_overrides_polluted_parent_access(monkeypatch) -> None:
+    for key in (
+        "ARC_CODEX_ALLOW_INTERNET",
+        "ARC_CLAUDE_ALLOW_INTERNET",
+        "ARC_CODEX_ENABLE_MCP",
+        "ARC_CLAUDE_ALLOW_MCP",
+    ):
+        monkeypatch.setenv(key, "true")
+    monkeypatch.setenv("ARC_CODEX_MCP_MODE", "unrestricted")
+    monkeypatch.setenv("ARC_CLAUDE_MCP_MODE", "unrestricted")
+
+    env = pipeline_module._llm_runtime_env(allow_mcp=False, allow_internet=False)
+
+    assert env["ARC_CODEX_ALLOW_INTERNET"] == "false"
+    assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
+    assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+    assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+    assert "ARC_CODEX_MCP_MODE" not in env
+    assert "ARC_CLAUDE_MCP_MODE" not in env
+
+
+def test_coverage_repair_validation_failure_never_chains_token_repair(tmp_path: Path) -> None:
+    run = _inline_run("math", "x", 2, tex="x")
+    blocks = [
+        {
+            "block_id": "bad-token", "type": "text", "text": "Value x.",
+            "inline_runs": [_inline_run("text", "Value ", 1), run, _inline_run("text", ".", 3)],
+        },
+        {"block_id": "missing", "type": "text", "text": "Missing."},
+    ]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        if label.endswith("coverage-repair-1"):
+            return {"repairs": [{"block_id": "missing", "slots": [{
+                "slot_id": pipeline_module._translation_coverage_slot_ids(blocks[1])[0],
+                "text": "补译。",
+            }]}]}
+        return {"blocks": [{"block_id": "bad-token", "text": "缺失 token。"}]}
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    with pytest.raises(CompanionLaneError):
+        _generate_translations(
+            [{"segment_id": "seg-0063", "block_ids": ["bad-token", "missing"]}],
+            options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+            bundle=bundle, glossary={"entries": []}, protected_names=[],
+            checkpoint_dir=checkpoint_dir, llm=llm,
+        )
+    assert calls == [
+        "companion-translation-seg-0063",
+        "companion-translation-seg-0063-coverage-repair-1",
+    ]
+    assert not list((checkpoint_dir / "translations").glob("*.json"))
+
+
 def test_segment_preflight_rejects_later_token_only_block_before_repair(tmp_path: Path) -> None:
     blocks = []
     for number in (1, 2):
@@ -532,7 +883,10 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
             assert required_tokens[segment_id] not in prompt
             assert pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION in prompt
             assert Path(kwargs["artifact_dir"]).name == "retry-1"
-            assert kwargs["env"] is None
+            assert kwargs["env"]["ARC_CODEX_ENABLE_MCP"] == "false"
+            assert kwargs["env"]["ARC_CLAUDE_ALLOW_MCP"] == "false"
+            assert kwargs["env"]["ARC_CODEX_ALLOW_INTERNET"] == "false"
+            assert kwargs["env"]["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
             assert kwargs["model_tier"] == pipeline_module.TRANSLATION_RETRY_TIER == "medium"
             slots = [
                 {"slot_id": repair_slot_ids[segment_id][0], "text": "缺少控制器令牌"},
@@ -616,7 +970,6 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
 
 def test_non_token_translation_validation_errors_do_not_retry(tmp_path: Path) -> None:
     scenarios = {
-        "coverage": {"blocks": []},
         "empty": {"blocks": [{"block_id": "body", "text": ""}]},
         "protected-name": {"blocks": [{"block_id": "body", "text": "此处省略姓名。"}]},
     }
@@ -874,11 +1227,16 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
         assert env["ARC_CLAUDE_MCP_MODE"] == "arc-only"
         assert "FULL-PAPER NAVIGATION CONTEXT" in str(call["prompt"])
         assert "Setup" in str(call["prompt"])
-    assert all(
-        call["env"] is None
-        for call in fake.calls
-        if call not in externally_enabled
-    )
+    for call in fake.calls:
+        if call in externally_enabled:
+            continue
+        env = call["env"]
+        assert env["ARC_CODEX_ALLOW_INTERNET"] == "false"
+        assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
+        assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+        assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+        assert "ARC_CODEX_MCP_MODE" not in env
+        assert "ARC_CLAUDE_MCP_MODE" not in env
     annotation_calls = [call for call in fake.calls if str(call["call_label"]).startswith("companion-annotation-")]
     assert len(annotation_calls) == 2
     assert len({call["thread"] for call in annotation_calls}) == 2
