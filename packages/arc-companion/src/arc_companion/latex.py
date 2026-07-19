@@ -1277,7 +1277,13 @@ def _render_html_fragment(
     return re.sub(r"[ \t]+\n", "\n", rendered).strip() + ("\n\n" if not contents_only else "")
 
 
-def _render_html_node(node: Any, *, rendered_links: list[dict[str, str]]) -> str:
+def _render_html_node(
+    node: Any,
+    *,
+    rendered_links: list[dict[str, str]],
+    markerless_list_item: bool = False,
+    toc_list_context: bool = False,
+) -> str:
     if isinstance(node, NavigableString):
         text = re.sub(r"\s+", " ", str(node))
         return escape_tex(text)
@@ -1295,14 +1301,33 @@ def _render_html_node(node: Any, *, rendered_links: list[dict[str, str]]) -> str
         display = str(node.get("display") or "").lower() == "block"
         return anchor + (f"\\[{tex}\\]" if display else f"\\({tex}\\)")
     if name in {"ul", "ol"}:
-        environment = "enumerate" if name == "ol" else "itemize"
+        class_parts = {
+            part.casefold()
+            for token in node.get("class", [])
+            for part in re.split(r"[-_]", str(token))
+        }
+        is_toc_list = toc_list_context or any(part.startswith("toc") for part in class_parts)
+        markerless = name == "ol" and is_toc_list and _ordered_list_has_structural_labels(node)
+        environment = "description" if markerless else ("enumerate" if name == "ol" else "itemize")
         items = "".join(
-            _render_html_node(child, rendered_links=rendered_links)
+            _render_html_node(
+                child,
+                rendered_links=rendered_links,
+                markerless_list_item=markerless,
+                toc_list_context=is_toc_list,
+            )
             for child in node.children
             if isinstance(child, Tag) and child.name == "li"
         )
         return anchor + f"\\begin{{{environment}}}\n{items}\\end{{{environment}}}\n"
-    children = "".join(_render_html_node(child, rendered_links=rendered_links) for child in node.children)
+    children = "".join(
+        _render_html_node(
+            child,
+            rendered_links=rendered_links,
+            toc_list_context=toc_list_context,
+        )
+        for child in node.children
+    )
     if name == "a":
         href = str(node.get("href") or "").strip()
         if not href:
@@ -1334,12 +1359,39 @@ def _render_html_node(node: Any, *, rendered_links: list[dict[str, str]]) -> str
     if name == "pre":
         return anchor + f"\\begin{{quote}}\\ttfamily {children}\\end{{quote}}\n"
     if name == "li":
-        return anchor + f"\\item {children}\n"
+        item = "\\item[]" if markerless_list_item else "\\item"
+        return anchor + f"{item} {children}\n"
     if name == "p":
         return anchor + children.strip() + "\n\n"
     if name in {"img", "source", "object"}:
         return anchor
     return anchor + children
+
+
+_NUMERIC_STRUCTURAL_LIST_LABEL_RE = re.compile(r"^\d+(?:\.\d+)*\.?(?=\s+\S)")
+_ALPHA_STRUCTURAL_LIST_LABEL_RE = re.compile(
+    r"^(?:[A-Z](?:\.\d+)*|[IVXLCDM]+)\.?(?=\s+\S)"
+)
+
+
+def _ordered_list_has_structural_labels(node: Tag) -> bool:
+    """Return whether every direct item carries its own section-like label."""
+    labels: list[str] = []
+    for item in node.find_all("li", recursive=False):
+        parts: list[str] = []
+        for child in item.children:
+            if isinstance(child, Tag) and str(child.name).lower() in {"ol", "ul"}:
+                break
+            if isinstance(child, NavigableString):
+                parts.append(str(child))
+            elif isinstance(child, Tag):
+                parts.append(child.get_text(" ", strip=True))
+        labels.append(" ".join(" ".join(parts).split()))
+    return bool(labels) and all(
+        _NUMERIC_STRUCTURAL_LIST_LABEL_RE.match(label)
+        or _ALPHA_STRUCTURAL_LIST_LABEL_RE.match(label)
+        for label in labels
+    )
 
 
 def _bibliography_text(item: dict[str, Any], *, rendered_links: list[dict[str, str]]) -> str:

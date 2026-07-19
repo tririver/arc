@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 from arc_companion import cli
-from arc_companion.latex import LatexError, _render_table, render_companion_tex, validate_tex_fidelity
+from arc_companion.latex import (
+    LatexError,
+    _render_html_fragment,
+    _render_table,
+    render_companion_tex,
+    validate_tex_fidelity,
+)
 from arc_companion.package import package_project
 from arc_companion.source import SourceError, load_source_bundle, validate_complete_document
 
@@ -387,6 +393,18 @@ def test_heading_and_nested_list_fields_render_without_falling_back_to_prose(tmp
     assert r"\item Second" in tex
 
 
+def test_html_ordered_list_with_years_keeps_automatic_numbering() -> None:
+    tex = _render_html_fragment(
+        "<ol><li>2020 result</li><li>2021 follow-up</li></ol>",
+        rendered_links=[],
+    )
+
+    assert r"\begin{enumerate}" in tex
+    assert r"\item 2020 result" in tex
+    assert r"\item 2021 follow-up" in tex
+    assert r"\begin{description}" not in tex
+
+
 def test_html_renderer_preserves_inline_structure_without_front_or_reference_duplication(tmp_path: Path) -> None:
     document = {
         "front_matter": {"title": "One title", "authors": ["A. Author"]},
@@ -464,11 +482,11 @@ def test_source_only_toc_acknowledgments_and_references_render_once_with_toc_str
             },
             {
                 "block_id": "toc-list", "kind": "list", "source_role": "table_of_contents",
-                "text": "1 Main 1.1 Detail", "list_kind": "ordered", "items": [],
+                "text": "1 Main 1.1 Detail 2 Other", "list_kind": "ordered", "items": [],
                 "html": (
                     '<ol class="ltx_toclist"><li><a href="#S1">1 Main</a>'
-                    '<ol class="ltx_toclist"><li><a href="#S1.SS1">1.1 Detail</a></li></ol>'
-                    '</li></ol>'
+                    '<ol><li><a href="#S1.SS1">1.1 Detail</a></li></ol>'
+                    '</li><li>2 Other</li></ol>'
                 ),
             },
             {
@@ -522,9 +540,11 @@ def test_source_only_toc_acknowledgments_and_references_render_once_with_toc_str
     assert tex.count(r"\paragraph*{Contents}") == 1
     assert tex.count("We thank our colleagues") == 1
     assert tex.count("Reference work") == 1
-    assert tex.count(r"\begin{enumerate}") >= 2
-    assert r"\hyperref[S1]{1 Main}" in tex
-    assert r"\hyperref[S1.SS1]{1.1 Detail}" in tex
+    assert tex.count(r"\begin{description}") == 2
+    assert r"\begin{enumerate}" not in tex
+    assert r"\item[] \hyperref[S1]{1 Main}" in tex
+    assert r"\item[] \hyperref[S1.SS1]{1.1 Detail}" in tex
+    assert r"\item[] 2 Other" in tex
     assert manifest["rendered_links"] == manifest["expected_links"]
     assert manifest["companion_layers"]["semantic_segment_ids"] == ["body"]
     assert validate_tex_fidelity(tex, document, manifest) == []
