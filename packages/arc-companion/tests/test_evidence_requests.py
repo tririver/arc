@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import threading
 import json
 
@@ -31,7 +32,8 @@ def _request(relation: str = "prior") -> dict:
 
 
 def _record(relation: str = "prior") -> dict:
-    blocks = [{"block_id": "S1", "text": "Verified paper passage.", "sha256": text_sha256("Verified paper passage.")}]
+    text = "This verified passage supports the specific mechanism and concrete historical claim."
+    blocks = [{"block_id": "S1", "text": text, "sha256": text_sha256(text)}]
     record = {
         "evidence_id": "verified-paper",
         "relation": relation,
@@ -72,7 +74,7 @@ def _unverified_discovery_abstract(relation: str = "prior") -> dict:
 
 def test_annotation_schema_and_controller_enforce_two_strict_requests() -> None:
     base = {
-        "explanation": "Explanation", "prior_work": [], "later_work": [],
+        "explanation": "Explanation", "prior_work": [], "later_work": [], "context_claims": [],
         "commentary": "Commentary", "evidence_ids": [], "key_points": [], "source_notes": [],
     }
     for count in (0, 1, 2):
@@ -252,9 +254,11 @@ def test_default_lanes_consume_queries_and_expand_beyond_domain_without_short_ci
     # The more claim-specific paper discovered outside the domain is ranked
     # ahead of the broad domain hit; domain membership is only a soft signal.
     assert result.records[0]["paper_id"] == "arXiv:2222.2222"
-    assert {record["paper_id"] for record in result.records} == {
-        "arXiv:1111.1111", "arXiv:2222.2222",
-    }
+    assert {record["paper_id"] for record in result.records} == {"arXiv:2222.2222"}
+    assert any(
+        item["reason"] == "insufficient_direct_support"
+        for item in result.audit["rejected"]
+    )
     assert all(result.audit["lanes"][name]["status"] == "complete" for name in ("arc", "inspire", "web"))
 
 
@@ -313,6 +317,30 @@ def test_unmapped_web_snippet_is_discovery_only() -> None:
         item["lane"] == "web" and item["reason"] == "discovery_only_not_claim_evidence"
         for item in result.audit["rejected"]
     )
+
+
+@pytest.mark.skipif(
+    os.environ.get("ARC_RUN_NET_TESTS") != "1",
+    reason="set ARC_RUN_NET_TESTS=1 for live INSPIRE/candidate-URL verification",
+)
+def test_live_inspire_and_annotation_candidate_url_contract() -> None:
+    from arc_paper import service
+
+    search = service.search_inspire("quasi-single field inflation", limit=3)
+    assert search["ok"] and search["data"]
+    request = {
+        "relation": "context",
+        "needed_claim": "Quasi-single field inflation couples massive isocurvature modes.",
+        "queries": ["massive isocurvature quasi-single field inflation"],
+        "candidate_paper_ids": [],
+        "candidate_urls": ["https://arxiv.org/abs/0911.3380"],
+        "reason": "Verify the paper-level context from a live scholarly record.",
+    }
+    result = EvidenceRequestController(adapter=ArcPaperEvidenceAdapter()).resolve(
+        normalize_evidence_requests("net-segment", [request])
+    )
+    assert result.audit["lanes"]["inspire"]["status"] == "complete"
+    assert result.audit["lanes"]["web"]["status"] == "unavailable"
 
 
 def _install_production_service_fixture(monkeypatch, *, section_text="Verified full text."):
@@ -385,7 +413,7 @@ def test_production_adapter_runs_real_service_paths_and_shares_inflight_cache(mo
     assert calls.count(("citers", "arXiv:9999.9999")) == 1
     assert calls.count(("parsed", "arXiv:1234.5678")) == 1
     assert calls.count(("metadata", "arXiv:1234.5678")) == 1
-    assert result.audit["schema_version"] == "arc.companion.evidence-resolution.v2"
+    assert result.audit["schema_version"] == "arc.companion.evidence-resolution.v3"
     assert {record["relation"] for record in result.records} == {"prior", "later"}
     assert all(record["evidence_level"] == "full_text" for record in result.records)
 
@@ -400,6 +428,65 @@ def test_production_adapter_marks_missing_web_provider_unavailable(monkeypatch) 
     assert result.audit["lanes"]["arc"]["status"] == "complete"
     assert result.audit["lanes"]["inspire"]["status"] == "complete"
     assert result.audit["lanes"]["web"]["status"] == "unavailable"
+
+
+def test_missing_web_provider_still_verifies_annotation_agent_candidate_url(monkeypatch) -> None:
+    _install_production_service_fixture(monkeypatch, section_text=(
+        "The specific mechanism supports the concrete historical claim."
+    ))
+    request = _request()
+    request["candidate_urls"] = ["https://arxiv.org/abs/1204.5678"]
+    result = EvidenceRequestController(adapter=ArcPaperEvidenceAdapter()).resolve(
+        normalize_evidence_requests("seg-url", [request])
+    )
+
+    assert result.audit["lanes"]["web"]["status"] == "unavailable"
+    assert any(
+        item["lane"] == "web" and item["discovery_origin"] == "annotation_agent"
+        for item in result.audit["accepted"]
+    )
+
+
+def test_lane_and_global_budgets_are_fair_across_requests(monkeypatch) -> None:
+    import arc_companion.evidence_requests as module
+
+    first = normalize_evidence_requests("seg-a", [_request()])[0]
+    second = normalize_evidence_requests("seg-b", [_request()])[0]
+    monkeypatch.setattr(module, "_MAX_LANE_RESULTS", 2)
+    monkeypatch.setattr(module, "_MAX_TOTAL_CANDIDATES", 2)
+
+    def crowded(_requests):
+        for _ in range(20):
+            yield {"request_key": first["request_key"], "record": _record()}
+        yield {"request_key": second["request_key"], "record": _record()}
+
+    result = EvidenceRequestController({
+        "arc": crowded, "inspire": lambda requests: [], "web": lambda requests: [],
+    }).resolve([first, second])
+
+    assert set(result.supported_request_keys) == {
+        first["request_key"], second["request_key"],
+    }
+    assert all(result.audit["per_request"][key]["considered"] for key in result.supported_request_keys)
+
+
+def test_explicit_same_relation_candidate_without_direct_support_is_rejected() -> None:
+    request = normalize_evidence_requests("seg", [_request()])[0]
+    unrelated = _record()
+    unrelated["blocks"][0]["text"] = "A telescope catalog measures detector calibration noise."
+    unrelated["blocks"][0]["sha256"] = text_sha256(unrelated["blocks"][0]["text"])
+    unrelated["source_descriptor"] = arc_cache_descriptor(
+        paper_id=unrelated["paper_id"], title=unrelated["title"], authors=[], year=2020,
+        evidence_level="full_text", content=unrelated["blocks"], document_hash="d" * 64,
+    )
+    result = EvidenceRequestController({
+        "arc": lambda requests: [{"request_key": request["request_key"], "record": unrelated}],
+        "inspire": lambda requests: [], "web": lambda requests: [],
+    }).resolve([request])
+
+    assert result.records == ()
+    assert result.supported_request_keys == ()
+    assert result.audit["rejected"][0]["reason"] == "insufficient_direct_support"
 
 
 def test_audit_is_bounded_and_never_embeds_full_evidence(monkeypatch) -> None:
@@ -473,6 +560,7 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
         }], "evidence_ids": ["missing"], "key_points": [], "source_notes": [], "evidence_requests": unresolved},
     }
     record = _record()
+    record["supported_request_keys"] = [requests[0]["request_key"]]
 
     class Controller:
         def resolve(self, material, *, existing_records):
@@ -480,7 +568,7 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
             return EvidenceResolution(
                 records=(record,), evidence_ids_by_segment={"s2": ("verified-paper",)},
                 supported_request_keys=(requests[0]["request_key"],),
-                audit={"schema_version": "arc.companion.evidence-resolution.v2", "requests": material, "lanes": {}, "accepted": [{
+                audit={"schema_version": "arc.companion.evidence-resolution.v3", "requests": material, "lanes": {}, "accepted": [{
                     "request_key": requests[0]["request_key"], "evidence_id": "verified-paper",
                 }], "rejected": []},
             )
@@ -514,7 +602,7 @@ def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypat
     assert final["s3"]["later_work"] == []
     assert all(not item["evidence_requests"] for item in final.values())
     assert [item["evidence_id"] for item in merged["related_papers"]] == ["verified-paper"]
-    audit = __import__("json").loads((tmp_path / "evidence-resolution.v2.json").read_text())
+    audit = __import__("json").loads((tmp_path / "evidence-resolution.v3.json").read_text())
     assert audit["rerun_segments"] == ["s2"]
     assert audit["final_claim_evidence_ids"]["s2"] == ["verified-paper"]
     assert audit["final_claim_bindings"]["s2"][0]["source_locators"] == [
@@ -528,6 +616,7 @@ def test_rerun_ignoring_request_evidence_drops_only_that_claim(monkeypatch, tmp_
     generic = _record()
     generic["evidence_id"] = "generic-prior"
     resolved = _record()
+    resolved["supported_request_keys"] = [request["request_key"]]
     first_claim = {
         "text": "Existing supported context.", "evidence_ids": ["generic-prior"],
         "source_locators": [{"evidence_id": "generic-prior", "locator": "S1"}],
@@ -545,7 +634,7 @@ def test_rerun_ignoring_request_evidence_drops_only_that_claim(monkeypatch, tmp_
                 records=(resolved,), evidence_ids_by_segment={"s1": ("verified-paper",)},
                 supported_request_keys=(request["request_key"],),
                 audit={
-                    "schema_version": "arc.companion.evidence-resolution.v2",
+                    "schema_version": "arc.companion.evidence-resolution.v3",
                     "requests": material, "lanes": {}, "rejected": [],
                     "accepted": [{
                         "request_key": request["request_key"],
@@ -582,6 +671,56 @@ def test_rerun_ignoring_request_evidence_drops_only_that_claim(monkeypatch, tmp_
 
     assert final["s1"]["prior_work"] == [first_claim]
     assert final["s1"]["evidence_ids"] == ["generic-prior"]
+
+
+def test_context_request_rerun_consumes_bound_context_evidence(monkeypatch, tmp_path: Path) -> None:
+    segment = {"segment_id": "s1", "block_ids": ["b1"]}
+    request = normalize_evidence_requests("s1", [_request("context")])[0]
+    record = _record("context")
+    record["supported_request_keys"] = [request["request_key"]]
+    annotations = {"s1": {
+        "commentary": "draft", "explanation": "draft", "prior_work": [],
+        "later_work": [], "context_claims": [], "evidence_ids": [],
+        "key_points": [], "source_notes": [], "evidence_requests": [request],
+    }}
+
+    class Controller:
+        def resolve(self, material, *, existing_records):
+            return EvidenceResolution(
+                records=(record,), evidence_ids_by_segment={"s1": ("verified-paper",)},
+                supported_request_keys=(request["request_key"],),
+                audit={"requests": material, "lanes": {}, "rejected": [], "accepted": [{
+                    "request_key": request["request_key"], "evidence_id": "verified-paper",
+                }]},
+            )
+
+    monkeypatch.setattr("arc_companion.pipeline._generate_annotations", lambda selected, **kwargs: {
+        "s1": {
+            "commentary": "context used", "explanation": "context used",
+            "prior_work": [], "later_work": [], "context_claims": [{
+                "text": "The specific mechanism supports the historical claim.",
+                "evidence_ids": ["verified-paper"],
+                "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
+                "request_key": request["request_key"],
+            }],
+            "evidence_ids": ["verified-paper"], "key_points": [],
+            "source_notes": [], "evidence_requests": [],
+        },
+    })
+    bundle = SourceBundle(
+        "arXiv:1", {"paper_id": "arXiv:1"},
+        {"blocks": [{"block_id": "b1", "type": "text", "text": "source"}]},
+        {}, [], [],
+    )
+    final, _ = _resolve_and_rerun_evidence_requests(
+        [segment], annotations, options=BuildOptions("arXiv:1", tmp_path), bundle=bundle,
+        evidence={"related_papers": []}, domain_context=None, glossary={},
+        protected_names=[], checkpoint_dir=tmp_path, llm=lambda *args, **kwargs: {},
+        controller=Controller(),
+    )
+
+    assert final["s1"]["context_claims"][0]["request_key"] == request["request_key"]
+    assert final["s1"]["evidence_ids"] == ["verified-paper"]
 
 
 def test_review_cannot_add_related_work_from_relation_level_id(tmp_path: Path) -> None:

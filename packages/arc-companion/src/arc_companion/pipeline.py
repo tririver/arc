@@ -66,7 +66,7 @@ from .segmentation import SegmentationError, segment_document, validate_exact_co
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
 
 
-WORKFLOW_VERSION = "arc.companion.workflow.v6"
+WORKFLOW_VERSION = "arc.companion.workflow.v7"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -82,7 +82,7 @@ TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION = (
 ANNOTATION_TIER = "high"
 REVIEW_TIER = "high"
 REVIEW_VERSION = "arc.companion.review.v3"
-ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v4"
+ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v5"
 SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
@@ -807,6 +807,13 @@ def _generate_annotations(
     resolution_by_segment: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
+    usage_state: dict[str, Any] = {"counts": {}, "topics": []}
+    segment_evidence_by_id = {
+        str(segment["segment_id"]): _evidence_for_segment(
+            segment, by_id, evidence, usage_state=usage_state,
+        )
+        for segment in segments
+    }
     annotation_dir = checkpoint_dir / ("annotations" if round_number == 1 else "annotations-evidence-rerun")
     segment_evidence_dir = checkpoint_dir / "segment-evidence"
     annotation_dir.mkdir(parents=True, exist_ok=True)
@@ -815,7 +822,7 @@ def _generate_annotations(
     pending: list[dict[str, Any]] = []
     for segment in segments:
         path = annotation_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json"
-        segment_evidence = _evidence_for_segment(segment, by_id, evidence)
+        segment_evidence = segment_evidence_by_id[str(segment["segment_id"])]
         write_json(
             segment_evidence_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json",
             {
@@ -855,7 +862,7 @@ def _generate_annotations(
 
     def generate(segment: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         selected = [_annotation_input_block(by_id[value], bundle.document) for value in segment["block_ids"]]
-        segment_evidence = _evidence_for_segment(segment, by_id, evidence)
+        segment_evidence = segment_evidence_by_id[str(segment["segment_id"])]
         paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
         value = _llm_call(
             llm,
@@ -907,6 +914,13 @@ def _generate_annotations(
                     else {str(item.get("evidence_id") or "") for item in segment_evidence["papers"]}
                 ),
             ),
+            "context_claims": _normalize_related_work(
+                value.get("context_claims") or [],
+                known_evidence_ids=(
+                    None if round_number == 1
+                    else {str(item.get("evidence_id") or "") for item in segment_evidence["papers"]}
+                ),
+            ),
             "evidence_ids": _validated_evidence_ids(
                 (
                     value.get("evidence_ids") or []
@@ -949,7 +963,7 @@ def _generate_annotations(
                         "input_sha256": _segment_input_hash(
                             segment, by_id, glossary=glossary,
                             extra={
-                                "evidence": _evidence_for_segment(segment, by_id, evidence),
+                                "evidence": segment_evidence_by_id[str(segment_id)],
                                 "names": protected_names,
                                 "paper_context": _full_paper_context(
                                     bundle.document, segment, blocks_by_id=by_id
@@ -989,7 +1003,7 @@ def _resolve_and_rerun_evidence_requests(
         for request in annotations[str(segment["segment_id"])].get("evidence_requests") or []
     ]
     if not requests:
-        write_json(checkpoint_dir / "evidence-resolution.v2.json", {
+        write_json(checkpoint_dir / "evidence-resolution.v3.json", {
             "schema_version": EVIDENCE_RESOLUTION_VERSION,
             "requests": [],
             "lanes": {},
@@ -1019,11 +1033,14 @@ def _resolve_and_rerun_evidence_requests(
     audit = dict(resolution.audit)
     audit["round"] = 1
     audit["rerun_segments"] = sorted(resolution.evidence_ids_by_segment)
-    write_json(checkpoint_dir / "evidence-resolution.v2.json", audit)
+    write_json(checkpoint_dir / "evidence-resolution.v3.json", audit)
 
+    merged_records = _merge_evidence_records(
+        evidence.get("related_papers") or [], resolution.records,
+    )
     merged_evidence = {
         **evidence,
-        "related_papers": [*(evidence.get("related_papers") or []), *resolution.records],
+        "related_papers": merged_records,
         "required_evidence_ids_by_segment": {
             key: list(values) for key, values in resolution.evidence_ids_by_segment.items()
         },
@@ -1040,7 +1057,7 @@ def _resolve_and_rerun_evidence_requests(
                 if item["segment_id"] == segment_id and item["request_key"] in supported
             },
             "requests": [item for item in requests if item["segment_id"] == segment_id],
-            "audit_path": str(checkpoint_dir / "evidence-resolution.v2.json"),
+            "audit_path": str(checkpoint_dir / "evidence-resolution.v3.json"),
         }
         for segment_id in rerun_ids
     }
@@ -1072,6 +1089,7 @@ def _resolve_and_rerun_evidence_requests(
             supported=supported,
             evidence_ids_by_request=evidence_ids_by_request,
             first_draft=first_round_annotations.get(segment_id),
+            records=merged_records,
         )
         _clear_unresolved_requested_work(annotation, segment_requests, supported)
         annotation["evidence_requests"] = []
@@ -1084,14 +1102,17 @@ def _resolve_and_rerun_evidence_requests(
                 "evidence_ids": list(claim.get("evidence_ids") or []),
                 "source_locators": list(claim.get("source_locators") or []),
             }
-            for field, relation in (("prior_work", "prior"), ("later_work", "later"))
+            for field, relation in (
+                ("prior_work", "prior"), ("later_work", "later"),
+                ("context_claims", "context"),
+            )
             for claim in annotation.get(field) or []
             if isinstance(annotation.get(field), list) and isinstance(claim, dict)
         ]
     audit["round"] = 2
     audit["final_claim_evidence_ids"] = claim_bindings
     audit["final_claim_bindings"] = claim_binding_records
-    write_json(checkpoint_dir / "evidence-resolution.v2.json", audit)
+    write_json(checkpoint_dir / "evidence-resolution.v3.json", audit)
     return annotations, merged_evidence
 
 
@@ -1131,6 +1152,23 @@ def _normalize_related_work(
     return claims
 
 
+def _merge_evidence_records(
+    existing: list[dict[str, Any]], updates: tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    """Replace updated registry records in place and append genuinely new records."""
+    output = [dict(item) for item in existing]
+    index = {str(item.get("evidence_id") or ""): position for position, item in enumerate(output)}
+    for raw in updates:
+        item = dict(raw)
+        evidence_id = str(item.get("evidence_id") or "")
+        if evidence_id in index:
+            output[index[evidence_id]] = item
+        else:
+            index[evidence_id] = len(output)
+            output.append(item)
+    return output
+
+
 def _known_evidence_ids(values: Any, records: list[dict[str, Any]]) -> list[str]:
     valid = {str(item.get("evidence_id") or "") for item in records}
     return [str(value) for value in values if str(value) in valid]
@@ -1141,7 +1179,10 @@ def _drop_unsupported_second_round_related_work(
 ) -> None:
     relation_by_id = {str(item.get("evidence_id") or ""): str(item.get("relation") or "") for item in records}
     used = list(annotation.get("evidence_ids") or [])
-    for field, relation in (("prior_work", "prior"), ("later_work", "later")):
+    for field, relation in (
+        ("prior_work", "prior"), ("later_work", "later"),
+        ("context_claims", "context"),
+    ):
         value = annotation.get(field)
         if isinstance(value, list):
             annotation[field] = [
@@ -1155,7 +1196,9 @@ def _drop_unsupported_second_round_related_work(
             ]
         elif not any(relation_by_id.get(evidence_id) == relation for evidence_id in used):
             annotation[field] = []
-    if any(isinstance(annotation.get(field), list) for field in ("prior_work", "later_work")):
+    if any(isinstance(annotation.get(field), list) for field in (
+        "prior_work", "later_work", "context_claims",
+    )):
         _sync_claim_evidence_ids(annotation)
         return
     used_relations = {
@@ -1174,7 +1217,10 @@ def _clear_unresolved_requested_work(
         str(item["request_key"]): str(item["relation"])
         for item in requests if str(item["request_key"]) not in supported
     }
-    for field, relation in (("prior_work", "prior"), ("later_work", "later")):
+    for field, relation in (
+        ("prior_work", "prior"), ("later_work", "later"),
+        ("context_claims", "context"),
+    ):
         value = annotation.get(field)
         relation_keys = {key for key, item_relation in unresolved.items() if item_relation == relation}
         if not relation_keys:
@@ -1197,10 +1243,20 @@ def _enforce_request_claim_bindings(
     supported: set[str],
     evidence_ids_by_request: dict[str, set[str]],
     first_draft: dict[str, Any] | None,
+    records: list[dict[str, Any]],
 ) -> None:
     """Drop only request-bound claims that ignored their specifically resolved evidence."""
     request_by_key = {str(item["request_key"]): item for item in requests}
-    for field, relation in (("prior_work", "prior"), ("later_work", "later")):
+    supported_keys_by_id = {
+        str(item.get("evidence_id") or ""): {
+            str(key) for key in item.get("supported_request_keys") or []
+        }
+        for item in records
+    }
+    for field, relation in (
+        ("prior_work", "prior"), ("later_work", "later"),
+        ("context_claims", "context"),
+    ):
         value = annotation.get(field)
         resolved_keys = {
             key for key, request in request_by_key.items()
@@ -1231,7 +1287,8 @@ def _enforce_request_claim_bindings(
                 str(item.get("evidence_id") or "")
                 for item in claim.get("source_locators") or [] if isinstance(item, dict)
             }
-            if expected and cited.intersection(expected) and located.intersection(expected):
+            bound = cited.intersection(expected).intersection(located)
+            if bound and any(request_key in supported_keys_by_id.get(item, set()) for item in bound):
                 kept.append(claim)
         annotation[field] = kept
     _sync_claim_evidence_ids(annotation)
@@ -1250,7 +1307,10 @@ def _claim_binding_key(claim: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _sync_claim_evidence_ids(annotation: dict[str, Any]) -> None:
-    claim_fields = [annotation.get("prior_work"), annotation.get("later_work")]
+    claim_fields = [
+        annotation.get("prior_work"), annotation.get("later_work"),
+        annotation.get("context_claims"),
+    ]
     if not any(isinstance(value, list) for value in claim_fields):
         return
     claim_ids = list(dict.fromkeys(
@@ -3724,6 +3784,8 @@ def _evidence_for_segment(
     segment: dict[str, Any],
     blocks_by_id: dict[str, dict[str, Any]],
     evidence: dict[str, Any],
+    *,
+    usage_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_text = " ".join(
         str(blocks_by_id[value].get("text") or blocks_by_id[value].get("title") or "")
@@ -3737,12 +3799,14 @@ def _evidence_for_segment(
         (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
     )
     selected: list[dict[str, Any]] = []
-    for relation in ("prior", "later"):
+    for relation in ("prior", "later", "context"):
         candidates: list[tuple[int, int, float, int, int, dict[str, Any]]] = []
         for index, paper in enumerate(related_papers):
             if paper.get("relation") != relation:
                 continue
             required = str(paper.get("evidence_id") or "") in required_ids
+            if relation == "context" and not required:
+                continue
             exact = relation == "prior" and _paper_matches_citation_targets(paper, citation_targets)
             local_relevance = _strongest_local_relevance(paper, source_tokens, idf)
             if not (required or exact or local_relevance is not None):
@@ -3754,10 +3818,13 @@ def _evidence_for_segment(
             )
             citation_prior = min(_citation_count_value(paper).bit_length(), 10)
             candidates.append((-int(exact), -int(required), -relevance, -citation_prior, index, paper))
-        for _, _, _, _, _, paper in sorted(candidates)[:3]:
+        for _, _, _, _, _, paper in _select_related_candidates(
+            candidates, usage_state=usage_state, limit=3,
+        ):
             compact = {key: paper.get(key) for key in (
                 "evidence_id", "relation", "paper_id", "arxiv_id", "doi", "inspire_id",
                 "title", "authors", "year", "citation_count", "evidence_level", "abstract",
+                "supported_request_keys",
             )}
             remaining = 4_000
             snippets: list[dict[str, str]] = []
@@ -3806,6 +3873,54 @@ def _evidence_for_segment(
         ),
         "papers": selected,
     }
+
+
+def _select_related_candidates(
+    candidates: list[tuple[int, int, float, int, int, dict[str, Any]]],
+    *,
+    usage_state: dict[str, Any] | None,
+    limit: int,
+) -> list[tuple[int, int, float, int, int, dict[str, Any]]]:
+    """Apply deterministic whole-paper soft reuse and topic-diversity penalties."""
+    if usage_state is None:
+        return sorted(candidates)[:limit]
+    counts = usage_state.setdefault("counts", {})
+    global_topics = usage_state.setdefault("topics", [])
+    remaining = list(candidates)
+    chosen: list[tuple[int, int, float, int, int, dict[str, Any]]] = []
+    local_topics: list[set[str]] = []
+    while remaining and len(chosen) < limit:
+        ranked: list[tuple[float, int, tuple[int, int, float, int, int, dict[str, Any]], set[str]]] = []
+        for candidate in remaining:
+            exact = candidate[0] < 0
+            required = candidate[1] < 0
+            paper = candidate[-1]
+            evidence_id = str(paper.get("evidence_id") or "")
+            topic = _terms(f"{paper.get('title', '')} {paper.get('abstract', '')}")
+            reuse_penalty = 0.0 if exact or required else 2.25 * int(counts.get(evidence_id, 0))
+            comparisons = [*global_topics[-24:], *local_topics]
+            diversity_penalty = 0.0
+            if comparisons and topic and not exact and not required:
+                diversity_penalty = 1.5 * max(
+                    len(topic & other) / max(1, len(topic | other))
+                    for other in comparisons if other
+                )
+            adjusted = -float(candidate[2]) - reuse_penalty - diversity_penalty
+            ranked.append((-adjusted, int(candidate[4]), candidate, topic))
+        _, _, best, topic = min(ranked)
+        exact = best[0] < 0
+        required = best[1] < 0
+        evidence_id = str(best[-1].get("evidence_id") or "")
+        adjusted = -min(ranked)[0]
+        if adjusted <= 0.0 and not exact and not required:
+            break
+        chosen.append(best)
+        remaining.remove(best)
+        counts[evidence_id] = int(counts.get(evidence_id, 0)) + 1
+        if topic:
+            local_topics.append(topic)
+            global_topics.append(topic)
+    return chosen
 
 
 def _terms(text: str) -> set[str]:

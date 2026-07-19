@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "arc.companion.prompts.v9"
-SCHEMA_VERSION = "arc.companion.schemas.v8"
+PROMPT_VERSION = "arc.companion.prompts.v10"
+SCHEMA_VERSION = "arc.companion.schemas.v9"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v4"
 TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v3"
 TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION = (
@@ -177,6 +177,7 @@ ANNOTATION_SCHEMA: dict[str, Any] = {
         "explanation",
         "prior_work",
         "later_work",
+        "context_claims",
         "commentary",
         "evidence_ids",
         "key_points",
@@ -187,6 +188,12 @@ ANNOTATION_SCHEMA: dict[str, Any] = {
         "explanation": {"type": "string", "minLength": 1},
         "prior_work": RELATED_WORK_SCHEMA,
         "later_work": RELATED_WORK_SCHEMA,
+        "context_claims": {
+            **RELATED_WORK_SCHEMA,
+            "description": (
+                "Audited context claims used in explanation/commentary; empty unless context evidence is used."
+            ),
+        },
         "commentary": {"type": "string", "minLength": 1},
         "evidence_ids": {
             "type": "array", "maxItems": 6, "items": {"type": "string"},
@@ -497,6 +504,8 @@ def annotation_prompt(
         "a closed corpus. A domain match never forbids or short-circuits ARC, INSPIRE, references/citers, or web "
         "research, and a more directly relevant paper outside the domain may be preferred. The reference and "
         "citer catalogs are discovery context, not evidence that may be cited without a registered descriptor. "
+        "For a resolved context request, include an audited context_claims object binding the exact factual "
+        "statement used in explanation/commentary to the request_key, evidence ID, and exact locator. "
         f"Write in {language}; state uncertainty explicitly. Protected names: "
         f"{json.dumps(protected_names, ensure_ascii=False)}.\n\n"
         f"PAPER METADATA:\n{json.dumps(metadata, ensure_ascii=False)}\n\n"

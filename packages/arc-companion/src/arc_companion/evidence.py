@@ -300,7 +300,10 @@ def validate_annotation_citations(annotation: Any, records: Iterable[Any]) -> li
     used_relations: set[str] = set()
     claim_bound_ids: list[str] = []
     has_claim_level_bindings = False
-    for field, relation in (("prior_work", "prior"), ("later_work", "later")):
+    for field, relation in (
+        ("prior_work", "prior"), ("later_work", "later"),
+        ("context_claims", "context"),
+    ):
         value = annotation.get(field)
         if not _has_claims(value):
             continue

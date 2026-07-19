@@ -19,7 +19,8 @@ from .evidence import (
 
 
 EVIDENCE_REQUEST_VERSION = "arc.companion.evidence-request.v1"
-EVIDENCE_RESOLUTION_VERSION = "arc.companion.evidence-resolution.v2"
+EVIDENCE_RESOLUTION_VERSION = "arc.companion.evidence-resolution.v3"
+SUPPORT_ASSESSMENT_VERSION = "arc.companion.evidence-support.v1"
 LANE_NAMES = ("arc", "inspire", "web")
 _RELATIONS = {"prior", "later", "context"}
 _MAX_GRAPH_RESULTS_PER_ANCHOR = 48
@@ -255,7 +256,9 @@ class EvidenceRequestController:
             for future in as_completed(futures):
                 name = futures[future]
                 try:
-                    output = [dict(item) for item in islice(future.result(), _MAX_LANE_RESULTS)]
+                    output = _consume_lane_fairly(
+                        future.result(), list(request_by_key), limit=_MAX_LANE_RESULTS,
+                    )
                 except EvidenceLaneUnavailable as exc:
                     lane_outputs[name] = []
                     audit_lanes[name] = {
@@ -271,12 +274,18 @@ class EvidenceRequestController:
                         "raw_results": [],
                     }
                 else:
-                    lane_outputs[name] = output
+                    unavailable = [item for item in output if item.get("lane_unavailable")]
+                    usable = [item for item in output if not item.get("lane_unavailable")]
+                    lane_outputs[name] = usable
                     audit_lanes[name] = {
-                        "status": "complete",
+                        "status": (
+                            "unavailable" if unavailable else "complete"
+                        ),
                         "raw_results": [_audit_candidate(item) for item in output],
                         "truncated": len(output) == _MAX_LANE_RESULTS,
                     }
+                    if unavailable:
+                        audit_lanes[name]["reason"] = str(unavailable[0].get("reason") or "")
 
         registry: list[dict[str, Any]] = []
         alias_to_id: dict[str, str] = {}
@@ -296,14 +305,10 @@ class EvidenceRequestController:
         ids_by_segment: dict[str, list[str]] = {}
         supported_keys: set[str] = set()
         created_ids: set[str] = set()
-        ranked_candidates = sorted(
-            (
-                (lane_name, candidate)
-                for lane_name in LANE_NAMES
-                for candidate in lane_outputs.get(lane_name, [])
-            ),
-            key=lambda item: (-_score(item[1].get("relevance_score")), LANE_NAMES.index(item[0])),
-        )[:_MAX_TOTAL_CANDIDATES]
+        changed_ids: set[str] = set()
+        ranked_candidates = _fair_ranked_candidates(
+            material, lane_outputs, limit=_MAX_TOTAL_CANDIDATES,
+        )
         for lane_name, candidate in ranked_candidates:
             request_key = str(candidate.get("request_key") or "")
             request = request_by_key.get(request_key)
@@ -312,6 +317,7 @@ class EvidenceRequestController:
                 "request_key": request_key,
                 "relevance_score": _score(candidate.get("relevance_score")),
                 "discovery_source": str(candidate.get("discovery_source") or ""),
+                "discovery_origin": str(candidate.get("discovery_origin") or ""),
             }
             if request is None:
                 rejected.append({**base, "reason": "unknown_request"})
@@ -339,6 +345,20 @@ class EvidenceRequestController:
             if str(record.get("relation") or "") != request["relation"]:
                 rejected.append({**base, "reason": "relation_mismatch"})
                 continue
+            support = _direct_support_assessment(request, record)
+            if not support["supported"]:
+                rejected.append({
+                    **base,
+                    "reason": "insufficient_direct_support",
+                    "support_assessment": support,
+                })
+                continue
+            record = {
+                **record,
+                "supported_request_keys": list(dict.fromkeys([
+                    *(record.get("supported_request_keys") or []), request_key,
+                ])),
+            }
             identities = _candidate_identities(record, candidate)
             evidence_id = next((alias_to_id[value] for value in identities if value in alias_to_id), None)
             identity = identities[0]
@@ -347,21 +367,35 @@ class EvidenceRequestController:
                 registry.append(record)
                 registry_index[evidence_id] = len(registry) - 1
                 created_ids.add(evidence_id)
-                accepted.append({**base, "evidence_id": evidence_id, "identity": identity})
+                changed_ids.add(evidence_id)
+                accepted.append({
+                    **base, "evidence_id": evidence_id, "identity": identity,
+                    "support_assessment": support,
+                })
             else:
                 upgraded = False
-                if evidence_id in created_ids:
-                    index = registry_index[evidence_id]
-                    if _record_quality(record) > _record_quality(registry[index]):
-                        replacement = {**record, "evidence_id": evidence_id}
-                        registry[index] = replacement
-                        upgraded = True
+                index = registry_index[evidence_id]
+                existing = registry[index]
+                supported_request_keys = list(dict.fromkeys([
+                    *(existing.get("supported_request_keys") or []), request_key,
+                ]))
+                if _record_quality(record) > _record_quality(existing):
+                    replacement = {
+                        **record, "evidence_id": evidence_id,
+                        "supported_request_keys": supported_request_keys,
+                    }
+                    upgraded = True
+                else:
+                    replacement = {**existing, "supported_request_keys": supported_request_keys}
+                registry[index] = replacement
+                changed_ids.add(evidence_id)
                 accepted.append({
                     **base,
                     "evidence_id": evidence_id,
                     "identity": identity,
                     "deduplicated": True,
                     "upgraded_to_preferred_source": upgraded,
+                    "support_assessment": support,
                 })
             for value in identities:
                 alias_to_id[value] = evidence_id
@@ -369,7 +403,7 @@ class EvidenceRequestController:
             ids_by_segment.setdefault(segment_id, []).append(evidence_id)
             supported_keys.add(request_key)
 
-        new_records = tuple(item for item in registry if item["evidence_id"] in created_ids)
+        new_records = tuple(item for item in registry if item["evidence_id"] in changed_ids)
         return EvidenceResolution(
             records=new_records,
             evidence_ids_by_segment={
@@ -384,8 +418,81 @@ class EvidenceRequestController:
                 "rejected": rejected,
                 "claim_evidence_policy": "verified_arc_full_text_or_inspire_abstract",
                 "candidate_limit": _MAX_TOTAL_CANDIDATES,
+                "per_request": {
+                    key: {
+                        "considered": sum(
+                            str(item.get("request_key") or "") == key
+                            for _, item in ranked_candidates
+                        ),
+                        "accepted": sum(item.get("request_key") == key for item in accepted),
+                        "rejected": sum(item.get("request_key") == key for item in rejected),
+                    }
+                    for key in request_by_key
+                },
             },
         )
+
+
+def _consume_lane_fairly(
+    values: Iterable[dict[str, Any]], request_keys: list[str], *, limit: int,
+) -> list[dict[str, Any]]:
+    """Scan a bounded per-request envelope, then emit stable round-robin results."""
+    if not request_keys:
+        return []
+    per_request = max(1, (limit + len(request_keys) - 1) // len(request_keys))
+    buckets = {key: [] for key in request_keys}
+    scan_limit = max(limit, _MAX_DISCOVERED_PAPERS_PER_REQUEST) * len(request_keys)
+    for raw in islice(values, scan_limit):
+        item = dict(raw)
+        key = str(item.get("request_key") or "")
+        bucket = buckets.setdefault(key, [])
+        if len(bucket) < per_request:
+            bucket.append(item)
+    output: list[dict[str, Any]] = []
+    while len(output) < limit:
+        progressed = False
+        for key in request_keys:
+            if buckets.get(key):
+                output.append(buckets[key].pop(0))
+                progressed = True
+                if len(output) >= limit:
+                    break
+        if not progressed:
+            break
+    return output
+
+
+def _fair_ranked_candidates(
+    requests: list[dict[str, Any]],
+    lane_outputs: Mapping[str, list[dict[str, Any]]],
+    *,
+    limit: int,
+) -> list[tuple[str, dict[str, Any]]]:
+    buckets: dict[str, list[tuple[str, dict[str, Any]]]] = {
+        str(request["request_key"]): [] for request in requests
+    }
+    for lane_name in LANE_NAMES:
+        for candidate in lane_outputs.get(lane_name, []):
+            key = str(candidate.get("request_key") or "")
+            buckets.setdefault(key, []).append((lane_name, candidate))
+    for values in buckets.values():
+        values.sort(key=lambda item: (
+            -_score(item[1].get("relevance_score")), LANE_NAMES.index(item[0]),
+            str(item[1].get("discovery_source") or ""),
+        ))
+    order = [str(request["request_key"]) for request in requests]
+    output: list[tuple[str, dict[str, Any]]] = []
+    while len(output) < limit:
+        progressed = False
+        for key in order:
+            if buckets.get(key):
+                output.append(buckets[key].pop(0))
+                progressed = True
+                if len(output) >= limit:
+                    break
+        if not progressed:
+            break
+    return output
 
 
 def normalize_evidence_requests(segment_id: str, values: Any) -> list[dict[str, Any]]:
@@ -427,10 +534,41 @@ def default_evidence_lanes(
     domain_ids = _canonical_ids(domain_paper_ids)
     seed_ids = _canonical_ids(seed_paper_ids)
     return {
-        "arc": lambda requests: _arc_lane(requests, backend, domain_ids),
-        "inspire": lambda requests: _inspire_lane(requests, backend, seed_ids),
-        "web": lambda requests: _web_lane(requests, backend),
+        "arc": lambda requests: _fair_request_results(
+            requests, lambda request: _arc_lane([request], backend, domain_ids),
+        ),
+        "inspire": lambda requests: _fair_request_results(
+            requests, lambda request: _inspire_lane([request], backend, seed_ids),
+        ),
+        "web": lambda requests: _fair_request_results(
+            requests, lambda request: _web_lane([request], backend),
+        ),
     }
+
+
+def _fair_request_results(
+    requests: list[dict[str, Any]],
+    producer: Callable[[dict[str, Any]], Iterable[dict[str, Any]]],
+) -> Iterable[dict[str, Any]]:
+    """Round-robin bounded request iterators so early requests cannot exhaust a lane."""
+    if not requests:
+        return
+    per_request = max(1, _MAX_LANE_RESULTS // len(requests))
+    iterators = [(iter(producer(request)), 0) for request in requests]
+    emitted = 0
+    while iterators and emitted < _MAX_LANE_RESULTS:
+        next_round: list[tuple[Iterable[dict[str, Any]], int]] = []
+        for iterator, count in iterators:
+            if count >= per_request or emitted >= _MAX_LANE_RESULTS:
+                continue
+            try:
+                item = next(iterator)
+            except StopIteration:
+                continue
+            yield item
+            emitted += 1
+            next_round.append((iterator, count + 1))
+        iterators = next_round
 
 
 def _arc_lane(
@@ -527,14 +665,22 @@ def _web_lane(
 ) -> Iterable[dict[str, Any]]:
     for request in requests:
         discoveries = [
-            {"url": url, "candidate_url": url}
+            {
+                "url": url, "candidate_url": url,
+                "discovery_origin": "annotation_agent",
+            }
             for url in request["candidate_urls"][:_MAX_DISCOVERED_PAPERS_PER_REQUEST]
         ]
+        search_unavailable: str | None = None
         for query in request["queries"][:_MAX_QUERIES_PER_REQUEST]:
-            discoveries.extend(
-                dict(item)
-                for item in islice(adapter.search_web(query), _MAX_WEB_RESULTS_PER_QUERY)
-            )
+            try:
+                discoveries.extend(
+                    dict(item)
+                    for item in islice(adapter.search_web(query), _MAX_WEB_RESULTS_PER_QUERY)
+                )
+            except EvidenceLaneUnavailable as exc:
+                search_unavailable = str(exc)
+                break
             if len(discoveries) >= _MAX_DISCOVERED_PAPERS_PER_REQUEST:
                 break
         for hit in discoveries[:_MAX_DISCOVERED_PAPERS_PER_REQUEST]:
@@ -559,6 +705,7 @@ def _web_lane(
                     aliases=_paper_aliases(metadata or parsed or {}, paper_id),
                     relevance_score=_relevance(request, {**hit, **(metadata or {})}),
                     discovery_source="web_mapped_verified_paper",
+                    discovery_origin=str(hit.get("discovery_origin") or "host_web_provider"),
                     verified_source=True,
                 )
             if not verified:
@@ -569,6 +716,13 @@ def _web_lane(
                     "discovery_source": "web_discovery_only",
                     "discovery_only": True,
                 }
+        if search_unavailable is not None:
+            yield {
+                "request_key": request["request_key"],
+                "lane_unavailable": True,
+                "reason": search_unavailable,
+                "discovery_source": "web_search_provider_unavailable",
+            }
 
 
 def _candidate(
@@ -578,6 +732,7 @@ def _candidate(
     aliases: Iterable[str] = (),
     relevance_score: float = 0.0,
     discovery_source: str = "",
+    discovery_origin: str = "",
     verified_source: bool = False,
 ) -> dict[str, Any]:
     return {
@@ -586,6 +741,7 @@ def _candidate(
         "canonical_aliases": _canonical_ids(aliases),
         "relevance_score": relevance_score,
         "discovery_source": discovery_source,
+        "discovery_origin": discovery_origin,
         "verified_source": verified_source,
     }
 
@@ -824,6 +980,83 @@ def _relevance(
     return min(1.0, len(overlap) / max(1, len(wanted_terms)))
 
 
+def _direct_support_assessment(
+    request: Mapping[str, Any], record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Conservatively require concentrated overlap with one verified source piece."""
+    wanted = _support_terms(" ".join([
+        str(request.get("needed_claim") or ""),
+        " ".join(str(item) for item in request.get("queries") or []),
+    ]))
+    pieces: list[tuple[str, str]] = []
+    title = str(record.get("title") or "").strip()
+    if title:
+        pieces.append(("title", title))
+    abstract = str(record.get("abstract") or "").strip()
+    if abstract:
+        pieces.append(("abstract", abstract))
+    for index, block in enumerate(record.get("blocks") or [], 1):
+        if not isinstance(block, Mapping):
+            continue
+        text = str(block.get("text") or "").strip()
+        if not text:
+            continue
+        locator = str(block.get("locator") or block.get("block_id") or f"block-{index}")
+        words = re.findall(r"\S+", text)
+        for start in range(0, len(words), 64):
+            excerpt = " ".join(words[start:start + 128])
+            if excerpt:
+                pieces.append((locator, excerpt))
+            if start + 128 >= len(words):
+                break
+    best: dict[str, Any] | None = None
+    for locator, text in pieces:
+        observed = _support_terms(text)
+        shared = wanted & observed
+        if len(shared) < 2 or not wanted or not observed:
+            continue
+        wanted_coverage = len(shared) / len(wanted)
+        piece_coverage = len(shared) / len(observed)
+        cosine = len(shared) / ((len(wanted) * len(observed)) ** 0.5)
+        supported = (
+            wanted_coverage >= 0.25
+            and piece_coverage >= 0.08
+            and cosine >= 0.20
+        )
+        score = min(wanted_coverage, piece_coverage) + cosine
+        candidate = {
+            "version": SUPPORT_ASSESSMENT_VERSION,
+            "supported": supported,
+            "score": round(score, 6),
+            "locator": locator,
+            "matched_terms": sorted(shared)[:16],
+            "wanted_coverage": round(wanted_coverage, 6),
+            "piece_coverage": round(piece_coverage, 6),
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best or {
+        "version": SUPPORT_ASSESSMENT_VERSION,
+        "supported": False,
+        "score": 0.0,
+        "locator": "",
+        "matched_terms": [],
+        "wanted_coverage": 0.0,
+        "piece_coverage": 0.0,
+    }
+
+
+def _support_terms(value: str) -> set[str]:
+    generic = {
+        "about", "after", "also", "and", "before", "claim",
+        "context", "field", "fields", "for", "from", "general",
+        "into", "model", "models", "paper", "result", "results",
+        "study", "that", "the", "their", "theory", "these", "this", "those",
+        "using", "with", "work",
+    }
+    return {term for term in _terms(value) if term not in generic}
+
+
 def _terms(value: str) -> set[str]:
     return {
         term.casefold()
@@ -850,6 +1083,7 @@ def _audit_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     summary = {
         "request_key": str(candidate.get("request_key") or ""),
         "discovery_source": str(candidate.get("discovery_source") or ""),
+        "discovery_origin": str(candidate.get("discovery_origin") or ""),
         "relevance_score": _score(candidate.get("relevance_score")),
         "canonical_aliases": _canonical_ids(_value_ids(candidate.get("canonical_aliases"))),
     }

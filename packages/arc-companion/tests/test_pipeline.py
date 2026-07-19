@@ -3477,11 +3477,44 @@ def test_selected_candidate_can_be_bound_in_production_claim_schema() -> None:
             }],
             "request_key": None,
         }],
-        "later_work": [], "evidence_ids": [chosen["evidence_id"]],
+        "later_work": [], "context_claims": [], "evidence_ids": [chosen["evidence_id"]],
         "key_points": [], "source_notes": [], "evidence_requests": [],
     }
 
     jsonschema.validate(annotation, ANNOTATION_SCHEMA)
+
+
+def test_whole_paper_soft_reuse_can_leave_empty_but_exact_citation_is_exempt() -> None:
+    segment = {"segment_id": "seg", "block_ids": ["source"]}
+    by_id = {"source": {
+        "block_id": "source", "text": "spectator conversion creates a bispectrum",
+    }}
+    record = _related_work_record(
+        "prior-repeat", relation="prior", title="Spectator conversion bispectrum",
+        abstract="Spectator conversion creates a bispectrum.", citation_count=1,
+        paper_id="arXiv:0001.0009",
+    )
+    usage = {"counts": {}, "topics": []}
+    outputs = [
+        _evidence_for_segment(
+            segment, by_id, {"related_papers": [record]}, usage_state=usage,
+        )["papers"]
+        for _ in range(8)
+    ]
+
+    assert outputs[0]
+    assert outputs[-1] == []
+
+    citation = _inline_run("citation", "[9]", 2)
+    citation["target_id"] = "bib.bib9"
+    by_id["source"]["inline_runs"] = [citation]
+    exact = _evidence_for_segment(
+        segment, by_id, {
+            "bibliography": [{"id": "bib.bib9", "arxiv_id": "0001.0009"}],
+            "related_papers": [record],
+        }, usage_state=usage,
+    )
+    assert [item["evidence_id"] for item in exact["papers"]] == ["prior-repeat"]
 
 
 def test_exact_bibliography_target_is_first_and_each_relation_is_capped_at_three() -> None:
