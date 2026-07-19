@@ -18,7 +18,7 @@
   },
   "ideas_run": {
     "loops_per_variant": 5,
-    "rounds_per_loop": 5,
+    "rounds_per_loop": 3,
     "matched_replicates_per_arm": 2,
     "save_prompts": true
   },
@@ -29,6 +29,6 @@
     "maximum_same_central_mechanism": 2,
     "minimum_blind_preference_rate": 0.6,
     "maximum_feasibility_drop": 0.25,
-    "single_domain_request_hashes_unchanged": true
+    "single_domain_prompt_contract_unchanged": true
   }
 }

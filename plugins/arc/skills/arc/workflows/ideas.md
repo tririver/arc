@@ -3,7 +3,7 @@
 Use this workflow for Case 2 idea generation. It selects the single-domain or
 cross-domain variant from the project domain manifest, then runs concurrent
 proposer-reviewer loops. Each loop has exactly one proposer and exactly one
-reviewer; the reviewer serves only that proposer and sends five reviewer reports per loop by default.
+reviewer; the reviewer serves only that proposer and sends three reviewer reports per loop by default.
 
 ## Inputs
 

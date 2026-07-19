@@ -17,7 +17,7 @@ WJ = WF / "json"
 WS = WF / "scripts"
 SINGLE_DOMAIN_GOLDEN_SHA256 = {
     "ideas-domain.variant.json": "5bff07665fdca9a9b9983106bba4954f090cbc2add7ab1edc324e5bd4792ef81",
-    "ideas-loop.template.json": "71fd87242edc47482d42298a7e816bd83f190ac2263b384981f85260d5bd7ae8",
+    "ideas-loop.template.json": "4880f3cafc76163dc4c348c7716167e0fcdfbf82a975c24fc1e2b5f4fc2c3e99",
     "ideas-proposer.template.json": "e6efaa6c250231b0d75c861728f5ffb95cde202f0aaad4900cf115bc9daad70e",
     "ideas-reviewer.template.json": "5d778af29cad459211315c3f4b1e4a8bfbecc3732e310d7d7b72be36e9050cbd",
     "ideas-reviewer-output.schema.json": "be8504c44d47bb471488d522720cffaa610d1633b473349e65907b64010dcf0d",
@@ -36,7 +36,7 @@ def _load_runner_module():
         sys.path.remove(str(WS))
 
 
-def test_single_domain_worker_contract_files_match_pre_cross_domain_golden() -> None:
+def test_single_domain_worker_contract_files_match_expected_golden() -> None:
     actual = {
         name: hashlib.sha256((WJ / name).read_bytes()).hexdigest()
         for name in SINGLE_DOMAIN_GOLDEN_SHA256
@@ -45,7 +45,20 @@ def test_single_domain_worker_contract_files_match_pre_cross_domain_golden() -> 
     assert actual == SINGLE_DOMAIN_GOLDEN_SHA256
 
 
-def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path) -> None:
+def test_all_ideas_loop_templates_default_to_three_rounds() -> None:
+    template_names = [
+        "ideas-loop.template.json",
+        "ideas-cross-domain-loop.template.json",
+        "ideas-no-info-loop.template.json",
+    ]
+
+    assert {
+        json.loads((WJ / name).read_text(encoding="utf-8"))["max_rounds"]
+        for name in template_names
+    } == {3}
+
+
+def test_ideas_launches_three_round_loop_without_postprocessing(tmp_path: Path) -> None:
     runner = _load_runner_module()
     project_dir = tmp_path / "project"
     (project_dir / "domain").mkdir(parents=True)
@@ -117,8 +130,8 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
 
     assert result["status"] == "completed"
     assert result["proposal_count"] == 1
-    assert result["reviewer_call_count"] == 5
-    assert result["loop_reviewer_call_count"] == 5
+    assert result["reviewer_call_count"] == 3
+    assert result["loop_reviewer_call_count"] == 3
     assert "global_review" not in result
     assert "ideas" not in result
     assert "report" not in result
@@ -134,7 +147,7 @@ def test_ideas_launches_five_report_loops_without_postprocessing(tmp_path: Path)
     assert batch_config["output_recovery"]["schema_violation_policy"] == "peer_visible"
     assert batch_config["output_recovery"]["reviewer_validation_retries"] == 0
     assert {loop["loop_id"] for loop in batch_config["loops"]} == {"domain_idea_001"}
-    assert {loop["max_rounds"] for loop in batch_config["loops"]} == {5}
+    assert {loop["max_rounds"] for loop in batch_config["loops"]} == {3}
     assert all(loop["early_stop"]["enabled"] is False for loop in batch_config["loops"])
     assert all(loop["proposers"][0]["model_tier"] == "high" for loop in batch_config["loops"])
     assert all(loop["reviewers"][0]["model_tier"] == "high" for loop in batch_config["loops"])
@@ -335,7 +348,7 @@ def test_domain_variant_attaches_all_domain_markdown_files_recursively(tmp_path:
                 {
                     "loop_id": batch_config["loops"][0]["loop_id"],
                     "status": "completed",
-                    "rounds_completed": 5,
+                    "rounds_completed": batch_config["loops"][0]["max_rounds"],
                     "loop_root": str(run_root / "loops" / batch_config["loops"][0]["loop_id"]),
                 }
             ],
@@ -541,14 +554,25 @@ def test_cross_domain_manifest_routes_to_structured_profiles_and_contract(tmp_pa
             "status": "completed",
             "run_id": batch_config["run_id"],
             "run_root": str(run_root),
-            "loops": [],
+            "loops": [
+                {
+                    "loop_id": loop["loop_id"],
+                    "status": "completed",
+                    "rounds_completed": loop["max_rounds"],
+                    "loop_root": str(run_root / "loops" / loop["loop_id"]),
+                }
+                for loop in batch_config["loops"]
+            ],
         }
 
     result = runner.run_ideas(config, batch_runner=fake_batch_runner, base_env={})
 
     assert result["research_scope"] == "cross_domain"
     assert result["proposal_count"] == 5
+    assert result["reviewer_call_count"] == 15
+    assert result["loop_reviewer_call_count"] == 15
     loops = seen_batch_configs[0]["loops"]
+    assert {loop["max_rounds"] for loop in loops} == {3}
     assert {loop["loop_id"] for loop in loops} == {
         "cross_domain_idea_001",
         "cross_domain_idea_002",
@@ -791,7 +815,7 @@ def test_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path:
         max_concurrent_loops: int | None = None,
     ) -> dict[str, Any]:
         run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
-        scores_by_loop = {"domain_idea_001": [77, 78, 78, 78, 78]}
+        scores_by_loop = {"domain_idea_001": [77, 78, 78]}
         for loop in batch_config["loops"]:
             loop_id = loop["loop_id"]
             loop_root = run_root / "loops" / loop_id
@@ -836,7 +860,7 @@ def test_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path:
                 {
                     "loop_id": loop["loop_id"],
                     "status": "completed",
-                    "rounds_completed": 5,
+                    "rounds_completed": loop["max_rounds"],
                     "loop_root": str(run_root / "loops" / loop["loop_id"]),
                 }
                 for loop in batch_config["loops"]
@@ -854,16 +878,14 @@ def test_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path:
         "R1",
         "R2",
         "R3",
-        "R4",
-        "R5",
-        "Δ R1→R5",
+        "Δ R1→R3",
         "Best",
     ]
     assert [row["loop_id"] for row in table["rows"]] == ["domain_idea_001"]
-    assert table["rows"][0]["total_scores_by_round"] == {"1": 77, "2": 78, "3": 78, "4": 78, "5": 78}
+    assert table["rows"][0]["total_scores_by_round"] == {"1": 77, "2": 78, "3": 78}
     assert table["rows"][0]["delta_total"] == 1
     assert table["rows"][0]["best_total"] == 78
-    assert "| domain_idea_001 | domain | domain_idea_001 final title | 77 | 78 | 78 | 78 | 78 | +1 | 78 |" in table["markdown"]
+    assert "| domain_idea_001 | domain | domain_idea_001 final title | 77 | 78 | 78 | +1 | 78 |" in table["markdown"]
     assert "no_info_idea_001" not in table["markdown"]
 
 

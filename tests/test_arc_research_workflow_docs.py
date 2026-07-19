@@ -847,7 +847,7 @@ def test_ideas_workflow_points_to_active_runner_without_global_review() -> None:
     assert "ideas_runner.py" in text
     assert "global reviewer" not in text
     assert "global_review" not in text
-    assert "five reviewer reports per loop" in text
+    assert "three reviewer reports per loop" in text
     assert "<project-dir>/ideas/<run-id>/idea_loops/loops/" in text
     assert "scripts/rank-ideas.py" in text
     assert "<project-dir>/ideas/<run-id>/ideas.md" not in text

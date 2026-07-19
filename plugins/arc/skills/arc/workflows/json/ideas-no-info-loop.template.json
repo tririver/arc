@@ -1,6 +1,6 @@
 {
   "loop_id": "<loop-id>",
-  "max_rounds": 5,
+  "max_rounds": 3,
   "early_stop": {
     "enabled": false
   },

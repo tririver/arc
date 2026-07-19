@@ -6,6 +6,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "tests/fixtures/cross_domain_0911_benchmark.json"
+CROSS_DOMAIN_LOOP_TEMPLATE = (
+    ROOT / "plugins/arc/skills/arc/workflows/json/ideas-cross-domain-loop.template.json"
+)
 
 
 def test_0911_benchmark_uses_current_checkout_and_ai_selected_partner() -> None:
@@ -31,7 +34,7 @@ def test_0911_benchmark_budget_and_acceptance_are_frozen() -> None:
 
     assert payload["ideas_run"] == {
         "loops_per_variant": 5,
-        "rounds_per_loop": 5,
+        "rounds_per_loop": 3,
         "matched_replicates_per_arm": 2,
         "save_prompts": True,
     }
@@ -42,5 +45,13 @@ def test_0911_benchmark_budget_and_acceptance_are_frozen() -> None:
         "maximum_same_central_mechanism": 2,
         "minimum_blind_preference_rate": 0.6,
         "maximum_feasibility_drop": 0.25,
-        "single_domain_request_hashes_unchanged": True,
+        "single_domain_prompt_contract_unchanged": True,
     }
+
+
+def test_0911_benchmark_round_budget_matches_current_arc_template() -> None:
+    payload = json.loads(SPEC.read_text(encoding="utf-8"))
+    loop_template = json.loads(CROSS_DOMAIN_LOOP_TEMPLATE.read_text(encoding="utf-8"))
+
+    assert payload["ideas_run"]["rounds_per_loop"] == loop_template["max_rounds"] == 3
+    assert payload["ideas_run"]["loops_per_variant"] * payload["ideas_run"]["rounds_per_loop"] == 15
