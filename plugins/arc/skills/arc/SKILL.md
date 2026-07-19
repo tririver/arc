@@ -20,7 +20,8 @@ direct human invocation. If provenance is unavailable or ambiguous, treat the
 request as not mode-eligible and continue in `auto` without asking.
 
 Managed workflow runs follow `workflows/domain.md`, `workflows/ideas.md`,
-`workflows/check.md`, `workflows/plan.md`, or `workflows/calculate.md`, and
+`workflows/check.md`, `workflows/plan.md`, `workflows/calculate.md`, or
+`workflows/companion.md`, and
 create project-local workflow artifacts such as domain references, ranked
 ideas, work notes, note-check records, calculation records, reports, rankings,
 recommendations, research directions, or follow-up project directories. For
@@ -70,7 +71,8 @@ not optional.
   `workflows/check.md` before any parse, section read, or equation extraction call.
 - When the user intent triggers a workflow-specific file
   (`workflows/check.md`, `workflows/domain.md`, `workflows/ideas.md`,
-  `workflows/plan.md`, or `workflows/calculate.md`), read that workflow file
+  `workflows/plan.md`, `workflows/calculate.md`, or `workflows/companion.md`),
+  read that workflow file
   and follow its steps. Reading the workflow file is a blocking requirement
   before any workflow MCP or CLI call.
 - ARC workflow completion checks and improvement notes: read
@@ -85,6 +87,8 @@ not optional.
   behavior: read `manuals/arc-mcp.md`.
 - Host LLM/provider detection, model choice, direct prompt tests, or provider
   troubleshooting: read `manuals/arc-llm.md`.
+- Companion-reading PDF generation: read `workflows/companion.md` and
+  `manuals/arc-companion.md` before fetching a paper or starting LLM work.
 - User-facing Markdown report export: see `rules/math_typeset.md` and
   `manuals/arc-mcp.md`.
 
@@ -178,7 +182,7 @@ skill directory and `skill_workflow_json_dir` to
 
 ### Phase 2: Route Selection
 
-Resolve the user's intent and classify it into one of the four cases below.
+Resolve the user's intent and classify it into one of the five cases below.
 Choose only the case needed for the requested outcome. Run another case only
 when it is an explicit prerequisite below or the caller also requested that
 outcome. Never interpret `auto` as permission to advance to a later case.
@@ -227,6 +231,14 @@ in `Rough Steps For Later Planning`: promote and execute it, remove or mark it
 obsolete/not triggered, or record an explicit stop condition in `Open Questions`
 or `Calculation Status`. Only stop when requested calculation coverage is
 complete and no triggered rough/pending item remains.
+
+Case 5: Generate a companion-reading PDF.
+Use only when the user explicitly requests a companion reading or asks for the
+original paper to be split into semantic units with interleaved translation
+and commentary.
+Read and execute `workflows/companion.md`. The default deliverable is one PDF;
+never generate a reproducibility package unless the user explicitly requests
+it.
 
 ### Phase 3: Self-Reflection
 

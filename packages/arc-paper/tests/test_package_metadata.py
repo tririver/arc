@@ -10,6 +10,7 @@ PACKAGE_ROOTS = {
     "arc-paper": ROOT / "packages/arc-paper",
     "arc-domain": ROOT / "packages/arc-domain",
     "arc-typeset": ROOT / "packages/arc-typeset",
+    "arc-companion": ROOT / "packages/arc-companion",
     "arc-mcp": ROOT / "packages/arc-mcp",
 }
 EXPECTED_INTERNAL_DEPENDENCIES = {
@@ -17,12 +18,16 @@ EXPECTED_INTERNAL_DEPENDENCIES = {
     "arc-paper": ["arc-llm>=0.9,<0.10"],
     "arc-domain": ["arc-llm>=0.9,<0.10", "arc-paper>=0.9,<0.10"],
     "arc-typeset": ["arc-llm>=0.9,<0.10"],
+    "arc-companion": ["arc-llm>=0.9,<0.10", "arc-paper>=0.9,<0.10"],
     "arc-mcp": [
         "arc-domain>=0.9,<0.10",
         "arc-llm>=0.9,<0.10",
         "arc-paper>=0.9,<0.10",
         "arc-typeset>=0.9,<0.10",
     ],
+}
+EXPECTED_EXTERNAL_DEPENDENCIES = {
+    "arc-companion": ["beautifulsoup4>=4.12"],
 }
 
 
@@ -51,6 +56,14 @@ def test_arc_package_internal_dependencies_are_version_bounded():
     for package_name, expected_dependencies in EXPECTED_INTERNAL_DEPENDENCIES.items():
         pyproject = _pyproject(package_name)
         dependencies = pyproject["project"].get("dependencies", [])
+
+        for dependency in expected_dependencies:
+            assert dependency in dependencies
+
+
+def test_arc_packages_declare_direct_external_dependencies():
+    for package_name, expected_dependencies in EXPECTED_EXTERNAL_DEPENDENCIES.items():
+        dependencies = _pyproject(package_name)["project"].get("dependencies", [])
 
         for dependency in expected_dependencies:
             assert dependency in dependencies

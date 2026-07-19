@@ -3,14 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import get_ident
 from typing import Any
 from urllib.parse import quote
+
+import fcntl
 
 from .ids import normalize_paper_id, paper_ids_safe_dir_name
 
@@ -23,6 +27,8 @@ class CachePaths:
     paper_id: str
     paper_dir: Path
     ar5iv_html: Path
+    ar5iv_assets: Path
+    ar5iv_asset_manifest: Path
     inspire_metadata: Path
     inspire_references: Path
     inspire_citers: Path
@@ -35,6 +41,8 @@ class CachePaths:
             paper_id=normalized,
             paper_dir=paper_dir,
             ar5iv_html=paper_dir / "ar5iv" / "fulltext.html",
+            ar5iv_assets=paper_dir / "ar5iv" / "assets" / "sha256",
+            ar5iv_asset_manifest=paper_dir / "ar5iv" / "assets" / "manifest.json",
             inspire_metadata=paper_dir / "inspire" / "metadata.json",
             inspire_references=paper_dir / "inspire" / "references.json",
             inspire_citers=paper_dir / "inspire" / "citers.json",
@@ -62,6 +70,12 @@ class CachePaths:
             )
         return self.paper_dir / "summaries" / prompt_version / f"{source_hash}.json"
 
+    def arxiv_source_version_dir(self, version: int) -> Path:
+        return self.paper_dir / "arxiv-source" / f"v{int(version)}"
+
+    def arxiv_source_manifest(self, version: int) -> Path:
+        return self.arxiv_source_version_dir(version) / "manifest.json"
+
 
 def cache_root() -> Path:
     if value := os.environ.get("ARC_PAPER_CACHE"):
@@ -81,6 +95,33 @@ def text_query_cache_path(namespace: str, text: str) -> Path:
 def parsed_source_cache_path(source_id: str) -> Path:
     safe_name = paper_ids_safe_dir_name([source_id])
     return cache_root() / "sources" / f"{safe_name}.json"
+
+
+def rich_document_cache_path(source_id: str, source_hash: str, rich_parser_version: int) -> Path:
+    safe_name = paper_ids_safe_dir_name([source_id])
+    return (
+        cache_root()
+        / "rich-sources"
+        / safe_name
+        / f"v{int(rich_parser_version)}"
+        / f"{source_hash}.json"
+    )
+
+
+@contextmanager
+def parsed_source_lock(source_id: str, *, namespace: str = "light"):
+    """Serialize cache construction for one paper across processes."""
+
+    safe_name = paper_ids_safe_dir_name([source_id])
+    safe_namespace = re.sub(r"[^A-Za-z0-9_.-]+", "_", namespace).strip("._") or "cache"
+    path = cache_root() / "locks" / "sources" / f"{safe_name}.{safe_namespace}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def parsed_source_annotations_cache_path(source_id: str) -> Path:
@@ -172,6 +213,13 @@ def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _unique_tmp_path(path)
     tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _unique_tmp_path(path)
+    tmp.write_bytes(data)
     tmp.replace(path)
 
 

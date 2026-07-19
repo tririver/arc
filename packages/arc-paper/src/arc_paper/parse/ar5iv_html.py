@@ -8,10 +8,11 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 from ..results import err, ok
 from .equations import extract_equation_contexts
+from .document import build_document
 
 
 HEADING_NAMES = ("h1", "h2", "h3", "h4", "h5", "h6")
-PARSER_VERSION = 6
+PARSER_VERSION = 13
 INLINE_LABEL_TAG_NAMES = ("b", "strong", "em", "i", "span")
 REFERENCE_LABELS = {"references", "bibliography"}
 INLINE_SECTION_LABELS = {
@@ -27,7 +28,14 @@ INLINE_SECTION_LABELS = {
 }
 
 
-def parse_html(html: str, *, paper_id: str = "") -> dict[str, Any]:
+def parse_html(
+    html: str,
+    *,
+    paper_id: str = "",
+    include_document: bool = True,
+    source_url: str = "",
+    assets: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
     sections = []
     toc = []
@@ -47,14 +55,24 @@ def parse_html(html: str, *, paper_id: str = "") -> dict[str, Any]:
         toc.append({"id": item["section_id"], "title": item["title"], "level": item["level"]})
         sections.append(item)
 
-    return {
+    equations = extract_equation_contexts(soup)
+    parsed = {
         "paper_id": paper_id,
         "parser_version": PARSER_VERSION,
         "source_hash": hashlib.sha256(html.encode("utf-8")).hexdigest(),
         "toc": toc,
         "sections": sections,
-        "equations": extract_equation_contexts(soup),
+        "equations": equations,
     }
+    if include_document:
+        parsed["document"] = build_document(
+            html,
+            paper_id=paper_id,
+            source_url=source_url,
+            assets=assets,
+            equations=equations,
+        )
+    return parsed
 
 
 def get_section(parsed: dict[str, Any], selector: str) -> dict[str, Any]:

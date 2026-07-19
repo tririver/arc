@@ -10,7 +10,7 @@ from typing import Any
 from .ar5iv_html import parse_html
 
 
-PARSER_VERSION = 12
+PARSER_VERSION = 14
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
 EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"
@@ -46,23 +46,43 @@ def parse_source_input(
     html_path: str | Path | None = None,
     html_text: str | None = None,
     tex_path: str | Path | None = None,
+    markdown_path: str | Path | None = None,
     pdf_path: str | Path | None = None,
+    include_document: bool = True,
+    source_url: str = "",
+    assets: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    resolved = _resolve_inputs(source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
+    resolved = _resolve_inputs(
+        source_path=source_path,
+        html_path=html_path,
+        tex_path=tex_path,
+        markdown_path=markdown_path,
+        pdf_path=pdf_path,
+    )
     paper_id = source_id or _generated_source_id()
     if html_text is not None:
-        parsed = parse_html(html_text, paper_id=paper_id)
+        parsed = parse_html(
+            html_text,
+            paper_id=paper_id,
+            include_document=include_document,
+            source_url=source_url,
+            assets=assets,
+        )
         return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_text(html_text))
     if resolved["html_path"]:
         path = Path(resolved["html_path"])
         data = path.read_bytes()
-        parsed = parse_html(data.decode("utf-8"), paper_id=paper_id)
+        parsed = parse_html(data.decode("utf-8"), paper_id=paper_id, include_document=include_document)
         return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_bytes(data))
     if resolved["tex_path"]:
         return parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"])
+    if resolved["markdown_path"]:
+        return parse_markdown_document(
+            Path(resolved["markdown_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]
+        )
     if resolved["pdf_path"]:
         return parse_pdf_document(Path(resolved["pdf_path"]), paper_id=paper_id)
-    raise ValueError("parse_source_input requires an HTML, TeX, PDF, or ar5iv source")
+    raise ValueError("parse_source_input requires an HTML, TeX, Markdown, PDF, or ar5iv source")
 
 
 def parse_source_input_with_warnings(
@@ -72,17 +92,25 @@ def parse_source_input_with_warnings(
     html_path: str | Path | None = None,
     html_text: str | None = None,
     tex_path: str | Path | None = None,
+    markdown_path: str | Path | None = None,
     pdf_path: str | Path | None = None,
+    include_document: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    resolved = _resolve_inputs(source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
+    resolved = _resolve_inputs(
+        source_path=source_path,
+        html_path=html_path,
+        tex_path=tex_path,
+        markdown_path=markdown_path,
+        pdf_path=pdf_path,
+    )
     paper_id = source_id or _generated_source_id()
     if html_text is not None:
-        parsed = parse_html(html_text, paper_id=paper_id)
+        parsed = parse_html(html_text, paper_id=paper_id, include_document=include_document)
         return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_text(html_text)), []
     if resolved["html_path"]:
         path = Path(resolved["html_path"])
         data = path.read_bytes()
-        parsed = parse_html(data.decode("utf-8"), paper_id=paper_id)
+        parsed = parse_html(data.decode("utf-8"), paper_id=paper_id, include_document=include_document)
         return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_bytes(data)), []
     if resolved["tex_path"]:
         if resolved["pdf_path"]:
@@ -90,9 +118,15 @@ def parse_source_input_with_warnings(
                 Path(resolved["tex_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]
             )
         return parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id), []
+    if resolved["markdown_path"]:
+        if resolved["pdf_path"]:
+            return parse_markdown_document_with_warnings(
+                Path(resolved["markdown_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]
+            )
+        return parse_markdown_document(Path(resolved["markdown_path"]), paper_id=paper_id), []
     if resolved["pdf_path"]:
         return parse_pdf_document_with_warnings(Path(resolved["pdf_path"]), paper_id=paper_id)
-    raise ValueError("parse_source_input requires an HTML, TeX, PDF, or ar5iv source")
+    raise ValueError("parse_source_input requires an HTML, TeX, Markdown, PDF, or ar5iv source")
 
 
 def source_input_hash(
@@ -100,9 +134,16 @@ def source_input_hash(
     source_path: str | Path | None = None,
     html_path: str | Path | None = None,
     tex_path: str | Path | None = None,
+    markdown_path: str | Path | None = None,
     pdf_path: str | Path | None = None,
 ) -> str:
-    resolved = _resolve_inputs(source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
+    resolved = _resolve_inputs(
+        source_path=source_path,
+        html_path=html_path,
+        tex_path=tex_path,
+        markdown_path=markdown_path,
+        pdf_path=pdf_path,
+    )
     if resolved["html_path"]:
         return _sha256_bytes(Path(resolved["html_path"]).read_bytes())
     if resolved["tex_path"]:
@@ -110,9 +151,14 @@ def source_input_hash(
         if resolved["pdf_path"]:
             paths.append(Path(resolved["pdf_path"]))
         return _combined_hash(paths)
+    if resolved["markdown_path"]:
+        paths = [Path(resolved["markdown_path"])]
+        if resolved["pdf_path"]:
+            paths.append(Path(resolved["pdf_path"]))
+        return _combined_hash(paths)
     if resolved["pdf_path"]:
         return _sha256_bytes(Path(resolved["pdf_path"]).read_bytes())
-    raise ValueError("parse_source_input requires an HTML, TeX, PDF, or ar5iv source")
+    raise ValueError("parse_source_input requires an HTML, TeX, Markdown, PDF, or ar5iv source")
 
 
 def extract_pdf_pages(path: str | Path) -> list[str]:
@@ -209,6 +255,57 @@ def _tex_document_from_pages(
     }
 
 
+def parse_markdown_document(
+    path: Path, *, paper_id: str, pdf_path: str | Path | None = None
+) -> dict[str, Any]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    pdf_pages = extract_pdf_pages(pdf_path) if pdf_path else []
+    return _markdown_document_from_pages(
+        path, paper_id=paper_id, pdf_path=pdf_path, lines=lines, pdf_pages=pdf_pages
+    )
+
+
+def parse_markdown_document_with_warnings(
+    path: Path, *, paper_id: str, pdf_path: str | Path | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    pdf_pages: list[str] = []
+    warnings: list[dict[str, Any]] = []
+    if pdf_path:
+        pdf_pages, warning = _extract_pdf_pages_with_warning(pdf_path)
+        if warning:
+            warnings.append(warning)
+    return (
+        _markdown_document_from_pages(
+            path, paper_id=paper_id, pdf_path=pdf_path, lines=lines, pdf_pages=pdf_pages
+        ),
+        warnings,
+    )
+
+
+def _markdown_document_from_pages(
+    path: Path,
+    *,
+    paper_id: str,
+    pdf_path: str | Path | None,
+    lines: list[str],
+    pdf_pages: list[str],
+) -> dict[str, Any]:
+    sections = _markdown_sections(path, lines)
+    equations = _markdown_equations(path, lines, sections)
+    if pdf_pages:
+        _enrich_equations_from_pdf(equations, pdf_pages)
+        _fill_section_pdf_pages(sections, equations)
+    return {
+        "paper_id": paper_id,
+        "parser_version": PARSER_VERSION,
+        "source_hash": _combined_hash([path, Path(pdf_path)] if pdf_path else [path]),
+        "toc": [{"id": item["section_id"], "title": item["title"], "level": item["level"]} for item in sections],
+        "sections": sections,
+        "equations": equations,
+    }
+
+
 def parse_pdf_document(path: Path, *, paper_id: str) -> dict[str, Any]:
     pages = extract_pdf_pages(path)
     return _pdf_document_from_pages(path, paper_id=paper_id, pages=pages)
@@ -234,7 +331,7 @@ def _pdf_document_from_pages(path: Path, *, paper_id: str, pages: list[str]) -> 
 
 
 def _canonical(parsed: dict[str, Any], *, paper_id: str, source_hash: str) -> dict[str, Any]:
-    return {
+    result = {
         "paper_id": paper_id,
         "parser_version": PARSER_VERSION,
         "source_hash": source_hash,
@@ -242,6 +339,9 @@ def _canonical(parsed: dict[str, Any], *, paper_id: str, source_hash: str) -> di
         "sections": list(parsed.get("sections") or []),
         "equations": list(parsed.get("equations") or []),
     }
+    if isinstance(parsed.get("document"), dict):
+        result["document"] = dict(parsed["document"])
+    return result
 
 
 def _resolve_inputs(
@@ -249,11 +349,13 @@ def _resolve_inputs(
     source_path: str | Path | None,
     html_path: str | Path | None,
     tex_path: str | Path | None,
+    markdown_path: str | Path | None,
     pdf_path: str | Path | None,
 ) -> dict[str, Path | None]:
     resolved = {
         "html_path": Path(html_path) if html_path else None,
         "tex_path": Path(tex_path) if tex_path else None,
+        "markdown_path": Path(markdown_path) if markdown_path else None,
         "pdf_path": Path(pdf_path) if pdf_path else None,
     }
     if source_path:
@@ -263,6 +365,8 @@ def _resolve_inputs(
             resolved["html_path"] = path
         elif suffix == ".tex":
             resolved["tex_path"] = path
+        elif suffix in {".md", ".markdown"}:
+            resolved["markdown_path"] = path
         elif suffix == ".pdf":
             resolved["pdf_path"] = path
         else:
@@ -344,6 +448,159 @@ def _tex_equations(path: Path, lines: list[str], sections: list[dict[str, Any]])
             continue
         index += 1
     return equations
+
+
+def _markdown_sections(path: Path, lines: list[str]) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    in_fence = False
+    for index, line in enumerate(lines, start=1):
+        if re.match(r"^\s*(```|~~~)", line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if not match:
+            continue
+        hashes, title = match.groups()
+        sections.append(
+            {
+                "section_id": f"sec_{len(sections) + 1:04d}",
+                "title": _clean_markdown_text(title),
+                "level": len(hashes),
+                "text": "",
+                "source_path": str(path),
+                "markdown_line_start": index,
+                "markdown_line_end": len(lines),
+                "pdf_page_start": None,
+                "pdf_page_end": None,
+            }
+        )
+    if not sections and lines:
+        sections.append(
+            {
+                "section_id": "sec_0001",
+                "title": path.stem,
+                "level": 1,
+                "text": "",
+                "source_path": str(path),
+                "markdown_line_start": 1,
+                "markdown_line_end": len(lines),
+                "pdf_page_start": None,
+                "pdf_page_end": None,
+            }
+        )
+    for index, section in enumerate(sections):
+        if index + 1 < len(sections):
+            section["markdown_line_end"] = sections[index + 1]["markdown_line_start"] - 1
+        start = int(section["markdown_line_start"])
+        end = int(section["markdown_line_end"])
+        section["text"] = _markdown_section_text(lines, start, end)
+    return sections
+
+
+def _markdown_equations(
+    path: Path, lines: list[str], sections: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    equations: list[dict[str, Any]] = []
+    in_fence = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if re.match(r"^\s*(```|~~~)", line):
+            in_fence = not in_fence
+            index += 1
+            continue
+        if in_fence:
+            index += 1
+            continue
+        span = _markdown_display_math_span(lines, index)
+        if not span:
+            index += 1
+            continue
+        start, end, environment = span
+        raw_tex = "\n".join(lines[start : end + 1])
+        equation = _normalize_latex(raw_tex, environment)
+        section = _section_for_markdown_line(sections, start + 1)
+        record: dict[str, Any] = {
+            "id": f"eq_{len(equations) + 1:05d}",
+            "equation": equation,
+            "before": _nearby_markdown_text_before(lines, start),
+            "after": _nearby_markdown_text_after(lines, end),
+            "section_id": str(section.get("section_id") or ""),
+            "section_title": str(section.get("title") or ""),
+            "source_path": str(path),
+            "markdown_line_start": start + 1,
+            "markdown_line_end": end + 1,
+            "tex_label": _equation_label(lines, start, end),
+            "raw_tex": raw_tex,
+            "normalized_latex": equation,
+            "confidence": "high",
+            "parser_warnings": [],
+        }
+        tag = re.search(r"\\tag\*?\{([^{}]+)\}", raw_tex)
+        if tag:
+            record["printed_equation_number"] = tag.group(1).strip()
+        equations.append(record)
+        index = end + 1
+    return equations
+
+
+def _markdown_display_math_span(lines: list[str], start: int) -> tuple[int, int, str] | None:
+    stripped = lines[start].strip()
+    if stripped.startswith("$$"):
+        if stripped != "$$" and stripped.count("$$") >= 2:
+            return start, start, "dollar_display"
+        return start, _find_display_end(lines, start + 1, "$$"), "dollar_display"
+    if stripped.startswith(r"\["):
+        if stripped != r"\[" and r"\]" in stripped:
+            return start, start, "display_math"
+        return start, _find_display_end(lines, start + 1, r"\]"), "display_math"
+    env = _begin_environment(lines[start])
+    if env:
+        return start, _find_environment_end(lines, start, env), env
+    return None
+
+
+def _section_for_markdown_line(sections: list[dict[str, Any]], line_number: int) -> dict[str, Any]:
+    for section in reversed(sections):
+        if int(section["markdown_line_start"]) <= line_number <= int(section["markdown_line_end"]):
+            return section
+    return {}
+
+
+def _markdown_section_text(lines: list[str], start: int, end: int) -> str:
+    return _clean_text("\n".join(_clean_markdown_text(line) for line in lines[start - 1 : end]))
+
+
+def _nearby_markdown_text_before(lines: list[str], start: int) -> str:
+    for index in range(start - 1, -1, -1):
+        if text := _markdown_context_line(lines[index]):
+            return text
+    return ""
+
+
+def _nearby_markdown_text_after(lines: list[str], end: int) -> str:
+    for index in range(end + 1, len(lines)):
+        if text := _markdown_context_line(lines[index]):
+            return text
+    return ""
+
+
+def _markdown_context_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped or stripped in {"$$", r"\[", r"\]"}:
+        return ""
+    if re.match(r"^\s*(?:```|~~~|#{1,6}\s)", line):
+        return ""
+    return _clean_markdown_text(line)
+
+
+def _clean_markdown_text(text: str) -> str:
+    cleaned = re.sub(r"!?(?:\[([^\]]*)\])\([^)]*\)", r"\1", text)
+    cleaned = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", cleaned)
+    cleaned = re.sub(r"[*_`~]", "", cleaned)
+    return _clean_text(cleaned)
 
 
 def _tex_equation_record(

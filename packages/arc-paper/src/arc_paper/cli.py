@@ -104,18 +104,37 @@ def main(argv: list[str] | None = None) -> int:
     equation.add_argument("--refresh", action="store_true")
     equation.add_argument("--json", action="store_true")
 
+    source_cache = sub.add_parser("source-cache")
+    source_cache.add_argument("paper_id")
+    source_cache.add_argument("--version", type=int, required=True)
+    source_cache.add_argument("--license", dest="license_url", default="")
+    source_cache.add_argument("--refresh", action="store_true")
+    source_cache.add_argument("--json", action="store_true")
+    source_probe = sub.add_parser("source-probe")
+    source_probe.add_argument("paper_id")
+    source_probe.add_argument("--version", type=int, required=True)
+    source_probe.add_argument("--json", action="store_true")
+
     parse = sub.add_parser("parse")
     parse.add_argument("source_path", nargs="?")
-    parse.add_argument("--source", default="auto", choices=["auto", "ar5iv", "html", "tex", "pdf", "tex-pdf"])
+    parse.add_argument(
+        "--source",
+        default="auto",
+        choices=["auto", "ar5iv", "html", "tex", "markdown", "pdf", "tex-pdf", "markdown-pdf"],
+    )
     parse.add_argument("--id", dest="source_id", default=None)
     parse.add_argument("--paper-id", default=None)
     parse.add_argument("--html", default=None)
     parse.add_argument("--tex", default=None)
+    parse.add_argument("--markdown", "--md", dest="markdown", default=None)
     parse.add_argument("--pdf", default=None)
     parse.add_argument("--refresh", action="store_true")
+    parse.add_argument("--recache", action="store_true")
+    parse.add_argument("--include-document", action="store_true")
     parse.add_argument("--json", action="store_true")
     get_parsed = sub.add_parser("get-parsed")
     get_parsed.add_argument("source_id")
+    get_parsed.add_argument("--include-document", action="store_true")
     get_parsed.add_argument("--json", action="store_true")
     get_parsed_toc = sub.add_parser("get-parsed-toc")
     get_parsed_toc.add_argument("source_id")
@@ -343,17 +362,34 @@ def _dispatch(args: argparse.Namespace) -> Any:
             refresh=args.refresh,
         )
     if command == "parse":
-        return service.parse_source(
-            args.source_path,
-            source=args.source,
-            source_id=args.source_id,
-            paper_id=args.paper_id,
-            html_path=args.html,
-            tex_path=args.tex,
-            pdf_path=args.pdf,
+        kwargs = {
+            "source": args.source,
+            "source_id": args.source_id,
+            "paper_id": args.paper_id,
+            "html_path": args.html,
+            "tex_path": args.tex,
+            "pdf_path": args.pdf,
+            "refresh": args.refresh,
+        }
+        if args.markdown:
+            kwargs["markdown_path"] = args.markdown
+        if args.recache:
+            kwargs["recache"] = True
+        if args.include_document:
+            kwargs["include_document"] = True
+        return service.parse_source(args.source_path, **kwargs)
+    if command == "source-cache":
+        return service.cache_arxiv_source(
+            args.paper_id,
+            version=args.version,
             refresh=args.refresh,
+            license_url=args.license_url,
         )
+    if command == "source-probe":
+        return service.probe_arxiv_source(args.paper_id, version=args.version)
     if command == "get-parsed":
+        if args.include_document:
+            return service.get_parsed_source(args.source_id, include_document=True)
         return service.get_parsed_source(args.source_id)
     if command == "get-parsed-toc":
         return service.get_parsed_source_toc(args.source_id)

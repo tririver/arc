@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-launcher_version="2"
+launcher_version="3"
 install_ref_override="${ARC_MCP_INSTALL_REF:-}"
 install_repo="${ARC_MCP_INSTALL_REPO:-https://github.com/tririver/arc.git}"
 install_source="${ARC_MCP_INSTALL_SOURCE:-auto}"
@@ -14,7 +14,7 @@ plugin_root="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
 default_repo_root="$(CDPATH= cd -- "$plugin_root/../.." && pwd -P)"
 repo_root="${ARC_MCP_REPO_ROOT:-$default_repo_root}"
 tool_name="${ARC_MCP_TOOL_NAME:-$(basename -- "$0")}"
-arc_tools="arc-mcp arc-paper arc-domain arc-llm arc-typeset"
+arc_tools="arc-mcp arc-paper arc-domain arc-llm arc-typeset arc-companion"
 
 case " ${arc_tools} " in
   *" ${tool_name} "*) ;;
@@ -299,6 +299,7 @@ install_runtime() {
       "${repo_root}/packages/arc-paper"
       "${repo_root}/packages/arc-domain"
       "${repo_root}/packages/arc-typeset"
+      "${repo_root}/packages/arc-companion"
       "${repo_root}/packages/arc-mcp"
     )
   else
@@ -308,6 +309,7 @@ install_runtime() {
       "arc-paper @ ${source_base}#subdirectory=packages/arc-paper"
       "arc-domain @ ${source_base}#subdirectory=packages/arc-domain"
       "arc-typeset @ ${source_base}#subdirectory=packages/arc-typeset"
+      "arc-companion @ ${source_base}#subdirectory=packages/arc-companion"
       "arc-mcp @ ${source_base}#subdirectory=packages/arc-mcp"
     )
   fi

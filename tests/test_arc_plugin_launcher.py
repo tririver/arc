@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "plugins/arc/bin/arc-mcp"
 PLUGIN_BIN = ROOT / "plugins/arc/bin"
-ARC_TOOLS = ("arc-mcp", "arc-paper", "arc-domain", "arc-llm", "arc-typeset")
+ARC_TOOLS = ("arc-mcp", "arc-paper", "arc-domain", "arc-llm", "arc-typeset", "arc-companion")
 
 
 def _run_launcher(
@@ -407,7 +407,7 @@ def test_launcher_uses_configured_repo_root_for_local_packages(tmp_path):
     fake_launcher.chmod(0o755)
 
     local_repo = tmp_path / "local-repo"
-    for package in ("arc-llm", "arc-paper", "arc-domain", "arc-typeset", "arc-mcp"):
+    for package in ("arc-llm", "arc-paper", "arc-domain", "arc-typeset", "arc-companion", "arc-mcp"):
         (local_repo / "packages" / package).mkdir(parents=True)
 
     calls = tmp_path / "uv-calls.log"

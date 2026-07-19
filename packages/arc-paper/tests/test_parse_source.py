@@ -1,6 +1,8 @@
 import re
 
 import arc_paper.parse.source as source
+import pytest
+from arc_paper.parse.document import DOCUMENT_SCHEMA_VERSION
 from arc_paper.parse.source import parse_source_input, parse_source_input_with_warnings
 
 
@@ -20,7 +22,8 @@ def test_parse_local_html_returns_current_ar5iv_shape(tmp_path):
 
     parsed = parse_source_input(html_path=html_path, source_id="local-html")
 
-    assert set(parsed) == {"paper_id", "parser_version", "source_hash", "toc", "sections", "equations"}
+    assert {"paper_id", "parser_version", "source_hash", "toc", "sections", "equations"} <= set(parsed)
+    assert parsed["document"]["schema_version"] == DOCUMENT_SCHEMA_VERSION
     assert parsed["paper_id"] == "local-html"
     assert parsed["toc"] == [{"id": "S1", "title": "1 Intro", "level": 2}]
     assert parsed["sections"][0]["section_id"] == "S1"
@@ -472,3 +475,45 @@ def test_parse_without_id_generates_arc_id(tmp_path):
     parsed = parse_source_input(html_path=html_path)
 
     assert re.fullmatch(r"arc-\d{8}", parsed["paper_id"])
+
+
+def test_parse_markdown_records_sections_equations_and_line_anchors(tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\n\nBefore the equation.\n$$\nE = m c^2\n$$\nAfter the equation.\n\n## Details\nText.\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_source_input(source_path=markdown_path, source_id="notes")
+
+    assert parsed["parser_version"] == 14
+    assert parsed["toc"] == [
+        {"id": "sec_0001", "title": "Notes", "level": 1},
+        {"id": "sec_0002", "title": "Details", "level": 2},
+    ]
+    assert parsed["sections"][0]["markdown_line_start"] == 1
+    assert parsed["sections"][0]["markdown_line_end"] == 8
+    assert parsed["equations"][0]["equation"] == "E = m c^2"
+    assert parsed["equations"][0]["markdown_line_start"] == 4
+    assert parsed["equations"][0]["markdown_line_end"] == 6
+    assert parsed["equations"][0]["before"] == "Before the equation."
+    assert parsed["equations"][0]["after"] == "After the equation."
+
+
+def test_parse_markdown_pdf_uses_combined_hash_and_pdf_mapping(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.markdown"
+    markdown_path.write_text("# Dynamics\nBefore text.\n$$ H^2 = 8 pi G rho / 3 $$\nAfter text.\n", encoding="utf-8")
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        "arc_paper.parse.source.extract_pdf_pages",
+        lambda path: ["Dynamics\nBefore text.\nH^2 = 8 pi G rho / 3 (1.2)\nAfter text."],
+    )
+
+    parsed = parse_source_input(source_path=markdown_path, pdf_path=pdf_path, source_id="notes")
+
+    assert parsed["source_hash"] != parse_source_input(source_path=markdown_path, source_id="notes")["source_hash"]
+    assert parsed["equations"][0]["pdf_page"] == 1
+    assert parsed["equations"][0]["printed_equation_number"] == "1.2"
+    assert parsed["sections"][0]["pdf_page_start"] == 1
+    assert parsed["sections"][0]["pdf_page_end"] == 1

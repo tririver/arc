@@ -22,6 +22,7 @@ def _make_fake_repo(tmp_path: Path, label: str) -> Path:
         ("arc-paper", "arc_paper"),
         ("arc-domain", "arc_domain"),
         ("arc-typeset", "arc_typeset"),
+        ("arc-companion", "arc_companion"),
         ("arc-mcp", "arc_mcp"),
     ):
         module_dir = root / "packages" / package / "src" / module

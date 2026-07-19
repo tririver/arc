@@ -232,6 +232,37 @@ def test_cli_parse_dispatches_tex_pdf(monkeypatch, capsys):
     assert output["data"] == {"paper_id": "lecture-9", "tex_path": "note.tex", "pdf_path": "book.pdf"}
 
 
+@pytest.mark.parametrize("option", ["--markdown", "--md"])
+def test_cli_parse_dispatches_markdown_aliases(monkeypatch, capsys, option):
+    def parse_source(source_path=None, **kwargs):
+        return {
+            "ok": True,
+            "data": {"paper_id": kwargs["source_id"], "markdown_path": str(kwargs["markdown_path"])},
+            "errors": [],
+            "meta": {},
+        }
+
+    monkeypatch.setattr(cli.service, "parse_source", parse_source)
+
+    assert cli.main(["parse", option, "note.md", "--id", "notes", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"] == {
+        "paper_id": "notes",
+        "markdown_path": "note.md",
+    }
+
+
+def test_cli_parse_accepts_markdown_pdf_source(monkeypatch, capsys):
+    def parse_source(source_path=None, **kwargs):
+        return {"ok": True, "data": kwargs, "errors": [], "meta": {}}
+
+    monkeypatch.setattr(cli.service, "parse_source", parse_source)
+
+    assert cli.main(["parse", "--source", "markdown-pdf", "note.md", "--pdf", "note.pdf", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["source"] == "markdown-pdf"
+    assert output["data"]["pdf_path"] == "note.pdf"
+
+
 def test_cli_prints_parse_warnings_to_stderr(monkeypatch, capsys):
     def parse_source(
         source_path=None,

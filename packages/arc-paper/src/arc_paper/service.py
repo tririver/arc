@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -18,7 +19,10 @@ from .cache import (
     now_iso,
     parsed_source_annotations_cache_path,
     parsed_source_cache_path,
+    parsed_source_lock,
+    read_paper_alias,
     read_json,
+    rich_document_cache_path,
     text_query_cache_path,
     write_json,
 )
@@ -28,11 +32,13 @@ from .ids import normalize_paper_id
 from .ids import paper_ids_safe_dir_name as _paper_ids_safe_dir_name
 from .parse.ar5iv_html import get_section as parsed_get_section
 from .parse.equations import find_equation_context
+from .parse.document import DOCUMENT_SCHEMA_VERSION
 from .parse.source import PARSER_VERSION as SOURCE_PARSER_VERSION
 from .parse.source import parse_source_input
 from .parse.source import parse_source_input_with_warnings
 from .parse.source import source_input_hash
-from .providers import Ar5ivProvider, InspireProvider
+from .providers import Ar5ivProvider, ArxivSourceProvider, InspireProvider
+from .providers.ar5iv import ar5iv_url
 from .providers.base import ProviderError
 from .reference_inference import ReferenceInferenceError, infer_main_references
 from .results import err, ok
@@ -46,7 +52,10 @@ from .summary.store import read_latest_summary, read_summary, store_summary
 
 _inspire = InspireProvider()
 _ar5iv = Ar5ivProvider()
+_arxiv_source = ArxivSourceProvider()
 ProgressCallback = Callable[[dict[str, Any]], None]
+LEGACY_PARSED_SOURCE_KEYS = ("paper_id", "parser_version", "source_hash", "toc", "sections", "equations")
+RICH_PARSER_VERSION = 1
 
 
 def extract_paper_ids(text: str) -> dict[str, Any]:
@@ -59,6 +68,51 @@ def paper_ids_safe_dir_name(ids: str | Iterable[str]) -> dict[str, Any]:
     if not values:
         return err("paper_ids_required", "At least one paper id is required.")
     return ok(_paper_ids_safe_dir_name(values), provider="local")
+
+
+def cache_arxiv_source(
+    paper_id: str,
+    *,
+    version: int,
+    refresh: bool = False,
+    license_url: str = "",
+) -> dict[str, Any]:
+    normalized = normalize_paper_id(paper_id)
+    if not arxiv_path_id(normalized):
+        return err("not_arxiv_id", f"arXiv source requires an arXiv ID: {paper_id}")
+    try:
+        with parsed_source_lock(normalized, namespace=f"arxiv-source-v{version}"):
+            manifest = _arxiv_source.cache_source(
+                normalized,
+                version=version,
+                refresh=refresh,
+                license_url=license_url,
+            )
+        return ok(manifest, provider="arxiv-source", cache="write" if refresh else "hit-or-write")
+    except ProviderError as exc:
+        return err(exc.code, exc.message)
+    except ValueError as exc:
+        return err("arxiv_source_invalid", str(exc))
+    except Exception as exc:
+        return err("arxiv_source_cache_failed", str(exc))
+
+
+def probe_arxiv_source(paper_id: str, *, version: int) -> dict[str, Any]:
+    normalized = normalize_paper_id(paper_id)
+    if not arxiv_path_id(normalized):
+        return err("not_arxiv_id", f"arXiv source requires an arXiv ID: {paper_id}")
+    try:
+        manifest = _arxiv_source.probe_source(normalized, version=version)
+        if manifest is None:
+            return err(
+                "arxiv_source_not_cached",
+                f"No cached source found for {normalized}v{version}; run source-cache explicitly.",
+            )
+        return ok(manifest, provider="local-cache", cache="hit")
+    except ValueError as exc:
+        return err("arxiv_source_invalid", str(exc))
+    except Exception as exc:
+        return err("arxiv_source_probe_failed", str(exc))
 
 
 def llm_infer_main_references(
@@ -252,51 +306,116 @@ def parse_source(
     paper_id: str | None = None,
     html_path: str | Path | None = None,
     tex_path: str | Path | None = None,
+    markdown_path: str | Path | None = None,
     pdf_path: str | Path | None = None,
     refresh: bool = False,
+    include_document: bool = False,
+    recache: bool = False,
 ) -> dict[str, Any]:
     try:
+        if refresh and recache:
+            raise ValueError("--refresh and --recache are mutually exclusive")
         warnings: list[dict[str, Any]] = []
         resolved_id = _parse_source_id(source_id=source_id, paper_id=paper_id)
         if source == "ar5iv" or paper_id:
             if source not in {"auto", "ar5iv"}:
                 raise ValueError("--paper-id only supports source=auto or source=ar5iv")
-            parsed = _parse_ar5iv_source(resolved_id, refresh=refresh)
+            cache_id = _parsed_source_lookup_id(str(resolved_id or ""))
+            if not cache_id:
+                raise ValueError("ar5iv parsing requires paper_id")
+            with parsed_source_lock(cache_id, namespace=f"light-v{SOURCE_PARSER_VERSION}"):
+                path = parsed_source_cache_path(cache_id)
+                cached = read_json(path) if not refresh and not recache else None
+                if _is_current_light_cache(cached, cache_id):
+                    if not include_document:
+                        return ok(
+                            _parsed_source_view(cached, include_document=False),
+                            provider="local-cache",
+                            cache="hit",
+                            cache_path=str(path),
+                        )
+                    document = _read_rich_document(cached)
+                    if document is not None:
+                        return ok(
+                            _parsed_source_with_document(cached, document),
+                            provider="local-cache",
+                            cache="hit",
+                            cache_path=str(path),
+                            rich_cache_path=str(_rich_cache_path(cached)),
+                        )
+                parsed = _parse_ar5iv_source(
+                    resolved_id,
+                    refresh=refresh,
+                    include_document=include_document,
+                )
+                if (
+                    _is_current_light_cache(cached, cache_id)
+                    and not recache
+                    and cached.get("source_hash") == parsed.get("source_hash")
+                ):
+                    path = parsed_source_cache_path(cache_id)
+                    rich_path = _write_rich_cache(parsed) if include_document else None
+                else:
+                    path, rich_path = _write_parsed_caches(parsed, include_document=include_document)
         else:
             _validate_local_source(
                 source,
                 source_path=source_path,
                 html_path=html_path,
                 tex_path=tex_path,
+                markdown_path=markdown_path,
                 pdf_path=pdf_path,
             )
-            if not refresh and resolved_id:
-                current_hash = source_input_hash(
-                    source_path=source_path,
-                    html_path=html_path,
-                    tex_path=tex_path,
-                    pdf_path=pdf_path,
-                )
-                path = parsed_source_cache_path(resolved_id)
-                cached = read_json(path)
-                if (
-                    isinstance(cached, dict)
-                    and cached.get("paper_id") == resolved_id
-                    and cached.get("parser_version") == SOURCE_PARSER_VERSION
-                    and cached.get("source_hash") == current_hash
-                ):
-                    return ok(cached, provider="local-cache", cache="hit", cache_path=str(path))
-            parsed, warnings = _parse_local_source(
-                source=source,
+            current_hash = source_input_hash(
                 source_path=source_path,
-                source_id=resolved_id,
                 html_path=html_path,
                 tex_path=tex_path,
+                markdown_path=markdown_path,
                 pdf_path=pdf_path,
             )
-        path = parsed_source_cache_path(str(parsed["paper_id"]))
-        write_json(path, parsed)
-        return ok(parsed, provider="local-cache", cache="write", cache_path=str(path), warnings=warnings or None)
+            lock_id = str(resolved_id or current_hash)
+            with parsed_source_lock(lock_id, namespace=f"light-v{SOURCE_PARSER_VERSION}"):
+                path = parsed_source_cache_path(resolved_id) if resolved_id else None
+                cached = read_json(path) if path is not None and not refresh and not recache else None
+                if (
+                    _is_current_light_cache(cached, resolved_id)
+                    and cached.get("source_hash") == current_hash
+                ):
+                    if not include_document:
+                        return ok(
+                            _parsed_source_view(cached, include_document=False),
+                            provider="local-cache",
+                            cache="hit",
+                            cache_path=str(path),
+                        )
+                    document = _read_rich_document(cached)
+                    if document is not None:
+                        return ok(
+                            _parsed_source_with_document(cached, document),
+                            provider="local-cache",
+                            cache="hit",
+                            cache_path=str(path),
+                            rich_cache_path=str(_rich_cache_path(cached)),
+                        )
+                parsed, warnings = _parse_local_source(
+                    source=source,
+                    source_path=source_path,
+                    source_id=resolved_id,
+                    html_path=html_path,
+                    tex_path=tex_path,
+                    markdown_path=markdown_path,
+                    pdf_path=pdf_path,
+                    include_document=include_document,
+                )
+                path, rich_path = _write_parsed_caches(parsed, include_document=include_document)
+        return ok(
+            _parsed_source_view(parsed, include_document=include_document),
+            provider="local-cache",
+            cache="write",
+            cache_path=str(path),
+            rich_cache_path=str(rich_path) if rich_path is not None else None,
+            warnings=warnings or None,
+        )
     except FileNotFoundError as exc:
         return err("parse_source_not_found", str(exc))
     except ValueError as exc:
@@ -307,11 +426,35 @@ def parse_source(
         return err("parse_source_failed", str(exc))
 
 
-def get_parsed_source(source_id: str) -> dict[str, Any]:
+def get_parsed_source(source_id: str, *, include_document: bool = False) -> dict[str, Any]:
+    lookup_id = _parsed_source_lookup_id(source_id)
     parsed = _read_parsed_source(source_id)
     if parsed is None:
         return err("parsed_source_not_found", f"No parsed source found for {source_id}")
-    return ok(parsed, provider="local-cache", cache="hit", cache_path=str(parsed_source_cache_path(source_id)))
+    rich_path: Path | None = None
+    if include_document:
+        document = _read_rich_document(parsed)
+        if document is not None:
+            parsed = _parsed_source_with_document(parsed, document)
+            rich_path = _rich_cache_path(parsed)
+        elif arxiv_path_id(lookup_id):
+            try:
+                parsed = _parsed(lookup_id, refresh=False, require_document=True)
+                rich_path = _rich_cache_path(parsed)
+            except (ProviderError, ValueError, OSError) as exc:
+                return err("parsed_source_upgrade_failed", str(exc))
+        else:
+            return err(
+                "parsed_source_document_not_found",
+                f"No complete parsed document found for {source_id}; recache an HTML source first.",
+            )
+    return ok(
+        _parsed_source_view(parsed, include_document=include_document),
+        provider="local-cache",
+        cache="hit",
+        cache_path=str(parsed_source_cache_path(lookup_id)),
+        rich_cache_path=str(rich_path) if rich_path is not None else None,
+    )
 
 
 def get_parsed_source_toc(source_id: str) -> dict[str, Any]:
@@ -374,11 +517,13 @@ def mark_parsed_equation(
     parsed = _read_parsed_source(source_id)
     if parsed is None:
         return err("parsed_source_not_found", f"No parsed source found for {source_id}")
-    if _find_parsed_equation(parsed, equation_id) is None:
+    equation = _find_parsed_equation(parsed, equation_id)
+    if equation is None:
         return err("parsed_source_equation_not_found", f"No equation {equation_id} found in {source_id}")
 
-    path = parsed_source_annotations_cache_path(source_id)
-    sidecar = _read_parsed_source_annotations(source_id)
+    annotation_source_id = _parsed_source_lookup_id(source_id)
+    path = parsed_source_annotations_cache_path(annotation_source_id)
+    sidecar = _read_parsed_source_annotations(annotation_source_id)
     annotations = [
         annotation
         for annotation in sidecar.get("annotations", [])
@@ -391,12 +536,14 @@ def mark_parsed_equation(
     existing = _annotation_for_target(sidecar.get("annotations", []), equation_id)
     now = now_iso()
     annotation = {
-        "source_id": source_id,
+        "source_id": annotation_source_id,
         "target_kind": "equation",
         "target_id": equation_id,
         "status": status,
         "reason": reason,
         "source_hash": str(parsed.get("source_hash") or ""),
+        "parser_version": int(parsed.get("parser_version") or 0),
+        "equation_fingerprint": _equation_fingerprint(equation),
         "created_at": str(existing.get("created_at") or now) if existing else now,
         "updated_at": now,
     }
@@ -405,7 +552,7 @@ def mark_parsed_equation(
         path,
         {
             "schema_version": "arc.parsed_source.annotations.v1",
-            "source_id": source_id,
+            "source_id": annotation_source_id,
             "annotations": annotations,
         },
     )
@@ -431,7 +578,7 @@ def search_parsed_source(
 
 
 def _read_parsed_source(source_id: str) -> dict[str, Any] | None:
-    parsed = read_json(parsed_source_cache_path(source_id))
+    parsed = read_json(parsed_source_cache_path(_parsed_source_lookup_id(source_id)))
     return parsed if isinstance(parsed, dict) else None
 
 
@@ -469,7 +616,7 @@ def _annotation_for_target(annotations: list[Any], equation_id: str) -> dict[str
 
 def _current_equation_annotations(source_id: str, parsed: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     source_hash = str(parsed.get("source_hash") or "")
-    sidecar = _read_parsed_source_annotations(source_id)
+    sidecar = _read_parsed_source_annotations(_parsed_source_lookup_id(source_id))
     current: dict[str, list[dict[str, Any]]] = {}
     for annotation in sidecar.get("annotations", []):
         if annotation.get("target_kind") != "equation":
@@ -479,8 +626,32 @@ def _current_equation_annotations(source_id: str, parsed: dict[str, Any]) -> dic
         target_id = str(annotation.get("target_id") or "")
         if not target_id:
             continue
+        equation = _find_parsed_equation(parsed, target_id)
+        if equation is None:
+            continue
+        if int(annotation.get("parser_version") or 0) != int(parsed.get("parser_version") or 0):
+            continue
+        if str(annotation.get("equation_fingerprint") or "") != _equation_fingerprint(equation):
+            continue
         current.setdefault(target_id, []).append(dict(annotation))
     return current
+
+
+def _equation_fingerprint(equation: dict[str, Any]) -> str:
+    material = "\n".join(
+        str(equation.get(key) or "")
+        for key in (
+            "id",
+            "equation",
+            "before",
+            "after",
+            "section_id",
+            "section_title",
+            "tex_label",
+            "printed_equation_number",
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _with_equation_annotations(equation: dict[str, Any], annotations: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -994,15 +1165,26 @@ def _parse_local_source(
     source_id: str | None,
     html_path: str | Path | None,
     tex_path: str | Path | None,
+    markdown_path: str | Path | None,
     pdf_path: str | Path | None,
+    include_document: bool,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    _validate_local_source(source, source_path=source_path, html_path=html_path, tex_path=tex_path, pdf_path=pdf_path)
+    _validate_local_source(
+        source,
+        source_path=source_path,
+        html_path=html_path,
+        tex_path=tex_path,
+        markdown_path=markdown_path,
+        pdf_path=pdf_path,
+    )
     return parse_source_input_with_warnings(
         source_path=source_path,
         source_id=source_id,
         html_path=html_path,
         tex_path=tex_path,
+        markdown_path=markdown_path,
         pdf_path=pdf_path,
+        include_document=include_document,
     )
 
 
@@ -1012,48 +1194,183 @@ def _validate_local_source(
     source_path: str | Path | None,
     html_path: str | Path | None,
     tex_path: str | Path | None,
+    markdown_path: str | Path | None,
     pdf_path: str | Path | None,
 ) -> None:
-    if source not in {"auto", "html", "tex", "pdf", "tex-pdf"}:
+    if source not in {"auto", "html", "tex", "markdown", "pdf", "tex-pdf", "markdown-pdf"}:
         raise ValueError(f"Unsupported parse source: {source}")
     if source == "auto":
         return
     source_suffix = Path(source_path).suffix.lower() if source_path else ""
     has_html = bool(html_path) or source_suffix in {".html", ".htm"}
     has_tex = bool(tex_path) or source_suffix == ".tex"
+    has_markdown = bool(markdown_path) or source_suffix in {".md", ".markdown"}
     has_pdf = bool(pdf_path) or source_suffix == ".pdf"
     if source == "html":
-        if not has_html or has_tex or has_pdf:
+        if not has_html or has_tex or has_markdown or has_pdf:
             raise ValueError("source=html requires HTML input only")
     elif source == "tex":
-        if not has_tex or has_html or has_pdf:
+        if not has_tex or has_html or has_markdown or has_pdf:
             raise ValueError("source=tex requires TeX input only; use source=tex-pdf with --pdf")
+    elif source == "markdown":
+        if not has_markdown or has_html or has_tex or has_pdf:
+            raise ValueError("source=markdown requires Markdown input only; use source=markdown-pdf with --pdf")
     elif source == "pdf":
-        if not has_pdf or has_html or has_tex:
+        if not has_pdf or has_html or has_tex or has_markdown:
             raise ValueError("source=pdf requires PDF input only")
     elif source == "tex-pdf":
-        if not has_tex or not pdf_path or has_html or source_suffix == ".pdf":
+        if not has_tex or not pdf_path or has_html or has_markdown or source_suffix == ".pdf":
             raise ValueError("source=tex-pdf requires TeX input plus --pdf")
+    elif source == "markdown-pdf":
+        if not has_markdown or not pdf_path or has_html or has_tex or source_suffix == ".pdf":
+            raise ValueError("source=markdown-pdf requires Markdown input plus --pdf")
 
 
-def _parse_ar5iv_source(paper_id: str | None, *, refresh: bool) -> dict[str, Any]:
+def _parse_ar5iv_source(
+    paper_id: str | None,
+    *,
+    refresh: bool,
+    include_document: bool = False,
+) -> dict[str, Any]:
     if not paper_id:
         raise ValueError("ar5iv parsing requires paper_id")
     full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
     html = _ar5iv.get_html(full_text_id, refresh=refresh)
-    return parse_source_input(html_text=html, source_id=normalize_paper_id(full_text_id))
+    assets: list[dict[str, Any]] = []
+    if include_document:
+        cache_assets = getattr(_ar5iv, "cache_assets", None)
+        if callable(cache_assets):
+            assets = cache_assets(full_text_id, html, refresh=refresh)
+    normalized = normalize_paper_id(full_text_id)
+    return parse_source_input(
+        html_text=html,
+        source_id=normalized,
+        include_document=include_document,
+        source_url=ar5iv_url(normalized),
+        assets=assets,
+    )
 
 
-def _parsed(paper_id: str, *, refresh: bool) -> dict[str, Any]:
+def _parsed(paper_id: str, *, refresh: bool, require_document: bool = False) -> dict[str, Any]:
     full_text_id = _full_text_paper_id(paper_id, refresh=refresh)
     normalized = normalize_paper_id(full_text_id)
-    path = parsed_source_cache_path(normalized)
-    if not refresh and (cached := read_json(path)):
-        if cached.get("parser_version") == SOURCE_PARSER_VERSION:
-            return cached
-    parsed = _parse_ar5iv_source(normalized, refresh=refresh)
-    write_json(path, parsed)
-    return parsed
+    with parsed_source_lock(normalized, namespace=f"light-v{SOURCE_PARSER_VERSION}"):
+        path = parsed_source_cache_path(normalized)
+        cached = read_json(path) if not refresh else None
+        if _is_current_light_cache(cached, normalized):
+            if not require_document:
+                return cached
+            document = _read_rich_document(cached)
+            if document is not None:
+                return _parsed_source_with_document(cached, document)
+        parsed = _parse_ar5iv_source(
+            normalized,
+            refresh=refresh,
+            include_document=require_document,
+        )
+        _write_parsed_caches(parsed, include_document=require_document)
+        return parsed
+
+
+def _is_current_light_cache(cached: Any, paper_id: str | None) -> bool:
+    return bool(
+        isinstance(cached, dict)
+        and cached.get("paper_id") == paper_id
+        and cached.get("parser_version") == SOURCE_PARSER_VERSION
+        and cached.get("source_hash")
+    )
+
+
+def _rich_cache_path(parsed: dict[str, Any]) -> Path:
+    return rich_document_cache_path(
+        str(parsed.get("paper_id") or ""),
+        str(parsed.get("source_hash") or ""),
+        RICH_PARSER_VERSION,
+    )
+
+
+def _read_rich_document(parsed: dict[str, Any]) -> dict[str, Any] | None:
+    cached = read_json(_rich_cache_path(parsed))
+    if isinstance(cached, dict):
+        document = cached.get("document")
+        if (
+            cached.get("paper_id") == parsed.get("paper_id")
+            and cached.get("source_hash") == parsed.get("source_hash")
+            and cached.get("rich_parser_version") == RICH_PARSER_VERSION
+            and isinstance(document, dict)
+            and document.get("schema_version") == DOCUMENT_SCHEMA_VERSION
+        ):
+            return document
+    legacy_document = parsed.get("document")
+    if (
+        isinstance(legacy_document, dict)
+        and legacy_document.get("schema_version") == DOCUMENT_SCHEMA_VERSION
+    ):
+        write_json(
+            _rich_cache_path(parsed),
+            {
+                "paper_id": parsed.get("paper_id"),
+                "source_hash": parsed.get("source_hash"),
+                "rich_parser_version": RICH_PARSER_VERSION,
+                "document": legacy_document,
+            },
+        )
+        return legacy_document
+    return None
+
+
+def _write_parsed_caches(
+    parsed: dict[str, Any],
+    *,
+    include_document: bool,
+) -> tuple[Path, Path | None]:
+    paper_id = str(parsed["paper_id"])
+    light = {key: parsed.get(key) for key in LEGACY_PARSED_SOURCE_KEYS}
+    light_path = parsed_source_cache_path(paper_id)
+    write_json(light_path, light)
+    rich_path: Path | None = None
+    document = parsed.get("document")
+    if include_document and isinstance(document, dict):
+        rich_path = _write_rich_cache(parsed)
+    return light_path, rich_path
+
+
+def _write_rich_cache(parsed: dict[str, Any]) -> Path:
+    path = _rich_cache_path(parsed)
+    write_json(
+        path,
+        {
+            "paper_id": parsed.get("paper_id"),
+            "source_hash": parsed.get("source_hash"),
+            "rich_parser_version": RICH_PARSER_VERSION,
+            "document": parsed["document"],
+        },
+    )
+    return path
+
+
+def _parsed_source_with_document(parsed: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
+    return {**_parsed_source_view(parsed, include_document=False), "document": document}
+
+
+def _parsed_source_view(parsed: dict[str, Any], *, include_document: bool) -> dict[str, Any]:
+    if include_document:
+        document = parsed.get("document")
+        if isinstance(document, dict):
+            return _parsed_source_with_document(parsed, document)
+    return {key: parsed.get(key) for key in LEGACY_PARSED_SOURCE_KEYS}
+
+
+def _parsed_source_lookup_id(source_id: str) -> str:
+    current = normalize_paper_id(source_id)
+    seen: set[str] = set()
+    while current and current not in seen:
+        seen.add(current)
+        alias = normalize_paper_id(read_paper_alias(current))
+        if not alias:
+            return current
+        current = alias
+    return current or normalize_paper_id(source_id)
 
 
 def _full_text_search_files(

@@ -6,7 +6,7 @@ from typing import Any
 from bs4 import BeautifulSoup, Tag
 
 
-EQUATION_SELECTORS = "table.ltx_equation, div.ltx_equation, span.ltx_equation, math"
+EQUATION_SELECTORS = "table.ltx_equation, div.ltx_equation, span.ltx_equation, table.ltx_equationgroup tr.ltx_equation, math"
 
 
 def extract_equation_contexts(html_or_soup: str | BeautifulSoup, *, window_paragraphs: int = 1) -> list[dict[str, Any]]:
@@ -17,17 +17,42 @@ def extract_equation_contexts(html_or_soup: str | BeautifulSoup, *, window_parag
             continue
         text = element.get_text(" ", strip=True)
         section_id, section_title = _section_info(element)
-        contexts.append(
-            {
-                "id": str(element.get("id") or ""),
-                "equation": text,
-                "before": "\n\n".join(_previous_paragraphs(element, window_paragraphs)),
-                "after": "\n\n".join(_next_paragraphs(element, window_paragraphs)),
-                "section_id": section_id,
-                "section_title": section_title,
-            }
-        )
+        group = element.find_parent("table", class_="ltx_equationgroup")
+        group_rows = group.select("tr.ltx_equation") if isinstance(group, Tag) else []
+        row_index = group_rows.index(element) if element in group_rows else -1
+        context = {
+            "id": _equation_id(element, group=group, row_index=row_index),
+            "equation": text,
+            "before": "\n\n".join(_previous_paragraphs(element, window_paragraphs)),
+            "after": "\n\n".join(_next_paragraphs(element, window_paragraphs)),
+            "section_id": section_id,
+            "section_title": section_title,
+        }
+        if isinstance(group, Tag):
+            context.update(
+                {
+                    "group_id": str(group.get("id") or ""),
+                    "group_row": row_index + 1,
+                    "group_row_count": len(group_rows),
+                }
+            )
+        contexts.append(context)
     return contexts
+
+
+def _equation_id(element: Tag, *, group: Tag | None, row_index: int) -> str:
+    if element.get("id"):
+        return str(element["id"])
+    tbody = element.find_parent("tbody")
+    if isinstance(tbody, Tag) and tbody.get("id"):
+        rows = tbody.find_all("tr", class_="ltx_equation", recursive=False)
+        if len(rows) == 1:
+            return str(tbody["id"])
+    if isinstance(group, Tag) and group.get("id") and row_index >= 0:
+        return f"{group['id']}.row-{row_index + 1}"
+    if isinstance(tbody, Tag) and tbody.get("id") and row_index >= 0:
+        return f"{tbody['id']}.row-{row_index + 1}"
+    return ""
 
 
 def find_equation_context(equations: Iterable[dict[str, Any]], query: str) -> list[dict[str, Any]]:

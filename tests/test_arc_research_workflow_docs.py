@@ -32,10 +32,11 @@ def test_arc_skill_routes_check_and_calculation_workflows() -> None:
 
     assert "references/" not in text
     assert "classify" in text.lower()
-    assert "four cases" in text.lower()
+    assert "five cases" in text.lower()
     assert "check.md" in text
     assert "plan.md" in text
     assert "calculate.md" in text
+    assert "companion.md" in text
     assert "foundation.md" not in text
     assert "work-note.md" in text
 

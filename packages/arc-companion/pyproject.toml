@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arc-companion"
+version = "0.9.4"
+description = "Source-faithful, LLM-assisted paper companions for ARC."
+readme = "../../README.md"
+license = "MIT"
+authors = [{ name = "ARC" }]
+requires-python = ">=3.11"
+dependencies = [
+  "arc-domain>=0.9,<0.10",
+  "arc-llm>=0.9,<0.10",
+  "arc-paper>=0.9,<0.10",
+  "beautifulsoup4>=4.12",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+
+[project.urls]
+Homepage = "https://github.com/tririver/arc"
+Repository = "https://github.com/tririver/arc"
+Issues = "https://github.com/tririver/arc/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+arc-companion = "arc_companion.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arc_companion"]

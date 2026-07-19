@@ -342,6 +342,35 @@ def test_parse_source_tex_pdf_requires_tex_and_pdf(monkeypatch, tmp_path):
     assert result["error"]["code"] == "parse_source_invalid"
 
 
+def test_parse_source_markdown_writes_and_reuses_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\n\n$$ x = y $$\n", encoding="utf-8")
+
+    first = service.parse_source(markdown_path=markdown_path, source_id="markdown-notes")
+    second = service.parse_source(markdown_path=markdown_path, source_id="markdown-notes")
+
+    assert first["ok"] is True
+    assert first["meta"]["cache"] == "write"
+    assert first["data"]["sections"][0]["markdown_line_start"] == 1
+    assert first["data"]["equations"][0]["markdown_line_start"] == 3
+    assert second["ok"] is True
+    assert second["meta"]["cache"] == "hit"
+
+
+def test_parse_source_markdown_pdf_requires_both_inputs(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text("# Notes\n", encoding="utf-8")
+
+    result = service.parse_source(
+        source="markdown-pdf", markdown_path=markdown_path, source_id="missing-pdf"
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "parse_source_invalid"
+
+
 def test_parse_source_tex_rejects_pdf_companion(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     tex_path = tmp_path / "note.tex"

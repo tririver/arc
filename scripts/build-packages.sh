@@ -8,4 +8,5 @@ python -m build --outdir dist packages/arc-llm
 python -m build --outdir dist packages/arc-paper
 python -m build --outdir dist packages/arc-domain
 python -m build --outdir dist packages/arc-typeset
+python -m build --outdir dist packages/arc-companion
 python -m build --outdir dist packages/arc-mcp

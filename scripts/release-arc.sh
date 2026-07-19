@@ -65,7 +65,9 @@ version_paths=(
   "packages/arc-paper/pyproject.toml"
   "packages/arc-domain/pyproject.toml"
   "packages/arc-typeset/pyproject.toml"
+  "packages/arc-companion/pyproject.toml"
   "packages/arc-mcp/pyproject.toml"
+  "packages/arc-companion/src/arc_companion/__init__.py"
   "packages/arc-paper/src/arc_paper/__init__.py"
   "packages/arc-mcp/src/arc_mcp/__init__.py"
   "packages/arc-paper/tests/test_import.py"
@@ -201,7 +203,7 @@ version = sys.argv[1]
 internal_range = sys.argv[2]
 paths = [Path(item) for item in sys.argv[3:]]
 
-internal_dep_re = re.compile(r"(arc-(?:llm|paper|domain|typeset|mcp))>=\d+\.\d+,<\d+\.\d+")
+internal_dep_re = re.compile(r"(arc-(?:llm|paper|domain|typeset|companion|mcp))>=\d+\.\d+,<\d+\.\d+")
 
 
 def replace_once(path: Path, pattern: str, replacement: str) -> None:
@@ -258,7 +260,7 @@ from pathlib import Path
 version = sys.argv[1]
 internal_range = sys.argv[2]
 root = Path(sys.argv[3])
-packages = ["arc-llm", "arc-paper", "arc-domain", "arc-typeset", "arc-mcp"]
+packages = ["arc-llm", "arc-paper", "arc-domain", "arc-typeset", "arc-companion", "arc-mcp"]
 
 for manifest in [
     root / "plugins/arc/.codex-plugin/plugin.json",

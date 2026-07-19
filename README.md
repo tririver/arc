@@ -2,7 +2,7 @@
 
 Agent Research Copilot (ARC) is an angentic research toolkit for theoretical physics knowledge domain construction, idea generation and calculation workflows. It works as a plugin of coding agents such as Codex / Claude Code, with the strength of bringing coding agents into a research context, and generating publication-level ideas in theoretical research.
 
-ARC has a set of workflow skills built around five Python command line tools; `arc-mcp` also runs the optional MCP server:
+ARC has a set of workflow skills built around six Python command line tools; `arc-mcp` also runs the optional MCP server:
 
 - `arc-paper`: paper metadata, references, citers, ar5iv sections, equation
   context, full-text search, LLM paper summaries, and paper-summary batches.
@@ -12,6 +12,8 @@ ARC has a set of workflow skills built around five Python command line tools; `a
   proposers-reviewer workflows.
 - `arc-typeset`: deterministic typesetting utilities, including Markdown to PDF
   conversion through Pandoc and XeLaTeX.
+- `arc-companion`: builds a source-faithful original/translation/commentary PDF
+  from INSPIRE/ar5iv papers with a unified glossary and deterministic LaTeX.
 - `arc-mcp`: exposes ARC tools to MCP clients and manages background jobs.
 - `plugins/arc/skills/arc`: agent-facing workflow instructions for domain
   building, idea generation, and research calculations.
@@ -22,6 +24,9 @@ Use ARC when you want to:
 
 - Look up reliable paper metadata, references, citers, sections, or equations.
 - Summarize a paper from cached ar5iv/INSPIRE data.
+- Generate a Chinese-by-default companion-reading PDF with a glossary and an
+  original, translation, companion sequence while retaining the paper's
+  equations, equation numbers, figures, tables, and bibliography.
 - Build a research-domain overview from a seed paper.
 - Generate ideas using domain context and reviewer scoring.
 - Plan and execute a careful symbolic or numerical research calculation with
@@ -70,6 +75,8 @@ https://chinaxiv.org/abs/202606.00234
   prompt handoff.
 - Optional for `arc-typeset md2pdf`: `pandoc`, `xelatex`, and a CJK-capable
   font such as `Noto Sans CJK SC`.
+- For `arc-companion build`: `latexmk`, `xelatex`, Poppler command-line tools,
+  and fonts covering the source and annotation languages.
 
 ### Agent Plugin Setup
 
@@ -101,7 +108,7 @@ On first MCP or CLI use, the launcher installs ARC into a cache-local runtime
 and reuses it for later MCP calls and plugin CLI shims. After `install.ok`
 exists, the launcher directly execs the cached runtime command; later MCP starts
 do not need `uv`, `pip`, or other installer tools. The plugin exposes
-`arc-paper`, `arc-domain`, `arc-llm`, `arc-typeset`, and `arc-mcp` from
+`arc-paper`, `arc-domain`, `arc-llm`, `arc-typeset`, `arc-companion`, and `arc-mcp` from
 `plugins/arc/bin/`; the Python packages are installed inside the private
 runtime, so `pip show arc-paper` in the host shell is not expected to find them.
 First install uses `uv` when available and falls back to `python3 -m venv` plus
@@ -183,6 +190,7 @@ python -m pip install -e packages/arc-llm[test]
 python -m pip install -e packages/arc-paper[test]
 python -m pip install -e packages/arc-domain[test]
 python -m pip install -e packages/arc-typeset[test]
+python -m pip install -e packages/arc-companion[test]
 python -m pip install -e packages/arc-mcp[test]
 ```
 
@@ -193,6 +201,7 @@ arc-paper --help
 arc-domain --help
 arc-llm --help
 arc-typeset --help
+arc-companion --help
 arc-mcp --help
 ```
 
@@ -222,6 +231,41 @@ the same folder and `<name>.zh_CN.pdf` is missing:
 ```bash
 arc-typeset batch-translate <project-dir> --json
 ```
+
+Build or resume a companion-reading PDF. If `--annotation-language` is omitted,
+ARC prints a language-switch notice and continues in Chinese:
+
+```bash
+arc-companion build arXiv:0911.3380 --project-dir ./0911.3380-companion --json
+arc-companion validate --project-dir ./0911.3380-companion --json
+```
+
+Companion generation starts medium semantic segmentation and medium-tier full-
+paper glossary construction concurrently, then starts low-tier translation and
+high-tier commentary in independent parallel waves. The default is 24
+translations plus 24 commentaries at once, followed by a high-tier
+whole-document review. Each lane drains submitted work and retains successful
+checkpoints before reporting aggregated failures, so a retry schedules only
+missing or stale units. Commentary can use bounded,
+targeted reference and citer full text cached through `arc-paper`, with bounded
+per-paper/per-unit selection and verified abstract fallback.
+
+Every translation and commentary call also receives bounded full-paper
+navigation context. Where the host supports it, these calls may use ARC-only
+MCP/cache access and internet lookup; no extra CLI flag is required.
+Translations may consult external sources only for terminology and source
+disambiguation, while external commentary claims require captured provenance.
+If MCP or web access is unavailable, ARC falls back to the segment, glossary,
+paper map, contextual anchors, and evidence already embedded in the portable
+prompt.
+
+Each unit is rendered as original, translation, then companion, using three
+distinct light background colors suitable for printing. The renderer copies
+displayed formulas into translations without their equation numbers and does
+not clone figures, tables, or other floating objects. Personal names remain in
+their Latin-script source form. The default deliverable is one PDF. A
+reproducibility ZIP is generated only through an explicit
+`arc-companion package` request.
 
 The same converter is available from MCP as `md2pdf`.
 The MCP `md2pdf`, `translate`, and `batch_translate` tools always start
@@ -696,6 +740,11 @@ Package boundaries:
   foundation selection, domain paper selection, graph artifacts, evidence
   packs, HTML rendering, and domain summaries. It calls `arc-paper` for
   single-paper work and `arc-llm` for LLM work.
+- `packages/arc-companion` owns companion-specific evidence selection,
+  semantic segmentation, glossary construction, parallel translation and
+  commentary, whole-document review, checkpoints, deterministic LaTeX
+  rendering, and PDF validation. It consumes full-document and asset caches
+  from `arc-paper` and LLM calls from `arc-llm`.
 - `packages/arc-mcp` stays a thin MCP adapter over package service functions
   and background-job management.
 - `plugins/arc/skills/arc`, prompts, schemas, and plugin manifests describe or
@@ -727,6 +776,7 @@ python -m pytest \
   packages/arc-llm/tests \
   packages/arc-paper/tests \
   packages/arc-domain/tests \
+  packages/arc-companion/tests \
   packages/arc-mcp/tests
 ```
 
@@ -737,6 +787,7 @@ python -m pytest \
   packages/arc-llm/tests \
   packages/arc-paper/tests \
   packages/arc-domain/tests \
+  packages/arc-companion/tests \
   packages/arc-mcp/tests \
   tests -q
 ```

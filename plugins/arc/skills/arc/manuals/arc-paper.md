@@ -82,13 +82,16 @@ Step 2: Retry with a valid section id, number, or heading from that `toc`.
 
 ## Parsed Source CLI
 
-For TeX/PDF notes, `arc-paper parse` is the required source-ingestion step.
+For Markdown/TeX/PDF notes, `arc-paper parse` is the required
+source-ingestion step.
 Parsed ARC paper output is the source of truth for sections, equations, line
 anchors, and PDF page anchors.
 
 Parse accessible sources before checking claims:
 
 ```bash
+arc-paper parse --markdown NOTE.md --pdf NOTE.pdf --id NOTE_ID --json
+arc-paper parse --markdown NOTE.md --id NOTE_ID --json
 arc-paper parse --tex NOTE.tex --pdf NOTE.pdf --id NOTE_ID --json
 arc-paper parse --tex NOTE.tex --id NOTE_ID --json
 arc-paper parse --pdf NOTE.pdf --id NOTE_ID --json
@@ -96,10 +99,10 @@ arc-paper parse --html NOTE.html --id NOTE_ID --json
 arc-paper parse --paper-id 0911.3380 --source ar5iv --json
 ```
 
-If a PDF is larger than the TeX source, such as a book containing one TeX
-section, use the TeX+PDF parse command so ARC paper can locate equation numbers
-and pages from nearby prose, equation tokens, and printed number candidates. If
-a PDF cannot be used, rely on warnings returned by `arc-paper parse`.
+When Markdown or TeX was derived from a PDF, use the paired Markdown+PDF or
+TeX+PDF parse command so ARC paper can locate equation numbers and pages from
+nearby prose, equation tokens, and printed number candidates. If a PDF cannot
+be used, rely on warnings returned by `arc-paper parse`.
 
 Read parsed sources through ARC paper commands:
 
@@ -241,6 +244,25 @@ For LLM paper summaries through MCP, use `background=true` for slow or massive
 launches and then follow `manuals/arc-mcp.md`.
 
 ## Cache Notes
+
+Parsed paper access is lightweight by default. It stores the paper ID, source
+hash, TOC, section text, and equation context without building a rich document
+or downloading image assets. Use `arc-paper parse --include-document` only for
+an explicit rich-document consumer such as `arc-companion`; rich sidecars are
+keyed independently by source hash and rich parser version.
+
+arXiv author source is also explicit-only and never participates in normal
+parsing or rendering:
+
+```bash
+arc-paper source-cache 0911.3380 --version 3 --json
+arc-paper source-probe 0911.3380 --version 3 --json
+```
+
+The cache records the fixed version, reported license, archive and file hashes,
+sizes, file manifest, and static main-TeX candidates. Extraction rejects unsafe
+paths, links, special files, and excessive expansion. ARC does not execute the
+author TeX or treat a cached source as permission to publish derivatives.
 
 Discover the active cache path:
 
