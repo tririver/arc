@@ -830,6 +830,148 @@ def test_segment_preflight_allows_controller_owned_link_or_citation_only_blocks(
         )
 
 
+def test_extra_nontranslatable_block_normalizes_then_repairs_tokens_only(tmp_path: Path) -> None:
+    math_run = _inline_run("math", "x", 2, tex="x")
+    blocks = [
+        {"block_id": "p1", "type": "text", "text": "First."},
+        {
+            "block_id": "p2", "type": "text", "text": "Value x.",
+            "inline_runs": [
+                _inline_run("text", "Value ", 1), math_run, _inline_run("text", ".", 3),
+            ],
+        },
+        {"block_id": "S7.E1", "type": "equation", "text": "x"},
+        {"block_id": "p3", "type": "text", "text": "Third."},
+    ]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:0911.3380", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {
+        "segment_id": "seg-0063",
+        "block_ids": ["p1", "p2", "S7.E1", "p3"],
+    }
+    p1 = {"block_id": "p1", "text": "  第一段原译  ", "audit": "preserve"}
+    p3 = {"block_id": "p3", "text": "第三段原译"}
+    raw = {"blocks": [
+        p1,
+        {"block_id": "p2", "text": "坏译文。"},
+        {"block_id": "S7.E1", "text": "x"},
+        p3,
+    ]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    pipeline_module._seed_translation_coverage_draft(
+        segment,
+        bundle=bundle,
+        glossary={"entries": []},
+        protected_names=[],
+        checkpoint_dir=checkpoint_dir,
+        translation=raw,
+    )
+    calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        calls.append(str(kwargs["call_label"]))
+        slot_ids = pipeline_module._translation_repair_slot_ids(blocks[1])
+        return {"repairs": [{"block_id": "p2", "slots": [
+            {"slot_id": slot_ids[0], "text": "坏译文"},
+            {"slot_id": slot_ids[1], "text": "。"},
+        ]}]}
+
+    result = _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=llm,
+    )["seg-0063"]
+
+    assert calls == ["companion-translation-seg-0063-retry-1"]
+    assert result["blocks"][0] == p1
+    assert result["blocks"][2] == p3
+    assert [item["block_id"] for item in result["blocks"]] == ["p1", "p2", "p3"]
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(result["blocks"][1]["text"]) == (
+        pipeline_module._opaque_inline_tokens(blocks[1])
+    )
+    checkpoint = json.loads(next((checkpoint_dir / "translations").glob("*.json")).read_text())
+    assert [item["kind"] for item in checkpoint["generation_provenance"]["repairs"]] == [
+        "coverage-normalization", "token-placement",
+    ]
+    assert not list((checkpoint_dir / "translation-coverage-attempts").glob("*.json"))
+    assert list((checkpoint_dir / "translation-token-attempts").glob("*.json"))
+
+
+def test_token_invalid_draft_resumes_after_interruption_before_attempt(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    math_run = _inline_run("math", "x", 2, tex="x")
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1), math_run, _inline_run("text", ".", 3),
+        ],
+    }
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:0911.3380", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-0063", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    original_write_json = pipeline_module.write_json
+
+    def interrupted_write(path, value):
+        if "translation-token-attempts" in Path(path).parts:
+            raise RuntimeError("simulated interruption before token attempt marker")
+        original_write_json(path, value)
+
+    monkeypatch.setattr(pipeline_module, "write_json", interrupted_write)
+    first_calls: list[str] = []
+
+    def primary_llm(prompt: str, **kwargs):
+        first_calls.append(str(kwargs["call_label"]))
+        return {"blocks": [{"block_id": "body", "text": "缺少令牌。"}]}
+
+    with pytest.raises(CompanionLaneError):
+        _generate_translations(
+            [segment],
+            options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+            bundle=bundle, glossary={"entries": []}, protected_names=[],
+            checkpoint_dir=checkpoint_dir, llm=primary_llm,
+        )
+    assert first_calls == ["companion-translation-seg-0063"]
+    assert list((checkpoint_dir / "translation-drafts").glob("*.json"))
+    assert not list((checkpoint_dir / "translation-token-attempts").glob("*.json"))
+
+    monkeypatch.setattr(pipeline_module, "write_json", original_write_json)
+    resume_calls: list[str] = []
+
+    def repair_llm(prompt: str, **kwargs):
+        resume_calls.append(str(kwargs["call_label"]))
+        slot_ids = pipeline_module._translation_repair_slot_ids(block)
+        return {"repairs": [{"block_id": "body", "slots": [
+            {"slot_id": slot_ids[0], "text": "缺少令牌"},
+            {"slot_id": slot_ids[1], "text": "。"},
+        ]}]}
+
+    result = _generate_translations(
+        [segment],
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1),
+        bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=repair_llm,
+    )
+    assert resume_calls == ["companion-translation-seg-0063-retry-1"]
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(
+        result["seg-0063"]["blocks"][0]["text"]
+    ) == pipeline_module._opaque_inline_tokens(block)
+
+
 def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp_path: Path) -> None:
     blocks = []
     segments = []
@@ -878,6 +1020,9 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
         segment_id = label.removeprefix("companion-translation-").removesuffix("-retry-1")
         block_id_value = f"b{int(segment_id[-4:])}"
         if is_retry:
+            assert pipeline_module._translation_token_attempt_path(
+                checkpoint_dir, segment_id,
+            ).is_file()
             assert "VALIDATION ERROR" in prompt
             assert "opaque_inline_token_mismatch" in prompt
             assert required_tokens[segment_id] not in prompt
@@ -942,30 +1087,36 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
     }
     assert saved_ids == {"seg-0001", "seg-0002"}
 
-    recovery_calls: list[str] = []
-
-    def recovery_llm(prompt: str, **kwargs):
-        label = str(kwargs["call_label"])
-        recovery_calls.append(label)
-        segment_id = label.removeprefix("companion-translation-")
-        block_id_value = f"b{int(segment_id[-4:])}"
-        return {
-            "blocks": [{"block_id": block_id_value, "text": f"译文 {required_tokens[segment_id]}。"}]
-        }
-
-    recovered = _generate_translations(
-        segments,
-        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "project", workers=4),
-        bundle=bundle,
-        glossary={"entries": []},
-        protected_names=[],
-        checkpoint_dir=checkpoint_dir,
-        llm=recovery_llm,
-    )
-    assert list(recovered) == [segment["segment_id"] for segment in segments]
-    assert set(recovery_calls) == {
-        "companion-translation-seg-0003", "companion-translation-seg-0004",
+    attempt_ids = {
+        json.loads(path.read_text(encoding="utf-8"))["segment_id"]
+        for path in (checkpoint_dir / "translation-token-attempts").glob("*.json")
     }
+    assert attempt_ids == {"seg-0002", "seg-0003", "seg-0004"}
+    assert all(
+        json.loads(path.read_text(encoding="utf-8"))["response_schema_version"]
+        == pipeline_module.TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION
+        for path in (checkpoint_dir / "translation-token-attempts").glob("*.json")
+    )
+
+    def forbidden_recovery_llm(prompt: str, **kwargs):
+        raise AssertionError("consumed token repair must not invoke any model")
+
+    with pytest.raises(CompanionLaneError) as exc_info:
+        _generate_translations(
+            segments,
+            options=BuildOptions(
+                paper_id=bundle.paper_id, project_dir=tmp_path / "project", workers=4,
+            ),
+            bundle=bundle,
+            glossary={"entries": []},
+            protected_names=[],
+            checkpoint_dir=checkpoint_dir,
+            llm=forbidden_recovery_llm,
+        )
+    assert {segment_id for segment_id, _ in exc_info.value.failures} == {
+        "seg-0003", "seg-0004",
+    }
+    assert all("attempt already consumed" in str(error) for _, error in exc_info.value.failures)
 
 
 def test_non_token_translation_validation_errors_do_not_retry(tmp_path: Path) -> None:

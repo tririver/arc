@@ -42,6 +42,7 @@ from .prompts import (
     TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
     TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
     TRANSLATION_RETRY_PROMPT_VERSION,
+    TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
     annotation_prompt,
     review_prompt,
     section_review_prompt,
@@ -1073,6 +1074,28 @@ def _matching_translation_coverage_attempt(
     return None
 
 
+def _translation_token_attempt_path(checkpoint_dir: Path, segment_id: str) -> Path:
+    return (
+        checkpoint_dir
+        / "translation-token-attempts"
+        / f"{_segment_checkpoint_name(segment_id)}.json"
+    )
+
+
+def _matching_translation_token_attempt(
+    checkpoint_dir: Path, segment_id: str, input_sha256: str,
+) -> dict[str, Any] | None:
+    path = _translation_token_attempt_path(checkpoint_dir, segment_id)
+    value = read_json(path) if path.is_file() else None
+    if (
+        isinstance(value, dict)
+        and value.get("segment_id") == segment_id
+        and value.get("input_sha256") == input_sha256
+    ):
+        return value
+    return None
+
+
 def _translation_primary_draft_payload(
     segment: dict[str, Any],
     translation: dict[str, Any],
@@ -1128,6 +1151,80 @@ def _seed_translation_coverage_draft(
         ),
     )
     return path
+
+
+def _repair_translation_token_placement(
+    segment: dict[str, Any],
+    translation: dict[str, Any],
+    *,
+    blocks_by_id: dict[str, dict[str, Any]],
+    protected_names: list[str],
+    options: BuildOptions,
+    checkpoint_dir: Path,
+    artifact_dir: Path,
+    input_sha256: str,
+    llm: Callable[..., dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the single lifetime-bounded token-placement repair for a segment input."""
+    segment_id = str(segment["segment_id"])
+    if _matching_translation_token_attempt(checkpoint_dir, segment_id, input_sha256):
+        raise RuntimeError(
+            f"translation token placement repair attempt already consumed for {segment_id}"
+        )
+    token_errors = _translation_opaque_token_errors(segment, translation, blocks_by_id)
+    source_blocks = [blocks_by_id[item.block_id] for item in token_errors]
+    previous_by_id = {
+        str(item.get("block_id") or ""): item for item in translation["blocks"]
+    }
+    repair_contexts = [
+        _translation_slot_repair_context(
+            source_block,
+            str(previous_by_id[block_id(source_block)].get("text") or ""),
+            protected_names=protected_names,
+        )
+        for source_block in source_blocks
+    ]
+    write_json(_translation_token_attempt_path(checkpoint_dir, segment_id), {
+        "schema_version": "arc.companion.translation-token-attempt.v1",
+        "segment_id": segment_id,
+        "input_sha256": input_sha256,
+        "status": "started",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+        "model_tier": TRANSLATION_RETRY_TIER,
+        "block_ids": [block_id(block) for block in source_blocks],
+    })
+    value = _llm_call(
+        llm,
+        translation_retry_prompt(
+            segment,
+            repair_contexts,
+            validation_errors=[item.prompt_payload() for item in token_errors],
+            retry_model_tier=TRANSLATION_RETRY_TIER,
+        ),
+        TRANSLATION_SLOT_REPAIR_SCHEMA,
+        options=options,
+        artifact_dir=artifact_dir / "retry-1",
+        call_label=f"companion-translation-{segment_id}-retry-1",
+        model_tier=TRANSLATION_RETRY_TIER,
+        allow_mcp=False,
+        allow_internet=False,
+    )
+    repaired = _apply_translation_slot_repairs(
+        translation,
+        source_blocks,
+        value,
+        protected_names=protected_names,
+    )
+    _validate_translation(segment, repaired, blocks_by_id, protected_names)
+    return repaired, {
+        "kind": "token-placement",
+        "attempt": 1,
+        "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+        "model_tier": TRANSLATION_RETRY_TIER,
+        "repaired_block_ids": [block_id(block) for block in source_blocks],
+    }
 
 
 def _generate_translations(
@@ -1188,6 +1285,9 @@ def _generate_translations(
         attempt = _matching_translation_coverage_attempt(
             checkpoint_dir, segment_id, input_hashes[segment_id]
         )
+        token_attempt = _matching_translation_token_attempt(
+            checkpoint_dir, segment_id, input_hashes[segment_id]
+        )
         candidate_provenance: dict[str, Any] | None = None
         translation: dict[str, Any] | None = None
         if (
@@ -1202,6 +1302,8 @@ def _generate_translations(
                 _validate_translation(segment, draft_translation, by_id, protected_names)
             except TranslationCoverageError:
                 translation = draft_translation
+            except TranslationOpaqueTokenError:
+                translation = draft_translation
             except RuntimeError:
                 pass
             else:
@@ -1212,6 +1314,10 @@ def _generate_translations(
         if attempt is not None and translation is None:
             raise RuntimeError(
                 f"translation coverage repair attempt already consumed for {segment_id}"
+            )
+        if token_attempt is not None and translation is None:
+            raise RuntimeError(
+                f"translation token placement repair attempt already consumed for {segment_id}"
             )
         if translatable:
             if translation is None:
@@ -1313,51 +1419,36 @@ def _generate_translations(
                     "attempt": 0,
                     "normalization": diagnostics,
                 })
-            _validate_translation(segment, translation, by_id, protected_names)
+                try:
+                    _validate_translation(segment, translation, by_id, protected_names)
+                except TranslationOpaqueTokenError:
+                    translation, provenance = _repair_translation_token_placement(
+                        segment,
+                        translation,
+                        blocks_by_id=by_id,
+                        protected_names=protected_names,
+                        options=options,
+                        checkpoint_dir=checkpoint_dir,
+                        artifact_dir=artifact_dir,
+                        input_sha256=input_hashes[segment_id],
+                        llm=llm,
+                    )
+                    repair_provenance.append(provenance)
+            if missing_blocks:
+                _validate_translation(segment, translation, by_id, protected_names)
         except TranslationOpaqueTokenError:
-            token_errors = _translation_opaque_token_errors(segment, translation, by_id)
-            source_blocks = [by_id[item.block_id] for item in token_errors]
-            previous_by_id = {
-                str(item.get("block_id") or ""): item for item in translation["blocks"]
-            }
-            repair_contexts = [
-                _translation_slot_repair_context(
-                    source_block,
-                    str(previous_by_id[block_id(source_block)].get("text") or ""),
-                    protected_names=protected_names,
-                )
-                for source_block in source_blocks
-            ]
-            value = _llm_call(
-                llm,
-                translation_retry_prompt(
-                    segment,
-                    repair_contexts,
-                    validation_errors=[item.prompt_payload() for item in token_errors],
-                    retry_model_tier=TRANSLATION_RETRY_TIER,
-                ),
-                TRANSLATION_SLOT_REPAIR_SCHEMA,
-                options=options,
-                artifact_dir=artifact_dir / "retry-1",
-                call_label=f"companion-translation-{segment['segment_id']}-retry-1",
-                model_tier=TRANSLATION_RETRY_TIER,
-                allow_mcp=False,
-                allow_internet=False,
-            )
-            translation = _apply_translation_slot_repairs(
+            translation, provenance = _repair_translation_token_placement(
+                segment,
                 translation,
-                source_blocks,
-                value,
+                blocks_by_id=by_id,
                 protected_names=protected_names,
+                options=options,
+                checkpoint_dir=checkpoint_dir,
+                artifact_dir=artifact_dir,
+                input_sha256=input_hashes[segment_id],
+                llm=llm,
             )
-            _validate_translation(segment, translation, by_id, protected_names)
-            repair_provenance.append({
-                "kind": "token-placement",
-                "attempt": 1,
-                "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
-                "model_tier": TRANSLATION_RETRY_TIER,
-                "repaired_block_ids": [block_id(block) for block in source_blocks],
-            })
+            repair_provenance.append(provenance)
         return segment_id, translation, {
             "candidate": candidate_provenance or {},
             "repairs": repair_provenance,

@@ -6,6 +6,7 @@ from typing import Any
 PROMPT_VERSION = "arc.companion.prompts.v7"
 SCHEMA_VERSION = "arc.companion.schemas.v6"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v2"
+TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v1"
 TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION = (
     "arc.companion.translation-coverage-repair-prompt.v1"
 )
