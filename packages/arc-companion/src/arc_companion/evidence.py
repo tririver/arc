@@ -259,7 +259,7 @@ def validate_cited_ids(values: Any, records: Iterable[Any]) -> list[str]:
 
 
 def validate_annotation_citations(annotation: Any, records: Iterable[Any]) -> list[str]:
-    """Enforce relation-level support without trusting model-returned descriptors."""
+    """Enforce claim-level IDs and exact locators without trusting model descriptors."""
     if not isinstance(annotation, dict):
         raise EvidenceProvenanceError("annotation must be an object")
     material = list(records)
@@ -279,6 +279,8 @@ def validate_annotation_citations(annotation: Any, records: Iterable[Any]) -> li
                 f"{relation}-work commentary has no registered {relation} evidence"
             )
         if isinstance(value, list):
+            if len(value) > 3:
+                raise EvidenceProvenanceError(f"{field} contains more than three claims")
             has_claim_level_bindings = True
             for index, claim in enumerate(value, 1):
                 if not isinstance(claim, dict) or not str(claim.get("text") or "").strip():
@@ -294,6 +296,41 @@ def validate_annotation_citations(annotation: Any, records: Iterable[Any]) -> li
                     raise EvidenceProvenanceError(
                         f"{field} claim {index} cites relation-mismatched evidence: {wrong}"
                     )
+                if "request_key" not in claim:
+                    raise EvidenceProvenanceError(
+                        f"{field} claim {index} has no request_key field"
+                    )
+                request_key = claim.get("request_key")
+                if request_key is not None and not str(request_key).strip():
+                    raise EvidenceProvenanceError(
+                        f"{field} claim {index} has an empty request_key"
+                    )
+                locators = claim.get("source_locators")
+                if not isinstance(locators, list) or not locators:
+                    raise EvidenceProvenanceError(
+                        f"{field} claim {index} has no source locators"
+                    )
+                located_ids: set[str] = set()
+                for locator_index, locator in enumerate(locators, 1):
+                    if not isinstance(locator, dict):
+                        raise EvidenceProvenanceError(
+                            f"{field} claim {index} locator {locator_index} is not an object"
+                        )
+                    evidence_id = str(locator.get("evidence_id") or "")
+                    location = str(locator.get("locator") or "").strip()
+                    if evidence_id not in claim_ids or not location:
+                        raise EvidenceProvenanceError(
+                            f"{field} claim {index} has an unbound source locator"
+                        )
+                    if location not in _evidence_source_locators(registry[evidence_id]):
+                        raise EvidenceProvenanceError(
+                            f"{field} claim {index} cites an unknown source locator for {evidence_id}"
+                        )
+                    located_ids.add(evidence_id)
+                if located_ids != set(claim_ids):
+                    raise EvidenceProvenanceError(
+                        f"{field} claim {index} must locate every cited evidence item"
+                    )
                 claim_bound_ids.extend(claim_ids)
     unused = [value for value in ids if str(registry[value]["relation"]) not in used_relations]
     if unused:
@@ -303,6 +340,20 @@ def validate_annotation_citations(annotation: Any, records: Iterable[Any]) -> li
             "annotation evidence_ids must equal the union of claim-level evidence IDs"
         )
     return ids
+
+
+def _evidence_source_locators(record: dict[str, Any]) -> set[str]:
+    pieces = record.get("snippets")
+    if pieces is None:
+        pieces = record.get("blocks")
+    locators = {
+        str(piece.get("locator") or piece.get("block_id") or "").strip()
+        for piece in pieces or []
+        if isinstance(piece, dict)
+    }
+    if not locators and str(record.get("abstract") or "").strip():
+        locators.add("abstract")
+    return {value for value in locators if value}
 
 
 def _validate_piece(value: Any, *, evidence_id: str) -> None:

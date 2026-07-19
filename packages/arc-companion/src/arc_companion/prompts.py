@@ -139,6 +139,39 @@ TRANSLATION_COVERAGE_REPAIR_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+RELATED_WORK_CLAIM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["text", "evidence_ids", "source_locators", "request_key"],
+    "properties": {
+        "text": {"type": "string", "minLength": 1},
+        "evidence_ids": {
+            "type": "array", "minItems": 1, "items": {"type": "string"},
+        },
+        "source_locators": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["evidence_id", "locator"],
+                "properties": {
+                    "evidence_id": {"type": "string", "minLength": 1},
+                    "locator": {"type": "string", "minLength": 1},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "request_key": {"type": ["string", "null"]},
+    },
+    "additionalProperties": False,
+}
+
+RELATED_WORK_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {"type": "string"},
+        {"type": "array", "maxItems": 3, "items": RELATED_WORK_CLAIM_SCHEMA},
+    ],
+}
+
 ANNOTATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
@@ -153,14 +186,8 @@ ANNOTATION_SCHEMA: dict[str, Any] = {
     ],
     "properties": {
         "explanation": {"type": "string", "minLength": 1},
-        "prior_work": {
-            "type": "string",
-            "description": "Optional; use an empty string unless direct registered evidence exists.",
-        },
-        "later_work": {
-            "type": "string",
-            "description": "Optional; use an empty string unless direct registered evidence exists.",
-        },
+        "prior_work": RELATED_WORK_SCHEMA,
+        "later_work": RELATED_WORK_SCHEMA,
         "commentary": {"type": "string", "minLength": 1},
         "evidence_ids": {
             "type": "array", "maxItems": 6, "items": {"type": "string"},
@@ -217,8 +244,14 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     },
                     "commentary": {"type": ["string", "null"], "minLength": 1},
                     "explanation": {"type": ["string", "null"], "minLength": 1},
-                    "prior_work": {"type": ["string", "null"]},
-                    "later_work": {"type": ["string", "null"]},
+                    "prior_work": {
+                        "type": ["string", "array", "null"],
+                        "oneOf": [{"type": "null"}, *RELATED_WORK_SCHEMA["oneOf"]],
+                    },
+                    "later_work": {
+                        "type": ["string", "array", "null"],
+                        "oneOf": [{"type": "null"}, *RELATED_WORK_SCHEMA["oneOf"]],
+                    },
                     "evidence_ids": {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
@@ -438,14 +471,17 @@ def annotation_prompt(
     return (
         "Write rigorous companion commentary for this contiguous theoretical-physics paper segment. "
         "Return a self-contained explanation and one combined commentary suitable for typesetting. The "
-        "prior_work and later_work fields are strictly optional: include at most three papers in each only "
-        "when they directly illuminate a concrete claim in this exact segment. Never fill either field merely "
-        "because it exists in the schema, and never use a famous, highly cited, or field-defining paper as a "
-        "generic fallback. Empty strings are the correct output when no directly relevant evidence exists. "
-        "Ground every related-work claim in the supplied evidence and list only evidence IDs actually used. "
-        "Treat the segment's exact bibliography citation targets as the strongest prior-work relevance signal; "
-        "citation count is only a weak secondary prior. Prefer a more directly relevant paper even when it is "
-        "outside the supplied domain or less cited. Do not fill a quota. Explain motivation, assumptions, "
+        "prior_work and later_work fields are strictly optional. Return each non-empty field as at most three claim "
+        "objects, each with text, the evidence_ids used for that exact claim, source_locators pairing every "
+        "evidence_id with an exact supplied block/snippet locator (or 'abstract'), and request_key (null for "
+        "an initially supported claim). The top-level evidence_ids must equal the union of claim evidence_ids. "
+        "Include a claim only when it directly illuminates a concrete claim in this exact segment. Never fill "
+        "either field merely because it exists in the schema, and never use a famous, highly cited, or field-"
+        "defining paper as a generic fallback. A same-relation paper is not generic support for another claim. "
+        "Empty strings are the correct output when no directly relevant evidence exists. Treat the segment's "
+        "exact bibliography citation targets as the strongest prior-work relevance signal; citation count is only "
+        "a weak secondary prior. Prefer a more directly relevant paper even when it is outside the supplied domain "
+        "or less cited. Do not fill a quota. Explain motivation, assumptions, "
         "derivation logic, notation, and conceptual connections. Do not rewrite or correct the source. "
         "Use the glossary consistently and preserve every personal name in Latin spelling. "
         "When needed, use the bounded full-paper navigation context, ARC cached-paper tools, and internet search "
@@ -454,7 +490,9 @@ def annotation_prompt(
         "later-work claim from an external result unless it is also present in BOUNDED LITERATURE EVIDENCE with "
         "a registered evidence_id and source_descriptor. If research identifies a potentially useful new "
         "source that is not registered, keep the dependent related-work claim out of prior_work/later_work and "
-        "return a precise evidence_requests item instead (at most two). A request must state the claim, relation, "
+        "return a precise evidence_requests item instead (at most two). On the evidence rerun, a claim depending "
+        "on a resolved request must carry that request_key and bind one of that request's newly registered evidence "
+        "IDs and its exact locator; otherwise omit that claim and preserve unrelated claims. A request must state the claim, relation, "
         "queries, candidate paper IDs or discovery URLs, and reason. Web snippets are discovery hints only. "
         "When EXPLICIT DOMAIN CONTEXT is present, use it as preferred navigation and a relevance signal, not as "
         "a closed corpus. A domain match never forbids or short-circuits ARC, INSPIRE, references/citers, or web "
@@ -486,7 +524,9 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "must remain unchanged, and use an empty string only when intentionally clearing prior_work or later_work. "
         "Prior and later work are optional; never add a generic or quota-filling related-work patch. "
         "Return full replacement translation blocks for a translation correction. Never alter equations, equation numbers, figures, "
-        "tables, citations, references, identifiers, or evidence IDs. Translation coverage applies only to "
+        "tables, citations, references, identifiers, or evidence IDs. Never create a new prior/later claim or bind "
+        "an existing relation-level evidence ID to a new fact; review may only correct wording or remove an already "
+        "claim-bound item. Translation coverage applies only to "
         "translatable natural-language blocks supplied in translation blocks. Display equations, figures, "
         "tables, bibliography, and other controller-owned or source-only blocks are intentionally absent and "
         "must not be invented as translation blocks. An empty patches list is valid. "
@@ -499,7 +539,8 @@ def section_review_prompt(payload: dict[str, Any], *, language: str) -> str:
     return (
         "Review this portion of a source/translation/companion theoretical-physics paper. Identify concrete "
         "technical, translation, coverage, terminology, protected-name, and evidence-grounding issues. "
-        "Do not propose changes to source blocks or the frozen glossary. Return reviewed_segments containing "
+        "Do not propose changes to source blocks or the frozen glossary. Do not add any prior/later fact or new "
+        "claim-evidence binding during review. Return reviewed_segments containing "
         "exactly every input segment_id plus complete reviewed translation and annotation values (unchanged when correct) "
         "so the controller can verify section coverage and project only concrete differences to the final reviewer. "
         "Translation coverage applies only to translatable natural-language blocks already represented in the "

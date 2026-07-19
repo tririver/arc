@@ -885,8 +885,20 @@ def _generate_annotations(
         normalized = {
             "commentary": str(value["commentary"]),
             "explanation": str(value.get("explanation") or value["commentary"]),
-            "prior_work": str(value.get("prior_work") or ""),
-            "later_work": str(value.get("later_work") or ""),
+            "prior_work": _normalize_related_work(
+                value.get("prior_work"),
+                known_evidence_ids=(
+                    None if round_number == 1
+                    else {str(item.get("evidence_id") or "") for item in segment_evidence["papers"]}
+                ),
+            ),
+            "later_work": _normalize_related_work(
+                value.get("later_work"),
+                known_evidence_ids=(
+                    None if round_number == 1
+                    else {str(item.get("evidence_id") or "") for item in segment_evidence["papers"]}
+                ),
+            ),
             "evidence_ids": _validated_evidence_ids(
                 (
                     value.get("evidence_ids") or []
@@ -981,6 +993,21 @@ def _resolve_and_rerun_evidence_requests(
 
     resolution = controller.resolve(requests, existing_records=evidence.get("related_papers") or [])
     supported = set(resolution.supported_request_keys)
+    evidence_ids_by_request: dict[str, set[str]] = {}
+    for accepted in resolution.audit.get("accepted") or []:
+        if not isinstance(accepted, dict):
+            continue
+        request_key = str(accepted.get("request_key") or "")
+        evidence_id = str(accepted.get("evidence_id") or "")
+        if request_key in supported and evidence_id:
+            evidence_ids_by_request.setdefault(request_key, set()).add(evidence_id)
+    for segment_id, ids in resolution.evidence_ids_by_segment.items():
+        segment_keys = [
+            str(item["request_key"]) for item in requests
+            if item["segment_id"] == segment_id and item["request_key"] in supported
+        ]
+        if len(segment_keys) == 1 and not evidence_ids_by_request.get(segment_keys[0]):
+            evidence_ids_by_request[segment_keys[0]] = set(ids)
     audit = dict(resolution.audit)
     audit["round"] = 1
     audit["rerun_segments"] = sorted(resolution.evidence_ids_by_segment)
@@ -999,11 +1026,17 @@ def _resolve_and_rerun_evidence_requests(
         segment_id: {
             "round": 2,
             "registered_evidence_ids": list(resolution.evidence_ids_by_segment[segment_id]),
+            "evidence_ids_by_request": {
+                item["request_key"]: sorted(evidence_ids_by_request.get(item["request_key"], set()))
+                for item in requests
+                if item["segment_id"] == segment_id and item["request_key"] in supported
+            },
             "requests": [item for item in requests if item["segment_id"] == segment_id],
             "audit_path": str(checkpoint_dir / "evidence-resolution.v1.json"),
         }
         for segment_id in rerun_ids
     }
+    first_round_annotations = annotations
     if rerun_ids:
         rerun = _generate_annotations(
             [segment_by_id[value] for value in rerun_ids],
@@ -1022,15 +1055,72 @@ def _resolve_and_rerun_evidence_requests(
         annotations = {**annotations, **rerun}
 
     claim_bindings: dict[str, list[str]] = {}
+    claim_binding_records: dict[str, list[dict[str, Any]]] = {}
     for segment_id, annotation in annotations.items():
         segment_requests = [item for item in requests if item["segment_id"] == segment_id]
+        _enforce_request_claim_bindings(
+            annotation,
+            segment_requests,
+            supported=supported,
+            evidence_ids_by_request=evidence_ids_by_request,
+            first_draft=first_round_annotations.get(segment_id),
+        )
         _clear_unresolved_requested_work(annotation, segment_requests, supported)
         annotation["evidence_requests"] = []
         claim_bindings[segment_id] = list(annotation.get("evidence_ids") or [])
+        claim_binding_records[segment_id] = [
+            {
+                "relation": relation,
+                "text": str(claim.get("text") or ""),
+                "request_key": claim.get("request_key"),
+                "evidence_ids": list(claim.get("evidence_ids") or []),
+                "source_locators": list(claim.get("source_locators") or []),
+            }
+            for field, relation in (("prior_work", "prior"), ("later_work", "later"))
+            for claim in annotation.get(field) or []
+            if isinstance(annotation.get(field), list) and isinstance(claim, dict)
+        ]
     audit["round"] = 2
     audit["final_claim_evidence_ids"] = claim_bindings
+    audit["final_claim_bindings"] = claim_binding_records
     write_json(checkpoint_dir / "evidence-resolution.v1.json", audit)
     return annotations, merged_evidence
+
+
+def _normalize_related_work(
+    value: Any,
+    *,
+    known_evidence_ids: set[str] | None = None,
+) -> str | list[dict[str, Any]]:
+    """Preserve legacy strings while normalizing claim-level evidence bindings."""
+    if not isinstance(value, list):
+        return str(value or "")
+    if len(value) > 3:
+        raise RuntimeError("related work may contain at most three claims")
+    claims: list[dict[str, Any]] = []
+    for index, raw in enumerate(value, 1):
+        if not isinstance(raw, dict) or not str(raw.get("text") or "").strip():
+            raise RuntimeError(f"related-work claim {index} has no text")
+        evidence_ids = [
+            str(item) for item in raw.get("evidence_ids") or []
+            if isinstance(item, str)
+            and (known_evidence_ids is None or item in known_evidence_ids)
+        ]
+        locator_values = [
+            {"evidence_id": str(item.get("evidence_id") or ""),
+             "locator": str(item.get("locator") or "")}
+            for item in raw.get("source_locators") or []
+            if isinstance(item, dict)
+            and str(item.get("evidence_id") or "") in evidence_ids
+        ]
+        request_key = raw.get("request_key")
+        claims.append({
+            "text": str(raw["text"]),
+            "evidence_ids": list(dict.fromkeys(evidence_ids)),
+            "source_locators": locator_values,
+            "request_key": None if request_key is None else str(request_key),
+        })
+    return claims
 
 
 def _known_evidence_ids(values: Any, records: list[dict[str, Any]]) -> list[str]:
@@ -1043,10 +1133,23 @@ def _drop_unsupported_second_round_related_work(
 ) -> None:
     relation_by_id = {str(item.get("evidence_id") or ""): str(item.get("relation") or "") for item in records}
     used = list(annotation.get("evidence_ids") or [])
-    if not any(relation_by_id.get(value) == "prior" for value in used):
-        annotation["prior_work"] = ""
-    if not any(relation_by_id.get(value) == "later" for value in used):
-        annotation["later_work"] = ""
+    for field, relation in (("prior_work", "prior"), ("later_work", "later")):
+        value = annotation.get(field)
+        if isinstance(value, list):
+            annotation[field] = [
+                claim for claim in value
+                if isinstance(claim, dict)
+                and claim.get("evidence_ids")
+                and all(
+                    relation_by_id.get(str(evidence_id)) == relation
+                    for evidence_id in claim.get("evidence_ids") or []
+                )
+            ]
+        elif not any(relation_by_id.get(evidence_id) == relation for evidence_id in used):
+            annotation[field] = ""
+    if any(isinstance(annotation.get(field), list) for field in ("prior_work", "later_work")):
+        _sync_claim_evidence_ids(annotation)
+        return
     used_relations = {
         relation for relation, field in (("prior", "prior_work"), ("later", "later_work"))
         if str(annotation.get(field) or "").strip()
@@ -1059,13 +1162,104 @@ def _drop_unsupported_second_round_related_work(
 def _clear_unresolved_requested_work(
     annotation: dict[str, Any], requests: list[dict[str, Any]], supported: set[str],
 ) -> None:
-    unresolved_relations = {
-        str(item["relation"]) for item in requests if str(item["request_key"]) not in supported
+    unresolved = {
+        str(item["request_key"]): str(item["relation"])
+        for item in requests if str(item["request_key"]) not in supported
     }
-    if "prior" in unresolved_relations:
-        annotation["prior_work"] = ""
-    if "later" in unresolved_relations:
-        annotation["later_work"] = ""
+    for field, relation in (("prior_work", "prior"), ("later_work", "later")):
+        value = annotation.get(field)
+        relation_keys = {key for key, item_relation in unresolved.items() if item_relation == relation}
+        if not relation_keys:
+            continue
+        if isinstance(value, list):
+            annotation[field] = [
+                claim for claim in value
+                if not isinstance(claim, dict)
+                or str(claim.get("request_key") or "") not in relation_keys
+            ]
+        else:
+            annotation[field] = ""
+    _sync_claim_evidence_ids(annotation)
+
+
+def _enforce_request_claim_bindings(
+    annotation: dict[str, Any],
+    requests: list[dict[str, Any]],
+    *,
+    supported: set[str],
+    evidence_ids_by_request: dict[str, set[str]],
+    first_draft: dict[str, Any] | None,
+) -> None:
+    """Drop only request-bound claims that ignored their specifically resolved evidence."""
+    request_by_key = {str(item["request_key"]): item for item in requests}
+    for field, relation in (("prior_work", "prior"), ("later_work", "later")):
+        value = annotation.get(field)
+        resolved_keys = {
+            key for key, request in request_by_key.items()
+            if request["relation"] == relation and key in supported
+        }
+        if not resolved_keys:
+            continue
+        if not isinstance(value, list):
+            original = (first_draft or {}).get(field)
+            annotation[field] = str(original or "") if not isinstance(original, list) else ""
+            continue
+        prior_bindings = {
+            _claim_binding_key(claim)
+            for claim in (first_draft or {}).get(field) or []
+            if isinstance(claim, dict)
+        } if isinstance((first_draft or {}).get(field), list) else set()
+        kept: list[dict[str, Any]] = []
+        for claim in value:
+            if not isinstance(claim, dict):
+                continue
+            request_key = str(claim.get("request_key") or "")
+            if request_key not in resolved_keys:
+                if _claim_binding_key(claim) in prior_bindings:
+                    kept.append(claim)
+                continue
+            expected = evidence_ids_by_request.get(request_key, set())
+            cited = {str(item) for item in claim.get("evidence_ids") or []}
+            located = {
+                str(item.get("evidence_id") or "")
+                for item in claim.get("source_locators") or [] if isinstance(item, dict)
+            }
+            if expected and cited.intersection(expected) and located.intersection(expected):
+                kept.append(claim)
+        annotation[field] = kept
+    _sync_claim_evidence_ids(annotation)
+
+
+def _claim_binding_key(claim: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        claim.get("request_key"),
+        tuple(str(item) for item in claim.get("evidence_ids") or []),
+        tuple(
+            (str(item.get("evidence_id") or ""), str(item.get("locator") or ""))
+            for item in claim.get("source_locators") or [] if isinstance(item, dict)
+        ),
+    )
+
+
+def _sync_claim_evidence_ids(annotation: dict[str, Any]) -> None:
+    claim_fields = [annotation.get("prior_work"), annotation.get("later_work")]
+    if not any(isinstance(value, list) for value in claim_fields):
+        return
+    claim_ids = list(dict.fromkeys(
+        str(evidence_id)
+        for value in claim_fields if isinstance(value, list)
+        for claim in value if isinstance(claim, dict)
+        for evidence_id in claim.get("evidence_ids") or []
+    ))
+    if any(
+        not isinstance(value, list) and str(value or "").strip()
+        for value in claim_fields
+    ):
+        claim_ids.extend(
+            str(value) for value in annotation.get("evidence_ids") or []
+            if str(value) not in claim_ids
+        )
+    annotation["evidence_ids"] = claim_ids
 
 
 def _translation_draft_path(checkpoint_dir: Path, segment_id: str) -> Path:
@@ -1986,6 +2180,7 @@ def _review(
         segment_id = str(patch.get("segment_id") or "")
         if segment_id not in valid_ids or segment_id in patched:
             raise RuntimeError(f"review returned invalid or duplicate annotation patch: {segment_id}")
+        original_annotation = dict(reviewed[segment_id])
         translation_changed = patch.get("translation_blocks") is not None
         if translation_changed:
             replacement = {"blocks": list(patch.get("translation_blocks") or [])}
@@ -2008,15 +2203,20 @@ def _review(
                 reviewed[segment_id][field] = _validated_evidence_ids(
                     patch[field], {"related_papers": segment_evidence["papers"]}
                 )
+            elif field in {"prior_work", "later_work"}:
+                reviewed[segment_id][field] = _normalize_related_work(patch[field])
             else:
                 text = str(patch[field])
                 if field in {"commentary", "explanation"} and not text.strip():
                     raise RuntimeError(f"review returned empty {field} patch: {segment_id}")
                 reviewed[segment_id][field] = text
+        if any(field in changed_annotation_fields for field in ("prior_work", "later_work")):
+            _sync_claim_evidence_ids(reviewed[segment_id])
         segment = next(item for item in segments if item["segment_id"] == segment_id)
         _validate_annotation_evidence(
             reviewed[segment_id], _evidence_for_segment(segment, by_id, evidence)["papers"]
         )
+        _assert_review_did_not_add_related_work(original_annotation, reviewed[segment_id])
         patched.add(segment_id)
     return reviewed_translations, reviewed, {
         "hierarchical": hierarchical,
@@ -2026,6 +2226,30 @@ def _review(
         "patched_segment_ids": sorted(patched),
         "citation_delimiter_normalized_segment_ids": sorted(citation_normalized),
     }
+
+
+def _assert_review_did_not_add_related_work(
+    before: dict[str, Any], after: dict[str, Any],
+) -> None:
+    """The non-research review pass may edit/drop claims but never create bindings."""
+    for field in ("prior_work", "later_work"):
+        old_value = before.get(field)
+        new_value = after.get(field)
+        if isinstance(new_value, list):
+            old_bindings = {
+                _claim_binding_key(claim)
+                for claim in old_value or [] if isinstance(claim, dict)
+            } if isinstance(old_value, list) else set()
+            new_bindings = {
+                _claim_binding_key(claim)
+                for claim in new_value if isinstance(claim, dict)
+            }
+            if not new_bindings.issubset(old_bindings):
+                raise RuntimeError("review added a related-work claim without prior claim evidence")
+        elif str(new_value or "").strip() and not str(old_value or "").strip():
+            raise RuntimeError("review added a related-work claim without prior claim evidence")
+        elif isinstance(old_value, list) and str(new_value or "").strip():
+            raise RuntimeError("review replaced claim bindings with unbound related-work text")
 
 
 def _llm_call(

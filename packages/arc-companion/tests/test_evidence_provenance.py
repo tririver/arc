@@ -145,12 +145,21 @@ def test_annotation_claims_require_registered_relation_matching_ids() -> None:
 def test_claim_level_bindings_require_support_for_each_claim() -> None:
     prior = _arc_record()
     annotation = {
-        "prior_work": [{"text": "Prior result.", "evidence_ids": ["prior-001"]}],
+        "prior_work": [{
+            "text": "Prior result.", "evidence_ids": ["prior-001"],
+            "source_locators": [{"evidence_id": "prior-001", "locator": "b-1"}],
+            "request_key": None,
+        }],
         "later_work": [],
         "evidence_ids": ["prior-001"],
     }
 
     assert validate_annotation_citations(annotation, [prior]) == ["prior-001"]
+
+    unrelated_locator = deepcopy(annotation)
+    unrelated_locator["prior_work"][0]["source_locators"][0]["locator"] = "b-unrelated"
+    with pytest.raises(EvidenceProvenanceError, match="unknown source locator"):
+        validate_annotation_citations(unrelated_locator, [prior])
 
     missing = deepcopy(annotation)
     missing["prior_work"][0]["evidence_ids"] = []
