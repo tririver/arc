@@ -73,6 +73,9 @@ GLOSSARY_TIER = "medium"
 TRANSLATION_TIER = "low"
 TRANSLATION_RETRY_TIER = "medium"
 TRANSLATION_COVERAGE_REPAIR_TIER = "medium"
+TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION = (
+    "arc.companion.translation-citation-delimiters.v1"
+)
 ANNOTATION_TIER = "high"
 REVIEW_TIER = "high"
 REVIEW_VERSION = "arc.companion.review.v2"
@@ -1222,6 +1225,9 @@ def _repair_translation_token_placement(
         "kind": "token-placement",
         "attempt": 1,
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+        "citation_delimiter_normalizer_version": (
+            TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION
+        ),
         "model_tier": TRANSLATION_RETRY_TIER,
         "repaired_block_ids": [block_id(block) for block in source_blocks],
     }
@@ -2133,9 +2139,110 @@ def _apply_translation_slot_repair_block(
         for index, slot in enumerate(slots)
         for part in ([slot, expected_tokens[index]] if index < len(expected_tokens) else [slot])
     )
+    assembled = _normalize_translation_citation_delimiters(source_block, assembled)
     repaired_blocks = list(previous_blocks)
     repaired_blocks[failed_index] = {**previous_blocks[failed_index], "text": assembled}
     return {**previous_translation, "blocks": repaired_blocks}
+
+
+def _normalize_translation_citation_delimiters(
+    source_block: dict[str, Any], translated_text: str,
+) -> str:
+    """Relocate, but never add or delete, source-owned ASCII citation brackets."""
+    original_residue = _translation_natural_residue(translated_text)
+    source_text = str(_translation_input_block(source_block).get("text") or "")
+    opaque_runs = [
+        run
+        for run in source_block.get("inline_runs") or []
+        if isinstance(run, dict) and str(run.get("kind") or "") != "text"
+    ]
+    expected_tokens = _opaque_inline_tokens(source_block)
+    normalized = translated_text
+    for run, token in zip(opaque_runs, expected_tokens):
+        if str(run.get("kind") or "").casefold() != "citation":
+            continue
+        source_index = source_text.find(token)
+        source_end = source_index + len(token)
+        source_wraps_token = (
+            source_index > 0
+            and source_end < len(source_text)
+            and source_text[source_index - 1] == "["
+            and source_text[source_end] == "]"
+        )
+        if not source_wraps_token:
+            continue
+        if normalized.count(token) != 1:
+            raise RuntimeError("citation delimiter normalization requires exactly one token")
+        index = normalized.find(token)
+        end = index + len(token)
+        if (
+            index > 0
+            and end < len(normalized)
+            and normalized[index - 1] == "["
+            and normalized[end] == "]"
+        ):
+            continue
+        brackets_before = index >= 2 and normalized[index - 2:index] == "[]"
+        brackets_after = normalized[end:end + 2] == "[]"
+        if brackets_before == brackets_after:
+            raise RuntimeError(
+                "citation delimiter normalization requires one adjacent empty bracket pair"
+            )
+        if brackets_before:
+            normalized = normalized[:index - 2] + "[" + token + "]" + normalized[end:]
+        else:
+            normalized = normalized[:index] + "[" + token + "]" + normalized[end + 2:]
+    if _translation_natural_residue(normalized) != original_residue:
+        raise RuntimeError("citation delimiter normalization changed natural-language residue")
+    return normalized
+
+
+def _repair_translation_checkpoint_citation_delimiters(
+    checkpoint_path: Path,
+    segment: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+    *,
+    protected_names: list[str],
+) -> dict[str, Any]:
+    """Atomically normalize a validated checkpoint and record deterministic provenance."""
+    checkpoint = read_json(checkpoint_path)
+    translation = checkpoint.get("translation") if isinstance(checkpoint, dict) else None
+    raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
+    if not isinstance(raw_blocks, list):
+        raise RuntimeError("translation checkpoint has no block list")
+    changed_ids: list[str] = []
+    repaired_blocks: list[dict[str, Any]] = []
+    for item in raw_blocks:
+        if not isinstance(item, dict):
+            raise RuntimeError("translation checkpoint contains a malformed block")
+        item_id = str(item.get("block_id") or "")
+        source_block = blocks_by_id.get(item_id)
+        if source_block is None:
+            raise RuntimeError(f"translation checkpoint contains unknown block {item_id}")
+        previous_text = str(item.get("text") or "")
+        repaired_text = _normalize_translation_citation_delimiters(source_block, previous_text)
+        if repaired_text != previous_text:
+            changed_ids.append(item_id)
+        repaired_blocks.append({**item, "text": repaired_text})
+    repaired_translation = {**translation, "blocks": repaired_blocks}
+    _validate_translation(segment, repaired_translation, blocks_by_id, protected_names)
+    if not changed_ids:
+        return checkpoint
+    generation_provenance = dict(checkpoint.get("generation_provenance") or {})
+    repairs = list(generation_provenance.get("repairs") or [])
+    repairs.append({
+        "kind": "citation-delimiter-normalization",
+        "attempt": 0,
+        "normalizer_version": TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION,
+        "repaired_block_ids": changed_ids,
+    })
+    repaired_checkpoint = {
+        **checkpoint,
+        "generation_provenance": {**generation_provenance, "repairs": repairs},
+        "translation": repaired_translation,
+    }
+    write_json(checkpoint_path, repaired_checkpoint)
+    return repaired_checkpoint
 
 
 def _translation_natural_residue(previous_text: str) -> str:

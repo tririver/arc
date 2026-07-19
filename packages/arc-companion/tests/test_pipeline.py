@@ -151,6 +151,100 @@ def test_slot_repair_preserves_natural_text_and_assembles_twenty_two_mixed_token
     )
 
 
+def _bracketed_citation_block() -> dict:
+    return {
+        "block_id": "cited", "type": "text", "text": "Read as [9].",
+        "inline_runs": [
+            _inline_run("text", "Read as [", 1),
+            _inline_run("citation", "9", 2),
+            _inline_run("text", "].", 3),
+        ],
+    }
+
+
+def test_citation_delimiter_normalizer_keeps_correct_and_relocates_empty_pair() -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+
+    assert pipeline_module._normalize_translation_citation_delimiters(
+        block, f"参见[{token}]。",
+    ) == f"参见[{token}]。"
+    assert pipeline_module._normalize_translation_citation_delimiters(
+        block, f"参见[]{token}。",
+    ) == f"参见[{token}]。"
+    assert pipeline_module._normalize_translation_citation_delimiters(
+        block, f"参见{token}[]。",
+    ) == f"参见[{token}]。"
+
+
+@pytest.mark.parametrize(
+    "text_template",
+    ("参见{}。", "参见[额外]{}。", "参见{}[额外]。", "参见[]{}[]。"),
+)
+def test_citation_delimiter_normalizer_rejects_missing_ambiguous_or_nonempty_brackets(
+    text_template: str,
+) -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+
+    with pytest.raises(RuntimeError, match="citation delimiter normalization"):
+        pipeline_module._normalize_translation_citation_delimiters(
+            block, text_template.format(token),
+        )
+
+
+def test_slot_repair_relocates_citation_brackets_without_changing_residue() -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    previous = {"blocks": [{"block_id": "cited", "text": "参见[]。"}]}
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+
+    result = pipeline_module._apply_translation_slot_repairs(
+        previous,
+        [block],
+        {"repairs": [{"block_id": "cited", "slots": [
+            {"slot_id": slot_ids[0], "text": "参见"},
+            {"slot_id": slot_ids[1], "text": "[]。"},
+        ]}]},
+        protected_names=[],
+    )
+
+    assert result["blocks"][0]["text"] == f"参见[{token}]。"
+    assert pipeline_module._translation_natural_residue(result["blocks"][0]["text"]) == (
+        "参见[]。"
+    )
+
+
+def test_checkpoint_citation_delimiter_repair_revalidates_and_records_provenance(
+    tmp_path: Path,
+) -> None:
+    block = _bracketed_citation_block()
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    segment = {"segment_id": "seg-0063", "block_ids": ["cited"]}
+    checkpoint_path = tmp_path / "translation.json"
+    checkpoint_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-checkpoint.v2",
+        "segment_id": "seg-0063",
+        "input_sha256": "fixture",
+        "generation_provenance": {"candidate": {"origin": "primary-model"}, "repairs": []},
+        "translation": {"blocks": [{"block_id": "cited", "text": f"参见{token}[]。"}]},
+    }), encoding="utf-8")
+
+    repaired = pipeline_module._repair_translation_checkpoint_citation_delimiters(
+        checkpoint_path, segment, {"cited": block}, protected_names=[],
+    )
+
+    assert repaired["translation"]["blocks"][0]["text"] == f"参见[{token}]。"
+    assert repaired["generation_provenance"]["candidate"] == {"origin": "primary-model"}
+    assert repaired["generation_provenance"]["repairs"][-1] == {
+        "kind": "citation-delimiter-normalization",
+        "attempt": 0,
+        "normalizer_version": pipeline_module.TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION,
+        "repaired_block_ids": ["cited"],
+    }
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8")) == repaired
+
+
 def test_slot_repair_allows_only_exact_missing_name_insertion() -> None:
     block = {
         "block_id": "runs", "type": "text", "text": "Ada Lovelace uses x.",
