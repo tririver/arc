@@ -36,10 +36,12 @@ from .prompts import (
     SECTION_REVIEW_SCHEMA,
     PROMPT_VERSION,
     SCHEMA_VERSION,
+    TRANSLATION_RETRY_PROMPT_VERSION,
     annotation_prompt,
     review_prompt,
     section_review_prompt,
     translation_prompt,
+    translation_retry_prompt,
 )
 from .projection import (
     annotation_input_block as _project_annotation_input_block,
@@ -91,6 +93,38 @@ class CompanionGenerationError(RuntimeError):
             f"{lane}: {type(exc).__name__}: {exc}" for lane, exc in sorted(failures.items())
         )
         super().__init__(f"per-segment generation failed after draining both lanes: {detail}")
+
+
+class TranslationOpaqueTokenError(RuntimeError):
+    """A generated translation changed the controller-owned inline token stream."""
+
+    def __init__(
+        self,
+        *,
+        segment_id: str,
+        block_id_value: str,
+        expected_tokens: list[str],
+        actual_tokens: list[str],
+    ) -> None:
+        self.segment_id = segment_id
+        self.block_id = block_id_value
+        self.expected_tokens = list(expected_tokens)
+        self.actual_tokens = list(actual_tokens)
+        super().__init__(
+            f"translation {segment_id} changed, dropped, or reordered opaque inline tokens "
+            f"in {block_id_value} (expected {len(expected_tokens)}, received {len(actual_tokens)})"
+        )
+
+    def prompt_payload(self) -> dict[str, Any]:
+        return {
+            "type": "opaque_inline_token_mismatch",
+            "retry_prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+            "segment_id": self.segment_id,
+            "block_id": self.block_id,
+            "expected_tokens": self.expected_tokens,
+            "actual_tokens": self.actual_tokens,
+            "message": str(self),
+        }
 
 
 @dataclass(frozen=True)
@@ -1045,6 +1079,9 @@ def _generate_translations(
         translatable = [_translation_input_block(block) for block in selected if _is_translatable(block)]
         paper_context = _full_paper_context(bundle.document, segment, blocks_by_id=by_id)
         if translatable:
+            artifact_dir = (
+                checkpoint_dir / "llm" / "translations" / _segment_checkpoint_name(segment["segment_id"])
+            )
             value = _llm_call(
                 llm,
                 translation_prompt(
@@ -1057,7 +1094,7 @@ def _generate_translations(
                 ),
                 TRANSLATION_SCHEMA,
                 options=options,
-                artifact_dir=checkpoint_dir / "llm" / "translations" / _segment_checkpoint_name(segment["segment_id"]),
+                artifact_dir=artifact_dir,
                 call_label=f"companion-translation-{segment['segment_id']}",
                 model_tier=TRANSLATION_TIER,
                 allow_mcp=True,
@@ -1067,7 +1104,37 @@ def _generate_translations(
         else:
             blocks = []
         translation = {"blocks": blocks}
-        _validate_translation(segment, translation, by_id, protected_names)
+        try:
+            _validate_translation(segment, translation, by_id, protected_names)
+        except TranslationOpaqueTokenError as exc:
+            required_token_sequences = {
+                block_id(block): _opaque_inline_tokens(block)
+                for block in selected
+                if _is_translatable(block)
+            }
+            value = _llm_call(
+                llm,
+                translation_retry_prompt(
+                    segment,
+                    translatable,
+                    language=options.annotation_language,
+                    glossary=glossary,
+                    protected_names=protected_names,
+                    paper_context=paper_context,
+                    previous_translation=translation,
+                    validation_error=exc.prompt_payload(),
+                    required_token_sequences=required_token_sequences,
+                ),
+                TRANSLATION_SCHEMA,
+                options=options,
+                artifact_dir=artifact_dir / "retry-1",
+                call_label=f"companion-translation-{segment['segment_id']}-retry-1",
+                model_tier=TRANSLATION_TIER,
+                allow_mcp=False,
+                allow_internet=False,
+            )
+            translation = {"blocks": list(value.get("blocks") or [])}
+            _validate_translation(segment, translation, by_id, protected_names)
         return segment["segment_id"], translation
 
     with ThreadPoolExecutor(max_workers=min(options.workers, max(1, len(pending)))) as executor:
@@ -1640,9 +1707,11 @@ def _validate_translation(
         expected_tokens = _opaque_inline_tokens(source)
         actual_tokens = _OPAQUE_INLINE_PATTERN.findall(text)
         if actual_tokens != expected_tokens:
-            raise RuntimeError(
-                f"translation {segment['segment_id']} changed, dropped, or reordered opaque inline tokens "
-                f"in {block_id(source)}"
+            raise TranslationOpaqueTokenError(
+                segment_id=str(segment["segment_id"]),
+                block_id_value=block_id(source),
+                expected_tokens=expected_tokens,
+                actual_tokens=actual_tokens,
             )
         _validate_names_in_generated([source], text, protected_names, label=block_id(source))
 

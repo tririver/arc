@@ -11,12 +11,14 @@ from arc_companion.evidence import arc_cache_descriptor, text_sha256, validate_e
 from arc_companion.evidence_requests import EvidenceResolution
 from arc_companion.pipeline import (
     BuildOptions,
+    CompanionLaneError,
     _evidence,
     _fingerprint,
     _evidence_for_segment,
     _first_wave_preview_document,
     _full_paper_context,
     _generation_document,
+    _generate_translations,
     _translation_input_block,
     _validate_translation,
     _protected_names,
@@ -67,6 +69,208 @@ def test_translation_uses_and_validates_ordered_opaque_inline_tokens() -> None:
         assert "opaque inline tokens" in str(exc)
     else:
         raise AssertionError("reordered math tokens must be rejected")
+
+
+def test_translation_rejects_an_extra_opaque_link_occurrence() -> None:
+    link_run = _inline_run("link", "project page", 2)
+    link_run["href"] = "https://example.test/project"
+    block = {
+        "block_id": "linked",
+        "kind": "prose",
+        "text": "See project page.",
+        "inline_runs": [
+            _inline_run("text", "See ", 1),
+            link_run,
+            _inline_run("text", ".", 3),
+        ],
+    }
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    segment = {"segment_id": "seg-link", "block_ids": ["linked"]}
+
+    _validate_translation(
+        segment, {"blocks": [{"block_id": "linked", "text": f"参见 {token}。"}]},
+        {"linked": block}, [],
+    )
+    try:
+        _validate_translation(
+            segment,
+            {"blocks": [{"block_id": "linked", "text": f"参见 {token} 和 {token}。"}]},
+            {"linked": block},
+            [],
+        )
+    except RuntimeError as exc:
+        assert "opaque inline tokens" in str(exc)
+    else:
+        raise AssertionError("a duplicated rendered link token must be rejected")
+
+
+def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp_path: Path) -> None:
+    blocks = []
+    segments = []
+    required_tokens: dict[str, str] = {}
+    for number in range(1, 5):
+        block_id_value = f"b{number}"
+        math_run = _inline_run("math", f"x_{number}", 2, tex=f"x_{number}")
+        block = {
+            "block_id": block_id_value,
+            "type": "text",
+            "text": f"Value x_{number}.",
+            "inline_runs": [
+                _inline_run("text", "Value ", 1),
+                math_run,
+                _inline_run("text", ".", 3),
+            ],
+        }
+        blocks.append(block)
+        segment_id = f"seg-{number:04d}"
+        segments.append({"segment_id": segment_id, "block_ids": [block_id_value]})
+        required_tokens[segment_id] = pipeline_module._opaque_inline_tokens(block)[0]
+
+    document = {
+        "schema_version": "arc.paper.document.v1",
+        "front_matter": {"title": "Retry fixture", "authors": [], "affiliations": []},
+        "blocks": blocks,
+        "equations": [], "figures": [], "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete", "document_hash": "retry-fixture"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678",
+        parsed={"paper_id": "arXiv:1234.5678", "document": document},
+        document=document,
+        metadata={"title": "Retry fixture"}, references=[], citers=[],
+    )
+    calls: dict[str, int] = {}
+    calls_lock = threading.Lock()
+
+    def retrying_llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        with calls_lock:
+            calls[label] = calls.get(label, 0) + 1
+        is_retry = label.endswith("-retry-1")
+        segment_id = label.removeprefix("companion-translation-").removesuffix("-retry-1")
+        block_id_value = f"b{int(segment_id[-4:])}"
+        if is_retry:
+            assert "VALIDATION ERROR" in prompt
+            assert "opaque_inline_token_mismatch" in prompt
+            assert required_tokens[segment_id] in prompt
+            assert pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION in prompt
+            assert Path(kwargs["artifact_dir"]).name == "retry-1"
+            assert kwargs["env"] is None
+        valid = segment_id == "seg-0001" or (segment_id == "seg-0002" and is_retry)
+        text = f"译文 {required_tokens[segment_id]}。" if valid else "缺少控制器令牌。"
+        return {"blocks": [{"block_id": block_id_value, "text": text}]}
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    try:
+        _generate_translations(
+            segments,
+            options=BuildOptions(
+                paper_id=bundle.paper_id, project_dir=tmp_path / "project", workers=4,
+            ),
+            bundle=bundle,
+            glossary={"entries": []},
+            protected_names=[],
+            checkpoint_dir=checkpoint_dir,
+            llm=retrying_llm,
+        )
+    except CompanionLaneError as exc:
+        assert exc.lane == "translation"
+        assert {segment_id for segment_id, _ in exc.failures} == {"seg-0003", "seg-0004"}
+        assert all("opaque inline tokens" in str(error) for _, error in exc.failures)
+    else:
+        raise AssertionError("persistently invalid translations must fail the lane")
+
+    assert calls == {
+        "companion-translation-seg-0001": 1,
+        "companion-translation-seg-0002": 1,
+        "companion-translation-seg-0002-retry-1": 1,
+        "companion-translation-seg-0003": 1,
+        "companion-translation-seg-0003-retry-1": 1,
+        "companion-translation-seg-0004": 1,
+        "companion-translation-seg-0004-retry-1": 1,
+    }
+    saved_ids = {
+        json.loads(path.read_text(encoding="utf-8"))["segment_id"]
+        for path in (checkpoint_dir / "translations").glob("*.json")
+    }
+    assert saved_ids == {"seg-0001", "seg-0002"}
+
+    recovery_calls: list[str] = []
+
+    def recovery_llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        recovery_calls.append(label)
+        segment_id = label.removeprefix("companion-translation-")
+        block_id_value = f"b{int(segment_id[-4:])}"
+        return {
+            "blocks": [{"block_id": block_id_value, "text": f"译文 {required_tokens[segment_id]}。"}]
+        }
+
+    recovered = _generate_translations(
+        segments,
+        options=BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "project", workers=4),
+        bundle=bundle,
+        glossary={"entries": []},
+        protected_names=[],
+        checkpoint_dir=checkpoint_dir,
+        llm=recovery_llm,
+    )
+    assert list(recovered) == [segment["segment_id"] for segment in segments]
+    assert set(recovery_calls) == {
+        "companion-translation-seg-0003", "companion-translation-seg-0004",
+    }
+
+
+def test_non_token_translation_validation_errors_do_not_retry(tmp_path: Path) -> None:
+    scenarios = {
+        "coverage": {"blocks": []},
+        "empty": {"blocks": [{"block_id": "body", "text": ""}]},
+        "protected-name": {"blocks": [{"block_id": "body", "text": "此处省略姓名。"}]},
+    }
+    for scenario, generated in scenarios.items():
+        block = {
+            "block_id": "body", "type": "text", "text": "Ada presents the result.",
+            "inline_runs": [
+                _inline_run("text", "Ada presents the result.", 1),
+            ],
+        }
+        document = {
+            "schema_version": "arc.paper.document.v1",
+            "front_matter": {"title": "Validation fixture", "authors": [], "affiliations": []},
+            "blocks": [block],
+            "equations": [], "figures": [], "tables": [], "bibliography": [], "assets": [],
+            "integrity": {"status": "complete", "document_hash": f"fixture-{scenario}"},
+        }
+        bundle = SourceBundle(
+            paper_id="arXiv:1234.5678",
+            parsed={"paper_id": "arXiv:1234.5678", "document": document},
+            document=document,
+            metadata={"title": "Validation fixture"}, references=[], citers=[],
+        )
+        calls: list[str] = []
+
+        def invalid_llm(prompt: str, **kwargs):
+            calls.append(str(kwargs["call_label"]))
+            return generated
+
+        try:
+            _generate_translations(
+                [{"segment_id": "seg-0001", "block_ids": ["body"]}],
+                options=BuildOptions(
+                    paper_id=bundle.paper_id, project_dir=tmp_path / scenario, workers=1,
+                ),
+                bundle=bundle,
+                glossary={"entries": []},
+                protected_names=["Ada"],
+                checkpoint_dir=tmp_path / f"checkpoints-{scenario}",
+                llm=invalid_llm,
+            )
+        except CompanionLaneError as exc:
+            assert len(exc.failures) == 1
+            assert "retry-1" not in str(exc)
+        else:
+            raise AssertionError(f"{scenario} validation failure must fail the lane")
+        assert calls == ["companion-translation-seg-0001"]
 
 
 def test_generation_document_excludes_front_matter_and_all_source_only_sections() -> None:

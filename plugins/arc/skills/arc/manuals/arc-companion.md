@@ -77,6 +77,19 @@ followed by a high-tier consolidation review, with complete unit coverage and a
 bounded source anchor for every unit in the consolidation payload. Review
 patches may change translations and commentaries only.
 
+If a generated translation changes, drops, or reorders an opaque inline
+formula, citation, or link token,
+the controller gives only that unit one correction attempt. The correction
+prompt includes the precise validation error, the previous output, and the
+required byte-exact token sequence for every block. The corrected output must
+pass the same strict validation; the controller never repairs, normalizes, or
+relaxes formula, citation, or link tokens. Only a validated result is checkpointed,
+and a second mismatch is reported with the lane's aggregated failures. The
+correction runs offline because all required data is already frozen. Its prompt
+has a separate failure-only version embedded in the correction provenance, so
+changing correction guidance does not invalidate already valid content
+checkpoints through the global prompt fingerprint.
+
 The controller first submits exactly the first `min(workers, unit_count)`
 source-order units to both lanes. As soon as translation and commentary have
 both finished for that first wave, and before any remaining unit is submitted,
@@ -333,10 +346,12 @@ artifacts for diagnosis but never publishes a successful deliverable.
 - Failed segmentation window or local refinement: inspect the returned window,
   cut, and refinement diagnostics, then rerun the same build. Valid window
   checkpoints are retained; no partial final segmentation is accepted.
-- Failed glossary, translation, or commentary unit: rerun the build. Successful
-  independent work is not repeated. Translation and commentary lanes drain all
+- Failed glossary, translation, or commentary unit: rerun the build. A
+  translation with an opaque-token mismatch already receives one bounded
+  controller-guided correction attempt during that build. Successful independent
+  work is not repeated. Translation and commentary lanes drain all
   submitted units before reporting their aggregated failures, so later
-  successes remain checkpointed and the retry schedules only missing or stale
+  successes remain checkpointed and a new build schedules only missing or stale
   units.
 - If a traceback suggests that one early unit cancelled unrelated work, compare
   the traceback with checkpoint coverage and reproduce the scheduling behavior
