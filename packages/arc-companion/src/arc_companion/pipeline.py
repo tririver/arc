@@ -1141,7 +1141,7 @@ def _guard_translation_token_attempt_before_primary(
         )
     is_current = (
         value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
-        or value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
+        and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
     )
     if not is_current:
         return None
@@ -1334,24 +1334,29 @@ def _repair_translation_token_placement(
     persisted = _matching_translation_token_repair_draft(
         checkpoint_dir, segment_id, input_sha256,
     )
+    invalid_persisted_draft = False
     if persisted is not None:
         repaired = persisted["translation"]
-        _validate_translation(segment, repaired, blocks_by_id, protected_names)
-        prior_marker = _read_checkpoint_json(
-            _translation_token_attempt_path(checkpoint_dir, segment_id)
-        )
-        _write_validated_translation_token_marker(
-            checkpoint_dir,
-            segment_id,
-            input_sha256,
-            repaired=repaired,
-            raw_response=persisted["raw_response"],
-            repaired_block_ids=list(
-                persisted["repair_provenance"].get("repaired_block_ids") or []
-            ),
-            prior_marker=prior_marker if isinstance(prior_marker, dict) else None,
-        )
-        return repaired, dict(persisted["repair_provenance"])
+        try:
+            _validate_translation(segment, repaired, blocks_by_id, protected_names)
+        except RuntimeError:
+            invalid_persisted_draft = True
+        else:
+            prior_marker = _read_checkpoint_json(
+                _translation_token_attempt_path(checkpoint_dir, segment_id)
+            )
+            _write_validated_translation_token_marker(
+                checkpoint_dir,
+                segment_id,
+                input_sha256,
+                repaired=repaired,
+                raw_response=persisted["raw_response"],
+                repaired_block_ids=list(
+                    persisted["repair_provenance"].get("repaired_block_ids") or []
+                ),
+                prior_marker=prior_marker if isinstance(prior_marker, dict) else None,
+            )
+            return repaired, dict(persisted["repair_provenance"])
     attempt_path = _translation_token_attempt_path(checkpoint_dir, segment_id)
     raw_attempt = _read_checkpoint_json(attempt_path)
     if attempt_path.is_file() and raw_attempt is None:
@@ -1362,6 +1367,15 @@ def _repair_translation_token_placement(
     attempt = _matching_translation_token_attempt(
         checkpoint_dir, segment_id, input_sha256,
     )
+    if invalid_persisted_draft and not (
+        isinstance(attempt, dict)
+        and attempt.get("status") == "validated"
+        and isinstance(attempt.get("raw_response"), dict)
+    ):
+        raise RuntimeError(
+            f"translation token repair draft is invalid for {segment_id} and has no "
+            "validated raw response; refusing a new model call"
+        )
     raw_repair_draft = _read_checkpoint_json(repair_draft_path)
     if (
         repair_draft_path.is_file()
@@ -1572,9 +1586,6 @@ def _generate_translations(
         attempt = _matching_translation_coverage_attempt(
             checkpoint_dir, segment_id, input_hashes[segment_id]
         )
-        token_attempt = _guard_translation_token_attempt_before_primary(
-            checkpoint_dir, segment_id, input_hashes[segment_id]
-        )
         candidate_provenance: dict[str, Any] | None = None
         translation: dict[str, Any] | None = None
         if (
@@ -1602,10 +1613,6 @@ def _generate_translations(
             raise RuntimeError(
                 f"translation coverage repair attempt already consumed for {segment_id}"
             )
-        if token_attempt is not None and translation is None:
-            raise RuntimeError(
-                f"translation token placement repair attempt already consumed for {segment_id}"
-            )
         if segment_id in v4_upgrade_ids and (
             translation is None
             or str((candidate_provenance or {}).get("origin") or "") != "primary-model"
@@ -1616,6 +1623,13 @@ def _generate_translations(
             )
         if translatable:
             if translation is None:
+                guarded_attempt = _guard_translation_token_attempt_before_primary(
+                    checkpoint_dir, segment_id, input_hashes[segment_id]
+                )
+                if guarded_attempt is not None:
+                    raise RuntimeError(
+                        f"translation token placement repair attempt already consumed for {segment_id}"
+                    )
                 translation = _llm_call(
                     llm,
                     translation_prompt(

@@ -693,7 +693,8 @@ def test_started_token_repair_retries_medium_and_corrupt_draft_recovers(
         "schema_version": "arc.companion.translation-token-repair-draft.v1",
         "segment_id": segment["segment_id"], "input_sha256": "resume-input",
         "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
-        "translation": [], "repair_provenance": None,
+        "translation": {"blocks": []},
+        "repair_provenance": {"kind": "token-placement", "repaired_block_ids": ["body"]},
         "raw_response": {"damaged": True},
     }), encoding="utf-8")
 
@@ -764,6 +765,96 @@ def test_v4_upgrade_without_primary_draft_blocks_before_low_model(tmp_path: Path
         )
     assert calls == []
     assert "requires its stored primary draft" in str(exc_info.value.failures[0][1])
+
+
+def test_v3_attempt_v2_marker_migrates_to_v4_without_low(tmp_path: Path) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:0911.3380", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-v3-marker", "block_ids": ["body"]}
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1)
+    context = pipeline_module._full_paper_context(
+        document, segment, blocks_by_id={"body": block},
+    )
+    input_sha256 = pipeline_module._segment_input_hash(
+        segment, {"body": block}, glossary={"entries": []},
+        extra={"names": [], "paper_context": context,
+               "runtime_access": pipeline_module._generation_runtime_policy()},
+    )
+    checkpoint_dir = tmp_path / "checkpoints"
+    final_path = (
+        checkpoint_dir / "translations"
+        / f"{pipeline_module._segment_checkpoint_name(segment['segment_id'])}.json"
+    )
+    final_path.parent.mkdir(parents=True)
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    final_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-checkpoint.v2",
+        "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+        "generation_provenance": {"repairs": [{
+            "kind": "token-placement",
+            "prompt_version": "arc.companion.translation-retry-prompt.v3",
+        }]},
+        "translation": {"blocks": [{
+            "block_id": "body", "text": f"错误地把{token}作为对象。",
+        }]},
+    }), encoding="utf-8")
+    primary_path = pipeline_module._translation_draft_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    primary_path.parent.mkdir(parents=True)
+    primary_path.write_text(json.dumps(
+        pipeline_module._translation_primary_draft_payload(
+            segment,
+            {"blocks": [{"block_id": "body", "text": "缺少令牌。"}]},
+            input_sha256=input_sha256, origin="primary-model",
+        )
+    ), encoding="utf-8")
+    old_marker = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    old_marker.parent.mkdir(parents=True)
+    old_marker.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-attempt.v2",
+        "prompt_version": "arc.companion.translation-retry-prompt.v3",
+        "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+        "status": "validated",
+    }), encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+
+    def repair_llm(prompt: str, **kwargs):
+        calls.append((str(kwargs["call_label"]), str(kwargs["model_tier"])))
+        slot_ids = pipeline_module._translation_repair_slot_ids(block)
+        return {"repairs": [{"block_id": "body", "slots": [
+            {"slot_id": slot_ids[0], "text": "修复后的"},
+            {"slot_id": slot_ids[1], "text": "。"},
+        ]}]}
+
+    result = _generate_translations(
+        [segment], options=options, bundle=bundle, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir, llm=repair_llm,
+    )
+    assert calls == [("companion-translation-seg-v3-marker-retry-1", "medium")]
+    assert result[segment["segment_id"]]["blocks"][0]["text"] == (
+        f"修复后的{token}。"
+    )
+    migrated_marker = json.loads(old_marker.read_text(encoding="utf-8"))
+    assert migrated_marker["prompt_version"] == pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION
+    assert migrated_marker["status"] == "validated"
 
 
 @pytest.mark.parametrize("marker_kind", ["unreadable", "malformed-current"])
@@ -852,7 +943,8 @@ def test_damaged_current_repair_draft_without_validated_raw_fails_closed(
         "schema_version": "arc.companion.translation-token-repair-draft.v1",
         "segment_id": segment["segment_id"], "input_sha256": "damaged-input",
         "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
-        "translation": [], "repair_provenance": None,
+        "translation": {"blocks": []},
+        "repair_provenance": {"kind": "token-placement", "repaired_block_ids": ["body"]},
         "raw_response": {"repairs": []},
     }), encoding="utf-8")
     calls = 0
@@ -862,7 +954,7 @@ def test_damaged_current_repair_draft_without_validated_raw_fails_closed(
         calls += 1
         raise AssertionError("damaged current draft must not trigger a model")
 
-    with pytest.raises(RuntimeError, match="draft is corrupt"):
+    with pytest.raises(RuntimeError, match="no validated raw response"):
         pipeline_module._repair_translation_token_placement(
             segment,
             {"blocks": [{"block_id": "body", "text": "译文。"}]},
