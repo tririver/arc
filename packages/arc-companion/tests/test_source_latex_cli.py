@@ -525,8 +525,14 @@ def test_source_only_toc_acknowledgments_and_references_render_once_with_toc_str
     assert tex.count(r"\begin{enumerate}") >= 2
     assert r"\hyperref[S1]{1 Main}" in tex
     assert r"\hyperref[S1.SS1]{1.1 Detail}" in tex
+    assert manifest["rendered_links"] == manifest["expected_links"]
     assert manifest["companion_layers"]["semantic_segment_ids"] == ["body"]
     assert validate_tex_fidelity(tex, document, manifest) == []
+
+    manifest["rendered_links"].append(dict(manifest["rendered_links"][0]))
+    assert "rendered 1 unregistered source link occurrence(s)" in validate_tex_fidelity(
+        tex, document, manifest,
+    )
 
 
 def test_multirow_equations_preserve_each_number_and_label(tmp_path: Path) -> None:

@@ -330,6 +330,8 @@ def validate_tex_fidelity(tex: str, document: dict[str, Any], manifest: dict[str
         target = expected.get("target_id")
         if target and not allow_unresolved_targets and f"\\label{{{_safe_label(target)}}}" not in tex:
             errors.append(f"internal link target was not rendered: {target}")
+    if rendered_links:
+        errors.append(f"rendered {len(rendered_links)} unregistered source link occurrence(s)")
     expected_tables = [_table_audit_record(item) for item in document.get("tables") or []]
     if manifest.get("tables") != expected_tables:
         errors.append("source table manifest does not match the current document")
