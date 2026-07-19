@@ -39,6 +39,14 @@ from .prompts import (
     section_review_prompt,
     translation_prompt,
 )
+from .projection import (
+    annotation_input_block as _project_annotation_input_block,
+    is_translatable as _project_is_translatable,
+    opaque_inline_token as _project_opaque_inline_token,
+    opaque_inline_tokens as _project_opaque_inline_tokens,
+    prompt_safe_value as _project_prompt_safe_value,
+    translation_input_block as _project_translation_input_block,
+)
 from .results import err, ok
 from .segmentation import SegmentationError, segment_document, validate_exact_coverage
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
@@ -1274,82 +1282,27 @@ def _evidence(bundle: SourceBundle) -> dict[str, Any]:
     }
 
 
-_NON_TRANSLATABLE_TYPES = {
-    "equation", "math", "display_math", "figure", "table",
-    "bibliography", "bibliography_item", "reference",
-}
-
-
 def _is_translatable(block: dict[str, Any]) -> bool:
-    kind = str(block.get("type") or block.get("kind") or "").casefold()
-    if kind in _NON_TRANSLATABLE_TYPES:
-        return False
-    return bool(str(block.get("text") or block.get("title") or "").strip())
+    return _project_is_translatable(block)
 
 
 def _translation_input_block(block: dict[str, Any]) -> dict[str, Any]:
-    inline_runs = list(block.get("inline_runs") or [])
-    text = str(block.get("text") or block.get("title") or "")
-    if inline_runs:
-        text = "".join(
-            str(run.get("content") or "")
-            if str(run.get("kind") or "") == "text"
-            else _opaque_inline_token(run)
-            for run in inline_runs
-            if isinstance(run, dict)
-        )
-    value = {
-        "block_id": block_id(block),
-        "type": str(block.get("type") or block.get("kind") or "text"),
-        "text": text,
-    }
-    for key in ("section_id", "level", "items", "list_items"):
-        if key in block:
-            value[key] = block[key]
-    return value
+    return _project_translation_input_block(block)
 
 
 def _opaque_inline_token(run: dict[str, Any]) -> str:
-    token_id = str(run.get("token_id") or "")
-    content_hash = str(run.get("content_hash") or "")
-    if not token_id or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
-        raise RuntimeError("rich inline run lacks a stable token id or content hash")
-    return f"[[ARC_INLINE:{token_id}:{content_hash}]]"
+    return _project_opaque_inline_token(run)
 
 
 _OPAQUE_INLINE_PATTERN = re.compile(r"\[\[ARC_INLINE:[^\]\s]+:[0-9a-f]{64}\]\]")
 
 
 def _opaque_inline_tokens(block: dict[str, Any]) -> list[str]:
-    return [
-        _opaque_inline_token(run)
-        for run in block.get("inline_runs") or []
-        if isinstance(run, dict) and str(run.get("kind") or "") != "text"
-    ]
+    return _project_opaque_inline_tokens(block)
 
 
 def _annotation_input_block(block: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
-    kind = str(block.get("type") or block.get("kind") or "text")
-    value: dict[str, Any] = {"block_id": block_id(block), "type": kind}
-    for key in ("text", "title", "caption", "section_id", "section_title", "level", "items", "list_items"):
-        if key in block:
-            value[key] = _prompt_safe_value(block[key])
-    singular = {"equation": "equations", "figure": "figures", "table": "tables"}.get(kind.casefold())
-    if singular:
-        entity_id = str(
-            block.get(f"{singular[:-1]}_id") or block.get("entity_id") or block.get("ref_id") or ""
-        )
-        for entity in document.get(singular) or []:
-            candidate_id = str(entity.get("id") or entity.get(f"{singular[:-1]}_id") or "")
-            if entity_id and candidate_id == entity_id:
-                allowed = {
-                    key: _prompt_safe_value(entity[key])
-                    for key in ("id", "tex", "printed_equation_numbers", "tag", "caption", "rows", "column_count")
-                    if key in entity
-                }
-                value[singular[:-1]] = allowed
-                break
-    return value
+    return _project_annotation_input_block(block, document)
 
 
 def _full_paper_context(
@@ -1440,16 +1393,7 @@ def _bounded_projection(value: dict[str, Any], limit: int) -> dict[str, Any]:
 
 
 def _prompt_safe_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _prompt_safe_value(item)
-            for key, item in value.items()
-            if "html" not in str(key).casefold()
-            and str(key).casefold() not in {"cache_path", "local_path", "asset_bytes"}
-        }
-    if isinstance(value, list):
-        return [_prompt_safe_value(item) for item in value]
-    return value
+    return _project_prompt_safe_value(value)
 
 
 def _shrink_paper_context(context: dict[str, Any], *, max_chars: int) -> None:

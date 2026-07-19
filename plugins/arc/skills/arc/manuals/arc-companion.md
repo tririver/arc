@@ -217,17 +217,20 @@ the final paper endpoint, then converts accepted cuts into canonical
 order; no LLM-provided source range is trusted.
 
 Every resulting unit must satisfy the implementation's fine-grain hard limits:
-at most 24 atomic blocks or 60,000 characters of JSON-serialized semantic
-source payload. The character guard excludes preservation-only raw HTML fields
-(`html`, `*_html`, and `html_*`) from size accounting while retaining text,
-mathematics, captions, labels, structure, and other segmentation-relevant
-source data. This accounting rule does not delete, rewrite, or unpin raw HTML
-or any other content in the pinned `arc-paper` document and does not narrow the
-source-fidelity contract. When a unit is too large, only that unit is sent for
-another medium stateless cut-only refinement. Refinement is limited to three
-local rounds. An unresolved oversized unit is a blocking segmentation failure;
-the controller does not silently accept it, mechanically split source
-structures, or fall back to LLM-authored source data.
+at most 24 atomic blocks or 60,000 characters in the largest actual source-block
+projection supplied to either the translation or commentary prompt. The
+projection retains the text, opaque inline tokens, compact TeX, captions,
+labels, and structure those agents receive; it does not count rich-document
+preservation data such as raw HTML, MathML, formula-layout records, or assets
+that stay controller-owned and never enter those prompt fields. This accounting
+rule does not delete, rewrite, or unpin any content in the pinned `arc-paper`
+document and does not narrow the source-fidelity contract. When a splittable
+unit is too large, only that unit is sent for another medium stateless cut-only
+refinement. Refinement is limited to three local rounds. An individual atomic
+block, including an indivisible display-equation block, is never mechanically
+split to satisfy a prompt-size guard. An unresolved oversized splittable unit
+is a blocking segmentation failure; the controller does not silently accept it,
+mechanically split source structures, or fall back to LLM-authored source data.
 
 Before translation and commentary start, validation must prove that the merged ranges cover
 every source block exactly once, in order, with no gap, overlap, duplicate,

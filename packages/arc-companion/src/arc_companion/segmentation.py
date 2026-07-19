@@ -7,10 +7,11 @@ from typing import Any, Callable
 
 from .io import read_json, sha256_json, write_json
 from .prompts import CUT_SCHEMA, segmentation_prompt
+from .projection import annotation_input_block, is_translatable, translation_input_block
 from .source import block_id
 
 
-SEGMENTATION_VERSION = "arc.companion.segmentation.v3"
+SEGMENTATION_VERSION = "arc.companion.segmentation.v4"
 WINDOW_MAX_BLOCKS = 100
 WINDOW_MAX_PROJECTED_CHARS = 30_000
 SEGMENT_HARD_MAX_BLOCKS = 24
@@ -383,7 +384,7 @@ def segment_document(
             (
                 f"{item['segment_id']}[{item['start_ordinal']}..{item['end_ordinal']}; "
                 f"blocks={item['block_count']}; "
-                f"semantic_chars={item['semantic_source_chars']}]"
+                f"prompt_projection_chars={item['prompt_projection_chars']}]"
             )
             for item in oversized[:8]
         ]
@@ -526,42 +527,38 @@ def _oversized_segments(
         start = positions[str(segment["start_block_id"])]
         end = positions[str(segment["end_block_id"])]
         selected = blocks[start - 1:end]
-        semantic_source_chars = len(json.dumps(
-            _semantic_source_payload(selected),
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        ))
+        annotation_projection = [
+            annotation_input_block(block, document) for block in selected
+        ]
+        translation_projection = [
+            translation_input_block(block) for block in selected if is_translatable(block)
+        ]
+        prompt_projection_chars = max(
+            _serialized_chars(annotation_projection),
+            _serialized_chars(translation_projection),
+        )
         if len(selected) > 1 and (
             len(selected) > SEGMENT_HARD_MAX_BLOCKS
-            or semantic_source_chars > SEGMENT_HARD_MAX_SOURCE_CHARS
+            or prompt_projection_chars > SEGMENT_HARD_MAX_SOURCE_CHARS
         ):
             oversized.append({
                 "segment_id": str(segment["segment_id"]),
                 "start_ordinal": start,
                 "end_ordinal": end,
                 "block_count": len(selected),
-                "semantic_source_chars": semantic_source_chars,
+                "prompt_projection_chars": prompt_projection_chars,
             })
     return oversized
 
 
-def _semantic_source_payload(value: Any) -> Any:
-    """Remove preservation-only HTML while retaining segmentation semantics."""
-    if isinstance(value, list):
-        return [_semantic_source_payload(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _semantic_source_payload(item)
-            for key, item in value.items()
-            if not _is_preservation_html_field(key)
-        }
-    return value
-
-
-def _is_preservation_html_field(key: Any) -> bool:
-    normalized = str(key).casefold()
-    return normalized == "html" or normalized.endswith("_html") or normalized.startswith("html_")
+def _serialized_chars(value: Any) -> int:
+    return len(json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    ))
 
 
 def _window_record(

@@ -9,6 +9,7 @@ import threading
 import pytest
 
 from arc_companion.prompts import CUT_SCHEMA
+from arc_companion.projection import annotation_input_block
 from arc_companion.segmentation import (
     SegmentationError,
     build_block_inventory,
@@ -328,6 +329,62 @@ def test_preservation_html_does_not_inflate_semantic_refinement_size(tmp_path: P
     assert not list((tmp_path / "segmentation" / "refinements").rglob("*.json"))
     assert (tmp_path / "segmentation.json").is_file()
     assert document == original
+
+
+def test_rich_inline_math_and_equation_layout_do_not_inflate_prompt_projection(
+    tmp_path: Path,
+) -> None:
+    document = _document(["prose", "equation", "prose"], section_size=100)
+    for index, block in enumerate(document["blocks"], start=1):
+        block["inline_runs"] = [{
+            "kind": "math",
+            "token_id": f"math-{index}",
+            "content_hash": f"{index}" * 64,
+            "content": "m" * 24_000,
+            "mathml": "<math>" + ("x" * 24_000) + "</math>",
+            "layout": {"cells": ["y" * 24_000]},
+        }]
+    document["equations"][0]["mathml"] = "<math>" + ("z" * 30_000) + "</math>"
+    document["equations"][0]["layout"] = {"rows": ["w" * 30_000]}
+    projected_equation = annotation_input_block(document["blocks"][1], document)["equation"]
+    assert projected_equation["tex"] == ["x_{2}=y_{2}"]
+    assert "mathml" not in projected_equation
+    assert "layout" not in projected_equation
+    original = deepcopy(document)
+    calls: list[str] = []
+
+    segments = segment_document(
+        document,
+        checkpoint_dir=tmp_path,
+        workers=1,
+        force=False,
+        call_model=_cut_model({}, calls),
+    )
+
+    assert calls == ["companion-segmentation-w-0001-attempt-1"]
+    assert len(segments) == 1
+    assert not list((tmp_path / "segmentation" / "refinements").rglob("*.json"))
+    assert document == original
+
+
+def test_indivisible_display_equation_is_not_mechanically_refined_for_size(
+    tmp_path: Path,
+) -> None:
+    document = _document(["equation"], section_size=100)
+    document["equations"][0]["tex"] = ["x" * 70_000]
+    calls: list[str] = []
+
+    segments = segment_document(
+        document,
+        checkpoint_dir=tmp_path,
+        workers=1,
+        force=False,
+        call_model=_cut_model({}, calls),
+    )
+
+    assert calls == []
+    assert segments[0]["block_ids"] == ["b0001"]
+    assert not list((tmp_path / "segmentation" / "refinements").rglob("*.json"))
 
 
 def test_large_non_html_semantic_fields_still_trigger_refinement_failure(
