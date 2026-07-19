@@ -164,9 +164,15 @@ tools it names.
   stay opt-in through `ARC_RUN_NET_TESTS=1`.
 - Keep tests close to the module they cover. Use repository-level tests only for
   cross-package integration behavior.
-- Put generated ARC workflow/test-run project artifacts under `arc-tests/`; do
-  not create ad hoc run directories at repository root or inside package
-  directories. Workflow runs that exercise planning should write
+- Keep ARC development assets, including package-local unit tests and fixtures,
+  in their designated repository locations. For every non-development
+  execution that uses or evaluates ARC—including workflow tests, benchmarks,
+  integration or evaluation runs, and ordinary research use—create the project
+  or run directory under the git-ignored `arc-tests/` tree and write all
+  generated artifacts there. Do not create ad hoc project, run, benchmark, or
+  output directories at the repository root, under `packages/` or `plugins/`,
+  or elsewhere in source directories.
+- Workflow runs that exercise planning should write
   `<project-dir>/work-note.md` and archived work-note versions under the run
   directory instead of separate foundation artifacts.
 
