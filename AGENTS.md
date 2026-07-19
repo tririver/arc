@@ -172,6 +172,10 @@ tools it names.
   generated artifacts there. Do not create ad hoc project, run, benchmark, or
   output directories at the repository root, under `packages/` or `plugins/`,
   or elsewhere in source directories.
+- Never write test, workflow, benchmark, evaluation, preview, render, log, or
+  other run-generated information to a path that is not covered by the
+  repository's git-ignore rules. Use `arc-tests/` for all such output, and
+  verify the selected path is ignored before starting the run.
 - Workflow runs that exercise planning should write
   `<project-dir>/work-note.md` and archived work-note versions under the run
   directory instead of separate foundation artifacts.
