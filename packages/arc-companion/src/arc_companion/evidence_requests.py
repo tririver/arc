@@ -1,28 +1,41 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import hashlib
 from itertools import islice
 import re
+import threading
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .evidence import (
     EvidenceProvenanceError,
     arc_cache_descriptor,
+    inspire_abstract_descriptor,
+    json_sha256,
     text_sha256,
     validate_evidence_record,
 )
 
 
 EVIDENCE_REQUEST_VERSION = "arc.companion.evidence-request.v1"
-EVIDENCE_RESOLUTION_VERSION = "arc.companion.evidence-resolution.v1"
+EVIDENCE_RESOLUTION_VERSION = "arc.companion.evidence-resolution.v2"
 LANE_NAMES = ("arc", "inspire", "web")
 _RELATIONS = {"prior", "later", "context"}
 _MAX_GRAPH_RESULTS_PER_ANCHOR = 48
+_MAX_GRAPH_ANCHORS = 24
 _MAX_DISCOVERED_PAPERS_PER_REQUEST = 96
+_MAX_WEB_RESULTS_PER_QUERY = 24
+_MAX_QUERIES_PER_REQUEST = 8
+_MAX_LANE_RESULTS = 256
+_MAX_TOTAL_CANDIDATES = 512
 
 EvidenceLane = Callable[[list[dict[str, Any]]], Iterable[dict[str, Any]]]
+WebSearch = Callable[[str], Iterable[dict[str, Any]]]
+
+
+class EvidenceLaneUnavailable(RuntimeError):
+    """Raised when the active host has no provider for a discovery lane."""
 
 
 class EvidenceDiscoveryAdapter(Protocol):
@@ -52,6 +65,9 @@ class EvidenceDiscoveryAdapter(Protocol):
 
 class ArcPaperEvidenceAdapter:
     """Default adapter backed by public ``arc-paper`` service operations."""
+
+    def __init__(self, *, web_search: WebSearch | None = None) -> None:
+        self._web_search = web_search
 
     def search_arc_full_text(
         self, paper_ids: list[str], query: str,
@@ -91,15 +107,95 @@ class ArcPaperEvidenceAdapter:
         return data if isinstance(data, list) else []
 
     def search_inspire(self, query: str) -> Iterable[dict[str, Any]]:
-        # arc-paper does not yet expose free-form INSPIRE search.  Candidate
-        # expansion through seed references/citers remains available; hosts
-        # with scholarly search inject this method.
-        return []
+        from arc_paper import service
+
+        result = service.search_inspire(query, limit=20)
+        data = result.get("data") if isinstance(result, dict) and result.get("ok") else None
+        if data is None:
+            error = result.get("error") if isinstance(result, dict) else None
+            raise RuntimeError(f"INSPIRE search failed: {error or 'unknown error'}")
+        return data if isinstance(data, list) else []
 
     def search_web(self, query: str) -> Iterable[dict[str, Any]]:
-        # Web search is deliberately host-provided.  Raw snippets are discovery
-        # hints only and still pass through paper verification below.
-        return []
+        if self._web_search is None:
+            raise EvidenceLaneUnavailable("host web search provider is not configured")
+        return self._web_search(query)
+
+
+class CachingEvidenceDiscoveryAdapter:
+    """Share completed and in-flight provider calls across all requests/lanes."""
+
+    def __init__(self, backend: EvidenceDiscoveryAdapter) -> None:
+        self._backend = backend
+        self._lock = threading.Lock()
+        self._calls: dict[tuple[Any, ...], Future[tuple[dict[str, Any], ...] | dict[str, Any] | None]] = {}
+
+    def search_arc_full_text(self, paper_ids: list[str], query: str) -> Iterable[dict[str, Any]]:
+        return self._many(
+            ("arc_search", tuple(paper_ids), query),
+            lambda: self._backend.search_arc_full_text(paper_ids, query),
+        )
+
+    def get_parsed_source(self, paper_id: str) -> dict[str, Any] | None:
+        return self._one(("parsed", paper_id), lambda: self._backend.get_parsed_source(paper_id))
+
+    def get_metadata(self, paper_id: str) -> dict[str, Any] | None:
+        return self._one(("metadata", paper_id), lambda: self._backend.get_metadata(paper_id))
+
+    def get_references(self, paper_id: str) -> Iterable[dict[str, Any]]:
+        return self._many(
+            ("references", paper_id),
+            lambda: islice(self._backend.get_references(paper_id), _MAX_GRAPH_RESULTS_PER_ANCHOR),
+        )
+
+    def get_citers(self, paper_id: str) -> Iterable[dict[str, Any]]:
+        return self._many(
+            ("citers", paper_id),
+            lambda: islice(self._backend.get_citers(paper_id), _MAX_GRAPH_RESULTS_PER_ANCHOR),
+        )
+
+    def search_inspire(self, query: str) -> Iterable[dict[str, Any]]:
+        return self._many(
+            ("inspire_search", query),
+            lambda: islice(self._backend.search_inspire(query), _MAX_DISCOVERED_PAPERS_PER_REQUEST),
+        )
+
+    def search_web(self, query: str) -> Iterable[dict[str, Any]]:
+        return self._many(
+            ("web_search", query),
+            lambda: islice(self._backend.search_web(query), _MAX_WEB_RESULTS_PER_QUERY),
+        )
+
+    def _many(
+        self, key: tuple[Any, ...], load: Callable[[], Iterable[dict[str, Any]]],
+    ) -> tuple[dict[str, Any], ...]:
+        value = self._memo(key, lambda: tuple(dict(item) for item in load()))
+        return value if isinstance(value, tuple) else ()
+
+    def _one(
+        self, key: tuple[Any, ...], load: Callable[[], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        value = self._memo(key, lambda: dict(found) if (found := load()) is not None else None)
+        return value if isinstance(value, dict) else None
+
+    def _memo(
+        self,
+        key: tuple[Any, ...],
+        load: Callable[[], tuple[dict[str, Any], ...] | dict[str, Any] | None],
+    ) -> tuple[dict[str, Any], ...] | dict[str, Any] | None:
+        owner = False
+        with self._lock:
+            future = self._calls.get(key)
+            if future is None:
+                future = Future()
+                self._calls[key] = future
+                owner = True
+        if owner:
+            try:
+                future.set_result(load())
+            except BaseException as exc:
+                future.set_exception(exc)
+        return future.result()
 
 
 @dataclass(frozen=True)
@@ -159,7 +255,14 @@ class EvidenceRequestController:
             for future in as_completed(futures):
                 name = futures[future]
                 try:
-                    output = [dict(item) for item in future.result()]
+                    output = [dict(item) for item in islice(future.result(), _MAX_LANE_RESULTS)]
+                except EvidenceLaneUnavailable as exc:
+                    lane_outputs[name] = []
+                    audit_lanes[name] = {
+                        "status": "unavailable",
+                        "reason": str(exc),
+                        "raw_results": [],
+                    }
                 except Exception as exc:  # one failed lane never cancels another
                     lane_outputs[name] = []
                     audit_lanes[name] = {
@@ -169,7 +272,11 @@ class EvidenceRequestController:
                     }
                 else:
                     lane_outputs[name] = output
-                    audit_lanes[name] = {"status": "complete", "raw_results": output}
+                    audit_lanes[name] = {
+                        "status": "complete",
+                        "raw_results": [_audit_candidate(item) for item in output],
+                        "truncated": len(output) == _MAX_LANE_RESULTS,
+                    }
 
         registry: list[dict[str, Any]] = []
         alias_to_id: dict[str, str] = {}
@@ -196,7 +303,7 @@ class EvidenceRequestController:
                 for candidate in lane_outputs.get(lane_name, [])
             ),
             key=lambda item: (-_score(item[1].get("relevance_score")), LANE_NAMES.index(item[0])),
-        )
+        )[:_MAX_TOTAL_CANDIDATES]
         for lane_name, candidate in ranked_candidates:
             request_key = str(candidate.get("request_key") or "")
             request = request_by_key.get(request_key)
@@ -219,8 +326,15 @@ class EvidenceRequestController:
                 rejected.append({**base, "reason": f"invalid_record: {exc}"})
                 continue
             descriptor = record["source_descriptor"]
-            if descriptor.get("source_type") == "web" and candidate.get("verified_source") is not True:
+            if lane_name == "web" and candidate.get("verified_source") is not True:
                 rejected.append({**base, "reason": "web_snippet_not_claim_evidence"})
+                continue
+            if (
+                lane_name == "inspire"
+                and record.get("evidence_level") == "abstract_only"
+                and descriptor.get("source_type") != "inspire_record"
+            ):
+                rejected.append({**base, "reason": "unverified_discovery_abstract"})
                 continue
             if str(record.get("relation") or "") != request["relation"]:
                 rejected.append({**base, "reason": "relation_mismatch"})
@@ -268,7 +382,8 @@ class EvidenceRequestController:
                 "lanes": audit_lanes,
                 "accepted": accepted,
                 "rejected": rejected,
-                "claim_evidence_policy": "verified_paper_or_fetched_web_sources",
+                "claim_evidence_policy": "verified_arc_full_text_or_inspire_abstract",
+                "candidate_limit": _MAX_TOTAL_CANDIDATES,
             },
         )
 
@@ -308,7 +423,7 @@ def default_evidence_lanes(
     domain_paper_ids: Iterable[str] = (),
     seed_paper_ids: Iterable[str] = (),
 ) -> dict[str, EvidenceLane]:
-    backend = adapter or ArcPaperEvidenceAdapter()
+    backend = CachingEvidenceDiscoveryAdapter(adapter or ArcPaperEvidenceAdapter())
     domain_ids = _canonical_ids(domain_paper_ids)
     seed_ids = _canonical_ids(seed_paper_ids)
     return {
@@ -324,13 +439,15 @@ def _arc_lane(
     domain_paper_ids: list[str],
 ) -> Iterable[dict[str, Any]]:
     for request in requests:
-        explicit = _canonical_ids(request["candidate_paper_ids"])
+        explicit = _canonical_ids(request["candidate_paper_ids"])[
+            :_MAX_DISCOVERED_PAPERS_PER_REQUEST
+        ]
         pool = _canonical_ids([*domain_paper_ids, *explicit])
         discovered: dict[str, tuple[float, str]] = {
             paper_id: (0.25 if paper_id in explicit else 0.05, "explicit_candidate")
             for paper_id in explicit
         }
-        for query in request["queries"]:
+        for query in request["queries"][:_MAX_QUERIES_PER_REQUEST]:
             for hit in adapter.search_arc_full_text(pool, query):
                 paper_id = _paper_id(hit)
                 if not paper_id:
@@ -341,6 +458,10 @@ def _arc_lane(
                 current = discovered.get(paper_id)
                 if current is None or score > current[0]:
                     discovered[paper_id] = (score, "arc_full_text_query")
+                if len(discovered) >= _MAX_DISCOVERED_PAPERS_PER_REQUEST:
+                    break
+            if len(discovered) >= _MAX_DISCOVERED_PAPERS_PER_REQUEST:
+                break
         for paper_id, (score, source) in sorted(discovered.items(), key=lambda item: -item[1][0]):
             data = adapter.get_parsed_source(paper_id)
             record = _full_text_record(request, data, paper_id)
@@ -360,14 +481,20 @@ def _inspire_lane(
     seed_paper_ids: list[str],
 ) -> Iterable[dict[str, Any]]:
     for request in requests:
-        explicit = _canonical_ids(request["candidate_paper_ids"])
+        explicit = _canonical_ids(request["candidate_paper_ids"])[
+            :_MAX_DISCOVERED_PAPERS_PER_REQUEST
+        ]
         discovered: dict[str, tuple[float, str, dict[str, Any] | None]] = {
             value: (0.25, "explicit_candidate", None) for value in explicit
         }
-        for query in request["queries"]:
-            for hit in adapter.search_inspire(query):
+        for query in request["queries"][:_MAX_QUERIES_PER_REQUEST]:
+            for hit in islice(adapter.search_inspire(query), _MAX_DISCOVERED_PAPERS_PER_REQUEST):
                 _remember_discovery(discovered, request, hit, query, "inspire_query")
-        for anchor in _canonical_ids([*seed_paper_ids, *explicit]):
+                if len(discovered) >= _MAX_DISCOVERED_PAPERS_PER_REQUEST:
+                    break
+            if len(discovered) >= _MAX_DISCOVERED_PAPERS_PER_REQUEST:
+                break
+        for anchor in _canonical_ids([*seed_paper_ids, *explicit])[:_MAX_GRAPH_ANCHORS]:
             for source, values in (
                 ("inspire_reference", adapter.get_references(anchor)),
                 ("inspire_citer", adapter.get_citers(anchor)),
@@ -378,10 +505,12 @@ def _inspire_lane(
                     break
             if len(discovered) >= _MAX_DISCOVERED_PAPERS_PER_REQUEST:
                 break
-        for paper_id, (score, source, discovered_metadata) in sorted(
+        for paper_id, (score, source, _discovery_metadata) in sorted(
             discovered.items(), key=lambda item: -item[1][0]
         ):
-            metadata = adapter.get_metadata(paper_id) or discovered_metadata
+            # Search and graph payloads are discovery hints.  Registration is
+            # allowed only after a fresh provider-level metadata verification.
+            metadata = adapter.get_metadata(paper_id)
             record = _abstract_record(request, metadata, paper_id)
             if record is not None:
                 yield _candidate(
@@ -399,11 +528,16 @@ def _web_lane(
     for request in requests:
         discoveries = [
             {"url": url, "candidate_url": url}
-            for url in request["candidate_urls"]
+            for url in request["candidate_urls"][:_MAX_DISCOVERED_PAPERS_PER_REQUEST]
         ]
-        for query in request["queries"]:
-            discoveries.extend(dict(item) for item in adapter.search_web(query))
-        for hit in discoveries:
+        for query in request["queries"][:_MAX_QUERIES_PER_REQUEST]:
+            discoveries.extend(
+                dict(item)
+                for item in islice(adapter.search_web(query), _MAX_WEB_RESULTS_PER_QUERY)
+            )
+            if len(discoveries) >= _MAX_DISCOVERED_PAPERS_PER_REQUEST:
+                break
+        for hit in discoveries[:_MAX_DISCOVERED_PAPERS_PER_REQUEST]:
             paper_ids = _canonical_ids([
                 *_value_ids(hit.get("paper_id")),
                 *_value_ids(hit.get("candidate_paper_ids")),
@@ -538,6 +672,14 @@ def _abstract_record(
         evidence_level="abstract_only",
         content=abstract,
     )
+    record["source_descriptor"] = inspire_abstract_descriptor(
+        paper_id=paper_id,
+        title=record["title"],
+        authors=record["authors"],
+        year=record["year"],
+        abstract=abstract,
+    )
+    validate_evidence_record(record)
     record["canonical_aliases"] = _paper_aliases(metadata, paper_id)
     return record
 
@@ -700,6 +842,42 @@ def _record_quality(record: Mapping[str, Any]) -> int:
     return {"full_text": 2, "abstract_only": 1}.get(
         str(record.get("evidence_level") or ""), 0,
     )
+
+
+def _audit_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Return an auditable summary without embedding evidence payloads."""
+    record = candidate.get("record")
+    summary = {
+        "request_key": str(candidate.get("request_key") or ""),
+        "discovery_source": str(candidate.get("discovery_source") or ""),
+        "relevance_score": _score(candidate.get("relevance_score")),
+        "canonical_aliases": _canonical_ids(_value_ids(candidate.get("canonical_aliases"))),
+    }
+    if not isinstance(record, dict):
+        snippet = str(candidate.get("snippet") or "")
+        return {
+            **summary,
+            "candidate_url": str(candidate.get("candidate_url") or ""),
+            "discovery_only": True,
+            "excerpt": snippet[:240],
+            "content_sha256": text_sha256(snippet) if snippet else "",
+        }
+    descriptor = record.get("source_descriptor")
+    descriptor = descriptor if isinstance(descriptor, dict) else {}
+    excerpt = str(record.get("abstract") or "")
+    if not excerpt:
+        blocks = record.get("blocks")
+        if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict):
+            excerpt = str(blocks[0].get("text") or "")
+    return {
+        **summary,
+        "paper_id": str(record.get("paper_id") or ""),
+        "evidence_level": str(record.get("evidence_level") or ""),
+        "source_type": str(descriptor.get("source_type") or ""),
+        "canonical_locator": str(descriptor.get("canonical_locator") or ""),
+        "content_sha256": str(descriptor.get("content_sha256") or json_sha256(record)),
+        "excerpt": excerpt[:240],
+    }
 
 
 def _strings(value: Any) -> list[str]:

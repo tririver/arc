@@ -38,6 +38,21 @@ FULL_REFERENCE_RECORD = {
 }
 
 
+def test_inspire_search_metadata_consumes_query_and_limit():
+    observed = {}
+
+    def handler(request):
+        observed.update(dict(request.url.params))
+        return httpx.Response(200, json={"hits": {"hits": [INSPIRE_RECORD]}})
+
+    provider = InspireProvider(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    result = provider.search_metadata("specific mechanism", limit=7)
+
+    assert observed["q"] == "specific mechanism"
+    assert observed["size"] == "7"
+    assert result[0]["paper_id"] == "arXiv:0911.3380"
+
+
 def test_inspire_mathml_text_is_normalized(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     planck = '<math display="inline"><mi>P</mi><mi>l</mi><mi>a</mi><mi>n</mi><mi>c</mi><mi>k</mi></math>'

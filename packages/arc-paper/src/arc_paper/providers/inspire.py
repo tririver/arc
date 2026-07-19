@@ -49,6 +49,31 @@ class InspireProvider:
         raw = self.get_raw_record(paper_id, refresh=refresh)
         return _normalize_record(raw)
 
+    def search_metadata(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            raise ProviderError("inspire_search_query_required", "INSPIRE search requires a query")
+        size = _clamp_limit(limit)
+        response = self.client.get(
+            f"{BASE_URL}/literature",
+            params={
+                "q": normalized_query,
+                "size": str(size),
+                "sort": "mostcited",
+                "fields": SUMMARY_FIELDS,
+                "format": "json",
+            },
+            timeout=self.timeout,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError("inspire_search_failed", str(exc)) from exc
+        return [
+            _normalize_record(hit)
+            for hit in response.json().get("hits", {}).get("hits", [])[:size]
+        ]
+
     def get_references(self, paper_id: str, *, refresh: bool = False, enrich: bool = False) -> list[dict[str, Any]]:
         paths = _cache_paths_for_cached_paper(paper_id)
         references: list[dict[str, Any]]

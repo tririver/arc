@@ -220,6 +220,9 @@ def test_llm_infer_main_references_rejects_unverified_candidates(monkeypatch, tm
 
 
 class FakeInspire:
+    def search_metadata(self, query, *, limit=20):
+        return [{"paper_id": "arXiv:0911.3380", "title": query, "limit": limit}]
+
     def get_metadata(self, paper_id, *, refresh=False):
         return {
             "paper_id": "arXiv:0911.3380",
@@ -241,6 +244,17 @@ class FakeInspire:
 
     def get_citer_count(self, paper_id, *, refresh=False):
         return 5
+
+
+def test_search_inspire_uses_provider_query_and_limit(monkeypatch):
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+
+    result = service.search_inspire("specific mechanism", limit=7)
+
+    assert result["ok"] is True
+    assert result["data"] == [{
+        "paper_id": "arXiv:0911.3380", "title": "specific mechanism", "limit": 7,
+    }]
 
 
 class FakeAr5iv:

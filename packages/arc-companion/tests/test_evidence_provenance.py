@@ -7,12 +7,35 @@ import pytest
 from arc_companion.evidence import (
     EvidenceProvenanceError,
     arc_cache_descriptor,
+    inspire_abstract_descriptor,
     text_sha256,
     validate_annotation_citations,
     validate_cited_ids,
     validate_evidence_record,
     web_evidence_record,
 )
+
+
+def test_inspire_abstract_descriptor_has_independent_provider_identity() -> None:
+    abstract = "A provider-verified abstract."
+    record = {
+        "evidence_id": "inspire-abstract-1",
+        "relation": "context",
+        "paper_id": "arXiv:1234.5678",
+        "title": "Verified",
+        "authors": [],
+        "year": 2012,
+        "evidence_level": "abstract_only",
+        "abstract": abstract,
+        "blocks": [],
+        "source_descriptor": inspire_abstract_descriptor(
+            paper_id="arXiv:1234.5678", title="Verified", authors=[], year=2012,
+            abstract=abstract,
+        ),
+    }
+
+    assert validate_evidence_record(record) is record
+    assert record["source_descriptor"]["provider"] == "INSPIRE"
 
 
 def _arc_record(*, relation: str = "prior", evidence_id: str = "prior-001") -> dict:

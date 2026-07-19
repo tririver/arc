@@ -65,6 +65,29 @@ def arc_cache_descriptor(
     return descriptor
 
 
+def inspire_abstract_descriptor(
+    *, paper_id: str, title: str, authors: Any, year: Any, abstract: str,
+) -> dict[str, Any]:
+    """Describe an abstract independently fetched from an INSPIRE record."""
+    descriptor = {
+        "schema_version": SOURCE_DESCRIPTOR_VERSION,
+        "source_type": "inspire_record",
+        "provider": "INSPIRE",
+        "canonical_locator": str(paper_id).strip(),
+        "title": str(title or "").strip(),
+        "authors": _authors(authors),
+        "year": year,
+        "evidence_level": "abstract_only",
+        "content_sha256": json_sha256(str(abstract or "").strip()),
+        "locator": {
+            "paper_id": str(paper_id).strip(),
+            "field": "abstract",
+        },
+    }
+    validate_source_descriptor(descriptor)
+    return descriptor
+
+
 def web_evidence_record(
     *,
     relation: str,
@@ -146,7 +169,7 @@ def validate_source_descriptor(value: Any) -> dict[str, Any]:
     if value.get("schema_version") != SOURCE_DESCRIPTOR_VERSION:
         raise EvidenceProvenanceError("unsupported source descriptor schema")
     source_type = str(value.get("source_type") or "")
-    if source_type not in {"arc_cache", "web"}:
+    if source_type not in {"arc_cache", "inspire_record", "web"}:
         raise EvidenceProvenanceError(f"unsupported source type: {source_type}")
     level = str(value.get("evidence_level") or "")
     if level not in _EVIDENCE_LEVELS:
@@ -173,6 +196,14 @@ def validate_source_descriptor(value: Any) -> dict[str, Any]:
         document_hash = str(locator.get("document_hash") or "").casefold()
         if document_hash and not _SHA256.fullmatch(document_hash):
             raise EvidenceProvenanceError("ARC cache locator has an invalid document hash")
+    elif source_type == "inspire_record":
+        if value.get("provider") != "INSPIRE":
+            raise EvidenceProvenanceError("INSPIRE evidence must name the INSPIRE provider")
+        locator = value.get("locator")
+        if not isinstance(locator, dict) or str(locator.get("paper_id") or "").strip() != canonical:
+            raise EvidenceProvenanceError("INSPIRE locator does not match the canonical paper ID")
+        if str(locator.get("field") or "") != "abstract" or level != "abstract_only":
+            raise EvidenceProvenanceError("INSPIRE evidence must identify a verified abstract")
     else:
         canonical_url, _ = canonical_web_url(canonical)
         if canonical_url != canonical:
@@ -230,7 +261,7 @@ def validate_evidence_record(value: Any) -> dict[str, Any]:
         if evidence_id != f"web-{identity_hash[:20]}":
             raise EvidenceProvenanceError("web evidence ID is not derived from its recorded source")
     elif descriptor["content_sha256"] != json_sha256(content):
-        raise EvidenceProvenanceError("ARC descriptor hash does not match its recorded content")
+        raise EvidenceProvenanceError("paper descriptor hash does not match its recorded content")
     elif str(value.get("paper_id") or "").strip() != descriptor["canonical_locator"]:
         raise EvidenceProvenanceError("ARC evidence paper ID does not match its source descriptor")
     return value

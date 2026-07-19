@@ -222,6 +222,10 @@ def get_metadata(ids: str | Iterable[str], *, refresh: bool = False):
     return _map(ids, lambda paper_id: _call(lambda: _inspire.get_metadata(paper_id, refresh=refresh), "inspire"))
 
 
+def search_inspire(query: str, *, limit: int = 20) -> dict[str, Any]:
+    return _call(lambda: _inspire.search_metadata(query, limit=limit), "inspire")
+
+
 def get_references(ids: str | Iterable[str], *, refresh: bool = False, enrich: bool = False):
     return _map(
         ids,

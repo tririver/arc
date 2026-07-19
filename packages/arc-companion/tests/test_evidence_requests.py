@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import threading
+import json
 
 import jsonschema
 import pytest
 
 from arc_companion.evidence import arc_cache_descriptor, text_sha256, web_evidence_record
 from arc_companion.evidence_requests import (
+    ArcPaperEvidenceAdapter,
     EvidenceRequestController,
     EvidenceResolution,
     normalize_evidence_requests,
@@ -44,6 +46,26 @@ def _record(relation: str = "prior") -> dict:
     record["source_descriptor"] = arc_cache_descriptor(
         paper_id=record["paper_id"], title=record["title"], authors=[], year=2020,
         evidence_level="full_text", content=blocks, document_hash="d" * 64,
+    )
+    return record
+
+
+def _unverified_discovery_abstract(relation: str = "prior") -> dict:
+    abstract = "A search-result abstract that was not independently fetched."
+    record = {
+        "evidence_id": "unverified-abstract",
+        "relation": relation,
+        "paper_id": "arXiv:1234.5678",
+        "title": "Discovery result",
+        "authors": [],
+        "year": 2020,
+        "evidence_level": "abstract_only",
+        "abstract": abstract,
+        "blocks": [],
+    }
+    record["source_descriptor"] = arc_cache_descriptor(
+        paper_id=record["paper_id"], title=record["title"], authors=[], year=2020,
+        evidence_level="abstract_only", content=abstract,
     )
     return record
 
@@ -286,11 +308,151 @@ def test_unmapped_web_snippet_is_discovery_only() -> None:
     normalized = normalize_evidence_requests("seg-1", [_request()])
     result = EvidenceRequestController(adapter=adapter).resolve(normalized)
 
-    assert all(record["source_descriptor"]["source_type"] == "arc_cache" for record in result.records)
+    assert all(record["source_descriptor"]["source_type"] != "web" for record in result.records)
     assert any(
         item["lane"] == "web" and item["reason"] == "discovery_only_not_claim_evidence"
         for item in result.audit["rejected"]
     )
+
+
+def _install_production_service_fixture(monkeypatch, *, section_text="Verified full text."):
+    from arc_paper import service
+
+    calls = []
+    metadata = {
+        "paper_id": "arXiv:1234.5678", "arxiv_id": "1234.5678",
+        "doi": "10.1000/same", "inspire_recid": "123",
+        "title": "Specific mechanism", "abstract": "Specific mechanism abstract.",
+        "authors": [], "year": 2012,
+    }
+
+    def search_full_text(ids, *, query, limit):
+        calls.append(("arc_search", tuple(ids), query))
+        return {"ok": True, "data": [{
+            "paper_id": "arXiv:1234.5678", "snippet": "specific mechanism",
+        }]}
+
+    def parsed(paper_id):
+        calls.append(("parsed", paper_id))
+        return {"ok": True, "data": {
+            **metadata, "source_hash": "f" * 64,
+            "sections": [{"section_id": "S1", "text": section_text}],
+        }}
+
+    def get_metadata(paper_id):
+        calls.append(("metadata", paper_id))
+        return {"ok": True, "data": metadata}
+
+    def references(paper_id, *, enrich):
+        calls.append(("references", paper_id))
+        return {"ok": True, "data": [{**metadata, "paper_id": "arXiv:1234.5678"}]}
+
+    def citers(paper_id, *, limit):
+        calls.append(("citers", paper_id))
+        return {"ok": True, "data": [{**metadata, "paper_id": "arXiv:1234.5678"}]}
+
+    def inspire(query, *, limit):
+        calls.append(("inspire_search", query))
+        return {"ok": True, "data": [{**metadata, "paper_id": "arXiv:1234.5678"}]}
+
+    monkeypatch.setattr(service, "search_full_text", search_full_text)
+    monkeypatch.setattr(service, "get_parsed_source", parsed)
+    monkeypatch.setattr(service, "get_metadata", get_metadata)
+    monkeypatch.setattr(service, "get_references", references)
+    monkeypatch.setattr(service, "get_citers", citers)
+    monkeypatch.setattr(service, "search_inspire", inspire)
+    return calls
+
+
+def test_production_adapter_runs_real_service_paths_and_shares_inflight_cache(monkeypatch) -> None:
+    calls = _install_production_service_fixture(monkeypatch)
+    web_calls = []
+
+    def web_search(query):
+        web_calls.append(query)
+        return [{"paper_id": "arXiv:1234.5678", "url": "https://example.test/paper"}]
+
+    requests = normalize_evidence_requests("seg-1", [_request("prior"), _request("later")])
+    result = EvidenceRequestController(
+        adapter=ArcPaperEvidenceAdapter(web_search=web_search),
+        domain_paper_ids=["arXiv:1234.5678"],
+        seed_paper_ids=["arXiv:9999.9999"],
+    ).resolve(requests)
+
+    assert web_calls == ["specific mechanism"]
+    assert calls.count(("inspire_search", "specific mechanism")) == 1
+    assert calls.count(("references", "arXiv:9999.9999")) == 1
+    assert calls.count(("citers", "arXiv:9999.9999")) == 1
+    assert calls.count(("parsed", "arXiv:1234.5678")) == 1
+    assert calls.count(("metadata", "arXiv:1234.5678")) == 1
+    assert result.audit["schema_version"] == "arc.companion.evidence-resolution.v2"
+    assert {record["relation"] for record in result.records} == {"prior", "later"}
+    assert all(record["evidence_level"] == "full_text" for record in result.records)
+
+
+def test_production_adapter_marks_missing_web_provider_unavailable(monkeypatch) -> None:
+    _install_production_service_fixture(monkeypatch)
+    result = EvidenceRequestController(
+        adapter=ArcPaperEvidenceAdapter(),
+        domain_paper_ids=["arXiv:1234.5678"],
+    ).resolve(normalize_evidence_requests("seg-1", [_request()]))
+
+    assert result.audit["lanes"]["arc"]["status"] == "complete"
+    assert result.audit["lanes"]["inspire"]["status"] == "complete"
+    assert result.audit["lanes"]["web"]["status"] == "unavailable"
+
+
+def test_audit_is_bounded_and_never_embeds_full_evidence(monkeypatch) -> None:
+    secret_tail = "UNIQUE_FULL_TEXT_TAIL_" + "x" * 2000
+    _install_production_service_fixture(monkeypatch, section_text="prefix " + secret_tail)
+    yielded = []
+
+    def web_search(query):
+        for index in range(1000):
+            yielded.append(index)
+            yield {"url": f"https://example.test/{index}", "snippet": "discovery snippet"}
+
+    result = EvidenceRequestController(
+        adapter=ArcPaperEvidenceAdapter(web_search=web_search),
+        domain_paper_ids=["arXiv:1234.5678"],
+    ).resolve(normalize_evidence_requests("seg-1", [_request()]))
+
+    assert len(yielded) == 24
+    assert len(result.audit["lanes"]["web"]["raw_results"]) == 25
+    serialized = json.dumps(result.audit)
+    assert secret_tail not in serialized
+    assert max(
+        len(item.get("excerpt", ""))
+        for lane in result.audit["lanes"].values()
+        for item in lane["raw_results"]
+    ) <= 240
+
+
+def test_discovery_abstract_is_rejected_when_metadata_verification_fails() -> None:
+    adapter = _DiscoveryFixture()
+    adapter.get_metadata = lambda paper_id: None
+    adapter.get_parsed_source = lambda paper_id: None
+    request = _request()
+    request["candidate_paper_ids"] = []
+    result = EvidenceRequestController(adapter=adapter).resolve(
+        normalize_evidence_requests("seg-1", [request])
+    )
+
+    assert result.records == ()
+    assert result.evidence_ids_by_segment == {}
+
+    normalized = normalize_evidence_requests("seg-2", [_request()])
+    envelope = {
+        "request_key": normalized[0]["request_key"],
+        "record": _unverified_discovery_abstract(),
+    }
+    direct = EvidenceRequestController({
+        "arc": lambda requests: [],
+        "inspire": lambda requests: [envelope],
+        "web": lambda requests: [],
+    }).resolve(normalized)
+    assert direct.records == ()
+    assert direct.audit["rejected"][0]["reason"] == "unverified_discovery_abstract"
 
 
 def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypatch, tmp_path: Path) -> None:
