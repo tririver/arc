@@ -1139,12 +1139,14 @@ def _guard_translation_token_attempt_before_primary(
             f"translation token repair marker is unreadable for {segment_id}; "
             "refusing a primary model call"
         )
-    is_current = (
-        value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
-        and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
-    )
-    if not is_current:
+    prompt_version = str(value.get("prompt_version") or "")
+    if prompt_version == "arc.companion.translation-retry-prompt.v3":
         return None
+    if prompt_version != TRANSLATION_RETRY_PROMPT_VERSION:
+        raise RuntimeError(
+            f"translation token repair marker has unknown prompt identity for {segment_id}; "
+            "refusing a primary model call"
+        )
     if not (
         value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
         and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION

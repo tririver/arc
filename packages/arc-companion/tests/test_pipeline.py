@@ -857,7 +857,10 @@ def test_v3_attempt_v2_marker_migrates_to_v4_without_low(tmp_path: Path) -> None
     assert migrated_marker["status"] == "validated"
 
 
-@pytest.mark.parametrize("marker_kind", ["unreadable", "malformed-current"])
+@pytest.mark.parametrize(
+    "marker_kind",
+    ["unreadable", "malformed-current", "current-missing-schema", "unknown-prompt"],
+)
 def test_token_attempt_marker_fails_closed_before_low_model(
     tmp_path: Path, marker_kind: str,
 ) -> None:
@@ -894,12 +897,25 @@ def test_token_attempt_marker_fails_closed_before_low_model(
     marker_path.parent.mkdir(parents=True)
     if marker_kind == "unreadable":
         marker_path.write_text("{broken", encoding="utf-8")
-    else:
+    elif marker_kind == "malformed-current":
         marker_path.write_text(json.dumps({
             "schema_version": "arc.companion.translation-token-attempt.v2",
             "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
             "segment_id": segment["segment_id"],
             "input_sha256": input_sha256 + "-wrong",
+            "status": "started",
+        }), encoding="utf-8")
+    elif marker_kind == "current-missing-schema":
+        marker_path.write_text(json.dumps({
+            "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+            "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+            "status": "started",
+        }), encoding="utf-8")
+    else:
+        marker_path.write_text(json.dumps({
+            "schema_version": "arc.companion.translation-token-attempt.v2",
+            "prompt_version": "arc.companion.translation-retry-prompt.v99",
+            "segment_id": segment["segment_id"], "input_sha256": input_sha256,
             "status": "started",
         }), encoding="utf-8")
     calls: list[str] = []
