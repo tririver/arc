@@ -486,7 +486,7 @@ def test_parse_markdown_records_sections_equations_and_line_anchors(tmp_path):
 
     parsed = parse_source_input(source_path=markdown_path, source_id="notes")
 
-    assert parsed["parser_version"] == 19
+    assert parsed["parser_version"] == 20
     assert parsed["toc"] == [
         {"id": "sec_0001", "title": "Notes", "level": 1},
         {"id": "sec_0002", "title": "Details", "level": 2},
@@ -669,6 +669,32 @@ def test_pdf_mapping_uses_source_number_anchors_as_monotonic_bounds(monkeypatch,
 
     assert [equation.get("pdf_page") for equation in equations] == [1, 2, 3]
     assert equations[1]["printed_equation_number"] == "1.2"
+
+
+def test_pdf_mapping_accepts_ocr_spaced_labels_and_repeated_numbers(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\n$$ a = b \\tag{1} $$\n$$ c = d \\tag{2} $$\n"
+        "$$ e = f \\tag{1} $$\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "a = b ( 1 )\nc = d ( 2 )",
+            "e = f ( 1 )",
+        ],
+    )
+
+    equations = parse_source_input(markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes")[
+        "equations"
+    ]
+
+    assert [equation.get("pdf_page") for equation in equations] == [1, 1, 2]
+    assert [equation.get("printed_equation_number") for equation in equations] == ["1", "2", "1"]
 
 
 def test_source_number_does_not_anchor_to_wrong_page_without_formula_or_context(

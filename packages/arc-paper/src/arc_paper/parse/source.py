@@ -11,11 +11,16 @@ from .ar5iv_html import parse_html
 from .markdown_document import build_markdown_document
 
 
-PARSER_VERSION = 19
+PARSER_VERSION = 20
 PDF_PAGE_MATCH_MIN_SCORE = 8
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
 EQUATION_NUMBER_PATTERN = r"[A-Za-z]?\d+(?:\.\d+)+|\d+(?:\.\d+)*[A-Za-z]?"
+# Printed equation labels in scanned books are frequently OCR'd with spaces
+# around dots or between digits, e.g. ``( 1.1 . 7)``.  Keep the canonical
+# source-number grammar strict, but accept this layout variant when reading
+# the PDF text layer and normalize it before matching source tags.
+PRINTED_EQUATION_NUMBER_PATTERN = r"(?:[A-Za-z]?\s*\d+(?:\s*\.\s*\d+)+|\s*\d+(?:\s*\.\s*\d+)*[A-Za-z]?)\s*"
 MATH_LIKE_CHARS = set("=+-*/^_<>≤≥∝⇒≡−•·√∂∇πρφΩωηε")
 GREEK_TOKEN_NAMES = {
     "\u03b1": "alpha",
@@ -838,7 +843,7 @@ def _text_context_line(line: str) -> str:
 
 
 def _pdf_equation_candidate(line: str) -> str:
-    cleaned = re.sub(rf"\(({EQUATION_NUMBER_PATTERN})\)\s*$", "", line).strip()
+    cleaned = re.sub(rf"\(({PRINTED_EQUATION_NUMBER_PATTERN})\)\s*$", "", line).strip()
     if "=" not in cleaned:
         return ""
     tokens = _search_tokens(cleaned)
@@ -848,8 +853,8 @@ def _pdf_equation_candidate(line: str) -> str:
 
 
 def _line_equation_number(line: str) -> str | None:
-    match = re.search(rf"\(({EQUATION_NUMBER_PATTERN})\)\s*$", line)
-    return match.group(1) if match else None
+    match = re.search(rf"\(({PRINTED_EQUATION_NUMBER_PATTERN})\)\s*$", line)
+    return re.sub(r"\s+", "", match.group(1)) if match else None
 
 
 def _first_heading_like_line(page: str) -> str:
@@ -1052,15 +1057,33 @@ def _monotonic_tag_anchors(
             if page_index not in page_numbers:
                 page_numbers.append(page_index)
 
-    candidates: list[tuple[int, int]] = []
+    # Equation numbers are not globally unique in books that restart numbering
+    # by chapter (and short labels such as ``(1)`` repeat especially often).
+    # Resolve them in source order instead of selecting only globally unique
+    # labels.  The first candidate after the preceding anchor with formula or
+    # nearby-prose evidence is the stable page anchor; this keeps subsequent
+    # unnumbered displays within the correct local page interval.
+    anchors: list[tuple[int, int]] = []
+    previous_page = 0
     for equation_index, equation in enumerate(equations):
         tags = _source_equation_numbers(str(equation.get("raw_tex") or ""))
-        tag_pages = {pages_by_number[tag][0] for tag in tags if len(pages_by_number.get(tag, [])) == 1}
-        if tags and len(tag_pages) == 1:
-            page = tag_pages.pop()
+        if not tags:
+            continue
+        candidate_pages = pages_by_number.get(tags[0], [])
+        if not candidate_pages:
+            continue
+        selected_page: int | None = None
+        for page in candidate_pages:
+            if page < previous_page:
+                continue
             if _source_number_anchor_has_content_evidence(equation, pages[page - 1]):
-                candidates.append((equation_index, page))
-    return _longest_nondecreasing_anchors(candidates)
+                selected_page = page
+                break
+        if selected_page is None:
+            continue
+        anchors.append((equation_index, selected_page))
+        previous_page = selected_page
+    return anchors
 
 
 def _source_number_anchor_has_content_evidence(equation: dict[str, Any], page: str) -> bool:
@@ -1232,14 +1255,14 @@ def _printed_equation_number_candidates(text: str) -> list[tuple[str, int]]:
         offset += len(raw_line)
         line = raw_line.rstrip()
         stripped = line.strip()
-        match = re.search(rf"\(({EQUATION_NUMBER_PATTERN})\)\s*$", line)
+        match = re.search(rf"\(({PRINTED_EQUATION_NUMBER_PATTERN})\)\s*$", line)
         if not match:
             if stripped:
                 previous_nonempty = stripped
             continue
         prefix = line[: match.start()].strip()
         if _looks_like_printed_number_prefix(prefix, previous_nonempty):
-            candidates.append((match.group(1), line_start + match.start()))
+            candidates.append((re.sub(r"\s+", "", match.group(1)), line_start + match.start()))
         if stripped:
             previous_nonempty = stripped
     return candidates
@@ -1328,6 +1351,11 @@ def _looks_like_printed_number_prefix(prefix: str, previous_nonempty: str) -> bo
     if not prefix:
         return True
     if _has_math_like_text(prefix):
+        return True
+    # OCR sometimes turns the tail of a display into a short fragment such as
+    # ``~( } r`` immediately before the label.  It is still a printed equation
+    # label when the prefix is short and contains no prose-like word sequence.
+    if len(prefix) <= 24 and len(re.findall(r"[A-Za-z]+", prefix)) <= 3:
         return True
     return bool(re.fullmatch(r"[\d\s.,]+", prefix) and _has_math_like_text(previous_nonempty))
 
