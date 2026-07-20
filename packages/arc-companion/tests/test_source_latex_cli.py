@@ -423,6 +423,9 @@ def test_companion_docs_describe_bounded_full_text_evidence_and_package_contents
     assert "before any remaining unit is submitted" in manual
     assert "`--stop-after-preview`" in manual
     assert "materially useful current understanding or development" in manual
+    assert "merely restates the source" in manual
+    assert "historical story or interesting fact" in manual
+    assert "what specifically changed" in manual
     assert "Table-of-contents blocks, acknowledgment sections, and\nreference-list headings" in manual
     assert "lanes drain all\n  submitted units before reporting their aggregated failures" in manual
     assert "targeted reference and citer full text cached through `arc-paper`" in readme

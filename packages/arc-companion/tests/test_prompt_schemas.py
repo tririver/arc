@@ -118,6 +118,11 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     assert "Explanation is optional" in generation
     assert "opening of a section or chapter" in generation
     assert "alternative presentation" in generation
+    assert "same meaning" in generation
+    assert "logical starting point" in generation
+    assert "historical story" in generation
+    assert "concept, course, or discipline" in generation
+    assert "what specifically changed" in generation
     assert "copied verbatim" in generation
     assert "separate from source_locators" in generation
     assert "equivalent formulation as an inconsistency" in generation
@@ -128,4 +133,5 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     assert "empty explanation/commentary is valid" in reviews
     assert "notation, convention, normalization" in reviews
     assert "materially useful current understanding or developments" in reviews
+    assert "same-meaning paraphrase" in reviews
     assert "registered, verifiable evidence" in reviews

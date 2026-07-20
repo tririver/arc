@@ -169,24 +169,36 @@ External access has different authority in the two generation tracks:
 Commentary is selected by reader value, not by a requirement to explain every
 segment. An evident passage may have empty explanation and commentary fields;
 generation and review must not fill them with paraphrase or generic teaching
-text. When explanation is useful, choose the most relevant emphasis:
+text. A commentary that merely restates the source, rewrites the same meaning,
+or repeats the same reasoning in different words is prohibited; every
+non-empty commentary must add concrete information, a new reasoning step, or a
+useful reader connection. When explanation is useful, choose the most relevant
+emphasis:
 
 - why the material is needed and how it advances the argument, giving this
   priority at section and chapter openings;
-- a useful alternative presentation supported by the supplied references;
+- a genuinely different presentation supported by the supplied references,
+  where the logical starting point, viewpoint, or organization differs; an
+  equivalent restatement does not qualify;
 - a cautiously stated, substantive incompatibility with another source, while
   excluding differences that reduce to convention, notation, normalization,
   or an equivalent formulation; or
 - intermediate mathematics omitted from a derivation that is not evident to
   the intended reader; or
-- a materially useful current understanding or development that directly
-  changes how the passage should be understood and is supported by registered,
-  verifiable evidence.
+- a concrete connection to another useful concept, course, or discipline when
+  the relationship is substantive rather than a loose analogy; or
+- a reliable, relevant historical story or interesting fact, supported by a
+  verifiable source and not folklore or uncertain attribution; or
+- a materially useful current understanding or development considered
+  proactively, but included only when a registered, verifiable source
+  identifies what specifically changed and the commentary explains exactly how it
+  materially changes the interpretation of this passage.
 
 These are priorities, not mandatory fields. Do not force all of them into one
 segment, repeat the source, chase novelty, present an ordinary reformulation as
 progress, or invent a distinction solely to create commentary. Never present a
-purported update from model memory or from an unregistered search result.
+purported update, historical anecdote, or external connection from model memory
+or from an unregistered search result.
 
 MCP and internet access are optional. A host without either capability uses the
 same portable prompt with the current segment, frozen glossary, bounded full-

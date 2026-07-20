@@ -107,18 +107,29 @@ complete, source-faithful rendering of the supplied blocks and must never add,
 replace, or correct source content from an external page. Commentary is
 optional for an already evident passage and discusses supported prior and
 subsequent work only when this adds reader value. Never manufacture an
-explanation merely to fill every unit. When explanation is useful, select the
-relevant emphasis rather than mechanically covering a checklist: explain the
-material's motivation and role in the argument, with motivation preferred at a
-section or chapter opening; compare a useful alternative presentation in the
-supplied references; cautiously flag deeper incompatibilities between sources
-while treating mere convention, notation, normalization, and equivalent
-formulations as differences rather than inconsistencies; or fill in non-evident
-intermediate mathematics. Do not repeat or paraphrase an already clear source
-passage. Optionally mention a current understanding or development only when it
-materially changes how this exact passage should be understood and registered,
-verifiable evidence supports it. Do not chase novelty, call an ordinary
-reformulation progress, or rely on model memory for an update. Keep stable
+explanation merely to fill every unit. A commentary that only restates the
+source with different wording, gives the same reasoning in different prose, or
+offers a generic teaching summary is prohibited: every non-empty explanation
+must add concrete information, a genuinely new reasoning step, or a useful
+connection for the reader. When explanation is useful, select the relevant
+emphasis rather than mechanically covering a checklist: explain the material's
+motivation and role in the argument, with motivation preferred at a section or
+chapter opening; compare a reference's alternative only when it starts from a
+clearly different logical motivation, viewpoint, or organization (not when it is
+merely an equivalent restatement); cautiously flag deeper incompatibilities
+between sources while treating mere convention, notation, normalization, and
+equivalent formulations as differences rather than inconsistencies; fill in
+non-evident intermediate mathematics; connect the passage to other useful
+concepts, courses, or disciplines when the relationship is concrete rather
+than a loose analogy; or add a reliable historical story or interesting fact
+when it is directly relevant and supported by a verifiable source, avoiding
+folklore and uncertain attribution. Consider current understanding or
+developments proactively, but include one only after identifying a registered,
+verifiable source, stating what specifically changed, and explaining exactly
+how it materially changes the interpretation of this passage; registered,
+verifiable evidence supports it. Do not use a
+vague "recent progress" remark, rely on model memory, chase novelty, or call
+an ordinary reformulation progress. Keep stable
 evidence identifiers only in structured evidence fields
 and manifests; never
 show controller IDs or hashes to the reader. Reader-facing citations use the
