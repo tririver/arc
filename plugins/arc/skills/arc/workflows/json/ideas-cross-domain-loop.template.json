@@ -8,7 +8,7 @@
     "user_intent": "<user_intent>",
     "domain_cards": [],
     "exploration_profile": {},
-    "arc_paper_tool_notes": "ARC paper MCP tools are available. Use ARC's local paper database before internet search for metadata, sections, cached full text, references, citers, equation context, and nearby literature. Use search_full_text for focused cached ar5iv checks. Use internet search for uncached, recent, or non-arXiv public evidence. Record source, query, and result for novelty checks in the source domain, target domain, and their intersection."
+    "arc_paper_tool_notes": "The controller has already collected bounded ARC paper context with arc-paper CLI/service calls. Treat this supplied context as read-only evidence. Do not invoke ARC CLIs, shell commands, or MCP tools from the worker. Use internet search only for uncached, recent, or non-arXiv public evidence. Record precise missing checks in the source domain, target domain, and their intersection so the controller can resolve them between worker rounds."
   },
   "proposers": [],
   "reviewers": []

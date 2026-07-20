@@ -208,9 +208,10 @@ Step 3: Retry failures only after checking the error cause.
 arc-paper summary-batch retry-failed <batch-name> --json
 ```
 
-## MCP Tools
+## Optional MCP Tools
 
-Read `manuals/arc-mcp.md` before using MCP.
+Skip this section for normal Skill/CLI workflows. Read `manuals/arc-mcp.md`
+only when the user explicitly installed or requested the MCP companion.
 
 Paper MCP tools:
 
@@ -240,8 +241,9 @@ summary_batch_export
 summary_batch_retry_failed
 ```
 
-For LLM paper summaries through MCP, use `background=true` for slow or massive
-launches and then follow `manuals/arc-mcp.md`.
+For LLM paper summaries through optional MCP, use `background=true` for slow
+or massive launches and follow `manuals/arc-mcp.md`. Default workflows should
+submit the equivalent CLI through `arc-jobs`.
 
 ## Cache Notes
 

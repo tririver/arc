@@ -2,6 +2,7 @@ import asyncio
 import shlex
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,8 +12,8 @@ from arc_mcp import server
 
 @pytest.fixture(autouse=True)
 def _mcp_job_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("ARC_MCP_CACHE", str(tmp_path / "arc-mcp"))
-    monkeypatch.setenv("ARC_MCP_WORKER_MODE", "thread")
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "arc-jobs"))
+    monkeypatch.setenv("ARC_JOBS_WORKER_MODE", "thread")
 
 
 def test_call_tool_dispatches_to_service(monkeypatch):
@@ -52,21 +53,213 @@ def test_bool_arg_rejects_invalid_values():
         server._bool_arg(2)  # noqa: SLF001
 
 
-def test_arc_mcp_watch_command_uses_runtime_executable_when_path_absent(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("md2pdf", {"input": "report.md", "texlive_bin": ""}),
+        ("translate", {"input": "report.md"}),
+        ("batch_translate", {"project_dir": "reports"}),
+        ("parse", {"tex_path": "note.tex"}),
+        ("summary_batch_create", {"name": "batch", "papers_file": "papers.txt"}),
+        ("summary_batch_export", {"name": "batch", "output": "summaries.jsonl"}),
+    ],
+)
+def test_file_tools_reject_paths_relative_to_mcp_server_cwd(tool, arguments):
+    result = server.call_tool(tool, arguments)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "absolute_path_required"
+    assert "MCP server cwd is not a project directory" in result["error"]["message"]
+
+
+def test_arc_jobs_watch_command_uses_runtime_executable_when_path_absent(monkeypatch, tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     runtime_python = bin_dir / "python"
     runtime_python.write_text("#!/bin/sh\n", encoding="utf-8")
-    runtime_arc_mcp = bin_dir / "arc-mcp"
-    runtime_arc_mcp.write_text("#!/bin/sh\n", encoding="utf-8")
-    runtime_arc_mcp.chmod(0o755)
+    runtime_arc_jobs = bin_dir / "arc-jobs"
+    runtime_arc_jobs.write_text("#!/bin/sh\n", encoding="utf-8")
+    runtime_arc_jobs.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     monkeypatch.setattr(server, "sys", SimpleNamespace(executable=str(runtime_python)), raising=False)
 
-    result = server._arc_mcp_watch_command("job id")  # noqa: SLF001
+    result = server._arc_jobs_watch_command("job id")  # noqa: SLF001
 
-    assert shlex.split(result["cli_command"]) == [str(runtime_arc_mcp), "watch", "job id", "--json"]
+    assert shlex.split(result["cli_command"]) == [str(runtime_arc_jobs), "watch", "job id", "--json"]
     assert result["mcp_fallback_tool"] == "job_status"
+
+
+def test_background_jobs_map_to_allowlisted_core_cli_argv(tmp_path):
+    source = tmp_path / "report.md"
+    assert server._md2pdf_cli_argv(  # noqa: SLF001
+        {
+            "input": str(source),
+            "output": str(tmp_path / "report.pdf"),
+            "texlive_bin": "",
+            "margin": "2cm",
+            "mainfont": "Noto Sans",
+            "cjk_mainfont": "Noto Sans CJK SC",
+            "resource_path": [str(tmp_path)],
+            "timeout_seconds": 12,
+        }
+    ) == [
+        "arc-typeset",
+        "md2pdf",
+        str(source),
+        "--output",
+        str(tmp_path / "report.pdf"),
+        "--texlive-bin",
+        "",
+        "--margin",
+        "2cm",
+        "--mainfont",
+        "Noto Sans",
+        "--cjk-mainfont",
+        "Noto Sans CJK SC",
+        "--timeout-seconds",
+        "12",
+        "--resource-path",
+        str(tmp_path),
+        "--json",
+    ]
+    assert server._translate_cli_argv(  # noqa: SLF001
+        {
+            "input": str(source),
+            "target_language": "Chinese",
+            "target_locale": "zh_CN",
+            "provider": "manual",
+            "model": None,
+            "model_tier": "low",
+            "quality": True,
+            "overwrite": True,
+        }
+    ) == [
+        "arc-typeset",
+        "translate",
+        str(source),
+        "--target-language",
+        "Chinese",
+        "--target-locale",
+        "zh_CN",
+        "--provider",
+        "manual",
+        "--model-tier",
+        "low",
+        "--quality",
+        "--overwrite",
+        "--json",
+    ]
+    assert server._batch_translate_cli_argv(  # noqa: SLF001
+        {
+            "project_dir": str(tmp_path),
+            "target_language": "Chinese",
+            "target_locale": "zh_CN",
+            "provider": "manual",
+            "model_tier": "low",
+        }
+    ) == [
+        "arc-typeset",
+        "batch-translate",
+        str(tmp_path),
+        "--target-language",
+        "Chinese",
+        "--target-locale",
+        "zh_CN",
+        "--provider",
+        "manual",
+        "--model-tier",
+        "low",
+        "--json",
+    ]
+    assert server._paper_summary_cli_argv(  # noqa: SLF001
+        ["arXiv:0911.3380"], provider="manual", model=None, model_tier="low", refresh=True
+    ) == [
+        "arc-paper",
+        "llm-generate-summary",
+        "arXiv:0911.3380",
+        "--provider",
+        "manual",
+        "--model-tier",
+        "low",
+        "--refresh",
+        "--json",
+    ]
+    assert server._reference_inference_cli_argv(  # noqa: SLF001
+        "See arXiv:0911.3380", provider="manual", model=None, refresh=False
+    ) == [
+        "arc-paper",
+        "llm-infer-main-references",
+        "See arXiv:0911.3380",
+        "--provider",
+        "manual",
+        "--json",
+    ]
+    assert server._domain_build_cli_argv(  # noqa: SLF001
+        "0911.3380",
+        intent="test",
+        domain_id=None,
+        provider="manual",
+        model=None,
+        model_tier="medium",
+        refresh=False,
+        workers=2,
+    ) == [
+        "arc-domain",
+        "llm-build",
+        "arXiv:0911.3380",
+        "--intent",
+        "test",
+        "--provider",
+        "manual",
+        "--workers",
+        "2",
+        "--model-tier",
+        "medium",
+        "--json",
+    ]
+    assert server._summary_batch_cli_argv(  # noqa: SLF001
+        "batch", provider="manual", model=None, model_tier="low", concurrency=2, max_items=5
+    ) == [
+        "arc-paper",
+        "summary-batch",
+        "run",
+        "batch",
+        "--provider",
+        "manual",
+        "--concurrency",
+        "2",
+        "--model-tier",
+        "low",
+        "--max-items",
+        "5",
+        "--json",
+    ]
+
+
+def test_mcp_job_result_unwraps_arc_jobs_process_output(monkeypatch):
+    monkeypatch.setattr(
+        server.MCP_JOBS,
+        "result",
+        lambda job_id: {
+            "ok": True,
+            "status": "done",
+            "job_id": job_id,
+            "result": {
+                "argv": ["arc-paper", "llm-generate-summary", "0911.3380", "--json"],
+                "command": "/runtime/bin/arc-paper",
+                "exit_code": 0,
+                "stdout_path": "/cache/stdout.log",
+                "output": {"ok": True, "data": {"paper_id": "arXiv:0911.3380"}, "meta": {}},
+            },
+            "meta": {"job": {"job_id": job_id}},
+        },
+    )
+
+    result = server.job_result("job123")
+
+    assert result["result"]["data"]["paper_id"] == "arXiv:0911.3380"
+    assert result["meta"]["execution"]["argv"][0] == "arc-paper"
+    assert "output" not in result["meta"]["execution"]
 
 
 def test_call_tool_md2pdf_starts_background_job_without_waiting(monkeypatch, tmp_path):
@@ -109,6 +302,7 @@ def test_call_tool_md2pdf_starts_background_job_without_waiting(monkeypatch, tmp
     assert result["inline_wait_seconds"] == 0.0
     assert result["background_requested"] is True
     assert result["job"]["input"] == str(source)
+    assert result["job"]["cwd"] == str(Path.cwd().resolve())
 
     release_conversion.set()
     status = _wait_for_mcp_job(result["job_id"])
@@ -268,7 +462,7 @@ def test_call_tool_searches_full_text(monkeypatch):
     assert result["data"]["case_sensitive"] is True
 
 
-def test_call_tool_dispatches_unified_parse(monkeypatch):
+def test_call_tool_dispatches_unified_parse(monkeypatch, tmp_path):
     monkeypatch.setattr(
         server.service,
         "parse_source",
@@ -289,11 +483,16 @@ def test_call_tool_dispatches_unified_parse(monkeypatch):
 
     result = server.call_tool(
         "parse",
-        {"tex_path": "note.tex", "pdf_path": "book.pdf", "source_id": "lecture-9", "refresh": True},
+        {
+            "tex_path": str(tmp_path / "note.tex"),
+            "pdf_path": str(tmp_path / "book.pdf"),
+            "source_id": "lecture-9",
+            "refresh": True,
+        },
     )
 
-    assert result["data"]["tex_path"] == "note.tex"
-    assert result["data"]["pdf_path"] == "book.pdf"
+    assert result["data"]["tex_path"] == str(tmp_path / "note.tex")
+    assert result["data"]["pdf_path"] == str(tmp_path / "book.pdf")
     assert result["data"]["source_id"] == "lecture-9"
     assert result["data"]["refresh"] is True
 
@@ -635,7 +834,9 @@ def test_get_llm_summary_starts_background_job_when_uncached(monkeypatch):
     assert status["sections_total"] == 1
     assert status["sections_completed"] == 1
     assert status["phase"] == "done"
-    assert [event["event"] for event in status["events"]][-2:] == ["section_started", "section_completed"]
+    event_names = [event["event"] for event in status["events"]]
+    assert event_names.index("section_started") < event_names.index("section_completed")
+    assert event_names[-1] == "job_done"
     assert server.job_result(started["job_id"])["result"]["data"]["paper_id"] == "arXiv:0911.3380"
 
 

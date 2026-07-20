@@ -376,7 +376,7 @@ def _runtime_file_hashes(env: Mapping[str, str]) -> dict[str, list[dict[str, Any
                 "env_json": env.get("ARC_CLAUDE_ARC_MCP_ENV_JSON"),
                 "arc_paper_cache": env.get("ARC_PAPER_CACHE"),
                 "arc_domain_cache": env.get("ARC_DOMAIN_CACHE"),
-                "arc_mcp_cache": env.get("ARC_MCP_CACHE"),
+                "arc_jobs_cache": env.get("ARC_JOBS_CACHE"),
             }
         ]
     elif generated_arc_mcp_path:

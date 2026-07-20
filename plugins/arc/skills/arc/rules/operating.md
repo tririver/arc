@@ -8,10 +8,10 @@ commands and MCP tool names live in the package-specific references.
 - Prefer cache reads first; generate or refresh only when needed.
 - Use structured CLI output when available.
 - Paper IDs may omit the `arXiv:` prefix.
-- For slow or large MCP work, use the background-job procedure in
-  `manuals/arc-mcp.md`.
-- If MCP is unavailable, check the relevant package manual and use the
-  corresponding CLI command with structured output.
+- For slow or large work, use the protocol-neutral background-job procedure in
+  `manuals/arc-jobs.md`.
+- Use the package CLI with structured output by default. Use the optional MCP
+  adapter only when the user or host configuration explicitly selects it.
 - For user choices and confirmations, use
   `rules/interaction.md`.
 - Do not cancel a job unless the user explicitly asks.
@@ -25,8 +25,8 @@ commands and MCP tool names live in the package-specific references.
 Step 1: For single-paper work, read `manuals/arc-paper.md`.
 Step 2: For domain or research-field work, read
 `manuals/arc-domain.md`.
-Step 3: For MCP calls or background jobs, read
-`manuals/arc-mcp.md`.
+Step 3: For background jobs, read `manuals/arc-jobs.md`. For an explicitly
+enabled MCP adapter, also read `manuals/arc-mcp.md`.
 Step 4: For provider/model/runtime diagnosis, read
 `manuals/arc-llm.md`.
 

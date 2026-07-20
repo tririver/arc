@@ -4,17 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arc-mcp"
-version = "0.9.4"
+version = "1.0.0"
 description = "MCP tools for ARC research workflows."
 readme = "../../README.md"
 license = "MIT"
 authors = [{ name = "ARC" }]
 requires-python = ">=3.11"
 dependencies = [
-  "arc-domain>=0.9,<0.10",
-  "arc-llm>=0.9,<0.10",
-  "arc-paper>=0.9,<0.10",
-  "arc-typeset>=0.9,<0.10",
+  "arc-domain>=1.0,<1.1",
+  "arc-jobs>=1.0,<1.1",
+  "arc-llm>=1.0,<1.1",
+  "arc-paper>=1.0,<1.1",
+  "arc-typeset>=1.0,<1.1",
   "mcp>=1.0",
   "pydantic>=2"
 ]

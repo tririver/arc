@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "plugins/arc/skills/arc/workflows"
 WJ = WF / "json"
 WS = WF / "scripts"
-UNCHANGED_GENERIC_REVIEW_CONTRACT_SHA256 = {
-    "ideas-reviewer.template.json": "5d778af29cad459211315c3f4b1e4a8bfbecc3732e310d7d7b72be36e9050cbd",
+PINNED_GENERIC_REVIEW_CONTRACT_SHA256 = {
+    "ideas-reviewer.template.json": "874b39544b7dad9a6eff4372202cf7798146b18e53fe08a3fcc9021ce6f81c26",
     "ideas-reviewer-output.schema.json": "be8504c44d47bb471488d522720cffaa610d1633b473349e65907b64010dcf0d",
     "ideas-marking-scheme.json": "a126c2add3c15d13b4911e72687e53528e2374f6ee724ab8d53adca50beaecc1",
 }
@@ -33,13 +33,13 @@ def _load_runner_module():
         sys.path.remove(str(WS))
 
 
-def test_generic_review_contract_files_remain_unchanged() -> None:
+def test_generic_review_contract_files_match_pinned_content() -> None:
     actual = {
         name: hashlib.sha256((WJ / name).read_bytes()).hexdigest()
-        for name in UNCHANGED_GENERIC_REVIEW_CONTRACT_SHA256
+        for name in PINNED_GENERIC_REVIEW_CONTRACT_SHA256
     }
 
-    assert actual == UNCHANGED_GENERIC_REVIEW_CONTRACT_SHA256
+    assert actual == PINNED_GENERIC_REVIEW_CONTRACT_SHA256
 
 
 def test_single_domain_variant_uses_mathematical_feasibility_contract() -> None:
@@ -229,6 +229,73 @@ def test_ideas_launches_three_round_loop_without_postprocessing(tmp_path: Path) 
     assert result["batch_result"]["run_root"] == str(project_dir / "ideas" / "ideas_test" / "idea_loops")
     assert result["warnings_summary"]["structured_output_warning_count"] == 2
     assert result["warnings_summary"]["cache_warning_count"] == 1
+
+
+def test_ideas_default_controller_resolves_arc_paper_metadata(tmp_path: Path, monkeypatch: Any) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    (project_dir / "domain").mkdir(parents=True)
+    (project_dir / "domain" / "domain_summary.md").write_text("# Domain\n", encoding="utf-8")
+    config = {
+        "schema_version": "arc.workflow.ideas.config.v1",
+        "run_id": "ideas_test",
+        "run_dir": str(project_dir / "ideas"),
+        "project_dir": str(project_dir),
+        "user_intent": "intent",
+        "variant_config_dir": str(WJ),
+        "variant_glob": "ideas-*.variant.json",
+        "loops_per_variant": 1,
+    }
+    captured: dict[str, Any] = {}
+
+    def get_metadata(paper_ids: str, *, refresh: bool = False) -> dict[str, Any]:
+        assert paper_ids == "0911.3380"
+        assert refresh is False
+        return {
+            "ok": True,
+            "data": {"title": "Cached title"},
+            "errors": [],
+            "meta": {"provider": "local-cache", "cache": "hit"},
+        }
+
+    def fake_batch_runner(
+        batch_config: dict[str, Any],
+        *,
+        evidence_controller: Any,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        request = runner.EvidenceRequest(
+            "proposer_001-metadata",
+            "paper.metadata",
+            {"paper_id": "0911.3380"},
+            worker_id="proposer_001",
+            role="proposer",
+        )
+        captured["response"] = evidence_controller((request,), round_number=1)[0]
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        return {
+            "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+            "status": "completed",
+            "run_id": batch_config["run_id"],
+            "run_root": str(run_root),
+            "loops": [],
+        }
+
+    monkeypatch.setattr(runner.arc_paper_service, "get_metadata", get_metadata)
+    monkeypatch.setattr(runner, "run_proposers_reviewer_batch", fake_batch_runner)
+
+    result = runner.run_ideas(config, base_env={})
+
+    assert result["status"] == "completed"
+    response = captured["response"]
+    assert response.ok is True
+    assert response.data == {"title": "Cached title"}
+    assert response.provenance == {
+        "source": "arc-paper",
+        "operation": "paper.metadata",
+        "evidence_round": 1,
+        "service_meta": {"provider": "local-cache", "cache": "hit"},
+    }
 
 
 def test_ideas_caps_concurrency_for_many_loops(tmp_path: Path) -> None:
@@ -926,6 +993,57 @@ def test_ideas_warns_when_reviewer_tier_is_below_proposer(tmp_path: Path) -> Non
     warnings_file = warnings_path.read_text(encoding="utf-8")
     assert "WARNING: Running 1 variants x 1 proposer-reviewer loops" in warnings_file
     assert "WARNING: REVIEWER MODEL TIER BELOW PROPOSER" in warnings_file
+
+
+def test_no_info_variant_disables_controller_evidence_in_materialized_loop(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    workflow_dir = _workflow_dir_with_reviewer_tier(tmp_path, "high")
+    project_dir = tmp_path / "project"
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(workflow_dir),
+            "variant_glob": "ideas-no-info.variant.json",
+            "loops_per_variant": 1,
+        }
+    )
+
+    ideas = runner._materialize_ideas(parsed)  # noqa: SLF001
+    batch = runner._loop_batch_config(parsed, ideas, run_root=project_dir / "ideas")  # noqa: SLF001
+    loop = batch["loops"][0]
+
+    assert loop["evidence"] == {"enabled": False}
+    assert "controller_evidence_operations" not in loop["caller_context"]
+
+
+def test_domain_variant_keeps_controller_evidence_enabled(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    (project_dir / "domain").mkdir(parents=True)
+    (project_dir / "domain/domain_summary.md").write_text("# Domain\n", encoding="utf-8")
+    parsed = runner.load_ideas_config(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_test",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+            "variant_glob": "ideas-domain.variant.json",
+            "loops_per_variant": 1,
+        }
+    )
+
+    ideas = runner._materialize_ideas(parsed)  # noqa: SLF001
+    batch = runner._loop_batch_config(parsed, ideas, run_root=project_dir / "ideas")  # noqa: SLF001
+    loop = batch["loops"][0]
+
+    assert loop["evidence"] == {"enabled": True}
+    assert loop["caller_context"]["controller_evidence_operations"]
 
 
 def test_ideas_cli_prints_warnings(tmp_path: Path, capsys: Any) -> None:

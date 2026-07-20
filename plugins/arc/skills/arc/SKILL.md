@@ -11,7 +11,7 @@ or reimplementing paper/domain workflows.
 
 ## Preflight Gate
 
-Before any ARC MCP or CLI call, decide whether the request is a managed ARC
+Before any ARC CLI call, decide whether the request is a managed ARC
 workflow run or a direct ARC tool task. Also determine whether the current
 request came directly from a human who explicitly named ARC, rather than from
 another agent or from a human request that did not name ARC. Use the message
@@ -74,7 +74,7 @@ not optional.
   `workflows/plan.md`, `workflows/calculate.md`, or `workflows/companion.md`),
   read that workflow file
   and follow its steps. Reading the workflow file is a blocking requirement
-  before any workflow MCP or CLI call.
+  before any workflow CLI call.
 - ARC workflow completion checks and improvement notes: read
   `rules/self-reflection.md`.
 - Single-paper metadata, full text, sections, equations, citers, references,
@@ -83,14 +83,33 @@ not optional.
 - Research field/domain construction, foundation-paper selection, domain
   networks, evidence packs, graph HTML, or field briefings: read
   `manuals/arc-domain.md`.
-- Any MCP tool call, background job, job watcher, timeout, or cancellation
-  behavior: read `manuals/arc-mcp.md`.
+- Any background job, job watcher, timeout, cancellation, or asynchronous
+  report export: read `manuals/arc-jobs.md`.
+- Optional MCP calls: read `manuals/arc-mcp.md`, but only when the user
+  explicitly installed or requested the separate MCP companion.
 - Host LLM/provider detection, model choice, direct prompt tests, or provider
   troubleshooting: read `manuals/arc-llm.md`.
 - Companion-reading PDF generation: read `workflows/companion.md` and
   `manuals/arc-companion.md` before fetching a paper or starting LLM work.
 - User-facing Markdown report export: see `rules/math_typeset.md` and
-  `manuals/arc-mcp.md`.
+  `manuals/arc-jobs.md`.
+
+## CLI Resolution
+
+Use `arc-paper`, `arc-domain`, `arc-llm`, `arc-typeset`, `arc-companion`, and
+`arc-jobs` directly when the host plugin exposes them on `PATH`. For a
+standalone Skill install, or when a bare command is unavailable, invoke the
+same command through:
+
+```bash
+<skill-dir>/scripts/arc-runtime <arc-command> [args...]
+```
+
+The first real CLI call lazily installs the immutable core runtime. Managed,
+CI, or offline-preparation environments may prewarm it with
+`<skill-dir>/scripts/arc-runtime setup --profile core`; diagnose it with
+`<skill-dir>/scripts/arc-runtime doctor --profile core`. The base Skill never
+installs or starts MCP.
 
 ## Workflow
 
@@ -101,7 +120,7 @@ cancel any job because it is slow or time consuming.
 
 Step 1: Decide the automation level and requested scope.
 Use this step only for managed ARC workflow runs. For direct ARC tool tasks,
-skip the Workflow section and use the relevant manuals and MCP/CLI tools
+skip the Workflow section and use the relevant manuals and CLI tools
 directly.
 
 For managed workflows invoked directly by a human whose current prompt
@@ -138,7 +157,7 @@ for routing, domain building, checking, or later workflows.
 Step 3: Resolve `<seed-paper-list>`.
 Use explicit paper identifiers when present. Otherwise infer seed papers from
 `<user-intent>` through ARC paper tools. See `manuals/arc-paper.md` for paper
-identifier inference and `manuals/arc-mcp.md` for background jobs.
+identifier inference and `manuals/arc-jobs.md` for background jobs.
 
 Step 4: Resolve `<project-dir>`.
 Capture `<arc-run-root>` by running `pwd -P` in the directory where the user

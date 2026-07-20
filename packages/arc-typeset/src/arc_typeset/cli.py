@@ -59,8 +59,19 @@ def main(argv: list[str] | None = None) -> int:
     batch_parser.add_argument("--json", action="store_true", help="Print structured JSON output")
 
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        result = _dispatch(args)
+    except Exception as exc:
+        if not getattr(args, "json", False):
+            raise
+        result = _exception_result(exc)
+    _emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "md2pdf":
-        result = md2pdf.convert_markdown_to_pdf(
+        return md2pdf.convert_markdown_to_pdf(
             input_path=Path(args.input),
             output_path=Path(args.output) if args.output else None,
             texlive_bin=Path(args.texlive_bin) if args.texlive_bin else None,
@@ -70,10 +81,8 @@ def main(argv: list[str] | None = None) -> int:
             resource_paths=[Path(path) for path in args.resource_path] if args.resource_path else None,
             timeout_seconds=args.timeout_seconds,
         )
-        _emit(result, json_output=args.json)
-        return 0 if result.get("ok") else 1
     if args.command == "translate":
-        result = translate.translate_markdown(
+        return translate.translate_markdown(
             input_path=Path(args.input),
             output_path=Path(args.output) if args.output else None,
             target_language=args.target_language,
@@ -85,10 +94,8 @@ def main(argv: list[str] | None = None) -> int:
             convert_pdf=not args.no_pdf,
             overwrite=args.overwrite,
         )
-        _emit(result, json_output=args.json)
-        return 0 if result.get("ok") else 1
     if args.command == "batch-translate":
-        result = translate.batch_translate_project(
+        return translate.batch_translate_project(
             project_dir=Path(args.project_dir),
             target_language=args.target_language,
             target_locale=args.target_locale,
@@ -98,9 +105,21 @@ def main(argv: list[str] | None = None) -> int:
             quality=args.quality,
             overwrite=args.overwrite,
         )
-        _emit(result, json_output=args.json)
-        return 0 if result.get("ok") else 1
     raise AssertionError(f"Unhandled command: {args.command}")
+
+
+def _exception_result(exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "error",
+        "error": {
+            "code": "command_failed",
+            "message": str(exc) or exc.__class__.__name__,
+            "type": exc.__class__.__name__,
+        },
+        "errors": [],
+        "meta": {},
+    }
 
 
 def _emit(result: dict[str, Any], *, json_output: bool) -> None:

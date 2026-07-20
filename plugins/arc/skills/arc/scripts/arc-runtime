@@ -1,0 +1,711 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+launcher_version="5"
+install_ref_override="${ARC_INSTALL_REF:-}"
+install_repo="${ARC_INSTALL_REPO:-https://github.com/tririver/arc.git}"
+install_source="${ARC_INSTALL_SOURCE:-auto}"
+python_spec="${ARC_INSTALL_PYTHON:->=3.11}"
+uv_bin_override="${ARC_INSTALL_UV:-}"
+python_bin="${ARC_INSTALL_PYTHON_BIN:-python3}"
+retry_requested="${ARC_INSTALL_RETRY:-0}"
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+component_root="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
+profile_file="${script_dir}/.arc-runtime-profile"
+constraints_file="${script_dir}/runtime-constraints.txt"
+
+first_line() {
+  sed -n '1{s/[[:space:]]//g;p;q;}' "$1" 2>/dev/null || true
+}
+
+bundled_profile="$(first_line "$profile_file")"
+case "$bundled_profile" in
+  core|mcp) ;;
+  *)
+    printf 'Invalid or missing ARC runtime profile marker: %s\n' "$profile_file" >&2
+    exit 78
+    ;;
+esac
+if [ ! -f "$constraints_file" ]; then
+  printf 'Missing ARC runtime constraints: %s\n' "$constraints_file" >&2
+  exit 78
+fi
+
+if [ -f "${component_root}/SKILL.md" ]; then
+  skill_root="$component_root"
+  plugin_candidate="$(CDPATH= cd -- "$skill_root/../.." 2>/dev/null && pwd -P || true)"
+  if [ -n "$plugin_candidate" ] && { [ -f "${plugin_candidate}/.codex-plugin/plugin.json" ] || [ -f "${plugin_candidate}/.claude-plugin/plugin.json" ]; }; then
+    plugin_root="$plugin_candidate"
+  else
+    plugin_root="$skill_root"
+  fi
+else
+  skill_root=""
+  plugin_root="$component_root"
+fi
+
+default_repo_root="$(CDPATH= cd -- "$plugin_root/../.." 2>/dev/null && pwd -P || printf '%s' "$plugin_root")"
+repo_root="${ARC_INSTALL_REPO_ROOT:-$default_repo_root}"
+
+core_tools="arc-paper arc-domain arc-llm arc-typeset arc-companion arc-jobs"
+all_tools="${core_tools} arc-mcp"
+core_packages="arc-jobs arc-llm arc-paper arc-domain arc-typeset arc-companion"
+mcp_packages="${core_packages} arc-mcp"
+
+is_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_path() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null && return 0
+  fi
+  realpath "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 | awk '{print $NF}'
+    return
+  fi
+  printf 'ARC requires sha256sum, shasum, or openssl to identify its private runtime.\n' >&2
+  return 127
+}
+
+sha256_file() {
+  sha256_stream < "$1"
+}
+
+redact_stream() {
+  sed -E 's#([[:alpha:]][[:alnum:]+.-]*://)[^/@[:space:]]+@#\1[REDACTED]@#g'
+}
+
+python_identity() {
+  identity_path="$(command -v "$python_bin" 2>/dev/null || true)"
+  if [ -n "$identity_path" ]; then
+    identity_path="$(resolve_path "$identity_path")"
+    identity_version="$("$python_bin" -c 'import platform; print(platform.python_version())' 2>/dev/null || true)"
+    if [ -z "$identity_version" ]; then
+      identity_version="$("$python_bin" --version 2>&1 || true)"
+    fi
+  else
+    identity_path="unresolved:${python_bin}"
+    identity_version="unresolved"
+  fi
+  printf 'selector=%s;path=%s;version=%s\n' "$python_spec" "$identity_path" "$identity_version"
+}
+
+detect_json_revision() {
+  metadata_file="$1"
+  [ -f "$metadata_file" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$metadata_file" "$plugin_root" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+
+metadata_file, plugin_root = sys.argv[1:]
+plugin_root = os.path.realpath(plugin_root)
+try:
+    with open(metadata_file, encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception:
+    raise SystemExit(0)
+
+if isinstance(payload, dict):
+    revision = payload.get("revision") or payload.get("gitCommitSha")
+    if revision:
+        print(revision)
+        raise SystemExit(0)
+
+plugins = payload.get("plugins") if isinstance(payload, dict) else None
+if not isinstance(plugins, dict):
+    raise SystemExit(0)
+for installs in plugins.values():
+    if not isinstance(installs, list):
+        continue
+    for install in installs:
+        if not isinstance(install, dict):
+            continue
+        install_path = install.get("installPath")
+        if install_path and os.path.realpath(install_path) == plugin_root:
+            revision = install.get("gitCommitSha") or install.get("revision")
+            if revision:
+                print(revision)
+                raise SystemExit(0)
+PY
+}
+
+detect_install_ref() {
+  for metadata_file in \
+    "${plugin_root}/.codex-marketplace-install.json" \
+    "${HOME:-}/.claude/plugins/installed_plugins.json"; do
+    ref="$(detect_json_revision "$metadata_file")"
+    if [ -n "$ref" ]; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  done
+  for ref_file in "${component_root}/.arc-install-ref" "${plugin_root}/.arc-install-ref"; do
+    if [ -f "$ref_file" ]; then
+      first_line "$ref_file"
+      return 0
+    fi
+  done
+}
+
+validate_immutable_ref() {
+  ref="$1"
+  case "$ref" in
+    main|stable|master|develop|development|HEAD|'') return 1 ;;
+  esac
+  printf '%s\n' "$ref" | grep -Eq '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64}|v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)$'
+}
+
+if [ -n "$install_ref_override" ]; then
+  install_ref="$install_ref_override"
+else
+  install_ref="$(detect_install_ref)"
+fi
+if ! validate_immutable_ref "$install_ref"; then
+  printf 'ARC install ref must be a full commit SHA or immutable vX.Y.Z tag; got: %s\n' "${install_ref:-<empty>}" >&2
+  exit 78
+fi
+
+usage() {
+  cat >&2 <<EOF
+Usage:
+  arc-runtime setup [--profile ${bundled_profile}] [--retry]
+  arc-runtime doctor [--profile ${bundled_profile}]
+  arc-runtime run [--profile ${bundled_profile}] ARC_COMMAND [ARGS...]
+  arc-runtime ARC_COMMAND [ARGS...]
+EOF
+}
+
+selected_profile="$bundled_profile"
+management_command=""
+tool_name="${ARC_RUNTIME_TOOL:-}"
+
+select_profile() {
+  requested="$1"
+  if [ "$requested" != "$bundled_profile" ]; then
+    printf 'This launcher contains only the %s ARC runtime profile; requested %s.\n' "$bundled_profile" "$requested" >&2
+    exit 64
+  fi
+  selected_profile="$requested"
+}
+
+if [ -z "$tool_name" ]; then
+  case "${1:-}" in
+    setup|doctor)
+      management_command="$1"
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --profile)
+            [ "$#" -ge 2 ] || { usage; exit 64; }
+            select_profile "$2"
+            shift 2
+            ;;
+          --retry)
+            [ "$management_command" = "setup" ] || { usage; exit 64; }
+            retry_requested=1
+            shift
+            ;;
+          *) usage; exit 64 ;;
+        esac
+      done
+      ;;
+    run)
+      shift
+      if [ "${1:-}" = "--profile" ]; then
+        [ "$#" -ge 3 ] || { usage; exit 64; }
+        select_profile "$2"
+        shift 2
+      fi
+      tool_name="${1:-}"
+      [ -n "$tool_name" ] || { usage; exit 64; }
+      shift
+      ;;
+    '') usage; exit 64 ;;
+    *)
+      tool_name="$1"
+      shift
+      ;;
+  esac
+fi
+
+if [ "$selected_profile" = "core" ]; then
+  allowed_tools="$core_tools"
+  profile_packages="$core_packages"
+  expected_tools="$core_tools"
+else
+  allowed_tools="arc-mcp"
+  profile_packages="$mcp_packages"
+  expected_tools="$all_tools"
+fi
+
+if [ -n "$tool_name" ]; then
+  case " ${allowed_tools} " in
+    *" ${tool_name} "*) ;;
+    *)
+      printf 'ARC command %s is not available in the %s profile.\n' "$tool_name" "$selected_profile" >&2
+      exit 64
+      ;;
+  esac
+fi
+
+local_packages_available() {
+  for package in $profile_packages; do
+    [ -f "${repo_root}/packages/${package}/pyproject.toml" ] || return 1
+  done
+}
+
+case "$install_source" in
+  auto|local|git) ;;
+  *)
+    printf 'ARC_INSTALL_SOURCE must be one of: auto, local, git\n' >&2
+    exit 78
+    ;;
+esac
+
+if [ "$install_source" = "local" ] && ! local_packages_available; then
+  printf 'ARC_INSTALL_REPO_ROOT is not a complete local ARC checkout: %s\n' "$repo_root" >&2
+  exit 78
+fi
+if [ "$install_source" = "local" ] || { [ "$install_source" = "auto" ] && local_packages_available; }; then
+  resolved_source="local"
+else
+  resolved_source="git"
+fi
+
+local_checkout_identity() {
+  canonical_root="$(resolve_path "$repo_root")"
+  revision="$(git -C "$repo_root" rev-parse --verify HEAD 2>/dev/null || true)"
+  [ -n "$revision" ] || revision="no-vcs-revision"
+  content_hash="$({
+    for package in $profile_packages; do
+      package_root="${repo_root}/packages/${package}"
+      find "$package_root" -type f \
+        ! -path '*/.venv/*' \
+        ! -path '*/__pycache__/*' \
+        ! -path '*/build/*' \
+        ! -path '*/dist/*' \
+        ! -path '*/*.egg-info/*' \
+        ! -name '*.pyc' \
+        -print
+    done | LC_ALL=C sort | while IFS= read -r source_file; do
+      relative_file="${source_file#"${repo_root}/"}"
+      printf '%s\0' "$relative_file"
+      sha256_file "$source_file"
+    done
+  } | sha256_stream)"
+  printf 'root=%s;revision=%s;content=%s\n' "$canonical_root" "$revision" "$content_hash"
+}
+
+runtime_home="${ARC_RUNTIME_HOME:-${HOME:?HOME is required}/.codex/arc/runtimes}"
+constraints_hash="$(sha256_file "$constraints_file")"
+python_fingerprint="$(python_identity)"
+if [ "$resolved_source" = "local" ]; then
+  source_fingerprint="local:$(local_checkout_identity)"
+else
+  source_fingerprint="git:repo=${install_repo};ref=${install_ref}"
+fi
+runtime_fingerprint="$(printf '%s\n' \
+  "launcher=${launcher_version}" \
+  "profile=${selected_profile}" \
+  "source=${source_fingerprint}" \
+  "python=${python_fingerprint}" \
+  "constraints=${constraints_hash}" | sha256_stream)"
+cache_key="${runtime_fingerprint}"
+runtime_dir="${runtime_home}/v${launcher_version}/${selected_profile}/${cache_key}"
+venv_dir="${runtime_dir}/venv"
+ready_file="${runtime_dir}/install.ok"
+failed_file="${runtime_dir}/install.failed"
+status_file="${runtime_dir}/install.status"
+log_file="${runtime_dir}/install.log"
+lock_dir="${runtime_dir}/install.lock"
+permissions_file="${runtime_dir}/permissions.ok"
+display_repo="$(printf '%s\n' "$install_repo" | redact_stream)"
+
+runtime_permissions_ready() {
+  [ -f "$permissions_file" ] || return 1
+  [ "$(cat "$permissions_file" 2>/dev/null || true)" = "$runtime_fingerprint" ]
+}
+
+secure_runtime_state() {
+  [ -d "$runtime_dir" ] || return 0
+  chmod 700 "$runtime_dir"
+  find "$runtime_dir" -type d -exec chmod 700 {} +
+  find "$runtime_dir" -type f -exec chmod go-rwx {} +
+  printf '%s\n' "$runtime_fingerprint" > "$permissions_file"
+  chmod 600 "$permissions_file"
+}
+
+runtime_ready() {
+  [ -f "$ready_file" ] || return 1
+  [ "$(sed -n 's/^profile=//p' "$ready_file" | head -n 1)" = "$selected_profile" ] || return 1
+  [ "$(sed -n 's/^runtime_fingerprint=//p' "$ready_file" | head -n 1)" = "$runtime_fingerprint" ] || return 1
+  [ "$(sed -n 's/^constraints_sha256=//p' "$ready_file" | head -n 1)" = "$constraints_hash" ] || return 1
+  for expected_tool in $expected_tools; do
+    [ -x "${venv_dir}/bin/${expected_tool}" ] || return 1
+  done
+  if ! runtime_permissions_ready; then
+    secure_runtime_state || return 1
+  fi
+}
+
+runtime_failed() {
+  [ -f "$failed_file" ] && ! is_true "$retry_requested"
+}
+
+previous_status() {
+  status="$(cat "$status_file" 2>/dev/null || true)"
+  case "$status" in
+    ''|*[!0-9]*) printf '1\n' ;;
+    *) printf '%s\n' "$status" ;;
+  esac
+}
+
+print_install_log_tail() {
+  [ -s "$log_file" ] || return 0
+  lines="${ARC_INSTALL_LOG_TAIL_LINES:-40}"
+  case "$lines" in
+    ''|*[!0-9]*) lines=40 ;;
+  esac
+  printf 'Install log tail:\n' >&2
+  tail -n "$lines" "$log_file" >&2 2>/dev/null || sed -n '$p' "$log_file" >&2
+}
+
+print_previous_failure() {
+  {
+    printf 'Previous ARC %s runtime install failed; not retrying automatically.\n' "$selected_profile"
+    printf 'Failure marker: %s\n' "$failed_file"
+    printf 'Install log: %s\n' "$log_file"
+    printf 'Run arc-runtime setup --profile %s --retry after fixing the cause.\n' "$selected_profile"
+  } >&2
+  print_install_log_tail
+}
+
+resolve_uv_cmd() {
+  uv_cmd=()
+  if [ -n "$uv_bin_override" ]; then
+    if [ -x "$uv_bin_override" ]; then
+      uv_cmd=("$uv_bin_override")
+      return 0
+    fi
+    uv_path="$(command -v "$uv_bin_override" 2>/dev/null || true)"
+    if [ -n "$uv_path" ]; then
+      uv_cmd=("$uv_path")
+      return 0
+    fi
+    return 1
+  fi
+  if uv_path="$(command -v uv 2>/dev/null)" && [ -n "$uv_path" ]; then
+    uv_cmd=("$uv_path")
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1 && python3 -m uv --version >/dev/null 2>&1; then
+    uv_cmd=(python3 -m uv)
+    return 0
+  fi
+  return 1
+}
+
+check_python_fallback_version() {
+  "$python_bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null
+}
+
+install_with_pip() {
+  if ! command -v "$python_bin" >/dev/null 2>&1; then
+    printf 'Neither uv nor %s is available to create the ARC runtime.\n' "$python_bin" >&2
+    return 127
+  fi
+  if ! check_python_fallback_version; then
+    printf 'Fallback installer requires Python >= 3.11: %s\n' "$python_bin" >&2
+    return 127
+  fi
+  "$python_bin" -m venv "$venv_dir" || return $?
+  "${venv_dir}/bin/python" -m pip install --constraint "$constraints_file" "${requirements[@]}" || return $?
+}
+
+install_with_uv() {
+  "${uv_cmd[@]}" venv "$venv_dir" --python "$python_spec" || return $?
+  "${uv_cmd[@]}" pip install --python "${venv_dir}/bin/python" --constraint "$constraints_file" "${requirements[@]}" || return $?
+}
+
+install_runtime() {
+  if [ "$resolved_source" = "local" ]; then
+    requirements=()
+    for package in $profile_packages; do
+      requirements+=("${repo_root}/packages/${package}")
+    done
+  else
+    resolved_source="git"
+    source_base="git+${install_repo}@${install_ref}"
+    requirements=()
+    for package in $profile_packages; do
+      requirements+=("${package} @ ${source_base}#subdirectory=packages/${package}")
+    done
+  fi
+
+  rm -rf "$venv_dir"
+  if resolve_uv_cmd; then
+    install_with_uv || return $?
+    installer="uv"
+  else
+    install_with_pip || return $?
+    installer="pip"
+  fi
+
+  for expected_tool in $expected_tools; do
+    [ -x "${venv_dir}/bin/${expected_tool}" ] || {
+      printf 'Missing ARC runtime command after install: %s\n' "$expected_tool" >&2
+      return 127
+    }
+  done
+  "${venv_dir}/bin/${expected_tools%% *}" --help >/dev/null || return $?
+  {
+    printf 'profile=%s\n' "$selected_profile"
+    printf 'repo=%s\n' "$display_repo"
+    printf 'ref=%s\n' "$install_ref"
+    printf 'source=%s\n' "$resolved_source"
+    printf 'installer=%s\n' "$installer"
+    printf 'launcher_version=%s\n' "$launcher_version"
+    printf 'runtime_fingerprint=%s\n' "$runtime_fingerprint"
+    printf 'python=%s\n' "$python_fingerprint"
+    printf 'constraints_sha256=%s\n' "$constraints_hash"
+  } > "$ready_file"
+  secure_runtime_state
+}
+
+current_epoch() {
+  date +%s
+}
+
+current_host() {
+  hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown-host\n'
+}
+
+process_start_token() {
+  pid="$1"
+  [ -r "/proc/${pid}/stat" ] || return 0
+  sed 's/^.*) //' "/proc/${pid}/stat" 2>/dev/null | awk '{print $20}'
+}
+
+lock_created_epoch() {
+  created="$(cat "${lock_dir}/created" 2>/dev/null || true)"
+  case "$created" in
+    ''|*[!0-9]*)
+      if stat -c %Y "$lock_dir" >/dev/null 2>&1; then
+        stat -c %Y "$lock_dir"
+      elif stat -f %m "$lock_dir" >/dev/null 2>&1; then
+        stat -f %m "$lock_dir"
+      else
+        printf '0\n'
+      fi
+      ;;
+    *) printf '%s\n' "$created" ;;
+  esac
+}
+
+lock_age_seconds() {
+  now="$(current_epoch)"
+  created="$(lock_created_epoch)"
+  if [ "$created" -gt "$now" ]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$((now - created))"
+  fi
+}
+
+lock_is_stale() {
+  stale_after="${ARC_INSTALL_LOCK_STALE_SEC:-1800}"
+  init_grace="${ARC_INSTALL_LOCK_INIT_GRACE_SEC:-5}"
+  case "$stale_after" in ''|*[!0-9]*) stale_after=1800 ;; esac
+  case "$init_grace" in ''|*[!0-9]*) init_grace=5 ;; esac
+
+  age="$(lock_age_seconds)"
+  owner_pid="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
+  owner_host="$(cat "${lock_dir}/host" 2>/dev/null || true)"
+  owner_start="$(cat "${lock_dir}/process-start" 2>/dev/null || true)"
+
+  case "$owner_pid" in
+    ''|*[!0-9]*) [ "$age" -ge "$init_grace" ]; return ;;
+  esac
+
+  if [ -z "$owner_host" ]; then
+    [ "$age" -ge "$init_grace" ] || return 1
+    kill -0 "$owner_pid" 2>/dev/null || return 0
+    [ "$age" -ge "$stale_after" ]
+    return
+  fi
+
+  if [ "$owner_host" = "$lock_host" ]; then
+    if kill -0 "$owner_pid" 2>/dev/null; then
+      live_start="$(process_start_token "$owner_pid")"
+      if [ -z "$owner_start" ] || [ -z "$live_start" ] || [ "$owner_start" = "$live_start" ]; then
+        return 1
+      fi
+    fi
+    return 0
+  fi
+
+  [ "$age" -ge "$stale_after" ]
+}
+
+recover_stale_lock() {
+  observed_owner="$(cat "${lock_dir}/owner" 2>/dev/null || true)"
+  lock_is_stale || return 1
+  [ "$(cat "${lock_dir}/owner" 2>/dev/null || true)" = "$observed_owner" ] || return 1
+  stale_lock="${lock_dir}.stale.$$.$(current_epoch)"
+  if mv "$lock_dir" "$stale_lock" 2>/dev/null; then
+    rm -rf "$stale_lock"
+    printf 'Recovered stale ARC runtime install lock: %s\n' "$lock_dir" >&2
+    return 0
+  fi
+  return 1
+}
+
+write_lock_owner() {
+  lock_host="$(current_host)"
+  lock_created="$(current_epoch)"
+  lock_owner="${lock_host}:$$:${lock_created}:${RANDOM:-0}"
+  printf '%s\n' "$lock_owner" > "${lock_dir}/owner"
+  printf '%s\n' "$$" > "${lock_dir}/pid"
+  printf '%s\n' "$lock_host" > "${lock_dir}/host"
+  printf '%s\n' "$lock_created" > "${lock_dir}/created"
+  process_start_token "$$" > "${lock_dir}/process-start"
+}
+
+release_lock() {
+  [ -d "$lock_dir" ] || return 0
+  [ "$(cat "${lock_dir}/owner" 2>/dev/null || true)" = "${lock_owner:-}" ] || return 0
+  rm -rf "$lock_dir"
+}
+
+ensure_runtime() {
+  if runtime_ready; then
+    return 0
+  fi
+  if runtime_failed; then
+    print_previous_failure
+    return "$(previous_status)"
+  fi
+
+  mkdir -p "$runtime_dir"
+  chmod 700 "$runtime_dir"
+  waited=0
+  lock_timeout="${ARC_INSTALL_LOCK_TIMEOUT_SEC:-600}"
+  case "$lock_timeout" in
+    ''|*[!0-9]*) lock_timeout=600 ;;
+  esac
+  lock_host="$(current_host)"
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if recover_stale_lock; then
+      continue
+    fi
+    if [ "$waited" -ge "$lock_timeout" ]; then
+      printf 'Timed out waiting for ARC runtime install lock: %s\n' "$lock_dir" >&2
+      return 75
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  write_lock_owner
+  trap release_lock EXIT
+
+  if runtime_ready; then
+    release_lock
+    trap - EXIT
+    return 0
+  fi
+  if runtime_failed; then
+    print_previous_failure
+    status="$(previous_status)"
+    release_lock
+    trap - EXIT
+    return "$status"
+  fi
+
+  rm -f "$failed_file" "$status_file"
+  set +e
+  install_runtime 2>&1 | redact_stream >"$log_file"
+  install_pipe_status=("${PIPESTATUS[@]}")
+  install_status="${install_pipe_status[0]}"
+  if [ "$install_status" -eq 0 ] && [ "${install_pipe_status[1]}" -ne 0 ]; then
+    install_status="${install_pipe_status[1]}"
+  fi
+  set -e
+  if [ "$install_status" -ne 0 ]; then
+    rm -rf "$venv_dir"
+    printf '%s\n' "$install_status" > "$status_file"
+    {
+      printf 'ARC %s runtime install failed.\n' "$selected_profile"
+      printf 'Install log: %s\n' "$log_file"
+      printf 'Run arc-runtime setup --profile %s --retry after fixing the cause.\n' "$selected_profile"
+    } > "$failed_file"
+    printf 'ARC %s runtime install failed.\n' "$selected_profile" >&2
+    printf 'Install log: %s\n' "$log_file" >&2
+    print_install_log_tail
+    release_lock
+    trap - EXIT
+    return "$install_status"
+  fi
+
+  rm -f "$failed_file" "$status_file"
+  release_lock
+  trap - EXIT
+}
+
+if [ "$management_command" = "doctor" ]; then
+  printf 'profile=%s\n' "$selected_profile"
+  printf 'repo=%s\n' "$display_repo"
+  printf 'ref=%s\n' "$install_ref"
+  printf 'source=%s\n' "$resolved_source"
+  printf 'source_request=%s\n' "$install_source"
+  printf 'fingerprint=%s\n' "$runtime_fingerprint"
+  printf 'python=%s\n' "$python_fingerprint"
+  printf 'constraints_sha256=%s\n' "$constraints_hash"
+  printf 'runtime=%s\n' "$runtime_dir"
+  printf 'venv=%s\n' "$venv_dir"
+  printf 'ready_file=%s\n' "$ready_file"
+  if runtime_ready; then
+    printf 'status=ready\n'
+    exit 0
+  fi
+  if [ -f "$failed_file" ]; then
+    printf 'status=failed\n'
+    exit 1
+  fi
+  printf 'status=not-installed\n'
+  exit 1
+fi
+
+set +e
+ensure_runtime
+ensure_status=$?
+set -e
+if [ "$ensure_status" -ne 0 ]; then
+  exit "$ensure_status"
+fi
+
+if [ "$management_command" = "setup" ]; then
+  printf 'ARC %s runtime ready: %s\n' "$selected_profile" "$runtime_dir"
+  exit 0
+fi
+
+exec "${venv_dir}/bin/${tool_name}" "$@"

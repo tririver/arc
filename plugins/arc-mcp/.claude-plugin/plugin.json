@@ -1,0 +1,12 @@
+{
+  "name": "arc-mcp",
+  "version": "1.0.0",
+  "description": "Optional MCP adapter for ARC research tools.",
+  "author": {
+    "name": "ARC"
+  },
+  "homepage": "https://github.com/tririver/arc",
+  "repository": "https://github.com/tririver/arc",
+  "license": "MIT",
+  "keywords": ["arc", "mcp", "papers", "arxiv", "inspire", "research"]
+}

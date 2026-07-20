@@ -593,8 +593,7 @@ def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str,
     elif step.kind == "new_calculation":
         runtime = {
             "allow_internet": True,
-            "allow_mcp": True,
-            "mcp_mode": "arc-only",
+            "allow_mcp": False,
             "codex_sandbox": "read-only",
         }
     else:
@@ -605,8 +604,6 @@ def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str,
         }
     runtime.update(_dict(config.defaults.get("proposer_runtime", {}), "defaults.proposer_runtime"))
     runtime.update(step.proposer_runtime)
-    if _bool_default(runtime.get("allow_mcp", False), False) and "mcp_mode" not in runtime:
-        runtime["mcp_mode"] = "arc-only"
     return runtime
 
 

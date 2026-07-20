@@ -6,6 +6,7 @@ import json
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
+from arc_llm.evidence import EVIDENCE_REQUESTS_FIELD
 from arc_llm.proposers_reviewer.config import ConfigError, load_batch_config, worker_env
 from arc_llm.proposers_reviewer.prompts import proposer_context, render_prompt, reviewer_context
 
@@ -68,6 +69,7 @@ def test_valid_config_parses_and_merges_defaults():
     assert loop.loop_id == "idea_001"
     assert loop.max_rounds == 5
     assert loop.early_stop_enabled is False
+    assert loop.evidence_enabled is True
     assert loop.caller_context == {"user_intent": "test intent"}
     assert loop.session.policy == "stateful"
 
@@ -78,8 +80,11 @@ def test_valid_config_parses_and_merges_defaults():
     assert proposer.model_tier == "high"
     assert proposer.runtime["allow_internet"] is True
     assert proposer.runtime["allow_mcp"] is False
+    assert proposer.evidence_enabled is True
+    assert EVIDENCE_REQUESTS_FIELD in proposer.output_schema.get("properties", {})
     assert ARC_LLM_CALL_RECORD_FIELD not in proposer.output_schema.get("properties", {})
     assert reviewer.runtime["allow_mcp"] is True
+    assert reviewer.evidence_enabled is True
     assert reviewer.runtime["claude_effort"] == "high"
 
 
@@ -149,6 +154,28 @@ def test_invalid_string_boolean_fails():
 
     with pytest.raises(ConfigError, match="early_stop.enabled"):
         load_batch_config(payload)
+
+
+def test_evidence_capability_cascades_from_batch_loop_and_worker():
+    batch_disabled = minimal_config()
+    batch_disabled["evidence"] = {"enabled": False}
+    batch_disabled["loops"][0]["evidence"] = {"enabled": True}
+    disabled = load_batch_config(batch_disabled)
+
+    assert disabled.evidence.enabled is False
+    assert disabled.loops[0].evidence_enabled is False
+    assert all(not worker.evidence_enabled for worker in disabled.loops[0].proposers + disabled.loops[0].reviewers)
+    assert EVIDENCE_REQUESTS_FIELD not in disabled.loops[0].proposers[0].output_schema.get("properties", {})
+
+    worker_disabled = minimal_config()
+    worker_disabled["loops"][0]["proposers"][0]["evidence"] = {"enabled": False}
+    enabled = load_batch_config(worker_disabled)
+
+    assert enabled.loops[0].evidence_enabled is True
+    assert enabled.loops[0].proposers[0].evidence_enabled is False
+    assert enabled.loops[0].reviewers[0].evidence_enabled is True
+    assert EVIDENCE_REQUESTS_FIELD not in enabled.loops[0].proposers[0].output_schema.get("properties", {})
+    assert EVIDENCE_REQUESTS_FIELD in enabled.loops[0].reviewers[0].output_schema.get("properties", {})
 
 
 def test_duplicate_loop_ids_fail():
@@ -221,6 +248,11 @@ def test_worker_env_false_runtime_clears_inherited_permission_flags():
         "ARC_CLAUDE_ALLOW_MCP": "true",
         "ARC_CODEX_MCP_MODE": "arc-only",
         "ARC_CLAUDE_MCP_MODE": "arc-only",
+        "ARC_CODEX_PROFILE": "mcp-profile",
+        "ARC_CODEX_CONFIG": 'mcp_servers.arc.command="arc-mcp"',
+        "ARC_CLAUDE_MCP_CONFIG": "/tmp/arc-mcp.json",
+        "ARC_CLAUDE_TOOLS": "default",
+        "ARC_CLAUDE_ALLOWED_TOOLS": "mcp__arc__*",
     }
 
     env = worker_env(worker, base_env=base_env)
@@ -231,6 +263,13 @@ def test_worker_env_false_runtime_clears_inherited_permission_flags():
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
     assert "ARC_CODEX_MCP_MODE" not in env
     assert "ARC_CLAUDE_MCP_MODE" not in env
+    assert "ARC_CODEX_PROFILE" not in env
+    assert "ARC_CODEX_CONFIG" not in env
+    assert "ARC_CLAUDE_MCP_CONFIG" not in env
+    assert "ARC_CLAUDE_TOOLS" not in env
+    assert "ARC_CLAUDE_ALLOWED_TOOLS" not in env
+    assert env["ARC_CODEX_IGNORE_USER_CONFIG"] == "true"
+    assert env["ARC_CLAUDE_BARE"] == "true"
 
 
 def test_worker_env_maps_mcp_model_and_provider_options():

@@ -427,7 +427,7 @@ def _arc_only_mcp_config_overrides(env: Mapping[str, str]) -> list[tuple[str, st
     mcp_env = {
         "ARC_AGENT_HOST": "codex",
     }
-    for key in ("ARC_PAPER_CACHE", "ARC_DOMAIN_CACHE", "ARC_MCP_CACHE"):
+    for key in ("ARC_PAPER_CACHE", "ARC_DOMAIN_CACHE", "ARC_JOBS_CACHE"):
         if value := env.get(key):
             mcp_env[key] = value
     if raw := env.get("ARC_CODEX_ARC_MCP_ENV_JSON"):

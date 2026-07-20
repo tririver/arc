@@ -14,6 +14,7 @@ from _arc_script_bootstrap import bootstrap_arc_pythonpath
 bootstrap_arc_pythonpath()
 
 from arc_domain.summary import mathematical_opportunities_validation_error
+from arc_llm.evidence import EvidenceControllerCallback, EvidenceRequest, EvidenceResponse
 from arc_llm.proposers_reviewer.artifacts import atomic_write_json, atomic_write_text
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
 from arc_llm.proposers_reviewer.template_materializer import (
@@ -23,6 +24,7 @@ from arc_llm.proposers_reviewer.template_materializer import (
     materialize_worker,
     replace_placeholders,
 )
+from arc_paper import service as arc_paper_service
 
 from ideas_config import ConfigError, IdeasConfig, VariantConfig, load_ideas_config
 from ideas_marking import load_marking_scheme, marking_scheme_for_context, marks_schema, normalized_marks, score_fields
@@ -68,6 +70,23 @@ DEFAULT_CROSS_DOMAIN_PROFILES = [
         ),
     },
 ]
+ARC_PAPER_EVIDENCE_OPERATIONS = [
+    {"operation": "paper.metadata", "arguments": "paper_id or paper_ids; optional refresh boolean"},
+    {"operation": "paper.section", "arguments": "paper_id or paper_ids, section; optional refresh boolean"},
+    {
+        "operation": "paper.full_text_search",
+        "arguments": "query; optional paper_id or paper_ids, refresh, limit, context, case_sensitive",
+    },
+    {
+        "operation": "paper.references",
+        "arguments": "paper_id or paper_ids; optional refresh and enrich booleans",
+    },
+    {
+        "operation": "paper.citers",
+        "arguments": "paper_id or paper_ids; optional refresh, limit, sort (mostrecent or mostcited)",
+    },
+    {"operation": "paper.search", "arguments": "query; optional limit"},
+]
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,129 @@ class IdeaPlan:
     caller_context: dict[str, Any]
 
 
+class ArcPaperEvidenceResolver:
+    """Resolve the bounded evidence vocabulary through deterministic arc-paper services."""
+
+    def __call__(
+        self,
+        requests: tuple[EvidenceRequest, ...],
+        *,
+        round_number: int,
+    ) -> tuple[EvidenceResponse, ...]:
+        return tuple(self._resolve(request, round_number=round_number) for request in requests)
+
+    def _resolve(self, request: EvidenceRequest, *, round_number: int) -> EvidenceResponse:
+        try:
+            result = _dispatch_arc_paper_evidence(request.operation, request.arguments)
+        except Exception as exc:
+            return EvidenceResponse(
+                request.request_id,
+                False,
+                error=str(exc) or exc.__class__.__name__,
+                provenance={
+                    "source": "arc-paper",
+                    "operation": request.operation,
+                    "evidence_round": round_number,
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+        meta = result.get("meta") if isinstance(result, Mapping) else None
+        provenance = {
+            "source": "arc-paper",
+            "operation": request.operation,
+            "evidence_round": round_number,
+            "service_meta": dict(meta) if isinstance(meta, Mapping) else {},
+        }
+        if isinstance(result, Mapping) and result.get("ok") is True:
+            return EvidenceResponse(request.request_id, True, data=result.get("data"), provenance=provenance)
+        error = result.get("error") if isinstance(result, Mapping) else None
+        message = error.get("message") if isinstance(error, Mapping) else "arc-paper returned an invalid result"
+        return EvidenceResponse(request.request_id, False, error=str(message), provenance=provenance)
+
+
+def _dispatch_arc_paper_evidence(operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    args = dict(arguments)
+    refresh = _evidence_bool(args.get("refresh", False), "refresh")
+    if operation == "paper.metadata":
+        return arc_paper_service.get_metadata(_evidence_paper_ids(args), refresh=refresh)
+    if operation == "paper.section":
+        return arc_paper_service.get_section(
+            _evidence_paper_ids(args),
+            _evidence_text(args, "section"),
+            refresh=refresh,
+        )
+    if operation == "paper.full_text_search":
+        return arc_paper_service.search_full_text(
+            _evidence_paper_ids(args, required=False),
+            query=_evidence_text(args, "query"),
+            refresh=refresh,
+            limit=_evidence_int(args.get("limit", 20), "limit", minimum=1, maximum=100),
+            context=_evidence_int(args.get("context", 1), "context", minimum=0, maximum=10),
+            case_sensitive=_evidence_bool(args.get("case_sensitive", False), "case_sensitive"),
+        )
+    if operation == "paper.references":
+        return arc_paper_service.get_references(
+            _evidence_paper_ids(args),
+            refresh=refresh,
+            enrich=_evidence_bool(args.get("enrich", True), "enrich"),
+        )
+    if operation == "paper.citers":
+        sort = str(args.get("sort", "mostrecent"))
+        if sort not in {"mostrecent", "mostcited"}:
+            raise ValueError("sort must be mostrecent or mostcited")
+        return arc_paper_service.get_citers(
+            _evidence_paper_ids(args),
+            refresh=refresh,
+            limit=_evidence_int(args.get("limit", 100), "limit", minimum=1, maximum=1000),
+            sort=sort,
+        )
+    if operation == "paper.search":
+        return arc_paper_service.search_inspire(
+            _evidence_text(args, "query"),
+            limit=_evidence_int(args.get("limit", 20), "limit", minimum=1, maximum=100),
+        )
+    raise ValueError(
+        "unsupported evidence operation; use paper.metadata, paper.section, "
+        "paper.full_text_search, paper.references, paper.citers, or paper.search"
+    )
+
+
+def _evidence_paper_ids(arguments: Mapping[str, Any], *, required: bool = True) -> str | list[str] | None:
+    value = arguments.get("paper_ids", arguments.get("paper_id"))
+    if value is None and not required:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value):
+        return [item.strip() for item in value]
+    raise ValueError("paper_id or a non-empty paper_ids string array is required")
+
+
+def _evidence_text(arguments: Mapping[str, Any], key: str) -> str:
+    value = arguments.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return value.strip()
+
+
+def _evidence_bool(value: Any, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _evidence_int(value: Any, key: str, *, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer between {minimum} and {maximum}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer between {minimum} and {maximum}") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{key} must be an integer between {minimum} and {maximum}")
+    return parsed
+
+
 def run_ideas(
     config: IdeasConfig | Mapping[str, Any],
     *,
@@ -87,6 +229,7 @@ def run_ideas(
     batch_runner: BatchRunner | None = None,
     base_env: Mapping[str, str] | None = None,
     process_chain: list[str] | None = None,
+    evidence_controller: EvidenceControllerCallback | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     ideas_config = config if isinstance(config, IdeasConfig) else load_ideas_config(config)
@@ -123,14 +266,18 @@ def run_ideas(
     atomic_write_json(batch_config_path, batch_config)
     _write_warnings(warnings_path, warnings)
     try:
-        batch_result = (batch_runner or run_proposers_reviewer_batch)(
-            batch_config,
-            json_runner=json_runner,
-            base_env=base_env,
-            process_chain=process_chain,
-            dry_run=False,
-            max_concurrent_loops=max_concurrent,
-        )
+        batch_kwargs: dict[str, Any] = {
+            "json_runner": json_runner,
+            "base_env": base_env,
+            "process_chain": process_chain,
+            "dry_run": False,
+            "max_concurrent_loops": max_concurrent,
+        }
+        if evidence_controller is not None:
+            batch_kwargs["evidence_controller"] = evidence_controller
+        elif batch_runner is None:
+            batch_kwargs["evidence_controller"] = ArcPaperEvidenceResolver()
+        batch_result = (batch_runner or run_proposers_reviewer_batch)(batch_config, **batch_kwargs)
     except Exception as exc:
         batch_result = {
             "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
@@ -267,6 +414,9 @@ def _caller_context(
         caller_context.pop("domain_markdown_files", None)
     if not variant.context_policy.attach_arc_paper_tool_notes:
         caller_context.pop("arc_paper_tool_notes", None)
+        caller_context.pop("controller_evidence_operations", None)
+    else:
+        caller_context["controller_evidence_operations"] = copy.deepcopy(ARC_PAPER_EVIDENCE_OPERATIONS)
     return caller_context
 
 
@@ -322,6 +472,7 @@ def _idea_loop_payload(idea: IdeaPlan) -> dict[str, Any]:
             "generation_mode",
             "domain_cards",
             "arc_paper_tool_notes",
+            "controller_evidence_operations",
             "marking_scheme",
         ]
         volatile_context_keys = ["idea_id", "variant_id", "exploration_profile"]
@@ -330,6 +481,7 @@ def _idea_loop_payload(idea: IdeaPlan) -> dict[str, Any]:
             "user_intent",
             "domain_markdown_files",
             "arc_paper_tool_notes",
+            "controller_evidence_operations",
             "marking_scheme",
         ]
         volatile_context_keys = ["idea_id", "variant_id"]
@@ -342,6 +494,11 @@ def _idea_loop_payload(idea: IdeaPlan) -> dict[str, Any]:
         cache_context={
             "static_caller_context_keys": static_context_keys,
             "volatile_caller_context_keys": volatile_context_keys,
+        },
+        overrides={
+            "evidence": {
+                "enabled": idea.variant.context_policy.attach_arc_paper_tool_notes,
+            }
         },
     )
 

@@ -14,6 +14,14 @@ from typing import Any, Callable, Mapping
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA_VERSION
 from arc_llm.call_record import strip_arc_llm_call_records
+from arc_llm.evidence import (
+    EvidenceControllerCallback,
+    EvidenceProtocolError,
+    EvidenceRequest,
+    EvidenceResponse,
+    evidence_requests_from_output,
+    resolve_evidence_round,
+)
 from arc_llm.runner import run_json
 from arc_llm.schema_cache import schema_hash, sha256_text
 from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
@@ -70,6 +78,7 @@ def run_proposers_reviewer_batch(
     process_chain: list[str] | None = None,
     dry_run: bool = False,
     max_concurrent_loops: int | None = None,
+    evidence_controller: EvidenceControllerCallback | None = None,
 ) -> dict[str, Any]:
     batch = config if isinstance(config, BatchConfig) else load_batch_config(config)
     concurrency = max_concurrent_loops or batch.max_concurrent_loops
@@ -104,6 +113,7 @@ def run_proposers_reviewer_batch(
                     json_runner,
                     base_env,
                     process_chain,
+                    evidence_controller,
                 )
                 future_by_loop[future] = loop.loop_id
             if not future_by_loop:
@@ -195,6 +205,7 @@ def _run_loop(
     json_runner: JsonRunner | None,
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
+    evidence_controller: EvidenceControllerCallback | None,
 ) -> dict[str, Any]:
     if paths.loop_root.exists():
         return _loop_failure(loop.loop_id, paths, "loop directory already exists")
@@ -212,6 +223,7 @@ def _run_loop(
                 json_runner,
                 base_env,
                 process_chain,
+                evidence_controller,
             )
             atomic_write_json(paths.state, result)
             return result
@@ -231,11 +243,15 @@ def _run_loop_rounds(
     json_runner: JsonRunner | None,
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
+    evidence_controller: EvidenceControllerCallback | None,
 ) -> dict[str, Any]:
     correspondence: list[dict[str, Any]] = []
     rounds_completed = 0
+    evidence_rounds_completed = 0
+    evidence_request_count = 0
     stop_reason = ""
     for round_number in range(1, loop.max_rounds + 1):
+        evidence_followup_pending = False
         round_paths = paths.round(round_number)
         proposer_outputs = _run_proposers(
             loop,
@@ -309,25 +325,75 @@ def _run_loop_rounds(
             correspondence.append(event)
             append_jsonl(paths.transcript, event)
 
+        evidence_requests = _collect_evidence_requests(
+            loop=loop,
+            proposer_outputs=proposer_outputs,
+            review_output=review_output,
+        )
+        if evidence_requests:
+            evidence_request_count += len(evidence_requests)
+            if (
+                batch.evidence.enabled
+                and evidence_controller is not None
+                and evidence_rounds_completed < batch.evidence.max_rounds
+                and round_number < loop.max_rounds
+            ):
+                evidence_rounds_completed += 1
+                evidence_responses = resolve_evidence_round(
+                    evidence_requests,
+                    evidence_controller,
+                    round_number=evidence_rounds_completed,
+                    max_rounds=batch.evidence.max_rounds,
+                )
+                resolution_status = "resolved"
+                evidence_round_number: int | None = evidence_rounds_completed
+                evidence_followup_pending = round_number < loop.max_rounds
+            else:
+                evidence_responses, resolution_status = _unresolved_evidence_responses(
+                    evidence_requests,
+                    enabled=batch.evidence.enabled,
+                    controller_configured=evidence_controller is not None,
+                    limit_reached=evidence_rounds_completed >= batch.evidence.max_rounds,
+                    followup_available=round_number < loop.max_rounds,
+                )
+                evidence_round_number = None
+            evidence_event = _evidence_event(
+                round_number=round_number,
+                evidence_round_number=evidence_round_number,
+                status=resolution_status,
+                requests=evidence_requests,
+                responses=evidence_responses,
+            )
+            correspondence.append(evidence_event)
+            append_jsonl(paths.transcript, evidence_event)
+
         rounds_completed = round_number
         controller = review_output.get("controller", {})
-        if controller.get("stop_requested") and loop.early_stop_enabled:
+        if controller.get("stop_requested") and loop.early_stop_enabled and not evidence_followup_pending:
             stop_reason = str(controller.get("stop_reason") or controller.get("message") or "")
-            return {
-                "loop_id": loop.loop_id,
-                "status": "stopped",
-                "rounds_completed": rounds_completed,
-                "stop_reason": stop_reason,
-                "loop_root": str(paths.loop_root),
-            }
+            return _with_evidence_summary(
+                {
+                    "loop_id": loop.loop_id,
+                    "status": "stopped",
+                    "rounds_completed": rounds_completed,
+                    "stop_reason": stop_reason,
+                    "loop_root": str(paths.loop_root),
+                },
+                evidence_rounds_completed=evidence_rounds_completed,
+                evidence_request_count=evidence_request_count,
+            )
 
-    return {
-        "loop_id": loop.loop_id,
-        "status": "completed",
-        "rounds_completed": rounds_completed,
-        "stop_reason": stop_reason,
-        "loop_root": str(paths.loop_root),
-    }
+    return _with_evidence_summary(
+        {
+            "loop_id": loop.loop_id,
+            "status": "completed",
+            "rounds_completed": rounds_completed,
+            "stop_reason": stop_reason,
+            "loop_root": str(paths.loop_root),
+        },
+        evidence_rounds_completed=evidence_rounds_completed,
+        evidence_request_count=evidence_request_count,
+    )
 
 
 def _run_proposers(
@@ -1106,6 +1172,7 @@ def _reviewer_prompt_and_context(
             worker=reviewer,
             round_number=round_number,
             current_proposer_outputs=proposer_outputs,
+            correspondence=copy.deepcopy(correspondence),
         )
         return prompt, context, None
     context = reviewer_context(
@@ -1494,6 +1561,124 @@ def _round_events(
             }
         )
     return events
+
+
+def _collect_evidence_requests(
+    *,
+    loop: LoopConfig,
+    proposer_outputs: Mapping[str, Any],
+    review_output: Mapping[str, Any],
+) -> tuple[EvidenceRequest, ...]:
+    requests: list[EvidenceRequest] = []
+    proposer_by_id = {proposer.id: proposer for proposer in loop.proposers}
+    for proposer_id, output in sorted(proposer_outputs.items()):
+        proposer = proposer_by_id.get(proposer_id)
+        if proposer is not None and proposer.evidence_enabled:
+            requests.extend(
+                evidence_requests_from_output(
+                    output,
+                    worker_id=proposer_id,
+                    role="proposer",
+                )
+            )
+    reviewer = loop.reviewers[0]
+    if reviewer.evidence_enabled:
+        requests.extend(
+            evidence_requests_from_output(
+                review_output,
+                worker_id=reviewer.id,
+                role="reviewer",
+            )
+        )
+    request_ids = [request.request_id for request in requests]
+    if len(request_ids) != len(set(request_ids)):
+        raise EvidenceProtocolError("evidence request IDs must be unique across all workers in a loop round")
+    return tuple(requests)
+
+
+def _unresolved_evidence_responses(
+    requests: tuple[EvidenceRequest, ...],
+    *,
+    enabled: bool,
+    controller_configured: bool,
+    limit_reached: bool,
+    followup_available: bool,
+) -> tuple[tuple[EvidenceResponse, ...], str]:
+    if not enabled:
+        error = "controller-mediated evidence is disabled for this batch"
+        status = "disabled"
+    elif not followup_available:
+        error = "no worker follow-up round remains to consume controller evidence"
+        status = "no_followup_round"
+    elif not controller_configured:
+        error = "no controller evidence resolver was configured"
+        status = "resolver_unavailable"
+    elif limit_reached:
+        error = "the controller evidence limit of three rounds was reached"
+        status = "round_limit_reached"
+    else:  # pragma: no cover - kept as a defensive invariant
+        error = "controller evidence could not be resolved"
+        status = "unresolved"
+    return (
+        tuple(
+            EvidenceResponse(
+                request_id=request.request_id,
+                ok=False,
+                error=error,
+                provenance={"source": "arc-llm-controller", "status": status},
+            )
+            for request in requests
+        ),
+        status,
+    )
+
+
+def _evidence_event(
+    *,
+    round_number: int,
+    evidence_round_number: int | None,
+    status: str,
+    requests: tuple[EvidenceRequest, ...],
+    responses: tuple[EvidenceResponse, ...],
+) -> dict[str, Any]:
+    return {
+        "type": "evidence_responses",
+        "round_number": round_number,
+        "evidence_round_number": evidence_round_number,
+        "status": status,
+        "exchanges": [
+            {
+                "request": {
+                    "request_id": request.request_id,
+                    "operation": request.operation,
+                    "arguments": dict(request.arguments),
+                    "reason": request.reason,
+                    "worker_id": request.worker_id,
+                    "role": request.role,
+                },
+                "response": {
+                    "request_id": response.request_id,
+                    "ok": response.ok,
+                    "data": response.data,
+                    "error": response.error,
+                    "provenance": dict(response.provenance),
+                },
+            }
+            for request, response in zip(requests, responses, strict=True)
+        ],
+    }
+
+
+def _with_evidence_summary(
+    result: dict[str, Any],
+    *,
+    evidence_rounds_completed: int,
+    evidence_request_count: int,
+) -> dict[str, Any]:
+    if evidence_request_count:
+        result["evidence_rounds_completed"] = evidence_rounds_completed
+        result["evidence_request_count"] = evidence_request_count
+    return result
 
 
 def _loop_failure(loop_id: str, paths, message: str, *, exc: BaseException | None = None) -> dict[str, Any]:

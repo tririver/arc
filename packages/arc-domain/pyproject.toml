@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arc-domain"
-version = "0.9.4"
+version = "1.0.0"
 description = "Build cached research-field domain artifacts from a seed paper."
 readme = "../../README.md"
 license = "MIT"
 authors = [{ name = "ARC" }]
 requires-python = ">=3.11"
 dependencies = [
-  "arc-llm>=0.9,<0.10",
-  "arc-paper>=0.9,<0.10",
+  "arc-llm>=1.0,<1.1",
+  "arc-paper>=1.0,<1.1",
   "jsonschema>=4.22"
 ]
 classifiers = [

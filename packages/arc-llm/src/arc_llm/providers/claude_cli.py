@@ -427,7 +427,7 @@ def _write_arc_only_mcp_config(env: Mapping[str, str]) -> Path:
     path = _arc_only_mcp_config_path(env)
     command, args = _arc_mcp_command_and_args(env)
     mcp_env = {"ARC_AGENT_HOST": "claude"}
-    for key in ("ARC_PAPER_CACHE", "ARC_DOMAIN_CACHE", "ARC_MCP_CACHE"):
+    for key in ("ARC_PAPER_CACHE", "ARC_DOMAIN_CACHE", "ARC_JOBS_CACHE"):
         if value := env.get(key):
             mcp_env[key] = value
     if raw := env.get("ARC_CLAUDE_ARC_MCP_ENV_JSON"):

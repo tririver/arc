@@ -6,6 +6,50 @@ from types import SimpleNamespace
 from arc_llm import cli
 
 
+def test_main_returns_nonzero_for_error_envelope(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "_dispatch",
+        lambda _args: {"ok": False, "error": {"code": "failed", "message": "boom"}},
+    )
+
+    assert cli.main(["doctor", "host"]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_main_returns_nonzero_for_failed_status(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_dispatch", lambda _args: {"status": "failed"})
+
+    assert cli.main(["doctor", "host"]) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "failed"
+
+
+def test_main_treats_needs_llm_as_successful_handoff(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "_dispatch",
+        lambda _args: {"ok": False, "status": "needs_llm", "llm_task": {"prompt": "..."}},
+    )
+
+    assert cli.main(["doctor", "host"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "needs_llm"
+
+
+def test_main_json_wraps_dispatch_exception(monkeypatch, capsys):
+    def fail(_args):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(cli, "_dispatch", fail)
+
+    assert cli.main(["run-json", "--json"]) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] == {
+        "code": "command_failed",
+        "message": "provider unavailable",
+        "type": "RuntimeError",
+    }
+
+
 def test_runtime_env_merges_cli_llm_options(monkeypatch):
     monkeypatch.setenv("ARC_AGENT_HOST", "codex")
     parser_args = cli._build_parser().parse_args(

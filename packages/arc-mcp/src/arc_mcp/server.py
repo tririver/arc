@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import shlex
 import sys
 from pathlib import Path
-from shutil import which
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Mapping
 
+from arc_jobs.jobs import arc_jobs_cli_command
 from arc_domain import service as domain_service
 from arc_llm.host import detect_host, select_llm_provider
 from arc_llm.runner import resolve_llm_config
@@ -73,32 +72,32 @@ JOB_CANCEL_DESCRIPTION = (
     "Cancel an MCP job. Do not use this unless the user explicitly asks; cancelling may waste work "
     "and leave a requested cached artifact unfinished."
 )
-MD2PDF_INPUT_DESCRIPTION = "Markdown file to convert to PDF."
-MD2PDF_OUTPUT_DESCRIPTION = "Optional output PDF path. Defaults to the input path with a .pdf suffix."
+MD2PDF_INPUT_DESCRIPTION = "Absolute path to the Markdown file to convert to PDF."
+MD2PDF_OUTPUT_DESCRIPTION = "Optional absolute output PDF path. Defaults to the input path with a .pdf suffix."
 MD2PDF_TEXLIVE_BIN_DESCRIPTION = (
-    "Optional TeX Live bin directory to prepend to PATH. Pass an empty string to avoid modifying PATH."
+    "Optional absolute TeX Live bin directory to prepend to PATH. Pass an empty string to avoid modifying PATH."
 )
 MD2PDF_RESOURCE_PATH_DESCRIPTION = (
-    "Optional Pandoc resource path entries for resolving relative images and assets."
+    "Optional absolute Pandoc resource path entries for resolving relative images and assets."
 )
 MD2PDF_TIMEOUT_DESCRIPTION = "Pandoc/XeLaTeX timeout in seconds. Defaults to 600."
-TRANSLATE_INPUT_DESCRIPTION = "Markdown file to translate."
-TRANSLATE_OUTPUT_DESCRIPTION = "Optional translated Markdown output path. Defaults to input.<target_locale>.md."
+TRANSLATE_INPUT_DESCRIPTION = "Absolute path to the Markdown file to translate."
+TRANSLATE_OUTPUT_DESCRIPTION = "Optional absolute translated Markdown output path. Defaults to input.<target_locale>.md."
 TRANSLATE_TARGET_LANGUAGE_DESCRIPTION = "Target natural language for translation. Defaults to Chinese."
 TRANSLATE_TARGET_LOCALE_DESCRIPTION = "Target locale suffix for output files. Defaults to zh_CN."
-TRANSLATE_PROJECT_DIR_DESCRIPTION = "Project directory to scan for same-folder Markdown/PDF report pairs."
+TRANSLATE_PROJECT_DIR_DESCRIPTION = "Absolute project directory to scan for same-folder Markdown/PDF report pairs."
 TRANSLATE_QUALITY_DESCRIPTION = "When true, run an additional LLM QA/revision pass after fast translation."
 TRANSLATE_OVERWRITE_DESCRIPTION = "When true, overwrite existing translated Markdown/PDF outputs."
 MODEL_TIER_DESCRIPTION = (
     "LLM model tier for translation work: low, medium, high, or max. Defaults to low for speed and cost. "
     "Never select max automatically; use it only when the user explicitly requests the max model tier."
 )
-PARSE_SOURCE_PATH_DESCRIPTION = "Optional local source path. Extension may be .html, .tex, or .pdf."
+PARSE_SOURCE_PATH_DESCRIPTION = "Optional absolute local source path. Extension may be .html, .tex, or .pdf."
 PARSE_SOURCE_DESCRIPTION = "Source adapter: auto, ar5iv, html, tex, pdf, or tex-pdf."
 PARSE_ID_DESCRIPTION = "Parsed source id to store in paper_id and use for sources cache filename."
-PARSE_HTML_PATH_DESCRIPTION = "Optional local HTML source path."
-PARSE_TEX_PATH_DESCRIPTION = "Optional local TeX source path."
-PARSE_PDF_PATH_DESCRIPTION = "Optional local PDF source path."
+PARSE_HTML_PATH_DESCRIPTION = "Optional absolute local HTML source path."
+PARSE_TEX_PATH_DESCRIPTION = "Optional absolute local TeX source path."
+PARSE_PDF_PATH_DESCRIPTION = "Optional absolute local PDF source path."
 PARSED_SOURCE_ID_DESCRIPTION = "Parsed source id whose cached equation should be annotated."
 PARSED_EQUATION_ID_DESCRIPTION = "Parsed equation id to annotate, for example eq_00042."
 PARSED_EQUATION_STATUS_DESCRIPTION = "Equation annotation status: problematic, needs_recache, or resolved."
@@ -206,6 +205,179 @@ def _select_paper_ids(paper_id: Any = None, paper_ids: Any = None, *, required: 
     return paper_ids if has_many else paper_id
 
 
+def _absolute_path_arg(value: Any, name: str) -> Path:
+    candidate = Path(str(value)).expanduser()
+    if not candidate.is_absolute():
+        raise ToolInputError(
+            "absolute_path_required",
+            f"{name} must be an absolute path; MCP server cwd is not a project directory.",
+        )
+    return candidate.resolve(strict=False)
+
+
+def _optional_absolute_path_arg(value: Any, name: str) -> Path | None:
+    if value is None or value == "":
+        return None
+    return _absolute_path_arg(value, name)
+
+
+def _parse_response(args: dict[str, Any]) -> Any:
+    paths = {
+        name: _optional_absolute_path_arg(args.get(name), name)
+        for name in ("source_path", "html_path", "tex_path", "pdf_path")
+    }
+    return service.parse_source(
+        str(paths["source_path"]) if paths["source_path"] is not None else None,
+        source=str(args.get("source", "auto")),
+        source_id=args.get("source_id") or args.get("id"),
+        paper_id=args.get("paper_id"),
+        html_path=str(paths["html_path"]) if paths["html_path"] is not None else None,
+        tex_path=str(paths["tex_path"]) if paths["tex_path"] is not None else None,
+        pdf_path=str(paths["pdf_path"]) if paths["pdf_path"] is not None else None,
+        refresh=_bool_arg(args.get("refresh"), False),
+    )
+
+
+def _append_cli_option(argv: list[str], flag: str, value: Any) -> None:
+    if value is not None:
+        argv.extend([flag, str(value)])
+
+
+def _md2pdf_cli_argv(payload: Mapping[str, Any]) -> list[str]:
+    argv = ["arc-typeset", "md2pdf", str(payload["input"])]
+    _append_cli_option(argv, "--output", payload.get("output"))
+    _append_cli_option(argv, "--texlive-bin", payload.get("texlive_bin"))
+    _append_cli_option(argv, "--margin", payload.get("margin"))
+    _append_cli_option(argv, "--mainfont", payload.get("mainfont"))
+    _append_cli_option(argv, "--cjk-mainfont", payload.get("cjk_mainfont"))
+    _append_cli_option(argv, "--timeout-seconds", payload.get("timeout_seconds"))
+    for resource_path in payload.get("resource_path") or []:
+        argv.extend(["--resource-path", str(resource_path)])
+    argv.append("--json")
+    return argv
+
+
+def _translate_cli_argv(payload: Mapping[str, Any]) -> list[str]:
+    argv = ["arc-typeset", "translate", str(payload["input"])]
+    _append_cli_option(argv, "--output", payload.get("output"))
+    _append_cli_option(argv, "--target-language", payload.get("target_language"))
+    _append_cli_option(argv, "--target-locale", payload.get("target_locale"))
+    _append_cli_option(argv, "--provider", payload.get("provider"))
+    _append_cli_option(argv, "--model", payload.get("model"))
+    _append_cli_option(argv, "--model-tier", payload.get("model_tier"))
+    if payload.get("quality"):
+        argv.append("--quality")
+    if payload.get("overwrite"):
+        argv.append("--overwrite")
+    argv.append("--json")
+    return argv
+
+
+def _batch_translate_cli_argv(payload: Mapping[str, Any]) -> list[str]:
+    argv = ["arc-typeset", "batch-translate", str(payload["project_dir"])]
+    _append_cli_option(argv, "--target-language", payload.get("target_language"))
+    _append_cli_option(argv, "--target-locale", payload.get("target_locale"))
+    _append_cli_option(argv, "--provider", payload.get("provider"))
+    _append_cli_option(argv, "--model", payload.get("model"))
+    _append_cli_option(argv, "--model-tier", payload.get("model_tier"))
+    if payload.get("quality"):
+        argv.append("--quality")
+    if payload.get("overwrite"):
+        argv.append("--overwrite")
+    argv.append("--json")
+    return argv
+
+
+def _paper_summary_cli_argv(
+    paper_ids: Any,
+    *,
+    provider: str,
+    model: str | None,
+    model_tier: str | None,
+    refresh: bool,
+) -> list[str]:
+    normalized = [paper_ids] if isinstance(paper_ids, str) else list(paper_ids or [])
+    argv = ["arc-paper", "llm-generate-summary", *(str(item) for item in normalized), "--provider", provider]
+    _append_cli_option(argv, "--model", model)
+    _append_cli_option(argv, "--model-tier", model_tier)
+    if refresh:
+        argv.append("--refresh")
+    argv.append("--json")
+    return argv
+
+
+def _reference_inference_cli_argv(
+    text: str,
+    *,
+    provider: str,
+    model: str | None,
+    refresh: bool,
+) -> list[str]:
+    argv = ["arc-paper", "llm-infer-main-references", text, "--provider", provider]
+    _append_cli_option(argv, "--model", model)
+    if refresh:
+        argv.append("--refresh")
+    argv.append("--json")
+    return argv
+
+
+def _domain_build_cli_argv(
+    seed_paper: str,
+    *,
+    intent: str,
+    domain_id: str | None,
+    provider: str,
+    model: str | None,
+    model_tier: str | None,
+    refresh: bool,
+    workers: int,
+) -> list[str]:
+    argv = [
+        "arc-domain",
+        "llm-build",
+        normalize_paper_id(seed_paper),
+        "--intent",
+        intent,
+        "--provider",
+        provider,
+        "--workers",
+        str(workers),
+    ]
+    _append_cli_option(argv, "--domain-id", domain_id)
+    _append_cli_option(argv, "--model", model)
+    _append_cli_option(argv, "--model-tier", model_tier)
+    if refresh:
+        argv.append("--refresh")
+    argv.append("--json")
+    return argv
+
+
+def _summary_batch_cli_argv(
+    name: str,
+    *,
+    provider: str,
+    model: str | None,
+    model_tier: str | None,
+    concurrency: int,
+    max_items: int | None,
+) -> list[str]:
+    argv = [
+        "arc-paper",
+        "summary-batch",
+        "run",
+        name,
+        "--provider",
+        provider,
+        "--concurrency",
+        str(concurrency),
+    ]
+    _append_cli_option(argv, "--model", model)
+    _append_cli_option(argv, "--model-tier", model_tier)
+    _append_cli_option(argv, "--max-items", max_items)
+    argv.append("--json")
+    return argv
+
+
 TOOL_HANDLERS: dict[str, ToolHandler] = {
     "md2pdf": lambda args: _start_md2pdf_job_response(args),
     "translate": lambda args: _start_translate_job_response(args),
@@ -247,16 +419,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         str(args["query"]),
         refresh=_bool_arg(args.get("refresh"), False),
     ),
-    "parse": lambda args: service.parse_source(
-        args.get("source_path"),
-        source=str(args.get("source", "auto")),
-        source_id=args.get("source_id") or args.get("id"),
-        paper_id=args.get("paper_id"),
-        html_path=args.get("html_path"),
-        tex_path=args.get("tex_path"),
-        pdf_path=args.get("pdf_path"),
-        refresh=_bool_arg(args.get("refresh"), False),
-    ),
+    "parse": lambda args: _parse_response(args),
     "mark_parsed_equation": lambda args: service.mark_parsed_equation(
         str(args["source_id"]),
         str(args["equation_id"]),
@@ -311,14 +474,16 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 
 
 def _start_md2pdf_job_response(args: dict[str, Any]) -> dict[str, Any]:
-    input_path = Path(str(args["input"]))
-    output_path = Path(str(args["output"])) if args.get("output") else None
+    input_path = _absolute_path_arg(args["input"], "input")
+    output_path = _optional_absolute_path_arg(args.get("output"), "output")
     texlive_bin_raw = args.get("texlive_bin", str(typeset_md2pdf.DEFAULT_TEXLIVE_BIN))
-    texlive_bin = Path(str(texlive_bin_raw)) if texlive_bin_raw else None
+    texlive_bin = _optional_absolute_path_arg(texlive_bin_raw, "texlive_bin")
     margin = str(args.get("margin", typeset_md2pdf.DEFAULT_MARGIN))
     mainfont = str(args.get("mainfont", typeset_md2pdf.DEFAULT_MAINFONT))
     cjk_mainfont = str(args.get("cjk_mainfont", typeset_md2pdf.DEFAULT_CJK_MAINFONT))
-    resource_paths = [Path(str(path)) for path in args.get("resource_path") or []] or None
+    resource_paths = [
+        _absolute_path_arg(path, "resource_path") for path in args.get("resource_path") or []
+    ] or None
     try:
         timeout_seconds = _optional_float(args.get("timeout_seconds", typeset_md2pdf.DEFAULT_TIMEOUT_SECONDS))
     except ValueError as exc:
@@ -338,6 +503,7 @@ def _start_md2pdf_job_response(args: dict[str, Any]) -> dict[str, Any]:
     job_id = MCP_JOBS.start(
         job_type="md2pdf",
         payload=payload,
+        argv=_md2pdf_cli_argv(payload),
         runner=lambda progress, cancel: _run_md2pdf_job(
             input_path=input_path,
             output_path=output_path,
@@ -351,6 +517,7 @@ def _start_md2pdf_job_response(args: dict[str, Any]) -> dict[str, Any]:
             cancel=cancel,
         ),
         status_resolver=_arc_result_status,
+        cwd=_resolved_job_cwd(),
     )
     return _wait_or_background(
         job_id,
@@ -397,8 +564,8 @@ def _run_md2pdf_job(
 
 
 def _start_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
-    input_path = Path(str(args["input"]))
-    output_path = Path(str(args["output"])) if args.get("output") else None
+    input_path = _absolute_path_arg(args["input"], "input")
+    output_path = _optional_absolute_path_arg(args.get("output"), "output")
     target_language = str(args.get("target_language", typeset_translate.DEFAULT_TARGET_LANGUAGE))
     target_locale = str(args.get("target_locale", typeset_translate.DEFAULT_TARGET_LOCALE))
     provider = str(args.get("provider", "auto"))
@@ -421,6 +588,7 @@ def _start_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
     job_id = MCP_JOBS.start(
         job_type="translate",
         payload=payload,
+        argv=_translate_cli_argv(payload),
         runner=lambda progress, cancel: _run_translate_job(
             input_path=input_path,
             output_path=output_path,
@@ -435,6 +603,7 @@ def _start_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
             cancel=cancel,
         ),
         status_resolver=_arc_result_status,
+        cwd=_resolved_job_cwd(),
     )
     return _wait_or_background(
         job_id,
@@ -478,7 +647,7 @@ def _run_translate_job(
 
 
 def _start_batch_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
-    project_dir = Path(str(args["project_dir"]))
+    project_dir = _absolute_path_arg(args["project_dir"], "project_dir")
     target_language = str(args.get("target_language", typeset_translate.DEFAULT_TARGET_LANGUAGE))
     target_locale = str(args.get("target_locale", typeset_translate.DEFAULT_TARGET_LOCALE))
     provider = str(args.get("provider", "auto"))
@@ -500,6 +669,7 @@ def _start_batch_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
     job_id = MCP_JOBS.start(
         job_type="batch_translate",
         payload=payload,
+        argv=_batch_translate_cli_argv(payload),
         runner=lambda progress, cancel: _run_batch_translate_job(
             project_dir=project_dir,
             target_language=target_language,
@@ -513,6 +683,7 @@ def _start_batch_translate_job_response(args: dict[str, Any]) -> dict[str, Any]:
             cancel=cancel,
         ),
         status_resolver=_arc_result_status,
+        cwd=_resolved_job_cwd(),
     )
     return _wait_or_background(
         job_id,
@@ -581,6 +752,11 @@ def _error(code: str, message: str) -> dict[str, Any]:
     }
 
 
+def _resolved_job_cwd() -> str:
+    """Freeze MCP process-job path semantics at submission time."""
+    return str(Path.cwd().resolve(strict=True))
+
+
 def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -614,10 +790,18 @@ def _start_summary_job_response(
             "current_section": None,
             "background": background,
         },
+        argv=_paper_summary_cli_argv(
+            normalized,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            refresh=refresh,
+        ),
         runner=lambda progress, cancel: _run_summary_job(
             normalized, provider, model, model_tier, refresh, progress, cancel
         ),
         status_resolver=_arc_result_status,
+        cwd=_resolved_job_cwd(),
     )
     return _wait_or_background(
         job_id,
@@ -646,6 +830,12 @@ def _start_reference_inference_job_response(args: dict[str, Any]) -> dict[str, A
             "refresh": refresh,
             "background": background,
         },
+        argv=_reference_inference_cli_argv(
+            text,
+            provider=provider,
+            model=model,
+            refresh=refresh,
+        ),
         runner=lambda progress, cancel: _run_reference_inference_job(
             text,
             provider,
@@ -655,6 +845,7 @@ def _start_reference_inference_job_response(args: dict[str, Any]) -> dict[str, A
             cancel,
         ),
         status_resolver=_arc_result_status,
+        cwd=_resolved_job_cwd(),
     )
     return _wait_or_background(
         job_id,
@@ -691,6 +882,16 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
             "workers": workers,
             "background": background,
         },
+        argv=_domain_build_cli_argv(
+            seed_paper,
+            intent=intent,
+            domain_id=domain_id,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            refresh=refresh,
+            workers=workers,
+        ),
         runner=lambda progress, cancel: _run_domain_job(
             seed_paper,
             intent,
@@ -704,6 +905,7 @@ def _start_domain_job_response(args: dict[str, Any]) -> dict[str, Any]:
             cancel,
         ),
         status_resolver=_arc_result_status,
+        cwd=_resolved_job_cwd(),
     )
     return _wait_or_background(
         job_id,
@@ -859,10 +1061,19 @@ def _run_summary_batch_inline(args: dict[str, Any]) -> dict[str, Any]:
             "max_items": max_items_int,
             "background": background,
         },
+        argv=_summary_batch_cli_argv(
+            name,
+            provider=provider,
+            model=model,
+            model_tier=model_tier,
+            concurrency=concurrency,
+            max_items=max_items_int,
+        ),
         runner=lambda progress, cancel: _run_summary_batch_job(
             name, provider, model, model_tier, concurrency, max_items_int, progress, cancel
         ),
         status_resolver=_arc_result_status,
+        cwd=_resolved_job_cwd(),
     )
     return _wait_or_background(
         job_id,
@@ -901,7 +1112,8 @@ def _summary_batch_create_response(args: dict[str, Any]) -> dict[str, Any]:
     name = str(args["name"])
     prompt_version = str(args.get("prompt_version", "paper-summary-v1"))
     db = BatchDB.default()
-    with open(str(args["papers_file"]), encoding="utf-8") as handle:
+    papers_file = _absolute_path_arg(args["papers_file"], "papers_file")
+    with papers_file.open(encoding="utf-8") as handle:
         paper_ids = [line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")]
     db.create_batch(name, paper_ids, prompt_version)
     return {"ok": True, "data": {"batch": name, "counts": db.status_counts(name)}, "errors": [], "meta": {}}
@@ -923,9 +1135,10 @@ def _summary_batch_status_response(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _summary_batch_export_response(args: dict[str, Any]) -> dict[str, Any]:
+    output = _absolute_path_arg(args["output"], "output")
     return {
         "ok": True,
-        "data": export_batch(str(args["name"]), output=Path(str(args["output"]))),
+        "data": export_batch(str(args["name"]), output=output),
         "errors": [],
         "meta": {},
     }
@@ -948,7 +1161,7 @@ def _wait_or_background(
     inline_wait = 0.0 if background else resolve_inline_wait_seconds(server_name="arc")
     if not background and MCP_JOBS.wait(job_id, timeout=inline_wait):
         status = job_status(job_id)
-        wrapped = MCP_JOBS.result(job_id)
+        wrapped = job_result(job_id)
         result = wrapped.get("result") if isinstance(wrapped, dict) else None
         if isinstance(result, dict):
             return _attach_job_meta(result, status)
@@ -963,7 +1176,7 @@ def _wait_or_background(
         "inline_wait_seconds": inline_wait,
         "background_requested": background,
         "next": {
-            **_arc_mcp_watch_command(job_id),
+            **_arc_jobs_watch_command(job_id),
             "tool": "job_status",
             "arguments": {"job_id": job_id},
             "poll_after_seconds": poll_after_seconds,
@@ -974,15 +1187,11 @@ def _wait_or_background(
     }
 
 
-def _arc_mcp_watch_command(job_id: str) -> dict[str, str]:
-    found = which("arc-mcp")
-    if found:
-        cmd = found
-    else:
-        runtime_cmd = Path(sys.executable).with_name("arc-mcp")
-        cmd = str(runtime_cmd) if runtime_cmd.exists() else "arc-mcp"
+def _arc_jobs_watch_command(job_id: str) -> dict[str, str]:
     return {
-        "cli_command": f"{shlex.quote(cmd)} watch {shlex.quote(job_id)} --json",
+        "cli_command": arc_jobs_cli_command(
+            "watch", job_id, "--json", executable=sys.executable
+        ),
         "mcp_fallback_tool": "job_status",
     }
 
@@ -995,7 +1204,23 @@ def job_status(job_id: str) -> dict[str, Any]:
 
 
 def job_result(job_id: str) -> dict[str, Any]:
-    return MCP_JOBS.result(job_id)
+    wrapped = MCP_JOBS.result(job_id)
+    if not isinstance(wrapped, dict):
+        return wrapped
+    execution = wrapped.get("result")
+    if not (
+        isinstance(execution, dict)
+        and isinstance(execution.get("argv"), list)
+        and "exit_code" in execution
+        and "output" in execution
+    ):
+        return wrapped
+    adapted = dict(wrapped)
+    adapted["result"] = execution["output"]
+    meta = dict(adapted.get("meta") or {})
+    meta["execution"] = {key: value for key, value in execution.items() if key != "output"}
+    adapted["meta"] = meta
+    return adapted
 
 
 def cancel_job(job_id: str) -> dict[str, Any]:
@@ -1112,8 +1337,8 @@ def _register_tools(app: Any) -> None:
         resource_path: Md2PdfResourcePath = None,
         timeout_seconds: Md2PdfTimeout = typeset_md2pdf.DEFAULT_TIMEOUT_SECONDS,
     ) -> Any:
-        return _start_md2pdf_job_response(
-            {
+        return _tool_input_result(
+            lambda: _start_md2pdf_job_response({
                 "input": input,
                 "output": output,
                 "texlive_bin": texlive_bin,
@@ -1122,7 +1347,7 @@ def _register_tools(app: Any) -> None:
                 "cjk_mainfont": cjk_mainfont,
                 "resource_path": resource_path,
                 "timeout_seconds": timeout_seconds,
-            }
+            })
         )
 
     @app.tool(
@@ -1142,8 +1367,8 @@ def _register_tools(app: Any) -> None:
         quality: TranslateQuality = False,
         overwrite: TranslateOverwrite = False,
     ) -> Any:
-        return _start_translate_job_response(
-            {
+        return _tool_input_result(
+            lambda: _start_translate_job_response({
                 "input": input,
                 "output": output,
                 "target_language": target_language,
@@ -1153,7 +1378,7 @@ def _register_tools(app: Any) -> None:
                 "model_tier": model_tier,
                 "quality": quality,
                 "overwrite": overwrite,
-            }
+            })
         )
 
     @app.tool(
@@ -1172,8 +1397,8 @@ def _register_tools(app: Any) -> None:
         quality: TranslateQuality = False,
         overwrite: TranslateOverwrite = False,
     ) -> Any:
-        return _start_batch_translate_job_response(
-            {
+        return _tool_input_result(
+            lambda: _start_batch_translate_job_response({
                 "project_dir": project_dir,
                 "target_language": target_language,
                 "target_locale": target_locale,
@@ -1182,7 +1407,7 @@ def _register_tools(app: Any) -> None:
                 "model_tier": model_tier,
                 "quality": quality,
                 "overwrite": overwrite,
-            }
+            })
         )
 
     @app.tool(
@@ -1365,15 +1590,19 @@ def _register_tools(app: Any) -> None:
         pdf_path: ParsePdfPath = None,
         refresh: Refresh = False,
     ) -> Any:
-        return service.parse_source(
-            source_path,
-            source=source,
-            source_id=source_id,
-            paper_id=paper_id,
-            html_path=html_path,
-            tex_path=tex_path,
-            pdf_path=pdf_path,
-            refresh=refresh,
+        return _tool_input_result(
+            lambda: _parse_response(
+                {
+                    "source_path": source_path,
+                    "source": source,
+                    "source_id": source_id,
+                    "paper_id": paper_id,
+                    "html_path": html_path,
+                    "tex_path": tex_path,
+                    "pdf_path": pdf_path,
+                    "refresh": refresh,
+                }
+            )
         )
 
     @app.tool(
@@ -1519,12 +1748,14 @@ def _register_tools(app: Any) -> None:
         )
     )
     def summary_batch_create(
-        papers_file: Annotated[str, Field(description="Path to a text file containing one paper ID per line.")],
+        papers_file: Annotated[str, Field(description="Absolute path to a text file containing one paper ID per line.")],
         name: BatchName,
         prompt_version: Annotated[str, Field(description="Summary prompt/schema version to use.")] = "paper-summary-v1",
     ) -> Any:
-        return _summary_batch_create_response(
-            {"name": name, "papers_file": papers_file, "prompt_version": prompt_version}
+        return _tool_input_result(
+            lambda: _summary_batch_create_response(
+                {"name": name, "papers_file": papers_file, "prompt_version": prompt_version}
+            )
         )
 
     @app.tool(
@@ -1574,9 +1805,11 @@ def _register_tools(app: Any) -> None:
     @app.tool(description="Export completed paper summaries from a batch to a JSONL file.")
     def summary_batch_export(
         name: BatchName,
-        output: Annotated[str, Field(description="Output path for exported JSONL summaries.")],
+        output: Annotated[str, Field(description="Absolute output path for exported JSONL summaries.")],
     ) -> Any:
-        return _summary_batch_export_response({"name": name, "output": output})
+        return _tool_input_result(
+            lambda: _summary_batch_export_response({"name": name, "output": output})
+        )
 
     @app.tool(description="Move failed items in a paper-summary batch back to queued status for retry.")
     def summary_batch_retry_failed(name: BatchName) -> Any:

@@ -106,8 +106,8 @@ displayed formulas, or accepted prior derivations sufficient for proposers to
 perform the check without reading the original source.
 
 After writing `<project-dir>/initial-note-check.md`, follow
-`manuals/arc-mcp.md` Markdown Report Export for
-`md2pdf(input="<project-dir>/initial-note-check.md")`. This report-export gate
+`manuals/arc-jobs.md` Markdown Report Export for
+`<project-dir>/initial-note-check.md`. This report-export gate
 is not satisfied until `md2pdf` has been started or a `WARNING:` with the exact
 blocker is recorded. Do not wait for PDF completion.
 If PDF generation appears bugged, report it and continue this workflow; do not

@@ -517,8 +517,9 @@ def annotation_prompt(
         "available, cite the exact title alone and do not expose an opaque block locator. Use an ordinary "
         "reader citation such as '(Source: Exact Title, Chapter/Section)' (localized to the output language). "
         "Use the glossary consistently and preserve every personal name in Latin spelling. "
-        "When needed, use the bounded full-paper navigation context, ARC cached-paper tools, and internet search "
-        "to inspect the full paper or verify terminology and related-work context. Treat external material as "
+        "When needed, use the bounded full-paper navigation context and internet search to inspect the full paper "
+        "or verify terminology and related-work context. The worker has no ARC CLI, shell, or MCP access; request "
+        "additional ARC evidence through evidence_requests so the controller can resolve it through services. Treat external material as "
         "supporting context, never as permission to alter the immutable source passage. Do not make a prior- or "
         "later-work claim from an external result unless it is also present in BOUNDED LITERATURE EVIDENCE with "
         "a registered evidence_id and source_descriptor. If research identifies a potentially useful new "
@@ -552,9 +553,9 @@ def annotation_prompt(
         f"SEGMENT:\n{json.dumps(segment, ensure_ascii=False)}\n\n"
         f"SOURCE BLOCKS:\n{json.dumps(blocks, ensure_ascii=False)}\n\n"
         f"BOUNDED LITERATURE EVIDENCE:\n{json.dumps(evidence, ensure_ascii=False)}\n\n"
-        f"FIRST-ROUND DRAFT (present only for the single evidence rerun):\n"
+        f"FIRST-ROUND DRAFT (present only for the controller evidence rerun):\n"
         f"{json.dumps(first_draft, ensure_ascii=False)}\n\n"
-        f"CONTROLLER EVIDENCE RESOLUTION (present only for the single evidence rerun):\n"
+        f"CONTROLLER EVIDENCE RESOLUTION (present only for the controller evidence rerun):\n"
         f"{json.dumps(evidence_resolution, ensure_ascii=False)}"
     )
 

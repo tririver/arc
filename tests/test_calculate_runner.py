@@ -648,6 +648,17 @@ def test_proposer_source_policy_parses_string_false() -> None:
     assert "Do not use ARC paper MCP tools" in policy
 
 
+def test_new_calculation_worker_defaults_to_no_mcp(tmp_path: Path) -> None:
+    runner = load_calculate_runner()
+    config = runner.load_calculation_config(minimal_config(tmp_path))
+
+    runtime = runner._proposer_runtime(config, config.steps[0])  # noqa: SLF001
+
+    assert runtime["allow_internet"] is True
+    assert runtime["allow_mcp"] is False
+    assert "mcp_mode" not in runtime
+
+
 def test_calculate_worker_schemas_are_codex_strict(tmp_path) -> None:
     runner = load_calculate_runner()
     config = runner.load_calculation_config(minimal_config(tmp_path))

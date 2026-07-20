@@ -61,12 +61,20 @@ cd "$root"
 version_paths=(
   "plugins/arc/.codex-plugin/plugin.json"
   "plugins/arc/.claude-plugin/plugin.json"
+  "plugins/arc/skills/arc/.arc-install-ref"
+  "plugins/arc/skills/arc/scripts/runtime-constraints.txt"
+  "plugins/arc-mcp/.codex-plugin/plugin.json"
+  "plugins/arc-mcp/.claude-plugin/plugin.json"
+  "plugins/arc-mcp/.arc-install-ref"
+  "plugins/arc-mcp/scripts/runtime-constraints.txt"
   "packages/arc-llm/pyproject.toml"
+  "packages/arc-jobs/pyproject.toml"
   "packages/arc-paper/pyproject.toml"
   "packages/arc-domain/pyproject.toml"
   "packages/arc-typeset/pyproject.toml"
   "packages/arc-companion/pyproject.toml"
   "packages/arc-mcp/pyproject.toml"
+  "packages/arc-jobs/src/arc_jobs/__init__.py"
   "packages/arc-companion/src/arc_companion/__init__.py"
   "packages/arc-paper/src/arc_paper/__init__.py"
   "packages/arc-mcp/src/arc_mcp/__init__.py"
@@ -203,7 +211,7 @@ version = sys.argv[1]
 internal_range = sys.argv[2]
 paths = [Path(item) for item in sys.argv[3:]]
 
-internal_dep_re = re.compile(r"(arc-(?:llm|paper|domain|typeset|companion|mcp))>=\d+\.\d+,<\d+\.\d+")
+internal_dep_re = re.compile(r"(arc-(?:llm|jobs|paper|domain|typeset|companion|mcp))>=\d+\.\d+,<\d+\.\d+")
 
 
 def replace_once(path: Path, pattern: str, replacement: str) -> None:
@@ -221,7 +229,15 @@ def replace_all(path: Path, pattern: re.Pattern[str], replacement: str) -> None:
 
 
 for path in paths:
-    if path.suffix == ".json":
+    if path.name == ".arc-install-ref":
+        replace_once(path, r"^v\d+\.\d+\.\d+$", f"v{version}")
+    elif path.name == "runtime-constraints.txt":
+        replace_once(
+            path,
+            r"^(# Direct external dependencies tested for ARC v)\d+\.\d+\.\d+(\.)$",
+            rf"\g<1>{version}\2",
+        )
+    elif path.suffix == ".json":
         json.loads(path.read_text(encoding="utf-8"))
         replace_once(path, r'^(\s*"version"\s*:\s*")[^"]+(")', rf"\g<1>{version}\2")
     elif path.name == "pyproject.toml":
@@ -260,15 +276,33 @@ from pathlib import Path
 version = sys.argv[1]
 internal_range = sys.argv[2]
 root = Path(sys.argv[3])
-packages = ["arc-llm", "arc-paper", "arc-domain", "arc-typeset", "arc-companion", "arc-mcp"]
+packages = ["arc-llm", "arc-jobs", "arc-paper", "arc-domain", "arc-typeset", "arc-companion", "arc-mcp"]
 
 for manifest in [
     root / "plugins/arc/.codex-plugin/plugin.json",
     root / "plugins/arc/.claude-plugin/plugin.json",
+    root / "plugins/arc-mcp/.codex-plugin/plugin.json",
+    root / "plugins/arc-mcp/.claude-plugin/plugin.json",
 ]:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     if data.get("version") != version:
         raise SystemExit(f"{manifest} version mismatch")
+
+for install_ref in [
+    root / "plugins/arc/skills/arc/.arc-install-ref",
+    root / "plugins/arc-mcp/.arc-install-ref",
+]:
+    if install_ref.read_text(encoding="utf-8").strip() != f"v{version}":
+        raise SystemExit(f"{install_ref} version mismatch")
+
+for constraints in [
+    root / "plugins/arc/skills/arc/scripts/runtime-constraints.txt",
+    root / "plugins/arc-mcp/scripts/runtime-constraints.txt",
+]:
+    expected = f"# Direct external dependencies tested for ARC v{version}."
+    first_line = constraints.read_text(encoding="utf-8").splitlines()[0]
+    if first_line != expected:
+        raise SystemExit(f"{constraints} release marker mismatch")
 
 for package in packages:
     pyproject = root / "packages" / package / "pyproject.toml"
@@ -283,6 +317,7 @@ PY
 run git diff --check -- "${existing_version_paths[@]}"
 if command -v claude >/dev/null 2>&1; then
   run claude plugin validate plugins/arc
+  run claude plugin validate plugins/arc-mcp
 else
   printf 'SKIP: claude not found on PATH; using built-in manifest checks.\n'
 fi

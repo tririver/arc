@@ -78,9 +78,10 @@ Step 1: Run:
 arc-domain llm-summarize <seed-paper> --intent "<user-intent>" --json
 ```
 
-## MCP Tools
+## Optional MCP Tools
 
-Read `manuals/arc-mcp.md` before using MCP.
+Skip this section for normal Skill/CLI workflows. Read `manuals/arc-mcp.md`
+only when the user explicitly installed or requested the MCP companion.
 
 Domain MCP tools:
 

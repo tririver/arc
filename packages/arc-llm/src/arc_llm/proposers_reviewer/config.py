@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.call_record import allow_arc_llm_call_record
+from arc_llm.evidence import MAX_EVIDENCE_ROUNDS, allow_evidence_requests
 from arc_llm.model import VALID_MODEL_TIERS, reasoning_effort_for_model_tier
 
 
@@ -41,6 +42,7 @@ class WorkerConfig:
     model: str | None
     model_tier: str | None
     runtime: dict[str, Any]
+    evidence_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class LoopConfig:
     caller_context: dict[str, Any]
     session: SessionOptions
     cache_context: CacheContextOptions | None
+    evidence_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,12 @@ class OutputRecoveryOptions:
 
 
 @dataclass(frozen=True)
+class EvidenceOptions:
+    enabled: bool
+    max_rounds: int
+
+
+@dataclass(frozen=True)
 class BatchConfig:
     schema_version: str
     run_id: str
@@ -103,6 +112,7 @@ class BatchConfig:
     fail_fast: bool
     artifact_options: ArtifactOptions
     output_recovery: OutputRecoveryOptions
+    evidence: EvidenceOptions
     session: SessionOptions
     loops: list[LoopConfig]
 
@@ -119,6 +129,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     fail_fast = _bool(data.get("fail_fast", False), "fail_fast")
     artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
     output_recovery = _parse_output_recovery(data.get("output_recovery", {}))
+    evidence = _parse_evidence_options(data.get("evidence", {}))
     batch_session = _parse_session_options(data.get("session", {}), parent=None, default_policy="stateful")
 
     defaults = _dict(data.get("defaults", {}), "defaults")
@@ -144,6 +155,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
             default_model_tier=default_model_tier,
             default_runtime=default_runtime,
             parent_session=batch_session,
+            parent_evidence_enabled=evidence.enabled,
         )
         if loop.loop_id in seen_loop_ids:
             raise ConfigError(f"duplicate loop_id: {loop.loop_id}")
@@ -158,6 +170,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
         fail_fast=fail_fast,
         artifact_options=artifact_options,
         output_recovery=output_recovery,
+        evidence=evidence,
         session=batch_session,
         loops=loops,
     )
@@ -186,10 +199,27 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
     else:
         env["ARC_CODEX_ENABLE_MCP"] = "false"
         env["ARC_CLAUDE_ALLOW_MCP"] = "false"
-        env.pop("ARC_CODEX_MCP_MODE", None)
-        env.pop("ARC_CLAUDE_MCP_MODE", None)
-        env.pop("ARC_CLAUDE_MCP_CONFIG", None)
-        env.pop("ARC_CLAUDE_MCP_CONFIG_JSON", None)
+        for key in (
+            "ARC_CODEX_PROFILE",
+            "ARC_CODEX_PROFILE_V2",
+            "ARC_CODEX_CONFIG",
+            "ARC_CODEX_CONFIG_JSON",
+            "ARC_CODEX_MCP_MODE",
+            "ARC_CODEX_ARC_MCP_COMMAND",
+            "ARC_CODEX_ARC_MCP_ENV_JSON",
+            "ARC_CLAUDE_MCP_MODE",
+            "ARC_CLAUDE_MCP_CONFIG",
+            "ARC_CLAUDE_MCP_CONFIG_JSON",
+            "ARC_CLAUDE_ARC_MCP_COMMAND",
+            "ARC_CLAUDE_ARC_MCP_ARGS_JSON",
+            "ARC_CLAUDE_ARC_MCP_ENV_JSON",
+            "ARC_CLAUDE_ARC_MCP_CONFIG_PATH",
+            "ARC_CLAUDE_TOOLS",
+            "ARC_CLAUDE_ALLOWED_TOOLS",
+        ):
+            env.pop(key, None)
+        env["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
+        env["ARC_CLAUDE_BARE"] = "true"
     if worker.model_tier:
         env.setdefault("ARC_CODEX_REASONING_EFFORT", _codex_effort_for_model_tier(worker.model_tier))
         env.setdefault("ARC_CLAUDE_EFFORT", _claude_effort_for_model_tier(worker.model_tier))
@@ -227,12 +257,18 @@ def _parse_loop(
     default_model_tier: str | None,
     default_runtime: Mapping[str, Any],
     parent_session: SessionOptions,
+    parent_evidence_enabled: bool,
 ) -> LoopConfig:
     loop_data = _dict(raw_loop, "loop")
     loop_id = _safe_id(_required_text(loop_data, "loop_id"), "loop_id")
     max_rounds = _positive_int(loop_data.get("max_rounds"), f"{loop_id}.max_rounds")
     early_stop = _dict(loop_data.get("early_stop", {}), f"{loop_id}.early_stop")
     early_stop_enabled = _bool(early_stop.get("enabled", False), f"{loop_id}.early_stop.enabled")
+    evidence_options = _dict(loop_data.get("evidence", {}), f"{loop_id}.evidence")
+    evidence_enabled = parent_evidence_enabled and _bool(
+        evidence_options.get("enabled", True),
+        f"{loop_id}.evidence.enabled",
+    )
     proposers = _parse_workers(
         loop_data.get("proposers"),
         field_name=f"{loop_id}.proposers",
@@ -241,6 +277,7 @@ def _parse_loop(
         default_model_tier=default_model_tier,
         default_runtime=default_runtime,
         duplicate_label="proposer",
+        parent_evidence_enabled=evidence_enabled,
     )
     reviewers = _parse_workers(
         loop_data.get("reviewers"),
@@ -250,6 +287,7 @@ def _parse_loop(
         default_model_tier=default_model_tier,
         default_runtime=default_runtime,
         duplicate_label="reviewer",
+        parent_evidence_enabled=evidence_enabled,
     )
     if len(reviewers) != 1:
         raise ConfigError(f"{loop_id} must configure exactly one reviewer in v1")
@@ -263,6 +301,7 @@ def _parse_loop(
         caller_context=_dict(loop_data.get("caller_context", {}), f"{loop_id}.caller_context"),
         session=session,
         cache_context=_parse_cache_context(loop_data.get("cache_context"), f"{loop_id}.cache_context"),
+        evidence_enabled=evidence_enabled,
     )
 
 
@@ -275,6 +314,7 @@ def _parse_workers(
     default_model_tier: str | None,
     default_runtime: Mapping[str, Any],
     duplicate_label: str,
+    parent_evidence_enabled: bool,
 ) -> list[WorkerConfig]:
     if not isinstance(raw_workers, list) or not raw_workers:
         raise ConfigError(f"{field_name} must be a non-empty list")
@@ -288,6 +328,7 @@ def _parse_workers(
             default_model=default_model,
             default_model_tier=default_model_tier,
             default_runtime=default_runtime,
+            parent_evidence_enabled=parent_evidence_enabled,
         )
         if worker.id in seen_ids:
             raise ConfigError(f"duplicate {duplicate_label} id: {worker.id}")
@@ -304,6 +345,7 @@ def _parse_worker(
     default_model: str | None,
     default_model_tier: str | None,
     default_runtime: Mapping[str, Any],
+    parent_evidence_enabled: bool,
 ) -> WorkerConfig:
     worker_data = _dict(raw_worker, field_name)
     worker_id = _safe_id(_required_text(worker_data, "id"), f"{field_name}.id")
@@ -315,11 +357,22 @@ def _parse_worker(
     if not prompt.template:
         raise ConfigError(f"{field_name}.{worker_id}.prompt.template is required")
 
+    evidence_options = _dict(
+        worker_data.get("evidence", {}),
+        f"{field_name}.{worker_id}.evidence",
+    )
+    evidence_enabled = parent_evidence_enabled and _bool(
+        evidence_options.get("enabled", True),
+        f"{field_name}.{worker_id}.evidence.enabled",
+    )
+
     output_schema = worker_data.get("output_schema")
     if output_schema is not None and not isinstance(output_schema, dict):
         raise ConfigError(f"{field_name}.{worker_id}.output_schema must be an object")
     if output_schema is not None:
         output_schema = allow_arc_llm_call_record(output_schema)
+        if evidence_enabled:
+            output_schema = allow_evidence_requests(output_schema)
 
     runtime = dict(default_runtime)
     runtime.update(_dict(worker_data.get("runtime", {}), f"{field_name}.{worker_id}.runtime"))
@@ -337,6 +390,7 @@ def _parse_worker(
         model=model,
         model_tier=model_tier,
         runtime=runtime,
+        evidence_enabled=evidence_enabled,
     )
 
 
@@ -379,6 +433,17 @@ def _parse_output_recovery(raw_options: Any) -> OutputRecoveryOptions:
             schema_formatter_enabled,
             "output_recovery.schema_formatter.enabled",
         ),
+    )
+
+
+def _parse_evidence_options(raw_options: Any) -> EvidenceOptions:
+    options = _dict(raw_options, "evidence")
+    max_rounds = _positive_int(options.get("max_rounds", MAX_EVIDENCE_ROUNDS), "evidence.max_rounds")
+    if max_rounds > MAX_EVIDENCE_ROUNDS:
+        raise ConfigError(f"evidence.max_rounds must not exceed {MAX_EVIDENCE_ROUNDS}")
+    return EvidenceOptions(
+        enabled=_bool(options.get("enabled", True), "evidence.enabled"),
+        max_rounds=max_rounds,
     )
 
 

@@ -45,11 +45,6 @@ def main(argv: list[str] | None = None) -> int:
     domain.add_argument("--domain-id", default=None)
     domain.add_argument("--domain-manifest", default=None)
     build.add_argument(
-        "--no-mcp",
-        action="store_true",
-        help="disable MCP access for every companion LLM call",
-    )
-    build.add_argument(
         "--no-internet",
         action="store_true",
         help="disable internet access independently of MCP access",
@@ -87,6 +82,17 @@ def main(argv: list[str] | None = None) -> int:
     package.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
+    try:
+        result = _dispatch(args)
+    except Exception as exc:
+        if not getattr(args, "json", False):
+            raise
+        result = _exception_result(exc)
+    _emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "build":
         defaulted = args.annotation_language is None
         language = args.annotation_language or DEFAULT_LANGUAGE
@@ -111,7 +117,6 @@ def main(argv: list[str] | None = None) -> int:
                 force=args.force,
                 domain_id=args.domain_id,
                 domain_manifest=Path(args.domain_manifest) if args.domain_manifest else None,
-                allow_mcp=not args.no_mcp,
                 allow_internet=not args.no_internet,
                 context_paper_ids=tuple(args.context_paper_id),
                 stop_after_preview=args.stop_after_preview,
@@ -128,8 +133,21 @@ def main(argv: list[str] | None = None) -> int:
         result = package_project(Path(args.project_dir))
     else:
         raise AssertionError(f"Unhandled command: {args.command}")
-    _emit(result, json_output=args.json)
-    return 0 if result.get("ok") else 1
+    return result
+
+
+def _exception_result(exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "error",
+        "error": {
+            "code": "command_failed",
+            "message": str(exc) or exc.__class__.__name__,
+            "type": exc.__class__.__name__,
+        },
+        "errors": [],
+        "meta": {},
+    }
 
 
 def _emit(result: dict[str, Any], *, json_output: bool) -> None:

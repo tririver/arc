@@ -3,6 +3,43 @@ import json
 from arc_domain import cli
 
 
+def test_cli_returns_nonzero_for_error_envelope(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_dispatch",
+        lambda _args: {"ok": False, "data": None, "error": {"code": "failed", "message": "boom"}},
+    )
+
+    assert cli.main(["status", "0911.3380", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_cli_treats_needs_llm_as_successful_handoff(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_dispatch",
+        lambda _args: {"ok": False, "status": "needs_llm", "llm_task": {"prompt": "..."}},
+    )
+
+    assert cli.main(["status", "0911.3380", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "needs_llm"
+
+
+def test_cli_json_wraps_dispatch_exception(monkeypatch, capsys) -> None:
+    def fail(_args):
+        raise RuntimeError("service unavailable")
+
+    monkeypatch.setattr(cli, "_dispatch", fail)
+
+    assert cli.main(["status", "0911.3380", "--json"]) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] == {
+        "code": "command_failed",
+        "message": "service unavailable",
+        "type": "RuntimeError",
+    }
+
+
 def test_cli_init(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
 

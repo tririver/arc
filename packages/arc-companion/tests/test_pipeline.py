@@ -2314,9 +2314,7 @@ def test_offline_runtime_env_overrides_polluted_parent_access(monkeypatch) -> No
     monkeypatch.setenv("ARC_CLAUDE_MCP_MODE", "unrestricted")
 
     env = pipeline_module._llm_runtime_env(
-        allow_mcp=False,
         allow_internet=False,
-        force_disable_mcp=True,
         force_disable_internet=True,
     )
 
@@ -3069,10 +3067,10 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
         env = call["env"]
         assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
         assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
-        assert env["ARC_CODEX_ENABLE_MCP"] == "true"
-        assert env["ARC_CLAUDE_ALLOW_MCP"] == "true"
-        assert env["ARC_CODEX_MCP_MODE"] == "arc-only"
-        assert env["ARC_CLAUDE_MCP_MODE"] == "arc-only"
+        assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+        assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+        assert "ARC_CODEX_MCP_MODE" not in env
+        assert "ARC_CLAUDE_MCP_MODE" not in env
         assert "FULL-PAPER NAVIGATION CONTEXT" in str(call["prompt"])
         assert "Setup" in str(call["prompt"])
     for call in fake.calls:
@@ -3797,7 +3795,7 @@ def test_fingerprint_invalidates_when_workers_per_lane_changes(tmp_path: Path) -
     assert _fingerprint(bundle, default, evidence=evidence) != _fingerprint(bundle, old, evidence=evidence)
 
 
-def test_no_mcp_runtime_keeps_internet_enabled_and_scrubs_polluted_parent_env(
+def test_controller_only_runtime_keeps_internet_enabled_and_scrubs_polluted_parent_env(
     tmp_path: Path, monkeypatch
 ) -> None:
     polluted = {
@@ -3825,7 +3823,6 @@ def test_no_mcp_runtime_keeps_internet_enabled_and_scrubs_polluted_parent_env(
     options = BuildOptions(
         paper_id="local:book",
         project_dir=tmp_path,
-        allow_mcp=False,
         allow_internet=True,
     )
     _llm_call(
@@ -3836,7 +3833,6 @@ def test_no_mcp_runtime_keeps_internet_enabled_and_scrubs_polluted_parent_env(
         artifact_dir=tmp_path / "llm",
         call_label="test",
         model_tier="low",
-        allow_mcp=True,
         allow_internet=True,
     )
 
@@ -3861,7 +3857,7 @@ def test_fingerprint_covers_runtime_access_options(tmp_path: Path) -> None:
     local_only = BuildOptions(
         paper_id=bundle.paper_id,
         project_dir=tmp_path / "run",
-        allow_mcp=False,
+        allow_internet=False,
     )
     assert _fingerprint(bundle, enabled, evidence=evidence) != _fingerprint(
         bundle, local_only, evidence=evidence

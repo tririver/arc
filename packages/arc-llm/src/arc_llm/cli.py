@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .cache_audit import audit_run
 from .host import detect_host, select_llm_provider
@@ -20,12 +20,46 @@ from .sessions import LLMSessionManager
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    result = _dispatch(args)
+    try:
+        result = _dispatch(args)
+    except Exception as exc:
+        if not getattr(args, "json", False):
+            raise
+        result = _exception_result(exc)
     if isinstance(result, str):
         print(result, end="" if result.endswith("\n") else "\n")
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-    return 0
+    return 0 if _result_succeeded(result) else 1
+
+
+def _result_succeeded(result: Any) -> bool:
+    if not isinstance(result, Mapping):
+        return True
+    if result.get("status") == "needs_llm":
+        return True
+    if result.get("ok") is False:
+        return False
+    return str(result.get("status") or "").strip().lower() not in {
+        "error",
+        "failed",
+        "failure",
+    }
+
+
+def _exception_result(exc: Exception) -> dict[str, Any]:
+    """Return the stable failure envelope promised by ``--json`` commands."""
+    return {
+        "ok": False,
+        "status": "error",
+        "error": {
+            "code": "command_failed",
+            "message": str(exc) or exc.__class__.__name__,
+            "type": exc.__class__.__name__,
+        },
+        "errors": [],
+        "meta": {},
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:

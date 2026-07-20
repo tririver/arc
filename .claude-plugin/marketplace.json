@@ -7,8 +7,14 @@
   "plugins": [
     {
       "name": "arc",
-      "description": "ARC paper, research-domain, planning, calculation, and typesetting tools.",
+      "description": "CLI-first ARC paper, research-domain, planning, calculation, and typesetting tools.",
       "source": "./plugins/arc",
+      "category": "productivity"
+    },
+    {
+      "name": "arc-mcp",
+      "description": "Optional MCP adapter for ARC research tools.",
+      "source": "./plugins/arc-mcp",
       "category": "productivity"
     }
   ]

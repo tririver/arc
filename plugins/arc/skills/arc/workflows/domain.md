@@ -26,29 +26,31 @@ Step 1: Resolve the domain id for each `<seed-paper>` with the exact
 entry for Phase 2 and record the duplicate in `<project-dir>/context.json` or a
 visible workflow note.
 
-Step 2: For each distinct `<seed-paper>` in `seed_paper_list`, call the MCP tool
-`llm_domain_build` with:
+Step 2: For each distinct `<seed-paper>` in `seed_paper_list`, start a
+protocol-neutral CLI job:
 
-```text
-seed_paper=<seed-paper>
-intent=<user-intent>
-provider=<provider>
-model_tier=<model_tier>
-refresh=<refresh>
-workers=<workers>
-background=true
+```bash
+arc-jobs submit --job-type domain_build --cwd <project-dir> --json -- \
+  arc-domain llm-build <seed-paper> \
+  --intent "<user-intent>" \
+  --provider <provider> \
+  --model-tier <model_tier> \
+  --workers <workers> \
+  --json
 ```
+
+Add `--refresh` when `<refresh>` is true.
 
 Use exact `model=<model>` only when the context intentionally pins a
 non-`auto` provider.
 
-If there is more than one distinct domain, launch all `llm_domain_build`
+If there is more than one distinct domain, submit all domain-build
 background jobs before watching any of them. This allows independent domains to
 build concurrently while preserving per-job result inspection.
 
-Step 3: For every background job, follow `manuals/arc-mcp.md` using the
+Step 3: For every background job, follow `manuals/arc-jobs.md` using the
 returned `next.cli_command`. Watch all launched jobs to a terminal result. If
-host or MCP execution cannot run jobs concurrently, fall back to sequential
+the host cannot run jobs concurrently, fall back to sequential
 watching/running without changing the artifact contract.
 
 Step 4: Inspect each returned JSON body. Do not treat command exit code alone
@@ -172,8 +174,8 @@ For the domain summary Markdown, follow `rules/math_typeset.md` for math and
 TeX snippets.
 
 After writing each domain summary Markdown report to `<project-dir>/`, follow
-`manuals/arc-mcp.md` Markdown Report Export for
-`md2pdf(input="<project-dir>/<seed-safe>_domain_summary.md")`. This
+`manuals/arc-jobs.md` Markdown Report Export for
+`<project-dir>/<seed-safe>_domain_summary.md`. This
 report-export gate is not satisfied until `md2pdf` has been started or a
 `WARNING:` with the exact blocker is recorded. Do not wait for PDF completion.
 If PDF generation appears bugged, report it and continue this workflow; do not

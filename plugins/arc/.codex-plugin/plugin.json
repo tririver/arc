@@ -1,28 +1,24 @@
 {
   "name": "arc",
-  "version": "0.9.4",
-  "description": "ARC paper, research-domain, and report typesetting tools.",
+  "version": "1.0.0",
+  "description": "CLI-first ARC paper, research-domain, and report typesetting tools.",
   "author": {
     "name": "ARC"
   },
   "license": "MIT",
   "keywords": ["arc", "papers", "arxiv", "inspire", "research", "typesetting", "pdf", "translation"],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "ARC",
     "shortDescription": "Paper query, research workflows, PDF typesetting, and translation",
-    "longDescription": "Cache-first ar5iv and INSPIRE paper tools with LLM paper summaries, research-domain construction, Markdown-to-PDF report typesetting, and report translation.",
+    "longDescription": "Agent Skills and lazy-installed CLIs for cache-first paper access, research-domain construction, planning, calculation, typesetting, and translation. MCP is available as a separate optional plugin.",
     "developerName": "ARC",
     "category": "Productivity",
-    "capabilities": ["Research", "MCP"],
+    "capabilities": ["Research"],
     "defaultPrompt": [
       "Summarize arXiv:0911.3380",
-      "Get references for a paper",
       "Build a research domain from arXiv:0911.3380",
-      "Create a paper summary batch",
-      "Convert a Markdown report to PDF",
-      "Translate a Markdown report to Chinese"
+      "Convert a Markdown report to PDF"
     ]
   }
 }

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
+import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 
 ARC_PACKAGE_MODULES = (
+    ("arc-jobs", "arc_jobs"),
     ("arc-llm", "arc_llm"),
     ("arc-paper", "arc_paper"),
     ("arc-domain", "arc_domain"),
     ("arc-typeset", "arc_typeset"),
-    ("arc-mcp", "arc_mcp"),
+    ("arc-companion", "arc_companion"),
 )
 ARC_PACKAGES = tuple(package for package, _module in ARC_PACKAGE_MODULES)
 ARC_REQUIRE_REPO_ROOT = "ARC_REQUIRE_REPO_ROOT"
@@ -21,32 +25,201 @@ def bootstrap_arc_pythonpath() -> None:
     if required_root := os.environ.get(ARC_REQUIRE_REPO_ROOT):
         _bootstrap_required_repo_root(Path(required_root).expanduser())
         return
-    if _can_import_arc_llm():
-        return
     for root in _candidate_roots():
-        added = False
-        for package in ARC_PACKAGES:
-            src = root / "packages" / package / "src"
-            if src.is_dir() and str(src) not in sys.path:
-                sys.path.insert(0, str(src))
-                added = True
-        if added and _can_import_arc_llm():
+        if _bootstrap_checkout(root):
             return
-    for site_packages in _candidate_runtime_site_packages():
-        if site_packages.is_dir() and str(site_packages) not in sys.path:
-            sys.path.insert(0, str(site_packages))
-            if _can_import_arc_llm():
-                return
-    searched_roots = "\n".join(f"  - {root}" for root in _candidate_roots()) or "  - (none)"
-    searched_runtimes = "\n".join(f"  - {path}" for path in _candidate_runtime_site_packages()) or "  - (none)"
+    runtime_site_packages = _active_runtime_site_packages()
+    for _package, module_name in ARC_PACKAGE_MODULES:
+        _reject_loaded_module_outside(module_name, runtime_site_packages)
+    site_string = str(runtime_site_packages)
+    sys.path[:] = [entry for entry in sys.path if _resolved_path(entry) != site_string]
+    sys.path.insert(0, site_string)
+    importlib.invalidate_caches()
+    try:
+        arc_llm = importlib.import_module("arc_llm")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"The active ARC core runtime does not contain `arc_llm`: {runtime_site_packages}"
+        ) from exc
+    _assert_module_in_source(arc_llm, runtime_site_packages)
+
+
+def _bootstrap_checkout(root: Path) -> bool:
+    package_sources = [root / "packages" / package / "src" for package in ARC_PACKAGES]
+    if not all(source.is_dir() for source in package_sources):
+        return False
+    for package, module_name in ARC_PACKAGE_MODULES:
+        _reject_loaded_module_outside(module_name, root / "packages" / package / "src")
+    source_strings = [str(source.resolve()) for source in package_sources]
+    source_set = set(source_strings)
+    sys.path[:] = [entry for entry in sys.path if _resolved_path(entry) not in source_set]
+    sys.path[:0] = source_strings
+    importlib.invalidate_caches()
+    try:
+        arc_llm = importlib.import_module("arc_llm")
+    except ModuleNotFoundError:
+        return False
+    _assert_module_in_source(arc_llm, root / "packages" / "arc-llm" / "src")
+    return True
+
+
+def _reject_loaded_module_outside(module_name: str, expected_root: Path) -> None:
+    module = sys.modules.get(module_name)
+    if module is None:
+        return
+    try:
+        _assert_module_in_source(module, expected_root)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"ARC bootstrap rejected `{module_name}` already loaded outside the active "
+            f"ARC source/runtime rooted at {expected_root}. Restart the process without "
+            "the unrelated installed ARC package."
+        ) from exc
+
+
+def _active_runtime_site_packages() -> Path:
+    skill_root = Path(__file__).resolve().parents[2]
+    launcher = skill_root / "scripts" / "arc-runtime"
+    if not launcher.is_file():
+        raise RuntimeError(f"Cannot locate the ARC Skill runtime launcher: {launcher}")
+    completed = subprocess.run(
+        [str(launcher), "doctor", "--profile", "core"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    fields: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key.strip()] = value.strip()
+    if (
+        completed.returncode != 0
+        or fields.get("profile") != "core"
+        or fields.get("status") != "ready"
+        or not fields.get("runtime")
+        or not fields.get("venv")
+        or not fields.get("fingerprint")
+        or not fields.get("constraints_sha256")
+        or not fields.get("ready_file")
+    ):
+        detail = completed.stderr.strip() or completed.stdout.strip() or "runtime not installed"
+        raise RuntimeError(
+            "The runtime pinned by this ARC Skill is not ready. Run "
+            f"`{launcher} setup --profile core`, then retry. Doctor reported: {detail}"
+        )
+    runtime = Path(fields["runtime"]).expanduser()
+    try:
+        runtime = runtime.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"ARC doctor returned an inaccessible runtime: {runtime}") from exc
+    venv = Path(fields["venv"]).expanduser()
+    ready_file = Path(fields["ready_file"]).expanduser()
+    try:
+        venv = venv.resolve(strict=True)
+        ready_file = ready_file.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("ARC doctor returned inaccessible runtime metadata paths") from exc
+    if not _is_relative_to(venv, runtime) or not _is_relative_to(ready_file, runtime):
+        raise RuntimeError("ARC doctor returned runtime metadata outside its runtime directory")
+    _assert_runtime_python_compatible(venv, launcher=launcher)
+    marker_fields: dict[str, str] = {}
+    for line in ready_file.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            marker_fields[key.strip()] = value.strip()
+    if (
+        marker_fields.get("profile") != "core"
+        or marker_fields.get("runtime_fingerprint") != fields["fingerprint"]
+        or marker_fields.get("constraints_sha256") != fields["constraints_sha256"]
+    ):
+        raise RuntimeError("ARC runtime ready marker does not match this Skill's identity")
+    candidates = [venv / "Lib" / "site-packages"]
+    candidates.extend((venv / "lib").glob("python*/site-packages"))
+    existing: list[Path] = []
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        resolved_candidate = candidate.resolve()
+        if not _is_relative_to(resolved_candidate, venv):
+            raise RuntimeError(
+                "ARC runtime site-packages resolves outside its selected venv: "
+                f"{candidate} -> {resolved_candidate}"
+            )
+        existing.append(resolved_candidate)
+    if len(existing) != 1:
+        formatted = ", ".join(str(candidate) for candidate in existing) or "none"
+        raise RuntimeError(
+            f"ARC runtime must contain exactly one site-packages directory; found {formatted}"
+        )
+    return existing[0]
+
+
+def _assert_runtime_python_compatible(venv: Path, *, launcher: Path) -> None:
+    candidates = (venv / "Scripts" / "python.exe", venv / "bin" / "python")
+    runtime_python = next(
+        (candidate for candidate in candidates if candidate.is_file() and os.access(candidate, os.X_OK)),
+        None,
+    )
+    if runtime_python is None:
+        raise RuntimeError(f"ARC runtime has no executable Python interpreter under {venv}")
+    probe = (
+        "import json,sys,sysconfig;"
+        "print(json.dumps({'implementation':sys.implementation.name,"
+        "'major':sys.version_info.major,'minor':sys.version_info.minor,"
+        "'cache_tag':sys.implementation.cache_tag,"
+        "'soabi':sysconfig.get_config_var('SOABI')}))"
+    )
+    completed = subprocess.run(
+        [str(runtime_python), "-I", "-c", probe],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    try:
+        runtime_abi = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
+        raise RuntimeError(
+            f"Cannot inspect ARC runtime Python {runtime_python}: {detail}"
+        ) from exc
+    if completed.returncode != 0 or not isinstance(runtime_abi, dict):
+        detail = completed.stderr.strip() or completed.stdout.strip() or "probe failed"
+        raise RuntimeError(f"Cannot inspect ARC runtime Python {runtime_python}: {detail}")
+
+    current_abi = {
+        "implementation": sys.implementation.name,
+        "major": sys.version_info.major,
+        "minor": sys.version_info.minor,
+        "cache_tag": sys.implementation.cache_tag,
+        "soabi": sysconfig.get_config_var("SOABI"),
+    }
+    required_fields = ("implementation", "major", "minor", "cache_tag")
+    compatible = all(runtime_abi.get(key) == current_abi[key] for key in required_fields)
+    if runtime_abi.get("soabi") and current_abi["soabi"]:
+        compatible = compatible and runtime_abi["soabi"] == current_abi["soabi"]
+    if compatible:
+        return
+
+    current_label = _format_python_abi(current_abi)
+    runtime_label = _format_python_abi(runtime_abi)
     raise RuntimeError(
-        "Cannot import ARC internal module `arc_llm`. This does NOT mean `arc-llm` "
-        "should be installed from PyPI. ARC tools are provided by the ARC MCP/plugin "
-        "launcher and its bundled runtime. Run this workflow with the ARC runtime, "
-        "or set ARC_MCP_REPO_ROOT/ARC_REPO_ROOT/PYTHONPATH to a checkout containing "
-        "packages/arc-llm/src.\n"
-        f"Searched ARC roots:\n{searched_roots}\n"
-        f"Searched ARC runtime site-packages:\n{searched_runtimes}"
+        "The ARC runtime Python is not ABI-compatible with the interpreter running "
+        f"this workflow (current: {current_label}; runtime: {runtime_label}). Run the "
+        f"corresponding ARC command through `{launcher}`, or invoke this workflow with "
+        f"`{runtime_python}`, instead of importing the runtime into the current process."
+    )
+
+
+def _format_python_abi(identity: dict[str, object]) -> str:
+    return (
+        f"{identity.get('implementation')} "
+        f"{identity.get('major')}.{identity.get('minor')} "
+        f"cache_tag={identity.get('cache_tag')} soabi={identity.get('soabi')}"
     )
 
 
@@ -163,29 +336,12 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def _can_import_arc_llm() -> bool:
-    try:
-        __import__("arc_llm")
-        return True
-    except ModuleNotFoundError:
-        return False
-
-
 def _candidate_roots() -> list[Path]:
     roots: list[Path] = []
-    for key in ("ARC_REPO_ROOT", "ARC_MCP_REPO_ROOT", "ARC_PLUGIN_ROOT"):
-        value = os.environ.get(key)
-        if value:
-            roots.append(Path(value).expanduser())
-    here = Path(__file__).resolve()
-    roots.extend(here.parents)
-    home = Path.home()
-    roots.extend(
-        [
-            home / ".claude" / "plugins" / "marketplaces" / "arc",
-            home / ".codex" / "plugins" / "marketplaces" / "arc",
-        ]
-    )
+    if value := os.environ.get("ARC_INSTALL_REPO_ROOT"):
+        roots.append(Path(value).expanduser())
+    if containing_checkout := _checkout_containing_bootstrap():
+        roots.append(containing_checkout)
     deduped: list[Path] = []
     seen: set[str] = set()
     for root in roots:
@@ -199,13 +355,16 @@ def _candidate_roots() -> list[Path]:
     return deduped
 
 
-def _candidate_runtime_site_packages() -> list[Path]:
-    roots: list[Path] = []
-    if value := os.environ.get("ARC_MCP_RUNTIME_DIR"):
-        roots.append(Path(value).expanduser())
-    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
-    roots.extend((cache_home / "arc" / "arc-mcp-runtime").glob("v*/**/venv"))
-    site_packages: list[Path] = []
-    for root in roots:
-        site_packages.extend(root.glob("lib/python*/site-packages"))
-    return site_packages
+def _checkout_containing_bootstrap() -> Path | None:
+    here = Path(__file__).resolve()
+    relative_bootstrap = Path(
+        "plugins/arc/skills/arc/workflows/scripts/_arc_script_bootstrap.py"
+    )
+    for candidate in here.parents:
+        expected = candidate / relative_bootstrap
+        try:
+            if expected.resolve(strict=True) == here:
+                return candidate
+        except (OSError, RuntimeError):
+            continue
+    return None

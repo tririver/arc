@@ -63,6 +63,12 @@ python3 <skill-dir>/workflows/scripts/ideas_runner.py \
 Step 2: Print any returned `WARNING:` messages. For loop concurrency, see
 `manuals/arc-llm.md`.
 
+The workflow controller resolves structured worker evidence requests through
+the deterministic `arc-paper` service between rounds and returns response
+provenance in the next worker context. Proposers and reviewers must not invoke
+ARC CLI, shell, or MCP tools themselves. See the controller evidence protocol
+in `manuals/arc-llm.md`.
+
 Step 3: Continue only if the returned status is `completed`. If status is
 `failed`, print `WARNING:` with the error and artifact root.
 
@@ -146,8 +152,8 @@ artifacts without `idea_assessment` remain readable under the visibly reported
 `legacy_no_feasibility_gate` policy.
 
 Step 2: After writing the project-level Markdown report, follow
-`manuals/arc-mcp.md` Markdown Report Export for
-`md2pdf(input="<project-dir>/ranked-ideas.md")`. This report-export gate is not
+`manuals/arc-jobs.md` Markdown Report Export for
+`<project-dir>/ranked-ideas.md`. This report-export gate is not
 satisfied until `md2pdf` has been started or a `WARNING:` with the exact blocker
 is recorded. Do not wait for PDF completion.
 If PDF generation appears bugged, report it and continue this workflow; do not

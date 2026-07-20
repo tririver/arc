@@ -4,10 +4,11 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
-from .jobs import MCPJobManager, cache_root
-from .worker import run_job
+from arc_jobs import JobManager
+from arc_jobs.jobs import cache_root
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,11 +19,6 @@ def main(argv: list[str] | None = None) -> int:
         return _jobs(argv)
     if argv and argv[0] == "md2pdf":
         return _md2pdf(argv[1:])
-    if argv and argv[0] == "worker":
-        parser = argparse.ArgumentParser(description="Run ARC MCP worker")
-        parser.add_argument("job_id")
-        args = parser.parse_args(argv[1:])
-        return run_job(args.job_id)
     return _server().run_mcp_server()
 
 
@@ -61,19 +57,43 @@ def _jobs(argv: list[str]) -> int:
     root.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
-    manager = MCPJobManager()
-    if args.command == "status":
-        return _emit(manager.status(args.job_id), json_output=args.json)
-    if args.command == "result":
-        return _emit(manager.result(args.job_id), json_output=args.json)
-    if args.command == "cancel":
-        return _emit(manager.cancel(args.job_id), json_output=args.json)
-    if args.command == "list":
-        return _emit(manager.list_jobs(), json_output=args.json)
-    if args.command == "root":
-        return _emit({"ok": True, "data": {"cache_root": str(cache_root())}, "errors": [], "meta": {}}, json_output=args.json)
-    if args.command == "watch":
-        return _watch(manager, args.job_id, interval=args.interval, json_output=args.json, progress_jsonl=args.progress_jsonl)
+    try:
+        manager = JobManager()
+        if args.command == "status":
+            response = manager.status(args.job_id)
+            return _emit(
+                response,
+                json_output=args.json,
+                failure=response.get("status") in {"job_unknown", "failed", "cancelled"},
+            )
+        if args.command == "result":
+            response = manager.result(args.job_id)
+            return _emit(response, json_output=args.json, failure=response.get("ok") is not True)
+        if args.command == "cancel":
+            response = manager.cancel(args.job_id)
+            return _emit(
+                response,
+                json_output=args.json,
+                failure=response.get("status") == "job_unknown",
+            )
+        if args.command == "list":
+            return _emit(manager.list_jobs(), json_output=args.json)
+        if args.command == "root":
+            return _emit({"ok": True, "data": {"cache_root": str(cache_root())}, "errors": [], "meta": {}}, json_output=args.json)
+        if args.command == "watch":
+            return _watch(manager, args.job_id, interval=args.interval, json_output=args.json, progress_jsonl=args.progress_jsonl)
+    except Exception as exc:
+        return _emit(
+            {
+                "ok": False,
+                "status": "internal_error",
+                "error": {"code": "internal_error", "message": str(exc)},
+                "errors": [],
+                "meta": {},
+            },
+            json_output=getattr(args, "json", False),
+            failure=True,
+        )
     raise AssertionError(f"Unhandled jobs command: {args.command}")
 
 
@@ -95,13 +115,15 @@ def _md2pdf(argv: list[str]) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    payload: dict[str, Any] = {"input": args.input}
+    payload: dict[str, Any] = {"input": str(Path(args.input).expanduser().resolve())}
     for key in ("output", "texlive_bin", "margin", "mainfont", "cjk_mainfont", "timeout_seconds"):
         value = getattr(args, key)
         if value is not None:
+            if key in {"output", "texlive_bin"} and value != "":
+                value = str(Path(value).expanduser().resolve())
             payload[key] = value
     if args.resource_path is not None:
-        payload["resource_path"] = args.resource_path
+        payload["resource_path"] = [str(Path(path).expanduser().resolve()) for path in args.resource_path]
 
     result = _server().call_tool("md2pdf", payload)
     exit_code = 0 if _job_launch_succeeded(result) else 1
@@ -114,7 +136,7 @@ def _job_launch_succeeded(result: Any) -> bool:
 
 
 def _watch(
-    manager: MCPJobManager,
+    manager: JobManager,
     job_id: str,
     *,
     interval: float,
@@ -134,16 +156,16 @@ def _watch(
         if status.get("status") in {"done", "failed", "cancelled", "needs_llm", "job_unknown"}:
             if status.get("status") in {"done", "needs_llm"}:
                 return _emit(manager.result(job_id), json_output=json_output)
-            return _emit(status, json_output=json_output)
+            return _emit(status, json_output=json_output, failure=True)
         time.sleep(max(0.1, interval))
 
 
-def _emit(data: Any, *, json_output: bool) -> int:
+def _emit(data: Any, *, json_output: bool, failure: bool = False) -> int:
     if json_output:
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
     else:
         _print_human(data)
-    return 0
+    return 1 if failure else 0
 
 
 def _print_human(data: Any) -> None:

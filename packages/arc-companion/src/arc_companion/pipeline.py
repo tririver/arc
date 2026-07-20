@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Callable
 
 from bs4 import BeautifulSoup
+from arc_llm.evidence import EvidenceRequest, EvidenceResponse, resolve_evidence_round
 
 from .context_sources import load_context_evidence
 from .glossary import generate_glossary
@@ -196,7 +197,6 @@ class BuildOptions:
     review_context_chars: int = DEFAULT_REVIEW_CONTEXT_CHARS
     domain_id: str | None = None
     domain_manifest: Path | None = None
-    allow_mcp: bool = True
     allow_internet: bool = True
     context_paper_ids: tuple[str, ...] = ()
     stop_after_preview: bool = False
@@ -1040,7 +1040,6 @@ def _generate_annotations(
                 else f"companion-annotation-evidence-rerun-{segment['segment_id']}"
             ),
             model_tier=ANNOTATION_TIER,
-            allow_mcp=True,
             allow_internet=True,
         )
         normalized = {
@@ -1165,7 +1164,55 @@ def _resolve_and_rerun_evidence_requests(
         })
         return annotations, evidence
 
-    resolution = controller.resolve(requests, existing_records=evidence.get("related_papers") or [])
+    controller_request = EvidenceRequest(
+        request_id="companion-related-work-round-1",
+        operation="companion.resolve-related-work",
+        arguments={
+            "requests": requests,
+            "existing_records": evidence.get("related_papers") or [],
+        },
+    )
+
+    def resolve_with_services(
+        material: tuple[EvidenceRequest, ...], *, round_number: int,
+    ) -> tuple[EvidenceResponse, ...]:
+        responses: list[EvidenceResponse] = []
+        for request in material:
+            if request.operation != "companion.resolve-related-work":
+                responses.append(EvidenceResponse(
+                    request.request_id,
+                    False,
+                    error=f"unsupported evidence operation: {request.operation}",
+                ))
+                continue
+            try:
+                resolved = controller.resolve(
+                    request.arguments.get("requests") or [],
+                    existing_records=request.arguments.get("existing_records") or [],
+                )
+            except Exception as exc:
+                responses.append(EvidenceResponse(
+                    request.request_id,
+                    False,
+                    error=f"{type(exc).__name__}: {exc}",
+                ))
+            else:
+                responses.append(EvidenceResponse(
+                    request.request_id,
+                    True,
+                    resolved,
+                    provenance={"controller": "arc-companion", "round": round_number},
+                ))
+        return tuple(responses)
+
+    controller_response = resolve_evidence_round(
+        (controller_request,), resolve_with_services, round_number=1,
+    )[0]
+    if not controller_response.ok:
+        raise RuntimeError(f"evidence controller failed: {controller_response.error}")
+    resolution = controller_response.data
+    if not isinstance(resolution, EvidenceResolution):
+        raise RuntimeError("evidence controller returned an invalid resolution")
     supported = set(resolution.supported_request_keys)
     evidence_ids_by_request: dict[str, set[str]] = {}
     for accepted in resolution.audit.get("accepted") or []:
@@ -1975,7 +2022,6 @@ def _repair_translation_token_placement(
             artifact_dir=artifact_dir / "retry-offset-1",
             call_label=f"companion-translation-{segment_id}-retry-offset-1",
             model_tier=TRANSLATION_RETRY_TIER,
-            allow_mcp=False,
             allow_internet=False,
         )
         write_json(attempt_path, {
@@ -2183,7 +2229,6 @@ def _generate_translations(
                     artifact_dir=artifact_dir,
                     call_label=f"companion-translation-{segment_id}",
                     model_tier=TRANSLATION_TIER,
-                    allow_mcp=True,
                     allow_internet=True,
                 )
                 draft = _translation_primary_draft_payload(
@@ -2260,7 +2305,6 @@ def _generate_translations(
                     artifact_dir=artifact_dir / "coverage-repair-1",
                     call_label=f"companion-translation-{segment_id}-coverage-repair-1",
                     model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
-                    allow_mcp=False,
                     allow_internet=False,
                     force_offline=True,
                 )
@@ -2667,15 +2711,12 @@ def _llm_call(
     artifact_dir: Path,
     call_label: str,
     model_tier: str,
-    allow_mcp: bool = False,
     allow_internet: bool = False,
     force_offline: bool = False,
 ) -> dict[str, Any]:
-    force_offline = force_offline or (not allow_mcp and not allow_internet)
+    force_offline = force_offline or not allow_internet
     runtime_env = _llm_runtime_env(
-        allow_mcp=not force_offline and allow_mcp and options.allow_mcp,
         allow_internet=not force_offline and allow_internet and options.allow_internet,
-        force_disable_mcp=force_offline or not options.allow_mcp,
         force_disable_internet=force_offline or not options.allow_internet,
     )
     return llm(
@@ -2692,50 +2733,35 @@ def _llm_call(
 
 
 def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str, bool | str]:
-    allow_mcp = True if options is None else options.allow_mcp
     allow_internet = True if options is None else options.allow_internet
-    policy: dict[str, bool | str] = {
-        "allow_mcp": allow_mcp,
+    return {
+        "allow_mcp": False,
         "allow_internet": allow_internet,
     }
-    if allow_mcp:
-        policy["mcp_mode"] = "arc-only"
-    return policy
 
 
 def _llm_runtime_env(
     *,
-    allow_mcp: bool,
     allow_internet: bool,
-    force_disable_mcp: bool = False,
     force_disable_internet: bool = False,
 ) -> dict[str, str] | None:
     """Map portable access intent onto both supported host runtimes."""
-    if not allow_mcp and not allow_internet and not force_disable_mcp and not force_disable_internet:
-        return None
     env = dict(os.environ)
     if allow_internet or force_disable_internet:
         value = "true" if allow_internet else "false"
         env["ARC_CODEX_ALLOW_INTERNET"] = value
         env["ARC_CLAUDE_ALLOW_INTERNET"] = value
-    if allow_mcp or force_disable_mcp:
-        value = "true" if allow_mcp else "false"
-        env["ARC_CODEX_ENABLE_MCP"] = value
-        env["ARC_CLAUDE_ALLOW_MCP"] = value
-    if allow_mcp:
-        env["ARC_CODEX_MCP_MODE"] = "arc-only"
-        env["ARC_CLAUDE_MCP_MODE"] = "arc-only"
-    elif force_disable_mcp:
-        for key in _MCP_CONFIG_ENV_KEYS:
-            env.pop(key, None)
-        # These controls map to provider-native isolation flags.  Merely setting
-        # allow-MCP=false is insufficient when a parent profile/config injects
-        # servers or tools before the provider evaluates that boolean.
-        env["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
-        env["ARC_CLAUDE_BARE"] = "true"
-        claude_web_tools = "WebSearch,WebFetch" if allow_internet else ""
-        env["ARC_CLAUDE_TOOLS"] = claude_web_tools
-        env["ARC_CLAUDE_ALLOWED_TOOLS"] = claude_web_tools
+    for key in _MCP_CONFIG_ENV_KEYS:
+        env.pop(key, None)
+    # Companion evidence is controller-resolved.  Provider-native isolation is
+    # mandatory even when a parent profile injects MCP servers or tool grants.
+    env["ARC_CODEX_ENABLE_MCP"] = "false"
+    env["ARC_CLAUDE_ALLOW_MCP"] = "false"
+    env["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
+    env["ARC_CLAUDE_BARE"] = "true"
+    claude_web_tools = "WebSearch,WebFetch" if allow_internet else ""
+    env["ARC_CLAUDE_TOOLS"] = claude_web_tools
+    env["ARC_CLAUDE_ALLOWED_TOOLS"] = claude_web_tools
     return env
 
 

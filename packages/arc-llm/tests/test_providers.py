@@ -445,7 +445,7 @@ def test_codex_arc_only_mcp_keeps_user_config_ignored_and_injects_arc_server(mon
             "ARC_CODEX_WORK_DIR": "/tmp/project",
             "ARC_CODEX_ADD_DIRS": json.dumps(["/tmp/project/skills", "/tmp/arc-skills"]),
             "ARC_PAPER_CACHE": "/tmp/cache/arc-paper",
-            "ARC_CODEX_ARC_MCP_ENV_JSON": json.dumps({"ARC_MCP_CACHE": "/tmp/cache/arc-mcp"}),
+            "ARC_CODEX_ARC_MCP_ENV_JSON": json.dumps({"ARC_JOBS_CACHE": "/tmp/cache/arc-jobs"}),
         }
     )
 
@@ -460,7 +460,7 @@ def test_codex_arc_only_mcp_keeps_user_config_ignored_and_injects_arc_server(mon
     assert 'mcp_servers.arc.default_tools_approval_mode="approve"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_AGENT_HOST="codex"' in captured["cmd"]
     assert 'mcp_servers.arc.env.ARC_PAPER_CACHE="/tmp/cache/arc-paper"' in captured["cmd"]
-    assert 'mcp_servers.arc.env.ARC_MCP_CACHE="/tmp/cache/arc-mcp"' in captured["cmd"]
+    assert 'mcp_servers.arc.env.ARC_JOBS_CACHE="/tmp/cache/arc-jobs"' in captured["cmd"]
 
 
 def test_codex_arc_only_rejects_mcp_server_extra_config():

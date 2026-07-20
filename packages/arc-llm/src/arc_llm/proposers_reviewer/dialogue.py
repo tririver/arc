@@ -59,6 +59,10 @@ def render_initial_worker_prompt(
         "## Output Contract",
         "Return exactly one JSON object matching the provided schema. Do not wrap it in Markdown. If unsure about a field, still include the field with your best useful value. For arrays, return [] when no items are available. For booleans, return true or false. For nullable fields, use null when appropriate. Do not return explanatory prose outside the JSON object.",
     ]
+    if worker.evidence_enabled:
+        static_parts.append(
+            "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a worker-prefixed request_id unique in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. Do not invoke shell commands, ARC CLIs, or MCP tools yourself."
+        )
     static_prefix = "\n".join(static_parts).rstrip() + "\n\n"
     variable_suffix = "\n".join(
         [
@@ -101,6 +105,8 @@ def render_proposer_delta_prompt(
         ),
         "caller_context_delta": _volatile_caller_context(loop),
     }
+    if worker.evidence_enabled:
+        delta["evidence_responses"] = _evidence_responses(correspondence, worker_id=worker.id)
     prompt = "\n".join(
         [
             "## ARC-LLM Worker Delta Turn v2",
@@ -126,6 +132,7 @@ def render_reviewer_delta_prompt(
     worker: WorkerConfig,
     round_number: int,
     current_proposer_outputs: dict[str, Any],
+    correspondence: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     delta = {
         "role": "reviewer",
@@ -135,6 +142,10 @@ def render_reviewer_delta_prompt(
         "active_proposer_ids": [proposer.id for proposer in loop.proposers],
         "caller_context_delta": _volatile_caller_context(loop),
     }
+    if worker.evidence_enabled:
+        delta["evidence_responses"] = _evidence_responses(
+            correspondence or [], worker_id=worker.id
+        )
     outputs = strip_arc_llm_call_records(current_proposer_outputs)
     prompt = "\n".join(
         [
@@ -161,6 +172,7 @@ def _static_loop_metadata(loop: LoopConfig) -> dict[str, Any]:
     return {
         "max_rounds": loop.max_rounds,
         "early_stop_enabled": loop.early_stop_enabled,
+        "evidence_enabled": loop.evidence_enabled,
         "proposer_ids": [worker.id for worker in loop.proposers],
         "reviewer_ids": [worker.id for worker in loop.reviewers],
     }
@@ -210,6 +222,25 @@ def _last_event(
             continue
         return strip_arc_llm_call_records(event)
     return None
+
+
+def _evidence_responses(correspondence: list[dict[str, Any]], *, worker_id: str) -> list[dict[str, Any]]:
+    """Return controller responses addressed to one worker since its last turn."""
+
+    for event in reversed(correspondence):
+        if event.get("type") != "evidence_responses":
+            continue
+        exchanges = event.get("exchanges", [])
+        if not isinstance(exchanges, list):
+            return []
+        return [
+            strip_arc_llm_call_records(exchange)
+            for exchange in exchanges
+            if isinstance(exchange, dict)
+            and isinstance(exchange.get("request"), dict)
+            and exchange["request"].get("worker_id") == worker_id
+        ]
+    return []
 
 
 def _canonical_json(value: Any) -> str:

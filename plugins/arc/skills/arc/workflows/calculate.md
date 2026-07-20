@@ -62,10 +62,11 @@ If blind proposers agree with each other but not with the reviewer reference,
 record `reference_disagrees`; use remaining recalculation budget with
 non-revealing reviewer feedback before pausing for a human decision.
 
-For a post-check new calculation, enable source access by default unless the user requested otherwise:
+For a post-check new calculation, enable internet discovery but keep ARC source
+access controller-mediated:
 
 ```json
-"proposer_runtime": {"allow_internet": true, "allow_mcp": true}
+"proposer_runtime": {"allow_internet": true, "allow_mcp": false}
 ```
 
 External sources may guide methods, but any used identity or intermediate result must be derived or already accepted in the work note. Map all notation back to work-note conventions.
@@ -166,8 +167,8 @@ result. Promotion to an accepted premise belongs to `plan.md`.
 Write an immutable next work-note version at
 `<project-dir>/calculate/<run-id>/work-notes/work-note-vNNN.md`, then mirror it
 to `<project-dir>/work-note.md`. After writing the root work note, follow
-`manuals/arc-mcp.md` Markdown Report Export for
-`md2pdf(input="<project-dir>/work-note.md")`. This report-export gate is not
+`manuals/arc-jobs.md` Markdown Report Export for
+`<project-dir>/work-note.md`. This report-export gate is not
 satisfied until `md2pdf` has been started or a `WARNING:` with the exact blocker
 is recorded. Do not wait for PDF completion, and do not require any separate
 report. If PDF generation appears bugged, report it and continue this workflow;

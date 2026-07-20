@@ -47,9 +47,35 @@ def main(argv: list[str] | None = None) -> int:
     get_graph.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
-    result = _dispatch(args)
+    try:
+        result = _dispatch(args)
+    except Exception as exc:
+        if not getattr(args, "json", False):
+            raise
+        result = _exception_result(exc)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    if (
+        isinstance(result, dict)
+        and result.get("ok") is False
+        and result.get("status") != "needs_llm"
+    ):
+        return 1
     return 0
+
+
+def _exception_result(exc: Exception) -> dict[str, Any]:
+    """Return the stable failure envelope promised by ``--json`` commands."""
+    return {
+        "ok": False,
+        "status": "error",
+        "error": {
+            "code": "command_failed",
+            "message": str(exc) or exc.__class__.__name__,
+            "type": exc.__class__.__name__,
+        },
+        "errors": [],
+        "meta": {},
+    }
 
 
 def _seed_command(sub, name: str) -> argparse.ArgumentParser:

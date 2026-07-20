@@ -202,7 +202,7 @@ Step 2: Build final content before writing files and note planned PDF export in 
 Step 3: Write the next immutable version, starting with `work-note-v001.md`;
 never overwrite an old version.
 Step 4: Mirror it to `<project-dir>/work-note.md`.
-Step 5: Follow `manuals/arc-mcp.md` Markdown Report Export for `md2pdf(input="<project-dir>/work-note.md")`. This report-export gate is not satisfied until `md2pdf` has been started or a `WARNING:` with the exact blocker is recorded. Do not wait for PDF completion. Record any job id in host logs or the next work-note version, not by editing an old immutable version. If PDF generation appears bugged, report it and continue this workflow; do not debug or fix PDF generation unless the user explicitly asks.
+Step 5: Follow `manuals/arc-jobs.md` Markdown Report Export for `<project-dir>/work-note.md`. This report-export gate is not satisfied until `md2pdf` has been started or a `WARNING:` with the exact blocker is recorded. Do not wait for PDF completion. Record any job id in host logs or the next work-note version, not by editing an old immutable version. If PDF generation appears bugged, report it and continue this workflow; do not debug or fix PDF generation unless the user explicitly asks.
 
 ## Phase 5: Review
 Step 1: Review the plan before execution. If the host and workflow permissions
@@ -213,7 +213,7 @@ Step 2: Check that foundations are separated from derived results, accepted deri
 
 Step 3: If review finds gaps, build final content with the planned PDF export
 noted in the Journal, write a new immutable work-note version, mirror it to root,
-and follow `manuals/arc-mcp.md` Markdown Report Export. Record any returned job
+and follow `manuals/arc-jobs.md` Markdown Report Export. Record any returned job
 id in host/run logs or the next work-note version, not by editing the immutable
 version just written. If PDF generation appears bugged, report it and continue
 this workflow; do not debug or fix PDF generation unless the user explicitly asks.

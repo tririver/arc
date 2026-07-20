@@ -305,7 +305,7 @@ def test_cli_explicit_language_has_no_notice(tmp_path: Path, monkeypatch, capsys
     assert "默认使用中文" not in capsys.readouterr().err
 
 
-def test_cli_disables_mcp_independently_from_internet(tmp_path: Path, monkeypatch) -> None:
+def test_cli_is_controller_only_and_keeps_internet_enabled(tmp_path: Path, monkeypatch) -> None:
     captured = {}
 
     def fake_build(options):
@@ -320,10 +320,48 @@ def test_cli_disables_mcp_independently_from_internet(tmp_path: Path, monkeypatc
         str(tmp_path),
         "--annotation-language",
         "zh-CN",
-        "--no-mcp",
     ]) == 0
-    assert captured["options"].allow_mcp is False
+    assert not hasattr(captured["options"], "allow_mcp")
     assert captured["options"].allow_internet is True
+
+
+def test_cli_returns_nonzero_for_error_envelope(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli,
+        "build_companion",
+        lambda _options: {
+            "ok": False,
+            "data": None,
+            "error": {"code": "build_failed", "message": "boom"},
+            "meta": {},
+        },
+    )
+
+    assert cli.main([
+        "build",
+        "local:test",
+        "--project-dir",
+        str(tmp_path),
+        "--annotation-language",
+        "en",
+        "--json",
+    ]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_cli_json_wraps_dispatch_exception(monkeypatch, capsys) -> None:
+    def fail(_args):
+        raise RuntimeError("pipeline unavailable")
+
+    monkeypatch.setattr(cli, "_dispatch", fail)
+
+    assert cli.main(["status", "--project-dir", "/tmp/project", "--json"]) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] == {
+        "code": "command_failed",
+        "message": "pipeline unavailable",
+        "type": "RuntimeError",
+    }
 
 
 def test_cli_passes_stop_after_preview(tmp_path: Path, monkeypatch) -> None:

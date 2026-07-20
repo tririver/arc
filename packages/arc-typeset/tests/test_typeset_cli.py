@@ -5,6 +5,21 @@ import json
 from arc_typeset import cli
 
 
+def test_cli_json_wraps_dispatch_exception(monkeypatch, capsys):
+    def fail(_args):
+        raise RuntimeError("converter unavailable")
+
+    monkeypatch.setattr(cli, "_dispatch", fail)
+
+    assert cli.main(["md2pdf", "report.md", "--json"]) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] == {
+        "code": "command_failed",
+        "message": "converter unavailable",
+        "type": "RuntimeError",
+    }
+
+
 def test_cli_md2pdf_dispatches_to_converter(monkeypatch, tmp_path, capsys):
     source = tmp_path / "report.md"
     output = tmp_path / "report.pdf"

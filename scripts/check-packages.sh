@@ -2,6 +2,7 @@
 set -euo pipefail
 
 python -m build packages/arc-llm
+python -m build packages/arc-jobs
 python -m build packages/arc-paper
 python -m build packages/arc-domain
 python -m build packages/arc-typeset

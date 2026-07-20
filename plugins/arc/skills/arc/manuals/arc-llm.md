@@ -1,15 +1,15 @@
 # Arc LLM Package
 
 `arc-llm` is the reusable host LLM worker used by ARC packages. Most workflows
-should call `arc-paper`, `arc-domain`, or ARC MCP tools instead of calling
+should call `arc-paper` or `arc-domain` instead of calling
 `arc-llm` directly. Use this reference for provider diagnosis, direct prompt
 tests, and advanced LLM runtime options.
 
-ARC tools are provided through the ARC MCP/plugin launcher and its bundled
+ARC tools are provided through the ARC Skill/CLI launcher and its isolated
 runtime. Do not diagnose `arc-llm` by running `pip show arc-llm` in the system
 Python. `arc_llm` is an internal Python module under ARC's bundled source/runtime.
 If a workflow script cannot import `arc_llm`, it is using the wrong Python path/runtime;
-use the ARC plugin launcher/runtime or source-tree `PYTHONPATH`/`ARC_MCP_REPO_ROOT`,
+use the ARC plugin launcher/runtime or source-tree `PYTHONPATH`/`ARC_INSTALL_REPO_ROOT`,
 not `pip install arc-llm` from PyPI.
 
 For a source-sensitive development run, set
@@ -54,12 +54,11 @@ With `--provider auto`, ARC uses only host-native providers: Codex selects
 `manual`. `arc-llm` does not read provider config files, API-key files, or
 URL-based provider definitions.
 
-Claude Code requires explicit permission for MCP tools in non-interactive
-workers. ARC-only MCP sessions therefore allow `mcp__arc__*` by default while
-keeping built-in tools limited to the requested internet setting. If a Claude
-worker reports that ARC MCP tool permission is pending, check that the command
-includes `--allowedTools mcp__arc__*`. Advanced callers may override this with
-`ARC_CLAUDE_ALLOWED_TOOLS` or `--claude-allowed-tools`.
+ARC internal workers disable MCP and inherited MCP configuration. They receive
+local paper evidence from the owning controller and may use explicitly enabled
+internet access. Generic `arc-llm` callers may still opt into their own MCP
+configuration, but this is an advanced provider feature and not an ARC
+workflow default.
 
 ## Direct Prompt Tests
 
@@ -142,6 +141,31 @@ For example, the idea workflow uses:
 The loop runner owns all artifact writes. Worker prompts and outputs are stored
 under per-loop and per-round directories, so distinct loops can run
 concurrently without sharing mutable context.
+
+Workers may return the optional top-level `arc_evidence_requests` array. Each
+request contains a loop-round-unique `request_id`, an `operation`, JSON
+`arguments`, and a `reason`. The controller resolves requests outside the
+worker process, records response data and provenance in `transcript.jsonl`,
+and injects only the addressed worker's exchanges into its next turn. Empty
+arrays are no-ops, malformed requests fail the loop, and resolver calls stop
+after three evidence rounds. A request in the final configured worker round is
+recorded with `no_followup_round` instead of being resolved, because no later
+turn could consume it. Workers never call ARC CLI, shell, or MCP tools.
+
+The ideas workflow installs an `arc-paper` service resolver by default. Its
+portable operations are `paper.metadata`, `paper.section`,
+`paper.full_text_search`, `paper.references`, `paper.citers`, and
+`paper.search`. Python hosts may instead pass an `evidence_controller`
+callback to `run_proposers_reviewer_batch()` or `run_ideas()`; the callback
+receives typed requests and must return one typed response per request with
+matching IDs and provenance.
+
+Evidence capability is explicit and hierarchical. Batch `evidence.enabled`
+is the master switch; a loop or worker may further disable it with
+`"evidence": {"enabled": false}` but cannot re-enable a disabled parent.
+Disabled workers do not receive the evidence schema or prompt protocol, and
+their output can never reach the controller resolver. The ideas workflow uses
+this boundary to keep no-information variants isolated from ARC paper caches.
 
 Idea workflow loop concurrency is bounded by `ARC_IDEAS_MAX_CONCURRENT_LOOPS`
 and defaults to `12`.
@@ -295,24 +319,24 @@ Runtime capability options:
 --claude-effort low
 ```
 
-Use `--allow-mcp` for LLM tasks that need ARC tools or other configured MCP
-servers. Use `--allow-internet` only when fresh web access is required.
+`--allow-mcp` is an explicit advanced opt-in for standalone LLM tasks using
+caller-configured servers. ARC workflow workers must leave it disabled and use
+controller-supplied evidence. Use `--allow-internet` only when fresh web access
+is required.
 
-For proposers-reviewer JSON configs, prefer ARC-only MCP access when workers
-need ARC paper/domain tools:
+For proposers-reviewer JSON configs, keep MCP disabled and place resolved ARC
+paper/domain evidence in caller context:
 
 ```json
 {
   "runtime": {
-    "allow_mcp": true,
-    "mcp_mode": "arc-only",
+    "allow_mcp": false,
     "codex_sandbox": "read-only"
   }
 }
 ```
 
-With Codex, `mcp_mode: "arc-only"` keeps the user host config ignored, injects
-only the ARC MCP server, and approves that server's tools for the noninteractive
-worker. If a worker also needs bounded filesystem access, use
+When MCP is disabled, ARC scrubs inherited user/profile MCP configuration for
+the noninteractive worker. If a worker also needs bounded filesystem access, use
 `codex_sandbox: "workspace-write"` with `codex_work_dir` and `codex_add_dirs`;
 do not use `danger-full-access` for normal research workflows.

@@ -219,10 +219,15 @@ def main(argv: list[str] | None = None) -> int:
     export.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
-    result = _dispatch(args)
+    try:
+        result = _dispatch(args)
+    except Exception as exc:
+        if not getattr(args, "json", False):
+            raise
+        result = _exception_result(exc)
     _print_warnings(result)
     _print_json(result)
-    return 0
+    return _exit_code(result)
 
 
 def _paper_command(sub, name: str) -> argparse.ArgumentParser:
@@ -231,6 +236,30 @@ def _paper_command(sub, name: str) -> argparse.ArgumentParser:
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--json", action="store_true")
     return parser
+
+
+def _exit_code(result: Any) -> int:
+    """Map ARC result envelopes to a process status for agent callers."""
+    if isinstance(result, dict) and result.get("ok") is False:
+        if result.get("status") == "needs_llm":
+            return 0
+        return 1
+    return 0
+
+
+def _exception_result(exc: Exception) -> dict[str, Any]:
+    """Return the stable failure envelope promised by ``--json`` commands."""
+    return {
+        "ok": False,
+        "status": "error",
+        "error": {
+            "code": "command_failed",
+            "message": str(exc) or exc.__class__.__name__,
+            "type": exc.__class__.__name__,
+        },
+        "errors": [],
+        "meta": {},
+    }
 
 
 def _cache_filter_args(parser: argparse.ArgumentParser, *, include_all: bool) -> None:

@@ -1,0 +1,25 @@
+{
+  "name": "arc-mcp",
+  "version": "1.0.0",
+  "description": "Optional MCP adapter for ARC research tools.",
+  "author": {
+    "name": "ARC"
+  },
+  "homepage": "https://github.com/tririver/arc",
+  "repository": "https://github.com/tririver/arc",
+  "license": "MIT",
+  "keywords": ["arc", "mcp", "papers", "arxiv", "inspire", "research"],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ARC MCP",
+    "shortDescription": "Optional MCP access to ARC research tools",
+    "longDescription": "An explicit opt-in MCP adapter for ARC. Install the ARC plugin for the default Skill and CLI workflows; install this companion only when the host needs MCP tool discovery.",
+    "developerName": "ARC",
+    "category": "Productivity",
+    "capabilities": ["MCP"],
+    "defaultPrompt": [
+      "Use ARC MCP to inspect a paper",
+      "Use ARC MCP to build a research domain"
+    ]
+  }
+}

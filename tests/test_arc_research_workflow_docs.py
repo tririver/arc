@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins/arc"
+MCP_PLUGIN = ROOT / "plugins/arc-mcp"
 SKILL = PLUGIN / "skills/arc"
 RULES = SKILL / "rules"
 WF = SKILL / "workflows"
@@ -75,7 +76,7 @@ def test_arc_skill_frontloads_workflow_references_before_route_selection() -> No
     assert "When the user intent triggers a workflow-specific file" in required
     for name in ["check.md", "domain.md", "ideas.md", "plan.md", "calculate.md"]:
         assert f"`workflows/{name}`" in required
-    assert "blocking requirement before any workflow MCP or CLI call" in required_flat
+    assert "blocking requirement before any workflow CLI call" in required_flat
 
 
 def test_arc_skill_case3_requires_full_check_workflow_phases() -> None:
@@ -103,22 +104,20 @@ def test_check_plan_calculate_workflows_treat_heavy_workload_as_nonoptional() ->
 
 def test_arc_skill_references_pdf_export_manuals() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8").lower()
-    manual = (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8").lower()
+    manual = (SKILL / "manuals/arc-jobs.md").read_text(encoding="utf-8").lower()
     manual_flat = " ".join(manual.split())
 
     assert "markdown report export" in text
     assert "`rules/math_typeset.md`" in text
-    assert "`manuals/arc-mcp.md`" in text
+    assert "`manuals/arc-jobs.md`" in text
     assert "md2pdf" in manual
-    assert "background pdf job" in manual
+    assert "background cli job" in manual
     assert "do not wait" in manual
     assert "markdown report" in manual
-    assert "pdf export is a completion gate" in manual
-    assert "do not type `md2pdf(...)` as a shell" in manual_flat
-    assert "warning: pdf export not started" in manual_flat
-    assert "do not debug or fix pdf generation" in manual
-    assert "arc-mcp md2pdf" in manual
-    assert "if the mcp tool is unavailable, use `arc-mcp md2pdf" in manual_flat
+    assert "report-export gate is satisfied after the job is accepted" in manual_flat
+    assert "arc-jobs submit --job-type md2pdf" in manual
+    assert "print `warning:`" in manual_flat
+    assert "do not debug pandoc or tex" in manual
 
 
 def test_math_typeset_rules_define_markdown_math_hygiene() -> None:
@@ -159,7 +158,7 @@ def test_workflows_start_pdf_export_for_user_facing_markdown() -> None:
     for name, guard_count in expected_pdf_guard_counts.items():
         text = (WF / name).read_text(encoding="utf-8").lower()
         text_flat = " ".join(text.split())
-        assert "`manuals/arc-mcp.md` markdown report export" in text
+        assert "`manuals/arc-jobs.md` markdown report export" in text
         assert "md2pdf" in text
         assert "report-export gate" in text
         assert "warning:" in text
@@ -258,7 +257,7 @@ def test_manuals_do_not_hardcode_checkout_cache_paths() -> None:
         text = (SKILL / "manuals" / manual).read_text(encoding="utf-8")
         assert "/arc-dev/cache/" not in text
     assert "doctor-cache" in (SKILL / "manuals/arc-paper.md").read_text(encoding="utf-8")
-    assert "doctor_cache" in (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8")
+    assert "ARC_JOBS_CACHE" in (SKILL / "manuals/arc-jobs.md").read_text(encoding="utf-8")
 
 
 def test_self_reflection_allows_missing_git_metadata() -> None:
@@ -382,7 +381,8 @@ def test_plan_requires_review_after_drafting() -> None:
     assert "main agent" in text.lower()
     assert "<project-dir>/calculate/<run-id>/work-notes/work-note-v001.md" in text
     assert "<project-dir>/work-note.md" in text
-    assert 'md2pdf(input="<project-dir>/work-note.md")' in text
+    assert "`manuals/arc-jobs.md` Markdown Report Export" in text
+    assert "`<project-dir>/work-note.md`" in text
     assert "<project-dir>/plan.md" not in text
 
 
@@ -610,7 +610,8 @@ def test_calculate_uses_phase_specific_source_defaults() -> None:
     assert '"allow_internet": false' in text
     assert '"allow_mcp": false' in text
     assert '"allow_internet": true' in text
-    assert '"allow_mcp": true' in text
+    assert '"allow_mcp": true' not in text
+    assert "controller-mediated" in text
     assert "reference_disagrees" in text
     assert "post-check new calculation" in text
 
@@ -870,17 +871,19 @@ def test_ideas_workflow_has_deterministic_ranked_report_deliverable() -> None:
 
     assert "<project-dir>/ideas/<run-id>/ranked-ideas.md" in text
     assert "<project-dir>/ranked-ideas.md" in text
-    assert 'md2pdf(input="<project-dir>/ranked-ideas.md")' in text
+    assert "`<project-dir>/ranked-ideas.md`" in text
+    assert "manuals/arc-jobs.md" in text
     assert "ranked_ideas.md" not in text
     assert "<project-dir>/suggested-ideas.md" not in text
 
 
-def test_ideas_loop_reviewer_template_has_arc_only_access() -> None:
+def test_ideas_loop_reviewer_template_uses_controller_evidence_without_mcp() -> None:
     reviewer = json.loads((WJ / "ideas-reviewer.template.json").read_text(encoding="utf-8"))
 
     assert reviewer["id"] == "reviewer_001"
-    assert reviewer["runtime"]["allow_mcp"] is True
-    assert reviewer["runtime"]["mcp_mode"] == "arc-only"
+    assert reviewer["runtime"]["allow_mcp"] is False
+    assert "mcp_mode" not in reviewer["runtime"]
+    assert "controller-supplied" in reviewer["prompt"]["template"]
 
 
 def test_ideas_reviewer_uses_hundred_point_marking_scheme() -> None:
@@ -975,7 +978,7 @@ def test_max_model_tier_requires_an_explicit_user_request() -> None:
     assert "no workflow default or automatic task mapping may select it" in manual
 
 
-def test_ideas_full_info_template_includes_domain_context_and_arc_tools() -> None:
+def test_ideas_full_info_template_includes_domain_and_controller_context() -> None:
     batch = json.loads((WJ / "ideas-batch.template.json").read_text(encoding="utf-8"))
     variant = json.loads((WJ / "ideas-domain.variant.json").read_text(encoding="utf-8"))
     loop = json.loads((WJ / "ideas-loop.template.json").read_text(encoding="utf-8"))
@@ -988,8 +991,9 @@ def test_ideas_full_info_template_includes_domain_context_and_arc_tools() -> Non
     assert "domain_markdown_files" in loop["caller_context"]
     assert "arc_paper_tool_notes" in loop["caller_context"]
     assert proposer["runtime"]["allow_internet"] is True
-    assert proposer["runtime"]["allow_mcp"] is True
-    assert proposer["runtime"]["mcp_mode"] == "arc-only"
+    assert proposer["runtime"]["allow_mcp"] is False
+    assert "mcp_mode" not in proposer["runtime"]
+    assert "controller-supplied" in proposer["prompt"]["template"]
 
 
 def test_ideas_no_info_description_mentions_shared_marking_scheme() -> None:
@@ -1105,13 +1109,12 @@ def test_ideas_attaches_optional_domain_markdown_not_single_paper_summaries() ->
 def test_root_plugin_manifests_use_canonical_arc_skill_tree() -> None:
     codex_manifest = json.loads((PLUGIN / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
     claude_manifest = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
-    mcp_config = json.loads((PLUGIN / ".mcp.json").read_text(encoding="utf-8"))
 
     assert codex_manifest["name"] == "arc"
     assert codex_manifest["skills"] == "./skills/"
-    assert codex_manifest["mcpServers"] == "./.mcp.json"
+    assert "mcpServers" not in codex_manifest
+    assert not (PLUGIN / ".mcp.json").exists()
     assert claude_manifest["name"] == "arc"
-    assert "arc" in mcp_config["mcpServers"]
     assert (SKILL / "SKILL.md").is_file()
     legacy_skill = ROOT / "skills/arc"
     assert not legacy_skill.exists()
@@ -1144,10 +1147,13 @@ def test_generated_python_caches_are_ignored_for_release_artifacts() -> None:
         assert pattern in text
 
 
-def test_root_mcp_config_uses_bundled_arc_mcp_launcher() -> None:
-    mcp_config = json.loads((ROOT / "plugins/arc/.mcp.json").read_text(encoding="utf-8"))
+def test_optional_mcp_plugin_uses_bundled_arc_mcp_launcher() -> None:
+    manifest = json.loads((MCP_PLUGIN / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    mcp_config = json.loads((MCP_PLUGIN / ".mcp.json").read_text(encoding="utf-8"))
     arc_server = mcp_config["mcpServers"]["arc"]
 
+    assert manifest["name"] == "arc-mcp"
+    assert manifest["mcpServers"] == "./.mcp.json"
     assert arc_server["command"] == "./bin/arc-mcp"
     assert arc_server["args"] == []
     assert arc_server["cwd"] == "."
@@ -1156,11 +1162,13 @@ def test_root_mcp_config_uses_bundled_arc_mcp_launcher() -> None:
 def test_readme_documents_marketplace_first_install() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "plugins/arc/bin/arc-mcp --help" in text
-    assert "ARC_MCP_INSTALL_RETRY=1" in text
-    assert "do not need `uv`, `pip`, or other installer tools" in text
-    assert "falls back to `python3 -m venv` plus" in text
-    assert "plugin `gitCommitSha`" in text
+    assert "plugins/arc/bin/arc-runtime setup --profile core" in text
+    assert "codex plugin add arc-mcp@arc" in text
+    assert "separate `arc-mcp` plugin" in text
+    assert "ARC_MCP_INSTALL_RETRY=1" not in text
+    assert "arc-runtime setup --profile core --retry" in text
+    assert "Python `venv` + `pip` is the" in text
+    assert "host-recorded full commit SHA" in text
     assert "codex plugin marketplace add tririver/arc --ref stable" in text
     assert "codex plugin add arc@arc" in text
     assert "/plugin marketplace add tririver/arc@stable" in text

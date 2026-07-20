@@ -3,6 +3,17 @@ from __future__ import annotations
 from importlib import import_module
 
 from .call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA_VERSION, strip_arc_llm_call_records
+from .evidence import (
+    EVIDENCE_REQUESTS_FIELD,
+    MAX_EVIDENCE_ROUNDS,
+    EvidenceControllerCallback,
+    EvidenceProtocolError,
+    EvidenceRequest,
+    EvidenceResponse,
+    allow_evidence_requests,
+    evidence_requests_from_output,
+    resolve_evidence_round,
+)
 from .host import HostDetection, ProviderSelection, detect_host, select_llm_provider
 from .model import ModelTierError, resolve_model
 
@@ -28,13 +39,22 @@ def __getattr__(name: str):
 
 __all__ = [
     "HostDetection",
+    "EVIDENCE_REQUESTS_FIELD",
+    "EvidenceControllerCallback",
+    "EvidenceProtocolError",
+    "EvidenceRequest",
+    "EvidenceResponse",
     "LLMConfig",
     "ModelTierError",
+    "MAX_EVIDENCE_ROUNDS",
     "ProviderSelection",
     "ARC_LLM_CALL_RECORD_FIELD",
     "ARC_LLM_CALL_RECORD_SCHEMA_VERSION",
     "detect_host",
+    "allow_evidence_requests",
+    "evidence_requests_from_output",
     "resolve_llm_config",
+    "resolve_evidence_round",
     "resolve_model",
     "run_proposers_reviewer_batch",
     "run_proposers_reviewer_bench",

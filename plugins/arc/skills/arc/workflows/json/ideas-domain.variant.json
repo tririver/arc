@@ -1,7 +1,7 @@
 {
   "schema_version": "arc.workflow.ideas.variant.v1",
   "variant_id": "domain",
-  "description": "Proposer receives ARC domain Markdown, ARC paper-tool guidance, internet access, and ARC-only MCP access.",
+  "description": "Proposer receives ARC domain Markdown, controller-mediated ARC paper evidence, and internet access; MCP remains disabled.",
   "loop_template": "ideas-loop.template.json",
   "proposer_template": "ideas-proposer.template.json",
   "reviewer_template": "ideas-domain-reviewer.template.json",
