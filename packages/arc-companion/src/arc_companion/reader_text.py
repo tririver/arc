@@ -16,6 +16,19 @@ _MACHINE_SUMMARY_LABEL = re.compile(
     r"^(?:natural[\s_-]*image|ocr(?:[\s_-]*(?:metadata|text))?|image[\s_-]*metadata)$",
     flags=re.IGNORECASE,
 )
+_CONTROLLER_EVIDENCE_PHRASES = (
+    (re.compile(r"所给\s*背景资料", re.IGNORECASE), "参考资料"),
+    (re.compile(r"所给\s*(?:context|bounded\s+context)\s*证据", re.IGNORECASE), "所引参考资料"),
+    (re.compile(r"(?:context|bounded\s+context)\s*证据", re.IGNORECASE), "参考资料"),
+    (
+        re.compile(r"\b(?:supplied\s+|bounded\s+)?context\s+evidence\b", re.IGNORECASE),
+        "cited source",
+    ),
+    (
+        re.compile(r"\b(?:the\s+)?supplied\s+background\s+(?:material|source)\b", re.IGNORECASE),
+        "the cited source",
+    ),
+)
 
 
 def clean_reader_text(
@@ -38,6 +51,7 @@ def clean_reader_text(
         evidence_records=evidence_records,
         language=language,
     )
+    text = _replace_controller_evidence_phrases(text)
     return re.sub(r"[ \t]+(?=\n)", "", text).strip()
 
 
@@ -49,9 +63,16 @@ def clean_reader_annotation(
 ) -> dict[str, Any]:
     """Return a reader-clean annotation while retaining evidence metadata."""
     cleaned = deepcopy(annotation)
-    evidence_records = list(evidence_records)
+    evidence_records = _records_for_annotation(evidence_records, cleaned)
     citation_labels = _citation_labels(evidence_records, language=language)
-    global_ids = _string_ids(cleaned.get("evidence_ids"))
+    global_ids = list(dict.fromkeys([
+        *_annotation_evidence_ids(cleaned),
+        *(
+            str(record.get("evidence_id") or "")
+            for record in evidence_records
+            if str(record.get("evidence_id") or "")
+        ),
+    ]))
     for field in ("commentary", "explanation", "prior_work", "later_work"):
         value = cleaned.get(field)
         if isinstance(value, list):
@@ -133,6 +154,13 @@ def _strip_html_containers(text: str) -> str:
     rendered = _HTML_TAG.sub("", rendered)
     rendered = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", rendered)
     return rendered
+
+
+def _replace_controller_evidence_phrases(text: str) -> str:
+    """Remove pipeline vocabulary that has no meaning to a PDF-only reader."""
+    for pattern, replacement in _CONTROLLER_EVIDENCE_PHRASES:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def is_machine_summary_label(value: Any) -> bool:
@@ -238,7 +266,7 @@ def _readable_citation(
     if not visible:
         return ""
     joined = "；".join(dict.fromkeys(visible))
-    return f"（{joined}）" if _is_chinese(language) else f" ({joined})"
+    return f"（参考：{joined}）" if _is_chinese(language) else f" (Source: {joined})"
 
 
 def _citation_labels(
@@ -270,11 +298,90 @@ def _citation_labels(
     return labels
 
 
+def _records_for_annotation(
+    records: Iterable[dict[str, Any]], annotation: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Select the exact cited pieces so legacy prose gets the right location.
+
+    Evidence identities and checkpoint payloads are not modified.  The copied
+    records are presentation inputs only.
+    """
+    locators = _annotation_source_locators(annotation)
+    rendered: list[dict[str, Any]] = []
+    for value in records:
+        if not isinstance(value, dict):
+            continue
+        record = dict(value)
+        evidence_id = str(record.get("evidence_id") or "")
+        requested = locators.get(evidence_id) or []
+        if requested:
+            # Once a claim supplies an exact locator, a generic record-level
+            # section or a previously selected passage is not a safe fallback:
+            # it may name a different chapter.  Keep only exact matches for
+            # presentation; the title remains available when none match.
+            record.pop("section_title", None)
+            record.pop("section", None)
+            pieces = [
+                piece
+                for collection in (
+                    record.get("selected_snippets") or [],
+                    record.get("snippets") or [],
+                    record.get("blocks") or [],
+                )
+                for piece in collection
+                if isinstance(piece, dict) and _piece_matches_locator(piece, requested)
+            ]
+            unique: list[dict[str, Any]] = []
+            if pieces:
+                # Preserve order while avoiding the same piece when a compact
+                # snippet and the full cached block are both available.
+                seen: set[tuple[str, str]] = set()
+                for piece in pieces:
+                    key = (
+                        str(piece.get("locator") or piece.get("block_id") or ""),
+                        str(piece.get("text") or ""),
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(piece)
+            record["selected_snippets"] = unique
+            record["snippets"] = []
+        rendered.append(record)
+    return rendered
+
+
+def _annotation_source_locators(annotation: dict[str, Any]) -> dict[str, list[str]]:
+    output: dict[str, list[str]] = {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            evidence_id = str(value.get("evidence_id") or "")
+            locator = str(value.get("locator") or "")
+            if evidence_id and locator:
+                output.setdefault(evidence_id, []).append(locator)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(annotation)
+    return {key: list(dict.fromkeys(values)) for key, values in output.items()}
+
+
+def _piece_matches_locator(piece: dict[str, Any], requested: list[str]) -> bool:
+    values = {
+        str(piece.get("locator") or ""),
+        str(piece.get("block_id") or ""),
+    }
+    return bool(values & set(requested))
+
+
 def _evidence_section_title(record: dict[str, Any]) -> str:
     for owner in (
-        record,
         *(record.get("selected_snippets") or []),
         *(record.get("snippets") or []),
+        record,
     ):
         if not isinstance(owner, dict):
             continue
@@ -347,3 +454,20 @@ def _string_ids(values: Any) -> list[str]:
     if not isinstance(values, (list, tuple, set)):
         return []
     return [str(value) for value in values if isinstance(value, str) and value]
+
+
+def _annotation_evidence_ids(annotation: dict[str, Any]) -> list[str]:
+    """Collect registered IDs from both modern and legacy annotation shapes."""
+    output: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            output.extend(_string_ids(value.get("evidence_ids")))
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(annotation)
+    return list(dict.fromkeys(output))

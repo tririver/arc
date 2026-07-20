@@ -212,8 +212,8 @@ def test_review_normalization_keeps_structured_evidence_and_meaningful_detail_bo
     )
     cleaned_translation = clean_reader_translation(translation)
 
-    assert cleaned_annotation["explanation"] == "解释正文。（《Reference Book》）"
-    assert cleaned_annotation["prior_work"][0]["text"] == "前人结论（《Prior Paper》）"
+    assert cleaned_annotation["explanation"] == "解释正文。（参考：《Reference Book》）"
+    assert cleaned_annotation["prior_work"][0]["text"] == "前人结论（参考：《Prior Paper》）"
     assert cleaned_annotation["evidence_ids"] == ["context-1", "prior-1"]
     assert cleaned_annotation["prior_work"][0]["evidence_ids"] == ["prior-1"]
     assert cleaned_translation["blocks"][0]["text"] == "译文正文。"
@@ -326,6 +326,137 @@ def test_reader_cleanup_replaces_bare_unwrapped_and_soft_wrapped_registered_ids(
     assert cleaned["evidence_ids"] == ["context-abc", "prior-001"]
 
 
+def test_reader_cleanup_uses_nested_bindings_and_exact_reader_location() -> None:
+    annotation = {
+        "commentary": (
+            "所给背景资料和所给 context 证据只支持这一点【context-\nabc】；"
+            "另见证据：prior-001。"
+        ),
+        "explanation": "",
+        "prior_work": [],
+        "later_work": [],
+        # Legacy annotations can lack the top-level union while retaining the
+        # claim-level audit binding and exact source locator.
+        "context_claims": [{
+            "text": "Audited claim.",
+            "evidence_ids": ["context-abc", "prior-001"],
+            "source_locators": [
+                {"evidence_id": "context-abc", "locator": "sec_0042"},
+                {"evidence_id": "prior-001", "locator": "chapter-3"},
+            ],
+        }],
+    }
+    records = [{
+        "evidence_id": "context-abc",
+        "title": "Reference Book",
+        "section_title": "Generic root section",
+        "selected_snippets": [{
+            "block_id": "sec_wrong",
+            "section_title": "Unrelated section",
+            "text": "Wrong passage.",
+        }],
+        "blocks": [{
+            "block_id": "sec_0042",
+            "section_title": "1.2 Why quantum field theory?",
+            "text": "Exact cited passage.",
+        }],
+    }, {
+        "evidence_id": "prior-001",
+        "title": "Prior Paper",
+        "blocks": [{
+            "block_id": "chapter-3",
+            "section_title": "Chapter 3: Scattering",
+            "text": "Exact cited passage.",
+        }],
+    }]
+
+    cleaned = clean_reader_annotation(
+        annotation, evidence_records=records, language="zh-CN"
+    )
+
+    assert "context-abc" not in cleaned["commentary"]
+    assert "prior-001" not in cleaned["commentary"]
+    assert "context 证据" not in cleaned["commentary"]
+    assert "所给背景资料" not in cleaned["commentary"]
+    assert "所引参考资料" in cleaned["commentary"]
+    assert "《Reference Book》，1.2 Why quantum field theory?" in cleaned["commentary"]
+    assert "《Prior Paper》，Chapter 3: Scattering" in cleaned["commentary"]
+    assert "Unrelated section" not in cleaned["commentary"]
+    assert "Generic root section" not in cleaned["commentary"]
+    assert cleaned["context_claims"] == annotation["context_claims"]
+
+
+def test_reader_cleanup_uses_segment_records_when_legacy_annotation_lost_ids() -> None:
+    annotation = {
+        "commentary": "Legacy prose cites context-\nabc without a retained ID union.",
+        "explanation": "",
+        "prior_work": [],
+        "later_work": [],
+    }
+
+    cleaned = clean_reader_annotation(
+        annotation,
+        evidence_records=[{
+            "evidence_id": "context-abc",
+            "title": "Reference Book",
+            "selected_snippets": [{
+                "block_id": "sec_0042",
+                "section_title": "Section 4.2",
+                "text": "Cited passage.",
+            }],
+        }],
+        language="en",
+    )
+
+    assert cleaned["commentary"] == (
+        "Legacy prose cites (Source: Reference Book, Section 4.2) "
+        "without a retained ID union."
+    )
+
+
+def test_unmatched_exact_locator_falls_back_to_title_not_wrong_section() -> None:
+    annotation = {
+        "commentary": "说明【context-abc】。",
+        "explanation": "",
+        "prior_work": [],
+        "later_work": [],
+        "context_claims": [{
+            "evidence_ids": ["context-abc"],
+            "source_locators": [{
+                "evidence_id": "context-abc",
+                "locator": "missing-exact-block",
+            }],
+        }],
+    }
+    record = {
+        "evidence_id": "context-abc",
+        "title": "Reference Book",
+        "section_title": "Wrong generic root section",
+        "selected_snippets": [{
+            "block_id": "old-selection",
+            "section_title": "Wrong old selected section",
+            "text": "Old passage.",
+        }],
+        "snippets": [{
+            "block_id": "old-snippet",
+            "section_title": "Wrong old snippet section",
+            "text": "Old passage.",
+        }],
+        "blocks": [{
+            "block_id": "available-block",
+            "section_title": "Wrong available section",
+            "text": "A different passage.",
+        }],
+    }
+
+    cleaned = clean_reader_annotation(
+        annotation, evidence_records=[record], language="zh-CN"
+    )
+
+    assert cleaned["commentary"] == "说明（参考：《Reference Book》）。"
+    assert "Wrong" not in cleaned["commentary"]
+
+
 def test_actual_html_summary_keeps_reader_heading_unless_it_is_machine_only() -> None:
     rendered = _render_html_fragment(
         "<details><summary>Proof sketch</summary><p>Argument.</p></details>"
@@ -360,7 +491,7 @@ def test_legacy_evidence_snippet_recovers_only_an_explicit_heading_prefix() -> N
     )
 
     assert cleaned["commentary"] == (
-        "说明（《Modern Quantum Field Theory》，1.2 Why quantum field theory?）"
+        "说明（参考：《Modern Quantum Field Theory》，1.2 Why quantum field theory?）"
     )
 
 

@@ -132,7 +132,7 @@ def test_context_selection_is_relevant_bounded_and_kept_out_of_chronology() -> N
         evidence_records=[selected[0]],
         language="zh-CN",
     )
-    assert cleaned["commentary"] == "解释（《Title isbn:0》，Free field）"
+    assert cleaned["commentary"] == "解释（参考：《Title isbn:0》，Free field）"
 
     annotation = {
         "explanation": "Title isbn:0 clarifies the canonical relation.",
