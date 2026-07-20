@@ -252,11 +252,52 @@ def test_cleaned_html_wrappers_do_not_leave_bare_line_break_commands() -> None:
         "<p>Meaningful image description.<br/>&lt;/details&gt;</p>",
         rendered_links=[],
     )
+    interior_break = _render_html_fragment(
+        "<p>First reader-visible line.<br/>Second reader-visible line.</p>",
+        rendered_links=[],
+    )
 
     assert empty_wrapper.strip() == r"\phantomsection\label{wrapper}"
     assert described_image.strip() == "Meaningful image description."
     assert r"\\" not in empty_wrapper
     assert r"\\" not in described_image
+    assert "First reader-visible line.\\\\\nSecond reader-visible line." in interior_break
+
+
+@pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")
+def test_cleaned_empty_html_wrapper_compiles_outside_a_paragraph(tmp_path: Path) -> None:
+    rendered = _render_html_fragment(
+        '<p id="wrapper">&lt;details&gt;<br/>'
+        '&lt;summary&gt;natural_image&lt;/summary&gt;</p>',
+        rendered_links=[],
+    )
+    tex_path = tmp_path / "empty-reader-wrapper.tex"
+    tex_path.write_text(
+        "\\documentclass{article}\n"
+        "\\usepackage{hyperref}\n"
+        "\\begin{document}\n"
+        f"{rendered}\n"
+        "Visible prose.\n"
+        "\\end{document}\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            shutil.which("xelatex") or "xelatex",
+            "-halt-on-error",
+            "-interaction=nonstopmode",
+            f"-output-directory={tmp_path}",
+            str(tex_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    log = (tmp_path / "empty-reader-wrapper.log").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr + log
+    assert "There's no line here to end" not in log
 
 
 def test_reader_cleanup_replaces_bare_unwrapped_and_soft_wrapped_registered_ids() -> None:
