@@ -118,6 +118,8 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     assert "Explanation is optional" in generation
     assert "opening of a section or chapter" in generation
     assert "alternative presentation" in generation
+    assert "copied verbatim" in generation
+    assert "separate from source_locators" in generation
     assert "equivalent formulation as an inconsistency" in generation
     assert "intermediate mathematics" in generation
     assert "materially useful current understanding or development" in generation

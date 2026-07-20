@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "arc.companion.prompts.v11"
+PROMPT_VERSION = "arc.companion.prompts.v12"
 SCHEMA_VERSION = "arc.companion.schemas.v9"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v5"
 TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v4"
@@ -156,7 +156,14 @@ RELATED_WORK_CLAIM_SCHEMA: dict[str, Any] = {
                 "required": ["evidence_id", "locator"],
                 "properties": {
                     "evidence_id": {"type": "string", "minLength": 1},
-                    "locator": {"type": "string", "minLength": 1},
+                    "locator": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Exact machine locator copied verbatim from the supplied evidence "
+                            "snippet; never a title, section heading, page description, or paraphrase."
+                        ),
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -521,7 +528,11 @@ def annotation_prompt(
         "prior work, later work, chronology, or historical priority. Record its evidence_id only in the "
         "structured evidence_ids field when it materially supports such explanatory context. For every context "
         "evidence_id you record, cite that source's exact supplied title in explanation or commentary and add its "
-        "supplied section/location when available; do not print the identifier itself. "
+        "supplied section/location when available; do not print the identifier itself. This reader-facing "
+        "title/section citation is separate from source_locators: every source_locators.locator value must be "
+        "copied verbatim from that evidence record's supplied snippet locator (the snippet's locator or block_id, "
+        "or 'abstract' when no snippet exists). Never put a book title, section title, chapter label, page label, "
+        "or a rewritten locator in source_locators.locator. "
         "When EXPLICIT DOMAIN CONTEXT is present, use it as preferred navigation and a relevance signal, not as "
         "a closed corpus. A domain match never forbids or short-circuits ARC, INSPIRE, references/citers, or web "
         "research, and a more directly relevant paper outside the domain may be preferred. The reference and "

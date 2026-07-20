@@ -1081,6 +1081,7 @@ def _generate_annotations(
             evidence_records=segment_evidence["papers"],
             language=options.annotation_language,
         )
+        _repair_unique_supplied_source_locators(normalized, segment_evidence["papers"])
         if round_number > 1:
             _drop_unsupported_second_round_related_work(normalized, segment_evidence["papers"])
         _validate_annotation_evidence(normalized, segment_evidence["papers"])
@@ -1295,6 +1296,54 @@ def _normalize_related_work(
             "request_key": None if request_key is None else str(request_key),
         })
     return claims
+
+
+def _repair_unique_supplied_source_locators(
+    annotation: dict[str, Any], records: list[dict[str, Any]],
+) -> None:
+    """Correct an invented locator only when the registered choice is unique.
+
+    Models occasionally copy the reader-facing section title into the
+    structured provenance field. That value is not accepted as provenance.
+    If the cited evidence record contains exactly one supplied source piece,
+    the exact locator can instead be restored deterministically before strict
+    validation. Missing locators, unknown evidence IDs, and records with
+    multiple candidate locators remain errors.
+    """
+    allowed_by_id: dict[str, set[str]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        evidence_id = str(record.get("evidence_id") or "")
+        pieces = record.get("snippets")
+        if pieces is None:
+            pieces = record.get("blocks")
+        locators = {
+            str(piece.get("locator") or piece.get("block_id") or "").strip()
+            for piece in pieces or []
+            if isinstance(piece, dict)
+        }
+        locators.discard("")
+        if not locators and str(record.get("abstract") or "").strip():
+            locators.add("abstract")
+        if evidence_id:
+            allowed_by_id[evidence_id] = locators
+
+    for field in ("prior_work", "later_work", "context_claims"):
+        claims = annotation.get(field)
+        if not isinstance(claims, list):
+            continue
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            for binding in claim.get("source_locators") or []:
+                if not isinstance(binding, dict):
+                    continue
+                evidence_id = str(binding.get("evidence_id") or "")
+                supplied = allowed_by_id.get(evidence_id, set())
+                emitted = str(binding.get("locator") or "").strip()
+                if emitted and emitted not in supplied and len(supplied) == 1:
+                    binding["locator"] = next(iter(supplied))
 
 
 def _merge_evidence_records(

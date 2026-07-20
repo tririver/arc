@@ -28,6 +28,7 @@ from arc_companion.pipeline import (
     _validate_translation,
     _protected_names,
     _repair_reviewed_translation_checkpoint,
+    _repair_unique_supplied_source_locators,
     _segment_checkpoint_name,
     _state,
     build_companion,
@@ -4048,6 +4049,56 @@ def test_selected_candidate_can_be_bound_in_production_claim_schema() -> None:
     }
 
     jsonschema.validate(annotation, ANNOTATION_SCHEMA)
+
+
+def test_unique_supplied_locator_repairs_reader_facing_section_label() -> None:
+    record = {
+        "evidence_id": "context-one",
+        "snippets": [{"block_id": "sec_0042", "text": "Recorded passage."}],
+    }
+    annotation = {
+        "prior_work": [], "later_work": [],
+        "context_claims": [{
+            "text": "The reference gives another presentation.",
+            "evidence_ids": ["context-one"],
+            "source_locators": [{
+                "evidence_id": "context-one",
+                "locator": "Chapter 2: Reader-facing heading",
+            }],
+            "request_key": None,
+        }],
+    }
+
+    _repair_unique_supplied_source_locators(annotation, [record])
+
+    assert annotation["context_claims"][0]["source_locators"] == [{
+        "evidence_id": "context-one", "locator": "sec_0042",
+    }]
+
+
+def test_locator_repair_never_guesses_among_multiple_supplied_pieces() -> None:
+    record = {
+        "evidence_id": "context-many",
+        "snippets": [
+            {"block_id": "sec_0042", "text": "First passage."},
+            {"block_id": "sec_0043", "text": "Second passage."},
+        ],
+    }
+    annotation = {
+        "prior_work": [], "later_work": [],
+        "context_claims": [{
+            "text": "The reference gives another presentation.",
+            "evidence_ids": ["context-many"],
+            "source_locators": [{
+                "evidence_id": "context-many", "locator": "Chapter 2",
+            }],
+            "request_key": None,
+        }],
+    }
+
+    _repair_unique_supplied_source_locators(annotation, [record])
+
+    assert annotation["context_claims"][0]["source_locators"][0]["locator"] == "Chapter 2"
 
 
 def test_whole_paper_soft_reuse_can_leave_empty_but_exact_citation_is_exempt() -> None:
