@@ -88,9 +88,9 @@ RICH_HTML = """
 def test_rich_html_parse_stores_versioned_document_without_removing_legacy_fields():
     parsed = parse_source_input(html_text=RICH_HTML, source_id="rich-paper")
 
-    assert PARSER_VERSION == 18
+    assert PARSER_VERSION == 19
     assert LEGACY_PARSED_SOURCE_KEYS <= set(parsed)
-    assert parsed["parser_version"] == 18
+    assert parsed["parser_version"] == 19
 
     document = parsed["document"]
     assert document["schema_version"] == "arc.paper.document.v2"
@@ -566,6 +566,37 @@ def test_markdown_images_and_pipe_tables_are_loss_aware_rich_blocks(tmp_path):
     assert document["integrity"]["status"] == "complete"
 
 
+def test_markdown_machine_image_details_are_not_reader_prose(tmp_path):
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "diagram.png").write_bytes(b"diagram-bytes")
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\n"
+        "![](images/diagram.png)\n\n"
+        "<details>\n"
+        "<summary>natural_image</summary>\n\n"
+        "Generated image description.\n"
+        "</details> Reader conclusion.\n\n"
+        "<details><summary>Proof sketch</summary>Authored explanation.</details>\n",
+        encoding="utf-8",
+    )
+
+    document = parse_source_input(
+        markdown_path=markdown_path,
+        source_id="markdown-machine-details",
+        include_document=True,
+    )["document"]
+    visible_text = " ".join(str(block.get("text") or "") for block in document["blocks"])
+
+    assert len(document["figures"]) == 1
+    assert "Generated image description" not in visible_text
+    assert "natural_image" not in visible_text
+    assert "Reader conclusion" in visible_text
+    assert "Proof sketch" in visible_text
+    assert "Authored explanation" in visible_text
+
+
 def test_missing_markdown_image_is_retained_and_marks_integrity_partial(tmp_path):
     markdown_path = tmp_path / "notes.md"
     markdown_path.write_text("![Missing](images/not-there.png)\n", encoding="utf-8")
@@ -674,9 +705,9 @@ def test_recache_upgrades_v12_ar5iv_cache_without_refreshing_source(monkeypatch,
 
     assert result["ok"] is True
     assert provider.calls == [False]
-    assert result["data"]["parser_version"] == 18
+    assert result["data"]["parser_version"] == 19
     assert result["data"]["document"]["schema_version"] == DOCUMENT_SCHEMA_VERSION
-    assert read_json(path)["parser_version"] == 18
+    assert read_json(path)["parser_version"] == 19
 
 
 def test_refresh_and_recache_are_mutually_exclusive(monkeypatch, tmp_path):
@@ -705,7 +736,7 @@ def test_equation_annotations_are_bound_to_parser_version_and_equation_fingerpri
     marked = service.mark_parsed_equation("rich-paper", equation_id, reason="Verify the sign.")
 
     assert marked["ok"] is True
-    assert marked["data"]["parser_version"] == 18
+    assert marked["data"]["parser_version"] == 19
     assert marked["data"]["equation_fingerprint"]
     assert service.get_parsed_source_equation("rich-paper", equation_id)["data"]["annotations"] == [marked["data"]]
 

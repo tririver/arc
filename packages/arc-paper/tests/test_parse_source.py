@@ -486,7 +486,7 @@ def test_parse_markdown_records_sections_equations_and_line_anchors(tmp_path):
 
     parsed = parse_source_input(source_path=markdown_path, source_id="notes")
 
-    assert parsed["parser_version"] == 18
+    assert parsed["parser_version"] == 19
     assert parsed["toc"] == [
         {"id": "sec_0001", "title": "Notes", "level": 1},
         {"id": "sec_0002", "title": "Details", "level": 2},
@@ -743,6 +743,38 @@ def test_pdf_number_binding_rejects_numbered_formula_above_unnumbered_formula(mo
 
     assert equation["pdf_page"] == 1
     assert "printed_equation_number" not in equation
+
+
+def test_pdf_number_binding_reserves_source_tag_for_following_formula(monkeypatch, tmp_path):
+    markdown_path = tmp_path / "notes.md"
+    markdown_path.write_text(
+        "# Notes\n"
+        "The constants have dimensions.\n"
+        "$$ [c] = LT^{-1} $$\n"
+        "Natural units are defined by.\n"
+        "$$ c = 1 \\tag{0.1} $$\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF test")
+    monkeypatch.setattr(
+        source,
+        "extract_pdf_pages",
+        lambda path: [
+            "The constants have dimensions.\n"
+            "[c] = LT^-1\n"
+            "Natural units are defined by.\n"
+            "c = 1 (0.1)"
+        ],
+    )
+
+    equations = parse_source_input(
+        markdown_path=markdown_path, pdf_path=pdf_path, source_id="notes"
+    )["equations"]
+
+    assert equations[0]["pdf_page"] == 1
+    assert "printed_equation_number" not in equations[0]
+    assert equations[1]["printed_equation_number"] == "0.1"
 
 
 def test_pdf_text_extraction_preserves_internal_blank_pages(monkeypatch, tmp_path):

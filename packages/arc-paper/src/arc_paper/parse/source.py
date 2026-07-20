@@ -11,7 +11,7 @@ from .ar5iv_html import parse_html
 from .markdown_document import build_markdown_document
 
 
-PARSER_VERSION = 18
+PARSER_VERSION = 19
 PDF_PAGE_MATCH_MIN_SCORE = 8
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
@@ -890,6 +890,15 @@ def _enrich_equations_from_pdf(equations: list[dict[str, Any]], pages: list[str]
         equation["pdf_page"] = best_page
         previous_page = best_page
 
+    reserved_numbers_by_page: dict[int, set[str]] = {}
+    for equation in equations:
+        page_number = equation.get("pdf_page")
+        if not isinstance(page_number, int):
+            continue
+        source_numbers = _source_equation_numbers(str(equation.get("raw_tex") or ""))
+        if source_numbers:
+            reserved_numbers_by_page.setdefault(page_number, set()).update(source_numbers)
+
     for equation in equations:
         page_number = equation.get("pdf_page")
         raw_tex = str(equation.get("raw_tex") or "")
@@ -900,6 +909,11 @@ def _enrich_equations_from_pdf(equations: list[dict[str, Any]], pages: list[str]
         ):
             continue
         number, numbers = _best_equation_number_match(pages[page_number - 1], equation)
+        # A source tag is authoritative for the equation that owns it.  Do not
+        # infer the same printed number for a nearby unnumbered display on the
+        # same PDF page merely because its context window reaches that tag.
+        if number in reserved_numbers_by_page.get(page_number, set()):
+            continue
         if number:
             equation["printed_equation_number"] = number
             equation["printed_equation_numbers"] = numbers or [number]

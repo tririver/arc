@@ -20,6 +20,10 @@ _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 _PIPE_TABLE_SEPARATOR_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
 )
+_MACHINE_DETAIL_LABEL_RE = re.compile(
+    r"^(?:natural[\s_-]*image|ocr(?:[\s_-]*(?:metadata|text))?|image[\s_-]*metadata)$",
+    flags=re.IGNORECASE,
+)
 
 
 def build_markdown_document(
@@ -74,6 +78,7 @@ def _markdown_semantic_html(
     sections: list[dict[str, Any]],
     equations: list[dict[str, Any]],
 ) -> str:
+    lines = list(lines)
     equation_by_start = {
         int(item["markdown_line_start"]): item
         for item in equations
@@ -93,6 +98,15 @@ def _markdown_semantic_html(
 
     index = 0
     while index < len(lines):
+        machine_detail = _machine_detail_end(lines, index)
+        if machine_detail is not None:
+            machine_detail_end, trailing_text = machine_detail
+            if trailing_text:
+                lines[machine_detail_end] = trailing_text
+                index = machine_detail_end
+            else:
+                index = machine_detail_end + 1
+            continue
         line_number = index + 1
         equation = equation_by_start.get(line_number)
         if equation is not None:
@@ -224,6 +238,37 @@ def _markdown_semantic_html(
         parts.append("</section>")
     parts.append("</article>")
     return "\n".join(parts)
+
+
+def _machine_detail_end(lines: list[str], start: int) -> tuple[int, str] | None:
+    """Return the closing line for a machine-only Markdown detail block.
+
+    OCR exports often place generated image descriptions in raw ``details``
+    containers.  They are provenance metadata for the adjacent image, not
+    authored prose, so omit the whole container from the semantic document.
+    Ordinary reader-authored detail blocks remain untouched.
+    """
+    if re.match(r"^\s*<details\b", lines[start], flags=re.IGNORECASE) is None:
+        return None
+    end = start
+    while end < len(lines) and "</details>" not in lines[end].casefold():
+        end += 1
+    if end >= len(lines):
+        return None
+    raw = "\n".join(lines[start : end + 1])
+    summary = re.search(
+        r"<summary\b[^>]*>(?P<label>.*?)</summary\s*>",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if summary is None:
+        return None
+    label = " ".join(html.unescape(summary.group("label")).split())
+    if _MACHINE_DETAIL_LABEL_RE.fullmatch(label) is None:
+        return None
+    closing = re.search(r"</details\s*>", lines[end], flags=re.IGNORECASE)
+    trailing_text = lines[end][closing.end() :] if closing is not None else ""
+    return end, trailing_text.strip()
 
 
 def _section_open(section: dict[str, Any], *, source_path: Path) -> str:
