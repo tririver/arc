@@ -42,7 +42,7 @@ def test_model_tier_resolves_provider_specific_model_when_no_exact_model_is_set(
 
 def test_codex_model_tiers_resolve_requested_reasoning_effort():
     assert reasoning_effort_for_model_tier("codex-cli", "low") == "medium"
-    assert reasoning_effort_for_model_tier("codex-cli", "medium") == "xhigh"
+    assert reasoning_effort_for_model_tier("codex-cli", "medium") == "high"
     assert reasoning_effort_for_model_tier("codex-cli", "high") == "high"
     assert reasoning_effort_for_model_tier("codex-cli", "max") == "max"
 

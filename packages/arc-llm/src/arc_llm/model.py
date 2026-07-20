@@ -21,7 +21,7 @@ PROVIDER_MODEL_TIERS = {
 PROVIDER_REASONING_EFFORT_TIERS = {
     "codex-cli": {
         "low": "medium",
-        "medium": "xhigh",
+        "medium": "high",
         "high": "high",
         "max": "max",
     },
