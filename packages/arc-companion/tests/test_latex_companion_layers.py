@@ -3,6 +3,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import re
+import shutil
+import subprocess
+
+import pytest
 
 from arc_companion.latex import (
     _layer_region,
@@ -652,6 +656,7 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     assert r"\delta" in rendered
     assert r"\mathcal{O}" in rendered
     assert r"\mathbf{k}" in rendered
+    assert escape_tex("ℏ") == r"\(\hbar\)"
     assert r"\textsubscript{2}" in rendered
     assert r"\textsuperscript{\(\prime\)}" in rendered
 
@@ -667,3 +672,33 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     equation = _render_equation({"tex": r"x=y", "number": "(A.12)", "label": "eq:a12"})
     assert r"\tag{A.12}" in equation
     assert r"\label{eq:a12}" in equation
+
+
+@pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")
+def test_planck_constant_unicode_glyph_compiles_as_a_math_atom(tmp_path: Path) -> None:
+    rendered = escape_tex("Planck constant ℏ")
+    assert rendered == r"Planck constant \(\hbar\)"
+
+    tex_path = tmp_path / "planck-constant.tex"
+    tex_path.write_text(
+        "\\documentclass{article}\n"
+        "\\begin{document}\n"
+        f"{rendered}\n"
+        "\\end{document}\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            shutil.which("xelatex") or "xelatex",
+            "-halt-on-error",
+            "-interaction=nonstopmode",
+            f"-output-directory={tmp_path}",
+            str(tex_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    log = (tmp_path / "planck-constant.log").read_text(encoding="utf-8", errors="replace")
+    assert result.returncode == 0, result.stdout + result.stderr + log
+    assert "Missing character" not in log

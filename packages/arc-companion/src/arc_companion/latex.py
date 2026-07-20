@@ -85,7 +85,7 @@ _UNICODE_MATH_SYMBOLS = {
     "∼": r"\sim", "≪": r"\ll", "≫": r"\gg",
     "≲": r"\lesssim", "∝": r"\propto", "≡": r"\equiv", "≈": r"\approx", "∑": r"\sum",
     "⟨": r"\langle", "⟩": r"\rangle", "∙": r"\mathbin{\cdot}", "Ḣ": r"\dot{H}",
-    "ℒ": r"\mathcal{L}", "ℋ": r"\mathcal{H}",
+    "ℒ": r"\mathcal{L}", "ℋ": r"\mathcal{H}", "ℏ": r"\hbar",
 }
 
 _UNICODE_MATH_MODIFIERS = {
