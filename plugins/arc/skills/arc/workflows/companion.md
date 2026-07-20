@@ -141,13 +141,13 @@ registry and the unit's `segment-evidence/<segment>.json`; models may bind
 claims only to controller-registered evidence IDs in structured output, never
 to a URL or descriptor invented in their output.
 
-Require each new primary low-tier translation call to check exact block
+Require each new primary medium-tier translation call to check exact block
 coverage/order, byte-exact opaque-token coverage/order, cross-block token
 isolation, and protected-name spelling before returning. Keep existing valid
 checkpoints because they already passed the unchanged deterministic validator;
 do not invalidate all content merely to add this instruction checklist.
 
-When a low-tier translation changes, drops, or reorders an opaque formula,
+When a medium-tier translation changes, drops, or reorders an opaque formula,
 citation, or link token, collect every mismatched block in the segment into one
 medium-tier repair call, using the same provider selection but no MCP or internet
 access. Preserve all valid blocks. Do not
@@ -187,7 +187,7 @@ MCP and web access are optional capabilities, not workflow prerequisites. If
 the host cannot provide them, continue with the current segment, frozen
 glossary, full-paper navigation context, and prepared evidence embedded in the
 portable prompt. Preserve any capability diagnostic and do not infer
-unsupported related-work claims. Then perform a high-tier whole-document review
+unsupported related-work claims. Then perform a medium-tier whole-document review
 of both tracks and render with the deterministic LaTeX pipeline. Never
 reconstruct missing source text, equation numbers, tables, figures, or
 bibliography with an LLM.

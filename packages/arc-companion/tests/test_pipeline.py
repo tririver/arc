@@ -2653,7 +2653,7 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
                 slots[0]["start_offset"] = 1
             return {"repairs": [{"block_id": block_id_value, "slots": slots}]}
         else:
-            assert kwargs["model_tier"] == pipeline_module.TRANSLATION_TIER == "low"
+            assert kwargs["model_tier"] == pipeline_module.TRANSLATION_TIER == "medium"
             assert "perform this exact checklist" in prompt
             assert "every protected personal name" in prompt
         text = (
@@ -3055,8 +3055,8 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert all(tier == "medium" for label, tier in tiers.items() if "segmentation" in label)
     assert all(tier == "medium" for label, tier in tiers.items() if "glossary" in label)
     assert all(tier == "high" for label, tier in tiers.items() if "annotation" in label)
-    assert all(tier == "high" for label, tier in tiers.items() if "review" in label)
-    assert all(tier == "low" for label, tier in tiers.items() if "translation" in label)
+    assert all(tier == "medium" for label, tier in tiers.items() if "review" in label)
+    assert all(tier == "medium" for label, tier in tiers.items() if "translation" in label)
     assert all(call["session_policy"] == "stateless" for call in fake.calls)
     externally_enabled = [
         call for call in fake.calls
@@ -3778,11 +3778,11 @@ def test_fingerprint_invalidates_when_review_tier_changes(tmp_path: Path, monkey
     bundle = _bundle(tmp_path)
     options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run")
     evidence = _evidence(bundle)
-    high = _fingerprint(bundle, options, evidence=evidence)
+    baseline = _fingerprint(bundle, options, evidence=evidence)
 
-    monkeypatch.setattr(pipeline_module, "REVIEW_TIER", "medium")
+    monkeypatch.setattr(pipeline_module, "REVIEW_TIER", "high")
 
-    assert _fingerprint(bundle, options, evidence=evidence) != high
+    assert _fingerprint(bundle, options, evidence=evidence) != baseline
 
 
 def test_fingerprint_invalidates_when_workers_per_lane_changes(tmp_path: Path) -> None:

@@ -77,7 +77,7 @@ DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
 LANGUAGE_NOTICE = "默认使用中文生成伴读；如需切换伴读语言，请直接指定目标语言。"
 SEGMENTATION_TIER = "medium"
 GLOSSARY_TIER = "medium"
-TRANSLATION_TIER = "low"
+TRANSLATION_TIER = "medium"
 TRANSLATION_RETRY_TIER = "medium"
 TRANSLATION_COVERAGE_REPAIR_TIER = "medium"
 TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION = (
@@ -88,7 +88,7 @@ TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION = (
 )
 TRANSLATION_TOKEN_REPAIR_VERSION = "arc.companion.translation-token-repair.v3"
 ANNOTATION_TIER = "high"
-REVIEW_TIER = "high"
+REVIEW_TIER = "medium"
 REVIEW_VERSION = "arc.companion.review.v3"
 ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v5"
 SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
@@ -2195,7 +2195,7 @@ def _generate_translations(
         ):
             raise RuntimeError(
                 f"v4 translation upgrade for {segment_id} requires its stored primary draft; "
-                "refusing to rerun the low translation model"
+                "refusing to rerun the medium translation model"
             )
         if segment_id in protected_name_upgrade_ids and (
             translation is None
@@ -2203,7 +2203,7 @@ def _generate_translations(
         ):
             raise RuntimeError(
                 f"protected-name translation upgrade for {segment_id} requires its stored "
-                "primary draft; refusing to rerun the low translation model"
+                "primary draft; refusing to rerun the medium translation model"
             )
         if translatable:
             if translation is None:

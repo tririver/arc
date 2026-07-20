@@ -64,21 +64,21 @@ Default model routing is:
 
 - medium for segmentation and local boundary refinement;
 - medium for the comprehensive terminology glossary;
-- low for per-unit translation;
+- medium for per-unit translation;
 - medium for the single failure-only opaque-token translation correction;
 - high for per-unit companion commentary; and
-- high for section and whole-document review.
+- medium for section and whole-document review.
 
 Segmentation and glossary construction begin concurrently. After both pass
 validation, translation and commentary run as two independent stateless waves.
 Each wave is bounded by `workers`, so the default peak is 24 translation calls
 plus 24 commentary calls. Both calls receive the frozen full-paper glossary and
-the same current source unit. Long documents use high-tier section reviews
-followed by a high-tier consolidation review, with complete unit coverage and a
+the same current source unit. Long documents use medium-tier section reviews
+followed by a medium-tier consolidation review, with complete unit coverage and a
 bounded source anchor for every unit in the consolidation payload. Review
 patches may change translations and commentaries only.
 
-Every new primary low-tier translation prompt ends with an explicit controller
+Every new primary medium-tier translation prompt ends with an explicit controller
 checklist for exact block coverage/order, byte-exact opaque-token coverage/order,
 cross-block token isolation, and protected-name spelling. This reinforces the
 existing deterministic validator without changing its contract. Previously
@@ -88,7 +88,7 @@ reusable; the instruction-only checklist does not force wholesale regeneration.
 If a generated translation changes, drops, or reorders opaque inline formula,
 citation, or link tokens, the controller collects all mismatched blocks in that
 segment into one shared medium-tier placement correction; ordinary translation
-remains low-tier and every valid block stays unchanged.
+remains medium-tier and every valid block stays unchanged.
 The correction runs offline and receives the prior invalid block text, its
 natural-language residue after opaque markers are removed, source-run context,
 and exactly `N+1` stable slots for `N` source-owned tokens. It may only partition
