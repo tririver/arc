@@ -5,9 +5,11 @@ from pathlib import Path
 import re
 
 from arc_companion.latex import (
+    _layer_region,
     _png_needs_latex_flattening,
     _render_annotation,
     _render_equation,
+    _render_glossary,
     _render_html_fragment,
     escape_tex,
     render_companion_tex,
@@ -171,6 +173,12 @@ def test_reader_layers_remove_html_wrappers_and_internal_evidence_labels(tmp_pat
     assert "Earlier Work" in tex
     assert "伴读单元" not in tex
     assert r"\textbf{原文}" not in tex
+    assert "seg-internal" not in _layer_region(tex, "TRANSLATION", "seg-internal")
+    assert "seg-internal" not in _layer_region(tex, "COMPANION", "seg-internal")
+    assert "% ARC-TRANSLATION-BEGIN " in tex
+    assert "% ARC-COMPANION-BEGIN " in tex
+    assert manifest["companion_layers"]["rendered_translation_segment_ids"] == ["seg-internal"]
+    assert manifest["companion_layers"]["rendered_annotation_segment_ids"] == ["seg-internal"]
     assert manifest["blocks"][0]["sha256"]
     assert document["blocks"][0]["text"] == source
     assert annotations["seg-internal"]["evidence_ids"] == [
@@ -646,6 +654,15 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     assert r"\mathbf{k}" in rendered
     assert r"\textsubscript{2}" in rendered
     assert r"\textsuperscript{\(\prime\)}" in rendered
+
+    glossary_math = _render_glossary({"entries": [{
+        "source_term": "Dirac adjoint",
+        "target_term": "狄拉克共轭",
+        "brief_explanation": "ψ†γ⁰; φ⁴ theory",
+    }]}, language="zh-CN")
+    assert r"\(\psi\dagger\gamma{}^{0}\)" in glossary_math
+    assert r"\(\phi{}^{4}\)" in glossary_math
+    assert not any(glyph in glossary_math for glyph in "ψ†γ⁰φ⁴")
 
     equation = _render_equation({"tex": r"x=y", "number": "(A.12)", "label": "eq:a12"})
     assert r"\tag{A.12}" in equation

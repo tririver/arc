@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from .io import sha256_file, sha256_json
 from .reader_text import clean_reader_annotation, clean_reader_text, is_machine_summary_label
 from .source import asset_path, block_id
+from .substantive import non_substantive_block_ids
 
 
 class LatexError(RuntimeError):
@@ -65,15 +66,33 @@ def escape_tex(value: Any) -> str:
     return "".join(rendered)
 
 
-_UNICODE_SUBSCRIPTS = {"₀": "0", "₁": "1", "₂": "2", "₃": "3"}
+_UNICODE_SUBSCRIPTS = {
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+}
 
 _UNICODE_MATH_SYMBOLS = {
-    "δ": r"\delta", "ν": r"\nu", "θ": r"\theta", "σ": r"\sigma", "ζ": r"\zeta",
-    "τ": r"\tau", "α": r"\alpha", "ε": r"\epsilon", "ϵ": r"\epsilon", "β": r"\beta",
-    "φ": r"\phi", "π": r"\pi", "η": r"\eta", "∼": r"\sim", "≪": r"\ll", "≫": r"\gg",
+    "α": r"\alpha", "β": r"\beta", "γ": r"\gamma", "δ": r"\delta",
+    "ε": r"\epsilon", "ϵ": r"\epsilon", "ζ": r"\zeta", "η": r"\eta",
+    "θ": r"\theta", "ϑ": r"\vartheta", "ι": r"\iota", "κ": r"\kappa",
+    "λ": r"\lambda", "μ": r"\mu", "ν": r"\nu", "ξ": r"\xi",
+    "ο": r"o", "π": r"\pi", "ρ": r"\rho", "ϱ": r"\varrho",
+    "σ": r"\sigma", "ς": r"\varsigma", "τ": r"\tau", "υ": r"\upsilon",
+    "φ": r"\phi", "ϕ": r"\varphi", "χ": r"\chi", "ψ": r"\psi", "ω": r"\omega",
+    "Γ": r"\Gamma", "Δ": r"\Delta", "Θ": r"\Theta", "Λ": r"\Lambda",
+    "Ξ": r"\Xi", "Π": r"\Pi", "Σ": r"\Sigma", "Υ": r"\Upsilon",
+    "Φ": r"\Phi", "Ψ": r"\Psi", "Ω": r"\Omega",
+    "∼": r"\sim", "≪": r"\ll", "≫": r"\gg",
     "≲": r"\lesssim", "∝": r"\propto", "≡": r"\equiv", "≈": r"\approx", "∑": r"\sum",
     "⟨": r"\langle", "⟩": r"\rangle", "∙": r"\mathbin{\cdot}", "Ḣ": r"\dot{H}",
     "ℒ": r"\mathcal{L}", "ℋ": r"\mathcal{H}",
+}
+
+_UNICODE_MATH_MODIFIERS = {
+    "⁰": "{}^{0}", "¹": "{}^{1}", "²": "{}^{2}", "³": "{}^{3}", "⁴": "{}^{4}",
+    "⁵": "{}^{5}", "⁶": "{}^{6}", "⁷": "{}^{7}", "⁸": "{}^{8}", "⁹": "{}^{9}",
+    "⁺": "{}^{+}", "⁻": "{}^{-}", "⁼": "{}^{=}", "⁽": "{}^{(}", "⁾": "{}^{)}",
+    "†": r"\dagger", "‡": r"\ddagger",
 }
 
 _GREEK_NAME_TO_TEX = {
@@ -84,6 +103,9 @@ _GREEK_NAME_TO_TEX = {
 
 
 def _unicode_math_atom(char: str) -> str | None:
+    modifier = _UNICODE_MATH_MODIFIERS.get(char)
+    if modifier is not None:
+        return modifier
     direct = _UNICODE_MATH_SYMBOLS.get(char)
     if direct is not None:
         return direct
@@ -153,7 +175,7 @@ def render_companion_tex(
         if block_id(block) not in bibliography_blocks and front_roles.get(block_id(block)) not in {"title", "author"}
     }
     excluded_augmentation_ids = (
-        _non_substantive_augmentation_block_ids(document)
+        non_substantive_block_ids(document)
         if augmentation_scope == "substantive"
         else set()
     )
@@ -869,8 +891,7 @@ def _render_annotation(
     return (
         _layer_marker("COMPANION", "BEGIN", segment_id)
         +
-        f"\\begin{{arccompanion}}\n\\noindent\\textbf{{{escape_tex(labels['companion'])}}} "
-        f"\\texttt{{[{escape_tex(segment_id)}]}}\\par\n"
+        f"\\begin{{arccompanion}}\n\\noindent\\textbf{{{escape_tex(labels['companion'])}}}\\par\n"
         + "\n".join(sections)
         + "\n\\end{arccompanion}\n"
         + _layer_marker("COMPANION", "END", segment_id)
@@ -895,8 +916,7 @@ def _render_translation(
     }
     source_blocks = {block_id(item): item for item in document.get("blocks") or []}
     parts = [_layer_marker("TRANSLATION", "BEGIN", segment_id),
-             f"\\begin{{arctranslation}}\n\\noindent\\textbf{{{escape_tex(labels['translation'])}}} "
-             f"\\texttt{{[{escape_tex(segment_id)}]}}\\par\n"]
+             f"\\begin{{arctranslation}}\n\\noindent\\textbf{{{escape_tex(labels['translation'])}}}\\par\n"]
     translated_block_ids: list[str] = []
     equation_block_ids: list[str] = []
     excluded_float_block_ids: list[str] = []
@@ -1585,169 +1605,6 @@ def _front_matter_block_roles(
                 used.add(key)
                 break
     return roles
-
-
-def _non_substantive_augmentation_block_ids(document: dict[str, Any]) -> set[str]:
-    """Identify source blocks that should not receive translation/commentary.
-
-    This is deliberately a render-only classification.  It never changes the
-    document, segmentation, prompts, or checkpoint hashes.  Explicit ARC
-    structure wins; conservative shape-based inference only fills gaps in
-    Markdown-derived books whose contents entries do not carry per-block roles.
-    """
-    blocks = list(document.get("blocks") or [])
-    if not blocks:
-        return set()
-    positions = {block_id(block): index for index, block in enumerate(blocks)}
-    excluded: set[str] = set()
-
-    excluded_roles = {
-        "acknowledgement", "acknowledgements", "acknowledgment", "acknowledgments",
-        "bibliography", "copyright", "front_matter_affiliations",
-        "front_matter_authors", "front_matter_title", "publication",
-        "publication_details", "references", "table_of_contents", "toc",
-    }
-    for block in blocks:
-        role = str(block.get("source_role") or "").casefold()
-        if role in excluded_roles:
-            excluded.add(block_id(block))
-
-    front = document.get("front_matter") or {}
-    structured_ids = front.get("block_ids") or {}
-    if isinstance(structured_ids, dict):
-        excluded_front_keys = {
-            "affiliation", "affiliations", "author", "authors", "copyright",
-            "institution", "institutions", "publication", "publisher", "title",
-        }
-        for key, values in structured_ids.items():
-            if str(key).casefold() not in excluded_front_keys:
-                continue
-            if not isinstance(values, list):
-                values = [values]
-            excluded.update(str(value) for value in values if str(value) in positions)
-
-    front_roles = _front_matter_block_roles(blocks, front)
-    excluded.update(
-        bid for bid, role in front_roles.items()
-        if role in {"title", "author", "affiliation"}
-    )
-
-    toc_indices = [
-        index for index, block in enumerate(blocks)
-        if str(block.get("source_role") or "").casefold() in {"table_of_contents", "toc"}
-    ]
-    if toc_indices:
-        toc_start = min(toc_indices)
-        inferred_body_start = _body_start_after_contents(blocks, toc_indices)
-        if inferred_body_start is not None:
-            excluded.update(block_id(block) for block in blocks[toc_start:inferred_body_start])
-        else:
-            excluded.update(block_id(blocks[index]) for index in toc_indices)
-
-        # Before the contents, suppress metadata-like and list-oriented route
-        # sections while retaining prose chapters such as a preface or foreword.
-        for group in _section_groups(blocks[:toc_start]):
-            if any(front_roles.get(block_id(block)) == "abstract" for block in group):
-                continue
-            if _is_non_substantive_leading_group(group):
-                excluded.update(block_id(block) for block in group)
-
-    return excluded
-
-
-def _body_start_after_contents(
-    blocks: list[dict[str, Any]], toc_indices: list[int]
-) -> int | None:
-    """Return the first actual section represented by a contents entry."""
-    positions: dict[str, int] = {}
-    for index, block in enumerate(blocks):
-        for key in ("block_id", "source_id", "section_id", "id"):
-            value = block.get(key)
-            if value:
-                positions.setdefault(str(value), index)
-
-    linked_targets: list[int] = []
-    for index in toc_indices:
-        soup = BeautifulSoup(str(blocks[index].get("html") or ""), "html.parser")
-        for anchor in soup.find_all("a"):
-            href = str(anchor.get("href") or "")
-            if href.startswith("#") and href[1:] in positions:
-                target = positions[href[1:]]
-                if target > index:
-                    linked_targets.append(target)
-    if linked_targets:
-        return min(linked_targets)
-
-    last_toc = max(toc_indices)
-    headings = [
-        (index, _heading_signature(block))
-        for index, block in enumerate(blocks[last_toc + 1:], start=last_toc + 1)
-        if _is_heading(block) and _heading_signature(block)
-    ]
-    # Markdown OCR commonly loses TOC roles on the entry lines.  The first
-    # heading that reappears later marks the real chapter (including Preface).
-    for offset, (_, signature) in enumerate(headings):
-        for later_index, later_signature in headings[offset + 1:]:
-            if signature == later_signature:
-                return later_index
-    return None
-
-
-def _heading_signature(block: dict[str, Any]) -> str:
-    text = unicodedata.normalize(
-        "NFKC", str(block.get("title") or block.get("text") or "")
-    ).casefold()
-    text = re.sub(r"\.{2,}\s*\d+\s*$", "", text)
-    text = re.sub(r"\s+\d+\s*$", "", text)
-    return " ".join(re.findall(r"\w+", text, flags=re.UNICODE))
-
-
-def _is_heading(block: dict[str, Any]) -> bool:
-    return bool(
-        _kind(block) in {"heading", "section", "subsection", "subsubsection"}
-        or block.get("heading_level")
-        or isinstance(block.get("heading"), dict)
-    )
-
-
-def _section_groups(blocks: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    groups: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_section = object()
-    for block in blocks:
-        section = block.get("section_id")
-        if current and section != current_section:
-            groups.append(current)
-            current = []
-        current.append(block)
-        current_section = section
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _is_non_substantive_leading_group(group: list[dict[str, Any]]) -> bool:
-    if not group:
-        return False
-    # Equations and floats are strong evidence that this is substantive source.
-    if any(_kind(block) in {"equation", "math", "display_math", "figure", "image", "table"} for block in group):
-        return False
-    prose = [block for block in group if not _is_heading(block)]
-    list_like = [
-        block for block in prose
-        if block.get("list_kind")
-        or _kind(block) in {"list", "ordered_list", "unordered_list"}
-        or re.match(r"^\s*(?:[-*+•]|\d+[.)])\s+", str(block.get("text") or ""))
-    ]
-    if len(list_like) >= 2:
-        return True
-    prose_lengths = [
-        len(" ".join(str(block.get("text") or "").split())) for block in prose
-    ]
-    prose_chars = sum(prose_lengths)
-    # Retain prose-rich prefatory chapters without relying on language-specific
-    # labels such as "Preface" or "Foreword".
-    return prose_chars < 180 or max(prose_lengths, default=0) < 100
 
 
 def _anchors(item: dict[str, Any]) -> str:

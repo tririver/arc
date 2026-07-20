@@ -3308,6 +3308,105 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
         assert state[key]
 
 
+def test_first_wave_uses_first_substantive_unit_and_preserves_leading_source(tmp_path: Path) -> None:
+    substantive_preface = (
+        "This preface explains the motivation and intended conceptual route in "
+        "enough detail to be part of the book's substantive argument. "
+    ) * 2
+    blocks = [
+        {
+            "block_id": "title", "kind": "heading", "section_id": "title",
+            "source_role": "front_matter_title", "text": "A General Book",
+        },
+        {
+            "block_id": "authors", "kind": "prose", "section_id": "authors",
+            "source_role": "front_matter_authors", "text": "A. Author",
+        },
+        {"block_id": "routes", "kind": "heading", "section_id": "routes", "text": "Reading routes"},
+        {"block_id": "route-1", "kind": "prose", "section_id": "routes", "text": "• First resource"},
+        {"block_id": "route-2", "kind": "prose", "section_id": "routes", "text": "• Second resource"},
+        {
+            "block_id": "toc", "kind": "heading", "section_id": "toc",
+            "source_role": "table_of_contents", "text": "Contents",
+        },
+        {"block_id": "toc-preface", "kind": "heading", "section_id": "toc-p", "text": "Preface 3"},
+        {"block_id": "toc-body", "kind": "heading", "section_id": "toc-b", "text": "1 Beginning 5"},
+        {"block_id": "preface", "kind": "heading", "section_id": "preface", "text": "Preface"},
+        {"block_id": "preface-text", "kind": "prose", "section_id": "preface", "text": substantive_preface},
+        {"block_id": "body", "kind": "heading", "section_id": "body", "text": "1 Beginning"},
+        {"block_id": "body-text", "kind": "prose", "section_id": "body", "text": "Physical body text."},
+    ]
+    document = {
+        "schema_version": "arc.paper.document.v2",
+        "front_matter": {
+            "title": "A General Book", "authors": ["A. Author"],
+            "block_ids": {"title": ["title"], "authors": ["authors"]},
+        },
+        "blocks": blocks, "equations": [], "figures": [], "tables": [],
+        "assets": [], "bibliography": [], "links": [],
+        "integrity": {"status": "complete", "document_hash": "substantive-fixture"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:substantive-fixture",
+        parsed={"paper_id": "local:substantive-fixture", "document": document},
+        document=document,
+        metadata={"title": "A General Book", "authors": ["A. Author"]},
+        references=[], citers=[],
+    )
+    calls: list[tuple[str, str]] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append((label, prompt))
+        if label.startswith("companion-segmentation-w-"):
+            return {"cut_after_ordinals": []}
+        if label.startswith("companion-glossary-"):
+            return {"entries": []}
+        if label == "companion-translation-seg-0001":
+            return {"blocks": [
+                {"block_id": "preface", "text": "序言"},
+                {"block_id": "preface-text", "text": "有实质内容的序言译文。"},
+            ]}
+        if label == "companion-annotation-seg-0001":
+            return {
+                "explanation": "序言说明全书动机。", "prior_work": [], "later_work": [],
+                "commentary": "序言伴读。", "evidence_ids": [], "key_points": [],
+                "source_notes": [], "evidence_requests": [],
+            }
+        raise AssertionError(f"preview gate submitted unexpected work: {label}")
+
+    project = tmp_path / "substantive-first-wave"
+    result = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id, project_dir=project, workers=1,
+            review_context_chars=1, stop_after_preview=True,
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF-1.7 fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result["ok"], result
+    assert [block["block_id"] for block in _generation_document(document)["blocks"]] == [
+        "preface", "preface-text", "body", "body-text",
+    ]
+    assert result["data"]["preview_segment_ids"] == ["seg-0001"]
+    assert result["data"]["preview_segment_count"] == 1
+    assert not any(label.endswith("seg-0002") for label, _ in calls)
+    for _label, prompt in calls:
+        assert "First resource" not in prompt
+        assert "Second resource" not in prompt
+        assert "Preface 3" not in prompt
+    tex = Path(result["data"]["preview_tex"]).read_text(encoding="utf-8")
+    assert "First resource" in tex and "Second resource" in tex and "Preface 3" in tex
+    assert "Physical body text" not in tex
+    assert "有实质内容的序言译文" in tex and "序言说明全书动机" in tex
+    manifest = json.loads(Path(result["data"]["preview_source_manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["companion_layers"]["augmentation_scope"] == "substantive"
+    assert manifest["companion_layers"]["semantic_segment_ids"] == ["seg-0001"]
+
+
 def test_stop_after_preview_returns_before_remaining_work_and_resumes(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     fake = FakeLLM()

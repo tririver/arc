@@ -66,9 +66,10 @@ from .reader_text import clean_reader_annotation, clean_reader_translation
 from .results import err, ok
 from .segmentation import SegmentationError, segment_document, validate_exact_coverage
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
+from .substantive import non_substantive_block_ids
 
 
-WORKFLOW_VERSION = "arc.companion.workflow.v8"
+WORKFLOW_VERSION = "arc.companion.workflow.v9"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -92,7 +93,7 @@ ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v5"
 SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
-FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v1"
+FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
 FINAL_RENDER_VERSION = "arc.companion.final-render.v3"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
 CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
@@ -378,6 +379,7 @@ def build_companion(
             validation_name="first-round-preview-validation.json",
             compiler=compiler,
             pdf_validator=pdf_validator,
+            augmentation_scope="substantive",
         )
         preview_state = _state(
             state_path,
@@ -3965,93 +3967,7 @@ def _generation_document(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _generation_excluded_block_ids(document: dict[str, Any]) -> set[str]:
-    return _front_matter_excluded_block_ids(document) | _source_only_block_ids(document)
-
-
-def _source_only_block_ids(document: dict[str, Any]) -> set[str]:
-    """Identify structurally preserved blocks that must never enter LLM generation."""
-    blocks = list(document.get("blocks") or [])
-    excluded: set[str] = set()
-    source_only_sections: set[str] = set()
-    for block in blocks:
-        role = str(block.get("source_role") or "").casefold()
-        kind = str(block.get("type") or block.get("kind") or "").casefold()
-        inferred_role = role or _source_only_role_from_block(block)
-        if inferred_role or kind in {"bibliography", "bibliography_item", "reference"}:
-            excluded.add(block_id(block))
-            section_id = str(block.get("section_id") or "")
-            if section_id and inferred_role in {"acknowledgments", "references"}:
-                source_only_sections.add(section_id)
-    for block in blocks:
-        if str(block.get("section_id") or "") in source_only_sections:
-            excluded.add(block_id(block))
-    return excluded
-
-
-def _source_only_role_from_block(block: dict[str, Any]) -> str:
-    html = str(block.get("html") or "").casefold()
-    if re.search(r'(?:class|role)=["\'][^"\']*(?:ltx_toc|ltx_title_contents|doc-toc)', html):
-        return "table_of_contents"
-    if re.search(r'class=["\'][^"\']*acknowledg', html):
-        return "acknowledgments"
-    if re.search(r'class=["\'][^"\']*(?:bibliograph|reference)', html):
-        return "references"
-    kind = str(block.get("type") or block.get("kind") or "").casefold()
-    if kind not in {"heading", "section", "subsection", "subsubsection"}:
-        return ""
-    title = re.sub(
-        r"[^\w\u4e00-\u9fff]+",
-        " ",
-        str(block.get("title") or block.get("text") or "").casefold(),
-    ).strip()
-    if title in {"contents", "table of contents", "目录"}:
-        return "table_of_contents"
-    if title in {
-        "acknowledgment", "acknowledgments", "acknowledgement", "acknowledgements", "致谢",
-    }:
-        return "acknowledgments"
-    if title in {"references", "reference list", "bibliography", "literature cited", "参考文献"}:
-        return "references"
-    return ""
-
-
-def _front_matter_excluded_block_ids(document: dict[str, Any]) -> set[str]:
-    front = document.get("front_matter") or {}
-    structural_ids: set[str] = set()
-    recorded_ids = front.get("block_ids") or {}
-    if isinstance(recorded_ids, dict):
-        for key in ("title", "authors", "affiliations"):
-            values = recorded_ids.get(key) or []
-            if not isinstance(values, list):
-                values = [values]
-            structural_ids.update(str(value) for value in values if value)
-    structural_ids.update(
-        block_id(block)
-        for block in document.get("blocks") or []
-        if str(block.get("source_role") or "").casefold() in {
-            "front_matter", "front_matter_title", "front_matter_authors",
-            "front_matter_affiliations",
-        }
-    )
-    protected: set[str] = set()
-    for key in ("title", "authors", "affiliations"):
-        value = front.get(key)
-        items = value if isinstance(value, list) else [value]
-        for item in items:
-            text = _normalized_front_text(item)
-            if text:
-                protected.add(text)
-    return structural_ids | {
-        block_id(block)
-        for block in document.get("blocks") or []
-        if _normalized_front_text(block.get("text") or block.get("title")) in protected
-    }
-
-
-def _normalized_front_text(value: Any) -> str:
-    if isinstance(value, dict):
-        value = value.get("text") or value.get("name") or ""
-    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    return non_substantive_block_ids(document)
 
 
 def _annotation_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
