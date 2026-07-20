@@ -89,7 +89,7 @@ def load_calculation_config(payload: Mapping[str, Any]) -> CalculateConfig:
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
     workflow_json_dir = Path(str(data.get("workflow_json_dir") or _default_workflow_json_dir())).expanduser()
     proposer_count = _positive_int(data.get("proposer_count", 2), "proposer_count")
-    max_recalculations = _nonnegative_int(data.get("max_recalculations", 2), "max_recalculations")
+    max_recalculations = _nonnegative_int(data.get("max_recalculations", 1), "max_recalculations")
     human_gate = _parse_human_gate(data.get("human_gate", {}))
     defaults = _dict(data.get("defaults", {}), "defaults")
     if defaults.get("model") is not None and str(defaults.get("provider", "auto") or "auto") == "auto":

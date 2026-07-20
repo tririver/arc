@@ -32,12 +32,12 @@ Copy `workflows/json/calculate.config.template.json` to:
 ```
 
 Replace `<calculate-run-id>`, `<project-dir>`, `<run-id>`, and
-`<skill-workflow-json-dir>`. Use `skill_dir` from context as `<skill-dir>` in commands below. Keep `"proposer_count": 2`, `"max_recalculations": 2`, and `artifact_options.save_prompts` enabled unless the user asks otherwise.
+`<skill-workflow-json-dir>`. Use `skill_dir` from context as `<skill-dir>` in commands below. Keep `"proposer_count": 2`, `"max_recalculations": 1`, and `artifact_options.save_prompts` enabled unless the user asks otherwise.
 The default template uses high reasoning effort and medium verbosity because these tasks are mathematical derivations, not lightweight summaries. Lower effort only for cheap exploratory runs.
 
 The runner reads worker prompt/schema templates from `workflows/json/calculate-proposer.template.json`, `workflows/json/calculate-reviewer.template.json`, and `workflows/json/calculate-reviewer-output.schema.json`.
 
-`"max_recalculations": 2` means 3 total attempts: 1 initial attempt + 2 recalculations.
+`"max_recalculations": 1` means 2 total attempts: 1 initial attempt + 1 recalculation.
 Do not increase attempts unless the user asks.
 For retryable proposer disagreement statuses, use the recalculation budget before pausing for human input. Also retry `reference_disagrees` while budget remains when reviewer feedback can tell proposers what to recheck without revealing reviewer-only target formulas.
 

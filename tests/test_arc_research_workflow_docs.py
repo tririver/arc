@@ -616,13 +616,13 @@ def test_calculate_uses_phase_specific_source_defaults() -> None:
     assert "post-check new calculation" in text
 
 
-def test_calculate_uses_three_total_consensus_attempts() -> None:
+def test_calculate_uses_two_total_consensus_attempts() -> None:
     text = (WF / "calculate.md").read_text(encoding="utf-8").lower()
 
-    assert '"max_recalculations": 2' in text
-    assert "3 total attempts" in text
-    assert "1 initial attempt + 2 recalculations" in text
-    assert "4 attempts" not in text
+    assert '"max_recalculations": 1' in text
+    assert "2 total attempts" in text
+    assert "1 initial attempt + 1 recalculation" in text
+    assert "3 total attempts" not in text
 
 
 def test_calculate_uses_reviewer_judgment_not_mandatory_sympy_gate() -> None:

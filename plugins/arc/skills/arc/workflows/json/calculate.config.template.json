@@ -4,7 +4,7 @@
   "run_dir": "<project-dir>/calculate/<run-id>/execute",
   "workflow_json_dir": "<skill-workflow-json-dir>",
   "proposer_count": 2,
-  "max_recalculations": 2,
+  "max_recalculations": 1,
   "human_gate": {
     "enabled": false
   },

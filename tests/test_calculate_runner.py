@@ -572,6 +572,14 @@ def test_calculate_template_sets_high_reasoning_defaults() -> None:
     assert runtime["claude_effort"] == "high"
 
 
+def test_calculate_runner_defaults_to_one_recalculation(tmp_path) -> None:
+    runner = load_calculate_runner()
+
+    config = runner.load_calculation_config(minimal_config(tmp_path))
+
+    assert config.max_recalculations == 1
+
+
 def test_attempt_batch_config_carries_reasoning_defaults(tmp_path) -> None:
     runner = load_calculate_runner()
     template = json.loads((WJ / "calculate.config.template.json").read_text(encoding="utf-8"))
