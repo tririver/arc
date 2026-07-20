@@ -425,23 +425,25 @@ def _call_for_cuts(
 ) -> list[int]:
     last_error = "unknown validation failure"
     for attempt in range(1, MAX_VALIDATION_ATTEMPTS + 1):
-        response: Any = None
+        prompt = segmentation_prompt(
+            window, total_blocks=len(inventory), refinement=refinement
+        )
+        if attempt > 1:
+            prompt += (
+                "\n\nCORRECTION REQUIRED: The previous response was rejected by the "
+                f"deterministic validator: {last_error}. Return a corrected cut list for "
+                "the same unchanged source inventory and ownership interval."
+            )
+        # Provider, transport, quota, and cancellation failures are owned by
+        # arc-llm. They must escape immediately rather than being multiplied by
+        # this semantic-correction loop.
+        response: Any = call_model(
+            prompt,
+            CUT_SCHEMA,
+            attempts_dir / f"attempt-{attempt}" / "llm",
+            f"{label_prefix}-attempt-{attempt}",
+        )
         try:
-            prompt = segmentation_prompt(
-                window, total_blocks=len(inventory), refinement=refinement
-            )
-            if attempt > 1:
-                prompt += (
-                    "\n\nCORRECTION REQUIRED: The previous response was rejected by the "
-                    f"deterministic validator: {last_error}. Return a corrected cut list for "
-                    "the same unchanged source inventory and ownership interval."
-                )
-            response = call_model(
-                prompt,
-                CUT_SCHEMA,
-                attempts_dir / f"attempt-{attempt}" / "llm",
-                f"{label_prefix}-attempt-{attempt}",
-            )
             if not isinstance(response, dict):
                 raise SegmentationError("segmentation response must be an object")
             if "cut_after_ordinals" not in response:
@@ -467,7 +469,7 @@ def _call_for_cuts(
                 "cuts": cuts,
             })
             return cuts
-        except Exception as exc:
+        except (SegmentationError, KeyError, TypeError, ValueError) as exc:
             last_error = str(exc)
             write_json(attempts_dir / f"attempt-{attempt}.json", {
                 "schema_version": SEGMENTATION_VERSION,

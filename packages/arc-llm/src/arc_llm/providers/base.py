@@ -4,9 +4,16 @@ from typing import Any, Protocol
 
 
 class LLMWorkerError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        abort_batch: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.abort_batch = abort_batch
 
 
 class LLMWorkerTimeout(LLMWorkerError):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -14,10 +15,15 @@ from arc_companion.evidence import arc_cache_descriptor, text_sha256, validate_e
 from arc_companion.evidence_requests import EvidenceResolution
 from arc_companion.pipeline import (
     BuildOptions,
+    CompanionLLMCircuitOpen,
     CompanionLaneError,
     LANGUAGE_NOTICE,
     _evidence,
+    _checkpoint_dir_with_legacy_worker_migration,
     _fingerprint,
+    _first_wave_preview_outputs_match,
+    _legacy_worker_fingerprint,
+    _limit_llm_concurrency,
     _evidence_for_segment,
     _first_wave_preview_document,
     _full_paper_context,
@@ -3370,6 +3376,7 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
     fake.annotation_barrier = threading.Barrier(1)
+    fake.annotation_started.set()  # A total budget of one intentionally serializes both lanes.
     project = tmp_path / "preview-order"
     compiler_calls: list[tuple[Path, str]] = []
 
@@ -3559,6 +3566,7 @@ def test_stop_after_preview_returns_before_remaining_work_and_resumes(tmp_path: 
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
     fake.annotation_barrier = threading.Barrier(1)
+    fake.annotation_started.set()  # A total budget of one intentionally serializes both lanes.
     project = tmp_path / "preview-gate"
     compiler_calls: list[Path] = []
     validation_calls: list[Path] = []
@@ -3693,6 +3701,7 @@ def test_first_round_preview_failure_stops_before_evidence_and_review(tmp_path: 
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
     fake.annotation_barrier = threading.Barrier(1)
+    fake.annotation_started.set()  # A total budget of one intentionally serializes both lanes.
 
     result = build_companion(
         BuildOptions(
@@ -3785,14 +3794,236 @@ def test_fingerprint_invalidates_when_review_tier_changes(tmp_path: Path, monkey
     assert _fingerprint(bundle, options, evidence=evidence) != baseline
 
 
-def test_fingerprint_invalidates_when_workers_per_lane_changes(tmp_path: Path) -> None:
+def test_fingerprint_reuses_content_checkpoints_when_total_workers_change(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     evidence = _evidence(bundle)
     default = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run")
     old = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run", workers=12)
 
     assert default.workers == 24
-    assert _fingerprint(bundle, default, evidence=evidence) != _fingerprint(bundle, old, evidence=evidence)
+    assert _fingerprint(bundle, default, evidence=evidence) == _fingerprint(bundle, old, evidence=evidence)
+
+
+def test_shared_llm_limiter_bounds_aggregate_concurrency_across_lanes() -> None:
+    lock = threading.Lock()
+    release = threading.Event()
+    budget_reached = threading.Event()
+    active = 0
+    peak = 0
+
+    def model(prompt: str, **kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 2:
+                budget_reached.set()
+        assert release.wait(timeout=5)
+        with lock:
+            active -= 1
+        return {"prompt": prompt}
+
+    limited = _limit_llm_concurrency(model, 2)
+
+    def lane(prefix: str) -> list[dict[str, str]]:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(limited, f"{prefix}-{index}") for index in range(4)]
+            return [future.result() for future in futures]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(lane, prefix) for prefix in ("translation", "annotation")]
+        assert budget_reached.wait(timeout=5)
+        assert peak == 2
+        release.set()
+        results = [future.result() for future in futures]
+
+    assert sum(len(items) for items in results) == 8
+    assert active == 0
+    assert peak == 2
+
+
+def test_shared_llm_limiter_trips_queued_work_across_lanes_after_batch_abort() -> None:
+    lock = threading.Lock()
+    both_started = threading.Event()
+    release_abort = threading.Event()
+    calls: list[str] = []
+    active = 0
+
+    class FatalProviderError(RuntimeError):
+        abort_batch = True
+
+    def model(prompt: str, *, cancel_check=None) -> dict[str, str]:
+        nonlocal active
+        with lock:
+            calls.append(prompt)
+            active += 1
+            if active == 2:
+                both_started.set()
+        assert both_started.wait(timeout=5)
+        if prompt == "translation-active":
+            assert release_abort.wait(timeout=5)
+            try:
+                raise FatalProviderError("usage quota exhausted")
+            except FatalProviderError as exc:
+                raise RuntimeError("wrapped provider failure") from exc
+        assert cancel_check is not None
+        while not cancel_check():
+            threading.Event().wait(0.001)
+        raise RuntimeError("active call cancelled by build circuit")
+
+    limited = _limit_llm_concurrency(model, 2)
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        active_futures = [
+            executor.submit(limited, "translation-active"),
+            executor.submit(limited, "annotation-active"),
+        ]
+        assert both_started.wait(timeout=5)
+        queued_futures = [
+            executor.submit(limited, "translation-queued-1"),
+            executor.submit(limited, "annotation-queued-1"),
+            executor.submit(limited, "translation-queued-2"),
+            executor.submit(limited, "annotation-queued-2"),
+        ]
+        release_abort.set()
+        with pytest.raises(RuntimeError, match="wrapped provider failure"):
+            active_futures[0].result(timeout=5)
+        with pytest.raises(RuntimeError, match="cancelled by build circuit"):
+            active_futures[1].result(timeout=5)
+        for future in queued_futures:
+            with pytest.raises(CompanionLLMCircuitOpen):
+                future.result(timeout=5)
+
+    assert set(calls) == {"translation-active", "annotation-active"}
+    assert len(calls) == 2
+
+
+def test_shared_llm_limiter_does_not_inject_cancel_check_into_simple_fake() -> None:
+    calls: list[str] = []
+
+    def model(prompt: str) -> dict[str, str]:
+        calls.append(prompt)
+        return {"prompt": prompt}
+
+    assert _limit_llm_concurrency(model, 1)("plain") == {"prompt": "plain"}
+    assert calls == ["plain"]
+
+
+def test_shared_llm_limiter_does_not_trip_on_ordinary_unit_failure() -> None:
+    calls: list[str] = []
+
+    def model(prompt: str) -> dict[str, str]:
+        calls.append(prompt)
+        if prompt == "bad-unit":
+            raise RuntimeError("ordinary validation failure")
+        return {"prompt": prompt}
+
+    limited = _limit_llm_concurrency(model, 1)
+    with pytest.raises(RuntimeError, match="ordinary validation failure"):
+        limited("bad-unit")
+    assert limited("independent-unit") == {"prompt": "independent-unit"}
+    assert calls == ["bad-unit", "independent-unit"]
+
+
+def test_legacy_worker_fingerprint_checkpoint_is_exactly_migrated(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    project = tmp_path / "run"
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=project, workers=3)
+    evidence = _evidence(bundle)
+    fingerprint = _fingerprint(bundle, options, evidence=evidence)
+    legacy_fingerprint = _legacy_worker_fingerprint(
+        bundle,
+        options,
+        evidence=evidence,
+        domain_context=None,
+        workers_per_lane=24,
+    )
+    legacy = project / ".arc-companion" / "checkpoints" / legacy_fingerprint
+    legacy.mkdir(parents=True)
+    (legacy / "reusable.json").write_text("{}", encoding="utf-8")
+    (project / "context.json").write_text(json.dumps({"workers": 24}), encoding="utf-8")
+
+    previous_state = {
+        "fingerprint": legacy_fingerprint,
+        "checkpoint_dir": str(legacy),
+    }
+    target = _checkpoint_dir_with_legacy_worker_migration(
+        project,
+        fingerprint=fingerprint,
+        bundle=bundle,
+        options=options,
+        evidence=evidence,
+        domain_context=None,
+        previous_state=previous_state,
+    )
+
+    assert target == project / ".arc-companion" / "checkpoints" / fingerprint
+    assert not legacy.exists()
+    assert (target / "reusable.json").is_file()
+    migration = json.loads((target / "checkpoint-migration.v1.json").read_text())
+    assert migration["legacy_fingerprint"] == legacy_fingerprint
+    assert migration["content_fingerprint"] == fingerprint
+    assert migration["legacy_workers_per_lane"] == 24
+    assert previous_state["fingerprint"] == fingerprint
+    assert previous_state["checkpoint_dir"] == str(target)
+
+
+def test_legacy_worker_checkpoint_is_found_without_context_json(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    project = tmp_path / "run-without-context"
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=project, workers=2)
+    evidence = _evidence(bundle)
+    fingerprint = _fingerprint(bundle, options, evidence=evidence)
+    legacy_fingerprint = _legacy_worker_fingerprint(
+        bundle,
+        options,
+        evidence=evidence,
+        domain_context=None,
+        workers_per_lane=317,
+    )
+    legacy = project / ".arc-companion" / "checkpoints" / legacy_fingerprint
+    legacy.mkdir(parents=True)
+    (legacy / "window-0152.json").write_text("{}", encoding="utf-8")
+    previous_state = {
+        "fingerprint": legacy_fingerprint,
+        "checkpoint_dir": str(legacy.resolve()),
+    }
+
+    target = _checkpoint_dir_with_legacy_worker_migration(
+        project,
+        fingerprint=fingerprint,
+        bundle=bundle,
+        options=options,
+        evidence=evidence,
+        domain_context=None,
+        previous_state=previous_state,
+    )
+
+    assert target.name == fingerprint
+    assert not legacy.exists()
+    assert (target / "window-0152.json").is_file()
+    migration = json.loads((target / "checkpoint-migration.v1.json").read_text())
+    assert migration["legacy_workers_per_lane"] == 317
+
+
+def test_preview_completion_check_is_independent_of_current_worker_budget(tmp_path: Path) -> None:
+    state: dict[str, object] = {
+        "first_wave_preview_version": pipeline_module.FIRST_WAVE_PREVIEW_VERSION,
+        "segment_count": 20,
+        "preview_segment_count": 12,
+        "preview_segment_ids": [f"seg-{index:04d}" for index in range(1, 13)],
+    }
+    for path_key, hash_key in (
+        ("preview_tex", "preview_tex_sha256"),
+        ("preview_pdf", "preview_pdf_sha256"),
+        ("preview_source_manifest_path", "preview_source_manifest_sha256"),
+        ("preview_validation_path", "preview_validation_sha256"),
+    ):
+        path = tmp_path / path_key
+        path.write_bytes(path_key.encode("utf-8"))
+        state[path_key] = str(path)
+        state[hash_key] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    assert _first_wave_preview_outputs_match(state)
 
 
 def test_controller_only_runtime_keeps_internet_enabled_and_scrubs_polluted_parent_env(

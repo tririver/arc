@@ -980,6 +980,7 @@ def test_non_retryable_worker_error_stops_after_first_attempt(monkeypatch):
 
 def test_worker_error_is_retryable_by_default():
     assert LLMWorkerError("transient provider failure").retryable is True
+    assert LLMWorkerError("transient provider failure").abort_batch is False
 
 
 def test_run_json_stateful_records_session_usage_and_call_record(tmp_path, monkeypatch):

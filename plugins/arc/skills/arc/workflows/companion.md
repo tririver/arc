@@ -94,8 +94,12 @@ explicit-domain papers remain on lightweight parsed sections.
 
 Start two independent bounded waves together. Translate every unit with the
 low tier and generate companion commentary with the high tier; both receive
-the same unit and frozen glossary. Each wave may use up to `workers` calls, so
-the default is 24 concurrent translations plus 24 concurrent commentaries.
+the same unit and frozen glossary. All active stages and lanes share one total
+`workers` budget, so the default permits at most 24 ARC model calls in flight.
+An exception opens the build-wide submission circuit only when its wrapped
+exception chain contains the explicit `abort_batch=True` marker. In that case,
+queued calls fail locally and cancellable in-flight calls stop; ordinary unit
+failures continue to drain and checkpoint independent work.
 Each call also receives bounded full-paper navigation context: the paper's
 section map plus compact neighboring and global anchors. On hosts that support
 it, these two waves may use ARC-only MCP/cache access and internet lookup;
@@ -225,6 +229,10 @@ explicit table-of-contents entries rather than adding a second number.
 Rerun the same build command. Valid segmentation windows, glossary work,
 refinements, translations, and commentaries are cached independently; the
 final merged segmentation is cached only after exact coverage validation.
+Changing `workers` changes only the total runtime concurrency budget and must
+not invalidate content checkpoints. Migrate a legacy per-lane checkpoint only
+when the worker count in `context.json`, or a bounded reconstruction over old
+worker values, exactly reproduces its old fingerprint and recorded local path.
 Translation and commentary lanes finish every submitted unit before aggregating
 failures, preserving all successful checkpoints; a retry submits only missing
 or stale units. Submit exactly the first `min(workers, unit_count)` source-order

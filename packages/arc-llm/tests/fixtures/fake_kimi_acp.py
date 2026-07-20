@@ -169,6 +169,19 @@ def run_acp() -> int:
             session_id = str(request.get("params", {}).get("sessionId") or SESSION_ID)
             if SCENARIO == "transport_eof":
                 return 7
+            if SCENARIO == "transport_usage_limit":
+                sys.stderr.write("403 You've reached your usage limit\n")
+                sys.stderr.flush()
+                return 7
+            if SCENARIO == "rpc_usage_limit":
+                respond_error(request, -32099, "403 You've reached your usage limit")
+                continue
+            if SCENARIO == "rpc_quota_exhausted":
+                respond_error(request, -32000, "quota-exhausted")
+                continue
+            if SCENARIO == "rpc_rate_limit":
+                respond_error(request, -32000, "429 rate-limit exceeded")
+                continue
             if SCENARIO == "timeout":
                 hang_with_child()
             if SCENARIO == "reverse_permission":

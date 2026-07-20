@@ -34,8 +34,8 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=DEFAULT_WORKERS,
         help=(
-            f"maximum concurrency per independent stage/lane (default: {DEFAULT_WORKERS}; "
-            f"translation plus commentary may peak at {DEFAULT_WORKERS * 2})"
+            f"total LLM-call concurrency budget shared by all active stages and lanes "
+            f"(default: {DEFAULT_WORKERS})"
         ),
     )
     cache = build.add_mutually_exclusive_group()

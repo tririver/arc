@@ -5,11 +5,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import math
 import os
 from pathlib import Path
 import re
+import threading
 import uuid
 from typing import Any, Callable
 
@@ -182,6 +184,12 @@ class TranslationCoverageError(RuntimeError):
     """A translation candidate does not map exactly once to every expected block."""
 
 
+class CompanionLLMCircuitOpen(RuntimeError):
+    """The build stopped submitting calls after a provider-wide fatal failure."""
+
+    abort_batch = True
+
+
 @dataclass(frozen=True)
 class BuildOptions:
     paper_id: str
@@ -234,6 +242,7 @@ def build_companion(
         from arc_llm import run_json
 
         llm = run_json
+    llm = _limit_llm_concurrency(llm, options.workers)
     project_dir = options.project_dir.resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     state_path = project_dir / "state.json"
@@ -263,14 +272,22 @@ def build_companion(
             domain_manifest=options.domain_manifest,
         )
         fingerprint = _fingerprint(bundle, options, evidence=evidence, domain_context=domain_context)
-        checkpoint_dir = project_dir / ".arc-companion" / "checkpoints" / fingerprint
+        checkpoint_dir = _checkpoint_dir_with_legacy_worker_migration(
+            project_dir,
+            fingerprint=fingerprint,
+            bundle=bundle,
+            options=options,
+            evidence=evidence,
+            domain_context=domain_context,
+            previous_state=previous_state,
+        )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         if (
             not options.force
             and previous_state.get("status") == "complete"
             and previous_state.get("fingerprint") == fingerprint
             and _completion_outputs_match(previous_state)
-            and _first_wave_preview_outputs_match(previous_state, workers=options.workers)
+            and _first_wave_preview_outputs_match(previous_state)
         ):
             resumed_state = {**previous_state, "diagnostics": list(diagnostics)}
             _state(state_path, **resumed_state)
@@ -2732,6 +2749,84 @@ def _llm_call(
     )
 
 
+def _limit_llm_concurrency(
+    llm: Callable[..., dict[str, Any]], max_concurrent_calls: int,
+) -> Callable[..., dict[str, Any]]:
+    """Share one total call budget and stop queued work after an explicit batch abort."""
+    permits = threading.BoundedSemaphore(max_concurrent_calls)
+    tripped = threading.Event()
+    state_lock = threading.Lock()
+    abort_reason: BaseException | None = None
+
+    def raise_if_tripped() -> None:
+        if not tripped.is_set():
+            return
+        with state_lock:
+            reason = abort_reason
+        message = "companion LLM circuit is open after a provider-wide fatal failure"
+        if reason is not None and str(reason):
+            message += f": {reason}"
+        raise CompanionLLMCircuitOpen(message) from reason
+
+    def limited(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal abort_reason
+        raise_if_tripped()
+        with permits:
+            raise_if_tripped()
+            call_kwargs = kwargs
+            if _accepts_explicit_keyword(llm, "cancel_check"):
+                parent_cancel_check = kwargs.get("cancel_check")
+
+                def cancel_check() -> bool:
+                    return tripped.is_set() or bool(
+                        callable(parent_cancel_check) and parent_cancel_check()
+                    )
+
+                call_kwargs = {**kwargs, "cancel_check": cancel_check}
+            try:
+                return llm(*args, **call_kwargs)
+            except BaseException as exc:
+                if _exception_requests_batch_abort(exc):
+                    with state_lock:
+                        if abort_reason is None:
+                            abort_reason = exc
+                    tripped.set()
+                raise
+
+    return limited
+
+
+def _accepts_explicit_keyword(call: Callable[..., Any], name: str) -> bool:
+    """Return true only for a named keyword, not a permissive fake's **kwargs."""
+    try:
+        parameter = inspect.signature(call).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _exception_requests_batch_abort(exc: BaseException) -> bool:
+    """Inspect a wrapped exception chain for an explicit provider abort marker."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if getattr(current, "abort_batch", None) is True:
+            return True
+        if isinstance(current.__cause__, BaseException):
+            pending.append(current.__cause__)
+        if isinstance(current.__context__, BaseException):
+            pending.append(current.__context__)
+    return False
+
+
 def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str, bool | str]:
     allow_internet = True if options is None else options.allow_internet
     return {
@@ -2772,55 +2867,157 @@ def _fingerprint(
     evidence: dict[str, Any],
     domain_context: dict[str, Any] | None = None,
 ) -> str:
-    integrity = bundle.document.get("integrity") or {}
     return sha256_json(
-        {
-            "workflow_version": WORKFLOW_VERSION,
-            "prompt_version": PROMPT_VERSION,
-            "schema_version": SCHEMA_VERSION,
-            "paper_id": bundle.paper_id,
-            "document_hash": (
-                integrity.get("document_hash")
-                or bundle.document.get("document_hash")
-                or bundle.parsed.get("document_hash")
-                or sha256_json(bundle.document)
-            ),
-            "rich_parser_version": bundle.document.get("parser_version"),
-            "generation_projection_hash": sha256_json(_generation_document(bundle.document)),
-            "asset_manifest_hash": (
-                integrity.get("asset_manifest_hash")
-                or bundle.document.get("asset_manifest_hash")
-                or bundle.parsed.get("asset_manifest_hash")
-            ),
-            "language": options.annotation_language,
-            "provider": options.provider,
-            "model": options.model,
-            "model_tiers": {
-                "segmentation": SEGMENTATION_TIER,
-                "glossary": GLOSSARY_TIER,
-                "translation": TRANSLATION_TIER,
-                "annotation": ANNOTATION_TIER,
-                "review": REVIEW_TIER,
-            },
-            "workers_per_lane": options.workers,
-            "runtime_access": {
-                "segmentation": {"allow_mcp": False, "allow_internet": False},
-                "glossary": {"allow_mcp": False, "allow_internet": False},
-                "translation": _generation_runtime_policy(options),
-                "annotation": _generation_runtime_policy(options),
-                "review": {"allow_mcp": False, "allow_internet": False},
-            },
-            "full_paper_context_version": FULL_PAPER_CONTEXT_VERSION,
-            "context_selection": {
-                "version": CONTEXT_SELECTION_VERSION,
-                "chars_per_source": CONTEXT_SEGMENT_CHARS_PER_SOURCE,
-                "chars_total": CONTEXT_SEGMENT_CHARS_TOTAL,
-            },
-            "metadata_hash": sha256_json(bundle.metadata),
-            "evidence_hash": sha256_json(evidence),
-            "domain_context_hash": sha256_json(domain_context) if domain_context is not None else None,
-        }
+        _fingerprint_payload(
+            bundle,
+            options,
+            evidence=evidence,
+            domain_context=domain_context,
+        )
     )
+
+
+def _fingerprint_payload(
+    bundle: SourceBundle,
+    options: BuildOptions,
+    *,
+    evidence: dict[str, Any],
+    domain_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    integrity = bundle.document.get("integrity") or {}
+    return {
+        "workflow_version": WORKFLOW_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "paper_id": bundle.paper_id,
+        "document_hash": (
+            integrity.get("document_hash")
+            or bundle.document.get("document_hash")
+            or bundle.parsed.get("document_hash")
+            or sha256_json(bundle.document)
+        ),
+        "rich_parser_version": bundle.document.get("parser_version"),
+        "generation_projection_hash": sha256_json(_generation_document(bundle.document)),
+        "asset_manifest_hash": (
+            integrity.get("asset_manifest_hash")
+            or bundle.document.get("asset_manifest_hash")
+            or bundle.parsed.get("asset_manifest_hash")
+        ),
+        "language": options.annotation_language,
+        "provider": options.provider,
+        "model": options.model,
+        "model_tiers": {
+            "segmentation": SEGMENTATION_TIER,
+            "glossary": GLOSSARY_TIER,
+            "translation": TRANSLATION_TIER,
+            "annotation": ANNOTATION_TIER,
+            "review": REVIEW_TIER,
+        },
+        "runtime_access": {
+            "segmentation": {"allow_mcp": False, "allow_internet": False},
+            "glossary": {"allow_mcp": False, "allow_internet": False},
+            "translation": _generation_runtime_policy(options),
+            "annotation": _generation_runtime_policy(options),
+            "review": {"allow_mcp": False, "allow_internet": False},
+        },
+        "full_paper_context_version": FULL_PAPER_CONTEXT_VERSION,
+        "context_selection": {
+            "version": CONTEXT_SELECTION_VERSION,
+            "chars_per_source": CONTEXT_SEGMENT_CHARS_PER_SOURCE,
+            "chars_total": CONTEXT_SEGMENT_CHARS_TOTAL,
+        },
+        "metadata_hash": sha256_json(bundle.metadata),
+        "evidence_hash": sha256_json(evidence),
+        "domain_context_hash": sha256_json(domain_context) if domain_context is not None else None,
+    }
+
+
+def _legacy_worker_fingerprint(
+    bundle: SourceBundle,
+    options: BuildOptions,
+    *,
+    evidence: dict[str, Any],
+    domain_context: dict[str, Any] | None,
+    workers_per_lane: int,
+) -> str:
+    payload = _fingerprint_payload(
+        bundle,
+        options,
+        evidence=evidence,
+        domain_context=domain_context,
+    )
+    return sha256_json({**payload, "workers_per_lane": workers_per_lane})
+
+
+def _checkpoint_dir_with_legacy_worker_migration(
+    project_dir: Path,
+    *,
+    fingerprint: str,
+    bundle: SourceBundle,
+    options: BuildOptions,
+    evidence: dict[str, Any],
+    domain_context: dict[str, Any] | None,
+    previous_state: dict[str, Any],
+) -> Path:
+    """Move an exactly matched pre-total-budget checkpoint into its content identity."""
+    checkpoint_root = project_dir / ".arc-companion" / "checkpoints"
+    target = checkpoint_root / fingerprint
+    if target.exists() or options.force:
+        return target
+
+    context_workers = _read_optional_json(project_dir / "context.json").get("workers")
+    candidates: list[int] = []
+    if (
+        not isinstance(context_workers, bool)
+        and isinstance(context_workers, int)
+        and context_workers > 0
+    ):
+        candidates.append(context_workers)
+    candidates.extend(value for value in range(1, 1025) if value not in candidates)
+
+    recorded_fingerprint = previous_state.get("fingerprint")
+    legacy_workers: int | None = None
+    legacy_fingerprint: str | None = None
+    legacy_payload = _fingerprint_payload(
+        bundle,
+        options,
+        evidence=evidence,
+        domain_context=domain_context,
+    )
+    for candidate in candidates:
+        candidate_fingerprint = sha256_json(
+            {**legacy_payload, "workers_per_lane": candidate}
+        )
+        if candidate_fingerprint == recorded_fingerprint:
+            legacy_workers = candidate
+            legacy_fingerprint = candidate_fingerprint
+            break
+    if legacy_workers is None or legacy_fingerprint is None:
+        return target
+    legacy = checkpoint_root / legacy_fingerprint
+    recorded_checkpoint = previous_state.get("checkpoint_dir")
+    if (
+        not recorded_checkpoint
+        or Path(str(recorded_checkpoint)).resolve() != legacy.resolve()
+        or not legacy.is_dir()
+    ):
+        return target
+
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    os.replace(legacy, target)
+    write_json(target / "checkpoint-migration.v1.json", {
+        "schema_version": "arc.companion.checkpoint-migration.v1",
+        "kind": "workers-to-total-concurrency-budget",
+        "legacy_fingerprint": legacy_fingerprint,
+        "content_fingerprint": fingerprint,
+        "legacy_workers_per_lane": legacy_workers,
+        "migrated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    # Preserve completion/preview recovery in this invocation. The migration
+    # proved that only the legacy operational worker field changed.
+    previous_state["fingerprint"] = fingerprint
+    previous_state["checkpoint_dir"] = str(target)
+    return target
 
 
 def _page_count(bundle: SourceBundle) -> int | None:
@@ -2886,7 +3083,7 @@ def _completion_outputs_match(state: dict[str, Any]) -> bool:
     return True
 
 
-def _first_wave_preview_outputs_match(state: dict[str, Any], *, workers: int) -> bool:
+def _first_wave_preview_outputs_match(state: dict[str, Any]) -> bool:
     if state.get("first_wave_preview_version") != FIRST_WAVE_PREVIEW_VERSION:
         return False
     try:
@@ -2897,7 +3094,8 @@ def _first_wave_preview_outputs_match(state: dict[str, Any], *, workers: int) ->
     segment_ids = state.get("preview_segment_ids")
     if (
         segment_count < 1
-        or preview_segment_count != min(workers, segment_count)
+        or preview_segment_count < 1
+        or preview_segment_count > segment_count
         or not isinstance(segment_ids, list)
         or len(segment_ids) != preview_segment_count
         or any(not str(value) for value in segment_ids)

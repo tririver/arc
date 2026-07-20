@@ -300,7 +300,7 @@ def test_json_strict_mode_rejects_plain_text(tmp_path):
 
 
 @pytest.mark.parametrize("output_recovery", ["strict", "warn"])
-def test_empty_agent_response_is_retryable(output_recovery, tmp_path):
+def test_empty_agent_response_is_non_retryable(output_recovery, tmp_path):
     env = fake_env(tmp_path, scenario="empty")
 
     with pytest.raises(LLMWorkerError, match="no agent message text") as caught:
@@ -310,7 +310,29 @@ def test_empty_agent_response_is_retryable(output_recovery, tmp_path):
             output_recovery=output_recovery,
         )
 
-    assert caught.value.retryable is True
+    assert caught.value.retryable is False
+    assert caught.value.abort_batch is True
+
+
+@pytest.mark.parametrize(
+    ("scenario", "match"),
+    [
+        ("empty", "no agent message text"),
+        ("rpc_rate_limit", "rate-limit"),
+    ],
+)
+def test_runner_does_not_recreate_session_after_batch_aborting_response(
+    scenario, match, tmp_path
+):
+    env = fake_env(tmp_path, scenario=scenario)
+
+    with pytest.raises(RuntimeError, match=match) as caught:
+        run_text("prompt", provider="kimi-code-cli", env=env)
+
+    assert caught.value.__cause__.abort_batch is True
+    methods = [request["method"] for request in client_requests(env)]
+    assert methods.count("session/new") == 1
+    assert methods.count("session/prompt") == 1
 
 
 def test_reverse_permission_request_is_cancelled_without_claiming_sandbox(tmp_path):
@@ -352,16 +374,22 @@ def test_reverse_filesystem_requests_receive_json_rpc_errors(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("scenario", "match", "retryable"),
+    ("scenario", "match", "retryable", "abort_batch"),
     [
-        ("auth_error", "run `kimi login`", False),
-        ("invalid_session", "protocol error", False),
-        ("invalid_json", "invalid JSON", False),
-        ("old_version", "requires >=0.28.0", False),
-        ("transport_eof", "exited before replying", True),
+        ("auth_error", "run `kimi login`", False, True),
+        ("invalid_session", "protocol error", False, False),
+        ("invalid_json", "invalid JSON", False, False),
+        ("old_version", "requires >=0.28.0", False, False),
+        ("transport_eof", "exited before replying", True, False),
+        ("transport_usage_limit", "usage limit", False, True),
+        ("rpc_usage_limit", "usage limit", False, True),
+        ("rpc_quota_exhausted", "quota-exhausted", False, True),
+        ("rpc_rate_limit", "rate-limit", False, True),
     ],
 )
-def test_error_retryability_classification(scenario, match, retryable, tmp_path):
+def test_error_retryability_classification(
+    scenario, match, retryable, abort_batch, tmp_path
+):
     env = fake_env(tmp_path, scenario=scenario)
     session = None
     policy = "stateless"
@@ -383,6 +411,28 @@ def test_error_retryability_classification(scenario, match, retryable, tmp_path)
         )
 
     assert caught.value.retryable is retryable
+    assert caught.value.abort_batch is abort_batch
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "retryable", "abort_batch"),
+    [
+        ("403 Forbidden", False, True),
+        ("access forbidden", False, True),
+        ("You've reached your usage limit", False, True),
+        ("quota-exhausted", False, True),
+        ("429 rate-limit exceeded", False, True),
+        ("too many requests", False, True),
+        ("temporarily unavailable", True, False),
+    ],
+)
+def test_kimi_diagnostic_retryability_distinguishes_quota_from_throttling(
+    diagnostic, retryable, abort_batch
+):
+    assert kimi_module._diagnostic_disposition(diagnostic, default=True) == (
+        retryable,
+        abort_batch,
+    )
 
 
 def test_missing_binary_is_non_retryable(tmp_path):

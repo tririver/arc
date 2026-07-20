@@ -12,6 +12,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Mapping
 
+from arc_llm.retryable_output import ProviderOutputClass, classify_provider_output_text
 from arc_llm.schema_cache import canonical_json, sha256_text
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
@@ -191,7 +192,16 @@ class KimiCodeCliProvider:
                 )
             text = "".join(client.message_chunks)
             if not text:
-                raise _worker_error("Kimi ACP prompt returned no agent message text", retryable=True)
+                # A clean end_turn means the Kimi CLI already completed its own
+                # request lifecycle. Recreating an ARC stateless session cannot
+                # distinguish a transient provider failure from exhausted quota
+                # and can multiply provider-side retries, so leave recovery to a
+                # later workflow resume instead of retrying immediately.
+                raise _worker_error(
+                    "Kimi ACP prompt returned no agent message text",
+                    retryable=False,
+                    abort_batch=True,
+                )
             return LLMProviderResponse(
                 text,
                 usage=LLMUsage(),
@@ -326,7 +336,8 @@ class _AcpProcess:
                     message += f" (exit {return_code})"
                 if diagnostic:
                     message += f": {diagnostic}"
-                raise _worker_error(message, retryable=True)
+                retryable, abort_batch = _diagnostic_disposition(diagnostic, default=True)
+                raise _worker_error(message, retryable=retryable, abort_batch=abort_batch)
             try:
                 event = json.loads(line)
             except json.JSONDecodeError as exc:
@@ -398,7 +409,16 @@ class _AcpProcess:
                 self.process.stdin.write(line)
                 self.process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
-            raise _worker_error("Kimi ACP transport closed while writing", retryable=True) from exc
+            diagnostic = "".join(self.stderr_lines).strip()
+            message = "Kimi ACP transport closed while writing"
+            if diagnostic:
+                message += f": {diagnostic}"
+            retryable, abort_batch = _diagnostic_disposition(diagnostic, default=True)
+            raise _worker_error(
+                message,
+                retryable=retryable,
+                abort_batch=abort_batch,
+            ) from exc
 
     def cancel_and_stop(self, session_id: str | None) -> None:
         if self._stopped:
@@ -504,22 +524,79 @@ def _rpc_error(method: str, raw_error: Any) -> LLMWorkerError:
     error = raw_error if isinstance(raw_error, dict) else {}
     code = error.get("code")
     message = str(error.get("message") or raw_error or "unknown JSON-RPC error")
-    if code == -32000 or method == "authenticate":
+    if method == "authenticate":
         return _worker_error(
             f"Kimi Code authentication is unavailable; run `kimi login` first: {message}",
             retryable=False,
+            abort_batch=True,
         )
     if code in {-32600, -32601, -32602, -32603, -32700}:
         return _worker_error(f"Kimi ACP protocol error during {method}: {message}", retryable=False)
-    return _worker_error(f"Kimi ACP error during {method}: {message}", retryable=True)
+    retryable, abort_batch = _diagnostic_disposition(message, default=True)
+    return _worker_error(
+        f"Kimi ACP error during {method}: {message}",
+        retryable=retryable,
+        abort_batch=abort_batch,
+    )
 
 
-def _worker_error(message: str, *, retryable: bool) -> LLMWorkerError:
+def _diagnostic_disposition(diagnostic: str, *, default: bool) -> tuple[bool, bool]:
+    """Return retryability and batch-abort policy for a Kimi diagnostic."""
+    normalized = re.sub(r"[-_\s]+", " ", str(diagnostic or "").strip().lower())
+    if any(
+        phrase in normalized
+        for phrase in (
+            "usage limit",
+            "quota exhausted",
+            "quota exceeded",
+            "insufficient quota",
+            "billing hard limit",
+        )
+    ):
+        return False, True
+    if any(
+        phrase in normalized
+        for phrase in (
+            "too many requests",
+            "rate limit",
+            "authentication failed",
+            "invalid api key",
+            "login required",
+            "not logged in",
+            "unauthorized",
+            "forbidden",
+        )
+    ):
+        return False, True
+    if re.search(r"(?<!\d)(?:401|403|429)(?!\d)", normalized):
+        return False, True
+    classification = classify_provider_output_text(diagnostic)
+    if classification.classification == ProviderOutputClass.FATAL_PROVIDER_FAILURE:
+        return False, False
+    if classification.classification == ProviderOutputClass.RETRYABLE_PROVIDER_FAILURE:
+        return True, False
+    return default, False
+
+
+def _worker_error(
+    message: str,
+    *,
+    retryable: bool,
+    abort_batch: bool = False,
+) -> LLMWorkerError:
     try:
-        return LLMWorkerError(message, retryable=retryable)
+        return LLMWorkerError(
+            message,
+            retryable=retryable,
+            abort_batch=abort_batch,
+        )
     except TypeError:
-        error = LLMWorkerError(message)
+        try:
+            error = LLMWorkerError(message, retryable=retryable)
+        except TypeError:
+            error = LLMWorkerError(message)
         error.retryable = retryable  # type: ignore[attr-defined]
+        error.abort_batch = abort_batch  # type: ignore[attr-defined]
         return error
 
 

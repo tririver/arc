@@ -189,6 +189,29 @@ def test_portable_cut_schema_leaves_duplicate_rejection_to_companion_validation(
     assert not (tmp_path / "segmentation.json").exists()
 
 
+def test_provider_failure_is_not_multiplied_by_semantic_validation_retries(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+        calls.append(call_label)
+        raise RuntimeError("provider quota exhausted")
+
+    with pytest.raises(RuntimeError, match="provider quota exhausted"):
+        segment_document(
+            _document(["prose"] * 3),
+            checkpoint_dir=tmp_path,
+            workers=1,
+            force=False,
+            call_model=model,
+        )
+
+    assert calls == ["companion-segmentation-w-0001-attempt-1"]
+    assert not list((tmp_path / "segmentation" / "attempts").rglob("attempt-*.json"))
+    assert not (tmp_path / "segmentation.json").exists()
+
+
 @pytest.mark.parametrize("cuts", [["2"], [True], [0], [-1], [5], [99]])
 def test_malformed_or_out_of_range_cuts_are_rejected(cuts: list[object]) -> None:
     with pytest.raises(SegmentationError):

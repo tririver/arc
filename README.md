@@ -279,8 +279,9 @@ arc-companion validate --project-dir ./0911.3380-companion --json
 
 Companion generation starts medium semantic segmentation and medium-tier full-
 paper glossary construction concurrently, then starts low-tier translation and
-high-tier commentary in independent parallel waves. The default is 24
-translations plus 24 commentaries at once, followed by a high-tier
+high-tier commentary in independent parallel waves. All active stages and lanes
+share one total concurrency budget; the default permits at most 24 model calls
+at once, followed by a high-tier
 whole-document review. Each lane drains submitted work and retains successful
 checkpoints before reporting aggregated failures, so a retry schedules only
 missing or stale units. Commentary can use bounded,

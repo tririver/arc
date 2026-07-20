@@ -29,9 +29,13 @@ Useful build flags:
 - `--refresh`: refetch INSPIRE/ar5iv data before parsing; mutually exclusive
   with `--recache`.
 - `--force`: invalidate companion checkpoints, but not the `arc-paper` cache.
-- `--workers`: bounds each independent parallel wave. The default permits 24
-  concurrent translations and 24 concurrent companion commentaries; it also
-  bounds segmentation windows and local refinements.
+- `--workers`: sets one total LLM-call concurrency budget shared by all active
+  stages and lanes. The default permits at most 24 ARC model calls in flight
+  across translation, commentary, segmentation, glossary, and review work.
+  Changing this operational budget does not invalidate content checkpoints.
+  A provider error explicitly marked as batch-fatal opens a build-wide circuit:
+  queued calls fail locally, and providers supporting cancellation stop other
+  calls already in flight. Ordinary unit failures do not open this circuit.
 - `--domain-id <id>` / `--domain-manifest <path>`: mutually exclusive,
   read-only reuse of an explicitly named existing domain. Companion never
   discovers or builds a domain automatically.
@@ -71,11 +75,12 @@ Default model routing is:
 
 Segmentation and glossary construction begin concurrently. After both pass
 validation, translation and commentary run as two independent stateless waves.
-Each wave is bounded by `workers`, so the default peak is 24 translation calls
-plus 24 commentary calls. Both calls receive the frozen full-paper glossary and
-the same current source unit. Long documents use medium-tier section reviews
-followed by a medium-tier consolidation review, with complete unit coverage and a
-bounded source anchor for every unit in the consolidation payload. Review
+All active waves share one `workers` budget, so the default peak is 24 model
+calls total rather than 24 calls per lane. Both calls receive the frozen
+full-paper glossary and the same current source unit. Long documents use
+medium-tier section reviews followed by a medium-tier consolidation review,
+with complete unit coverage and a bounded source anchor for every unit in the
+consolidation payload. Review
 patches may change translations and commentaries only.
 
 Every new primary medium-tier translation prompt ends with an explicit controller
@@ -314,6 +319,10 @@ content, or the window endpoint. The controller adds every window endpoint and
 the final paper endpoint, then converts accepted cuts into canonical
 `start_block_id`, `end_block_id`, and `block_ids` ranges from the original
 order; no LLM-provided source range is trusted.
+Only a returned cut list rejected by this deterministic validator enters the
+three-attempt semantic correction loop. Provider, transport, quota, timeout,
+and cancellation failures stop that window immediately and are not multiplied
+by segmentation retries.
 
 Every resulting unit must satisfy the implementation's fine-grain hard limits:
 at most 24 atomic blocks or 60,000 characters in the largest actual source-block
@@ -436,7 +445,11 @@ artifacts for diagnosis but never publishes a successful deliverable.
 - Failed glossary, translation, or commentary unit: rerun the build. A
   translation with an opaque-token mismatch already receives one bounded
   controller-guided correction attempt during that build. Successful independent
-  work is not repeated. Translation and commentary lanes drain all
+  work is not repeated. Lowering or raising `--workers` reuses the same content
+  checkpoints. A legacy per-lane checkpoint is migrated only after either its
+  recorded `context.json` worker count or a bounded reconstruction of old worker
+  values exactly reproduces the prior state fingerprint and checkpoint path.
+  Translation and commentary lanes drain all
   submitted units before reporting their aggregated failures, so later
   successes remain checkpointed and a new build schedules only missing or stale
   units.
