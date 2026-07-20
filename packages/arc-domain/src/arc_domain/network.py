@@ -56,6 +56,8 @@ def build_network(
     max_citers: int = 1000,
     selected_count: int = 50,
     max_nodes: int = 60,
+    recent_window_days: int = RECENT_ARXIV_WINDOW_DAYS,
+    as_of_date: date | None = None,
 ) -> dict[str, Any]:
     update_status(paths, stage="network_started")
     selection = read_json(paths.foundation_selection, {})
@@ -87,6 +89,8 @@ def build_network(
         intent=intent,
         selected_count=selected_count,
         max_total=max(0, MAX_GRAPH_PAPER_COUNT - reserved_node_count),
+        recent_window_days=recent_window_days,
+        as_of_date=as_of_date,
     )
 
     selected_ids = [item["paper_id"] for item in selected]
@@ -144,9 +148,11 @@ def build_network(
         common_references=common_refs,
         refs_by_selected=refs_by_selected,
         intent=intent,
+        recent_window_days=recent_window_days,
+        as_of_date=as_of_date,
     )
     write_json(paths.domain_graph, graph)
-    update_status(paths, stage="network_done", node_count=len(graph["nodes"]), edge_count=len(graph["edges"]))
+    update_status(paths, stage="network_done", node_count=len(graph["nodes"]), edge_count=len(graph["edges"]), recency=graph["recency"])
     return {
         "domain_id": paths.domain_id,
         "foundation_paper": foundation_id,
@@ -158,6 +164,7 @@ def build_network(
         "selected_papers_path": str(paths.selected_papers),
         "reference_overlap_path": str(paths.reference_overlap),
         "graph": graph,
+        "recency": graph["recency"],
     }
 
 
@@ -301,8 +308,11 @@ def _select_domain_papers(
     intent: str,
     selected_count: int,
     max_total: int = MAX_GRAPH_PAPER_COUNT,
+    recent_window_days: int = RECENT_ARXIV_WINDOW_DAYS,
+    as_of_date: date | None = None,
 ) -> list[dict[str, Any]]:
-    now = datetime.now(timezone.utc)
+    current = as_of_date or datetime.now(timezone.utc).date()
+    now = datetime.combine(current, datetime.min.time(), tzinfo=timezone.utc)
     current_year = now.year
     intent_rank = {
         paper_id: index
@@ -342,7 +352,12 @@ def _select_domain_papers(
         record["in_graph_citer_score"] = 0.0
         record["reference_edge_count"] = 0
         record["reference_edge_score"] = 0.0
-        record["recent_arxiv"] = _is_recent_arxiv_paper(record, now=now)
+        paper_date, basis = _paper_date_with_basis(record)
+        if paper_date is None:
+            paper_date, basis = _arxiv_month_date(record), "arxiv_id_month"
+        record["first_public_date"] = paper_date.isoformat() if paper_date else None
+        record["recency_basis"] = basis if paper_date else None
+        record["recent_arxiv"] = _is_recent_arxiv_paper(record, now=now, window_days=recent_window_days)
         record["selection_reason"] = _selection_reason(record, paper_id in intent_rank)
         scored.append(record)
     scored.sort(
@@ -599,6 +614,8 @@ def _build_graph(
     common_references: list[dict[str, Any]],
     refs_by_selected: dict[str, Any],
     intent: str,
+    recent_window_days: int = RECENT_ARXIV_WINDOW_DAYS,
+    as_of_date: date | None = None,
 ) -> dict[str, Any]:
     nodes: dict[str, dict[str, Any]] = {}
     foundation_id = normalize_paper_id(foundation.get("paper_id") or "")
@@ -628,6 +645,8 @@ def _build_graph(
             target_id = normalize_paper_id(paper_key(ref))
             if target_id in node_ids and target_id != source_id:
                 _add_edge(edges, seen_edges, source_id, target_id, relation="cites")
+    current = as_of_date or datetime.now(timezone.utc).date()
+    included = sum(bool(item.get("recent_arxiv")) for item in selected_papers)
     return {
         "schema_version": "arc.domain_graph.v1",
         "intent": intent,
@@ -635,6 +654,14 @@ def _build_graph(
         "nodes": list(nodes.values()),
         "edges": edges,
         "created_at": now_iso(),
+        "recency": {
+            "window_days": recent_window_days,
+            "start_date": (current - timedelta(days=recent_window_days)).isoformat(),
+            "end_date": current.isoformat(),
+            "recency_basis": dict(sorted(Counter(str(item.get("recency_basis") or "unavailable") for item in selected_papers).items())),
+            "included_count": included,
+            "excluded_count": len(selected_papers) - included,
+        },
     }
 
 
@@ -734,7 +761,7 @@ def _is_recent_arxiv_paper(
     if paper_date is None:
         return False
     current = (now or datetime.now(timezone.utc)).date()
-    return paper_date >= current - timedelta(days=window_days)
+    return current - timedelta(days=window_days) <= paper_date <= current
 
 
 def _has_arxiv_id(record: dict[str, Any]) -> bool:
@@ -751,16 +778,16 @@ def _has_arxiv_id(record: dict[str, Any]) -> bool:
 
 
 def _paper_date(record: dict[str, Any]) -> date | None:
-    for key in ("published", "preprint_date", "earliest_date", "created", "updated"):
+    return _paper_date_with_basis(record)[0]
+
+
+def _paper_date_with_basis(record: dict[str, Any]) -> tuple[date | None, str | None]:
+    for key in ("published", "preprint_date", "earliest_date", "created"):
         value = str(record.get(key) or "").strip()
         parsed = _parse_date(value)
         if parsed is not None:
-            return parsed
-    year = record.get("year")
-    try:
-        return date(int(year), 1, 1) if year else None
-    except (TypeError, ValueError):
-        return None
+            return parsed, key
+    return None, None
 
 
 def _parse_date(value: str) -> date | None:

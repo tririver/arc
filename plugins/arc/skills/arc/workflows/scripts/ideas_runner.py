@@ -4,7 +4,9 @@ import argparse
 import copy
 import json
 import os
+import signal
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -230,6 +232,8 @@ def run_ideas(
     base_env: Mapping[str, str] | None = None,
     process_chain: list[str] | None = None,
     evidence_controller: EvidenceControllerCallback | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     ideas_config = config if isinstance(config, IdeasConfig) else load_ideas_config(config)
@@ -266,6 +270,8 @@ def run_ideas(
     atomic_write_json(batch_config_path, batch_config)
     _write_warnings(warnings_path, warnings)
     try:
+        sidechannel_callback = _progress_sidechannel_callback(base_env)
+        effective_progress_callback = _combined_progress_callback(progress_callback, sidechannel_callback)
         batch_kwargs: dict[str, Any] = {
             "json_runner": json_runner,
             "base_env": base_env,
@@ -273,6 +279,10 @@ def run_ideas(
             "dry_run": False,
             "max_concurrent_loops": max_concurrent,
         }
+        if effective_progress_callback is not None:
+            batch_kwargs["progress_callback"] = effective_progress_callback
+        if cancel_check is not None:
+            batch_kwargs["cancel_check"] = cancel_check
         if evidence_controller is not None:
             batch_kwargs["evidence_controller"] = evidence_controller
         elif batch_runner is None:
@@ -389,7 +399,7 @@ def _caller_context(
         domain_cards = _domain_cards(config)
         caller_context["domain_cards"] = domain_cards
         legacy_domain_ids = [
-            str(card.get("domain_id", ""))
+            str(card.get("field_id", ""))
             for card in domain_cards
             if not card.get("summary_capabilities", {}).get("mathematical_opportunities")
         ]
@@ -834,61 +844,48 @@ def _domain_cards(config: IdeasConfig) -> list[dict[str, Any]]:
     manifest = config.domain_manifest
     if not isinstance(manifest, Mapping):
         raise ConfigError("cross-domain ideas require a domain manifest")
-    domains = manifest.get("domains")
-    if not isinstance(domains, list):
-        raise ConfigError(f"{config.domain_manifest_path}.domains must be an array")
-
+    groups = manifest.get("field_groups")
+    packages = manifest.get("domain_packages")
+    if not isinstance(groups, list) or not isinstance(packages, list):
+        raise ConfigError(f"{config.domain_manifest_path}.field_groups must be an array")
+    by_id = {str(item.get("domain_package_id", "")): item for item in packages if isinstance(item, Mapping)}
     cards: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for index, entry in enumerate(domains):
-        if not isinstance(entry, Mapping):
-            raise ConfigError(f"{config.domain_manifest_path}.domains[{index}] must be an object")
-        domain_id = str(entry.get("domain_id", "")).strip()
-        if domain_id in seen:
-            continue
-        seen.add(domain_id)
-        summary_path = _domain_summary_path(config, entry=entry, index=index)
-        summary = _read_json(summary_path)
-        summary_version = str(summary.get("schema_version", "")).strip()
-        if summary_version not in {"arc.domain_summary.v4", "arc.domain_summary.v5"}:
-            raise ConfigError(
-                f"{summary_path}.schema_version must be arc.domain_summary.v4 or arc.domain_summary.v5"
-            )
-        supports_mathematical_opportunities = summary_version == "arc.domain_summary.v5"
-        mathematical_opportunities: dict[str, Any] = {"well_defined_problems": []}
-        if supports_mathematical_opportunities:
-            raw_opportunities = summary.get("mathematical_opportunities")
-            validation_error = mathematical_opportunities_validation_error(raw_opportunities)
-            if validation_error is not None:
-                raise ConfigError(
-                    f"{summary_path}.mathematical_opportunities is invalid for v5: {validation_error}"
-                )
-            mathematical_opportunities = copy.deepcopy(dict(raw_opportunities))
-        summary_domain_id = str(summary.get("domain_id", "")).strip()
-        if summary_domain_id != domain_id:
-            raise ConfigError(
-                f"domain manifest entry {domain_id!r} points to summary for {summary_domain_id!r}: {summary_path}"
-            )
-        cards.append(
-            {
-                "domain_id": domain_id,
-                "seed_paper": str(entry.get("seed_paper", "")).strip(),
-                "title": str(entry.get("title") or summary.get("domain_title") or domain_id).strip(),
-                "overview": summary.get("overview") or summary.get("brief_introduction", ""),
-                "task_focus": summary.get("task_focus", {}),
-                "methodology": summary.get("methodology", []),
-                "known_solved_cases": summary.get("known_solved_cases", []),
-                "open_axes_for_new_work": summary.get("open_axes_for_new_work", []),
-                "mathematical_opportunities": mathematical_opportunities,
-                "summary_schema_version": summary_version,
-                "summary_capabilities": {
-                    "mathematical_opportunities": supports_mathematical_opportunities,
-                },
-                "summary_json_path": str(summary_path),
-            }
-        )
+    for index, group in enumerate(groups):
+        if not isinstance(group, Mapping):
+            raise ConfigError(f"{config.domain_manifest_path}.field_groups[{index}] must be an object")
+        field_id = str(group.get("field_id", "")).strip()
+        field_card = group.get("field_card")
+        if not field_id or not isinstance(field_card, Mapping):
+            raise ConfigError(f"{config.domain_manifest_path}.field_groups[{index}] requires field_id and field_card")
+        versions = []
+        opportunities: list[Any] = []
+        for package_index, package_id in enumerate(group.get("domain_package_ids", [])):
+            package = by_id.get(str(package_id))
+            if not isinstance(package, Mapping): raise ConfigError(f"field {field_id!r} references unknown package {package_id!r}")
+            summary_path = _domain_summary_path(config, entry=package, index=package_index)
+            summary = _read_json(summary_path)
+            version = str(summary.get("schema_version", "")).strip()
+            if version not in {"arc.domain_summary.v4", "arc.domain_summary.v5"}:
+                raise ConfigError(f"{summary_path}.schema_version must be arc.domain_summary.v4 or arc.domain_summary.v5")
+            if str(summary.get("domain_id", "")).strip() != str(package_id):
+                raise ConfigError(f"package {package_id!r} points to summary for another package: {summary_path}")
+            versions.append(version)
+            if version == "arc.domain_summary.v5":
+                raw = summary.get("mathematical_opportunities")
+                validation_error = mathematical_opportunities_validation_error(raw)
+                if validation_error is not None: raise ConfigError(f"{summary_path}.mathematical_opportunities is invalid for v5: {validation_error}")
+                opportunities.extend(copy.deepcopy(raw.get("well_defined_problems", [])))
+        supports = isinstance(versions, list) and bool(versions) and all(item == "arc.domain_summary.v5" for item in versions)
+        card = copy.deepcopy(dict(field_card))
+        card.update({
+            "field_id": field_id,
+            "domain_package_ids": list(group.get("domain_package_ids", [])),
+            "summary_capabilities": {"mathematical_opportunities": supports},
+            "mathematical_opportunities": {"well_defined_problems": opportunities},
+        })
+        cards.append(card)
     if len(cards) < 2:
-        raise ConfigError("cross-domain ideas require at least two distinct domain cards")
+        raise ConfigError("cross-domain ideas require at least two distinct field cards")
     return cards
 
 
@@ -955,6 +952,42 @@ def _read_config_file(path: str) -> dict[str, Any]:
     return payload
 
 
+def _progress_sidechannel_callback(
+    base_env: Mapping[str, str] | None,
+) -> Callable[[dict[str, Any]], None] | None:
+    environment = base_env if base_env is not None else os.environ
+    raw = str(environment.get("ARC_JOB_PROGRESS_FILE", "")).strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    lock = threading.Lock()
+
+    def append_progress(event: dict[str, Any]) -> None:
+        payload = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+
+    return append_progress
+
+
+def _combined_progress_callback(
+    first: Callable[[dict[str, Any]], None] | None,
+    second: Callable[[dict[str, Any]], None] | None,
+) -> Callable[[dict[str, Any]], None] | None:
+    callbacks = tuple(item for item in (first, second) if item is not None)
+    if not callbacks:
+        return None
+
+    def emit(event: dict[str, Any]) -> None:
+        for callback in callbacks:
+            callback(dict(event))
+
+    return emit
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ARC ideas workflow helper")
     parser.add_argument("--config", required=True)
@@ -965,10 +998,27 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    result = run_ideas(
-        _read_config_file(args.config),
-        dry_run=args.dry_run,
-    )
+    cancel_event = threading.Event()
+    installed_handlers: dict[int, Any] = {}
+
+    def request_cancel(_signum: int, _frame: Any) -> None:
+        cancel_event.set()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            installed_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_cancel)
+        except (ValueError, OSError):
+            pass
+    try:
+        result = run_ideas(
+            _read_config_file(args.config),
+            dry_run=args.dry_run,
+            cancel_check=cancel_event.is_set,
+        )
+    finally:
+        for signum, handler in installed_handlers.items():
+            signal.signal(signum, handler)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     else:
@@ -978,7 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
         table = result.get("round_score_table", {}).get("markdown")
         if table:
             print(table)
-    return 0 if result.get("status") != "failed" else 1
+    return 1 if result.get("status") in {"failed", "cancelled", "needs_llm"} else 0
 
 
 if __name__ == "__main__":

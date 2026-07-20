@@ -6,6 +6,10 @@ from typing import Any
 from .call_record import ARC_LLM_CALL_RECORD_FIELD
 
 
+class CodexSchemaError(ValueError):
+    """Raised before provider invocation for an unsupported strict schema."""
+
+
 _SCHEMA_MAP_KEYS = ("$defs", "definitions", "dependentSchemas", "patternProperties", "properties")
 _SCHEMA_KEYS = (
     "additionalItems",
@@ -35,6 +39,55 @@ def to_provider_json_schema(schema: dict[str, Any] | None) -> dict[str, Any] | N
     normalized = deepcopy(schema)
     _normalize_schema_node(normalized)
     return normalized
+
+
+def validate_codex_strict_schema(schema: dict[str, Any] | None) -> None:
+    """Reject schemas Codex structured output cannot accept."""
+
+    if schema is None:
+        return
+    errors: list[str] = []
+    _validate_codex_node(schema, path="$", errors=errors)
+    if errors:
+        raise CodexSchemaError("Codex strict JSON schema is invalid: " + "; ".join(errors))
+
+
+def _validate_codex_node(node: Any, *, path: str, errors: list[str]) -> None:
+    if isinstance(node, list):
+        for index, child in enumerate(node):
+            _validate_codex_node(child, path=f"{path}[{index}]", errors=errors)
+        return
+    if not isinstance(node, dict):
+        return
+    if _is_object_schema(node):
+        properties = node.get("properties", {})
+        if not isinstance(properties, dict):
+            errors.append(f"{path}.properties must be an object")
+        else:
+            required = node.get("required")
+            if properties and not isinstance(required, list):
+                errors.append(f"{path}.required must list every property")
+            elif isinstance(required, list):
+                names = {item for item in required if isinstance(item, str)}
+                missing = sorted(set(properties) - names)
+                if missing:
+                    errors.append(f"{path}.required is missing {missing}")
+        if node.get("additionalProperties") is not False:
+            errors.append(f"{path}.additionalProperties must be false")
+    for key in _SCHEMA_MAP_KEYS:
+        value = node.get(key)
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                _validate_codex_node(child, path=f"{path}.{key}.{child_key}", errors=errors)
+    for key in _SCHEMA_KEYS:
+        value = node.get(key)
+        if isinstance(value, dict):
+            _validate_codex_node(value, path=f"{path}.{key}", errors=errors)
+    for key in _SCHEMA_LIST_KEYS:
+        value = node.get(key)
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                _validate_codex_node(child, path=f"{path}.{key}[{index}]", errors=errors)
 
 
 def _normalize_schema_node(node: Any) -> None:

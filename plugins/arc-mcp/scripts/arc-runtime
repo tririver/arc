@@ -11,6 +11,9 @@ uv_bin_override="${ARC_INSTALL_UV:-}"
 python_bin="${ARC_INSTALL_PYTHON_BIN:-python3}"
 retry_requested="${ARC_INSTALL_RETRY:-0}"
 
+ARC_HOME="${ARC_HOME:-${HOME:?HOME is required}/.codex/arc}"
+export ARC_HOME
+
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 component_root="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
 profile_file="${script_dir}/.arc-runtime-profile"
@@ -316,7 +319,8 @@ local_checkout_identity() {
   printf 'root=%s;revision=%s;content=%s\n' "$canonical_root" "$revision" "$content_hash"
 }
 
-runtime_home="${ARC_RUNTIME_HOME:-${HOME:?HOME is required}/.codex/arc/runtimes}"
+runtime_home="${ARC_RUNTIME_HOME:-${ARC_HOME}/runtimes}"
+export ARC_RUNTIME_HOME="$runtime_home"
 constraints_hash="$(sha256_file "$constraints_file")"
 python_fingerprint="$(python_identity)"
 if [ "$resolved_source" = "local" ]; then
@@ -681,9 +685,23 @@ if [ "$management_command" = "doctor" ]; then
   printf 'python=%s\n' "$python_fingerprint"
   printf 'constraints_sha256=%s\n' "$constraints_hash"
   printf 'runtime=%s\n' "$runtime_dir"
+  printf 'arc_home=%s\n' "$ARC_HOME"
+  printf 'paper_cache=%s\n' "${ARC_PAPER_CACHE:-${ARC_HOME}/cache/arc-paper}"
+  printf 'domain_cache=%s\n' "${ARC_DOMAIN_CACHE:-${ARC_HOME}/cache/arc-domain}"
+  printf 'llm_cache=%s\n' "${ARC_LLM_CACHE:-${ARC_HOME}/cache/arc-llm}"
+  printf 'jobs=%s\n' "${ARC_JOBS_DIR:-${ARC_HOME}/jobs}"
+  printf 'llm_tmp=%s\n' "${ARC_LLM_TMP_DIR:-${ARC_HOME}/tmp/arc-llm}"
+  printf 'migrations=%s\n' "${ARC_HOME}/migrations"
   printf 'venv=%s\n' "$venv_dir"
   printf 'ready_file=%s\n' "$ready_file"
   if runtime_ready; then
+    if [ -x "${venv_dir}/bin/python" ] && "${venv_dir}/bin/python" -c 'import arc_jobs.runtime' >/dev/null 2>&1; then
+      "${venv_dir}/bin/python" -m arc_jobs.runtime doctor
+    else
+      printf 'migration=unavailable\n'
+      printf 'host=unknown\n'
+      printf 'provider=manual\n'
+    fi
     printf 'status=ready\n'
     exit 0
   fi
@@ -706,6 +724,21 @@ fi
 if [ "$management_command" = "setup" ]; then
   printf 'ARC %s runtime ready: %s\n' "$selected_profile" "$runtime_dir"
   exit 0
+fi
+
+if [ -x "${venv_dir}/bin/python" ] && "${venv_dir}/bin/python" -c 'import arc_jobs.runtime' >/dev/null 2>&1; then
+  if [ "$resolved_source" = "local" ]; then
+    ARC_MIGRATION_SOURCE_ROOT="$repo_root" "${venv_dir}/bin/python" -m arc_jobs.runtime prepare >/dev/null
+  else
+    "${venv_dir}/bin/python" -m arc_jobs.runtime prepare >/dev/null
+  fi
+  if [ -z "${ARC_AGENT_HOST:-}" ]; then
+    detected_agent_host="$("${venv_dir}/bin/python" -m arc_jobs.runtime host)"
+    if [ -n "$detected_agent_host" ] && [ "$detected_agent_host" != "unknown" ]; then
+      ARC_AGENT_HOST="$detected_agent_host"
+      export ARC_AGENT_HOST
+    fi
+  fi
 fi
 
 exec "${venv_dir}/bin/${tool_name}" "$@"

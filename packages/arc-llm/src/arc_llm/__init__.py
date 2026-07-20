@@ -3,6 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 
 from .call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA_VERSION, strip_arc_llm_call_records
+from .cancellation import install_signal_cancel_chain
 from .evidence import (
     EVIDENCE_REQUESTS_FIELD,
     MAX_EVIDENCE_ROUNDS,
@@ -53,6 +54,7 @@ __all__ = [
     "detect_host",
     "allow_evidence_requests",
     "evidence_requests_from_output",
+    "install_signal_cancel_chain",
     "resolve_llm_config",
     "resolve_evidence_round",
     "resolve_model",

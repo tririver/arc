@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
-from arc_llm.providers.base import LLMWorkerError
+from arc_llm.providers.base import LLMSchemaError, LLMWorkerError
 from arc_llm.providers import claude_cli as claude_module
 from arc_llm.providers import codex_cli as codex_module
 from arc_llm.providers.claude_cli import ClaudeCliProvider
@@ -80,6 +80,25 @@ def test_codex_provider_writes_provider_safe_schema(monkeypatch, tmp_path):
     assert result == {"ok": True}
     assert ARC_LLM_CALL_RECORD_FIELD not in captured["schema"]["properties"]
     assert captured["schema"]["additionalProperties"] is False
+
+
+def test_codex_invalid_strict_schema_is_typed_nonretryable_before_request(monkeypatch):
+    monkeypatch.setattr(
+        "arc_llm.providers.codex_cli._run_codex",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("provider request must not start")),
+    )
+
+    with pytest.raises(LLMSchemaError, match="required is missing") as caught:
+        CodexCliProvider(env={}).generate_json(
+            "prompt",
+            schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": [],
+            },
+        )
+
+    assert caught.value.retryable is False
 
 
 def test_codex_generate_json_without_schema_omits_output_schema(monkeypatch):
@@ -830,7 +849,7 @@ def test_claude_strict_mode_raises_on_result_json_array(monkeypatch):
         ClaudeCliProvider().generate_json_result("prompt", schema={"type": "object"}, output_recovery="strict")
 
 
-def test_claude_structured_output_retry_error_recovered_in_warn_mode(monkeypatch):
+def test_claude_structured_output_retry_error_is_not_recovered_in_warn_mode(monkeypatch):
     def fake_run(cmd, **kwargs):
         payload = {
             "type": "result",
@@ -844,16 +863,13 @@ def test_claude_structured_output_retry_error_recovered_in_warn_mode(monkeypatch
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    response = ClaudeCliProvider().generate_json_result(
-        "prompt",
-        schema={"type": "object"},
-        model="deepseek-v4-flash",
-        output_recovery="warn",
-    )
-
-    assert response.value == {}
-    assert response.structured_output["provider_error_type"] == "error_max_structured_output_retries"
-    assert response.usage.cache_read_input_tokens == 100
+    with pytest.raises(LLMWorkerError, match="error_max_structured_output_retries"):
+        ClaudeCliProvider().generate_json_result(
+            "prompt",
+            schema={"type": "object"},
+            model="deepseek-v4-flash",
+            output_recovery="warn",
+        )
 
 
 def test_claude_nonzero_mcp_failure_still_raises_in_warn_mode(monkeypatch):

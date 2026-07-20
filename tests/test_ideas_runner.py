@@ -231,6 +231,40 @@ def test_ideas_launches_three_round_loop_without_postprocessing(tmp_path: Path) 
     assert result["warnings_summary"]["cache_warning_count"] == 1
 
 
+def test_ideas_forwards_cancel_and_progress_to_job_sidechannel(tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    progress_path = tmp_path / "job-progress.jsonl"
+    observed: dict[str, Any] = {}
+
+    def fake_batch_runner(batch_config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        kwargs["progress_callback"]({"event": "round_started", "loop_id": "domain_idea_001"})
+        assert kwargs["cancel_check"]() is True
+        run_root = Path(batch_config["run_dir"]) / batch_config["run_id"]
+        return {"status": "cancelled", "run_id": batch_config["run_id"], "run_root": str(run_root), "loops": []}
+
+    result = runner.run_ideas(
+        {
+            "schema_version": "arc.workflow.ideas.config.v1",
+            "run_id": "ideas_cancelled",
+            "run_dir": str(project_dir / "ideas"),
+            "project_dir": str(project_dir),
+            "user_intent": "intent",
+            "variant_config_dir": str(WJ),
+            "loops_per_variant": 1,
+        },
+        batch_runner=fake_batch_runner,
+        base_env={"ARC_JOB_PROGRESS_FILE": str(progress_path)},
+        cancel_check=lambda: True,
+    )
+
+    assert result["status"] == "cancelled"
+    assert callable(observed["progress_callback"])
+    assert json.loads(progress_path.read_text(encoding="utf-8"))["event"] == "round_started"
+
+
 def test_ideas_default_controller_resolves_arc_paper_metadata(tmp_path: Path, monkeypatch: Any) -> None:
     runner = _load_runner_module()
     project_dir = tmp_path / "project"
@@ -596,7 +630,7 @@ def test_explicit_missing_manifest_fails_instead_of_silently_using_single_domain
         )
 
 
-def test_duplicate_manifest_domain_ids_use_single_domain_route(tmp_path: Path) -> None:
+def test_v1_manifest_requires_regeneration(tmp_path: Path) -> None:
     runner = _load_runner_module()
     project_dir = tmp_path / "project"
     domain_dir = project_dir / "domain"
@@ -607,8 +641,8 @@ def test_duplicate_manifest_domain_ids_use_single_domain_route(tmp_path: Path) -
     }
     (domain_dir / "domain-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
-    parsed = runner.load_ideas_config(
-        {
+    with pytest.raises(runner.ConfigError, match="regenerate"):
+        runner.load_ideas_config({
             "schema_version": "arc.workflow.ideas.config.v1",
             "run_id": "ideas_test",
             "run_dir": str(project_dir / "ideas"),
@@ -617,11 +651,7 @@ def test_duplicate_manifest_domain_ids_use_single_domain_route(tmp_path: Path) -
             "variant_config_dir": str(WJ),
             "variant_glob": "ideas-*.variant.json",
             "loops_per_variant": 1,
-        }
-    )
-
-    assert parsed.research_scope == "single_domain"
-    assert [variant.variant_id for variant in parsed.variants] == ["domain"]
+        })
 
 
 def test_invalid_domain_manifest_fails_before_materializing_ideas(tmp_path: Path) -> None:
@@ -634,7 +664,7 @@ def test_invalid_domain_manifest_fails_before_materializing_ideas(tmp_path: Path
         encoding="utf-8",
     )
 
-    with pytest.raises(runner.ConfigError, match="schema_version must be arc.workflow.domain_manifest.v1"):
+    with pytest.raises(runner.ConfigError, match="schema_version must be arc.workflow.domain_manifest.v2"):
         runner.load_ideas_config(
             {
                 "schema_version": "arc.workflow.ideas.config.v1",
@@ -715,10 +745,9 @@ def test_cross_domain_manifest_routes_to_structured_profiles_and_contract(tmp_pa
     ]
     cards = loops[0]["caller_context"]["domain_cards"]
     assert loops[0]["caller_context"]["generation_mode"] == "cross_domain"
-    assert [card["domain_id"] for card in cards] == ["domain-a", "domain-b"]
+    assert [card["field_id"] for card in cards] == ["field-a", "field-b"]
     assert cards[0]["task_focus"]["research_scope"] == "scope a"
     assert cards[1]["methodology"] == [{"name": "method b"}]
-    assert cards[0]["summary_schema_version"] == "arc.domain_summary.v4"
     assert cards[0]["summary_capabilities"] == {"mathematical_opportunities": False}
     assert cards[0]["mathematical_opportunities"] == {"well_defined_problems": []}
     assert "legacy_domain_summary_without_mathematical_opportunities" in "\n".join(result["warnings"])
@@ -755,7 +784,7 @@ def test_cross_domain_cards_accept_mixed_v4_v5_summaries(tmp_path: Path) -> None
     project_dir = tmp_path / "project"
     _write_cross_domain_manifest(project_dir)
     manifest = json.loads((project_dir / "domain/domain-manifest.json").read_text(encoding="utf-8"))
-    v5_path = project_dir / manifest["domains"][1]["summary_json_path"]
+    v5_path = project_dir / manifest["domain_packages"][1]["summary_json_path"]
     v5 = json.loads(v5_path.read_text(encoding="utf-8"))
     v5["schema_version"] = "arc.domain_summary.v5"
     v5["mathematical_opportunities"] = {
@@ -788,6 +817,9 @@ def test_cross_domain_cards_accept_mixed_v4_v5_summaries(tmp_path: Path) -> None
         ]
     }
     v5_path.write_text(json.dumps(v5), encoding="utf-8")
+    manifest["field_groups"][1]["field_card"]["summary_schema_versions"] = ["arc.domain_summary.v5"]
+    manifest["field_groups"][1]["field_card"]["mathematical_opportunities"] = v5["mathematical_opportunities"]
+    (project_dir / "domain/domain-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     parsed = runner.load_ideas_config(
         {
             "schema_version": "arc.workflow.ideas.config.v1",
@@ -803,7 +835,6 @@ def test_cross_domain_cards_accept_mixed_v4_v5_summaries(tmp_path: Path) -> None
     cards = ideas[0].caller_context["domain_cards"]
 
     assert cards[0]["summary_capabilities"]["mathematical_opportunities"] is False
-    assert cards[1]["summary_schema_version"] == "arc.domain_summary.v5"
     assert cards[1]["summary_capabilities"]["mathematical_opportunities"] is True
     assert cards[1]["mathematical_opportunities"] == v5["mathematical_opportunities"]
 
@@ -814,7 +845,7 @@ def test_cross_domain_cards_reject_unknown_summary_schema(tmp_path: Path, schema
     project_dir = tmp_path / "project"
     _write_cross_domain_manifest(project_dir)
     manifest = json.loads((project_dir / "domain/domain-manifest.json").read_text(encoding="utf-8"))
-    summary_path = project_dir / manifest["domains"][0]["summary_json_path"]
+    summary_path = project_dir / manifest["domain_packages"][0]["summary_json_path"]
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["schema_version"] = schema_version
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
@@ -838,7 +869,7 @@ def test_cross_domain_cards_reject_incomplete_v5_summary(tmp_path: Path) -> None
     project_dir = tmp_path / "project"
     _write_cross_domain_manifest(project_dir)
     manifest = json.loads((project_dir / "domain/domain-manifest.json").read_text(encoding="utf-8"))
-    summary_path = project_dir / manifest["domains"][0]["summary_json_path"]
+    summary_path = project_dir / manifest["domain_packages"][0]["summary_json_path"]
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["schema_version"] = "arc.domain_summary.v5"
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
@@ -893,7 +924,7 @@ def test_cross_domain_rejects_manifest_summary_domain_mismatch(tmp_path: Path) -
     _write_cross_domain_manifest(project_dir)
     manifest_path = project_dir / "domain" / "domain-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["domains"][0]["summary_json_path"] = manifest["domains"][1]["summary_json_path"]
+    manifest["domain_packages"][0]["summary_json_path"] = manifest["domain_packages"][1]["summary_json_path"]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     parsed = runner.load_ideas_config(
         {
@@ -931,7 +962,7 @@ def test_cross_domain_worker_schemas_are_strict_and_source_to_target(tmp_path: P
     _assert_strict_objects(proposer["output_schema"])
     _assert_strict_objects(reviewer)
     roles = proposer["output_schema"]["properties"]["domain_roles"]
-    assert roles["required"] == ["source_domain_id", "target_domain_id", "supporting_domain_ids"]
+    assert roles["required"] == ["source_field_id", "target_field_id", "supporting_field_ids"]
     assessment = reviewer["properties"]["review_payload"]["properties"]["cross_domain_assessment"]
     assert "transfer_signature" in assessment["required"]
     assert assessment["properties"]["target_contribution_status"]["enum"] == [
@@ -1280,7 +1311,8 @@ def _workflow_dir_with_reviewer_tier(tmp_path: Path, tier: str) -> Path:
 def _write_cross_domain_manifest(project_dir: Path) -> None:
     domain_dir = project_dir / "domain"
     domain_dir.mkdir(parents=True)
-    domains = []
+    packages = []
+    groups = []
     for suffix in ("a", "b"):
         summary_path = domain_dir / f"{suffix}_domain_summary.json"
         summary_path.write_text(
@@ -1298,20 +1330,52 @@ def _write_cross_domain_manifest(project_dir: Path) -> None:
             ),
             encoding="utf-8",
         )
-        domains.append(
+        packages.append(
             {
-                "domain_id": f"domain-{suffix}",
+                "domain_package_id": f"domain-{suffix}",
                 "seed_paper": f"seed:{suffix}",
                 "title": f"Domain {suffix.upper()}",
                 "summary_json_path": f"domain/{summary_path.name}",
             }
         )
+        groups.append({
+            "field_id": f"field-{suffix}",
+            "domain_package_ids": [f"domain-{suffix}"],
+            "field_card": {
+                "seed_papers": [f"seed:{suffix}"],
+                "titles": [f"Domain {suffix.upper()}"],
+                "overviews": [f"overview {suffix}"],
+                "task_focus": {"research_scope": f"scope {suffix}"},
+                "methodology": [{"name": f"method {suffix}"}],
+                "known_solved_cases": [{"case": f"case {suffix}"}],
+                "open_axes_for_new_work": [{"axis": f"axis {suffix}"}],
+                "mathematical_opportunities": {"well_defined_problems": []},
+                "summary_schema_versions": ["arc.domain_summary.v4"],
+                "summary_json_paths": [f"domain/{summary_path.name}"],
+                "summary_markdown_paths": [f"domain/{suffix}_domain_summary.md"],
+                "paper_json_pack_paths": [f"domain/{suffix}_paper_json_pack.json"],
+            },
+        })
+        (domain_dir / f"{suffix}_domain_summary.md").write_text("# Domain\n", encoding="utf-8")
+        (domain_dir / f"{suffix}_paper_json_pack.json").write_text("{}\n", encoding="utf-8")
+    grouping = {
+        "schema_version": "arc.workflow.domain_field_grouping.v1",
+        "field_groups": [
+            {"field_id": item["field_id"], "domain_package_ids": item["domain_package_ids"]}
+            for item in groups
+        ],
+    }
+    (domain_dir / "field-grouping.json").write_text(json.dumps(grouping), encoding="utf-8")
     (domain_dir / "domain-manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": "arc.workflow.domain_manifest.v1",
-                "domain_count": 2,
-                "domains": domains,
+                "schema_version": "arc.workflow.domain_manifest.v2",
+                "package_count": 2,
+                "domain_packages": packages,
+                "field_count": 2,
+                "field_groups": groups,
+                "research_scope": "cross_domain",
+                "grouping_artifact": "domain/field-grouping.json",
             }
         ),
         encoding="utf-8",

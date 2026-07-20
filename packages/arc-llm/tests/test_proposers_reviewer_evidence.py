@@ -235,6 +235,7 @@ def test_reviewer_receives_its_controller_response_on_the_next_turn(tmp_path: Pa
                     "request_id": "reviewer_001-section",
                     "operation": "paper.section",
                     "arguments": {"paper_id": "0911.3380", "section": "S2"},
+                    "reason": "inspect normalization",
                 }
             ]
         return output
@@ -274,7 +275,7 @@ def test_malformed_worker_request_fails_the_loop_deterministically(tmp_path: Pat
     )
 
     assert result["status"] == "failed"
-    assert "evidence operation is required" in result["loops"][0]["error"]
+    assert "missing required fields" in result["loops"][0]["error"]
 
 
 def test_final_round_request_is_not_resolved_without_a_followup_turn(tmp_path: Path) -> None:
@@ -284,6 +285,7 @@ def test_final_round_request_is_not_resolved_without_a_followup_turn(tmp_path: P
                 "request_id": "proposer_001-final",
                 "operation": "paper.metadata",
                 "arguments": {"paper_id": "0911.3380"},
+                "reason": "inspect metadata",
             }
         ]
     )
@@ -321,6 +323,7 @@ def test_controller_is_never_called_after_three_evidence_rounds(tmp_path: Path) 
                 "request_id": f"proposer_001-round-{round_number}",
                 "operation": "paper.search",
                 "arguments": {"round": round_number},
+                "reason": "inspect nearby work",
             }
         ]
     )

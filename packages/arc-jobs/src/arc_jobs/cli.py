@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import time
 from typing import Any
@@ -117,23 +118,40 @@ def _watch(
     progress_jsonl: bool,
 ) -> int:
     seen_event_keys: set[tuple[Any, Any, Any]] = set()
-    while True:
-        status = manager.status(job_id)
-        if progress_jsonl:
-            events = status.get("events") if isinstance(status.get("events"), list) else []
-            for event in events:
-                key = (event.get("at"), event.get("event"), event.get("schema_version"))
-                if key not in seen_event_keys:
-                    _emit_jsonl({"job_id": job_id, **event})
-                    seen_event_keys.add(key)
-        elif not json_output:
-            _print_human_status(status)
-        if status.get("status") in TERMINAL_STATUSES or status.get("status") == "job_unknown":
-            response = manager.result(job_id)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupt_watch(signum, frame):
+        del signum, frame
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt_watch)
+    try:
+        while True:
+            status = manager.status(job_id)
             if progress_jsonl:
-                return _emit_jsonl(response, failure=response.get("ok") is not True)
-            return _emit(response, json_output=json_output, failure=response.get("ok") is not True)
-        time.sleep(max(0.1, interval))
+                events = status.get("events") if isinstance(status.get("events"), list) else []
+                for event in events:
+                    key = (event.get("event_id"), event.get("at"), event.get("event"))
+                    if key not in seen_event_keys:
+                        _emit_jsonl({"job_id": job_id, **event})
+                        seen_event_keys.add(key)
+            elif not json_output:
+                _print_human_status(status)
+            if status.get("status") in TERMINAL_STATUSES or status.get("status") == "job_unknown":
+                response = manager.result(job_id)
+                if progress_jsonl:
+                    return _emit_jsonl(response, failure=response.get("ok") is not True)
+                return _emit(response, json_output=json_output, failure=response.get("ok") is not True)
+            time.sleep(max(0.1, interval))
+    except KeyboardInterrupt:
+        manager.cancel(job_id)
+        manager.wait(job_id, timeout=5.0)
+        response = manager.result(job_id)
+        if progress_jsonl:
+            return _emit_jsonl(response, failure=True)
+        return _emit(response, json_output=json_output, failure=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _emit_jsonl(data: Any, *, failure: bool = False) -> int:

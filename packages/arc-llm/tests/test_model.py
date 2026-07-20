@@ -4,8 +4,10 @@ from arc_llm.model import (
     DEFAULT_MODEL_TIER,
     VALID_MODEL_TIERS,
     ModelTierError,
+    KIMI_TIER_UNMAPPED_WARNING,
     reasoning_effort_for_model_tier,
     resolve_model,
+    resolve_model_with_warnings,
 )
 
 
@@ -57,6 +59,27 @@ def test_model_tier_aliases_can_be_overridden_by_env():
     assert resolve_model("codex-cli", model_tier="max", env=env) == "codex-max-custom"
     assert resolve_model("codex-cli", model_tier="high", env=env) == "codex-high-custom"
     assert resolve_model("claude-cli", model_tier="low", env=env) == "claude-low-custom"
+
+
+def test_kimi_model_tier_uses_only_explicit_alias_or_default_model():
+    mapped = resolve_model_with_warnings(
+        "kimi-code-cli",
+        model_tier="high",
+        env={"ARC_LLM_KIMI_HIGH_MODEL": "kimi-high-alias"},
+    )
+    fallback = resolve_model_with_warnings("kimi-code-cli", model_tier="high", env={})
+
+    assert mapped.model == "kimi-high-alias"
+    assert mapped.warnings == ()
+    assert fallback.model == "default_model"
+    assert fallback.warnings == (KIMI_TIER_UNMAPPED_WARNING,)
+
+
+def test_kimi_exact_model_does_not_report_unmapped_tier():
+    resolution = resolve_model_with_warnings("kimi-code-cli", "kimi-explicit", model_tier="max", env={})
+
+    assert resolution.model == "kimi-explicit"
+    assert resolution.warnings == ()
 
 
 def test_model_tier_aliases_use_process_env_when_env_not_passed(monkeypatch):

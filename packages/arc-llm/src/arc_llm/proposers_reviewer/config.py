@@ -43,6 +43,7 @@ class WorkerConfig:
     model_tier: str | None
     runtime: dict[str, Any]
     evidence_enabled: bool
+    worker_call_timeout_seconds: float | None
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,7 @@ class BatchConfig:
     evidence: EvidenceOptions
     session: SessionOptions
     loops: list[LoopConfig]
+    worker_call_timeout_seconds: float | None
 
 
 def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
@@ -127,6 +129,12 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
     max_concurrent_loops = _positive_int(data.get("max_concurrent_loops", 1), "max_concurrent_loops")
     fail_fast = _bool(data.get("fail_fast", False), "fail_fast")
+    raw_batch_timeout = data.get("worker_call_timeout_seconds")
+    worker_call_timeout_seconds = (
+        _positive_float(raw_batch_timeout, "worker_call_timeout_seconds")
+        if raw_batch_timeout is not None
+        else None
+    )
     artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
     output_recovery = _parse_output_recovery(data.get("output_recovery", {}))
     evidence = _parse_evidence_options(data.get("evidence", {}))
@@ -173,6 +181,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
         evidence=evidence,
         session=batch_session,
         loops=loops,
+        worker_call_timeout_seconds=worker_call_timeout_seconds,
     )
 
 
@@ -391,6 +400,14 @@ def _parse_worker(
         model_tier=model_tier,
         runtime=runtime,
         evidence_enabled=evidence_enabled,
+        worker_call_timeout_seconds=(
+            _positive_float(
+                worker_data.get("worker_call_timeout_seconds"),
+                f"{field_name}.{worker_id}.worker_call_timeout_seconds",
+            )
+            if worker_data.get("worker_call_timeout_seconds") is not None
+            else None
+        ),
     )
 
 
@@ -544,6 +561,16 @@ def _positive_int(value: Any, field_name: str) -> int:
         raise ConfigError(f"{field_name} must be a positive integer") from exc
     if parsed <= 0:
         raise ConfigError(f"{field_name} must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: Any, field_name: str) -> float:
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise ConfigError(f"{field_name} must be a positive number") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{field_name} must be a positive number")
     return parsed
 
 

@@ -188,5 +188,28 @@ def test_live_partner_selector_requires_strict_source_mode(tmp_path: Path, monke
         module.select_partner(anchor, user_intent="intent")
 
 
+def test_v2_manifest_anchor_preserves_field_and_package_provenance(tmp_path: Path) -> None:
+    module = _load_module()
+    path = tmp_path / "domain-manifest.json"
+    card = {"titles": ["Anchor"], "seed_papers": ["seed:a"]}
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.workflow.domain_manifest.v2",
+                "field_groups": [
+                    {"field_id": "field-a", "domain_package_ids": ["package-a", "package-b"], "field_card": card}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    anchor = module._anchor_field(module._read_object(path), source_path=path, requested_field_id=None)
+
+    assert anchor["field_id"] == "field-a"
+    assert anchor["domain_package_ids"] == ["package-a", "package-b"]
+    assert anchor["field_card"] == card
+
+
 def _seed(index: int) -> str:
     return f"arXiv:2401.{index + 1:05d}"

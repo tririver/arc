@@ -246,6 +246,9 @@ def test_rank_run_includes_unstructured_round_without_marks(tmp_path: Path) -> N
     review_dir = round_root / "reviews"
     proposer_dir.mkdir(parents=True)
     review_dir.mkdir(parents=True)
+    (run_root / "loops/domain_idea_001/state.json").write_text(
+        json.dumps({"status": "completed"}), encoding="utf-8"
+    )
     (proposer_dir / "proposer_001.json").write_text(
         json.dumps(
             {
@@ -266,6 +269,24 @@ def test_rank_run_includes_unstructured_round_without_marks(tmp_path: Path) -> N
     assert entry["title"] == "Output did not satisfy the requested JSON schema."
     assert entry["marks"]["total_score"] == 0
     assert all(value == 0 for value in entry["marks"].values())
+
+
+def test_rank_run_admits_degraded_and_excludes_failed_loops(tmp_path: Path) -> None:
+    ranker = _load_rank_module()
+    run_root = tmp_path / "ideas" / "run_001"
+    marks = {"user_intent_relevance": 1, "novelty": 1, "confidence_of_novelty": 1,
+             "scientific_value": 1, "planning": 1, "problem_well_definedness": 1, "total_score": 6}
+    _write_round(run_root, "degraded", 1, title="usable", marks=marks)
+    _write_round(run_root, "failed", 1, title="must not rank", marks={**marks, "total_score": 99})
+    (run_root / "loops/degraded/state.json").write_text(json.dumps({"status": "degraded"}), encoding="utf-8")
+    (run_root / "loops/failed/state.json").write_text(json.dumps({"status": "failed", "error": "reviewer failed"}), encoding="utf-8")
+
+    payload = ranker.rank_run(run_root)
+
+    assert [item["loop_id"] for item in payload["ranking"]] == ["degraded"]
+    assert payload["degraded_loops"] == ["degraded"]
+    assert payload["excluded_loops"][0]["status"] == "failed"
+    assert "DEGRADED IDEAS BATCH" in ranker.markdown_table(payload)
 
 
 def test_single_domain_rank_uses_feasibility_gate_before_score(tmp_path: Path) -> None:
@@ -751,7 +772,7 @@ def _write_single_round(
 
 def _write_cross_config(run_root: Path, loop_ids: list[str]) -> None:
     run_root.mkdir(parents=True, exist_ok=True)
-    cards = [{"domain_id": "domain-a"}, {"domain_id": "domain-b"}]
+    cards = [{"field_id": "field-a"}, {"field_id": "field-b"}]
     (run_root / "config.json").write_text(
         json.dumps(
             {
@@ -783,8 +804,8 @@ def _cross_assessment(
     legacy_compatibility_failures: list[str] | None = None,
 ) -> dict[str, Any]:
     assessment = {
-        "source_domain_id": "domain-a",
-        "target_domain_id": "domain-b",
+        "source_field_id": "field-a",
+        "target_field_id": "field-b",
         "transfer_status": transfer_status,
         "target_contribution_status": target_contribution_status,
         "source_ingredient_validity": "valid",
@@ -838,9 +859,9 @@ def _write_cross_round(
         marks=marks,
         proposer_extra={
             "domain_roles": {
-                "source_domain_id": "domain-a",
-                "target_domain_id": "domain-b",
-                "supporting_domain_ids": [],
+                "source_field_id": "field-a",
+                "target_field_id": "field-b",
+                "supporting_field_ids": [],
             }
         },
         review_extra={"review_payload": {"marks": marks, "cross_domain_assessment": assessment}},
@@ -858,10 +879,15 @@ def _write_round(
     review_extra: dict[str, Any] | None = None,
 ) -> None:
     round_root = run_root / "loops" / loop_id / "rounds" / f"round_{round_number:03d}"
+    state_path = run_root / "loops" / loop_id / "state.json"
     proposer_dir = round_root / "proposer_outputs"
     review_dir = round_root / "reviews"
     proposer_dir.mkdir(parents=True, exist_ok=True)
     review_dir.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"status": "completed", "loop_id": loop_id, "rounds_completed": round_number}),
+        encoding="utf-8",
+    )
     proposer_payload = {
         "title": title,
         "idea_summary": "summary",

@@ -36,7 +36,7 @@ def test_pair_manifest_freezes_selected_domains_and_provenance(tmp_path: Path) -
             (domain_dir / f"{prefix}_{suffix}").write_text(f"{prefix} {suffix}\n", encoding="utf-8")
         domains.append(
             {
-                "domain_id": domain_id,
+                "domain_package_id": domain_id,
                 "seed_paper": seed,
                 "title": prefix,
                 "summary_json_path": f"domain/{prefix}_domain_summary.json",
@@ -48,9 +48,13 @@ def test_pair_manifest_freezes_selected_domains_and_provenance(tmp_path: Path) -
     domain_manifest.write_text(
         json.dumps(
             {
-                "schema_version": "arc.workflow.domain_manifest.v1",
+                "schema_version": "arc.workflow.domain_manifest.v2",
                 "user_intent": "intent",
-                "domains": domains,
+                "domain_packages": domains,
+                    "field_groups": [
+                        {"field_id": "field-anchor", "domain_package_ids": ["anchor-id"], "field_card": {"seed_papers": ["seed:anchor"]}},
+                        {"field_id": "field-partner", "domain_package_ids": ["partner-id"], "field_card": {"seed_papers": ["seed:partner"]}},
+                ],
             }
         ),
         encoding="utf-8",
@@ -60,7 +64,7 @@ def test_pair_manifest_freezes_selected_domains_and_provenance(tmp_path: Path) -
         json.dumps(
             {
                 "schema_version": "arc.workflow.cross_domain_partner_selection.v1",
-                "anchor": {"domain_id": "anchor-id"},
+                "anchor": {"field_id": "field-anchor"},
                 "selected_candidate": {"representative_seed": "SEED:PARTNER"},
             }
         ),
@@ -88,9 +92,9 @@ def test_pair_manifest_freezes_selected_domains_and_provenance(tmp_path: Path) -
     )
 
     assert payload["frozen"] is True
-    assert payload["anchor"]["domain_id"] == "anchor-id"
-    assert payload["partner"]["seed_paper"] == "seed:partner"
-    assert len(payload["anchor"]["artifacts"]["summary_json_path"]["sha256"]) == 64
+    assert payload["anchor"]["field_id"] == "field-anchor"
+    assert payload["partner"]["domain_packages"][0]["seed_paper"] == "seed:partner"
+    assert len(payload["anchor"]["domain_packages"][0]["artifacts"]["summary_json_path"]["sha256"]) == 64
     assert payload["source_provenance"]["repo_root"] == str(tmp_path)
 
 

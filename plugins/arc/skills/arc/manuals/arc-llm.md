@@ -18,10 +18,15 @@ installed, marketplace-cached, or other-checkout ARC modules instead of using a
 fallback runtime. Record the exact source state before the run with:
 
 ```bash
+<skill-dir>/scripts/arc-runtime setup --profile core
 python3 <skill-dir>/workflows/scripts/verify-source-runtime.py \
   --repo-root <checkout-root> \
   --output <project-dir>/source-provenance.json
 ```
+
+The first command is the exact core-runtime setup required by the verifier.
+When the verifier starts under system Python, it re-executes itself with that
+installed runtime's Python before loading checkout sources and dependencies.
 
 ## Provider Diagnosis
 
@@ -29,9 +34,9 @@ python3 <skill-dir>/workflows/scripts/verify-source-runtime.py \
 Step 1: Run:
 
 ```bash
-arc-llm doctor host
-arc-llm doctor provider
-arc-llm doctor config
+arc-llm doctor host --json
+arc-llm doctor provider --json
+arc-llm doctor config --json
 ```
 
 ### Phase 2: Check package-level provider detection if paper summaries fail.
@@ -47,18 +52,41 @@ Expected plugin environment:
 ```text
 Codex: ARC_AGENT_HOST=codex
 Claude Code: ARC_AGENT_HOST=claude-code
+Kimi Code: ARC_AGENT_HOST=kimi-code
 ```
 
 With `--provider auto`, ARC uses only host-native providers: Codex selects
-`codex-cli`, Claude Code selects `claude-cli`, and unknown hosts select
-`manual`. `arc-llm` does not read provider config files, API-key files, or
-URL-based provider definitions.
+`codex-cli`, Claude Code selects `claude-cli`, Kimi Code selects the
+experimental `kimi-code-cli`, and unknown hosts select `manual`. Kimi Code is
+also detected from the `@moonshot-ai/kimi-code` package name or a reliable
+`kimi` parent-process signal. An explicit `--provider kimi-code-cli` works from
+another host. `arc-llm` does not add URL-based provider definitions or inspect
+Kimi credential values.
 
-ARC internal workers disable MCP and inherited MCP configuration. They receive
-local paper evidence from the owning controller and may use explicitly enabled
-internet access. Generic `arc-llm` callers may still opt into their own MCP
-configuration, but this is an advanced provider feature and not an ARC
-workflow default.
+The Kimi provider requires the Node.js/TypeScript Kimi Code CLI `>=0.28.0` and
+an existing authentication created with `kimi login`. It uses `kimi acp` over
+stdin/stdout JSON-RPC. ARC does not use the argv-based `kimi -p` transport and
+does not add an OpenAI-compatible API provider.
+
+`kimi-code-cli` is experimental. Before the first Kimi call in a process ARC
+prints this warning:
+
+> `kimi-code-cli is experimental and inherits Kimi Code configuration, instructions, skills, hooks, plugins, MCP, tool permissions, and persistent sessions; it may access the network, run commands, and modify files.`
+
+ARC denies ACP permission and filesystem reverse requests, but this is not a
+sandbox. Kimi's own automatic approvals, instructions, skills, hooks, plugins,
+MCP servers, and local tools may still access the network, execute commands, or
+modify files. `arc-llm doctor provider` and `arc-llm doctor config` report the
+experimental status, provider-side persistence, missing native usage/schema
+support, and detected risk categories and paths without printing configuration
+values or credentials.
+
+Codex and Claude internal workers disable MCP and inherited MCP configuration.
+They receive local paper evidence from the owning controller and may use
+explicitly enabled internet access. Generic `arc-llm` callers may still opt
+into their own MCP configuration, but this is an advanced provider feature and
+not an ARC workflow default. Kimi is the documented exception: it inherits its
+own configuration even when ARC denies ACP reverse requests.
 
 ## Direct Prompt Tests
 
@@ -67,25 +95,35 @@ Use direct `arc-llm` calls only for debugging or standalone LLM tasks.
 Text output:
 
 ```bash
-arc-llm run-text --prompt "Say hello" --provider auto
+arc-llm run-text --prompt-text "Say hello" --provider auto
 ```
 
 JSON output:
 
 ```bash
-arc-llm run-json --prompt "Return {\"ok\": true}" --schema schema.json --provider auto --json
+arc-llm run-json --prompt-text "Return {\"ok\": true}" --schema schema.json --provider auto --json
 ```
 
-`run-json` appends an `arc_llm_call_record` object to the returned JSON. This
+Use `--prompt-text` for literal text and `--prompt-file` for a UTF-8 file
+(`--prompt-file -` reads stdin). The legacy `--prompt` option remains a
+file/stdin alias for existing callers; it does not interpret its value as
+inline text.
+
+`run-json` appends an `arc_llm_call_record` v3 object to the returned JSON. This
 records the requested provider/model tier, actual provider/model used,
 fallback index, successful attempt number, host signal, and all failed/successful
 attempts for that call. New records also include session policy, session key,
 native session id when available, prompt/schema hashes, and provider usage
-telemetry. Treat this as runtime audit data, not model-generated scientific
-content.
+telemetry. Every record has a `warnings` array. Kimi records stable warnings
+for its experimental status, inherited configuration, provider-side
+persistence, and any model tier that was not actually mapped. Kimi ACP does not
+provide token usage, so all fields in its usage object are null. Treat this as
+runtime audit data, not model-generated scientific content.
 
 ARC normalizes provider-facing JSON schemas to strict object schemas so they
-stay compatible with Codex structured output. Do not ask workers to generate
+stay compatible with Codex structured output. Kimi has no native schema mode;
+ARC appends a canonical JSON Schema prompt contract, then applies relaxed JSON
+parsing, schema validation, and recovery. Do not ask workers to generate
 `arc_llm_call_record`; ARC attaches that audit field after provider output.
 
 Direct calls are stateless by default. For a debugging session that should
@@ -93,7 +131,7 @@ reuse host conversation state, pass all session fields explicitly:
 
 ```bash
 arc-llm run-json \
-  --prompt prompt.txt \
+  --prompt-file prompt.txt \
   --schema schema.json \
   --provider auto \
   --session-policy stateful \
@@ -101,6 +139,13 @@ arc-llm run-json \
   --session-key debug/session_001 \
   --json
 ```
+
+For Kimi, ARC `stateless` means ARC does not reuse a native session ID. Kimi
+Code still creates and persists its own session in its data directory. ARC
+does not copy, migrate, or delete the user's Kimi configuration, credentials,
+or sessions. A new session uses `ARC_KIMI_WORK_DIR`, or the current working
+directory when unset; a stateful resume keeps the cwd stored in the native Kimi
+session.
 
 ## Proposers-Reviewer Loops
 
@@ -218,8 +263,13 @@ explicitly:
 ```bash
 ARC_RUN_LLM_TESTS=1 ARC_RUN_NET_TESTS=1 \
   packages/arc-paper/.venv/bin/python -m pytest \
+  packages/arc-llm/tests/test_cli_smoke_integration.py \
   packages/arc-llm/tests/test_proposers_reviewer_llm_integration.py -q
 ```
+
+The CLI smoke covers stateful structured output and a live Codex evidence
+schema response with `arc_evidence_requests: []`; a successful run confirms
+the strict schema is accepted instead of returning HTTP 400.
 
 Set `ARC_LLM_TEST_PROVIDER` to override the provider for that opt-in run.
 `ARC_LLM_TEST_MODEL` is an exact-model override and requires an explicit
@@ -286,6 +336,13 @@ Exact model names are advanced overrides for project contexts that intentionally
 pin a provider model. Exact `model` requires explicit `provider`; with
 `provider: auto`, use `model_tier`.
 
+For Kimi, set `ARC_LLM_KIMI_LOW_MODEL`,
+`ARC_LLM_KIMI_MEDIUM_MODEL`, `ARC_LLM_KIMI_HIGH_MODEL`, or
+`ARC_LLM_KIMI_MAX_MODEL` to map a tier to a Kimi model alias. Without a mapping,
+Kimi uses its `default_model` alias and the call record warns that the requested
+tier was not actually realized. ARC does not treat a `highspeed` model as a
+higher-quality tier and does not inject `KIMI_MODEL_*` API credentials.
+
 ## Runtime Options
 
 By default ARC keeps provider calls lightweight. Enable extra capability only
@@ -319,6 +376,22 @@ Runtime capability options:
 --claude-effort low
 ```
 
+Kimi runtime environment variables:
+
+```text
+ARC_KIMI_BIN                         Kimi executable; default: kimi
+ARC_KIMI_WORK_DIR                    Working directory for new sessions; default: current directory
+ARC_KIMI_TIMEOUT_SECONDS             Call timeout; falls back to ARC_LLM_TIMEOUT_SECONDS
+ARC_LLM_KIMI_LOW_MODEL               Low-tier model alias
+ARC_LLM_KIMI_MEDIUM_MODEL            Medium-tier model alias
+ARC_LLM_KIMI_HIGH_MODEL              High-tier model alias
+ARC_LLM_KIMI_MAX_MODEL               Max-tier model alias
+```
+
+ARC starts the Kimi subprocess with `KIMI_CODE_NO_AUTO_UPDATE=1`,
+`KIMI_DISABLE_TELEMETRY=1`, and `KIMI_DISABLE_CRON=1`. It preserves the user's
+existing `KIMI_CODE_HOME` and login state.
+
 `--allow-mcp` is an explicit advanced opt-in for standalone LLM tasks using
 caller-configured servers. ARC workflow workers must leave it disabled and use
 controller-supplied evidence. Use `--allow-internet` only when fresh web access
@@ -336,7 +409,10 @@ paper/domain evidence in caller context:
 }
 ```
 
-When MCP is disabled, ARC scrubs inherited user/profile MCP configuration for
-the noninteractive worker. If a worker also needs bounded filesystem access, use
-`codex_sandbox: "workspace-write"` with `codex_work_dir` and `codex_add_dirs`;
-do not use `danger-full-access` for normal research workflows.
+For Codex and Claude, disabling MCP scrubs inherited user/profile MCP
+configuration for the noninteractive worker. Kimi may still inherit its own
+MCP, hooks, plugins, and tool configuration; ACP reverse-request denial is not
+a filesystem or process sandbox. If a Codex worker also needs bounded
+filesystem access, use `codex_sandbox: "workspace-write"` with
+`codex_work_dir` and `codex_add_dirs`; do not use `danger-full-access` for
+normal research workflows.

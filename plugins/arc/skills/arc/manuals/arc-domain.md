@@ -26,13 +26,19 @@ Step 2: Run:
 
 ```bash
 arc-domain init <seed-paper> --intent "<user-intent>" --json
-arc-domain llm-build <seed-paper> --intent "<user-intent>" --json
+arc-domain llm-build <seed-paper> --intent "<user-intent>" \
+  --recent-window-days <days> --as-of-date <YYYY-MM-DD> --json
 ```
 
 Use `--domain-id <id>` when resuming a named domain package, `--refresh` to
 refetch deterministic source data, and `--workers <n>` for parallel paper-data
-work. `arc-domain build` is the same full build surface with provider/model
-options exposed.
+work. The default recent window is 365 days and `as_of_date` defaults to the
+current UTC date; managed runs freeze both values in `context.json`. A request
+for the last two years uses the exact day count back to the corresponding date
+two calendar years earlier. The context keys are `recent_window_days` and
+`as_of_date`; CLI spelling uses `--recent-window-days` and `--as-of-date`.
+`arc-domain build` is the same full build surface
+with provider/model options exposed.
 
 ### Phase 2: Inspect cached artifacts.
 Step 1: Check status and read outputs.
@@ -140,9 +146,20 @@ arc-domain status <seed-paper> --intent "<user-intent>" --json
 
 ## Package Boundary
 
-The domain build includes the selected domain papers and every arXiv paper in
-the domain candidate pool that appeared within the last year. ARC domain logic
-only chooses the cross-paper set and relations.
+The domain build includes the selected papers and recent arXiv papers in the
+configured window. Recency uses the first available public date in this order:
+`published`, `preprint_date`, `earliest_date`, `created`, then the arXiv-id
+month. A later `updated` date never makes an old paper recent. Graph, config,
+and status artifacts record the frozen window, date basis, and counts. Changing
+the window fingerprint rebuilds network, evidence, and summary artifacts while
+preserving the seed-specific package identity.
+
+Project handoff uses `arc.workflow.domain_manifest.v2`. It keeps every
+seed-specific `domain_package_id`, then groups packages into field cards. Only
+`distinct_field` at confidence `0.80` or above creates hard separation;
+uncertain, low-confidence, or failed grouping conservatively merges packages
+and emits a warning. Stable `field_id` values come from package ids and the
+intent fingerprint, not model-generated identifiers.
 
 All single-paper metadata, references, citers, full text, and sections should
 come through `arc-paper`. Do not fetch INSPIRE or ar5iv directly inside domain

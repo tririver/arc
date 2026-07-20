@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Mapping
+
+KIMI_TIER_UNMAPPED_WARNING = "kimi_code_cli.model_tier_unmapped"
 
 PROVIDER_MODEL_TIERS = {
     "codex-cli": {
@@ -36,6 +39,7 @@ PROVIDER_REASONING_EFFORT_TIERS = {
 PROVIDER_MODEL_TIER_ENV_PREFIXES = {
     "codex-cli": "ARC_LLM_CODEX",
     "claude-cli": "ARC_LLM_CLAUDE",
+    "kimi-code-cli": "ARC_LLM_KIMI",
 }
 
 DEFAULT_MODEL_TIER = "medium"
@@ -43,6 +47,7 @@ DEFAULT_MODEL_TIER = "medium"
 DEFAULT_PROVIDER_MODELS = {
     "codex-cli": PROVIDER_MODEL_TIERS["codex-cli"][DEFAULT_MODEL_TIER],
     "claude-cli": PROVIDER_MODEL_TIERS["claude-cli"][DEFAULT_MODEL_TIER],
+    "kimi-code-cli": "default_model",
 }
 
 VALID_MODEL_TIERS = frozenset({"low", "medium", "high", "max"})
@@ -52,6 +57,12 @@ class ModelTierError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class ModelResolution:
+    model: str | None
+    warnings: tuple[str, ...] = ()
+
+
 def resolve_model(
     provider_name: str,
     explicit_model: str | None = None,
@@ -59,12 +70,31 @@ def resolve_model(
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str | None:
+    return resolve_model_with_warnings(
+        provider_name,
+        explicit_model,
+        model_tier=model_tier,
+        env=env,
+    ).model
+
+
+def resolve_model_with_warnings(
+    provider_name: str,
+    explicit_model: str | None = None,
+    *,
+    model_tier: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ModelResolution:
     if explicit_model:
-        return explicit_model
+        return ModelResolution(explicit_model)
     tier = resolve_model_tier(model_tier)
     if tier:
-        return _model_for_tier(provider_name, tier, env=env)
-    return DEFAULT_PROVIDER_MODELS.get(provider_name)
+        model = _model_for_tier(provider_name, tier, env=env)
+        warnings = ()
+        if provider_name == "kimi-code-cli" and _model_tier_env_override(provider_name, tier, env=env) is None:
+            warnings = (KIMI_TIER_UNMAPPED_WARNING,)
+        return ModelResolution(model, warnings)
+    return ModelResolution(DEFAULT_PROVIDER_MODELS.get(provider_name))
 
 
 def resolve_model_tier(explicit_tier: str | None) -> str:

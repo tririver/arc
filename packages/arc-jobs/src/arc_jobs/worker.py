@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,9 @@ from .jobs import (
     persist_result,
     read_job,
     read_json,
+    record_progress,
     release_worker_lock,
+    restored_environment,
     set_error,
     start_running,
     open_private_binary,
@@ -31,11 +34,25 @@ from .jobs import (
 )
 
 
+MAX_PROGRESS_LINE_BYTES = 256 * 1024
+MAX_PROGRESS_FILE_BYTES = 16 * 1024 * 1024
+_SIGNAL_CANCEL_REQUESTED = False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one persisted ARC CLI job")
     parser.add_argument("job_id")
     args = parser.parse_args(argv)
-    return run_job(args.job_id)
+    previous_handlers: dict[int, Any] = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _request_signal_cancel)
+    try:
+        return run_job(args.job_id)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def run_job(job_id: str) -> int:
@@ -58,8 +75,35 @@ def run_job(job_id: str) -> int:
         persisted_command = job.get("command")
         if persisted_command and Path(str(persisted_command)).resolve() != Path(command).resolve():
             raise ValueError("persisted command no longer resolves to the active Python runtime")
-        result, exit_code = _run_command(job_id, normalized_argv, command, cwd=cwd, paths=paths)
+        result, exit_code = _run_command(
+            job_id,
+            normalized_argv,
+            command,
+            cwd=cwd,
+            paths=paths,
+            environment=restored_environment(job.get("environment")),
+        )
         persist_result(job_id, result, paths=paths)
+        output = result.get("output") if isinstance(result, dict) else None
+        reported_status = output.get("status") if isinstance(output, dict) else None
+        if reported_status == "cancelled":
+            set_error(
+                job_id,
+                "job_cancelled",
+                "ARC CLI reported cancellation.",
+                cancelled=True,
+                paths=paths,
+            )
+            return 1
+        if reported_status == "failed":
+            set_error(
+                job_id,
+                "job_command_reported_failure",
+                "ARC CLI reported a failed terminal status.",
+                details={"exit_code": exit_code},
+                paths=paths,
+            )
+            return 1
         if exit_code != 0:
             set_error(
                 job_id,
@@ -69,7 +113,9 @@ def run_job(job_id: str) -> int:
                 paths=paths,
             )
             return 1
-        output = result.get("output") if isinstance(result, dict) else None
+        if reported_status in {"done", "completed", "degraded", "stopped", "needs_llm"}:
+            finish_job(job_id, result, str(reported_status))
+            return 0
         if isinstance(output, dict) and output.get("ok") is False:
             if output.get("status") == "needs_llm":
                 finish_job(job_id, result, "needs_llm")
@@ -102,8 +148,13 @@ def _run_command(
     *,
     cwd: str,
     paths: JobPaths,
+    environment: dict[str, str],
 ) -> tuple[dict[str, Any], int]:
     launch_argv = [command, *argv[1:]]
+    paths.progress_sidechannel.unlink(missing_ok=True)
+    environment = dict(environment)
+    environment["ARC_JOB_PROGRESS_FILE"] = str(paths.progress_sidechannel)
+    progress_offset, progress_buffer = 0, b""
     with open_private_binary(paths.stdout) as stdout, open_private_binary(paths.stderr) as stderr:
         process = subprocess.Popen(
             launch_argv,
@@ -114,6 +165,7 @@ def _run_command(
             close_fds=True,
             shell=False,
             cwd=cwd,
+            env=environment,
         )
         update_status(
             job_id,
@@ -122,12 +174,23 @@ def _run_command(
             process={**_process_record(process.pid), "argv": argv, "command": command},
         )
         append_event(job_id, {"event": "command_started", "pid": process.pid}, paths=paths)
-        while process.poll() is None:
-            if is_cancel_requested(job_id):
-                _terminate_process(process)
-                raise JobCancelled("ARC job cancellation was requested; command was terminated.")
-            time.sleep(0.1)
-        exit_code = int(process.returncode or 0)
+        try:
+            while process.poll() is None:
+                progress_offset, progress_buffer = _drain_progress(
+                    job_id, paths, offset=progress_offset, buffer=progress_buffer
+                )
+                if is_cancel_requested(job_id) or _SIGNAL_CANCEL_REQUESTED:
+                    raise JobCancelled(
+                        "ARC job cancellation was requested; command was terminated."
+                    )
+                time.sleep(0.1)
+            exit_code = int(process.returncode or 0)
+            _drain_progress(
+                job_id, paths, offset=progress_offset, buffer=progress_buffer, final=True
+            )
+        except BaseException:
+            _terminate_process(process)
+            raise
 
     output = _read_json_output(paths.stdout)
     result: dict[str, Any] = {
@@ -144,6 +207,72 @@ def _run_command(
         result["output"] = output
     append_event(job_id, {"event": "command_finished", "exit_code": exit_code}, paths=paths)
     return result, exit_code
+
+
+def _request_signal_cancel(signum: int, frame: Any) -> None:
+    del signum, frame
+    global _SIGNAL_CANCEL_REQUESTED
+    _SIGNAL_CANCEL_REQUESTED = True
+
+
+def _drain_progress(
+    job_id: str,
+    paths: JobPaths,
+    *,
+    offset: int,
+    buffer: bytes,
+    final: bool = False,
+) -> tuple[int, bytes]:
+    try:
+        size = paths.progress_sidechannel.stat().st_size
+    except OSError:
+        return offset, buffer
+    if size > MAX_PROGRESS_FILE_BYTES or size < offset:
+        raise ValueError("ARC job progress side-channel is invalid or too large")
+    with paths.progress_sidechannel.open("rb") as handle:
+        handle.seek(offset)
+        chunk = handle.read()
+    offset += len(chunk)
+    lines = (buffer + chunk).split(b"\n")
+    buffer = lines.pop()
+    if final and buffer:
+        lines.append(buffer)
+        buffer = b""
+    for raw in lines:
+        if not raw.strip():
+            continue
+        if len(raw) > MAX_PROGRESS_LINE_BYTES:
+            raise ValueError("ARC job progress event exceeded its size limit")
+        try:
+            event = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("ARC job progress event is not valid JSON") from exc
+        record_progress(job_id, _validated_progress_event(event))
+    return offset, buffer
+
+
+def _validated_progress_event(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("ARC job progress event must be an object")
+    event = value.get("event")
+    if not isinstance(event, str) or not event or len(event) > 128:
+        raise ValueError("ARC job progress event requires a short event name")
+    schema_version = value.get("schema_version")
+    if schema_version not in {None, "arc.llm.proposers_reviewer.progress.v1"}:
+        raise ValueError("ARC job progress event has an unsupported schema_version")
+    forbidden = {"job_id", "status", "environment", "argv", "command"}
+    if forbidden & value.keys():
+        raise ValueError("ARC job progress event contains reserved fields")
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ARC job progress event must contain JSON values") from exc
+    if len(encoded.encode("utf-8")) > MAX_PROGRESS_LINE_BYTES:
+        raise ValueError("ARC job progress event exceeded its size limit")
+    sanitized = dict(value)
+    sanitized.pop("schema_version", None)
+    sanitized.pop("updated_at", None)
+    return sanitized
 
 
 def _validated_cwd(value: Any) -> str:

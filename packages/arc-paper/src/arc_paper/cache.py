@@ -80,10 +80,10 @@ class CachePaths:
 def cache_root() -> Path:
     if value := os.environ.get("ARC_PAPER_CACHE"):
         return Path(value).expanduser()
+    if value := os.environ.get("ARC_HOME"):
+        return Path(value).expanduser() / "cache" / "arc-paper"
     if value := os.environ.get("XDG_CACHE_HOME"):
         return Path(value).expanduser() / "arc" / "arc-paper"
-    if project_root := _project_root():
-        return project_root / "cache" / "arc-paper"
     return Path.home() / ".cache" / "arc" / "arc-paper"
 
 
@@ -235,10 +235,3 @@ def _is_fresh(path: Path, *, ttl_seconds: int | None) -> bool:
 
 def _unique_tmp_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{os.getpid()}.{get_ident()}.{time.time_ns()}.tmp")
-
-
-def _project_root() -> Path | None:
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "packages" / "arc-paper" / "pyproject.toml").is_file():
-            return parent
-    return None

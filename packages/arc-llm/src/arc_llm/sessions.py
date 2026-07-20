@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import time
 from contextlib import contextmanager
@@ -300,7 +301,7 @@ def runtime_fingerprint(
     env: Mapping[str, str] | None,
     process_chain: Sequence[str] | None = None,
 ) -> str:
-    env = env or {}
+    env = os.environ if env is None and provider == "kimi-code-cli" else (env or {})
     interesting = {
         key: env.get(key)
         for key in sorted(
@@ -354,7 +355,35 @@ def runtime_fingerprint(
         "file_hashes": _runtime_file_hashes(env),
         "process_chain": list(process_chain or []),
     }
+    if provider_runtime := _provider_runtime_values(provider, env):
+        payload["provider_runtime"] = provider_runtime
     return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _provider_runtime_values(provider: str, env: Mapping[str, str]) -> dict[str, Any]:
+    if provider != "kimi-code-cli":
+        return {}
+    binary = (env.get("ARC_KIMI_BIN") or "kimi").strip() or "kimi"
+    search_path = env.get("PATH", os.defpath)
+    resolved_binary = shutil.which(binary, path=search_path)
+    work_dir = Path(env.get("ARC_KIMI_WORK_DIR") or os.getcwd()).expanduser().resolve(strict=False)
+    provider_timeout = env.get("ARC_KIMI_TIMEOUT_SECONDS")
+    effective_timeout = (
+        provider_timeout
+        if provider_timeout is not None and provider_timeout.strip()
+        else env.get("ARC_LLM_TIMEOUT_SECONDS")
+    )
+    return {
+        "binary": binary,
+        "resolved_binary": resolved_binary,
+        "work_dir": str(work_dir),
+        "kimi_code_home": env.get("KIMI_CODE_HOME"),
+        "model_mappings": {
+            tier: env.get(f"ARC_LLM_KIMI_{tier.upper()}_MODEL")
+            for tier in ("low", "medium", "high", "max")
+        },
+        "timeout_seconds": effective_timeout,
+    }
 
 
 def _runtime_file_hashes(env: Mapping[str, str]) -> dict[str, list[dict[str, Any]]]:

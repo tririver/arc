@@ -31,33 +31,34 @@ def build_pair_manifest(
         _require_fresh_repo_path(path, repo_root=repo_root)
     domain_manifest = _read_object(domain_manifest_path)
     selection = _read_object(partner_selection_path)
-    if domain_manifest.get("schema_version") != "arc.workflow.domain_manifest.v1":
+    if domain_manifest.get("schema_version") == "arc.workflow.domain_manifest.v1":
+        raise PairManifestError("domain manifest v1 must be regenerated with semantic field grouping")
+    if domain_manifest.get("schema_version") != "arc.workflow.domain_manifest.v2":
         raise PairManifestError("domain manifest has the wrong schema_version")
-    if selection.get("schema_version") != "arc.workflow.cross_domain_partner_selection.v1":
+    if selection.get("schema_version") not in {
+        "arc.workflow.cross_domain_partner_selection.v1",
+        "arc.workflow.cross_domain_partner_selection.v2",
+    }:
         raise PairManifestError("partner selection has the wrong schema_version")
-    domains = domain_manifest.get("domains")
-    if not isinstance(domains, list):
-        raise PairManifestError("domain manifest domains must be an array")
-    distinct = {str(item.get("domain_id", "")).strip() for item in domains if isinstance(item, dict)}
-    distinct.discard("")
-    if len(distinct) != 2:
-        raise PairManifestError("a frozen cross-domain benchmark pair requires exactly two distinct domains")
+    domains, fields = domain_manifest.get("domain_packages"), domain_manifest.get("field_groups")
+    if not isinstance(domains, list) or not isinstance(fields, list):
+        raise PairManifestError("domain manifest requires domain_packages and field_groups")
+    if len(fields) != 2:
+        raise PairManifestError("a frozen cross-domain benchmark pair requires exactly two distinct fields")
 
     anchor_data = selection.get("anchor")
     selected = selection.get("selected_candidate")
     if not isinstance(anchor_data, dict) or not isinstance(selected, dict):
         raise PairManifestError("partner selection is missing anchor or selected_candidate")
-    anchor_id = str(anchor_data.get("domain_id", "")).strip()
+    anchor_id = str(anchor_data.get("field_id", "")).strip()
     partner_seed = str(selected.get("representative_seed", "")).strip()
     if not anchor_id or not partner_seed:
         raise PairManifestError("partner selection does not identify the anchor domain and selected seed")
 
     project_dir = domain_manifest_path.parent.parent
-    anchor_entry = next(
-        (item for item in domains if isinstance(item, dict) and item.get("domain_id") == anchor_id),
-        None,
-    )
-    partner_entry = next(
+    by_package = {str(item.get("domain_package_id", "")): item for item in domains if isinstance(item, dict)}
+    anchor_entry = next((item for item in fields if isinstance(item, dict) and item.get("field_id") == anchor_id), None)
+    partner_package = next(
         (
             item
             for item in domains
@@ -68,10 +69,12 @@ def build_pair_manifest(
     )
     if anchor_entry is None:
         raise PairManifestError(f"anchor domain {anchor_id!r} is absent from domain manifest")
-    if partner_entry is None:
+    if partner_package is None:
         raise PairManifestError(f"selected partner seed {partner_seed!r} is absent from domain manifest")
-    if anchor_entry.get("domain_id") == partner_entry.get("domain_id"):
-        raise PairManifestError("anchor and partner resolve to the same domain")
+    partner_id = str(partner_package.get("domain_package_id", ""))
+    partner_entry = next((item for item in fields if isinstance(item, dict) and partner_id in item.get("domain_package_ids", [])), None)
+    if partner_entry is None or anchor_entry.get("field_id") == partner_entry.get("field_id"):
+        raise PairManifestError("anchor and partner resolve to the same field")
 
     provenance = {
         "path": str(source_provenance_path),
@@ -86,30 +89,32 @@ def build_pair_manifest(
         "domain_manifest": {"path": str(domain_manifest_path), "sha256": _sha256(domain_manifest_path)},
         "partner_selection": {"path": str(partner_selection_path), "sha256": _sha256(partner_selection_path)},
         "source_provenance": provenance,
-        "anchor": _frozen_domain(project_dir, anchor_entry, repo_root=repo_root),
-        "partner": _frozen_domain(project_dir, partner_entry, repo_root=repo_root),
+        "anchor": _frozen_field(project_dir, anchor_entry, by_package=by_package, repo_root=repo_root),
+        "partner": _frozen_field(project_dir, partner_entry, by_package=by_package, repo_root=repo_root),
     }
 
 
-def _frozen_domain(project_dir: Path, entry: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
-    artifacts = {}
-    for field in ("summary_json_path", "summary_markdown_path", "paper_json_pack_path"):
-        raw = str(entry.get(field, "")).strip()
-        if not raw:
-            raise PairManifestError(f"domain {entry.get('domain_id')!r} is missing {field}")
-        path = Path(raw).expanduser()
-        if not path.is_absolute():
-            path = project_dir / path
-        path = path.resolve()
-        if not path.is_file():
-            raise PairManifestError(f"frozen domain artifact does not exist: {path}")
-        _require_fresh_repo_path(path, repo_root=repo_root)
-        artifacts[field] = {"path": str(path), "sha256": _sha256(path)}
+def _frozen_field(project_dir: Path, entry: dict[str, Any], *, by_package: dict[str, dict[str, Any]], repo_root: Path) -> dict[str, Any]:
+    frozen_packages = []
+    for package_id in entry.get("domain_package_ids", []):
+        package = by_package.get(str(package_id))
+        if package is None: raise PairManifestError(f"field references unknown package {package_id!r}")
+        artifacts = {}
+        for field in ("summary_json_path", "summary_markdown_path", "paper_json_pack_path"):
+            raw = str(package.get(field, "")).strip()
+            path = (Path(raw).expanduser() if Path(raw).is_absolute() else project_dir / raw).resolve()
+            if not path.is_file(): raise PairManifestError(f"frozen domain artifact does not exist: {path}")
+            _require_fresh_repo_path(path, repo_root=repo_root)
+            artifacts[field] = {"path": str(path), "sha256": _sha256(path)}
+        frozen_packages.append({"domain_package_id": package_id, "seed_paper": package.get("seed_paper", ""), "artifacts": artifacts})
+    card = entry.get("field_card")
+    if not isinstance(card, dict):
+        raise PairManifestError(f"field {entry.get('field_id')!r} is missing field_card provenance")
     return {
-        "domain_id": str(entry.get("domain_id", "")),
-        "seed_paper": str(entry.get("seed_paper", "")),
-        "title": str(entry.get("title", "")),
-        "artifacts": artifacts,
+        "field_id": str(entry.get("field_id", "")),
+        "field_card": card,
+        "domain_package_ids": [str(item) for item in entry.get("domain_package_ids", [])],
+        "domain_packages": frozen_packages,
     }
 
 

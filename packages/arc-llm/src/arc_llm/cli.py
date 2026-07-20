@@ -3,29 +3,42 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Mapping
 
 from .cache_audit import audit_run
 from .host import detect_host, select_llm_provider
+from .paths import llm_cache_root
 from .proposers_reviewer.template_materializer import materialize_batch
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
 from .proposers_reviewer_bench.runner import run_proposers_reviewer_bench
-from .runner import resolve_llm_config, run_json, run_text
+from .providers.registry import provider_diagnostic
+from .runner import LLMNeedsLLM, resolve_llm_config, run_json, run_text
 from .schema_formatter import format_to_schema
 from .sessions import LLMSessionManager
+
+
+_SIGNAL_CANCEL_REQUESTED = threading.Event()
+_PROGRESS_FILE_LOCK = threading.Lock()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    _SIGNAL_CANCEL_REQUESTED.clear()
+    previous_handlers = _install_cancel_signal_handlers()
     try:
-        result = _dispatch(args)
-    except Exception as exc:
-        if not getattr(args, "json", False):
-            raise
-        result = _exception_result(exc)
+        try:
+            result = _dispatch(args)
+        except Exception as exc:
+            if not isinstance(exc, LLMNeedsLLM) and not getattr(args, "json", False):
+                raise
+            result = _exception_result(exc)
+    finally:
+        _restore_signal_handlers(previous_handlers)
     if isinstance(result, str):
         print(result, end="" if result.endswith("\n") else "\n")
     else:
@@ -36,19 +49,32 @@ def main(argv: list[str] | None = None) -> int:
 def _result_succeeded(result: Any) -> bool:
     if not isinstance(result, Mapping):
         return True
-    if result.get("status") == "needs_llm":
+    status = str(result.get("status") or "").strip().lower()
+    if status in {"done", "completed", "degraded", "stopped", "needs_llm"}:
         return True
+    if status in {"cancelled", "error", "failed", "failure"}:
+        return False
     if result.get("ok") is False:
         return False
-    return str(result.get("status") or "").strip().lower() not in {
-        "error",
-        "failed",
-        "failure",
-    }
+    return True
 
 
 def _exception_result(exc: Exception) -> dict[str, Any]:
     """Return the stable failure envelope promised by ``--json`` commands."""
+    if isinstance(exc, LLMNeedsLLM):
+        return {
+            "ok": False,
+            "status": "needs_llm",
+            "llm_task": {
+                "provider_requested": "auto",
+                "provider_resolved": exc.config.provider,
+                "host": exc.config.host.host,
+                "signals": list(exc.config.signals),
+                "message": str(exc),
+            },
+            "errors": [],
+            "meta": {},
+        }
     return {
         "ok": False,
         "status": "error",
@@ -67,7 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_json_parser = sub.add_parser("run-json")
-    run_json_parser.add_argument("--prompt", default="-")
+    _prompt_args(run_json_parser)
     run_json_parser.add_argument("--schema", default=None)
     run_json_parser.add_argument("--provider", default="auto")
     run_json_parser.add_argument("--model", default=None)
@@ -78,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _llm_runtime_args(run_json_parser)
 
     run_text_parser = sub.add_parser("run-text")
-    run_text_parser.add_argument("--prompt", default="-")
+    _prompt_args(run_text_parser)
     run_text_parser.add_argument("--provider", default="auto")
     run_text_parser.add_argument("--model", default=None)
     run_text_parser.add_argument("--model-tier", choices=["max", "high", "medium", "low"], default=None)
@@ -106,6 +132,7 @@ def _build_parser() -> argparse.ArgumentParser:
     loop_parser.add_argument("--history-mode", choices=["auto", "delta", "full"], default=None)
     loop_parser.add_argument("--session-scope-id", default=None)
     loop_parser.add_argument("--max-concurrent-same-prefix", type=int, default=None)
+    loop_parser.add_argument("--timeout-seconds", type=float, default=None)
 
     bench_parser = sub.add_parser("proposers-reviewer-bench")
     bench_parser.add_argument("--config", required=True)
@@ -114,9 +141,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor")
     doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
-    doctor_sub.add_parser("host")
-    doctor_sub.add_parser("provider")
-    doctor_sub.add_parser("config")
+    for doctor_command in ("host", "provider", "config"):
+        doctor_parser = doctor_sub.add_parser(doctor_command)
+        doctor_parser.add_argument("--json", action="store_true")
     cache_audit = sub.add_parser("cache-audit")
     cache_audit.add_argument("run_root")
     materialize = sub.add_parser("materialize-proposers-reviewer")
@@ -131,21 +158,22 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.doctor_command == "provider":
             selected = select_llm_provider()
             return {
-                "provider": selected.provider,
+                **provider_diagnostic(selected.provider),
                 "host": selected.host.host,
                 "signals": selected.signals,
             }
         config = resolve_llm_config()
         return {
-            "provider": config.provider,
+            **provider_diagnostic(config.provider),
             "model": config.model,
             "host": config.host.host,
             "signals": config.signals,
+            "warnings": list(config.warnings),
         }
     if args.command == "run-json":
         session_manager = _session_manager(args)
         return run_json(
-            _read_prompt(args.prompt),
+            _read_prompt_argument(args),
             schema=_read_schema(args.schema),
             provider=args.provider,
             model=args.model,
@@ -157,11 +185,13 @@ def _dispatch(args: argparse.Namespace) -> Any:
             session_name=args.session_name,
             call_label=args.call_label,
             artifact_dir=args.session_root,
+            timeout_seconds=args.timeout_seconds,
+            cancel_check=_job_cancel_check,
         )
     if args.command == "run-text":
         session_manager = _session_manager(args)
         return run_text(
-            _read_prompt(args.prompt),
+            _read_prompt_argument(args),
             provider=args.provider,
             model=args.model,
             model_tier=args.model_tier,
@@ -172,6 +202,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             session_name=args.session_name,
             call_label=args.call_label,
             artifact_dir=args.session_root,
+            timeout_seconds=args.timeout_seconds,
+            cancel_check=_job_cancel_check,
         )
     if args.command == "schema-format":
         return format_to_schema(
@@ -187,10 +219,14 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "proposers-reviewer-loop":
         config = _read_json_file(args.config)
         _apply_loop_session_overrides(config, args)
+        if args.timeout_seconds is not None:
+            config["worker_call_timeout_seconds"] = args.timeout_seconds
         return run_proposers_reviewer_batch(
             config,
             dry_run=args.dry_run,
             max_concurrent_loops=args.max_concurrent_loops,
+            progress_callback=_job_progress_callback(),
+            cancel_check=_job_cancel_check,
         )
     if args.command == "proposers-reviewer-bench":
         return run_proposers_reviewer_bench(
@@ -213,11 +249,89 @@ def _session_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--call-label", default=None)
 
 
+def _prompt_args(parser: argparse.ArgumentParser) -> None:
+    prompts = parser.add_mutually_exclusive_group()
+    prompts.add_argument(
+        "--prompt",
+        default=None,
+        help="Legacy alias for --prompt-file; pass '-' to read stdin.",
+    )
+    prompts.add_argument(
+        "--prompt-file",
+        default=None,
+        help="Read the prompt from this UTF-8 file, or '-' for stdin.",
+    )
+    prompts.add_argument(
+        "--prompt-text",
+        default=None,
+        help="Use this argument verbatim as the prompt text.",
+    )
+
+
 def _session_manager(args: argparse.Namespace):
     if getattr(args, "session_policy", "stateless") != "stateful":
         return None
-    root = Path(args.session_root or ".arc-llm/sessions")
+    root = Path(args.session_root) if args.session_root else llm_cache_root() / "sessions"
     return LLMSessionManager(root)
+
+
+def _install_cancel_signal_handlers() -> dict[int, Any]:
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    previous: dict[int, Any] = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, _request_signal_cancel)
+    return previous
+
+
+def _restore_signal_handlers(previous: Mapping[int, Any]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+def _request_signal_cancel(signum: int, frame: Any) -> None:
+    del signum, frame
+    _SIGNAL_CANCEL_REQUESTED.set()
+
+
+def _job_cancel_check() -> bool:
+    if _SIGNAL_CANCEL_REQUESTED.is_set():
+        return True
+    explicit = os.environ.get("ARC_JOB_CANCEL_FILE")
+    if explicit:
+        return Path(explicit).expanduser().exists()
+    progress = os.environ.get("ARC_JOB_PROGRESS_FILE")
+    return bool(progress) and Path(progress).expanduser().with_name("cancel.request").exists()
+
+
+def _job_progress_callback():
+    raw_path = os.environ.get("ARC_JOB_PROGRESS_FILE")
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+
+    def append(event: dict[str, Any]) -> None:
+        sidechannel_event = {
+            key: value
+            for key, value in event.items()
+            if key not in {"schema_version", "job_id", "environment", "argv", "command"}
+        }
+        if "status" in sidechannel_event:
+            sidechannel_event["run_status"] = sidechannel_event.pop("status")
+        encoded = json.dumps(
+            sidechannel_event,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ) + "\n"
+        with _PROGRESS_FILE_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(encoded)
+                handle.flush()
+
+    return append
 
 
 def _apply_loop_session_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
@@ -243,6 +357,7 @@ def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--timeout-seconds", type=float, default=None)
     parser.add_argument("--codex-sandbox", default=None)
     parser.add_argument("--codex-profile", default=None)
     parser.add_argument("--codex-profile-v2", default=None)
@@ -365,6 +480,12 @@ def _read_prompt(value: str) -> str:
     if value == "-":
         return sys.stdin.read()
     return Path(value).read_text(encoding="utf-8")
+
+
+def _read_prompt_argument(args: argparse.Namespace) -> str:
+    if args.prompt_text is not None:
+        return args.prompt_text
+    return _read_prompt(args.prompt_file or args.prompt or "-")
 
 
 def _read_schema(value: str | None) -> dict[str, Any] | None:

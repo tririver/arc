@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from arc_paper.cache import (
     CachePaths,
@@ -14,26 +13,35 @@ from arc_paper.cache import (
 )
 
 
-def test_cache_root_prefers_arc_env(monkeypatch, tmp_path):
+def test_cache_root_prefers_package_env_over_arc_home_and_xdg(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("ARC_HOME", str(tmp_path / "arc-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     assert cache_root() == tmp_path / "cache"
 
 
-def test_cache_root_uses_xdg_when_arc_env_missing(monkeypatch, tmp_path):
+def test_cache_root_uses_arc_home_before_xdg(monkeypatch, tmp_path):
     monkeypatch.delenv("ARC_PAPER_CACHE", raising=False)
+    monkeypatch.setenv("ARC_HOME", str(tmp_path / "arc-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+
+    assert cache_root() == tmp_path / "arc-home" / "cache" / "arc-paper"
+
+
+def test_cache_root_uses_xdg_when_arc_envs_missing(monkeypatch, tmp_path):
+    monkeypatch.delenv("ARC_PAPER_CACHE", raising=False)
+    monkeypatch.delenv("ARC_HOME", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     assert cache_root() == tmp_path / "xdg" / "arc" / "arc-paper"
 
 
-def test_cache_root_uses_project_cache_in_arc_checkout(monkeypatch):
+def test_cache_root_never_implicitly_uses_source_checkout(monkeypatch, tmp_path):
     monkeypatch.delenv("ARC_PAPER_CACHE", raising=False)
+    monkeypatch.delenv("ARC_HOME", raising=False)
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
-    repo_root = next(
-        parent
-        for parent in Path(__file__).resolve().parents
-        if (parent / "packages" / "arc-paper").is_dir()
-    )
-    assert cache_root() == repo_root / "cache" / "arc-paper"
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+
+    assert cache_root() == tmp_path / "isolated-home" / ".cache" / "arc" / "arc-paper"
 
 
 def test_cache_paths_quote_paper_id(monkeypatch, tmp_path):

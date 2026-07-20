@@ -12,6 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+# Strict source verification imports modules directly from the checkout. Disable
+# bytecode before importing the bootstrap so a bare system-Python invocation
+# cannot write into the portable Skill or package source trees.
+sys.dont_write_bytecode = True
+
 from _arc_script_bootstrap import (
     ARC_PACKAGE_MODULES,
     ARC_REQUIRE_REPO_ROOT,
@@ -20,6 +25,7 @@ from _arc_script_bootstrap import (
 
 
 SCHEMA_VERSION = "arc.workflow.source_provenance.v1"
+RUNTIME_REEXEC_ENV = "ARC_SOURCE_VERIFIER_RUNTIME_REEXEC"
 SKILL_RELATIVE_PATH = Path("plugins/arc/skills/arc")
 HASHED_SUFFIXES = {".json", ".md", ".py"}
 
@@ -173,7 +179,9 @@ def build_provenance(root: Path, extra_files: Sequence[str]) -> dict[str, Any]:
         "repo_root": str(root),
         "git": _git_provenance(root),
         "runtime": {
-            "python_executable": str(Path(sys.executable).resolve()),
+            "python_executable": str(Path(sys.executable).absolute()),
+            "python_realpath": str(Path(sys.executable).resolve()),
+            "sys_prefix": str(Path(sys.prefix).absolute()),
             "python_version": sys.version,
             "require_repo_root_env": os.environ[ARC_REQUIRE_REPO_ROOT],
         },
@@ -182,13 +190,88 @@ def build_provenance(root: Path, extra_files: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _runtime_python(*, launcher: Path | None = None) -> Path:
+    launcher = launcher or Path(__file__).resolve().parents[2] / "scripts" / "arc-runtime"
+    if not launcher.is_file():
+        raise RuntimeError(f"Cannot locate the ARC Skill runtime launcher: {launcher}")
+    completed = subprocess.run(
+        [str(launcher), "doctor", "--profile", "core"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    fields: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key.strip()] = value.strip()
+    if (
+        completed.returncode != 0
+        or fields.get("profile") != "core"
+        or fields.get("status") != "ready"
+        or not fields.get("runtime")
+        or not fields.get("venv")
+        or not fields.get("ready_file")
+        or not fields.get("fingerprint")
+        or not fields.get("constraints_sha256")
+    ):
+        detail = completed.stderr.strip() or completed.stdout.strip() or "runtime not installed"
+        raise RuntimeError(f"ARC core runtime is not ready; doctor reported: {detail}")
+    try:
+        runtime = Path(fields["runtime"]).expanduser().resolve(strict=True)
+        venv = Path(fields["venv"]).expanduser().resolve(strict=True)
+        ready_file = Path(fields["ready_file"]).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("ARC doctor returned inaccessible runtime metadata paths") from exc
+    if not _is_relative_to(venv, runtime) or not _is_relative_to(ready_file, runtime):
+        raise RuntimeError("ARC doctor returned runtime metadata outside its runtime directory")
+    marker: dict[str, str] = {}
+    for line in ready_file.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            marker[key.strip()] = value.strip()
+    if (
+        marker.get("profile") != "core"
+        or marker.get("runtime_fingerprint") != fields["fingerprint"]
+        or marker.get("constraints_sha256") != fields["constraints_sha256"]
+    ):
+        raise RuntimeError("ARC runtime ready marker does not match this Skill's identity")
+    candidates = (venv / "Scripts/python.exe", venv / "bin/python")
+    python = next((item for item in candidates if item.is_file() and os.access(item, os.X_OK)), None)
+    if python is None:
+        raise RuntimeError(f"ARC runtime has no executable Python under {venv}")
+    return python
+
+
+def _reexec_runtime(argv: Sequence[str]) -> None:
+    python = _runtime_python()
+    current = Path(sys.executable).absolute()
+    target = python.absolute()
+    if current == target:
+        return
+    if os.environ.get(RUNTIME_REEXEC_ENV) == "1":
+        raise RuntimeError(
+            "ARC source verifier re-exec guard is set but the active interpreter "
+            f"is {current}, not the doctor-selected runtime {target}"
+        )
+    env = os.environ.copy()
+    env[RUNTIME_REEXEC_ENV] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.execve(str(target), [str(target), str(Path(__file__).resolve()), *argv], env)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = _parser().parse_args(raw_argv)
     root_value = args.repo_root or os.environ.get(ARC_REQUIRE_REPO_ROOT)
     if not root_value:
         raise SystemExit(
             f"error: --repo-root or {ARC_REQUIRE_REPO_ROOT} is required"
         )
+    os.environ[ARC_REQUIRE_REPO_ROOT] = str(Path(root_value).expanduser().resolve())
+    _reexec_runtime(raw_argv)
     record = build_provenance(Path(root_value), args.extra_files)
     payload = json.dumps(record, indent=2, sort_keys=True) + "\n"
     if args.output:

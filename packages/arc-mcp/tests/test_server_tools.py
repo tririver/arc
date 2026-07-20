@@ -733,7 +733,43 @@ def test_fastmcp_tools_have_discovery_metadata():
     assert "summary_batch_retry_failed" in by_name
     provider_description = by_name["llm_generate_summary"].inputSchema["properties"]["provider"]["description"]
     assert "built-in provider" in provider_description
+    assert "kimi-code-cli" in provider_description
+    assert "experimental" in provider_description
     assert "configured provider id" not in provider_description
+
+
+def test_doctor_provider_uses_one_shared_selection(monkeypatch):
+    calls = []
+    selected = SimpleNamespace(
+        provider="kimi-code-cli",
+        host=SimpleNamespace(host="kimi-code"),
+        signals=["env:ARC_AGENT_HOST=kimi-code"],
+    )
+
+    def select_provider():
+        calls.append(True)
+        return selected
+
+    monkeypatch.setattr(server, "select_llm_provider", select_provider)
+
+    result = server.call_tool("doctor_provider", {})
+
+    assert calls == [True]
+    data = result["data"]
+    assert data["provider"] == "kimi-code-cli"
+    assert data["experimental"] is True
+    assert data["supports_sessions"] is True
+    assert data["supports_usage"] is False
+    assert data["supports_native_schema"] is False
+    assert data["provider_side_persistence"] is True
+    assert data["warning_codes"] == [
+        "kimi_code_cli.experimental",
+        "kimi_code_cli.provider_side_persistence",
+        "kimi_code_cli.inherits_user_configuration",
+    ]
+    assert "inherits Kimi Code configuration" in data["risk_warning"]
+    assert data["host"] == "kimi-code"
+    assert data["signals"] == ["env:ARC_AGENT_HOST=kimi-code"]
 
 
 def test_call_tool_dispatches_summary_batch_tools(monkeypatch, tmp_path):

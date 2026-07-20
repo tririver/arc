@@ -32,6 +32,21 @@ def test_parent_process_detects_claude_code():
     assert detected.confidence >= 0.8
 
 
+def test_kimi_code_host_env_selects_native_provider():
+    provider = select_llm_provider(env={"ARC_AGENT_HOST": "kimi-code"}, process_chain=[])
+
+    assert provider.provider == "kimi-code-cli"
+    assert provider.host.host == "kimi-code"
+
+
+def test_parent_process_detects_kimi_code_package_and_command():
+    package = detect_host(env={}, process_chain=["node /opt/@moonshot-ai/kimi-code/dist/index.js"])
+    command = detect_host(env={}, process_chain=["/usr/local/bin/kimi acp"])
+
+    assert package.host == "kimi-code"
+    assert command.host == "kimi-code"
+
+
 def test_provider_selection_ignores_env_provider_override():
     provider = select_llm_provider(
         env={"ARC_AGENT_HOST": "codex", "ARC_LLM_PROVIDER": "external"},

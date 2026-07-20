@@ -31,11 +31,11 @@
       "domain_roles": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source_domain_id", "target_domain_id", "supporting_domain_ids"],
+        "required": ["source_field_id", "target_field_id", "supporting_field_ids"],
         "properties": {
-          "source_domain_id": {"type": "string", "minLength": 1},
-          "target_domain_id": {"type": "string", "minLength": 1},
-          "supporting_domain_ids": {"type": "array", "items": {"type": "string"}}
+          "source_field_id": {"type": "string", "minLength": 1},
+          "target_field_id": {"type": "string", "minLength": 1},
+          "supporting_field_ids": {"type": "array", "items": {"type": "string"}}
         }
       },
       "target_contribution": {"type": "string", "minLength": 1},

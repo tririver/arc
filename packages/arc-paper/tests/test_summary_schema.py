@@ -65,6 +65,13 @@ def test_valid_summary_passes_schema():
     validate_summary(valid_summary())
 
 
+def test_kimi_code_cli_summary_provenance_passes_schema():
+    payload = valid_summary()
+    payload["provenance"]["method"] = "kimi-code-cli"
+
+    validate_summary(payload)
+
+
 def test_missing_title_fails_schema():
     payload = valid_summary()
     payload.pop("title")

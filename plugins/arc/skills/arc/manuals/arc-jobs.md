@@ -21,20 +21,39 @@ run concurrently.
 ```bash
 arc-jobs list --json
 arc-jobs status <job-id> --json
-arc-jobs watch <job-id> --json
+arc-jobs watch <job-id> --progress-jsonl --json
 arc-jobs result <job-id> --json
 arc-jobs cancel <job-id> --json
 ```
 
-Terminal statuses are `done`, `failed`, `cancelled`, and `needs_llm`. A command
-is successful only when its process exit status is zero and the returned JSON
-does not report `ok: false`. Do not cancel a job merely because it is slow.
+Terminal statuses include successful `done`, `completed`, `degraded`,
+`stopped`, and `needs_llm`, plus unsuccessful `failed` and `cancelled`.
+`degraded` preserves usable work, failure counts, and warnings; it is not
+equivalent to a clean completion. A command is successful only when its process exit status is zero
+and the returned JSON does not report `ok: false`. Do not cancel a job merely
+because it is slow.
 Status and cancellation calls use `ok=true` when the control operation itself
 succeeds; `arc-jobs status` still exits nonzero for a failed or cancelled job,
 and `result` carries the command's success or failure envelope.
 
-`ARC_JOBS_CACHE` overrides the persistent job root. This setting is independent
-of optional MCP configuration.
+`ARC_JOBS_DIR` overrides the persistent job root; legacy `ARC_JOBS_CACHE`
+remains an earlier-layout override, and otherwise jobs use `ARC_HOME/jobs`.
+Submission snapshots only the allowlisted ARC runtime, cache,
+host, and timeout context. It never persists tokens, API keys, or arbitrary
+environment variables. This setting is independent of optional MCP
+configuration.
+
+Status includes the latest phase, round, worker counts, and validated progress
+events when the child CLI supplies them. `watch --progress-jsonl` streams those
+events without changing the run. Proposer/reviewer calls have one monotonic
+30-minute (1800-second) budget covering retries and structured-output
+formatting. Set
+`worker_call_timeout_seconds` in a batch config, or `--timeout-seconds` on the
+owning `arc-llm` CLI, for an explicit override.
+
+`SIGINT`, `SIGTERM`, and `arc-jobs cancel` request cancellation and terminate
+the full provider process group before the job reaches terminal `cancelled`.
+Do not treat an unchanged progress timestamp as permission to kill a live job.
 
 ARC stores job directories with user-only permissions. Worker recovery uses a
 PID plus process-start identity lease, not a time-only heartbeat: a silent live

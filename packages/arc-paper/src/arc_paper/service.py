@@ -837,6 +837,7 @@ def doctor_cache(paper_id: str | None = None) -> dict[str, Any]:
         "cache_root": str(cache_root()),
         "env": {
             "ARC_PAPER_CACHE": os.environ.get("ARC_PAPER_CACHE"),
+            "ARC_HOME": os.environ.get("ARC_HOME"),
             "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME"),
             "HOME": os.environ.get("HOME"),
         },

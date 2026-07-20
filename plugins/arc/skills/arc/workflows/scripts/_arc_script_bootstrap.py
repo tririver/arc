@@ -9,6 +9,11 @@ import sysconfig
 from pathlib import Path
 
 
+# Workflow scripts load ARC packages directly from a checkout. Keep all such
+# imports read-only with respect to the Skill and package source trees.
+sys.dont_write_bytecode = True
+
+
 ARC_PACKAGE_MODULES = (
     ("arc-jobs", "arc_jobs"),
     ("arc-llm", "arc_llm"),

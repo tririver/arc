@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from arc_llm.evidence import EVIDENCE_REQUESTS_FIELD, allow_evidence_requests
+
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ARC_RUN_LLM_TESTS") != "1" or os.environ.get("ARC_RUN_NET_TESTS") != "1",
@@ -26,7 +28,7 @@ def test_stateful_run_json_cli_smoke(provider, binary, tmp_path):
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {"ok": {"type": "boolean"}, "round": {"type": "integer"}},
-                "required": ["ok"],
+                "required": ["ok", "round"],
             }
         ),
         encoding="utf-8",
@@ -50,7 +52,7 @@ def test_stateful_run_json_cli_smoke(provider, binary, tmp_path):
     ]
 
     first = subprocess.run(
-        [*base, "--prompt", 'return {"ok": true}'],
+        [*base, "--prompt-text", 'return {"ok": true, "round": 1}'],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -59,7 +61,7 @@ def test_stateful_run_json_cli_smoke(provider, binary, tmp_path):
     )
     assert first.returncode == 0, first.stderr or first.stdout
     second = subprocess.run(
-        [*base, "--prompt", 'now return {"ok": true, "round": 2}'],
+        [*base, "--prompt-text", 'now return {"ok": true, "round": 2}'],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -68,3 +70,46 @@ def test_stateful_run_json_cli_smoke(provider, binary, tmp_path):
     )
     assert second.returncode == 0, second.stderr or second.stdout
     assert (session_root / "calls.jsonl").is_file()
+
+
+def test_codex_evidence_schema_strict_structured_output_smoke(tmp_path):
+    if shutil.which("codex") is None:
+        pytest.skip("codex CLI is not installed")
+    schema = allow_evidence_requests(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+    )
+    assert schema is not None
+    schema_path = tmp_path / "evidence-schema.json"
+    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "arc_llm.cli",
+            "run-json",
+            "--provider",
+            "codex-cli",
+            "--schema",
+            str(schema_path),
+            "--prompt-text",
+            "Return ok=true and arc_evidence_requests as an empty array.",
+            "--json",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "HTTP 400" not in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload[EVIDENCE_REQUESTS_FIELD] == []

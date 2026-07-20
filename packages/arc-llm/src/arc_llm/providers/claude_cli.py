@@ -5,16 +5,36 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.sessions import LLMSessionRef
+from arc_llm.paths import llm_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
 from .base import LLMWorkerError
+from .lifecycle import resolve_worker_call_timeout_seconds, run_process_group
+
+
+def _run_claude(cmd, prompt, *, env, timeout_seconds, deadline, cancel_check):
+    timeout = resolve_worker_call_timeout_seconds(timeout_seconds, env=env, provider="claude-cli")
+    if deadline is not None or cancel_check is not None or timeout_seconds is not None:
+        return run_process_group(
+            cmd, input_text=prompt, env=env,
+            deadline=deadline if deadline is not None else time.monotonic() + timeout,
+            cancel_check=cancel_check,
+        )
+    try:
+        return subprocess.run(
+            cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=dict(env), timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
 
 
 class ClaudeCliProvider:
@@ -43,6 +63,9 @@ class ClaudeCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        cancel_check=None,
     ) -> LLMProviderResponse[dict[str, Any]]:
         schema = schema or {"type": "object"}
         stateful = session_policy == "stateful" and session is not None
@@ -67,31 +90,12 @@ class ClaudeCliProvider:
         if model:
             cmd.extend(["--model", model])
 
-        try:
-            result = subprocess.run(
-                cmd,
-                input=effective_prompt,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=dict(self.env),
-                timeout=_timeout_seconds(self.env, "ARC_CLAUDE_TIMEOUT_SECONDS"),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
+        result = _run_claude(
+            cmd, effective_prompt, env=self.env, timeout_seconds=timeout_seconds,
+            deadline=deadline, cancel_check=cancel_check,
+        )
         _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
-            recovered = _maybe_recover_claude_error_envelope(result.stdout, output_recovery=output_recovery)
-            if recovered is not None:
-                value, usage, returned_session_id, structured_output = recovered
-                return LLMProviderResponse(
-                    value,
-                    usage=usage,
-                    native_session_id=returned_session_id or native_id,
-                    raw_output=result.stdout,
-                    prompt_sent_sha256=sha256_text(effective_prompt),
-                    structured_output=structured_output,
-                )
             raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
         value, usage, returned_session_id, structured_output = _extract_claude_metadata(
             result.stdout,
@@ -117,6 +121,9 @@ class ClaudeCliProvider:
         session: LLMSessionRef | None = None,
         session_policy: str = "stateless",
         artifact_dir: Path | None = None,
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        cancel_check=None,
     ) -> LLMProviderResponse[str]:
         stateful = session_policy == "stateful" and session is not None
         cmd = _base_cmd(self.env, stateful=stateful)
@@ -133,18 +140,10 @@ class ClaudeCliProvider:
         if model:
             cmd.extend(["--model", model])
 
-        try:
-            result = subprocess.run(
-                cmd,
-                input=prompt,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=dict(self.env),
-                timeout=_timeout_seconds(self.env, "ARC_CLAUDE_TIMEOUT_SECONDS"),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
+        result = _run_claude(
+            cmd, prompt, env=self.env, timeout_seconds=timeout_seconds,
+            deadline=deadline, cancel_check=cancel_check,
+        )
         _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
             raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
@@ -450,9 +449,7 @@ def _write_arc_only_mcp_config(env: Mapping[str, str]) -> Path:
 def _arc_only_mcp_config_path(env: Mapping[str, str]) -> Path:
     if value := _env_text(env, "ARC_CLAUDE_ARC_MCP_CONFIG_PATH", ""):
         return Path(value).expanduser()
-    cache_home = env.get("XDG_CACHE_HOME")
-    base = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
-    return base / "arc-llm" / "mcp" / "arc-claude-mcp.json"
+    return llm_cache_root(env) / "mcp" / "arc-claude-mcp.json"
 
 
 def _arc_mcp_command_and_args(env: Mapping[str, str]) -> tuple[str, list[str]]:

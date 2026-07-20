@@ -30,11 +30,12 @@ Step 3: Replace `<run-id>`, `<project-dir>`, `<user_intent>`, and
 `<skill-workflow-json-dir>`.
 
 Set `domain_manifest_path` to
-`<project-dir>/domain/domain-manifest.json`. One distinct `domain_id` preserves
-the established single-domain prompts and scoring. Two or more distinct
-domains select the cross-domain prompts, directed transfer profiles, reviewer
-assessment, and qualification gates. A cross-domain run must not proceed with
-a missing or invalid manifest.
+`<project-dir>/domain/domain-manifest.json`. Manifest v2 routes by
+`field_count`: one field, including multiple seed-specific packages, uses the
+single-domain prompts; two or more fields use cross-domain prompts, directed
+transfer profiles, reviewer assessment, and qualification gates. Cross-domain
+cards and source/target roles use `field_id`. A v1, missing, or invalid
+manifest must be regenerated before cross-domain work.
 
 Step 4: Keep `variant_glob` as `ideas-*.variant.json`. The release package
 runs only enabled variants, then selects only the enabled variant applicable
@@ -69,8 +70,10 @@ provenance in the next worker context. Proposers and reviewers must not invoke
 ARC CLI, shell, or MCP tools themselves. See the controller evidence protocol
 in `manuals/arc-llm.md`.
 
-Step 3: Continue only if the returned status is `completed`. If status is
-`failed`, print `WARNING:` with the error and artifact root.
+Step 3: Continue when status is `completed` or `degraded`. For `degraded`,
+print a prominent `WARNING:` with failed/degraded loop counts and the artifact
+root, then rank only usable loops with valid proposer and reviewer results. If
+status is `failed` or `cancelled`, print `WARNING:` and stop before ranking.
 
 The workflow runner writes this generated batch config before launch:
 
@@ -80,8 +83,9 @@ The workflow runner writes this generated batch config before launch:
 
 For proposer-reviewer artifact ownership and runner result shape, see
 `manuals/arc-llm.md`.
-Final ranked ideas must come from `ideas_runner.py` artifacts and the
-read-only ranking helper, not ad-hoc agent judgment. In cross-domain mode,
+Final ranked ideas must come from `ideas_runner.py` artifacts and the read-only
+ranking helper, not ad-hoc agent judgment. This includes usable loops from a
+degraded batch. In cross-domain mode,
 only candidates marked as genuine transfers with a substantial target-domain
 contribution and a feasible first calculation are eligible for the formal
 ranking. The source domain may contribute a mature method or mechanism without

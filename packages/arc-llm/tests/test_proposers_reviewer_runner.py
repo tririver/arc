@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from arc_llm import runner as core_runner
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.proposers_reviewer.config import load_batch_config
@@ -320,7 +322,7 @@ def test_strict_mode_worker_call_errors_are_saved_as_debug_artifacts(tmp_path):
     assert error["message"] == "simulated provider failure"
 
 
-def test_proposer_exception_does_not_fail_warn_mode_loop(tmp_path):
+def test_proposer_exception_degrades_warn_mode_loop_without_fabricating_output(tmp_path):
     config = base_config(tmp_path, max_rounds=1)
     calls: list[str] = []
 
@@ -344,24 +346,17 @@ def test_proposer_exception_does_not_fail_warn_mode_loop(tmp_path):
     result = run_proposers_reviewer_batch(config, json_runner=failing_proposer, base_env={})
 
     run_root = tmp_path / "ideas/run_001"
-    proposer_output = json.loads(
-        (run_root / "loops/loop_001/rounds/round_001/proposer_outputs/proposer_001.json").read_text(
-            encoding="utf-8"
-        )
+    failed_output = run_root / "loops/loop_001/rounds/round_001/proposer_outputs/proposer_001.json"
+    error = json.loads(
+        (run_root / "loops/loop_001/rounds/round_001/errors/proposer_001.json").read_text(encoding="utf-8")
     )
-    warnings = [
-        json.loads(line)
-        for line in (run_root / "structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
 
-    assert result["status"] == "completed"
+    assert result["status"] == "degraded"
+    assert result["loops"][0]["status"] == "degraded"
     assert "reviewer_001" in calls
-    assert proposer_output["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert proposer_output["role"] == "proposer"
-    assert proposer_output["recovered_unstructured_text"]
-    assert proposer_output[ARC_LLM_CALL_RECORD_FIELD]["call_label"] == "loop/loop_001/round_001/proposer_001"
-    assert warnings[-1]["call_label"] == "loop/loop_001/round_001/proposer_001"
-    assert warnings[-1]["recovery_strategy"] == "worker_exception_continue"
+    assert not failed_output.exists()
+    assert error["call_status"] == "provider_error"
+    assert error["message"] == "simulated proposer failure"
 
 
 def test_worker_env_maps_claude_json_schema_runtime_options(tmp_path):
@@ -491,7 +486,7 @@ def test_failed_loop_does_not_corrupt_successful_loop(tmp_path):
     result = run_proposers_reviewer_batch(config, json_runner=FakeJsonRunner(fail_loop="loop_bad"), base_env={})
 
     statuses = {item["loop_id"]: item["status"] for item in result["loops"]}
-    assert result["status"] == "failed"
+    assert result["status"] == "degraded"
     assert statuses["loop_001"] == "completed"
     assert statuses["loop_bad"] == "failed"
     assert (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").exists()
@@ -584,7 +579,7 @@ def test_review_envelope_requires_review_payload(tmp_path):
     assert "review.review_payload must be an object" in result["loops"][0]["error"]
 
 
-def test_invalid_reviewer_uses_worker_exception_warning_in_warn_mode(tmp_path):
+def test_invalid_reviewer_fails_warn_mode_without_fabricating_recovery(tmp_path):
     def invalid_reviewer(prompt, **kwargs):
         context = _context_from_prompt(prompt)
         if context["worker_id"].startswith("reviewer"):
@@ -603,25 +598,14 @@ def test_invalid_reviewer_uses_worker_exception_warning_in_warn_mode(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_reviewer, base_env={})
 
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    structured = review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]
+    round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
+    error = json.loads((round_root / "errors/reviewer_001.json").read_text(encoding="utf-8"))
 
-    assert result["status"] == "completed"
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review["role"] == "reviewer"
-    assert "review.review_payload must be an object" in review["raw_text"]
-    assert structured["severity"] == "major"
-    assert structured["recovery_strategy"] == "worker_exception_continue"
-    warnings = [
-        json.loads(line)
-        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert warnings[-1]["severity"] == "major"
-    assert warnings[-1]["recovery_strategy"] == "worker_exception_continue"
+    assert result["status"] == "failed"
+    assert result["loops"][0]["status"] == "failed"
+    assert not (round_root / "reviews/reviewer_001.json").exists()
+    assert error["call_status"] == "provider_error"
+    assert "review.review_payload must be an object" in error["message"]
 
 
 def test_review_envelope_rejects_unexpected_proposer_ids(tmp_path):
@@ -649,7 +633,7 @@ def test_review_envelope_rejects_unexpected_proposer_ids(tmp_path):
     assert "review.proposer_messages unexpected: proposer_999" in result["loops"][0]["error"]
 
 
-def test_invalid_reviewer_envelope_is_not_retried_by_reviewer_fallback(tmp_path):
+def test_invalid_reviewer_envelope_fails_without_retry_or_fabricated_review(tmp_path):
     calls = []
 
     def invalid_then_valid_reviewer(prompt, **kwargs):
@@ -680,21 +664,15 @@ def test_invalid_reviewer_envelope_is_not_retried_by_reviewer_fallback(tmp_path)
     result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid_reviewer, base_env={})
 
     reviewer_prompts = [call["prompt"] for call in calls if call["worker_id"].startswith("reviewer")]
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
     round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
 
-    assert result["status"] == "completed"
+    assert result["status"] == "failed"
     assert len(reviewer_prompts) == 1
     assert not (round_root / "prompts/reviewer_001.retry_001.md").exists()
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "worker_exception_continue"
+    assert not (round_root / "reviews/reviewer_001.json").exists()
 
 
-def test_reviewer_schema_failure_ignores_legacy_retry_count(tmp_path):
+def test_reviewer_schema_failure_ignores_legacy_retry_count_and_fails(tmp_path):
     calls = 0
 
     def invalid_twice_then_valid(prompt, **kwargs):
@@ -721,16 +699,14 @@ def test_reviewer_schema_failure_ignores_legacy_retry_count(tmp_path):
     result = run_proposers_reviewer_batch(config, json_runner=invalid_twice_then_valid, base_env={})
 
     round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
-    review = json.loads((round_root / "reviews/reviewer_001.json").read_text(encoding="utf-8"))
-    assert result["status"] == "completed"
+    assert result["status"] == "failed"
     assert calls == 1
     assert not (round_root / "prompts/reviewer_001.retry_001.md").exists()
     assert not (round_root / "prompts/reviewer_001.retry_002.md").exists()
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "worker_exception_continue"
+    assert not (round_root / "reviews/reviewer_001.json").exists()
 
 
-def test_invalid_reviewer_plain_text_records_worker_warning_without_retry(tmp_path):
+def test_invalid_reviewer_plain_text_fails_without_retry_or_warning_output(tmp_path):
     calls = 0
 
     def invalid_reviewer(prompt, **kwargs):
@@ -753,18 +729,10 @@ def test_invalid_reviewer_plain_text_records_worker_warning_without_retry(tmp_pa
     result = run_proposers_reviewer_batch(config, json_runner=invalid_reviewer, base_env={})
 
     round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
-    review = json.loads((round_root / "reviews/reviewer_001.json").read_text(encoding="utf-8"))
-    warnings = [
-        json.loads(line)
-        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-
-    assert result["status"] == "completed"
+    assert result["status"] == "failed"
     assert calls == 1
     assert not (round_root / "prompts/reviewer_001.retry_001.md").exists()
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review["role"] == "reviewer"
-    assert warnings[-1]["recovery_strategy"] == "worker_exception_continue"
+    assert not (round_root / "reviews/reviewer_001.json").exists()
 
 
 def test_invalid_idea_reviewer_no_longer_fabricates_zero_marks(tmp_path):
@@ -779,15 +747,9 @@ def test_invalid_idea_reviewer_no_longer_fabricates_zero_marks(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_idea_reviewer, base_env={})
 
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert result["status"] == "completed"
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert "review_payload" not in review
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "worker_exception_continue"
+    review_path = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json"
+    assert result["status"] == "failed"
+    assert not review_path.exists()
 
 
 def test_custom_idea_reviewer_rich_format_failure_no_longer_uses_reviewer_formatter(tmp_path):
@@ -834,18 +796,13 @@ def test_custom_idea_reviewer_rich_format_failure_no_longer_uses_reviewer_format
 
     result = run_proposers_reviewer_batch(config, json_runner=rich_malformed_reviewer, base_env={})
 
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert result["status"] == "completed"
+    review_path = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json"
+    assert result["status"] == "failed"
     assert calls == {"reviewer": 1, "formatter": 0}
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "worker_exception_continue"
+    assert not review_path.exists()
 
 
-def test_reviewer_exception_does_not_fail_warn_mode_loop(tmp_path):
+def test_reviewer_exception_fails_warn_mode_loop_without_fabricated_output(tmp_path):
     def reviewer_raises(prompt, **kwargs):
         context = _context_from_prompt(prompt)
         if context["worker_id"].startswith("reviewer"):
@@ -857,20 +814,12 @@ def test_reviewer_exception_does_not_fail_warn_mode_loop(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=reviewer_raises, base_env={})
 
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    warnings = [
-        json.loads(line)
-        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
+    error = json.loads((round_root / "errors/reviewer_001.json").read_text(encoding="utf-8"))
 
-    assert result["status"] == "completed"
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "worker_exception_continue"
-    assert warnings[-1]["provider_error_type"] == "RuntimeError"
+    assert result["status"] == "failed"
+    assert not (round_root / "reviews/reviewer_001.json").exists()
+    assert error["error_type"] == "RuntimeError"
 
 
 def test_peer_visible_proposer_plain_text_is_wrapped_for_reviewer_context_and_warned(tmp_path):
@@ -916,7 +865,7 @@ def test_peer_visible_proposer_plain_text_is_wrapped_for_reviewer_context_and_wa
     assert warnings[-1]["recovery_strategy"] == "peer_visible_unstructured_output"
 
 
-def test_peer_visible_short_reviewer_text_becomes_worker_warning(tmp_path):
+def test_peer_visible_short_reviewer_text_fails_without_fabricated_warning_output(tmp_path):
     def service_unavailable_reviewer(prompt, **kwargs):
         context = _context_from_prompt(prompt)
         if context["worker_id"].startswith("reviewer"):
@@ -934,22 +883,10 @@ def test_peer_visible_short_reviewer_text_becomes_worker_warning(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=service_unavailable_reviewer, base_env={})
 
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    warnings = [
-        json.loads(line)
-        for line in (tmp_path / "ideas/run_001/structured_output_warnings.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-
-    assert result["status"] == "completed"
-    assert result["warnings_summary"]["structured_output_warning_count"] == 1
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review["role"] == "reviewer"
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["call_label"] == "loop/loop_001/round_001/reviewer_001"
-    assert warnings[-1]["call_label"] == "loop/loop_001/round_001/reviewer_001"
+    round_root = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001"
+    assert result["status"] == "failed"
+    assert result["warnings_summary"]["structured_output_warning_count"] == 0
+    assert not (round_root / "reviews/reviewer_001.json").exists()
 
 
 def test_warn_mode_fatal_mcp_failure_still_raises(tmp_path):
@@ -1194,7 +1131,7 @@ def test_reviewer_valid_schema_does_not_retry_or_recover(tmp_path):
     assert record.get("structured_output") in (None, {})
 
 
-def test_reviewer_full_schema_failure_uses_worker_warning_without_retry(tmp_path):
+def test_reviewer_full_schema_failure_fails_without_retry_or_output(tmp_path):
     calls = 0
 
     def invalid_then_valid_reviewer(prompt, **kwargs):
@@ -1214,20 +1151,14 @@ def test_reviewer_full_schema_failure_uses_worker_warning_without_retry(tmp_path
     )
 
     retry_prompt = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/prompts/reviewer_001.retry_001.md"
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-
-    assert result["status"] == "completed"
+    review_path = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json"
+    assert result["status"] == "failed"
     assert calls == 1
     assert not retry_prompt.exists()
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["recovery_strategy"] == "worker_exception_continue"
+    assert not review_path.exists()
 
 
-def test_reviewer_schema_failure_uses_worker_warning_in_warn_mode(tmp_path):
+def test_reviewer_schema_failure_fails_warn_mode_without_fabricated_output(tmp_path):
     calls = 0
 
     def invalid_reviewer(prompt, **kwargs):
@@ -1244,22 +1175,13 @@ def test_reviewer_schema_failure_uses_worker_warning_in_warn_mode(tmp_path):
         base_env={},
     )
 
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    structured = review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]
-
-    assert result["status"] == "completed"
+    review_path = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json"
+    assert result["status"] == "failed"
     assert calls == 1
-    assert structured["mode"] == "recovered"
-    assert structured["severity"] == "major"
-    assert structured["recovery_strategy"] == "worker_exception_continue"
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
+    assert not review_path.exists()
 
 
-def test_reviewer_schema_failure_warning_cannot_preserve_approving_retry(tmp_path):
+def test_reviewer_schema_failure_cannot_preserve_approving_retry(tmp_path):
     calls = 0
 
     def invalid_then_approving_invalid_reviewer(prompt, **kwargs):
@@ -1284,17 +1206,10 @@ def test_reviewer_schema_failure_warning_cannot_preserve_approving_retry(tmp_pat
         base_env={},
     )
 
-    review = json.loads(
-        (tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json").read_text(
-            encoding="utf-8"
-        )
-    )
-
-    assert result["status"] == "completed"
+    review_path = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/reviews/reviewer_001.json"
+    assert result["status"] == "failed"
     assert calls == 1
-    assert review["schema_version"] == "arc.llm.unstructured_output.v1"
-    assert "review_payload" not in review
-    assert review[ARC_LLM_CALL_RECORD_FIELD]["structured_output"]["severity"] == "major"
+    assert not review_path.exists()
 
 
 def test_reviewer_schema_failure_raises_in_strict_mode(tmp_path):
@@ -1331,7 +1246,7 @@ def test_reviewer_schema_validation_is_requested_from_custom_runner(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid_reviewer, base_env={})
 
-    assert result["status"] == "completed"
+    assert result["status"] == "failed"
     assert calls == [True]
 
 
@@ -1362,7 +1277,8 @@ def test_reviewer_validation_artifact_is_not_saved_after_reviewer_fallback_remov
     result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid_reviewer, base_env={})
 
     validation_error = tmp_path / "ideas/run_001/loops/loop_001/rounds/round_001/errors/reviewer_001.validation_001.json"
-    assert result["status"] == "completed"
+    assert result["status"] == "failed"
+    assert calls == 1
     assert not validation_error.exists()
 
 
@@ -1615,6 +1531,7 @@ def test_custom_json_runner_that_calls_run_json_does_not_double_record_turns(tmp
                 }
             else:
                 value = {"ok": True}
+            value["arc_evidence_requests"] = []
             return LLMProviderResponse(
                 value,
                 usage=LLMUsage(input_tokens=10, cached_input_tokens=8),
@@ -1864,7 +1781,7 @@ def test_stateful_reviewer_validation_failure_is_not_retried(tmp_path):
 
     result = run_proposers_reviewer_batch(config, json_runner=invalid_then_valid, base_env={})
 
-    assert result["status"] == "completed"
+    assert result["status"] == "failed"
     assert len(reviewer_prompts) == 1
 
 

@@ -34,6 +34,8 @@ def detect_host(
     chain = list(process_chain) if process_chain is not None else _parent_process_chain()
     for item in chain:
         lowered = item.lower()
+        if "@moonshot-ai/kimi-code" in lowered or _has_command_token(lowered, "kimi"):
+            return HostDetection(host="kimi-code", confidence=0.9, signals=[f"parent:{item}"])
         if "@openai/codex" in lowered or _has_command_token(lowered, "codex"):
             return HostDetection(host="codex", confidence=0.9, signals=[f"parent:{item}"])
         if (
@@ -66,6 +68,8 @@ def _host_native_provider(host: HostDetection) -> str | None:
         return "codex-cli"
     if host.host == "claude-code":
         return "claude-cli"
+    if host.host == "kimi-code":
+        return "kimi-code-cli"
     return None
 
 

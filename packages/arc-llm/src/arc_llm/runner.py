@@ -12,7 +12,10 @@ from typing import Any, Callable, Mapping, Sequence
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record, strip_arc_llm_call_records
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
-from .model import reasoning_effort_for_model_tier, resolve_model
+from .model import reasoning_effort_for_model_tier, resolve_model_with_warnings
+from .providers.base import LLMSchemaError, LLMWorkerCancelled, LLMWorkerError, LLMWorkerTimeout
+from .providers.lifecycle import check_lifecycle, remaining_seconds, resolve_worker_call_timeout_seconds
+from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
@@ -29,6 +32,17 @@ class LLMTaskError(RuntimeError):
     pass
 
 
+class LLMNeedsLLM(LLMTaskError):
+    """Automatic provider selection found no runnable host LLM."""
+
+    def __init__(self, config: "LLMConfig") -> None:
+        super().__init__(
+            "provider=auto resolved to manual; run from a supported agent host "
+            "or select an explicit provider"
+        )
+        self.config = config
+
+
 class LLMOutputValidationError(RuntimeError):
     pass
 
@@ -43,6 +57,7 @@ class LLMConfig:
     model: str | None
     host: HostDetection
     signals: list[str]
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -65,6 +80,7 @@ class LLMCallOutcome:
     schema_sha256: str | None
     runtime_fingerprint: str | None
     structured_output: dict[str, Any] | None = None
+    warnings: tuple[str, ...] = ()
 
 
 def resolve_llm_config(
@@ -82,11 +98,19 @@ def resolve_llm_config(
         process_chain=process_chain,
         explicit_provider=None if provider == "auto" else provider,
     )
+    model_resolution = resolve_model_with_warnings(
+        selected.provider,
+        model,
+        model_tier=model_tier,
+        env=env,
+    )
+    spec = get_provider_spec(selected.provider)
     return LLMConfig(
         provider=selected.provider,
-        model=resolve_model(selected.provider, model, model_tier=model_tier, env=env),
+        model=model_resolution.model,
         host=selected.host,
         signals=selected.signals,
+        warnings=(*spec.warning_codes, *model_resolution.warnings),
     )
 
 
@@ -130,6 +154,8 @@ def run_json(
     artifact_dir: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
+    timeout_seconds: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
@@ -144,6 +170,7 @@ def run_json(
         env=env,
         process_chain=process_chain,
     )
+    _raise_if_auto_resolved_manual(provider, configs)
     return _run_with_retries(
         configs,
         provider_requested=provider,
@@ -153,7 +180,9 @@ def run_json(
         env=env,
         process_chain=process_chain,
         max_attempts=MAX_ATTEMPTS_PER_PROVIDER,
-        call=lambda selected, config: _generate_json(
+        timeout_seconds=timeout_seconds,
+        cancel_check=cancel_check,
+        call=lambda selected, config, deadline: _generate_json(
             selected,
             prompt,
             schema=schema,
@@ -174,6 +203,8 @@ def run_json(
             artifact_dir=Path(artifact_dir) if artifact_dir else None,
             call_label=call_label,
             static_prefix=static_prefix,
+            deadline=deadline,
+            cancel_check=cancel_check,
         ),
     )
 
@@ -194,6 +225,8 @@ def run_text(
     artifact_dir: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
+    timeout_seconds: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> str:
     return run_text_result(
         prompt,
@@ -210,6 +243,8 @@ def run_text(
         artifact_dir=artifact_dir,
         call_label=call_label,
         static_prefix=static_prefix,
+        timeout_seconds=timeout_seconds,
+        cancel_check=cancel_check,
     ).value
 
 
@@ -229,6 +264,8 @@ def run_text_result(
     artifact_dir: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
+    timeout_seconds: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> LLMCallOutcome:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
@@ -241,6 +278,7 @@ def run_text_result(
         env=env,
         process_chain=process_chain,
     )
+    _raise_if_auto_resolved_manual(provider, configs)
     return _run_with_retries(
         configs,
         provider_requested=provider,
@@ -251,7 +289,9 @@ def run_text_result(
         process_chain=process_chain,
         max_attempts=1 if session_policy == "stateful" else MAX_ATTEMPTS_PER_PROVIDER,
         return_outcome=True,
-        call=lambda selected, config: _generate_text(
+        timeout_seconds=timeout_seconds,
+        cancel_check=cancel_check,
+        call=lambda selected, config, deadline: _generate_text(
             selected,
             prompt,
             model=config.model,
@@ -267,8 +307,15 @@ def run_text_result(
             artifact_dir=Path(artifact_dir) if artifact_dir else None,
             call_label=call_label,
             static_prefix=static_prefix,
+            deadline=deadline,
+            cancel_check=cancel_check,
         ),
     )
+
+
+def _raise_if_auto_resolved_manual(provider_requested: str, configs: Sequence[LLMConfig]) -> None:
+    if provider_requested == "auto" and configs and configs[0].provider == "manual":
+        raise LLMNeedsLLM(configs[0])
 
 
 def _run_with_retries(
@@ -282,16 +329,25 @@ def _run_with_retries(
     process_chain: Sequence[str] | None,
     max_attempts: int = MAX_ATTEMPTS_PER_PROVIDER,
     return_outcome: bool = False,
-    call: Callable[[Any, LLMConfig], Any],
+    timeout_seconds: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    call: Callable[[Any, LLMConfig, float], Any],
 ) -> Any:
     failures: list[LLMAttemptFailure] = []
     attempt_records: list[dict[str, Any]] = []
+    timeout = resolve_worker_call_timeout_seconds(
+        timeout_seconds,
+        env=env,
+        provider=configs[0].provider if configs else None,
+    )
+    deadline = time.monotonic() + timeout
     for fallback_index, config in enumerate(configs):
         provider_env = _env_with_tier_reasoning_default(env, config.provider, model_tier_requested)
         selected = select_provider(config.provider, env=provider_env, process_chain=process_chain)
         for attempt in range(1, max_attempts + 1):
             try:
-                result = call(selected, config)
+                check_lifecycle(deadline, cancel_check)
+                result = call(selected, config, deadline)
                 value = result.value if isinstance(result, LLMCallOutcome) else result
                 attempt_record = _attempt_record(
                     config,
@@ -327,10 +383,17 @@ def _run_with_retries(
                         error=exc,
                     )
                 )
-                if isinstance(exc, LLMOutputValidationError):
+                if isinstance(exc, (LLMSchemaError, LLMWorkerCancelled, LLMWorkerTimeout)):
+                    raise
+                if isinstance(exc, LLMOutputValidationError) or (
+                    isinstance(exc, LLMWorkerError) and not exc.retryable
+                ):
                     raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts)) from exc
                 if _has_remaining_attempt(configs, fallback_index=fallback_index, attempt=attempt, max_attempts=max_attempts):
-                    time.sleep(RETRY_INTERVAL_SECONDS)
+                    delay = min(RETRY_INTERVAL_SECONDS, remaining_seconds(deadline))
+                    if delay <= 0:
+                        check_lifecycle(deadline, cancel_check)
+                    time.sleep(delay)
     raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts))
 
 
@@ -382,6 +445,8 @@ def _generate_json(
     artifact_dir: Path | None,
     call_label: str | None,
     static_prefix: str | None,
+    deadline: float,
+    cancel_check: Callable[[], bool] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
         provider_used=provider_used,
@@ -406,6 +471,10 @@ def _generate_json(
             }
             if _accepts_keyword(selected.generate_json_result, "output_recovery"):
                 kwargs["output_recovery"] = output_recovery
+            if _accepts_keyword(selected.generate_json_result, "deadline"):
+                kwargs["deadline"] = deadline
+            if _accepts_keyword(selected.generate_json_result, "cancel_check"):
+                kwargs["cancel_check"] = cancel_check
             return selected.generate_json_result(prompt, **kwargs)
         return LLMProviderResponse(selected.generate_json(prompt, schema=provider_schema, model=model))
 
@@ -473,6 +542,8 @@ def _generate_json(
                     model_tier=model_tier,
                     env=env,
                     process_chain=process_chain,
+                    deadline=deadline,
+                    cancel_check=cancel_check,
                 )
             except Exception:
                 record_turn(response.structured_output)
@@ -495,6 +566,8 @@ def _generate_json(
             model_tier=model_tier,
             env=env,
             process_chain=process_chain,
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         native_session_id = response.native_session_id
         prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
@@ -530,6 +603,8 @@ def _generate_text(
     artifact_dir: Path | None,
     call_label: str | None,
     static_prefix: str | None,
+    deadline: float,
+    cancel_check: Callable[[], bool] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
         provider_used=provider_used,
@@ -543,13 +618,17 @@ def _generate_text(
 
     def call_provider(session: LLMSessionRef | None) -> LLMProviderResponse[str]:
         if hasattr(selected, "generate_text_result"):
-            return selected.generate_text_result(
-                prompt,
-                model=model,
-                session=session,
-                session_policy=session_policy,
-                artifact_dir=artifact_dir,
-            )
+            kwargs = {
+                "model": model,
+                "session": session,
+                "session_policy": session_policy,
+                "artifact_dir": artifact_dir,
+            }
+            if _accepts_keyword(selected.generate_text_result, "deadline"):
+                kwargs["deadline"] = deadline
+            if _accepts_keyword(selected.generate_text_result, "cancel_check"):
+                kwargs["cancel_check"] = cancel_check
+            return selected.generate_text_result(prompt, **kwargs)
         return LLMProviderResponse(selected.generate_text(prompt, model=model))
 
     if session_policy == "stateful":
@@ -696,6 +775,8 @@ def _recover_or_validate_json_output(
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
+    deadline: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     structured_output = response.structured_output
     provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
@@ -738,6 +819,8 @@ def _recover_or_validate_json_output(
             model_tier=model_tier,
             env=env,
             process_chain=process_chain,
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         if schema is not None:
             _validate_json_output(result, schema)
@@ -764,6 +847,8 @@ def _recover_or_validate_json_output(
                 model_tier=model_tier,
                 env=env,
                 process_chain=process_chain,
+                deadline=deadline,
+                cancel_check=cancel_check,
             )
             _validate_json_output(result, schema)
             return result, structured_output
@@ -794,6 +879,8 @@ def _recover_warn_schema_output(
     model_tier: str | None,
     env: Mapping[str, str] | None,
     process_chain: Sequence[str] | None,
+    deadline: float | None,
+    cancel_check: Callable[[], bool] | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     source = _schema_recovery_source_text(result, response=response, provider_metadata=provider_metadata)
     if _is_low_content_source(source):
@@ -817,11 +904,18 @@ def _recover_warn_schema_output(
     if not schema_formatter_enabled:
         raise LLMOutputValidationError("JSON output failed schema validation and schema formatter is disabled")
     try:
+        def formatter_runner(format_prompt: str, **formatter_kwargs: Any) -> dict[str, Any]:
+            if deadline is not None:
+                check_lifecycle(deadline, cancel_check)
+                formatter_kwargs["timeout_seconds"] = remaining_seconds(deadline)
+            formatter_kwargs["cancel_check"] = cancel_check
+            return run_json(format_prompt, **formatter_kwargs)
+
         formatted = format_to_schema_or_retry(
             raw_text=source,
             schema=schema or {"type": "object"},
             role_hint=role_hint,
-            json_runner=run_json,
+            json_runner=formatter_runner,
             provider=provider,
             model=model,
             model_tier=model_tier,
@@ -988,6 +1082,15 @@ def _call_record(
         "runtime_fingerprint": outcome.runtime_fingerprint if outcome else None,
         "usage": outcome.usage.to_json() if outcome else LLMUsage().to_json(),
         "structured_output": outcome.structured_output if outcome else None,
+        "warnings": list(
+            dict.fromkeys((*config.warnings, *(outcome.warnings if outcome else ())))
+        ),
+        "call_status": (
+            "recovered"
+            if outcome and isinstance(outcome.structured_output, Mapping)
+            and outcome.structured_output.get("mode") == "recovered"
+            else "valid"
+        ),
     }
 
 

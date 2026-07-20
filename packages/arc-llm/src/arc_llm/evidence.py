@@ -133,6 +133,9 @@ def allow_evidence_requests(schema: Mapping[str, Any] | None) -> dict[str, Any] 
     if not isinstance(properties, dict):
         return result
     properties.setdefault(EVIDENCE_REQUESTS_FIELD, evidence_requests_schema())
+    required = result.setdefault("required", [])
+    if isinstance(required, list) and EVIDENCE_REQUESTS_FIELD not in required:
+        required.append(EVIDENCE_REQUESTS_FIELD)
     return result
 
 
@@ -145,7 +148,7 @@ def evidence_requests_schema() -> dict[str, Any]:
         "items": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["request_id", "operation"],
+            "required": ["request_id", "operation", "arguments", "reason"],
             "properties": {
                 "request_id": {"type": "string", "minLength": 1},
                 "operation": {"type": "string", "minLength": 1},
@@ -180,7 +183,10 @@ def evidence_requests_from_output(
         unexpected = sorted(set(raw_request) - {"request_id", "operation", "arguments", "reason"})
         if unexpected:
             raise EvidenceProtocolError(f"{field} has unexpected fields: {', '.join(unexpected)}")
-        arguments = raw_request.get("arguments", {})
+        missing = sorted({"request_id", "operation", "arguments", "reason"} - set(raw_request))
+        if missing:
+            raise EvidenceProtocolError(f"{field} is missing required fields: {', '.join(missing)}")
+        arguments = raw_request.get("arguments")
         if not isinstance(arguments, Mapping):
             raise EvidenceProtocolError(f"{field}.arguments must be an object")
         try:

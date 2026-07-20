@@ -21,8 +21,10 @@ from arc_llm.evidence import (
     EvidenceResponse,
     evidence_requests_from_output,
     resolve_evidence_round,
+    EVIDENCE_REQUESTS_FIELD,
 )
-from arc_llm.runner import run_json
+from arc_llm.runner import LLMNeedsLLM, resolve_llm_config, run_json
+from arc_llm.providers.base import LLMSchemaError, LLMWorkerCancelled, LLMWorkerTimeout
 from arc_llm.schema_cache import schema_hash, sha256_text
 from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
 from arc_llm.structured_recovery import structured_metadata
@@ -50,6 +52,9 @@ from .prompts import proposer_context, reviewer_context
 
 
 JsonRunner = Callable[..., Any]
+ProgressCallback = Callable[[dict[str, Any]], None]
+CancelCheck = Callable[[], bool]
+_PROGRESS_UPDATE_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,8 @@ def run_proposers_reviewer_batch(
     dry_run: bool = False,
     max_concurrent_loops: int | None = None,
     evidence_controller: EvidenceControllerCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> dict[str, Any]:
     batch = config if isinstance(config, BatchConfig) else load_batch_config(config)
     concurrency = max_concurrent_loops or batch.max_concurrent_loops
@@ -87,7 +94,43 @@ def run_proposers_reviewer_batch(
     paths = RunPaths(run_dir=batch.run_dir, run_id=batch.run_id)
     if dry_run:
         return _dry_run_result(batch, paths)
+    auto_workers = [
+        worker
+        for loop in batch.loops
+        for worker in (*loop.proposers, *loop.reviewers)
+        if worker.provider == "auto"
+    ]
+    if json_runner is None and auto_workers:
+        resolved = resolve_llm_config(provider="auto", env=base_env, process_chain=process_chain)
+        if resolved.provider == "manual":
+            exc = LLMNeedsLLM(resolved)
+            return {
+                "schema_version": "arc.llm.proposers_reviewer_batch.result.v1",
+                "ok": False,
+                "status": "needs_llm",
+                "run_id": batch.run_id,
+                "run_root": str(paths.run_root),
+                "llm_task": {
+                    "provider_requested": "auto",
+                    "provider_resolved": resolved.provider,
+                    "host": resolved.host.host,
+                    "signals": list(resolved.signals),
+                    "message": str(exc),
+                },
+                "loops": [],
+                "updated_at": _utc_now(),
+            }
     _prepare_run(paths, batch)
+    _emit_progress(
+        paths,
+        progress_callback,
+        event="run_started",
+        phase="starting",
+        run_id=batch.run_id,
+        active_workers=0,
+        completed_workers=0,
+        failed_workers=0,
+    )
     session_manager = LLMSessionManager(_session_root(batch, paths))
     prefix_limiter = PrefixConcurrencyLimiter(batch.session.max_concurrent_same_prefix)
 
@@ -98,6 +141,8 @@ def run_proposers_reviewer_batch(
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_by_loop = {}
         while True:
+            if cancel_check is not None and cancel_check():
+                stop_scheduling = True
             while not stop_scheduling and len(future_by_loop) < concurrency and next_loop_index < len(loops):
                 loop = loops[next_loop_index]
                 next_loop_index += 1
@@ -114,6 +159,8 @@ def run_proposers_reviewer_batch(
                     base_env,
                     process_chain,
                     evidence_controller,
+                    progress_callback,
+                    cancel_check,
                 )
                 future_by_loop[future] = loop.loop_id
             if not future_by_loop:
@@ -132,7 +179,10 @@ def run_proposers_reviewer_batch(
                 break
         if stop_scheduling:
             for loop in loops[next_loop_index:]:
-                loop_results.append(_skipped_loop_result(paths, loop.loop_id, "skipped by fail_fast"))
+                if cancel_check is not None and cancel_check():
+                    loop_results.append(_cancelled_loop_result(paths.loop(loop.loop_id), loop.loop_id, "cancelled before start"))
+                else:
+                    loop_results.append(_skipped_loop_result(paths, loop.loop_id, "skipped by fail_fast"))
 
     loop_results.sort(key=lambda item: item["loop_id"])
     status = _batch_status(loop_results)
@@ -143,8 +193,10 @@ def run_proposers_reviewer_batch(
         "run_root": str(paths.run_root),
         "warnings_summary": _warnings_summary(paths),
         "loops": loop_results,
+        "updated_at": _utc_now(),
     }
     _write_run_state(paths, run_result)
+    _emit_progress(paths, progress_callback, event="run_finished", phase="finished", status=status)
     return run_result
 
 
@@ -168,12 +220,17 @@ def _prepare_run(paths: RunPaths, batch: BatchConfig) -> None:
                 ],
             },
         )
-        atomic_write_json(paths.state, {"status": "running", "run_id": batch.run_id})
+        atomic_write_json(
+            paths.state,
+            {"status": "running", "run_id": batch.run_id, "updated_at": _utc_now()},
+        )
 
 
 def _write_run_state(paths: RunPaths, run_result: dict[str, Any]) -> None:
     with acquire_lock(paths.lock, run_id=run_result["run_id"]):
-        atomic_write_json(paths.state, run_result)
+        state = _read_json_object(paths.state)
+        state.update(run_result)
+        atomic_write_json(paths.state, state)
 
 
 def _warnings_summary(paths: RunPaths) -> dict[str, Any]:
@@ -206,13 +263,24 @@ def _run_loop(
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
     evidence_controller: EvidenceControllerCallback | None,
+    progress_callback: ProgressCallback | None,
+    cancel_check: CancelCheck | None,
 ) -> dict[str, Any]:
     if paths.loop_root.exists():
         return _loop_failure(loop.loop_id, paths, "loop directory already exists")
     try:
         with acquire_lock(paths.lock, run_id=run_id, loop_id=loop.loop_id):
             atomic_write_json(paths.config, _jsonable(loop))
-            atomic_write_json(paths.state, {"status": "running", "loop_id": loop.loop_id, "rounds_completed": 0})
+            atomic_write_json(
+                paths.state,
+                {
+                    "status": "running",
+                    "loop_id": loop.loop_id,
+                    "rounds_completed": 0,
+                    "updated_at": _utc_now(),
+                    "phase": "starting",
+                },
+            )
             result = _run_loop_rounds(
                 loop,
                 paths,
@@ -224,11 +292,19 @@ def _run_loop(
                 base_env,
                 process_chain,
                 evidence_controller,
+                progress_callback,
+                cancel_check,
             )
-            atomic_write_json(paths.state, result)
+            terminal_state = _read_json_object(paths.state)
+            terminal_state.update(result)
+            terminal_state.update({"phase": "finished", "active_workers": 0})
+            atomic_write_json(paths.state, terminal_state)
             return result
     except Exception as exc:
-        result = _loop_failure(loop.loop_id, paths, str(exc), exc=exc)
+        if isinstance(exc, LLMWorkerCancelled) or (cancel_check is not None and cancel_check()):
+            result = _cancelled_loop_result(paths, loop.loop_id, str(exc) or "cancelled")
+        else:
+            result = _loop_failure(loop.loop_id, paths, str(exc), exc=exc)
         _write_loop_failure_state(paths, run_id=run_id, result=result)
         return result
 
@@ -244,13 +320,28 @@ def _run_loop_rounds(
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
     evidence_controller: EvidenceControllerCallback | None,
+    progress_callback: ProgressCallback | None,
+    cancel_check: CancelCheck | None,
 ) -> dict[str, Any]:
     correspondence: list[dict[str, Any]] = []
     rounds_completed = 0
     evidence_rounds_completed = 0
     evidence_request_count = 0
     stop_reason = ""
+    worker_failures: list[dict[str, Any]] = []
     for round_number in range(1, loop.max_rounds + 1):
+        _raise_if_cancelled(cancel_check)
+        _emit_progress(
+            paths,
+            progress_callback,
+            event="round_started",
+            phase="proposers",
+            loop_id=loop.loop_id,
+            round_number=round_number,
+            active_workers=len(loop.proposers),
+            completed_workers=0,
+            failed_workers=0,
+        )
         evidence_followup_pending = False
         round_paths = paths.round(round_number)
         proposer_outputs = _run_proposers(
@@ -266,7 +357,12 @@ def _run_loop_rounds(
             base_env,
             process_chain,
             cache_warnings_path=paths.run_root / "cache_warnings.jsonl",
+            worker_failures=worker_failures,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
         )
+        if not proposer_outputs:
+            raise RuntimeError(f"all proposer calls failed in {loop.loop_id} round {round_number}")
         reviewer = loop.reviewers[0]
         session_key = _worker_session_key(batch.run_id, loop, reviewer, "reviewer")
         prompt_options = _reviewer_prompt_options(
@@ -277,6 +373,19 @@ def _run_loop_rounds(
             proposer_outputs=proposer_outputs,
             round_paths=round_paths,
             stateful_supported=_stateful_supported(json_runner),
+        )
+        _emit_progress(
+            paths,
+            progress_callback,
+            event="worker_started",
+            phase="reviewer",
+            loop_id=loop.loop_id,
+            round_number=round_number,
+            worker_id=reviewer.id,
+            role="reviewer",
+            active_workers=1,
+            completed_workers=len(proposer_outputs),
+            failed_workers=len(worker_failures),
         )
         try:
             review_output = _call_reviewer(
@@ -297,23 +406,40 @@ def _run_loop_rounds(
                 artifact_dir=round_paths.round_root / "llm_calls" / reviewer.id,
                 cache_guard=loop.session.cache_guard,
                 cache_warnings_path=paths.run_root / "cache_warnings.jsonl",
+                cancel_check=cancel_check,
             )
         except Exception as exc:
-            if not _warn_continue_policy(batch.output_recovery) or _is_fatal_provider_failure_exception(exc):
-                raise
-            review_output = _worker_exception_output(
-                worker=reviewer,
+            worker_failures.append(_worker_failure_record(reviewer.id, "reviewer", exc, round_number))
+            _emit_progress(
+                paths,
+                progress_callback,
+                event="worker_finished",
+                phase="reviewer",
+                loop_id=loop.loop_id,
+                round_number=round_number,
+                worker_id=reviewer.id,
                 role="reviewer",
-                exc=exc,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{reviewer.id}",
+                worker_status=_exception_call_status(exc),
+                active_workers=0,
+                completed_workers=len(proposer_outputs),
+                failed_workers=len(worker_failures),
             )
-            _record_structured_output_warning(
-                review_output[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
-                warnings_path=paths.run_root / "structured_output_warnings.jsonl",
-                worker=reviewer,
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{reviewer.id}",
-            )
+            raise
         atomic_write_json(round_paths.review(reviewer.id), review_output)
+        _emit_progress(
+            paths,
+            progress_callback,
+            event="worker_finished",
+            phase="reviewer",
+            loop_id=loop.loop_id,
+            round_number=round_number,
+            worker_id=reviewer.id,
+            role="reviewer",
+            worker_status=_output_call_status(review_output),
+            active_workers=0,
+            completed_workers=len(proposer_outputs) + 1,
+            failed_workers=len(worker_failures),
+        )
 
         round_events = _round_events(
             round_number=round_number,
@@ -332,6 +458,18 @@ def _run_loop_rounds(
         )
         if evidence_requests:
             evidence_request_count += len(evidence_requests)
+            _emit_progress(
+                paths,
+                progress_callback,
+                event="evidence_started",
+                phase="evidence",
+                loop_id=loop.loop_id,
+                round_number=round_number,
+                active_workers=0,
+                completed_workers=len(proposer_outputs) + 1,
+                failed_workers=len(worker_failures),
+                request_count=len(evidence_requests),
+            )
             if (
                 batch.evidence.enabled
                 and evidence_controller is not None
@@ -366,6 +504,17 @@ def _run_loop_rounds(
             )
             correspondence.append(evidence_event)
             append_jsonl(paths.transcript, evidence_event)
+            _emit_progress(
+                paths,
+                progress_callback,
+                event="evidence_finished",
+                phase="evidence",
+                loop_id=loop.loop_id,
+                round_number=round_number,
+                evidence_round_number=evidence_round_number,
+                evidence_status=resolution_status,
+                request_count=len(evidence_requests),
+            )
 
         rounds_completed = round_number
         controller = review_output.get("controller", {})
@@ -374,10 +523,11 @@ def _run_loop_rounds(
             return _with_evidence_summary(
                 {
                     "loop_id": loop.loop_id,
-                    "status": "stopped",
+                    "status": "degraded" if worker_failures else "stopped",
                     "rounds_completed": rounds_completed,
                     "stop_reason": stop_reason,
                     "loop_root": str(paths.loop_root),
+                    "worker_failures": worker_failures,
                 },
                 evidence_rounds_completed=evidence_rounds_completed,
                 evidence_request_count=evidence_request_count,
@@ -386,10 +536,11 @@ def _run_loop_rounds(
     return _with_evidence_summary(
         {
             "loop_id": loop.loop_id,
-            "status": "completed",
+            "status": "degraded" if worker_failures else "completed",
             "rounds_completed": rounds_completed,
             "stop_reason": stop_reason,
             "loop_root": str(paths.loop_root),
+            "worker_failures": worker_failures,
         },
         evidence_rounds_completed=evidence_rounds_completed,
         evidence_request_count=evidence_request_count,
@@ -409,8 +560,12 @@ def _run_proposers(
     base_env: Mapping[str, str] | None,
     process_chain: list[str] | None,
     cache_warnings_path: Path,
+    worker_failures: list[dict[str, Any]],
+    cancel_check: CancelCheck | None,
+    progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
     outputs: dict[str, Any] = {}
+    failures_before_round = len(worker_failures)
     session_keys: dict[str, str] = {}
     prompt_options_by_proposer: dict[str, dict[str, WorkerPromptOption]] = {}
     for proposer in loop.proposers:
@@ -449,6 +604,12 @@ def _run_proposers(
                 cache_warnings_path=cache_warnings_path,
                 output_recovery=batch.output_recovery,
                 validate_schema=True,
+                cancel_check=cancel_check,
+                timeout_seconds=(
+                    proposer.worker_call_timeout_seconds
+                    if proposer.worker_call_timeout_seconds is not None
+                    else batch.worker_call_timeout_seconds
+                ),
             ): proposer
             for proposer in loop.proposers
         }
@@ -465,17 +626,48 @@ def _run_proposers(
                     warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
                 )
             except Exception as exc:
-                if not _warn_continue_policy(batch.output_recovery) or _is_fatal_provider_failure_exception(exc):
+                if isinstance(exc, LLMWorkerCancelled):
                     raise
-                output = _worker_exception_output(worker=proposer, role="proposer", exc=exc, call_label=call_label)
-                _record_structured_output_warning(
-                    output[ARC_LLM_CALL_RECORD_FIELD]["structured_output"],
-                    warnings_path=cache_warnings_path.with_name("structured_output_warnings.jsonl"),
-                    worker=proposer,
-                    call_label=call_label,
+                worker_failures.append(_worker_failure_record(proposer.id, "proposer", exc, round_number))
+                _emit_progress(
+                    round_paths,
+                    progress_callback,
+                    event="worker_finished",
+                    phase="proposers",
+                    loop_id=loop.loop_id,
+                    round_number=round_number,
+                    worker_id=proposer.id,
+                    role="proposer",
+                    worker_status=_exception_call_status(exc),
+                    active_workers=(
+                        len(loop.proposers)
+                        - len(outputs)
+                        - (len(worker_failures) - failures_before_round)
+                    ),
+                    completed_workers=len(outputs),
+                    failed_workers=len(worker_failures) - failures_before_round,
                 )
+                continue
             outputs[proposer.id] = output
             atomic_write_json(round_paths.proposer_output(proposer.id), output)
+            _emit_progress(
+                round_paths,
+                progress_callback,
+                event="worker_finished",
+                phase="proposers",
+                loop_id=loop.loop_id,
+                round_number=round_number,
+                worker_id=proposer.id,
+                role="proposer",
+                worker_status=_output_call_status(output),
+                active_workers=(
+                    len(loop.proposers)
+                    - len(outputs)
+                    - (len(worker_failures) - failures_before_round)
+                ),
+                completed_workers=len(outputs),
+                failed_workers=len(worker_failures) - failures_before_round,
+            )
     return dict(sorted(outputs.items()))
 
 
@@ -498,6 +690,7 @@ def _call_reviewer(
     artifact_dir: Path | None,
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
+    cancel_check: CancelCheck | None,
 ) -> dict[str, Any]:
     first_call = _call_json_runner_with_prompt_options(
         json_runner,
@@ -519,9 +712,30 @@ def _call_reviewer(
         cache_warnings_path=cache_warnings_path,
         output_recovery=batch.output_recovery,
         validate_schema=True,
+        cancel_check=cancel_check,
+        timeout_seconds=(
+            worker.worker_call_timeout_seconds
+            if worker.worker_call_timeout_seconds is not None
+            else batch.worker_call_timeout_seconds
+        ),
     )
     review_output = first_call.output
-    _validate_reviewer_output(review_output, worker=worker, loop=loop)
+    try:
+        _validate_reviewer_output(review_output, worker=worker, loop=loop)
+    except Exception as exc:
+        atomic_write_json(
+            error_path,
+            {
+                "worker_id": worker.id,
+                "round_number": round_number,
+                "error_type": type(exc).__name__,
+                "call_status": _exception_call_status(exc),
+                "message": str(exc),
+                "prompt_path": str(first_call.prompt_path) if first_call.prompt_path is not None else "",
+                "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            },
+        )
+        raise
     return review_output
 
 
@@ -695,6 +909,8 @@ def _local_recovery_call_record(
         "schema_sha256": schema_hash(schema),
         "runtime_fingerprint": None,
         "usage": {},
+        "warnings": [],
+        "call_status": "recovered",
         "structured_output": structured_output,
     }
 
@@ -720,6 +936,8 @@ def _call_json_runner_with_prompt_options(
     cache_warnings_path: Path,
     output_recovery: OutputRecoveryOptions,
     validate_schema: bool = True,
+    cancel_check: CancelCheck | None = None,
+    timeout_seconds: float | None = None,
 ) -> WorkerCallResult:
     selected: WorkerPromptOption | None = None
 
@@ -751,6 +969,8 @@ def _call_json_runner_with_prompt_options(
             cache_warnings_path=cache_warnings_path,
             output_recovery=output_recovery,
             validate_schema=validate_schema,
+            cancel_check=cancel_check,
+            timeout_seconds=timeout_seconds,
         )
         return WorkerCallResult(
             output=output,
@@ -773,6 +993,7 @@ def _call_json_runner_with_prompt_options(
                 "worker_id": worker.id,
                 "round_number": round_number,
                 "error_type": type(exc).__name__,
+                "call_status": _exception_call_status(exc),
                 "message": str(exc),
                 "prompt_path": str(prompt_path) if prompt_path is not None else "",
                 "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
@@ -799,6 +1020,8 @@ def _call_json_runner(
     cache_warnings_path: Path,
     output_recovery: OutputRecoveryOptions,
     validate_schema: bool = True,
+    cancel_check: CancelCheck | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     env = worker_env(worker, base_env=base_env)
     effective_session_policy = session_policy
@@ -827,11 +1050,15 @@ def _call_json_runner(
                 "output_recovery": _output_recovery_mode(output_recovery),
                 "schema_formatter_enabled": output_recovery.schema_formatter_enabled,
                 "role_hint": _role_hint(worker),
+                "timeout_seconds": timeout_seconds,
+                "cancel_check": cancel_check,
             }
             for key, value in optional.items():
                 if _accepts_keyword(json_runner, key):
                     kwargs[key] = value
             result = json_runner(prompt, **kwargs)
+            if worker.evidence_enabled and isinstance(result, dict):
+                result.setdefault(EVIDENCE_REQUESTS_FIELD, [])
             after_count = session_manager.turn_count(session_key) if effective_session_policy == "stateful" else None
             if before_count == after_count:
                 _record_custom_session_turn(
@@ -882,6 +1109,8 @@ def _call_json_runner(
             output_recovery=_output_recovery_mode(output_recovery),
             schema_formatter_enabled=output_recovery.schema_formatter_enabled,
             role_hint=_role_hint(worker),
+            timeout_seconds=timeout_seconds,
+            cancel_check=cancel_check,
         )
         _maybe_record_cache_warning(
             result,
@@ -1675,6 +1904,7 @@ def _with_evidence_summary(
     evidence_rounds_completed: int,
     evidence_request_count: int,
 ) -> dict[str, Any]:
+    result.setdefault("updated_at", _utc_now())
     if evidence_request_count:
         result["evidence_rounds_completed"] = evidence_rounds_completed
         result["evidence_request_count"] = evidence_request_count
@@ -1688,6 +1918,7 @@ def _loop_failure(loop_id: str, paths, message: str, *, exc: BaseException | Non
         "rounds_completed": 0,
         "error": message,
         "loop_root": str(paths.loop_root),
+        "updated_at": _utc_now(),
     }
     if exc is not None:
         result["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -1697,7 +1928,10 @@ def _loop_failure(loop_id: str, paths, message: str, *, exc: BaseException | Non
 def _write_loop_failure_state(paths, *, run_id: str, result: dict[str, Any]) -> None:
     try:
         with acquire_lock(paths.lock, run_id=run_id, loop_id=str(result.get("loop_id") or "")):
-            atomic_write_json(paths.state, result)
+            state = _read_json_object(paths.state)
+            state.update(result)
+            state.update({"phase": "finished", "active_workers": 0})
+            atomic_write_json(paths.state, state)
     except LockConflictError as exc:
         atomic_write_json(
             _loop_failure_diagnostic_path(paths),
@@ -1721,17 +1955,172 @@ def _skipped_loop_result(paths: RunPaths, loop_id: str, error: str) -> dict[str,
         "rounds_completed": 0,
         "error": error,
         "loop_root": str(paths.loop(loop_id).loop_root),
+        "updated_at": _utc_now(),
     }
 
 
 def _batch_status(loop_results: list[dict[str, Any]]) -> str:
-    if any(item["status"] == "failed" for item in loop_results):
+    statuses = [str(item.get("status") or "failed") for item in loop_results]
+    if any(status == "cancelled" for status in statuses):
+        return "cancelled"
+    usable = [status for status in statuses if status in {"completed", "stopped", "degraded"}]
+    if not usable:
         return "failed"
-    if any(item["status"] == "skipped" for item in loop_results):
-        return "failed"
+    if any(status in {"degraded", "failed", "skipped"} for status in statuses):
+        return "degraded"
     if loop_results and all(item["status"] == "stopped" for item in loop_results):
         return "stopped"
     return "completed"
+
+
+def _cancelled_loop_result(paths, loop_id: str, error: str) -> dict[str, Any]:
+    return {
+        "loop_id": loop_id,
+        "status": "cancelled",
+        "rounds_completed": 0,
+        "error": error,
+        "loop_root": str(paths.loop_root),
+        "updated_at": _utc_now(),
+    }
+
+
+def _emit_progress(paths: Any, callback: ProgressCallback | None, *, event: str, **payload: Any) -> None:
+    run_root = (
+        Path(paths.run_root)
+        if hasattr(paths, "run_root")
+        else Path(paths.loop_root).parent.parent
+    )
+    item = {
+        "schema_version": "arc.llm.proposers_reviewer.progress.v1",
+        "event": event,
+        "updated_at": _utc_now(),
+        **payload,
+    }
+    with _PROGRESS_UPDATE_LOCK:
+        append_jsonl(run_root / "progress.jsonl", item)
+        _update_loop_progress_state(run_root, item)
+        _update_run_progress_state(run_root, item)
+    if callback is not None:
+        callback(dict(item))
+
+
+_PROGRESS_STATE_FIELDS = (
+    "phase",
+    "round_number",
+    "active_workers",
+    "completed_workers",
+    "failed_workers",
+    "worker_id",
+    "role",
+)
+
+
+def _update_loop_progress_state(run_root: Path, item: Mapping[str, Any]) -> None:
+    loop_id = item.get("loop_id")
+    if not isinstance(loop_id, str) or not loop_id:
+        return
+    state_path = run_root / "loops" / loop_id / "state.json"
+    state = _read_json_object(state_path)
+    state.setdefault("status", "running")
+    state["loop_id"] = loop_id
+    state["updated_at"] = item["updated_at"]
+    state["progress_event"] = item["event"]
+    for field in _PROGRESS_STATE_FIELDS:
+        if field in item:
+            state[field] = item[field]
+    atomic_write_json(state_path, state)
+
+
+def _update_run_progress_state(run_root: Path, item: Mapping[str, Any]) -> None:
+    state_path = run_root / "state.json"
+    state = _read_json_object(state_path)
+    run_id = str(state.get("run_id") or run_root.name)
+    run_paths = RunPaths(run_dir=run_root.parent, run_id=run_id)
+    with acquire_lock(run_paths.lock, run_id=run_id):
+        state = _read_json_object(state_path)
+        state.setdefault("status", "running")
+        state.setdefault("run_id", run_id)
+        state["updated_at"] = item["updated_at"]
+        state["progress_event"] = item["event"]
+        for field in _PROGRESS_STATE_FIELDS:
+            if field in item:
+                state[field] = item[field]
+        loop_id = item.get("loop_id")
+        if isinstance(loop_id, str) and loop_id:
+            state["loop_id"] = loop_id
+            loop_progress = dict(state.get("loop_progress") or {})
+            current = dict(loop_progress.get(loop_id) or {})
+            current.update(
+                {
+                    "loop_id": loop_id,
+                    "updated_at": item["updated_at"],
+                    "progress_event": item["event"],
+                }
+            )
+            for field in _PROGRESS_STATE_FIELDS:
+                if field in item:
+                    current[field] = item[field]
+            loop_progress[loop_id] = current
+            state["loop_progress"] = loop_progress
+            for count_field in ("active_workers", "completed_workers", "failed_workers"):
+                counts = [
+                    progress.get(count_field)
+                    for progress in loop_progress.values()
+                    if isinstance(progress, Mapping)
+                ]
+                state[count_field] = sum(value for value in counts if isinstance(value, int))
+        atomic_write_json(state_path, state)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _raise_if_cancelled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise LLMWorkerCancelled("proposer-reviewer batch was cancelled")
+
+
+def _exception_call_status(exc: BaseException) -> str:
+    if isinstance(exc, LLMWorkerCancelled):
+        return "cancelled"
+    if isinstance(exc, LLMWorkerTimeout) or "timed out" in str(exc).lower():
+        return "timeout"
+    if isinstance(exc, LLMSchemaError) or "schema is invalid" in str(exc).lower():
+        return "schema_error"
+    return "provider_error"
+
+
+def _worker_failure_record(worker_id: str, role: str, exc: BaseException, round_number: int) -> dict[str, Any]:
+    return {
+        "worker_id": worker_id,
+        "role": role,
+        "round_number": round_number,
+        "call_status": _exception_call_status(exc),
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+
+
+def _output_call_status(output: Any) -> str:
+    if isinstance(output, Mapping):
+        record = output.get(ARC_LLM_CALL_RECORD_FIELD)
+        if isinstance(record, Mapping):
+            status = str(record.get("call_status") or "")
+            if status in {"valid", "recovered"}:
+                return status
+            structured = record.get("structured_output")
+            if isinstance(structured, Mapping) and structured.get("mode") == "recovered":
+                return "recovered"
+    return "valid"
 
 
 def _dry_run_result(batch: BatchConfig, paths: RunPaths) -> dict[str, Any]:

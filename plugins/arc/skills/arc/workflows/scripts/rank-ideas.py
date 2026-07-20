@@ -81,7 +81,22 @@ def rank_run(run_root: Path) -> dict[str, Any]:
     scheme = load_marking_scheme(CROSS_MARKING_SCHEME) if cross_domain else None
     selected = []
     unqualified = []
+    excluded_loops: list[dict[str, str]] = []
+    degraded_loops: list[str] = []
     for loop_root in sorted(path for path in loops_root.iterdir() if path.is_dir()):
+        loop_state = _loop_state(loop_root)
+        loop_status = str(loop_state.get("status", "missing")).strip()
+        if loop_status not in {"completed", "stopped", "degraded"}:
+            excluded_loops.append(
+                {
+                    "loop_id": loop_root.name,
+                    "status": loop_status or "missing",
+                    "reason": str(loop_state.get("error") or "loop has no formally usable terminal state"),
+                }
+            )
+            continue
+        if loop_status == "degraded":
+            degraded_loops.append(loop_root.name)
         loop_context = cross_contexts.get(loop_root.name, {})
         single_context = single_contexts.get(loop_root.name, {})
         loop_rounds = [
@@ -108,10 +123,21 @@ def rank_run(run_root: Path) -> dict[str, Any]:
         else:
             best = dict(max(loop_rounds, key=_rank_key))
         best["rounds"] = loop_rounds
+        best["loop_status"] = loop_status
         selected.append(best)
 
     ranking = sorted(selected, key=lambda item: _rank_key(item, scheme=scheme), reverse=True)
     warnings: list[str] = []
+    if degraded_loops:
+        warnings.append(
+            "WARNING: DEGRADED IDEAS BATCH — formally ranking usable output from degraded loops: "
+            + ", ".join(degraded_loops)
+        )
+    if excluded_loops:
+        warnings.append(
+            "WARNING: EXCLUDED NON-USABLE LOOPS — failed/cancelled/skipped or incomplete loops were not ranked: "
+            + ", ".join(f"{item['loop_id']} ({item['status']})" for item in excluded_loops)
+        )
     top_three: list[dict[str, Any]] = []
     portfolio_excluded: list[dict[str, Any]] = []
     if cross_domain:
@@ -164,6 +190,9 @@ def rank_run(run_root: Path) -> dict[str, Any]:
         "user_intent": _run_user_intent(run_root),
         "summary_order": ranking if cross_domain else selected,
         "ranking": ranking,
+        "degraded_loops": degraded_loops,
+        "excluded_loops": excluded_loops,
+        "warnings": warnings,
     }
     if cross_domain:
         payload.update(
@@ -173,7 +202,6 @@ def rank_run(run_root: Path) -> dict[str, Any]:
                 "top_three": top_three,
                 "unqualified": unqualified,
                 "portfolio_excluded": portfolio_excluded,
-                "warnings": warnings,
                 "diagnostics": _cross_diagnostics(
                     run_root,
                     ranking=ranking,
@@ -192,7 +220,6 @@ def rank_run(run_root: Path) -> dict[str, Any]:
                 "summary_order": ranking,
                 "top_three": top_three,
                 "unqualified": unqualified,
-                "warnings": warnings,
                 "diagnostics": _single_domain_diagnostics(
                     run_root,
                     ranking=ranking,
@@ -202,9 +229,17 @@ def rank_run(run_root: Path) -> dict[str, Any]:
                 ),
             }
         )
-    elif warnings:
-        payload["warnings"] = warnings
     return payload
+
+
+def _loop_state(loop_root: Path) -> dict[str, Any]:
+    path = loop_root / "state.json"
+    if not path.is_file():
+        return {"status": "missing", "error": f"missing loop state: {path}"}
+    try:
+        return _read_json(path)
+    except (OSError, json.JSONDecodeError, SystemExit) as exc:
+        return {"status": "invalid", "error": f"invalid loop state: {exc}"}
 
 
 def _round_dirs(loop_root: Path) -> list[Path]:
@@ -479,22 +514,22 @@ def _cross_qualification(
 
     cards = cross_context.get("domain_cards", [])
     known_domain_ids = {
-        str(card.get("domain_id", "")).strip()
+        str(card.get("field_id", "")).strip()
         for card in cards
-        if isinstance(card, Mapping) and str(card.get("domain_id", "")).strip()
+        if isinstance(card, Mapping) and str(card.get("field_id", "")).strip()
     }
-    source = str(assessment.get("source_domain_id", "")).strip()
-    target = str(assessment.get("target_domain_id", "")).strip()
+    source = str(assessment.get("source_field_id", "")).strip()
+    target = str(assessment.get("target_field_id", "")).strip()
     if not source or not target or source == target:
         reasons.append("source_and_target_must_be_distinct")
     if source not in known_domain_ids or target not in known_domain_ids:
-        reasons.append("source_or_target_is_not_a_manifest_domain")
+        reasons.append("source_or_target_is_not_a_manifest_field")
 
     roles = proposer.get("domain_roles")
     if not isinstance(roles, Mapping):
         reasons.append("missing_proposer_domain_roles")
-    elif str(roles.get("source_domain_id", "")).strip() != source or str(
-        roles.get("target_domain_id", "")
+    elif str(roles.get("source_field_id", "")).strip() != source or str(
+        roles.get("target_field_id", "")
     ).strip() != target:
         reasons.append("proposer_and_reviewer_domain_roles_disagree")
 
@@ -718,11 +753,21 @@ def _rank_key(
 
 
 def markdown_table(payload: dict[str, Any]) -> str:
-    lines = [
+    lines: list[str] = []
+    if payload.get("warnings"):
+        lines.extend(
+            [
+                "# Ranking Warnings",
+                "",
+                *[f"> {warning}" for warning in payload["warnings"]],
+                "",
+            ]
+        )
+    lines.extend([
         _summary_table(payload),
         "",
         "# Appendix: Idea Details",
-    ]
+    ])
     for entry in payload["ranking"]:
         lines.extend(["", *_appendix_section(entry)])
     if payload.get("cross_domain"):

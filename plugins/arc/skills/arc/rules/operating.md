@@ -12,6 +12,8 @@ commands and MCP tool names live in the package-specific references.
   `manuals/arc-jobs.md`.
 - Use the package CLI with structured output by default. Use the optional MCP
   adapter only when the user or host configuration explicitly selects it.
+- The core `arc` plugin is CLI-only and must not register an MCP server. MCP is
+  available only through the separately installed optional `arc-mcp` plugin.
 - For user choices and confirmations, use
   `rules/interaction.md`.
 - Do not cancel a job unless the user explicitly asks.

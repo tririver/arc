@@ -158,8 +158,11 @@ Development benchmarks that must not fall back to an installed or cached ARC
 copy can set `ARC_REQUIRE_REPO_ROOT` to the checkout root. Workflow scripts then
 prepend that checkout's package sources, verify module origins, and fail before
 LLM work if any ARC module or workflow file comes from another installation.
-Use `verify-source-runtime.py --repo-root <checkout> --output <record.json>` to
-capture module, Git working-tree, and workflow-file provenance.
+First run `<skill-dir>/scripts/arc-runtime setup --profile core`, then use
+`python3 <skill-dir>/workflows/scripts/verify-source-runtime.py --repo-root
+<checkout> --output <record.json>` to capture module, Git working-tree, and
+workflow-file provenance. A verifier launched by system Python re-executes
+with the installed core runtime Python before loading checkout sources.
 
 Check the launcher directly from a source checkout:
 
@@ -315,24 +318,44 @@ Built-in host providers:
 
 - Codex: `codex-cli`
 - Claude Code: `claude-cli`
+- Kimi Code: `kimi-code-cli` (experimental; Kimi Code CLI `>=0.28.0`)
 - Manual fallback: `manual`
+
+The Kimi provider requires the Node.js/TypeScript `@moonshot-ai/kimi-code`
+CLI and an existing login created with `kimi login`. ARC talks to `kimi acp`
+over stdin/stdout; it does not use `kimi -p`, add an OpenAI-compatible API
+provider, or read and manage Kimi credentials itself.
 
 Check what ARC detects:
 
 ```bash
-arc-llm doctor host
-arc-llm doctor provider
-arc-llm doctor config
+arc-llm doctor host --json
+arc-llm doctor provider --json
+arc-llm doctor config --json
 arc-paper doctor host --json
 arc-paper doctor provider --json
 ```
 
 With `--provider auto`, ARC uses only host-native providers: Codex selects
-`codex-cli`, Claude Code selects `claude-cli`, and unknown hosts select
-`manual`. `arc-llm` does not read provider config files, API-key files, or
-URL-based provider definitions. Change run model through the run config/CLI:
-`provider` plus `model_tier`, or exact `model` with an explicit built-in
-provider.
+`codex-cli`, Claude Code selects `claude-cli`, Kimi Code selects
+`kimi-code-cli`, and unknown hosts select `manual`. Kimi detection uses
+`ARC_AGENT_HOST=kimi-code`, the `@moonshot-ai/kimi-code` package name, or a
+reliable `kimi` parent-process signal. An explicit `--provider kimi-code-cli`
+works under other hosts. ARC does not read URL-based provider definitions or
+Kimi credential values, but the Kimi subprocess inherits the user's Kimi Code
+home, authentication, configuration, and persistent sessions. Change the run
+model through the run config/CLI: `provider` plus `model_tier`, or exact
+`model` with an explicit built-in provider.
+
+`kimi-code-cli` is experimental. Before its first call ARC warns:
+
+> `kimi-code-cli is experimental and inherits Kimi Code configuration, instructions, skills, hooks, plugins, MCP, tool permissions, and persistent sessions; it may access the network, run commands, and modify files.`
+
+ARC denies ACP permission and filesystem reverse requests, but that is not a
+sandbox: Kimi automation, hooks, plugins, MCP servers, and local tools may act
+outside those reverse requests. Review `arc-llm doctor provider` and
+`arc-llm doctor config` before use. Kimi does not report token usage through
+this ACP integration, so usage fields remain null.
 
 ## Use ARC Through An Agent
 
@@ -468,14 +491,20 @@ Most users should call `arc-paper` or `arc-domain` instead of
 calling `arc-llm` directly. Direct LLM calls are useful for diagnosis:
 
 ```bash
-arc-llm run-text --prompt "Say hello." --provider auto
-arc-llm run-json --prompt "Return {\"ok\": true}" --provider auto --json
+arc-llm run-text --prompt-text "Say hello." --provider auto
+arc-llm run-json --prompt-text "Return {\"ok\": true}" --provider auto --json
 ```
 
+Use `--prompt-text` for literal text and `--prompt-file` for a UTF-8 prompt
+file (`--prompt-file -` reads stdin). The legacy `--prompt` flag remains a
+file/stdin alias for compatibility.
+
 Direct `arc-llm run-*` calls are stateless unless `--session-policy stateful`
-is paired with a session root and session key. Proposers-reviewer workflows use
-stateful delta sessions by default and write cache/session audit data under the
-run artifacts.
+is paired with a session root and session key. For Kimi, stateless means ARC
+does not reuse the native session ID; Kimi Code still uses provider-side
+persistence for its own session. ARC does not copy, migrate, or delete Kimi sessions.
+Proposers-reviewer workflows use stateful delta sessions by default and write
+cache/session audit data under the run artifacts.
 
 Custom `json_runner` wrappers must explicitly declare `session_policy`,
 `session_manager`, `session_key`, `artifact_dir`, `call_label`, and
@@ -701,7 +730,14 @@ arc-runtime doctor --profile core
 Useful environment variables:
 
 ```text
-ARC_AGENT_HOST                    Force host detection, for example codex or claude-code.
+ARC_AGENT_HOST                    Force host detection, for example codex, claude-code, or kimi-code.
+ARC_KIMI_BIN                      Kimi Code CLI executable (default kimi).
+ARC_KIMI_WORK_DIR                 Working directory for new Kimi ACP sessions (default current directory).
+ARC_KIMI_TIMEOUT_SECONDS          Kimi call timeout; falls back to ARC_LLM_TIMEOUT_SECONDS.
+ARC_LLM_KIMI_LOW_MODEL            Kimi model alias for the low tier.
+ARC_LLM_KIMI_MEDIUM_MODEL         Kimi model alias for the medium tier.
+ARC_LLM_KIMI_HIGH_MODEL           Kimi model alias for the high tier.
+ARC_LLM_KIMI_MAX_MODEL            Kimi model alias for the max tier.
 ARC_PAPER_CACHE                   Override the arc-paper cache root.
 ARC_DOMAIN_CACHE                  Override the arc-domain cache root.
 ARC_JOBS_CACHE                    Override the protocol-neutral job/cache root.
@@ -728,8 +764,8 @@ arc-paper get-metadata <paper-id> --refresh --json
 If LLM generation is unavailable:
 
 ```bash
-arc-llm doctor host
-arc-llm doctor provider
+arc-llm doctor host --json
+arc-llm doctor provider --json
 ```
 
 If an MCP call returns a job ID:
@@ -759,6 +795,7 @@ True LLM integration tests are also opt-in:
 ```bash
 ARC_RUN_LLM_TESTS=1 ARC_RUN_NET_TESTS=1 \
   python -m pytest \
+  packages/arc-llm/tests/test_cli_smoke_integration.py \
   packages/arc-llm/tests/test_proposers_reviewer_llm_integration.py -q
 ```
 

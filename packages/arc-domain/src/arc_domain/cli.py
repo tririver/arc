@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from . import service
@@ -85,6 +86,8 @@ def _seed_command(sub, name: str) -> argparse.ArgumentParser:
     parser.add_argument("--domain-id", default=None)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--recent-window-days", type=int, default=365)
+    parser.add_argument("--as-of-date", default=datetime.now(timezone.utc).date().isoformat())
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -97,7 +100,8 @@ def _llm_args(parser: argparse.ArgumentParser) -> None:
 
 def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "init":
-        return service.init_domain(args.seed_paper, intent=args.intent, domain_id=args.domain_id)
+        return service.init_domain(args.seed_paper, intent=args.intent, domain_id=args.domain_id,
+            recent_window_days=args.recent_window_days, as_of_date=args.as_of_date)
     if args.command in {"identify-foundation", "llm-identify-foundation"}:
         return service.identify_foundation(
             args.seed_paper,
@@ -108,6 +112,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             model_tier=args.model_tier,
             refresh=args.refresh,
             workers=args.workers,
+            recent_window_days=args.recent_window_days,
+            as_of_date=args.as_of_date,
         )
     if args.command in {"build-network", "llm-build-network"}:
         return service.build_network(
@@ -119,6 +125,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             model_tier=args.model_tier,
             refresh=args.refresh,
             workers=args.workers,
+            recent_window_days=args.recent_window_days,
+            as_of_date=args.as_of_date,
         )
     if args.command == "build-paper-json-pack":
         return service.build_paper_json_pack(
@@ -127,6 +135,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             domain_id=args.domain_id,
             refresh=args.refresh,
             workers=args.workers,
+            recent_window_days=args.recent_window_days,
+            as_of_date=args.as_of_date,
         )
     if args.command == "build-evidence":
         return service.build_evidence_pack(
@@ -135,6 +145,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             domain_id=args.domain_id,
             refresh=args.refresh,
             workers=args.workers,
+            recent_window_days=args.recent_window_days,
+            as_of_date=args.as_of_date,
         )
     if args.command in {"summarize", "llm-summarize"}:
         return service.summarize_domain(
@@ -144,6 +156,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             provider=args.provider,
             model=args.model,
             model_tier=args.model_tier,
+            recent_window_days=args.recent_window_days,
+            as_of_date=args.as_of_date,
         )
     if args.command in {"build", "llm-build"}:
         return service.build_domain(
@@ -155,6 +169,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             model_tier=args.model_tier,
             refresh=args.refresh,
             workers=args.workers,
+            recent_window_days=args.recent_window_days,
+            as_of_date=args.as_of_date,
         )
     if args.command == "status":
         return service.status(args.seed_paper, intent=args.intent, domain_id=args.domain_id)

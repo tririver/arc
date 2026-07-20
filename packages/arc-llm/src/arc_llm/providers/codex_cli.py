@@ -7,20 +7,40 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from arc_llm.json_schema import to_provider_json_schema
+from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, validate_codex_strict_schema
+from arc_llm.paths import llm_tmp_root, schema_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text, write_schema_cache_file
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
-from .base import LLMWorkerError
+from .base import LLMSchemaError, LLMWorkerError
+from .lifecycle import resolve_worker_call_timeout_seconds, run_process_group
 
 
 _RESUME_SCHEMA_SUPPORT_CACHE: dict[tuple[str, str | None], bool] = {}
 _RESUME_SCHEMA_SUPPORT_LOCK = threading.Lock()
+
+
+def _run_codex(cmd, prompt, *, env, timeout_seconds, deadline, cancel_check):
+    timeout = resolve_worker_call_timeout_seconds(timeout_seconds, env=env, provider="codex-cli")
+    if deadline is not None or cancel_check is not None or timeout_seconds is not None:
+        return run_process_group(
+            cmd, input_text=prompt, env=env,
+            deadline=deadline if deadline is not None else time.monotonic() + timeout,
+            cancel_check=cancel_check,
+        )
+    try:
+        return subprocess.run(
+            cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=dict(env), timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
 
 
 class CodexCliProvider:
@@ -49,10 +69,17 @@ class CodexCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        cancel_check=None,
     ) -> LLMProviderResponse[dict[str, Any]]:
         provider_schema = to_provider_json_schema(schema)
+        try:
+            validate_codex_strict_schema(provider_schema)
+        except CodexSchemaError as exc:
+            raise LLMSchemaError(str(exc)) from exc
         stateful = session_policy == "stateful" and session is not None
-        with tempfile.TemporaryDirectory(prefix="arc-llm-") as tmp:
+        with _temporary_directory(self.env) as tmp:
             tmpdir = Path(tmp)
             output_path = tmpdir / "output.json"
             schema_path: Path | None = None
@@ -78,18 +105,10 @@ class CodexCliProvider:
                 json_events=stateful,
             )
 
-            try:
-                result = subprocess.run(
-                    cmd,
-                    input=effective_prompt,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=dict(self.env),
-                    timeout=_timeout_seconds(self.env, "ARC_CODEX_TIMEOUT_SECONDS"),
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
+            result = _run_codex(
+                cmd, effective_prompt, env=self.env, timeout_seconds=timeout_seconds,
+                deadline=deadline, cancel_check=cancel_check,
+            )
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
@@ -117,9 +136,12 @@ class CodexCliProvider:
         session: LLMSessionRef | None = None,
         session_policy: str = "stateless",
         artifact_dir: Path | None = None,
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        cancel_check=None,
     ) -> LLMProviderResponse[str]:
         stateful = session_policy == "stateful" and session is not None
-        with tempfile.TemporaryDirectory(prefix="arc-llm-") as tmp:
+        with _temporary_directory(self.env) as tmp:
             output_path = Path(tmp) / "output.txt"
             cmd = _codex_exec_cmd(
                 self.env,
@@ -131,18 +153,10 @@ class CodexCliProvider:
                 json_events=stateful,
             )
 
-            try:
-                result = subprocess.run(
-                    cmd,
-                    input=prompt,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=dict(self.env),
-                    timeout=_timeout_seconds(self.env, "ARC_CODEX_TIMEOUT_SECONDS"),
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
+            result = _run_codex(
+                cmd, prompt, env=self.env, timeout_seconds=timeout_seconds,
+                deadline=deadline, cancel_check=cancel_check,
+            )
             if result.returncode != 0:
                 raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
@@ -254,9 +268,13 @@ def _codex_exec_cmd(
 
 
 def _default_schema_cache_dir(env: Mapping[str, str]) -> Path:
-    if value := _env_text(env, "ARC_LLM_SCHEMA_CACHE_DIR", ""):
-        return Path(value).expanduser()
-    return Path(tempfile.gettempdir()) / "arc-llm-schema-cache"
+    return schema_cache_root(env)
+
+
+def _temporary_directory(env: Mapping[str, str]):
+    root = llm_tmp_root(env)
+    root.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix="worker-", dir=root)
 
 
 def _codex_resume_supports_output_schema(env: Mapping[str, str]) -> bool:

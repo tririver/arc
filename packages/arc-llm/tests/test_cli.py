@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import signal
 from types import SimpleNamespace
+
+import pytest
 
 from arc_llm import cli
 
@@ -22,6 +25,17 @@ def test_main_returns_nonzero_for_failed_status(monkeypatch, capsys):
 
     assert cli.main(["doctor", "host"]) == 1
     assert json.loads(capsys.readouterr().out)["status"] == "failed"
+
+
+def test_terminal_status_exit_code_matrix(monkeypatch, capsys):
+    for status in ("completed", "degraded", "stopped"):
+        monkeypatch.setattr(cli, "_dispatch", lambda _args, status=status: {"ok": False, "status": status})
+        assert cli.main(["doctor", "host"]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == status
+
+    monkeypatch.setattr(cli, "_dispatch", lambda _args: {"status": "cancelled"})
+    assert cli.main(["doctor", "host"]) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "cancelled"
 
 
 def test_main_treats_needs_llm_as_successful_handoff(monkeypatch, capsys):
@@ -48,6 +62,88 @@ def test_main_json_wraps_dispatch_exception(monkeypatch, capsys):
         "message": "provider unavailable",
         "type": "RuntimeError",
     }
+
+
+def test_main_json_returns_needs_llm_for_auto_manual_without_provider_call(monkeypatch, capsys):
+    monkeypatch.delenv("ARC_AGENT_HOST", raising=False)
+    monkeypatch.setattr("arc_llm.host._parent_process_chain", lambda: [])
+    monkeypatch.setattr(cli, "_read_prompt", lambda _value: "prompt")
+
+    assert cli.main(["run-json", "--json", "--prompt", "-"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "needs_llm"
+    assert output["llm_task"]["provider_resolved"] == "manual"
+
+
+def test_run_text_returns_needs_llm_handoff_without_json_flag(monkeypatch, capsys):
+    monkeypatch.delenv("ARC_AGENT_HOST", raising=False)
+    monkeypatch.setattr("arc_llm.host._parent_process_chain", lambda: [])
+    monkeypatch.setattr(cli, "_read_prompt", lambda _value: "prompt")
+
+    assert cli.main(["run-text", "--prompt", "-"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "needs_llm"
+
+
+def test_job_progress_callback_writes_arc_jobs_compatible_jsonl(tmp_path, monkeypatch):
+    path = tmp_path / "progress.jsonl"
+    monkeypatch.setenv("ARC_JOB_PROGRESS_FILE", str(path))
+    callback = cli._job_progress_callback()
+
+    callback({"schema_version": "internal", "event": "run_finished", "status": "degraded", "completed_workers": 2})
+
+    event = json.loads(path.read_text(encoding="utf-8"))
+    assert event == {"event": "run_finished", "completed_workers": 2, "run_status": "degraded"}
+
+
+def test_job_cancel_check_accepts_explicit_and_progress_sibling_files(tmp_path, monkeypatch):
+    progress = tmp_path / "progress.jsonl"
+    monkeypatch.setenv("ARC_JOB_PROGRESS_FILE", str(progress))
+    monkeypatch.delenv("ARC_JOB_CANCEL_FILE", raising=False)
+    assert cli._job_cancel_check() is False
+    (tmp_path / "cancel.request").write_text("cancel", encoding="utf-8")
+    assert cli._job_cancel_check() is True
+
+    (tmp_path / "cancel.request").unlink()
+    explicit = tmp_path / "explicit.cancel"
+    monkeypatch.setenv("ARC_JOB_CANCEL_FILE", str(explicit))
+    explicit.write_text("cancel", encoding="utf-8")
+    assert cli._job_cancel_check() is True
+
+
+def test_signal_handler_sets_cli_cancellation_flag():
+    cli._SIGNAL_CANCEL_REQUESTED.clear()
+    cli._request_signal_cancel(signal.SIGTERM, None)
+    assert cli._job_cancel_check() is True
+    cli._SIGNAL_CANCEL_REQUESTED.clear()
+
+
+def test_doctor_provider_and_config_include_kimi_risk_metadata(tmp_path, monkeypatch):
+    kimi_home = tmp_path / "kimi-home"
+    kimi_home.mkdir()
+    (kimi_home / "mcp.json").write_text("do-not-report-this-value", encoding="utf-8")
+    monkeypatch.setenv("ARC_AGENT_HOST", "kimi-code")
+    monkeypatch.setenv("KIMI_CODE_HOME", str(kimi_home))
+
+    provider = cli._dispatch(cli._build_parser().parse_args(["doctor", "provider"]))
+    config = cli._dispatch(cli._build_parser().parse_args(["doctor", "config"]))
+
+    assert provider["provider"] == "kimi-code-cli"
+    assert provider["experimental"] is True
+    assert provider["provider_side_persistence"] is True
+    assert any(item["category"] == "mcp" for item in provider["risks"])
+    assert "do-not-report-this-value" not in repr(provider)
+    assert "kimi_code_cli.experimental" in config["warnings"]
+
+
+def test_doctor_json_is_accepted_after_each_doctor_subcommand(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "detect_host", lambda: SimpleNamespace(host="unknown", confidence=0.0, signals=[]))
+
+    assert cli.main(["doctor", "host", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["host"] == "unknown"
+
+    parser = cli._build_parser()
+    assert parser.parse_args(["doctor", "provider", "--json"]).json is True
+    assert parser.parse_args(["doctor", "config", "--json"]).json is True
 
 
 def test_runtime_env_merges_cli_llm_options(monkeypatch):
@@ -126,6 +222,40 @@ def test_run_text_cli_passes_model_tier(monkeypatch):
     assert captured["prompt"] == "prompt text"
     assert captured["model_tier"] == "high"
     assert captured["model"] is None
+
+
+def test_prompt_text_is_literal_and_does_not_read_a_file(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        cli,
+        "_read_prompt",
+        lambda _value: (_ for _ in ()).throw(AssertionError("literal prompt must not be opened")),
+    )
+    monkeypatch.setattr(cli, "run_text", lambda prompt, **_kwargs: captured.setdefault("prompt", prompt) or "ok")
+
+    args = cli._build_parser().parse_args(["run-text", "--prompt-text", "Say hello", "--provider", "manual"])
+
+    assert cli._dispatch(args) == "Say hello"
+    assert captured["prompt"] == "Say hello"
+
+
+def test_prompt_file_and_legacy_prompt_keep_file_semantics(tmp_path, monkeypatch):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("from file", encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(cli, "run_text", lambda prompt, **_kwargs: seen.append(prompt) or "ok")
+    parser = cli._build_parser()
+
+    assert cli._dispatch(parser.parse_args(["run-text", "--prompt-file", str(prompt_file)])) == "ok"
+    assert cli._dispatch(parser.parse_args(["run-text", "--prompt", str(prompt_file)])) == "ok"
+    assert seen == ["from file", "from file"]
+
+
+def test_prompt_sources_are_mutually_exclusive():
+    parser = cli._build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run-text", "--prompt-text", "literal", "--prompt-file", "prompt.txt"])
 
 
 def test_run_json_cli_passes_stateful_session_args(tmp_path, monkeypatch):

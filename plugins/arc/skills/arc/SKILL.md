@@ -111,6 +111,16 @@ CI, or offline-preparation environments may prewarm it with
 `<skill-dir>/scripts/arc-runtime doctor --profile core`. The base Skill never
 installs or starts MCP.
 
+The launcher defaults `ARC_HOME` to `$HOME/.codex/arc`; other hosts may set an
+explicit portable location. It keeps `runtimes/`, `cache/arc-paper/`,
+`cache/arc-domain/`, `cache/arc-llm/`, `jobs/`, `tmp/arc-llm/`, and
+`migrations/` below that root. On first use it migrates only recognized legacy
+ARC caches under a lock. Verified duplicates are deduplicated, conflicts are
+preserved under `migration-conflicts/`, and a failed migration stops startup
+instead of splitting state. `doctor` reports resolved paths, migration status,
+detected host, and provider. After runtime preparation the launcher exports
+the detected `ARC_AGENT_HOST` for CLI and detached-job provider selection.
+
 ## Workflow
 
 Follow the workflow step by step. Do not skip any step, and do not kill or
@@ -187,7 +197,12 @@ Step 5: Write `<project-dir>/context.json`.
 Include `automation_level`, `workflow`, `original_request`, `user_intent`,
 `arc_run_root`, `project_dir_name`, `project_dir`, `run_id`, `created_at`,
 `skill_version`, `skill_dir`, `skill_workflow_json_dir`, `seed_paper_list`,
-`provider`, `model_tier`, `workers`, and `refresh`.
+`provider`, `model_tier`, `workers`, `refresh`, `recent_window_days`, and
+`as_of_date`.
+
+Default `recent_window_days` to `365` and freeze `as_of_date` to the run's UTC
+date. When the request says "the last two years", use the exact number of days
+between `as_of_date` and the corresponding calendar date two years earlier.
 
 Set `provider` to `auto` unless the user pins a provider. Set `model_tier` to
 `medium` unless the user explicitly asks otherwise. Never select the `max`

@@ -158,3 +158,29 @@ def test_domain_selection_keeps_all_recent_arxiv_papers_beyond_selected_count():
     recent = selected[1]
     assert recent["recent_arxiv"] is True
     assert "recent arXiv" in recent["selection_reason"]
+
+
+def test_recent_window_uses_first_public_date_not_updated_and_is_inclusive():
+    as_of = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    old_revised = _paper(
+        "arXiv:2001.00001", published="2020-01-01", updated="2026-07-20"
+    )
+    boundary = _paper("arXiv:2507.00001", published="2025-07-20")
+
+    assert network._is_recent_arxiv_paper(old_revised, now=as_of, window_days=365) is False
+    assert network._is_recent_arxiv_paper(boundary, now=as_of, window_days=365) is True
+    assert network._paper_date_with_basis(old_revised) == (
+        datetime(2020, 1, 1).date(),
+        "published",
+    )
+
+
+def test_recent_window_falls_back_to_arxiv_month_not_revision_date():
+    record = _paper("arXiv:2507.12345", updated="2026-07-20")
+    selected = network._select_domain_papers(
+        [record], foundation_id="arXiv:2401.00001",
+        intent_ranking={"ranked_paper_ids": []}, intent="", selected_count=1,
+        recent_window_days=365, as_of_date=datetime(2026, 7, 20).date(),
+    )
+    assert selected[0]["first_public_date"] == "2025-07-01"
+    assert selected[0]["recency_basis"] == "arxiv_id_month"

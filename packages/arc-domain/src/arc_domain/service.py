@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from arc_paper.ids import normalize_paper_id
+from arc_llm.runner import LLMNeedsLLM
 
 from .cache import DomainPaths, domain_id_for, now_iso, read_json, update_status, write_json
 from .evidence import build_evidence_pack as _build_evidence_pack
@@ -24,14 +26,16 @@ SUPPORTED_DOMAIN_SUMMARY_SCHEMA_VERSIONS = frozenset(
 )
 
 
-def init_domain(seed_paper: str, *, intent: str = "", domain_id: str | None = None) -> dict[str, Any]:
+def init_domain(seed_paper: str, *, intent: str = "", domain_id: str | None = None,
+                recent_window_days: int = 365, as_of_date: str | date | None = None) -> dict[str, Any]:
     try:
         seed_id = normalize_paper_id(seed_paper)
         resolved = domain_id or domain_id_for(seed_id, intent)
         paths = DomainPaths.for_domain(resolved)
-        config = _domain_config(paths, seed_id=seed_id, intent=intent)
+        config = _domain_config(paths, seed_id=seed_id, intent=intent,
+                                recent_window_days=recent_window_days, as_of_date=as_of_date)
         write_json(paths.config, config)
-        update_status(paths, stage="initialized", seed_paper=seed_id, intent=intent)
+        update_status(paths, stage="initialized", seed_paper=seed_id, intent=intent, recency=config["recency"])
         return ok({"domain_id": paths.domain_id, "domain_dir": str(paths.domain_dir), "config": config})
     except Exception as exc:
         return err("domain_init_failed", str(exc))
@@ -47,6 +51,8 @@ def identify_foundation(
     model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> dict[str, Any]:
     try:
         paths = _ensure_domain(
@@ -56,6 +62,8 @@ def identify_foundation(
             provider=provider,
             model=model,
             model_tier=model_tier,
+            recent_window_days=recent_window_days,
+            as_of_date=as_of_date,
         )
         data = _identify_foundation(
             seed_paper=seed_paper,
@@ -82,6 +90,8 @@ def build_network(
     model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> dict[str, Any]:
     try:
         paths = _ensure_domain(
@@ -91,6 +101,8 @@ def build_network(
             provider=provider,
             model=model,
             model_tier=model_tier,
+            recent_window_days=recent_window_days,
+            as_of_date=as_of_date,
         )
         if not paths.foundation_selection.exists():
             _identify_foundation(
@@ -112,6 +124,8 @@ def build_network(
             model_tier=model_tier,
             refresh=refresh,
             workers=workers,
+            recent_window_days=recent_window_days,
+            as_of_date=_parse_as_of_date(as_of_date),
         )
         render = render_network_html(paths=paths)
         data.update(render)
@@ -127,9 +141,12 @@ def build_evidence_pack(
     domain_id: str | None = None,
     refresh: bool = False,
     workers: int = 8,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> dict[str, Any]:
     try:
-        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id)
+        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id,
+                               recent_window_days=recent_window_days, as_of_date=as_of_date)
         if not paths.domain_graph.exists():
             raise FileNotFoundError("domain_graph.json missing; run build-network first")
         return ok(_build_evidence_pack(paths=paths, refresh=refresh, workers=workers))
@@ -144,9 +161,12 @@ def build_paper_json_pack(
     domain_id: str | None = None,
     refresh: bool = False,
     workers: int = 8,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> dict[str, Any]:
     try:
-        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id)
+        paths = _ensure_domain(seed_paper, intent=intent, domain_id=domain_id,
+                               recent_window_days=recent_window_days, as_of_date=as_of_date)
         if not paths.domain_graph.exists():
             raise FileNotFoundError("domain_graph.json missing; run build-network first")
         return ok(_build_paper_json_pack(paths=paths, refresh=refresh, workers=workers))
@@ -162,6 +182,8 @@ def summarize_domain(
     provider: str = "auto",
     model: str | None = None,
     model_tier: str | None = None,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> dict[str, Any]:
     try:
         paths = _ensure_domain(
@@ -171,13 +193,19 @@ def summarize_domain(
             provider=provider,
             model=model,
             model_tier=model_tier,
+            recent_window_days=recent_window_days,
+            as_of_date=as_of_date,
         )
         if not paths.evidence_pack.exists():
             raise FileNotFoundError("evidence_pack.json missing; run build-evidence first")
+    except LLMNeedsLLM as exc:
+        return _needs_llm_result(exc)
     except Exception as exc:
         return err("domain_summary_failed", str(exc))
     try:
         return ok(_summarize_domain(paths=paths, provider=provider, model=model, model_tier=model_tier))
+    except LLMNeedsLLM as exc:
+        return _needs_llm_result(exc)
     except Exception as exc:
         warning = _record_domain_summary_warning(paths, exc)
         return ok(
@@ -196,6 +224,8 @@ def build_domain(
     model_tier: str | None = None,
     refresh: bool = False,
     workers: int = 8,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> dict[str, Any]:
     try:
         paths = _ensure_domain(
@@ -205,6 +235,8 @@ def build_domain(
             provider=provider,
             model=model,
             model_tier=model_tier,
+            recent_window_days=recent_window_days,
+            as_of_date=as_of_date,
         )
         foundation = _identify_foundation(
             seed_paper=seed_paper,
@@ -225,6 +257,8 @@ def build_domain(
             model_tier=model_tier,
             refresh=refresh,
             workers=workers,
+            recent_window_days=recent_window_days,
+            as_of_date=_parse_as_of_date(as_of_date),
         )
         html = render_network_html(paths=paths)
         paper_pack = _build_paper_json_pack(paths=paths, refresh=refresh, workers=workers)
@@ -235,6 +269,8 @@ def build_domain(
             summary_available = bool(summary.get("summary_available", summary.get("summary") is not None))
             if not summary_available and isinstance(summary.get("warnings"), list):
                 warnings.extend(summary["warnings"])
+        except LLMNeedsLLM:
+            raise
         except Exception as exc:
             warning = _record_domain_summary_warning(paths, exc)
             warnings.append(warning)
@@ -260,6 +296,8 @@ def build_domain(
                 "warnings": warnings,
             }
         )
+    except LLMNeedsLLM as exc:
+        return _needs_llm_result(exc)
     except Exception as exc:
         return err("domain_build_failed", str(exc))
 
@@ -357,6 +395,8 @@ def _ensure_domain(
     provider: str | None = None,
     model: str | None = None,
     model_tier: str | None = None,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> DomainPaths:
     seed_id = normalize_paper_id(seed_paper)
     paths = DomainPaths.for_domain(domain_id or domain_id_for(seed_id, intent))
@@ -369,13 +409,19 @@ def _ensure_domain(
             provider=provider,
             model=model,
             model_tier=model_tier,
+            recent_window_days=recent_window_days,
+            as_of_date=as_of_date,
         )
         write_json(paths.config, config)
+        update_status(paths, recency=config["recency"])
         return paths
+    original = config
     _validate_domain_config(config, paths=paths, seed_id=seed_id, intent=intent)
+    config = _with_recency_config(config, paths=paths, recent_window_days=recent_window_days, as_of_date=as_of_date)
     updated = _with_llm_fingerprint(config, provider=provider, model=model, model_tier=model_tier)
-    if updated != config:
+    if updated != original:
         write_json(paths.config, updated)
+        update_status(paths, recency=updated["recency"])
     return paths
 
 
@@ -387,14 +433,18 @@ def _domain_config(
     provider: str | None = None,
     model: str | None = None,
     model_tier: str | None = None,
+    recent_window_days: int = 365,
+    as_of_date: str | date | None = None,
 ) -> dict[str, Any]:
+    recency = _recency_config(recent_window_days, as_of_date)
     config = {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "domain_id": paths.domain_id,
         "seed_paper": seed_id,
         "intent": intent,
         "created_at": now_iso(),
-        "input_fingerprint": _input_fingerprint(seed_id=seed_id, intent=intent),
+        "recency": recency,
+        "input_fingerprint": _input_fingerprint(seed_id=seed_id, intent=intent, recency=recency),
     }
     return _with_llm_fingerprint(config, provider=provider, model=model, model_tier=model_tier)
 
@@ -443,17 +493,84 @@ def _with_llm_fingerprint(
     return updated
 
 
-def _input_fingerprint(*, seed_id: str, intent: str) -> dict[str, Any]:
+def _input_fingerprint(*, seed_id: str, intent: str, recency: dict[str, Any] | None = None) -> dict[str, Any]:
     identity = {
         "schema_version": INPUT_FINGERPRINT_SCHEMA_VERSION,
         "seed_paper": seed_id,
         "intent": intent,
     }
-    return {
+    result = {
         "schema_version": INPUT_FINGERPRINT_SCHEMA_VERSION,
         "identity": identity,
         "identity_hash": _stable_hash(identity),
     }
+    if recency is not None:
+        result.update({"recency": recency, "recency_hash": _stable_hash(recency)})
+    return result
+
+
+def _parse_as_of_date(value: str | date | None) -> date:
+    if value is None:
+        return datetime.now(timezone.utc).date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise ValueError("as_of_date must use YYYY-MM-DD") from exc
+
+
+def _recency_config(window_days: int, as_of_date: str | date | None) -> dict[str, Any]:
+    if isinstance(window_days, bool) or window_days <= 0:
+        raise ValueError("recent_window_days must be a positive integer")
+    end = _parse_as_of_date(as_of_date)
+    start = end - timedelta(days=int(window_days))
+    return {
+        "recent_window_days": int(window_days),
+        "as_of_date": end.isoformat(),
+        "window_start_date": start.isoformat(),
+        "window_end_date": end.isoformat(),
+    }
+
+
+def calendar_window_days(as_of_date: str | date, *, years: int = 2) -> int:
+    """Return the exact day span to the corresponding calendar date years ago."""
+    if isinstance(years, bool) or years <= 0:
+        raise ValueError("years must be a positive integer")
+    end = _parse_as_of_date(as_of_date)
+    try:
+        start = end.replace(year=end.year - int(years))
+    except ValueError:
+        # February 29 maps to the last valid day of February in a non-leap year.
+        start = end.replace(year=end.year - int(years), day=28)
+    return (end - start).days
+
+
+def _with_recency_config(config: dict[str, Any], *, paths: DomainPaths,
+                         recent_window_days: int, as_of_date: str | date | None) -> dict[str, Any]:
+    recency = _recency_config(recent_window_days, as_of_date)
+    stored = config.get("input_fingerprint")
+    if not isinstance(stored, dict):
+        stored = _input_fingerprint(seed_id=str(config.get("seed_paper", "")), intent=str(config.get("intent", "")))
+    new_hash = _stable_hash(recency)
+    if stored.get("recency_hash") not in {None, new_hash}:
+        for path in (paths.citer_pool, paths.intent_rankings, paths.selected_papers, paths.reference_overlap,
+                     paths.domain_graph, paths.paper_json_pack, paths.evidence_pack, paths.domain_summary,
+                     paths.domain_summary_markdown, paths.network_html):
+            path.unlink(missing_ok=True)
+        update_status(
+            paths,
+            stage="recency_config_changed",
+            recency=recency,
+            recency_artifacts_invalidated=True,
+        )
+    updated = dict(config)
+    fingerprint = dict(stored)
+    fingerprint.update({"recency": recency, "recency_hash": new_hash})
+    updated.update({"recency": recency, "input_fingerprint": fingerprint})
+    return updated
 
 
 def _llm_fingerprint(*, provider: str | None, model: str | None, model_tier: str | None) -> dict[str, Any]:
@@ -524,3 +641,19 @@ def _domain_summary_unavailable_result(paths: DomainPaths, warning: dict[str, An
         "summary_available": False,
         "warnings": [warning],
     }
+
+
+def _needs_llm_result(exc: LLMNeedsLLM) -> dict[str, Any]:
+    config = exc.config
+    return err(
+        "needs_llm",
+        str(exc),
+        status="needs_llm",
+        llm_task={
+            "provider_requested": "auto",
+            "provider_resolved": config.provider,
+            "host": config.host.host,
+            "signals": list(config.signals),
+            "message": str(exc),
+        },
+    )

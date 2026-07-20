@@ -3,9 +3,7 @@ from __future__ import annotations
 from typing import Mapping, Sequence
 
 from ..host import select_llm_provider
-from .claude_cli import ClaudeCliProvider
-from .codex_cli import CodexCliProvider
-from .manual import ManualProvider
+from .registry import create_provider
 
 
 def select_provider(
@@ -17,10 +15,4 @@ def select_provider(
     name = provider
     if provider == "auto":
         name = select_llm_provider(env=env, process_chain=process_chain).provider
-    if name == "codex-cli":
-        return CodexCliProvider(env=env)
-    if name == "claude-cli":
-        return ClaudeCliProvider(env=env)
-    if name == "manual":
-        return ManualProvider()
-    raise ValueError(f"Unknown LLM provider: {name}")
+    return create_provider(name, env=env)

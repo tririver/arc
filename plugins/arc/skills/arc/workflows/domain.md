@@ -7,7 +7,10 @@ more seed papers.
 
 Read `<project-dir>/context.json`. Use the exact values from that file for all
 ARC calls, especially `user_intent`, `seed_paper_list`, `provider`, `model_tier`,
-`workers`, and `refresh`.
+`workers`, `refresh`, `recent_window_days`, and `as_of_date`. Default
+`recent_window_days` to `365` and freeze `as_of_date` to the run's UTC date.
+For "the last two years", record the exact day count back to the corresponding
+calendar date two years earlier.
 
 ### Phase 1: Prepare Project Artifacts
 
@@ -36,6 +39,8 @@ arc-jobs submit --job-type domain_build --cwd <project-dir> --json -- \
   --provider <provider> \
   --model-tier <model_tier> \
   --workers <workers> \
+  --recent-window-days <recent_window_days> \
+  --as-of-date <as_of_date> \
   --json
 ```
 
@@ -200,11 +205,13 @@ python3 <skill-dir>/workflows/scripts/write-domain-manifest.py \
 ```
 
 The command must complete successfully before a requested ideas workflow
-starts. It writes `<project-dir>/domain/domain-manifest.json`, deduplicates
-domains by `domain_id`, and records project-relative paths for each summary and
-paper pack. Do not infer the number of research domains from the number of
-Markdown files or requested seeds. Print a `WARNING:` and stop before ideas if
-the manifest cannot be written or any referenced artifact is missing.
+starts. It writes `arc.workflow.domain_manifest.v2`, preserving each
+seed-specific package while semantically grouping packages into stable field
+cards. Only `distinct_field` with confidence at least `0.80` creates hard
+separation; uncertain, low-confidence, or failed grouping conservatively
+merges packages with a warning. Ideas routing uses `field_count` and `field_id`,
+never package count. Print a `WARNING:` and stop before ideas if the manifest
+cannot be written or any referenced artifact is missing.
 
 ### Phase 4: Scope Boundary and Interactive Review
 

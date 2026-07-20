@@ -73,10 +73,10 @@ def safe_domain_id(value: str) -> str:
 def cache_root() -> Path:
     if value := os.environ.get("ARC_DOMAIN_CACHE"):
         return Path(value).expanduser()
+    if value := os.environ.get("ARC_HOME"):
+        return Path(value).expanduser() / "cache" / "arc-domain"
     if value := os.environ.get("XDG_CACHE_HOME"):
         return Path(value).expanduser() / "arc" / "arc-domain"
-    if project_root := _project_root():
-        return project_root / "cache" / "arc-domain"
     return Path.home() / ".cache" / "arc" / "arc-domain"
 
 
@@ -111,10 +111,3 @@ def update_status(paths: DomainPaths, **fields: Any) -> dict[str, Any]:
     status["updated_at"] = now_iso()
     write_json(paths.status, status)
     return status
-
-
-def _project_root() -> Path | None:
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "packages" / "arc-domain").is_dir() and (parent / "cache").is_dir():
-            return parent
-    return None

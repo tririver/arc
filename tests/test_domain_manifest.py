@@ -64,11 +64,13 @@ def test_manifest_uses_distinct_domain_ids_and_relative_paths(tmp_path: Path) ->
 
     payload = module.build_domain_manifest(project)
 
-    assert payload["schema_version"] == "arc.workflow.domain_manifest.v1"
-    assert payload["domain_count"] == 2
-    assert [item["domain_id"] for item in payload["domains"]] == ["domain-a", "domain-b"]
-    assert payload["domains"][0]["summary_json_path"] == "domain/a_domain_summary.json"
-    assert payload["domains"][0]["seed_paper"] == "seed:a"
+    assert payload["schema_version"] == "arc.workflow.domain_manifest.v2"
+    assert payload["package_count"] == 2
+    assert payload["field_count"] == 1
+    assert payload["research_scope"] == "single_domain"
+    assert [item["domain_package_id"] for item in payload["domain_packages"]] == ["domain-a", "domain-b"]
+    assert payload["domain_packages"][0]["summary_json_path"] == "domain/a_domain_summary.json"
+    assert payload["domain_packages"][0]["seed_paper"] == "seed:a"
     assert payload["duplicates"] == [
         {
             "domain_id": "domain-a",
@@ -91,7 +93,7 @@ def test_manifest_preserves_requested_seed_order(tmp_path: Path) -> None:
 
     payload = module.build_domain_manifest(project)
 
-    assert [item["seed_paper"] for item in payload["domains"]] == ["seed:z", "seed:a"]
+    assert [item["seed_paper"] for item in payload["domain_packages"]] == ["seed:z", "seed:a"]
 
 
 def test_manifest_indexes_mixed_v4_v5_summaries_without_rewriting_them(tmp_path: Path) -> None:
@@ -107,7 +109,7 @@ def test_manifest_indexes_mixed_v4_v5_summaries_without_rewriting_them(tmp_path:
 
     payload = module.build_domain_manifest(project)
 
-    assert [item["domain_id"] for item in payload["domains"]] == ["domain-a", "domain-b"]
+    assert [item["domain_package_id"] for item in payload["domain_packages"]] == ["domain-a", "domain-b"]
     assert json.loads((project / "domain/a_domain_summary.json").read_text())["schema_version"] == (
         "arc.domain_summary.v4"
     )
@@ -135,7 +137,90 @@ def test_manifest_prefers_requested_seed_domain_records_over_foundation(tmp_path
 
     payload = module.build_domain_manifest(project)
 
-    assert payload["domains"][0]["seed_paper"] == "arXiv:1234.5678"
+    assert payload["domain_packages"][0]["seed_paper"] == "arXiv:1234.5678"
+
+
+def test_manifest_hard_separates_only_high_confidence_distinct_fields(tmp_path: Path) -> None:
+    module = _load_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "context.json").write_text(json.dumps({"user_intent": "bridge", "seed_paper_list": ["seed:a", "seed:b"]}))
+    _write_domain(project, "a", "domain-a", "seed:a")
+    _write_domain(project, "b", "domain-b", "seed:b")
+    pair = {"package_a": "domain-a", "package_b": "domain-b", "classification": "distinct_field",
+            "confidence": 0.8, "reason": "different methods", "evidence": {"semantic": "x"}}
+
+    payload = module.build_domain_manifest(project, grouping_result={"pairs": [pair]})
+
+    assert payload["field_count"] == 2
+    assert payload["research_scope"] == "cross_domain"
+    assert all(item["field_id"].startswith("field-") for item in payload["field_groups"])
+
+
+def test_manifest_low_confidence_or_failed_grouping_merges_conservatively(tmp_path: Path) -> None:
+    module = _load_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "context.json").write_text(json.dumps({"user_intent": "same area"}))
+    _write_domain(project, "a", "domain-a", "seed:a")
+    _write_domain(project, "b", "domain-b", "seed:b")
+    pair = {"package_a": "domain-a", "package_b": "domain-b", "classification": "distinct_field",
+            "confidence": 0.79, "reason": "weak", "evidence": {}}
+
+    low = module.build_domain_manifest(project, grouping_result={"pairs": [pair]})
+    failed = module.build_domain_manifest(project, grouping_result={"pairs": []})
+
+    assert low["field_count"] == 1
+    assert failed["field_count"] == 1
+    assert failed["grouping_method"] == "conservative_fallback"
+    assert failed["grouping_warnings"]
+
+
+def test_manifest_three_package_grouping_is_deterministic_and_evidence_backed(tmp_path: Path) -> None:
+    module = _load_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "context.json").write_text(json.dumps({"user_intent": "bridge"}), encoding="utf-8")
+    for suffix in ("a", "b", "c"):
+        _write_domain(project, suffix, f"domain-{suffix}", f"seed:{suffix}")
+    pairs = [
+        {"package_a": "domain-a", "package_b": "domain-b", "classification": "same_field", "confidence": 0.91, "reason": "same methods", "evidence": {"semantic": "shared"}},
+        {"package_a": "domain-a", "package_b": "domain-c", "classification": "distinct_field", "confidence": 0.94, "reason": "different objects", "evidence": {"semantic": "distinct"}},
+        {"package_a": "domain-b", "package_b": "domain-c", "classification": "distinct_field", "confidence": 0.88, "reason": "different objects", "evidence": {"semantic": "distinct"}},
+    ]
+
+    first = module.build_domain_manifest(project, grouping_result={"pairs": pairs})
+    second = module.build_domain_manifest(project, grouping_result={"pairs": list(reversed(pairs))})
+
+    assert first["field_count"] == 2
+    assert [item["field_id"] for item in first["field_groups"]] == [item["field_id"] for item in second["field_groups"]]
+    merged = next(item for item in first["field_groups"] if len(item["domain_package_ids"]) == 2)
+    assert merged["confidence"] == 0.91
+    assert merged["reason"]
+    assert merged["evidence"]
+
+
+def test_manifest_falls_back_on_nontransitive_grouping_across_hard_distinct_pair(tmp_path: Path) -> None:
+    module = _load_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "context.json").write_text(json.dumps({"user_intent": "bridge"}), encoding="utf-8")
+    for suffix in ("a", "b", "c"):
+        _write_domain(project, suffix, f"domain-{suffix}", f"seed:{suffix}")
+    pairs = [
+        {"package_a": "domain-a", "package_b": "domain-b", "classification": "same_field", "confidence": 0.9, "reason": "same", "evidence": {}},
+        {"package_a": "domain-b", "package_b": "domain-c", "classification": "uncertain", "confidence": 0.7, "reason": "uncertain", "evidence": {}},
+        {"package_a": "domain-a", "package_b": "domain-c", "classification": "distinct_field", "confidence": 0.95, "reason": "hard split", "evidence": {}},
+    ]
+
+    payload = module.build_domain_manifest(project, grouping_result={"pairs": pairs})
+
+    assert payload["field_count"] == 1
+    assert payload["research_scope"] == "single_domain"
+    assert payload["grouping_method"] == "conservative_fallback"
+    assert "non-transitive" in payload["grouping_warnings"][0]
+    grouping = json.loads((project / payload["grouping_artifact"]).read_text(encoding="utf-8"))
+    assert grouping["warnings"] == payload["grouping_warnings"]
 
 
 def test_manifest_requires_companion_artifacts(tmp_path: Path) -> None:

@@ -952,9 +952,11 @@ def test_domain_and_ideas_workflows_use_explicit_domain_manifest() -> None:
     ideas = (WF / "ideas.md").read_text(encoding="utf-8")
 
     assert "write-domain-manifest.py" in domain
-    assert "deduplicates\ndomains by `domain_id`" in domain
+    assert "arc.workflow.domain_manifest.v2" in domain
+    assert "field_count" in domain
+    assert "field_id" in domain
     assert "domain_manifest_path" in ideas
-    assert "Two or more distinct\ndomains select the cross-domain prompts" in ideas
+    assert "two or more fields use cross-domain prompts" in ideas
     assert "source domain may contribute a mature method" in ideas
 
 
@@ -976,6 +978,34 @@ def test_max_model_tier_requires_an_explicit_user_request() -> None:
     assert "only when the user explicitly requests the `max` model tier" in skill
     assert "Never select the `max` model tier automatically" in manual
     assert "no workflow default or automatic task mapping may select it" in manual
+
+
+def test_readme_and_llm_manual_document_experimental_kimi_provider() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    manual = (SKILL / "manuals/arc-llm.md").read_text(encoding="utf-8")
+    warning = (
+        "kimi-code-cli is experimental and inherits Kimi Code configuration, instructions, "
+        "skills, hooks, plugins, MCP, tool permissions, and persistent sessions; it may access "
+        "the network, run commands, and modify files."
+    )
+
+    for text in (readme, manual):
+        compact = " ".join(text.split())
+        assert "Kimi Code CLI `>=0.28.0`" in text
+        assert "`kimi login`" in text
+        assert "ARC_AGENT_HOST=kimi-code" in text
+        assert "ARC_KIMI_BIN" in text
+        assert "ARC_KIMI_WORK_DIR" in text
+        assert "ARC_KIMI_TIMEOUT_SECONDS" in text
+        assert "ARC_LLM_KIMI_LOW_MODEL" in text
+        assert "provider-side" in text
+        assert "not a sandbox" in compact
+        assert warning in compact
+
+    assert "usage fields remain null" in readme
+    assert "all fields in its usage object are null" in manual
+    assert "does not copy, migrate, or delete Kimi sessions" in readme
+    assert "does not copy, migrate, or delete the user's Kimi" in manual
 
 
 def test_ideas_full_info_template_includes_domain_and_controller_context() -> None:
@@ -1113,12 +1143,72 @@ def test_root_plugin_manifests_use_canonical_arc_skill_tree() -> None:
     assert codex_manifest["name"] == "arc"
     assert codex_manifest["skills"] == "./skills/"
     assert "mcpServers" not in codex_manifest
+    assert "mcpServers" not in claude_manifest
     assert not (PLUGIN / ".mcp.json").exists()
+    assert not (PLUGIN / "bin/arc-mcp").exists()
     assert claude_manifest["name"] == "arc"
     assert (SKILL / "SKILL.md").is_file()
     legacy_skill = ROOT / "skills/arc"
     assert not legacy_skill.exists()
     assert not legacy_skill.is_symlink()
+
+
+def test_arc_runtime_and_job_docs_cover_unified_context_and_lifecycle() -> None:
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    jobs = (SKILL / "manuals/arc-jobs.md").read_text(encoding="utf-8")
+
+    for value in (
+        "ARC_HOME",
+        "cache/arc-paper/",
+        "cache/arc-domain/",
+        "cache/arc-llm/",
+        "tmp/arc-llm/",
+        "migration-conflicts/",
+        "ARC_AGENT_HOST",
+    ):
+        assert value in skill
+    assert "migration status" in skill
+    assert "detected host" in skill
+    assert "provider" in skill
+    assert "1800-second" in jobs
+    assert "worker_call_timeout_seconds" in jobs
+    assert "--progress-jsonl" in jobs
+    assert "`degraded`" in jobs
+    assert "full provider process group" in jobs
+    assert "tokens, API keys" in jobs
+
+
+def test_domain_and_ideas_docs_route_by_semantic_fields_and_frozen_recency() -> None:
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    domain = (WF / "domain.md").read_text(encoding="utf-8")
+    manual = (SKILL / "manuals/arc-domain.md").read_text(encoding="utf-8")
+    ideas = (WF / "ideas.md").read_text(encoding="utf-8")
+
+    for text in (skill, domain, manual):
+        assert "recent_window_days" in text
+        assert "as_of_date" in text
+        assert "corresponding" in text and "two" in text
+    assert "arc.workflow.domain_manifest.v2" in domain
+    assert "arc.workflow.domain_manifest.v2" in manual
+    assert "field_count" in ideas
+    assert "multiple seed-specific packages" in ideas
+    assert "field_id" in ideas
+    assert "status is `completed` or `degraded`" in ideas
+    assert "rank only usable loops" in ideas
+
+
+def test_core_skill_docs_keep_mcp_optional_and_external() -> None:
+    operating = (SKILL / "rules/operating.md").read_text(encoding="utf-8")
+    mcp = (SKILL / "manuals/arc-mcp.md").read_text(encoding="utf-8")
+    codex_manifest = json.loads((PLUGIN / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    claude_manifest = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+
+    assert "CLI-only" in operating
+    assert "separately installed optional `arc-mcp`" in operating
+    assert "base `arc` plugin does not contain an MCP manifest" in mcp
+    assert "mcpServers" not in codex_manifest
+    assert "mcpServers" not in claude_manifest
+    assert not (PLUGIN / ".mcp.json").exists()
 
 
 def test_arc_plugin_has_no_packaged_skill_copies() -> None:
@@ -1212,6 +1302,10 @@ def _write_idea_round(
     review_dir = round_root / "reviews"
     proposer_dir.mkdir(parents=True)
     review_dir.mkdir(parents=True)
+    (run_root / "loops" / loop_id / "state.json").write_text(
+        json.dumps({"status": "completed", "loop_id": loop_id, "rounds_completed": round_number}),
+        encoding="utf-8",
+    )
     (proposer_dir / "proposer_001.json").write_text(json.dumps({"title": title}), encoding="utf-8")
     marks = {
         "novelty": novelty,

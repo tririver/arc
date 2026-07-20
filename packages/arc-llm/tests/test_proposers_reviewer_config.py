@@ -60,6 +60,7 @@ def test_valid_config_parses_and_merges_defaults():
     assert config.run_id == "idea-test"
     assert config.max_concurrent_loops == 2
     assert config.artifact_options.save_prompts is True
+    assert config.worker_call_timeout_seconds is None
     assert config.session.policy == "stateful"
     assert config.session.history_mode == "delta"
     assert config.session.max_concurrent_same_prefix == 12
@@ -86,6 +87,19 @@ def test_valid_config_parses_and_merges_defaults():
     assert reviewer.runtime["allow_mcp"] is True
     assert reviewer.evidence_enabled is True
     assert reviewer.runtime["claude_effort"] == "high"
+
+
+def test_timeout_config_preserves_unspecified_and_parses_batch_and_worker_overrides():
+    payload = minimal_config()
+    assert load_batch_config(payload).worker_call_timeout_seconds is None
+
+    payload["worker_call_timeout_seconds"] = 12
+    payload["loops"][0]["proposers"][0]["worker_call_timeout_seconds"] = 4
+    config = load_batch_config(payload)
+
+    assert config.worker_call_timeout_seconds == 12
+    assert config.loops[0].proposers[0].worker_call_timeout_seconds == 4
+    assert config.loops[0].reviewers[0].worker_call_timeout_seconds is None
 
 
 def test_session_options_parse_and_loop_overrides_parent():

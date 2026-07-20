@@ -6,6 +6,7 @@ import stat
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -22,6 +23,8 @@ from arc_jobs.jobs import (
     tail_events,
     validate_arc_argv,
     write_json,
+    snapshot_environment,
+    restored_environment,
 )
 
 
@@ -176,6 +179,64 @@ def test_worker_persists_nonzero_exit_and_json_failure(tmp_path, monkeypatch):
     assert result["error"]["code"] == "job_command_failed"
     assert result["error"]["exit_code"] == 9
     assert result["result"]["exit_code"] == 9
+
+
+@pytest.mark.parametrize(
+    ("reported", "expected_status", "expected_code"),
+    [
+        ("cancelled", "cancelled", "job_cancelled"),
+        ("failed", "failed", "job_command_reported_failure"),
+        ("completed", "failed", "job_command_failed"),
+    ],
+)
+def test_nonzero_exit_preserves_failure_semantics_and_rejects_success(
+    tmp_path, monkeypatch, reported, expected_status, expected_code
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(
+        tmp_path,
+        monkeypatch,
+        body=f"printf '%s' '{{\"ok\":false,\"status\":\"{reported}\"}}'; exit 7",
+    )
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+
+    assert worker.run_job(job_id) == 1
+    result = manager.result(job_id)
+
+    assert result["status"] == expected_status
+    assert result["error"]["code"] == expected_code
+    assert result["result"]["exit_code"] == 7
+
+
+@pytest.mark.parametrize("progress_kind", ["malformed", "oversized"])
+def test_invalid_progress_terminates_and_reaps_running_command(
+    tmp_path, monkeypatch, progress_kind
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    if progress_kind == "malformed":
+        body = "printf '%s\\n' 'not-json' > \"$ARC_JOB_PROGRESS_FILE\"; sleep 10"
+    else:
+        monkeypatch.setattr(worker, "MAX_PROGRESS_FILE_BYTES", 32)
+        body = (
+            "printf '%s' '123456789012345678901234567890123' "
+            "> \"$ARC_JOB_PROGRESS_FILE\"; sleep 10"
+        )
+    _install_fake_cli(tmp_path, monkeypatch, body=body)
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(worker.run_job, job_id)
+        assert future.result(timeout=3) == 1
+
+    status = manager.status(job_id)
+    process = status["process"]
+    assert status["status"] == "failed"
+    assert status["error"]["code"] == "job_failed"
+    assert jobs_module._pid_record_alive(process) is False
 
 
 def test_cancel_terminates_running_command(tmp_path, monkeypatch):
@@ -503,3 +564,147 @@ def test_tail_events_uses_bounded_binary_tail(tmp_path, monkeypatch):
     events = tail_events(path, limit=3)
 
     assert [event["event"] for event in events] == ["event-197", "event-198", "event-199"]
+
+
+def test_environment_snapshot_excludes_secrets_and_persists_host(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("ARC_AGENT_HOST", "kimi-code")
+    monkeypatch.setenv("ARC_LLM_TIMEOUT_SECONDS", "41")
+    monkeypatch.setenv("OPENAI_API_KEY", "not-persisted")
+    _install_fake_cli(tmp_path, monkeypatch, body="printf '%s' '{\"ok\":true}'")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    persisted = read_json(JobPaths.for_job(job_id).job)["environment"]
+    assert persisted["ARC_AGENT_HOST"] == "kimi-code"
+    assert persisted["ARC_LLM_TIMEOUT_SECONDS"] == "41"
+    assert "OPENAI_API_KEY" not in persisted
+
+
+def test_detached_kimi_context_matches_foreground_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    kimi_context = {
+        "ARC_AGENT_HOST": "kimi-code",
+        "ARC_KIMI_BIN": "/opt/kimi/bin/kimi",
+        "ARC_KIMI_WORK_DIR": str(tmp_path / "work"),
+        "KIMI_CODE_HOME": str(tmp_path / "kimi-home"),
+        "ARC_KIMI_TIMEOUT_SECONDS": "73",
+        "ARC_LLM_KIMI_LOW_MODEL": "kimi-low",
+        "ARC_LLM_KIMI_MEDIUM_MODEL": "kimi-medium",
+        "ARC_LLM_KIMI_HIGH_MODEL": "kimi-high",
+        "ARC_LLM_KIMI_MAX_MODEL": "kimi-max",
+    }
+    for key, value in kimi_context.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("KIMI_API_KEY", "must-not-persist")
+    _install_fake_cli(tmp_path, monkeypatch, body="printf '%s' '{\"ok\":true}'")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+
+    job_id = manager.submit(["arc-paper", "--json"])
+    persisted = read_json(JobPaths.for_job(job_id).job)["environment"]
+    restored = restored_environment(persisted, base={"PATH": os.environ["PATH"]})
+
+    assert {key: persisted[key] for key in kimi_context} == kimi_context
+    assert {key: restored[key] for key in kimi_context} == kimi_context
+    assert "KIMI_API_KEY" not in persisted
+    assert "KIMI_API_KEY" not in restored
+
+
+def test_environment_overrides_reject_secrets_and_unknown_keys():
+    with pytest.raises(ValueError, match="must not contain secrets"):
+        snapshot_environment(overrides={"ARC_API_KEY": "secret"})
+    with pytest.raises(ValueError, match="not allowlisted"):
+        snapshot_environment(overrides={"ARC_UNKNOWN": "value"})
+
+
+@pytest.mark.parametrize("host", ["codex", "claude-code", "kimi-code"])
+def test_detached_job_persists_agent_host(tmp_path, monkeypatch, host):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("ARC_AGENT_HOST", host)
+    _install_fake_cli(tmp_path, monkeypatch, body="printf '%s' '{\"ok\":true}'")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    assert read_json(JobPaths.for_job(job_id).job)["environment"]["ARC_AGENT_HOST"] == host
+
+
+@pytest.mark.parametrize("reported", ["completed", "degraded", "stopped"])
+def test_worker_preserves_success_terminal_statuses(tmp_path, monkeypatch, reported):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(
+        tmp_path,
+        monkeypatch,
+        body=f"printf '%s' '{{\"ok\":true,\"status\":\"{reported}\",\"failure_count\":2}}'",
+    )
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    assert worker.run_job(job_id) == 0
+    result = manager.result(job_id)
+    assert result["ok"] is True and result["status"] == reported
+    assert result["result"]["output"]["failure_count"] == 2
+
+
+def test_worker_forwards_progress_sidechannel(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(
+        tmp_path,
+        monkeypatch,
+        body=(
+            "printf '%s\\n' '{\"schema_version\":\"arc.llm.proposers_reviewer.progress.v1\","
+            "\"event\":\"worker_finished\",\"phase\":\"proposers\",\"round_number\":2,"
+            "\"role\":\"proposer\",\"completed_workers\":1,\"failed_workers\":1}' "
+            "> \"$ARC_JOB_PROGRESS_FILE\"; "
+            "printf '%s' '{\"ok\":true,\"status\":\"degraded\"}'"
+        ),
+    )
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    assert worker.run_job(job_id) == 0
+    status = manager.status(job_id)
+    assert status["status"] == "degraded"
+    assert status["round_number"] == 2 and status["failed_workers"] == 1
+    assert status["role"] == "proposer"
+    assert any(event["event"] == "worker_finished" for event in status["events"])
+
+
+def test_live_status_projects_actual_proposer_phase_and_round(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    progress_written = Event()
+    release = Event()
+    manager = JobManager(worker_mode="thread")
+
+    def runner(progress, cancel):
+        progress(
+            {
+                "schema_version": "arc.llm.proposers_reviewer.progress.v1",
+                "event": "round_started",
+                "phase": "proposers",
+                "loop_id": "loop-1",
+                "round_number": 3,
+            }
+        )
+        progress_written.set()
+        assert release.wait(timeout=2)
+        return {"ok": True}
+
+    job_id = manager.start(job_type="ideas", payload={}, runner=runner)
+    assert progress_written.wait(timeout=2)
+
+    status = manager.status(job_id)
+    assert status["phase"] == "proposers"
+    assert status["round_number"] == 3
+    assert status["loop_id"] == "loop-1"
+
+    release.set()
+    assert manager.wait(job_id, timeout=2)
+
+
+def test_arc_home_places_jobs_in_fixed_layout(tmp_path, monkeypatch):
+    monkeypatch.delenv("ARC_JOBS_CACHE", raising=False)
+    monkeypatch.delenv("ARC_JOBS_DIR", raising=False)
+    monkeypatch.setenv("ARC_HOME", str(tmp_path / "arc-home"))
+    assert jobs_module.jobs_root() == tmp_path / "arc-home" / "jobs"
+    assert jobs_module.stats_db_path() == tmp_path / "arc-home" / "jobs" / ".stats" / "jobs.sqlite"

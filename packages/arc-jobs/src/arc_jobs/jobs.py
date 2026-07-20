@@ -34,7 +34,11 @@ ALLOWED_COMMANDS = frozenset(
         "arc-companion",
     }
 )
-TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled", "needs_llm"})
+SUCCESS_TERMINAL_STATUSES = frozenset(
+    {"done", "completed", "degraded", "stopped", "needs_llm"}
+)
+FAILURE_TERMINAL_STATUSES = frozenset({"failed", "cancelled"})
+TERMINAL_STATUSES = SUCCESS_TERMINAL_STATUSES | FAILURE_TERMINAL_STATUSES
 MAX_WORKER_LAUNCH_ATTEMPTS = 3
 MAX_EVENT_TAIL_BYTES = 1024 * 1024
 WORKER_LAUNCH_GRACE_SECONDS = 1.0
@@ -62,6 +66,7 @@ RESERVED_STATUS_PAYLOAD_KEYS = frozenset(
         "ok",
         "errors",
         "meta",
+        "environment",
     }
 )
 _JOB_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
@@ -89,6 +94,7 @@ class JobPaths:
     stderr: Path
     worker_stdout: Path
     worker_stderr: Path
+    progress_sidechannel: Path
 
     @classmethod
     def for_job(cls, job_id: str, *, root: Path | None = None) -> "JobPaths":
@@ -111,6 +117,7 @@ class JobPaths:
             stderr=job_dir / "stderr.log",
             worker_stdout=job_dir / "worker.stdout.log",
             worker_stderr=job_dir / "worker.stderr.log",
+            progress_sidechannel=job_dir / "progress.jsonl",
         )
 
 
@@ -139,6 +146,7 @@ class JobManager:
         status_resolver: StatusResolver | None = None,
         argv: Sequence[str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> str:
         """Create a job, using a thread runner or an allowlisted CLI argv."""
         payload_dict = dict(payload or {})
@@ -148,6 +156,7 @@ class JobManager:
         if argv is not None:
             normalized_argv, command = validate_arc_argv(argv)
         normalized_cwd = _normalize_cwd(cwd)
+        environment_snapshot = snapshot_environment(overrides=environment)
 
         use_thread_worker = self._use_thread_worker() and runner is not None
         if not use_thread_worker and normalized_argv is None:
@@ -163,12 +172,12 @@ class JobManager:
             "payload": payload_dict,
             "created_at": now,
             "execution_mode": "thread" if use_thread_worker else "process",
+            "environment": environment_snapshot,
         }
         if normalized_argv is not None:
             job["argv"] = normalized_argv
             job["command"] = command
             job["cwd"] = normalized_cwd
-        _ensure_private_dir(cache_root())
         _ensure_private_dir(paths.job_dir.parent)
         paths.job_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
         write_json(paths.job, job)
@@ -215,8 +224,11 @@ class JobManager:
         job_type: str = "cli",
         payload: Mapping[str, Any] | None = None,
         cwd: str | os.PathLike[str] | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> str:
-        return self.start(job_type=job_type, payload=payload, argv=argv, cwd=cwd)
+        return self.start(
+            job_type=job_type, payload=payload, argv=argv, cwd=cwd, environment=environment
+        )
 
     def wait(self, job_id: str, *, timeout: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -253,7 +265,7 @@ class JobManager:
         assert paths is not None
         stored = read_json(paths.result)
         result = _unwrap_result(stored)
-        if status.get("status") in {"done", "needs_llm"}:
+        if status.get("status") in SUCCESS_TERMINAL_STATUSES:
             return {
                 "ok": True,
                 "status": status["status"],
@@ -357,6 +369,13 @@ class JobManager:
             worker_launch_attempts=attempts,
         )
         command = [sys.executable, "-m", "arc_jobs.worker", job_id]
+        job = read_json(paths.job, {})
+        snapshot = job.get("environment") if isinstance(job, Mapping) else None
+        try:
+            worker_environment = restored_environment(snapshot)
+        except ValueError as exc:
+            set_error(job_id, "job_environment_invalid", str(exc), paths=paths)
+            return
         stdout = open_private_binary(paths.worker_stdout, append=True)
         stderr = open_private_binary(paths.worker_stderr, append=True)
         try:
@@ -368,6 +387,7 @@ class JobManager:
                     stderr=stderr,
                     start_new_session=True,
                     close_fds=True,
+                    env=worker_environment,
                 )
             except Exception as exc:
                 set_error(job_id, "job_worker_launch_failed", f"Could not launch ARC job worker: {exc}")
@@ -503,15 +523,118 @@ class JobManager:
 def cache_root() -> Path:
     if value := os.environ.get("ARC_JOBS_CACHE"):
         return Path(value).expanduser()
+    if value := os.environ.get("ARC_HOME"):
+        return Path(value).expanduser() / "cache" / "arc-jobs"
     if value := os.environ.get("XDG_CACHE_HOME"):
         return Path(value).expanduser() / "arc" / "arc-jobs"
-    if project_root := _project_root():
-        return project_root / "cache" / "arc-jobs"
     return Path.home() / ".cache" / "arc" / "arc-jobs"
 
 
 def jobs_root() -> Path:
+    if value := os.environ.get("ARC_JOBS_DIR"):
+        return Path(value).expanduser()
+    if value := os.environ.get("ARC_JOBS_CACHE"):
+        return Path(value).expanduser() / "jobs"
+    if value := os.environ.get("ARC_HOME"):
+        return Path(value).expanduser() / "jobs"
     return cache_root() / "jobs"
+
+
+_SNAPSHOT_ENV_KEYS = frozenset(
+    {
+        "ARC_HOME",
+        "ARC_RUNTIME_HOME",
+        "ARC_AGENT_HOST",
+        "ARC_PAPER_CACHE",
+        "ARC_DOMAIN_CACHE",
+        "ARC_LLM_CACHE",
+        "ARC_JOBS_CACHE",
+        "ARC_JOBS_DIR",
+        "ARC_LLM_TMP_DIR",
+        "ARC_LLM_SCHEMA_CACHE_DIR",
+        "ARC_LLM_TIMEOUT_SECONDS",
+        "ARC_CODEX_TIMEOUT_SECONDS",
+        "ARC_CLAUDE_TIMEOUT_SECONDS",
+        "ARC_KIMI_TIMEOUT_SECONDS",
+        "ARC_KIMI_WORK_DIR",
+        "ARC_CODEX_BIN",
+        "ARC_CLAUDE_BIN",
+        "ARC_KIMI_BIN",
+        "KIMI_CODE_HOME",
+        "ARC_LLM_KIMI_LOW_MODEL",
+        "ARC_LLM_KIMI_MEDIUM_MODEL",
+        "ARC_LLM_KIMI_HIGH_MODEL",
+        "ARC_LLM_KIMI_MAX_MODEL",
+    }
+)
+_PROCESS_ENV_KEYS = frozenset(
+    {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "SYSTEMROOT", "COMSPEC", "PATHEXT"}
+)
+_SECRET_MARKERS = ("TOKEN", "API_KEY", "APIKEY", "PASSWORD", "SECRET", "CREDENTIAL")
+
+
+def snapshot_environment(
+    *,
+    env: Mapping[str, str] | None = None,
+    overrides: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Capture only portable, non-secret ARC context for a detached job."""
+    source = os.environ if env is None else env
+    result = {
+        key: str(source[key])
+        for key in _SNAPSHOT_ENV_KEYS
+        if source.get(key) not in {None, ""}
+    }
+    if "ARC_AGENT_HOST" not in result:
+        try:
+            from .runtime import detect_agent_host
+
+            host = detect_agent_host(source)
+            if host != "unknown":
+                result["ARC_AGENT_HOST"] = host
+        except (ImportError, RuntimeError):
+            pass
+    for key, value in dict(overrides or {}).items():
+        if any(marker in key.upper() for marker in _SECRET_MARKERS):
+            raise ValueError(f"job environment must not contain secrets: {key}")
+        if key not in _SNAPSHOT_ENV_KEYS:
+            raise ValueError(f"job environment key is not allowlisted: {key}")
+        if not isinstance(value, str):
+            raise ValueError(f"job environment value must be a string: {key}")
+        if value:
+            result[key] = value
+        else:
+            result.pop(key, None)
+    return dict(sorted(result.items()))
+
+
+def restored_environment(
+    snapshot: Any, *, base: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build a minimal child environment and reject tampered persisted context."""
+    base = os.environ if base is None else base
+    result = {
+        key: str(base[key])
+        for key in _PROCESS_ENV_KEYS
+        if base.get(key) not in {None, ""}
+    }
+    result.update(
+        {key: str(value) for key, value in base.items() if key.startswith("LC_") and value}
+    )
+    if snapshot is None:
+        return result
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("persisted job environment must be an object")
+    for key, value in snapshot.items():
+        if key not in _SNAPSHOT_ENV_KEYS or not isinstance(value, str):
+            raise ValueError(f"persisted job environment is invalid: {key}")
+        if any(marker in key.upper() for marker in _SECRET_MARKERS):
+            raise ValueError(f"persisted job environment contains a secret: {key}")
+        if value:
+            result[key] = value
+    if result.get("ARC_LLM_TMP_DIR"):
+        result["TMPDIR"] = result["ARC_LLM_TMP_DIR"]
+    return result
 
 
 def readable_job_roots() -> list[Path]:
@@ -519,6 +642,10 @@ def readable_job_roots() -> list[Path]:
 
 
 def stats_db_path() -> Path:
+    if (os.environ.get("ARC_HOME") or os.environ.get("ARC_JOBS_DIR")) and not os.environ.get(
+        "ARC_JOBS_CACHE"
+    ):
+        return jobs_root() / ".stats" / "jobs.sqlite"
     return cache_root() / "stats" / "jobs.sqlite"
 
 
@@ -683,12 +810,39 @@ def record_progress(job_id: str, event: Mapping[str, Any]) -> None:
     if is_cancel_requested(job_id):
         raise JobCancelled("ARC job cancellation was requested.")
     paths = find_job_paths(job_id) or JobPaths.for_job(job_id)
-    timestamped = append_event(job_id, event, paths=paths)
+    normalized_event = dict(event)
+    normalized_event.pop("schema_version", None)
+    normalized_event.pop("updated_at", None)
+    timestamped = append_event(job_id, normalized_event, paths=paths)
     event_name = str(timestamped.get("event") or "")
     progress = _progress_from_event(timestamped)
     updates: dict[str, Any] = {"phase": event_name or None, "progress": progress}
+    status_fields = {
+        "round",
+        "round_number",
+        "phase",
+        "run_id",
+        "loop_id",
+        "worker_id",
+        "role",
+        "worker_status",
+        "active_workers",
+        "completed_workers",
+        "failed_workers",
+        "evidence_round_number",
+        "evidence_status",
+        "request_count",
+        "sections_completed",
+        "sections_total",
+        "current",
+        "title",
+        "section_id",
+        "warning",
+        "warnings",
+        "failure_count",
+    }
     for key, value in timestamped.items():
-        if key not in {"schema_version", "at", "event"}:
+        if key in status_fields:
             updates[key] = value
     update_status(
         job_id,
@@ -708,7 +862,12 @@ def append_event(
     paths: JobPaths | None = None,
 ) -> dict[str, Any]:
     paths = paths or find_job_paths(job_id) or JobPaths.for_job(job_id)
-    timestamped = {"schema_version": "arc.job_event.v1", "at": now_iso(), **dict(event)}
+    timestamped = {
+        "schema_version": "arc.job_event.v1",
+        "event_id": uuid4().hex,
+        "at": now_iso(),
+        **dict(event),
+    }
     _ensure_private_dir(paths.events.parent)
     fd = os.open(paths.events, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as handle:
@@ -989,6 +1148,7 @@ def _secure_job_storage(paths: JobPaths) -> None:
         paths.stderr,
         paths.worker_stdout,
         paths.worker_stderr,
+        paths.progress_sidechannel,
     ):
         _chmod_private_file(path)
 
@@ -1186,8 +1346,8 @@ def _progress_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
 
 def _default_status(result: Any) -> str:
     if isinstance(result, dict):
-        if result.get("status") == "needs_llm":
-            return "needs_llm"
+        if result.get("status") in TERMINAL_STATUSES:
+            return str(result["status"])
         if result.get("ok") is False:
             return "failed"
         if result.get("ok") is True:
@@ -1196,9 +1356,7 @@ def _default_status(result: Any) -> str:
 
 
 def _project_root() -> Path | None:
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "packages" / "arc-jobs").is_dir() and (parent / "cache").is_dir():
-            return parent
+    """Compatibility hook; source-checkout caches are intentionally never selected."""
     return None
 
 

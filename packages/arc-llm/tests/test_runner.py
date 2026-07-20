@@ -4,14 +4,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, allow_arc_llm_call_record
+from arc_llm.call_record import (
+    ARC_LLM_CALL_RECORD_FIELD,
+    ARC_LLM_CALL_RECORD_SCHEMA,
+    ARC_LLM_CALL_RECORD_SCHEMA_VERSION,
+    allow_arc_llm_call_record,
+)
 from arc_llm.json_schema import to_provider_json_schema
+from arc_llm.providers.base import LLMWorkerError
 from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionManager
 from arc_llm.structured_recovery import structured_metadata
-from arc_llm.usage import LLMProviderResponse, LLMUsage
 from arc_llm import runner
 from arc_llm.runner import LLMTaskError, resolve_llm_config, run_json, run_text, run_text_result
+from arc_llm.usage import LLMProviderResponse, LLMUsage
 
 
 @pytest.fixture(autouse=True)
@@ -618,6 +624,17 @@ class FlakyTextProvider:
         return f"{self.name}:{model}:{prompt}"
 
 
+class NonRetryableProvider:
+    name = "codex-cli"
+
+    def __init__(self):
+        self.attempts = 0
+
+    def generate_json(self, prompt, *, schema=None, model=None):
+        self.attempts += 1
+        raise LLMWorkerError("invalid native session", retryable=False)
+
+
 def test_resolve_llm_config_uses_host_and_default_model(tmp_path):
     config = resolve_llm_config(env={"ARC_AGENT_HOST": "codex"}, process_chain=[])
     assert config.provider == "codex-cli"
@@ -926,6 +943,43 @@ def test_run_json_without_schema_passes_none_and_adds_call_record(monkeypatch):
     assert result["ok"] is True
     assert provider.schema is None
     assert ARC_LLM_CALL_RECORD_FIELD in result
+
+
+def test_call_record_v3_requires_warnings_and_existing_provider_emits_empty_list(monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: FakeProvider())
+
+    result = run_json("prompt", provider="codex-cli", env={}, process_chain=[])
+    record = result[ARC_LLM_CALL_RECORD_FIELD]
+
+    assert ARC_LLM_CALL_RECORD_SCHEMA_VERSION == "arc.llm.call_record.v3"
+    assert "warnings" in ARC_LLM_CALL_RECORD_SCHEMA["required"]
+    assert record["warnings"] == []
+
+
+def test_kimi_config_warnings_propagate_to_call_record(monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: FakeProvider())
+
+    result = run_json("prompt", provider="kimi-code-cli", model_tier="high", env={}, process_chain=[])
+    warnings = result[ARC_LLM_CALL_RECORD_FIELD]["warnings"]
+
+    assert "kimi_code_cli.experimental" in warnings
+    assert "kimi_code_cli.provider_side_persistence" in warnings
+    assert "kimi_code_cli.inherits_user_configuration" in warnings
+    assert "kimi_code_cli.model_tier_unmapped" in warnings
+
+
+def test_non_retryable_worker_error_stops_after_first_attempt(monkeypatch):
+    provider = NonRetryableProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    with pytest.raises(LLMTaskError, match="invalid native session"):
+        run_json("prompt", provider="codex-cli", env={}, process_chain=[])
+
+    assert provider.attempts == 1
+
+
+def test_worker_error_is_retryable_by_default():
+    assert LLMWorkerError("transient provider failure").retryable is True
 
 
 def test_run_json_stateful_records_session_usage_and_call_record(tmp_path, monkeypatch):

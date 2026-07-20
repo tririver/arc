@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from arc_llm.json_schema import to_provider_json_schema
+from arc_llm.host import HostDetection
+from arc_llm.runner import LLMConfig, LLMNeedsLLM
 from arc_domain import foundation
 from arc_domain import evidence
 from arc_domain import network
@@ -16,6 +19,7 @@ from arc_domain import service
 from arc_domain import summary as domain_summary
 from arc_domain.cache import DomainPaths, domain_id_for, read_json
 from arc_domain import paper
+from arc_domain import cache as domain_cache
 
 
 SEED = "arXiv:2401.00001"
@@ -193,6 +197,103 @@ def test_domain_rejects_reused_domain_id_with_changed_llm_config(monkeypatch, tm
     assert second["ok"] is False
     assert second["error"]["code"] == "foundation_identification_failed"
     assert "LLM configuration mismatch" in second["error"]["message"]
+
+
+def test_recency_config_change_invalidates_only_downstream_artifacts(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = "recency-change"
+    first = service.init_domain(SEED, intent="intent", domain_id=domain_id,
+                                recent_window_days=365, as_of_date="2026-07-20")
+    assert first["ok"] is True
+    paths = DomainPaths.for_domain(domain_id)
+    paths.foundation_selection.write_text("{}", encoding="utf-8")
+    paths.domain_graph.write_text("{}", encoding="utf-8")
+    paths.evidence_pack.write_text("{}", encoding="utf-8")
+
+    service._ensure_domain(SEED, intent="intent", domain_id=domain_id,
+                           recent_window_days=730, as_of_date="2026-07-20")
+
+    assert paths.foundation_selection.exists()
+    assert not paths.domain_graph.exists()
+    assert not paths.evidence_pack.exists()
+    config = read_json(paths.config)
+    assert config["recency"] == {
+        "recent_window_days": 730,
+        "as_of_date": "2026-07-20",
+        "window_start_date": "2024-07-20",
+        "window_end_date": "2026-07-20",
+    }
+    assert read_json(paths.status)["recency"] == config["recency"]
+    assert config["input_fingerprint"]["recency_hash"]
+
+
+def test_calendar_two_year_window_handles_leap_boundaries():
+    assert service.calendar_window_days("2024-02-29") == 731
+    assert service._recency_config(731, "2024-02-29")["window_start_date"] == "2022-02-28"
+    assert service.calendar_window_days("2026-03-01") == 730
+
+
+def _needs_llm() -> LLMNeedsLLM:
+    return LLMNeedsLLM(
+        LLMConfig(
+            provider="manual",
+            model=None,
+            host=HostDetection(host="unknown", confidence=0.0, signals=[]),
+            signals=[],
+        )
+    )
+
+
+def test_summarize_domain_propagates_needs_llm(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    domain_id = "needs-llm-summary"
+    paths = DomainPaths.for_domain(domain_id)
+    paths.domain_dir.mkdir(parents=True)
+    paths.evidence_pack.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(service, "_summarize_domain", lambda **kwargs: (_ for _ in ()).throw(_needs_llm()))
+
+    result = service.summarize_domain(SEED, intent="intent", domain_id=domain_id)
+
+    assert result["ok"] is False
+    assert result["status"] == "needs_llm"
+    assert result["error"]["code"] == "needs_llm"
+    assert result["llm_task"]["provider_resolved"] == "manual"
+
+
+def test_build_domain_propagates_needs_llm_from_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "arc-domain"))
+    monkeypatch.setattr(service, "_identify_foundation", lambda **kwargs: {"selection": {"selected_foundation": {}}})
+    monkeypatch.setattr(service, "_build_network", lambda **kwargs: {"node_count": 0, "edge_count": 0, "graph_path": "g"})
+    monkeypatch.setattr(service, "render_network_html", lambda **kwargs: {"network_html_path": "h"})
+    monkeypatch.setattr(service, "_build_paper_json_pack", lambda **kwargs: {"paper_json_pack_path": "p"})
+    monkeypatch.setattr(service, "_build_evidence_pack", lambda **kwargs: {"evidence_pack_path": "e"})
+    monkeypatch.setattr(service, "_summarize_domain", lambda **kwargs: (_ for _ in ()).throw(_needs_llm()))
+
+    result = service.build_domain(SEED, intent="intent")
+
+    assert result["ok"] is False
+    assert result["status"] == "needs_llm"
+
+
+def test_domain_cache_prefers_package_override_then_arc_home(monkeypatch, tmp_path):
+    monkeypatch.delenv("ARC_DOMAIN_CACHE", raising=False)
+    monkeypatch.setenv("ARC_HOME", str(tmp_path / "arc-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert domain_cache.cache_root() == tmp_path / "arc-home/cache/arc-domain"
+    monkeypatch.setenv("ARC_DOMAIN_CACHE", str(tmp_path / "override"))
+    assert domain_cache.cache_root() == tmp_path / "override"
+
+
+def test_domain_cache_uses_xdg_then_isolated_home_without_checkout_fallback(monkeypatch, tmp_path):
+    monkeypatch.delenv("ARC_DOMAIN_CACHE", raising=False)
+    monkeypatch.delenv("ARC_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert domain_cache.cache_root() == tmp_path / "xdg/arc/arc-domain"
+
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    assert domain_cache.cache_root() == tmp_path / "isolated-home/.cache/arc/arc-domain"
+    assert not domain_cache.cache_root().is_relative_to(Path(__file__).resolve().parents[3])
 
 
 def test_domain_llm_helpers_pass_model_tier_to_run_json(monkeypatch, tmp_path):

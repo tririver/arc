@@ -102,7 +102,7 @@
         "created_at": {"type": "string"},
         "method": {
           "type": "string",
-          "enum": ["manual", "codex-cli", "claude-cli", "openai", "anthropic"]
+          "enum": ["manual", "codex-cli", "claude-cli", "kimi-code-cli", "openai", "anthropic"]
         },
         "model": {"type": "string"},
         "prompt_version": {"type": "string", "const": "paper-summary-v1"},

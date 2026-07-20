@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 IDEAS_CONFIG_SCHEMA = "arc.workflow.ideas.config.v1"
 IDEAS_VARIANT_SCHEMA = "arc.workflow.ideas.variant.v1"
-DOMAIN_MANIFEST_SCHEMA = "arc.workflow.domain_manifest.v1"
+DOMAIN_MANIFEST_SCHEMA = "arc.workflow.domain_manifest.v2"
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 RESEARCH_SCOPES = {"single_domain", "cross_domain"}
 
@@ -226,20 +226,62 @@ def _load_domain_manifest(path: Path, *, required: bool) -> tuple[dict[str, Any]
         raise ConfigError(f"Could not read domain manifest {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ConfigError(f"domain manifest must be an object: {path}")
+    if payload.get("schema_version") == "arc.workflow.domain_manifest.v1":
+        raise ConfigError(f"{path} uses domain manifest v1; regenerate it to add semantic field grouping")
     if payload.get("schema_version") != DOMAIN_MANIFEST_SCHEMA:
         raise ConfigError(f"{path}.schema_version must be {DOMAIN_MANIFEST_SCHEMA}")
-    domains = payload.get("domains")
-    if not isinstance(domains, list) or not domains:
-        raise ConfigError(f"{path}.domains must be a non-empty array")
-    domain_ids: set[str] = set()
-    for index, domain in enumerate(domains):
-        if not isinstance(domain, dict):
-            raise ConfigError(f"{path}.domains[{index}] must be an object")
-        domain_id = str(domain.get("domain_id", "")).strip()
-        if not domain_id:
-            raise ConfigError(f"{path}.domains[{index}].domain_id is required")
-        domain_ids.add(domain_id)
-    return payload, "cross_domain" if len(domain_ids) >= 2 else "single_domain", []
+    packages, groups = payload.get("domain_packages"), payload.get("field_groups")
+    if not isinstance(packages, list) or not packages:
+        raise ConfigError(f"{path}.domain_packages must be a non-empty array")
+    if not isinstance(groups, list) or not groups:
+        raise ConfigError(f"{path}.field_groups must be a non-empty array")
+    package_ids = [str(item.get("domain_package_id", "")).strip() for item in packages if isinstance(item, dict)]
+    if len(package_ids) != len(packages) or "" in package_ids or len(set(package_ids)) != len(package_ids):
+        raise ConfigError(f"{path}.domain_packages requires unique domain_package_id values")
+    if payload.get("package_count") != len(packages):
+        raise ConfigError(f"{path}.package_count is inconsistent")
+    field_ids, covered = [], []
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict): raise ConfigError(f"{path}.field_groups[{index}] must be an object")
+        field_id, members = str(group.get("field_id", "")).strip(), group.get("domain_package_ids")
+        if not field_id or field_id in field_ids: raise ConfigError(f"{path}.field_groups[{index}].field_id must be unique")
+        if not isinstance(members, list) or not members: raise ConfigError(f"{path}.field_groups[{index}].domain_package_ids must be non-empty")
+        field_card = group.get("field_card")
+        if not isinstance(field_card, dict):
+            raise ConfigError(f"{path}.field_groups[{index}].field_card must be an object")
+        for key in ("seed_papers", "summary_json_paths", "summary_markdown_paths", "paper_json_pack_paths"):
+            if not isinstance(field_card.get(key), list) or not field_card[key]:
+                raise ConfigError(f"{path}.field_groups[{index}].field_card.{key} must be a non-empty array")
+        field_ids.append(field_id); covered.extend(str(item) for item in members)
+    if len(covered) != len(set(covered)) or set(covered) != set(package_ids):
+        raise ConfigError(f"{path}.field_groups must partition all domain_packages exactly once")
+    if payload.get("field_count") != len(groups): raise ConfigError(f"{path}.field_count is inconsistent")
+    expected_scope = "cross_domain" if len(groups) >= 2 else "single_domain"
+    if payload.get("research_scope") != expected_scope:
+        raise ConfigError(f"{path}.research_scope must be {expected_scope} for {len(groups)} field group(s)")
+    grouping_raw = str(payload.get("grouping_artifact", "")).strip()
+    if not grouping_raw:
+        raise ConfigError(f"{path}.grouping_artifact is required")
+    grouping_path = Path(grouping_raw).expanduser()
+    if not grouping_path.is_absolute():
+        project_candidate = path.parent.parent / grouping_path
+        manifest_candidate = path.parent / grouping_path
+        grouping_path = project_candidate if project_candidate.is_file() else manifest_candidate
+    if not grouping_path.is_file():
+        raise ConfigError(f"{path}.grouping_artifact does not exist: {grouping_path}")
+    try:
+        grouping = json.loads(grouping_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Could not read grouping artifact {grouping_path}: {exc}") from exc
+    if not isinstance(grouping, dict) or grouping.get("schema_version") != "arc.workflow.domain_field_grouping.v1":
+        raise ConfigError(f"{grouping_path} has the wrong schema_version")
+    grouping_groups = grouping.get("field_groups")
+    if not isinstance(grouping_groups, list) or {
+        str(item.get("field_id", "")) for item in grouping_groups if isinstance(item, dict)
+    } != set(field_ids):
+        raise ConfigError(f"{grouping_path}.field_groups is inconsistent with the domain manifest")
+    warnings = payload.get("grouping_warnings", [])
+    return payload, expected_scope, [str(item) for item in warnings]
 
 
 def _exploration_profiles(raw: Any) -> list[dict[str, str]]:

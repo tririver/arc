@@ -37,7 +37,8 @@ If setup failed after its cause was fixed, retry explicitly:
 - File, project-directory, output, and resource-path arguments must be
   absolute. Relative paths are rejected because an MCP server's working
   directory may be its plugin cache rather than the user's project.
-- `ARC_JOBS_CACHE` controls shared job persistence. MCP-only inline timeout
+- `ARC_JOBS_DIR` controls shared job persistence under `ARC_HOME/jobs`;
+  `ARC_JOBS_CACHE` remains a legacy layout override. MCP-only inline timeout
   settings remain under `ARC_MCP_INLINE_WAIT_SEC`,
   `ARC_MCP_TOOL_TIMEOUT_SEC`, and `ARC_MCP_BACKGROUND_MARGIN_SEC`.
 - Installing MCP does not change internal ARC worker policy: proposer,

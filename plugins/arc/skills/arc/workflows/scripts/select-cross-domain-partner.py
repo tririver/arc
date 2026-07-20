@@ -24,6 +24,7 @@ def select_partner(
     anchor_summary_path: Path,
     *,
     user_intent: str,
+    anchor_field_id: str | None = None,
     provider: str = "auto",
     model: str | None = None,
     model_tier: str = "high",
@@ -36,7 +37,8 @@ def select_partner(
         _require_strict_source_mode()
         bootstrap_arc_pythonpath()
     call_json = json_runner or _default_json_runner()
-    anchor = _read_object(anchor_path)
+    anchor_source = _read_object(anchor_path)
+    anchor = _anchor_field(anchor_source, source_path=anchor_path, requested_field_id=anchor_field_id)
     selector_schema = _workflow_json("cross-domain-partner-selector.schema.json")
     critic_schema = _workflow_json("cross-domain-partner-critic.schema.json")
     selector_prompt = _selector_prompt(anchor, user_intent=user_intent)
@@ -108,12 +110,8 @@ def select_partner(
 
     top_three = eligible[:3]
     return {
-        "schema_version": "arc.workflow.cross_domain_partner_selection.v1",
-        "anchor": {
-            "domain_id": str(anchor.get("domain_id", "")),
-            "title": str(anchor.get("domain_title", "")),
-            "summary_path": str(anchor_path),
-        },
+        "schema_version": "arc.workflow.cross_domain_partner_selection.v2",
+        "anchor": anchor,
         "user_intent": user_intent,
         "context_files": [str(anchor_path)],
         "selection_policy": {
@@ -156,6 +154,67 @@ def _selector_prompt(anchor: Mapping[str, Any], *, user_intent: str) -> str:
         "Semantic distance is diagnostic and is not valuable by itself.\n\n"
         f"User intent:\n{user_intent}\n\nAnchor domain card:\n{json.dumps(anchor, ensure_ascii=False)}"
     )
+
+
+def _anchor_field(
+    payload: Mapping[str, Any],
+    *,
+    source_path: Path,
+    requested_field_id: str | None,
+) -> dict[str, Any]:
+    if payload.get("schema_version") == "arc.workflow.domain_manifest.v2":
+        groups = payload.get("field_groups")
+        if not isinstance(groups, list) or not groups:
+            raise PartnerSelectionError("domain manifest v2 requires non-empty field_groups")
+        requested = str(requested_field_id or "").strip()
+        if not requested:
+            if len(groups) != 1:
+                raise PartnerSelectionError("--anchor-field-id is required when the domain manifest has multiple fields")
+            requested = str(groups[0].get("field_id", "")) if isinstance(groups[0], Mapping) else ""
+        group = next(
+            (item for item in groups if isinstance(item, Mapping) and str(item.get("field_id", "")) == requested),
+            None,
+        )
+        if group is None:
+            raise PartnerSelectionError(f"anchor field {requested!r} is absent from the domain manifest")
+        card = group.get("field_card")
+        members = group.get("domain_package_ids")
+        if not isinstance(card, Mapping) or not isinstance(members, list) or not members:
+            raise PartnerSelectionError(f"anchor field {requested!r} lacks its field card or package provenance")
+        return {
+            "field_id": requested,
+            "domain_package_ids": [str(item) for item in members],
+            "field_card": dict(card),
+            "source_path": str(source_path),
+        }
+    if payload.get("field_id") and isinstance(payload.get("field_card"), Mapping):
+        members = payload.get("domain_package_ids", [])
+        if not isinstance(members, list):
+            raise PartnerSelectionError("anchor domain_package_ids must be an array")
+        return {
+            "field_id": str(payload["field_id"]),
+            "domain_package_ids": [str(item) for item in members],
+            "field_card": dict(payload["field_card"]),
+            "source_path": str(source_path),
+        }
+    # Read-only compatibility for a single legacy summary. New artifacts still use
+    # the v2 field-card contract so the pair writer can consume them uniformly.
+    legacy_id = str(payload.get("domain_id", "")).strip()
+    if not legacy_id:
+        raise PartnerSelectionError("anchor input must be a v2 domain manifest, field card, or domain summary")
+    return {
+        "field_id": str(requested_field_id or legacy_id),
+        "domain_package_ids": [legacy_id],
+        "field_card": {
+            "titles": [str(payload.get("domain_title", ""))],
+            "overviews": [str(payload.get("overview") or payload.get("brief_introduction") or "")],
+            "task_focus": [payload.get("task_focus", {})],
+            "methodology": payload.get("methodology", []),
+            "summary_json_paths": [str(source_path)],
+        },
+        "source_path": str(source_path),
+        "compatibility_source": "legacy_domain_summary",
+    }
 
 
 def _critic_prompt(anchor: Mapping[str, Any], candidates: list[dict[str, Any]], *, user_intent: str) -> str:
@@ -265,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Select a history-blind cross-domain partner for an ARC domain.")
     parser.add_argument("--anchor-summary", required=True)
     parser.add_argument("--user-intent", required=True)
+    parser.add_argument("--anchor-field-id")
     parser.add_argument("--output", required=True)
     parser.add_argument("--provider", default="auto")
     parser.add_argument("--model")
@@ -275,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         result = select_partner(
             Path(args.anchor_summary),
             user_intent=args.user_intent,
+            anchor_field_id=args.anchor_field_id,
             provider=args.provider,
             model=args.model,
             model_tier=args.model_tier,

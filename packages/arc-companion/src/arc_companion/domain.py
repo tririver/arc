@@ -6,7 +6,8 @@ from typing import Any
 
 
 DOMAIN_CONTEXT_VERSION = "arc.companion.domain-context.v1"
-DOMAIN_MANIFEST_VERSION = "arc.workflow.domain_manifest.v1"
+DOMAIN_MANIFEST_VERSION = "arc.workflow.domain_manifest.v2"
+LEGACY_DOMAIN_MANIFEST_VERSION = "arc.workflow.domain_manifest.v1"
 
 
 class DomainContextError(ValueError):
@@ -70,11 +71,126 @@ def _load_domain_id(domain_id: str) -> dict[str, Any]:
 def _load_manifest(path: Path) -> dict[str, Any]:
     manifest_path = path.expanduser().resolve()
     manifest = _read_object(manifest_path)
-    if manifest.get("schema_version") != DOMAIN_MANIFEST_VERSION:
+    version = manifest.get("schema_version")
+    if version == DOMAIN_MANIFEST_VERSION:
+        return _load_manifest_v2(manifest_path, manifest)
+    if version == LEGACY_DOMAIN_MANIFEST_VERSION:
+        return _load_manifest_v1(manifest_path, manifest)
+    raise DomainContextError(
+        f"unsupported domain manifest schema in {manifest_path}: {version!r}"
+    )
+
+
+def _load_manifest_v2(manifest_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    entries = manifest.get("domain_packages")
+    if not isinstance(entries, list) or not entries:
+        raise DomainContextError(f"domain manifest has no domain_packages: {manifest_path}")
+    if manifest.get("package_count") != len(entries):
+        raise DomainContextError(f"domain manifest package_count is inconsistent: {manifest_path}")
+    groups = manifest.get("field_groups")
+    if not isinstance(groups, list) or not groups:
+        raise DomainContextError(f"domain manifest has no field_groups: {manifest_path}")
+    if manifest.get("field_count") != len(groups):
+        raise DomainContextError(f"domain manifest field_count is inconsistent: {manifest_path}")
+    research_scope = str(manifest.get("research_scope") or "").strip()
+    expected_scope = "single_domain" if len(groups) == 1 else "cross_domain"
+    if research_scope != expected_scope:
         raise DomainContextError(
-            f"unsupported domain manifest schema in {manifest_path}: "
-            f"{manifest.get('schema_version')!r}"
+            f"domain manifest research_scope must be {expected_scope!r}: {manifest_path}"
         )
+
+    project_dir = manifest_path.parent.parent
+    packages: list[dict[str, Any]] = []
+    all_papers: list[dict[str, str]] = []
+    package_ids: set[str] = set()
+    for index, raw in enumerate(entries):
+        if not isinstance(raw, dict):
+            raise DomainContextError(f"domain package entry {index} must be an object")
+        package_id = str(raw.get("domain_package_id") or "").strip()
+        if not package_id or package_id in package_ids:
+            raise DomainContextError(
+                f"domain manifest has invalid or duplicate domain_package_id: {package_id!r}"
+            )
+        package_ids.add(package_id)
+        summary_path = _artifact_path(
+            project_dir, raw.get("summary_json_path"), label="summary_json_path"
+        )
+        pack_path = _artifact_path(
+            project_dir, raw.get("paper_json_pack_path"), label="paper_json_pack_path"
+        )
+        summary = _read_object(summary_path)
+        pack = _read_object(pack_path)
+        if str(summary.get("domain_id") or "") != package_id:
+            raise DomainContextError(
+                f"domain summary ID does not match manifest package {package_id}"
+            )
+        pack_id = str(pack.get("domain_id") or "")
+        if pack_id and pack_id != package_id:
+            raise DomainContextError(
+                f"domain paper pack ID does not match manifest package {package_id}"
+            )
+        papers = _papers_from_pack(pack)
+        all_papers.extend(papers)
+        packages.append(
+            {
+                "domain_package_id": package_id,
+                "seed_paper": str(raw.get("seed_paper") or ""),
+                "summary": summary,
+                "papers": papers,
+                "artifact_paths": {
+                    "summary_json": str(summary_path),
+                    "paper_json_pack": str(pack_path),
+                },
+            }
+        )
+
+    fields: list[dict[str, Any]] = []
+    field_ids: set[str] = set()
+    covered: list[str] = []
+    for index, raw in enumerate(groups):
+        if not isinstance(raw, dict):
+            raise DomainContextError(f"field group entry {index} must be an object")
+        field_id = str(raw.get("field_id") or "").strip()
+        members = raw.get("domain_package_ids")
+        field_card = raw.get("field_card")
+        if not field_id or field_id in field_ids:
+            raise DomainContextError(f"domain manifest has invalid or duplicate field_id: {field_id!r}")
+        if not isinstance(members, list) or not members:
+            raise DomainContextError(f"field group {field_id!r} has no domain_package_ids")
+        if not isinstance(field_card, dict):
+            raise DomainContextError(f"field group {field_id!r} requires field_card")
+        member_ids = [str(item).strip() for item in members]
+        if "" in member_ids or len(member_ids) != len(set(member_ids)):
+            raise DomainContextError(f"field group {field_id!r} has invalid package membership")
+        field_ids.add(field_id)
+        covered.extend(member_ids)
+        fields.append(
+            {
+                "field_id": field_id,
+                "domain_package_ids": member_ids,
+                "field_card": dict(field_card),
+            }
+        )
+    if len(covered) != len(set(covered)) or set(covered) != package_ids:
+        raise DomainContextError(
+            f"domain manifest field_groups must partition domain_packages: {manifest_path}"
+        )
+
+    return {
+        "schema_version": DOMAIN_CONTEXT_VERSION,
+        "source": "domain_manifest",
+        "manifest_schema_version": DOMAIN_MANIFEST_VERSION,
+        "manifest_path": str(manifest_path),
+        "research_scope": research_scope,
+        "user_intent": str(manifest.get("user_intent") or ""),
+        "domain_packages": packages,
+        "field_groups": fields,
+        "paper_ids": _paper_ids(all_papers),
+    }
+
+
+def _load_manifest_v1(manifest_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Read legacy context for companion generation; v1 remains invalid for ideas routing."""
     entries = manifest.get("domains")
     if not isinstance(entries, list) or not entries:
         raise DomainContextError(f"domain manifest has no domains: {manifest_path}")
@@ -110,7 +226,9 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         })
     return {
         "schema_version": DOMAIN_CONTEXT_VERSION,
-        "source": "domain_manifest",
+        "source": "legacy_domain_manifest_v1",
+        "manifest_schema_version": LEGACY_DOMAIN_MANIFEST_VERSION,
+        "legacy_manifest": True,
         "manifest_path": str(manifest_path),
         "domains": domains,
         "paper_ids": _paper_ids(all_papers),

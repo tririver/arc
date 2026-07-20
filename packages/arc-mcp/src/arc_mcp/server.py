@@ -7,6 +7,7 @@ from typing import Annotated, Any, Callable, Mapping
 from arc_jobs.jobs import arc_jobs_cli_command
 from arc_domain import service as domain_service
 from arc_llm.host import detect_host, select_llm_provider
+from arc_llm.providers.registry import provider_diagnostic
 from arc_llm.runner import resolve_llm_config
 from arc_paper import service
 from arc_paper.batch.db import BatchDB
@@ -59,7 +60,10 @@ DOMAIN_INTENT_DESCRIPTION = "Optional description of the user's scientific inter
 DOMAIN_ID_DESCRIPTION = "Optional ARC domain id returned by llm_domain_build or arc-domain init."
 CITER_LIMIT_DESCRIPTION = "Maximum number of citing papers to return from INSPIRE, clamped to 1..1000."
 CITER_SORT_DESCRIPTION = "INSPIRE citer sort order: mostrecent or mostcited."
-LLM_PROVIDER_DESCRIPTION = "LLM provider: auto or a built-in provider (codex-cli, claude-cli, manual)."
+LLM_PROVIDER_DESCRIPTION = (
+    "LLM provider: auto or a built-in provider "
+    "(codex-cli, claude-cli, kimi-code-cli [experimental], manual)."
+)
 LLM_MODEL_DESCRIPTION = "Optional model name passed to the selected LLM provider."
 LLM_MODEL_TIER_DESCRIPTION = (
     "LLM model tier: low, medium, high, or max. Paper summaries default to low. "
@@ -378,6 +382,18 @@ def _summary_batch_cli_argv(
     return argv
 
 
+def _doctor_provider_response() -> dict[str, Any]:
+    selected = select_llm_provider()
+    data = provider_diagnostic(selected.provider)
+    data.update({"host": selected.host.host, "signals": selected.signals})
+    return {
+        "ok": True,
+        "data": data,
+        "errors": [],
+        "meta": {},
+    }
+
+
 TOOL_HANDLERS: dict[str, ToolHandler] = {
     "md2pdf": lambda args: _start_md2pdf_job_response(args),
     "translate": lambda args: _start_translate_job_response(args),
@@ -447,16 +463,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
         "errors": [],
         "meta": {},
     },
-    "doctor_provider": lambda args: {
-        "ok": True,
-        "data": {
-            "provider": select_llm_provider().provider,
-            "host": select_llm_provider().host.host,
-            "signals": select_llm_provider().signals,
-        },
-        "errors": [],
-        "meta": {},
-    },
+    "doctor_provider": lambda args: _doctor_provider_response(),
     "doctor_cache": lambda args: service.doctor_cache(args.get("paper_id")),
     "llm_domain_build": lambda args: _start_domain_job_response(args),
     "domain_status": lambda args: _domain_status_response(args),
@@ -1815,24 +1822,14 @@ def _register_tools(app: Any) -> None:
     def summary_batch_retry_failed(name: BatchName) -> Any:
         return _summary_batch_retry_failed_response({"name": name})
 
-    @app.tool(description="Diagnose which coding-agent host ARC detected, such as Codex or Claude Code.")
+    @app.tool(description="Diagnose which coding-agent host ARC detected, such as Codex, Claude Code, or Kimi Code.")
     def doctor_host() -> Any:
         detected = detect_host()
         return {"ok": True, "data": detected.__dict__, "errors": [], "meta": {}}
 
     @app.tool(description="Diagnose which LLM provider ARC will use for summary generation.")
     def doctor_provider() -> Any:
-        selected = select_llm_provider()
-        return {
-            "ok": True,
-            "data": {
-                "provider": selected.provider,
-                "host": selected.host.host,
-                "signals": selected.signals,
-            },
-            "errors": [],
-            "meta": {},
-        }
+        return _doctor_provider_response()
 
     @app.tool(description="Diagnose ARC's local cache directory and whether a paper summary is cached.")
     def doctor_cache(paper_id: PaperId = None) -> Any:

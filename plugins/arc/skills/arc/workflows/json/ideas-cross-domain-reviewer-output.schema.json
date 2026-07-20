@@ -39,8 +39,8 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "source_domain_id",
-            "target_domain_id",
+            "source_field_id",
+            "target_field_id",
             "transfer_status",
             "target_contribution_status",
             "source_ingredient_validity",
@@ -55,8 +55,8 @@
             "transfer_signature"
           ],
           "properties": {
-            "source_domain_id": {"type": "string", "minLength": 1},
-            "target_domain_id": {"type": "string", "minLength": 1},
+            "source_field_id": {"type": "string", "minLength": 1},
+            "target_field_id": {"type": "string", "minLength": 1},
             "transfer_status": {"type": "string", "enum": ["genuine", "partial", "decorative", "single_domain"]},
             "target_contribution_status": {"type": "string", "enum": ["incremental", "substantial", "transformative"]},
             "source_ingredient_validity": {"type": "string", "enum": ["valid", "uncertain", "invalid"]},

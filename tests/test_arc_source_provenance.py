@@ -1,15 +1,33 @@
 import json
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "plugins/arc/skills/arc/workflows/scripts"
 BOOTSTRAP = SCRIPTS / "_arc_script_bootstrap.py"
 VERIFIER = SCRIPTS / "verify-source-runtime.py"
+
+
+def _load_verifier_module():
+    old_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        spec = importlib.util.spec_from_file_location("arc_source_verifier_test", VERIFIER)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(SCRIPTS))
+        sys.dont_write_bytecode = old_dont_write_bytecode
 
 
 def _make_fake_repo(tmp_path: Path, label: str) -> Path:
@@ -394,6 +412,11 @@ def test_installed_skill_rejects_site_packages_symlink_outside_venv(tmp_path):
 
 def test_source_runtime_verifier_records_current_checkout(tmp_path):
     output = tmp_path / "source-provenance.json"
+    verifier = _load_verifier_module()
+    try:
+        runtime_python = verifier._runtime_python()
+    except RuntimeError as exc:
+        pytest.skip(f"ARC core runtime is not installed: {exc}")
     python = ROOT / "packages/arc-paper/.venv/bin/python"
     result = subprocess.run(
         [
@@ -416,6 +439,8 @@ def test_source_runtime_verifier_records_current_checkout(tmp_path):
     record = json.loads(output.read_text(encoding="utf-8"))
     assert json.loads(result.stdout) == record
     assert record["schema_version"] == "arc.workflow.source_provenance.v1"
+    assert Path(record["runtime"]["python_executable"]) == runtime_python.absolute()
+    assert Path(record["runtime"]["sys_prefix"]) == runtime_python.parent.parent.absolute()
     assert Path(record["repo_root"]) == ROOT
     assert record["git"]["available"] is True
     assert len(record["git"]["head"]) == 40
@@ -435,3 +460,40 @@ def test_source_runtime_verifier_records_current_checkout(tmp_path):
         "plugins/arc/skills/arc/workflows/scripts/verify-source-runtime.py"
         in hashed_paths
     )
+
+
+def test_source_verifier_reexecs_incompatible_system_python_into_runtime(monkeypatch, tmp_path):
+    module = _load_verifier_module()
+    runtime = tmp_path / "venv/bin/python"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("", encoding="utf-8")
+    monkeypatch.setattr(module.sys, "prefix", "/usr")
+    monkeypatch.setattr(module.sys, "base_prefix", "/usr")
+    monkeypatch.setattr(module.sys, "version_info", (9, 9, 0))
+    monkeypatch.setattr(module, "_runtime_python", lambda: runtime)
+    called = {}
+
+    def fake_execve(executable, argv, env):
+        called.update(executable=executable, argv=argv, env=env)
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(module.os, "execve", fake_execve)
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        module._reexec_runtime(["--repo-root", str(ROOT)])
+    assert called["executable"] == str(runtime)
+    assert called["env"][module.RUNTIME_REEXEC_ENV] == "1"
+    assert called["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    source = VERIFIER.read_text(encoding="utf-8")
+    assert source.index("sys.dont_write_bytecode = True") < source.index("from _arc_script_bootstrap import")
+
+
+def test_source_verifier_resolves_doctor_python_without_current_abi_probe(monkeypatch, tmp_path):
+    module = _load_verifier_module()
+    scripts, runtime, _runtime_module = _make_installed_skill_and_runtime(tmp_path)
+    launcher = scripts.parents[1] / "scripts" / "arc-runtime"
+    monkeypatch.setenv("FAKE_ARC_RUNTIME", str(runtime))
+    monkeypatch.setattr(module.sys, "version_info", (9, 9, 0))
+
+    selected = module._runtime_python(launcher=launcher)
+
+    assert selected == (runtime / "venv/bin/python").absolute()
