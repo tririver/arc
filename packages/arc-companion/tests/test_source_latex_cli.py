@@ -30,17 +30,11 @@ def test_markdown_rich_block_escaped_details_are_reader_clean(tmp_path: Path) ->
         encoding="utf-8",
     )
     parsed = parse_source_input(source_path=markdown_path, source_id="local:test-book")
-    block = next(
-        item for item in parsed["document"]["blocks"]
-        if "Meaningful geometric description" in str(item.get("text") or "")
+    visible_text = " ".join(
+        str(item.get("text") or "") for item in parsed["document"]["blocks"]
     )
-
-    rendered = _render_html_fragment(block["html"], rendered_links=[])
-
-    assert "Meaningful geometric description" in rendered
-    assert "details" not in rendered
-    assert "summary" not in rendered
-    assert "natural" not in rendered
+    assert "Meaningful geometric description" not in visible_text
+    assert "natural_image" not in visible_text
 
     proof_block = next(
         item for item in parsed["document"]["blocks"]

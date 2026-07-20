@@ -11,7 +11,12 @@ import unicodedata
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .io import sha256_file, sha256_json
-from .reader_text import clean_reader_annotation, clean_reader_text, is_machine_summary_label
+from .reader_text import (
+    clean_reader_annotation,
+    clean_reader_text,
+    is_machine_summary_label,
+    strip_machine_details,
+)
 from .source import asset_path, block_id
 from .substantive import non_substantive_block_ids
 
@@ -401,7 +406,7 @@ def validate_tex_fidelity(tex: str, document: dict[str, Any], manifest: dict[str
 def _preamble(*, title: Any, authors: str, language: str) -> str:
     return rf"""\documentclass[11pt,a4paper]{{article}}
 \usepackage{{amsmath,amssymb,mathtools}}
-\usepackage{{graphicx,longtable,array,multirow,hyperref,xcolor}}
+\usepackage{{graphicx,longtable,array,multirow,hyperref,xcolor,needspace}}
 \usepackage[most]{{tcolorbox}}
 \usepackage{{fontspec,xeCJK}}
 \IfFontExistsTF{{Noto Serif CJK SC}}{{
@@ -871,31 +876,47 @@ def _render_annotation(
     )
     labels = _labels(language)
     sections: list[str] = []
-    explanation = annotation.get("explanation")
+    explanation = str(annotation.get("explanation") or "").strip()
+    commentary = str(annotation.get("commentary") or "").strip()
     prior = annotation.get("prior_work")
     later = annotation.get("later_work")
-    if explanation:
-        sections.append(_annotation_section(labels["explanation"], explanation))
+    combined_explanation = _merge_annotation_prose(explanation, commentary)
+    if combined_explanation:
+        sections.append(_annotation_section(labels["explanation"], combined_explanation))
     if prior:
         sections.append(_annotation_section(labels["prior"], prior))
     if later:
         sections.append(_annotation_section(labels["later"], later))
     if not sections:
-        commentary = str(annotation.get("commentary") or "").strip()
-        if not commentary:
-            return (
-                _layer_marker("COMPANION", "BEGIN", segment_id)
-                + _layer_marker("COMPANION", "END", segment_id)
-            )
-        sections.append(_render_rich_text(commentary))
+        return (
+            _layer_marker("COMPANION", "BEGIN", segment_id)
+            + _layer_marker("COMPANION", "END", segment_id)
+        )
     return (
         _layer_marker("COMPANION", "BEGIN", segment_id)
         +
+        f"\\Needspace{{6\\baselineskip}}\n"
         f"\\begin{{arccompanion}}\n\\noindent\\textbf{{{escape_tex(labels['companion'])}}}\\par\n"
         + "\n".join(sections)
         + "\n\\end{arccompanion}\n"
         + _layer_marker("COMPANION", "END", segment_id)
     )
+
+
+def _merge_annotation_prose(explanation: str, commentary: str) -> str:
+    if not explanation:
+        return commentary
+    if not commentary:
+        return explanation
+    explanation_key = re.sub(r"\s+", " ", explanation).strip()
+    commentary_key = re.sub(r"\s+", " ", commentary).strip()
+    if explanation_key == commentary_key:
+        return explanation
+    if explanation_key in commentary_key:
+        return commentary
+    if commentary_key in explanation_key:
+        return explanation
+    return f"{explanation}\n\n{commentary}"
 
 
 def _render_translation(
@@ -1353,7 +1374,7 @@ def _render_html_fragment(
 ) -> str:
     if not html:
         return ""
-    soup = BeautifulSoup(str(html), "html.parser")
+    soup = BeautifulSoup(strip_machine_details(str(html)), "html.parser")
     nodes: list[Any]
     first = next((item for item in soup.contents if isinstance(item, Tag)), None)
     if contents_only and isinstance(first, Tag):
@@ -1399,6 +1420,12 @@ def _render_html_node(
     if not isinstance(node, Tag):
         return ""
     name = str(node.name or "").lower()
+    if name == "details":
+        summary = node.find("summary", recursive=False)
+        if isinstance(summary, Tag) and is_machine_summary_label(
+            summary.get_text(" ", strip=True)
+        ):
+            return ""
     if name == "summary":
         if is_machine_summary_label(node.get_text(" ", strip=True)):
             return ""

@@ -44,6 +44,10 @@ def clean_reader_text(
     untouched.  This function only normalizes a presentation copy.
     """
     text = str(value or "")
+    machine_cleaned = strip_machine_details(text)
+    if machine_cleaned != text and _evidence_marker_only(machine_cleaned, evidence_ids):
+        return ""
+    text = machine_cleaned
     text = _strip_html_containers(text)
     text = _replace_evidence_ids(
         text,
@@ -53,6 +57,44 @@ def clean_reader_text(
     )
     text = _replace_controller_evidence_phrases(text)
     return re.sub(r"[ \t]+(?=\n)", "", text).strip()
+
+
+def strip_machine_details(value: str) -> str:
+    """Remove raw or HTML-escaped machine-only details containers."""
+
+    def strip_containers(text: str, *, escaped: bool) -> str:
+        if escaped:
+            container = re.compile(
+                r"&lt;details\b(?P<attrs>(?:(?!&gt;).)*)&gt;"
+                r"(?P<body>(?:(?!&lt;/details\s*&gt;).)*)"
+                r"&lt;/details\s*&gt;",
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            summary = re.compile(
+                r"&lt;summary\b(?:(?!&gt;).)*&gt;(?P<label>.*?)"
+                r"&lt;/summary\s*&gt;",
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        else:
+            container = re.compile(
+                r"<details\b(?P<attrs>[^>]*)>"
+                r"(?P<body>(?:(?!</details\s*>).)*)</details\s*>",
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            summary = re.compile(
+                r"<summary\b[^>]*>(?P<label>.*?)</summary\s*>",
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+        def replace(match: re.Match[str]) -> str:
+            found = summary.search(match.group("body"))
+            if found is not None and is_machine_summary_label(found.group("label")):
+                return ""
+            return match.group(0)
+
+        return container.sub(replace, text)
+
+    return strip_containers(strip_containers(str(value), escaped=False), escaped=True)
 
 
 def clean_reader_annotation(
@@ -130,7 +172,7 @@ def _strip_html_containers(text: str) -> str:
         return text
     rendered = text
     # These nodes carry machine/controller metadata rather than reader prose.
-    # Container bodies remain available after their wrappers are removed.
+    # Non-machine container bodies remain available after wrappers are removed.
     rendered = re.sub(
         r"<summary\b[^>]*>(?P<body>.*?)</summary\s*>",
         lambda match: "" if is_machine_summary_label(match.group("body")) else match.group("body"),
@@ -154,6 +196,20 @@ def _strip_html_containers(text: str) -> str:
     rendered = _HTML_TAG.sub("", rendered)
     rendered = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", rendered)
     return rendered
+
+
+def _evidence_marker_only(text: str, evidence_ids: Iterable[str]) -> bool:
+    candidate = str(text)
+    known = _string_ids(evidence_ids)
+    if not known:
+        return False
+    for value in known:
+        candidate = re.sub(
+            _soft_wrapped_id_pattern(value), "", candidate, flags=re.IGNORECASE
+        )
+    candidate = re.sub(r"(?:证据|参考|来源|evidence|source)", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"[\s\[\]【】()（）:：,，;；.。]+", "", candidate)
+    return not candidate
 
 
 def _replace_controller_evidence_phrases(text: str) -> str:

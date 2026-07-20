@@ -35,6 +35,108 @@ def test_empty_optional_annotation_has_no_visible_companion_panel() -> None:
     assert "伴读" not in rendered
 
 
+def test_annotation_merges_distinct_explanation_and_commentary_without_repetition() -> None:
+    rendered = _render_annotation(
+        "s-merged",
+        {
+            "explanation": "EXPLANATION-UNIQUE",
+            "commentary": "COMMENTARY-UNIQUE",
+            "prior_work": "",
+            "later_work": "",
+        },
+        language="zh-CN",
+    )
+    repeated = _render_annotation(
+        "s-repeated",
+        {
+            "explanation": "共享解释。",
+            "commentary": "共享解释。",
+            "prior_work": "",
+            "later_work": "",
+        },
+        language="zh-CN",
+    )
+
+    assert "EXPLANATION-UNIQUE" in rendered
+    assert "COMMENTARY-UNIQUE" in rendered
+    assert rendered.count(r"\textbf{本段解释}") == 1
+    assert repeated.count("共享解释") == 1
+    assert r"\Needspace{6\baselineskip}" in rendered
+
+
+@pytest.mark.skipif(
+    shutil.which("xelatex") is None or shutil.which("pdftotext") is None,
+    reason="XeLaTeX and pdftotext are required",
+)
+def test_companion_heading_stays_with_body_when_page_space_is_short(tmp_path: Path) -> None:
+    document = {
+        "front_matter": {},
+        "blocks": [{"block_id": "p", "kind": "prose", "text": "SOURCE-TEXT"}],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    segments = [{
+        "segment_id": "s-pagination",
+        "block_ids": ["p"],
+        "start_block_id": "p",
+        "end_block_id": "p",
+    }]
+    tex, _ = render_companion_tex(
+        document,
+        segments,
+        {"s-pagination": {
+            "explanation": "EXPLANATION-FIRST-LINE",
+            "commentary": "COMMENTARY-SECOND-LINE",
+        }},
+        output_dir=tmp_path,
+        language="zh-CN",
+    )
+    tex = tex.replace(
+        r"\Needspace{6\baselineskip}",
+        "\\clearpage\n"
+        r"\vspace*{\dimexpr\textheight-4\baselineskip\relax}" "\n"
+        r"\Needspace{6\baselineskip}",
+        1,
+    )
+    tex_path = tmp_path / "companion-pagination.tex"
+    tex_path.write_text(tex, encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            shutil.which("xelatex") or "xelatex",
+            "-halt-on-error",
+            "-interaction=nonstopmode",
+            f"-output-directory={tmp_path}",
+            str(tex_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    log = (tmp_path / "companion-pagination.log").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr + log
+    extracted = subprocess.run(
+        ["pdftotext", str(tmp_path / "companion-pagination.pdf"), "-"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\f")
+    heading_page = next(
+        index
+        for index, page in enumerate(extracted)
+        if any(line.strip() == "伴读" for line in page.splitlines())
+    )
+    explanation_page = next(
+        index for index, page in enumerate(extracted) if "EXPLANATION-FIRST-LINE" in page
+    )
+    commentary_page = next(
+        index for index, page in enumerate(extracted) if "COMMENTARY-SECOND-LINE" in page
+    )
+    assert heading_page == explanation_page == commentary_page
+
+
 def test_renderer_orders_layers_and_repeats_only_unnumbered_equations(tmp_path: Path) -> None:
     image = tmp_path / "source-image.png"
     image.write_bytes(b"fixture image")
@@ -112,11 +214,7 @@ def test_renderer_orders_layers_and_repeats_only_unnumbered_equations(tmp_path: 
 
 
 def test_reader_layers_remove_html_wrappers_and_internal_evidence_labels(tmp_path: Path) -> None:
-    source = (
-        "<details><summary>natural_image</summary>"
-        "A geometric pattern that is meaningful source prose."
-        "</details>"
-    )
+    source = "Reader source prose."
     document = {
         "front_matter": {},
         "blocks": [{"block_id": "p", "kind": "prose", "text": source}],
@@ -131,7 +229,7 @@ def test_reader_layers_remove_html_wrappers_and_internal_evidence_labels(tmp_pat
     }]
     translations = {"seg-internal": {"blocks": [{
         "block_id": "p",
-        "text": "<details><summary>image</summary>有意义的译文。</details>",
+            "text": "<details><summary>natural_image</summary>有意义的译文。</details>",
     }]}}
     annotations = {"seg-internal": {
         "commentary": "解释【context-b65f8935dea5c99f8b42】。",
@@ -163,8 +261,8 @@ def test_reader_layers_remove_html_wrappers_and_internal_evidence_labels(tmp_pat
         language="zh-CN",
     )
 
-    assert "A geometric pattern that is meaningful source prose" in tex
-    assert "有意义的译文" in tex
+    assert "Reader source prose" in tex
+    assert "有意义的译文" not in tex
     assert "已有结果" in tex
     assert "details" not in tex
     assert "summary" not in tex
@@ -191,7 +289,7 @@ def test_reader_layers_remove_html_wrappers_and_internal_evidence_labels(tmp_pat
     assert validate_tex_fidelity(tex, document, manifest) == []
 
 
-def test_review_normalization_keeps_structured_evidence_and_meaningful_detail_body() -> None:
+def test_review_normalization_drops_machine_detail_body_and_keeps_evidence() -> None:
     annotation = {
         "explanation": "<details><summary>natural_image</summary>解释正文。</details>【context-1】",
         "prior_work": [{"text": "前人结论 [prior-1]", "evidence_ids": ["prior-1"]}],
@@ -199,7 +297,10 @@ def test_review_normalization_keeps_structured_evidence_and_meaningful_detail_bo
     }
     translation = {"blocks": [{
         "block_id": "p",
-        "text": "<details><summary>OCR metadata</summary>译文正文。</details>",
+        "text": (
+            "&lt;details&gt;&lt;summary&gt;OCR metadata&lt;/summary&gt;"
+            "译文正文。&lt;/details&gt;"
+        ),
     }]}
 
     cleaned_annotation = clean_reader_annotation(
@@ -212,13 +313,13 @@ def test_review_normalization_keeps_structured_evidence_and_meaningful_detail_bo
     )
     cleaned_translation = clean_reader_translation(translation)
 
-    assert cleaned_annotation["explanation"] == "解释正文。（参考：《Reference Book》）"
+    assert cleaned_annotation["explanation"] == ""
     assert cleaned_annotation["prior_work"][0]["text"] == "前人结论（参考：《Prior Paper》）"
     assert cleaned_annotation["evidence_ids"] == ["context-1", "prior-1"]
     assert cleaned_annotation["prior_work"][0]["evidence_ids"] == ["prior-1"]
-    assert cleaned_translation["blocks"][0]["text"] == "译文正文。"
+    assert cleaned_translation["blocks"][0]["text"] == ""
     assert annotation["explanation"].startswith("<details>")
-    assert translation["blocks"][0]["text"].startswith("<details>")
+    assert translation["blocks"][0]["text"].startswith("&lt;details&gt;")
 
 
 def test_markdown_escaped_detail_markup_is_cleaned_in_rich_html_renderer() -> None:
@@ -233,7 +334,7 @@ def test_markdown_escaped_detail_markup_is_cleaned_in_rich_html_renderer() -> No
         rendered_links=[],
     )
 
-    assert "Meaningful body" in rendered
+    assert "Meaningful body" not in rendered
     assert "Proof sketch" in rendered and "Argument body" in rendered
     assert "Before" in rendered and "After" in rendered
     assert r"\(x+y\)" in rendered
@@ -466,7 +567,20 @@ def test_actual_html_summary_keeps_reader_heading_unless_it_is_machine_only() ->
 
     assert "Proof sketch" in rendered and "Argument" in rendered
     assert "OCR metadata" not in rendered
-    assert "Recognized text" in rendered
+    assert "Recognized text" not in rendered
+
+
+def test_escaped_machine_details_do_not_consume_neighboring_authored_details() -> None:
+    rendered = _render_html_fragment(
+        "Before &lt;details&gt;Authored body.&lt;/details&gt; Between "
+        "&lt;details&gt;&lt;summary&gt;natural_image&lt;/summary&gt;"
+        "Generated description.&lt;/details&gt; After",
+        rendered_links=[],
+    )
+
+    assert "Before" in rendered and "Authored body" in rendered
+    assert "Between" in rendered and "After" in rendered
+    assert "Generated description" not in rendered
 
 
 def test_legacy_evidence_snippet_recovers_only_an_explicit_heading_prefix() -> None:
