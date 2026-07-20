@@ -1891,6 +1891,128 @@ def test_coverage_normalization_preserves_unique_blocks_and_repairs_duplicates()
     _validate_translation(segment, repaired, by_id, [])
 
 
+def test_coverage_normalization_treats_empty_natural_language_as_missing() -> None:
+    math_run = _inline_run("math", "x", 2, tex="x")
+    blocks = [
+        {"block_id": "kept", "type": "text", "text": "Keep this."},
+        {
+            "block_id": "empty", "type": "text", "text": "Value x.",
+            "inline_runs": [
+                _inline_run("text", "Value ", 1), math_run,
+                _inline_run("text", ".", 3),
+            ],
+        },
+    ]
+    by_id = {str(block["block_id"]): block for block in blocks}
+    segment = {"segment_id": "seg-empty", "block_ids": ["kept", "empty"]}
+    token = pipeline_module._opaque_inline_tokens(blocks[1])[0]
+    kept = {"block_id": "kept", "text": "保留此句。"}
+
+    normalized, missing, diagnostics = pipeline_module._normalize_translation_coverage(
+        segment,
+        {"blocks": [kept, {"block_id": "empty", "text": token}]},
+        by_id,
+    )
+
+    assert normalized["blocks"] == [kept]
+    assert [block["block_id"] for block in missing] == ["empty"]
+    assert diagnostics["preserved_block_ids"] == ["kept"]
+    assert diagnostics["empty_block_ids"] == ["empty"]
+
+
+def test_empty_primary_block_resumes_only_missing_segment_with_token_safe_repair(
+    tmp_path: Path,
+) -> None:
+    math_run = _inline_run("math", "x", 2, tex="x")
+    blocks = [
+        {"block_id": "done", "type": "text", "text": "Already complete."},
+        {"block_id": "kept", "type": "text", "text": "Keep this translation."},
+        {
+            "block_id": "empty", "type": "text", "text": "Translate x safely.",
+            "inline_runs": [
+                _inline_run("text", "Translate ", 1), math_run,
+                _inline_run("text", " safely.", 3),
+            ],
+        },
+    ]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    completed = {"segment_id": "seg-done", "block_ids": ["done"]}
+    missing = {"segment_id": "seg-missing", "block_ids": ["kept", "empty"]}
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=2)
+    checkpoint_dir = tmp_path / "checkpoints"
+
+    _generate_translations(
+        [completed], options=options, bundle=bundle, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir,
+        llm=lambda prompt, **kwargs: {
+            "blocks": [{"block_id": "done", "text": "已经完成。"}],
+        },
+    )
+    kept = {"block_id": "kept", "text": "逐字保留已有译文。", "audit": "keep"}
+    token = pipeline_module._opaque_inline_tokens(blocks[2])[0]
+    draft_path = pipeline_module._seed_translation_coverage_draft(
+        missing,
+        options=options,
+        bundle=bundle,
+        glossary={"entries": []},
+        protected_names=[],
+        checkpoint_dir=checkpoint_dir,
+        translation={"blocks": [
+            kept,
+            {"block_id": "empty", "text": token},
+        ]},
+    )
+    draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    draft["candidate_provenance"] = {
+        "origin": "primary-model",
+        "prompt_version": pipeline_module.PROMPT_VERSION,
+        "response_schema_version": pipeline_module.SCHEMA_VERSION,
+        "model_tier": pipeline_module.TRANSLATION_TIER,
+    }
+    draft_path.write_text(json.dumps(draft), encoding="utf-8")
+    calls: list[str] = []
+
+    def repair_llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        assert label == "companion-translation-seg-missing-coverage-repair-1"
+        assert kwargs["env"]["ARC_CODEX_ENABLE_MCP"] == "false"
+        assert kwargs["env"]["ARC_CODEX_ALLOW_INTERNET"] == "false"
+        assert token not in prompt
+        return {"repairs": [{
+            "block_id": "empty",
+            "slots": [
+                {"slot_id": slot_id, "text": text}
+                for slot_id, text in zip(
+                    pipeline_module._translation_coverage_slot_ids(blocks[2]),
+                    ["安全翻译", "。"],
+                )
+            ],
+        }]}
+
+    result = _generate_translations(
+        [completed, missing], options=options, bundle=bundle,
+        glossary={"entries": []}, protected_names=[], checkpoint_dir=checkpoint_dir,
+        llm=repair_llm,
+    )
+
+    assert calls == ["companion-translation-seg-missing-coverage-repair-1"]
+    assert result["seg-done"]["blocks"][0]["text"] == "已经完成。"
+    repaired = result["seg-missing"]["blocks"]
+    assert repaired[0] == kept
+    assert [block["block_id"] for block in repaired] == ["kept", "empty"]
+    assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(repaired[1]["text"]) == [token]
+    assert pipeline_module._translation_natural_residue(repaired[1]["text"]).strip()
+
+
 def test_coverage_repair_translates_all_omissions_with_controller_owned_dense_tokens(
     tmp_path: Path,
 ) -> None:
@@ -2249,7 +2371,7 @@ def test_coverage_repair_uses_no_second_model_call_for_token_placement(tmp_path:
     assert not list((checkpoint_dir / "translations").glob("*.json"))
 
 
-def test_segment_preflight_rejects_later_token_only_block_before_repair(tmp_path: Path) -> None:
+def test_empty_block_uses_coverage_repair_before_preserved_token_validation(tmp_path: Path) -> None:
     blocks = []
     for number in (1, 2):
         blocks.append({
@@ -2272,7 +2394,19 @@ def test_segment_preflight_rejects_later_token_only_block_before_repair(tmp_path
     calls: list[str] = []
 
     def llm(prompt: str, **kwargs):
-        calls.append(str(kwargs["call_label"]))
+        label = str(kwargs["call_label"])
+        calls.append(label)
+        if label.endswith("coverage-repair-1"):
+            return {"repairs": [{
+                "block_id": "b2",
+                "slots": [
+                    {"slot_id": slot_id, "text": text}
+                    for slot_id, text in zip(
+                        pipeline_module._translation_coverage_slot_ids(blocks[1]),
+                        ["第二段", "。"],
+                    )
+                ],
+            }]}
         return {"blocks": [
             {"block_id": "b1", "text": "首块缺少 token。"},
             {"block_id": "b2", "text": token_b2},
@@ -2286,10 +2420,13 @@ def test_segment_preflight_rejects_later_token_only_block_before_repair(tmp_path
             checkpoint_dir=tmp_path / "checkpoints", llm=llm,
         )
     except CompanionLaneError as exc:
-        assert "returned empty block b2" in str(exc)
+        assert "opaque inline tokens" in str(exc)
     else:
-        raise AssertionError("token-only natural text must fail segment preflight")
-    assert calls == ["companion-translation-seg-0001"]
+        raise AssertionError("preserved token-invalid prose must fail final validation")
+    assert calls == [
+        "companion-translation-seg-0001",
+        "companion-translation-seg-0001-coverage-repair-1",
+    ]
 
 
 def test_segment_preflight_allows_controller_owned_link_or_citation_only_blocks() -> None:
@@ -2593,7 +2730,9 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
     assert all("slot repair" in str(error) for _, error in exc_info.value.failures)
 
 
-def test_non_token_translation_validation_errors_do_not_retry(tmp_path: Path) -> None:
+def test_empty_translation_uses_bounded_coverage_repair_and_names_remain_deterministic(
+    tmp_path: Path,
+) -> None:
     scenarios = {
         "empty": {"blocks": [{"block_id": "body", "text": ""}]},
         "protected-name": {"blocks": [{"block_id": "body", "text": "此处省略姓名。"}]},
@@ -2621,7 +2760,16 @@ def test_non_token_translation_validation_errors_do_not_retry(tmp_path: Path) ->
         calls: list[str] = []
 
         def invalid_llm(prompt: str, **kwargs):
-            calls.append(str(kwargs["call_label"]))
+            label = str(kwargs["call_label"])
+            calls.append(label)
+            if scenario == "empty" and label.endswith("coverage-repair-1"):
+                return {"repairs": [{
+                    "block_id": "body",
+                    "slots": [{
+                        "slot_id": pipeline_module._translation_coverage_slot_ids(block)[0],
+                        "text": "艾达给出了结果。",
+                    }],
+                }]}
             return generated
 
         if scenario == "protected-name":
@@ -2638,21 +2786,22 @@ def test_non_token_translation_validation_errors_do_not_retry(tmp_path: Path) ->
             )
             assert result["seg-0001"]["blocks"][0]["text"] == "此处省略姓名（Ada）。"
         else:
-            with pytest.raises(CompanionLaneError) as exc_info:
-                _generate_translations(
-                    [{"segment_id": "seg-0001", "block_ids": ["body"]}],
-                    options=BuildOptions(
-                        paper_id=bundle.paper_id, project_dir=tmp_path / scenario, workers=1,
-                    ),
-                    bundle=bundle,
-                    glossary={"entries": []},
-                    protected_names=["Ada"],
-                    checkpoint_dir=tmp_path / f"checkpoints-{scenario}",
-                    llm=invalid_llm,
-                )
-            assert len(exc_info.value.failures) == 1
-            assert "retry-1" not in str(exc_info.value)
-        assert calls == ["companion-translation-seg-0001"]
+            result = _generate_translations(
+                [{"segment_id": "seg-0001", "block_ids": ["body"]}],
+                options=BuildOptions(
+                    paper_id=bundle.paper_id, project_dir=tmp_path / scenario, workers=1,
+                ),
+                bundle=bundle,
+                glossary={"entries": []},
+                protected_names=["Ada"],
+                checkpoint_dir=tmp_path / f"checkpoints-{scenario}",
+                llm=invalid_llm,
+            )
+            assert result["seg-0001"]["blocks"][0]["text"] == "艾达给出了结果（Ada）。"
+        assert calls == ["companion-translation-seg-0001"] + (
+            ["companion-translation-seg-0001-coverage-repair-1"]
+            if scenario == "empty" else []
+        )
 
 
 def test_generation_document_excludes_front_matter_and_all_source_only_sections() -> None:

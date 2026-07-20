@@ -2997,6 +2997,9 @@ def _normalize_translation_coverage(
         value: items[0]
         for value, items in candidates.items()
         if len(items) == 1
+        and _translation_block_has_required_natural_text(
+            blocks_by_id[value], items[0]
+        )
     }
     missing_blocks = [
         block for block in expected_blocks if block_id(block) not in unique
@@ -3011,6 +3014,14 @@ def _normalize_translation_coverage(
         "missing_block_ids": [block_id(block) for block in missing_blocks],
         "duplicate_block_ids": [
             value for value in expected_ids if len(candidates[value]) > 1
+        ],
+        "empty_block_ids": [
+            value
+            for value in expected_ids
+            if len(candidates[value]) == 1
+            and not _translation_block_has_required_natural_text(
+                blocks_by_id[value], candidates[value][0]
+            )
         ],
         "discarded_unknown_block_ids": unknown_ids,
         "discarded_malformed_count": malformed_count,
@@ -3924,11 +3935,21 @@ def _translation_preflight(
             f"translation {segment['segment_id']} does not cover every translatable block exactly once"
         )
     for source, translated in zip(expected_blocks, raw_blocks):
-        text = str(translated.get("text") or "").strip()
-        source_has_natural_text = bool(_natural_text_for_name_validation(source).strip())
-        if source_has_natural_text and not _translation_natural_residue(text).strip():
-            raise RuntimeError(f"translation {segment['segment_id']} returned empty block {block_id(source)}")
+        if not _translation_block_has_required_natural_text(source, translated):
+            raise TranslationCoverageError(
+                f"translation {segment['segment_id']} returned empty block {block_id(source)}"
+            )
     return expected_blocks, raw_blocks
+
+
+def _translation_block_has_required_natural_text(
+    source: dict[str, Any], translated: dict[str, Any],
+) -> bool:
+    """Return whether a mapped block contains prose when its source contains prose."""
+    if not _natural_text_for_name_validation(source).strip():
+        return True
+    text = str(translated.get("text") or "").strip()
+    return bool(_translation_natural_residue(text).strip())
 
 
 def _translation_opaque_token_errors(
