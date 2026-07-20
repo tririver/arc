@@ -240,6 +240,8 @@ def build_companion(
     notice = LANGUAGE_NOTICE if options.language_was_defaulted else None
     previous_state = _read_optional_json(state_path)
     diagnostics: tuple[dict[str, str], ...] = ()
+    fingerprint: str | None = None
+    checkpoint_dir: Path | None = None
     _state(
         state_path,
         status="loading_source",
@@ -582,6 +584,8 @@ def build_companion(
             state_path,
             status="failed",
             paper_id=options.paper_id,
+            fingerprint=fingerprint,
+            checkpoint_dir=str(checkpoint_dir) if checkpoint_dir is not None else None,
             notice=notice,
             error=str(exc),
             diagnostics=failure_diagnostics,
@@ -4841,13 +4845,48 @@ def _review_context_evidence_anchors(
 
 
 def _state(path: Path, **values: Any) -> dict[str, Any]:
-    state = {**_read_optional_json(path), **{key: value for key, value in values.items() if value is not None}}
+    previous = _read_optional_json(path)
+    incoming_fingerprint = values.get("fingerprint")
+    previous_fingerprint = previous.get("fingerprint")
+    fingerprint_changed = (
+        incoming_fingerprint is not None
+        and previous_fingerprint is not None
+        and incoming_fingerprint != previous_fingerprint
+    )
+    fingerprint_unresolved = (
+        values.get("status") in {"loading_source", "failed"}
+        and incoming_fingerprint is None
+    )
+    if fingerprint_changed or fingerprint_unresolved:
+        previous = {
+            key: value
+            for key, value in previous.items()
+            if not _fingerprint_bound_state_key(key)
+        }
+    if "notice" in values and values["notice"] is None:
+        previous.pop("notice", None)
+    state = {
+        **previous,
+        **{key: value for key, value in values.items() if value is not None},
+    }
     if values.get("status") and values.get("status") != "failed":
         state.pop("error", None)
     state["schema_version"] = "arc.companion.state.v1"
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json(path, state)
     return state
+
+
+def _fingerprint_bound_state_key(key: str) -> bool:
+    return key in {
+        "fingerprint",
+        "checkpoint_dir",
+        "segment_count",
+        "first_wave_preview_version",
+        "final_render_version",
+    } or key.startswith(
+        ("preview_", "output_", "source_manifest_", "validation_")
+    )
 
 
 def _read_optional_json(path: Path) -> dict[str, Any]:

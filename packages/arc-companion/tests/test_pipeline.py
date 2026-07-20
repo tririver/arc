@@ -15,6 +15,7 @@ from arc_companion.evidence_requests import EvidenceResolution
 from arc_companion.pipeline import (
     BuildOptions,
     CompanionLaneError,
+    LANGUAGE_NOTICE,
     _evidence,
     _fingerprint,
     _evidence_for_segment,
@@ -4685,3 +4686,126 @@ def test_non_failed_state_clears_stale_error(tmp_path: Path) -> None:
 
     assert state["status"] == "segmenting"
     assert "error" not in state
+
+
+def test_state_change_of_fingerprint_clears_bound_artifacts(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    _state(
+        path,
+        status="complete",
+        fingerprint="old-fingerprint",
+        checkpoint_dir="/run/checkpoints/old-fingerprint",
+        segment_count=12,
+        preview_pdf="/run/old-preview.pdf",
+        preview_validation_sha256="old-preview-validation",
+        first_wave_preview_version="old-preview-version",
+        output_pdf="/run/old-output.pdf",
+        output_pdf_sha256="old-output-hash",
+        source_manifest_path="/run/old-manifest.json",
+        validation_path="/run/old-validation.json",
+        final_render_version="old-render-version",
+    )
+
+    state = _state(
+        path,
+        status="failed",
+        fingerprint="new-fingerprint",
+        checkpoint_dir="/run/checkpoints/new-fingerprint",
+        error="new build failed",
+    )
+
+    assert state["fingerprint"] == "new-fingerprint"
+    assert state["checkpoint_dir"] == "/run/checkpoints/new-fingerprint"
+    assert state["error"] == "new build failed"
+    assert "segment_count" not in state
+    assert not any(key.startswith("preview_") for key in state)
+    assert "first_wave_preview_version" not in state
+    assert not any(key.startswith("output_") for key in state)
+    assert not any(key.startswith("source_manifest_") for key in state)
+    assert not any(key.startswith("validation_") for key in state)
+    assert "final_render_version" not in state
+
+
+def test_failure_before_fingerprint_clears_prior_fingerprint_state(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    _state(
+        path,
+        status="preview_ready",
+        fingerprint="old-fingerprint",
+        checkpoint_dir="/run/checkpoints/old-fingerprint",
+        segment_count=12,
+        preview_pdf="/run/old-preview.pdf",
+        preview_segment_ids=["seg-0001"],
+        first_wave_preview_version="old-preview-version",
+    )
+
+    state = _state(path, status="failed", error="source loading failed")
+
+    assert state["status"] == "failed"
+    assert state["error"] == "source loading failed"
+    assert "fingerprint" not in state
+    assert "checkpoint_dir" not in state
+    assert "segment_count" not in state
+    assert not any(key.startswith("preview_") for key in state)
+    assert "first_wave_preview_version" not in state
+
+
+def test_loading_source_hides_prior_fingerprint_state(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    _state(
+        path,
+        status="complete",
+        fingerprint="old-fingerprint",
+        checkpoint_dir="/run/checkpoints/old-fingerprint",
+        preview_pdf="/run/old-preview.pdf",
+        output_pdf="/run/old-output.pdf",
+    )
+
+    state = _state(path, status="loading_source", paper_id="new-paper")
+
+    assert state["status"] == "loading_source"
+    assert state["paper_id"] == "new-paper"
+    assert "fingerprint" not in state
+    assert "checkpoint_dir" not in state
+    assert "preview_pdf" not in state
+    assert "output_pdf" not in state
+
+
+def test_same_fingerprint_state_update_keeps_reusable_artifacts(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    _state(
+        path,
+        status="preview_ready",
+        fingerprint="same-fingerprint",
+        checkpoint_dir="/run/checkpoints/same-fingerprint",
+        preview_pdf="/run/preview.pdf",
+        first_wave_preview_version="preview-version",
+    )
+
+    state = _state(path, status="failed", fingerprint="same-fingerprint", error="retry")
+
+    assert state["fingerprint"] == "same-fingerprint"
+    assert state["checkpoint_dir"] == "/run/checkpoints/same-fingerprint"
+    assert state["preview_pdf"] == "/run/preview.pdf"
+    assert state["first_wave_preview_version"] == "preview-version"
+
+
+def test_explicit_language_state_clears_default_language_notice(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    _state(
+        path,
+        status="preview_ready",
+        fingerprint="same-fingerprint",
+        notice=LANGUAGE_NOTICE,
+    )
+
+    state = _state(
+        path,
+        status="loading_source",
+        paper_id="same-paper",
+        notice=None,
+    )
+
+    assert state["status"] == "loading_source"
+    assert state["paper_id"] == "same-paper"
+    assert "notice" not in state
