@@ -90,7 +90,7 @@ def test_rich_html_parse_stores_versioned_document_without_removing_legacy_field
 
     assert PARSER_VERSION == 20
     assert LEGACY_PARSED_SOURCE_KEYS <= set(parsed)
-    assert parsed["parser_version"] == 19
+    assert parsed["parser_version"] == 20
 
     document = parsed["document"]
     assert document["schema_version"] == "arc.paper.document.v2"
@@ -707,7 +707,7 @@ def test_recache_upgrades_v12_ar5iv_cache_without_refreshing_source(monkeypatch,
     assert provider.calls == [False]
     assert result["data"]["parser_version"] == 20
     assert result["data"]["document"]["schema_version"] == DOCUMENT_SCHEMA_VERSION
-    assert read_json(path)["parser_version"] == 19
+    assert read_json(path)["parser_version"] == 20
 
 
 def test_refresh_and_recache_are_mutually_exclusive(monkeypatch, tmp_path):
