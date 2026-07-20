@@ -1506,6 +1506,16 @@ def _matching_translation_coverage_attempt(
 def _translation_token_attempt_path(checkpoint_dir: Path, segment_id: str) -> Path:
     return (
         checkpoint_dir
+        / "translation-token-offset-attempts"
+        / f"{_segment_checkpoint_name(segment_id)}.json"
+    )
+
+
+def _legacy_translation_token_attempt_path(
+    checkpoint_dir: Path, segment_id: str,
+) -> Path:
+    return (
+        checkpoint_dir
         / "translation-token-attempts"
         / f"{_segment_checkpoint_name(segment_id)}.json"
     )
@@ -1535,13 +1545,35 @@ def _matching_translation_token_attempt(
     return None
 
 
+def _matching_superseded_translation_text_attempt(
+    checkpoint_dir: Path, segment_id: str, input_sha256: str,
+) -> dict[str, Any] | None:
+    """Return a same-input legacy text repair for audit and low-rerun guards."""
+    value = _read_checkpoint_json(
+        _legacy_translation_token_attempt_path(checkpoint_dir, segment_id)
+    )
+    if (
+        isinstance(value, dict)
+        and value.get("segment_id") == segment_id
+        and value.get("input_sha256") == input_sha256
+        and str(value.get("prompt_version") or "") in {
+            "arc.companion.translation-retry-prompt.v3",
+            "arc.companion.translation-retry-prompt.v4",
+        }
+    ):
+        return value
+    return None
+
+
 def _guard_translation_token_attempt_before_primary(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
 ) -> dict[str, Any] | None:
     """Fail closed on an unreadable or malformed current marker before low work."""
     path = _translation_token_attempt_path(checkpoint_dir, segment_id)
     if not path.is_file():
-        return None
+        return _matching_superseded_translation_text_attempt(
+            checkpoint_dir, segment_id, input_sha256,
+        )
     value = _read_checkpoint_json(path)
     if not isinstance(value, dict):
         raise RuntimeError(
@@ -1549,8 +1581,6 @@ def _guard_translation_token_attempt_before_primary(
             "refusing a primary model call"
         )
     prompt_version = str(value.get("prompt_version") or "")
-    if prompt_version == "arc.companion.translation-retry-prompt.v3":
-        return None
     if prompt_version != TRANSLATION_RETRY_PROMPT_VERSION:
         raise RuntimeError(
             f"translation token repair marker has unknown prompt identity for {segment_id}; "
@@ -1574,7 +1604,7 @@ def _translation_token_repair_draft_path(
 ) -> Path:
     return (
         checkpoint_dir
-        / "translation-token-repair-drafts"
+        / "translation-token-offset-repair-drafts"
         / f"{_segment_checkpoint_name(segment_id)}.json"
     )
 
@@ -1588,10 +1618,13 @@ def _matching_translation_token_repair_draft(
         isinstance(value, dict)
         and value.get("schema_version") == "arc.companion.translation-token-repair-draft.v1"
         and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
+        and value.get("response_schema_version")
+        == TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
         and isinstance(value.get("translation"), dict)
         and isinstance(value.get("repair_provenance"), dict)
+        and value["repair_provenance"].get("repair_mode") == "offset-only"
         and isinstance(value.get("raw_response"), dict)
     ):
         return value
@@ -1625,45 +1658,23 @@ def _write_validated_translation_token_marker(
         "validated_at": now,
         "validated_translation_sha256": sha256_json(repaired),
         "raw_response": raw_response,
+        **(
+            {"superseded_text_attempt": prior_marker["superseded_text_attempt"]}
+            if isinstance((prior_marker or {}).get("superseded_text_attempt"), dict)
+            else {}
+        ),
     })
-
-
-def _legacy_v3_translation_candidate(
-    checkpoint_dir: Path, segment_id: str, input_sha256: str,
-) -> dict[str, Any] | None:
-    draft_path = _translation_token_repair_draft_path(checkpoint_dir, segment_id)
-    draft = _read_checkpoint_json(draft_path)
-    if (
-        isinstance(draft, dict)
-        and draft.get("prompt_version") == "arc.companion.translation-retry-prompt.v3"
-        and draft.get("segment_id") == segment_id
-        and draft.get("input_sha256") == input_sha256
-        and isinstance(draft.get("translation"), dict)
-    ):
-        return draft["translation"]
-    checkpoint_path = (
-        checkpoint_dir / "translations" / f"{_segment_checkpoint_name(segment_id)}.json"
-    )
-    checkpoint = _read_checkpoint_json(checkpoint_path)
-    if not isinstance(checkpoint, dict) or checkpoint.get("input_sha256") != input_sha256:
-        return None
-    repairs = (checkpoint.get("generation_provenance") or {}).get("repairs") or []
-    if any(
-        isinstance(item, dict)
-        and item.get("prompt_version") == "arc.companion.translation-retry-prompt.v3"
-        and item.get("kind") == "token-placement"
-        for item in repairs
-    ) and isinstance(checkpoint.get("translation"), dict):
-        return checkpoint["translation"]
-    return None
 
 
 def _translation_checkpoint_requires_v4_upgrade(checkpoint: dict[str, Any]) -> bool:
     repairs = (checkpoint.get("generation_provenance") or {}).get("repairs") or []
     return any(
         isinstance(item, dict)
-        and item.get("prompt_version") == "arc.companion.translation-retry-prompt.v3"
         and item.get("kind") == "token-placement"
+        and (
+            item.get("prompt_version") != TRANSLATION_RETRY_PROMPT_VERSION
+            or item.get("repair_mode") != "offset-only"
+        )
         for item in repairs
     )
 
@@ -1756,6 +1767,12 @@ def _repair_translation_token_placement(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the single lifetime-bounded token-placement repair for a segment input."""
     segment_id = str(segment["segment_id"])
+    token_errors = _translation_opaque_token_errors(segment, translation, blocks_by_id)
+    source_blocks = [blocks_by_id[item.block_id] for item in token_errors]
+    if not source_blocks:
+        raise RuntimeError(
+            f"translation token repair has no structurally failing blocks for {segment_id}"
+        )
     repair_draft_path = _translation_token_repair_draft_path(
         checkpoint_dir, segment_id,
     )
@@ -1764,9 +1781,17 @@ def _repair_translation_token_placement(
     )
     invalid_persisted_draft = False
     if persisted is not None:
-        repaired = persisted["translation"]
         try:
+            repaired = _apply_translation_slot_repairs(
+                translation,
+                source_blocks,
+                persisted["raw_response"],
+                protected_names=protected_names,
+                offset_only=True,
+            )
             _validate_translation(segment, repaired, blocks_by_id, protected_names)
+            if sha256_json(repaired) != sha256_json(persisted["translation"]):
+                raise RuntimeError("persisted translation differs from replayed offsets")
         except RuntimeError:
             invalid_persisted_draft = True
         else:
@@ -1822,31 +1847,16 @@ def _repair_translation_token_placement(
         raise RuntimeError(
             f"translation token repair draft is corrupt for {segment_id}; refusing a new model call"
         )
-    token_errors = _translation_opaque_token_errors(segment, translation, blocks_by_id)
-    source_blocks = [blocks_by_id[item.block_id] for item in token_errors]
-    if not source_blocks:
-        raise RuntimeError(
-            f"translation token repair has no structurally failing blocks for {segment_id}"
-        )
-    legacy_candidate = _legacy_v3_translation_candidate(
-        checkpoint_dir, segment_id, input_sha256,
-    )
-    repair_input = legacy_candidate or translation
+    repair_input = translation
     previous_by_id = {
         str(item.get("block_id") or ""): item for item in repair_input["blocks"]
-    }
-    primary_by_id = {
-        str(item.get("block_id") or ""): item for item in translation["blocks"]
     }
     repair_contexts = [
         _translation_slot_repair_context(
             source_block,
             str(previous_by_id[block_id(source_block)].get("text") or ""),
             protected_names=protected_names,
-            primary_text=(
-                str(primary_by_id[block_id(source_block)].get("text") or "")
-                if legacy_candidate is not None else None
-            ),
+            primary_text=None,
         )
         for source_block in source_blocks
     ]
@@ -1859,6 +1869,16 @@ def _repair_translation_token_placement(
         "model_tier": TRANSLATION_RETRY_TIER,
         "block_ids": [block_id(block) for block in source_blocks],
     }
+    superseded_text_attempt = _matching_superseded_translation_text_attempt(
+        checkpoint_dir, segment_id, input_sha256,
+    )
+    if isinstance(superseded_text_attempt, dict):
+        marker_base["superseded_text_attempt"] = {
+            "path": str(_legacy_translation_token_attempt_path(checkpoint_dir, segment_id)),
+            "sha256": sha256_json(superseded_text_attempt),
+            "prompt_version": str(superseded_text_attempt.get("prompt_version") or ""),
+            "status": str(superseded_text_attempt.get("status") or ""),
+        }
     value: dict[str, Any] | None = None
     if attempt is not None:
         status = str(attempt.get("status") or "")
@@ -1869,7 +1889,12 @@ def _repair_translation_token_placement(
                     f"translation token repair marker lacks its auditable response for {segment_id}"
                 )
             value = raw_response
-        elif status != "started":
+        elif status == "started":
+            raise RuntimeError(
+                f"translation token repair attempt already started for {segment_id}; "
+                "refusing another model call"
+            )
+        else:
             raise RuntimeError(
                 f"translation token repair marker has invalid status {status!r} for {segment_id}"
             )
@@ -1892,8 +1917,8 @@ def _repair_translation_token_placement(
             ),
             TRANSLATION_SLOT_REPAIR_SCHEMA,
             options=options,
-            artifact_dir=artifact_dir / "retry-1",
-            call_label=f"companion-translation-{segment_id}-retry-1",
+            artifact_dir=artifact_dir / "retry-offset-1",
+            call_label=f"companion-translation-{segment_id}-retry-offset-1",
             model_tier=TRANSLATION_RETRY_TIER,
             allow_mcp=False,
             allow_internet=False,
@@ -1910,8 +1935,9 @@ def _repair_translation_token_placement(
         source_blocks,
         value,
         protected_names=protected_names,
-        allow_clause_rewrite=legacy_candidate is not None,
-        primary_translation=translation if legacy_candidate is not None else None,
+        allow_clause_rewrite=False,
+        primary_translation=None,
+        offset_only=True,
     )
     _validate_translation(segment, repaired, blocks_by_id, protected_names)
     provenance = {
@@ -1919,12 +1945,15 @@ def _repair_translation_token_placement(
         "attempt": 1,
         "repair_method": "model-offsets-controller-slices",
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+        "repair_mode": "offset-only",
         "citation_delimiter_normalizer_version": (
             TRANSLATION_CITATION_DELIMITER_NORMALIZER_VERSION
         ),
         "model_tier": TRANSLATION_RETRY_TIER,
         "repaired_block_ids": [block_id(block) for block in source_blocks],
     }
+    if isinstance(marker_base.get("superseded_text_attempt"), dict):
+        provenance["superseded_text_attempt"] = marker_base["superseded_text_attempt"]
     write_json(repair_draft_path, {
         "schema_version": "arc.companion.translation-token-repair-draft.v1",
         "segment_id": segment_id,
@@ -3020,16 +3049,40 @@ def _translation_slot_repair_context(
         )
         for index, slot in enumerate(prior_slots)
     ] if prior_tokens == expected_tokens else []
+    inline_runs = [
+        run for run in source_block.get("inline_runs") or [] if isinstance(run, dict)
+    ]
     source_runs: list[dict[str, Any]] = []
-    for index, run in enumerate(source_block.get("inline_runs") or [], start=1):
-        if not isinstance(run, dict):
-            continue
+    expected_token_semantics: list[dict[str, Any]] = []
+    opaque_index = 0
+    for index, run in enumerate(inline_runs, start=1):
         kind = str(run.get("kind") or "")
         record: dict[str, Any] = {"order": index, "kind": kind}
         if kind == "text":
             record["source_text"] = str(run.get("content") or "")
         else:
+            token = expected_tokens[opaque_index]
+            opaque_index += 1
             record["source_content"] = str(run.get("tex") or run.get("content") or "")
+            record["expected_token"] = token
+            left_text = next((
+                str(value.get("content") or "")
+                for value in reversed(inline_runs[:index - 1])
+                if str(value.get("kind") or "") == "text"
+            ), "")
+            right_text = next((
+                str(value.get("content") or "")
+                for value in inline_runs[index:]
+                if str(value.get("kind") or "") == "text"
+            ), "")
+            expected_token_semantics.append({
+                "token_ordinal": opaque_index,
+                "token": token,
+                "kind": kind,
+                "source_content": record["source_content"],
+                "left_source_text": left_text,
+                "right_source_text": right_text,
+            })
             if kind == "link" and run.get("href"):
                 record["href"] = str(run["href"])
         source_runs.append(record)
@@ -3050,6 +3103,7 @@ def _translation_slot_repair_context(
             if fragment
         ],
         "affected_token_ordinals": sorted(affected_ordinals),
+        "expected_tokens": expected_token_semantics,
         "expected_slot_count": len(expected_tokens) + 1,
         "slot_ids": _translation_repair_slot_ids(source_block),
         "missing_protected_names": _minimal_missing_name_insertions(
@@ -3197,6 +3251,7 @@ def _apply_translation_slot_repairs(
     protected_names: list[str],
     allow_clause_rewrite: bool = False,
     primary_translation: dict[str, Any] | None = None,
+    offset_only: bool = False,
 ) -> dict[str, Any]:
     """Patch every token-mismatched block in one bounded repair call."""
     raw_repairs = repair.get("repairs") if isinstance(repair, dict) else None
@@ -3218,6 +3273,7 @@ def _apply_translation_slot_repairs(
         result = _apply_translation_slot_repair_block(
             result, source_block, block_repair, protected_names=protected_names,
             allow_clause_rewrite=allow_clause_rewrite,
+            offset_only=offset_only,
             primary_text=(
                 str(primary_by_id.get(block_id(source_block), {}).get("text") or "")
                 if primary_translation is not None else None
@@ -3234,6 +3290,7 @@ def _apply_translation_slot_repair_block(
     protected_names: list[str],
     allow_clause_rewrite: bool = False,
     primary_text: str | None = None,
+    offset_only: bool = False,
 ) -> dict[str, Any]:
     """Patch one failed block while preserving prior natural language and all other blocks."""
     block_id_value = block_id(source_block)
@@ -3265,7 +3322,7 @@ def _apply_translation_slot_repair_block(
             (item.get("start_offset"), item.get("end_offset")) for item in raw_slots
         ]
         if any(
-            not isinstance(start, int) or not isinstance(end, int)
+            type(start) is not int or type(end) is not int
             for start, end in spans
         ):
             raise RuntimeError("translation slot repair returned non-integer residue offsets")
@@ -3279,6 +3336,8 @@ def _apply_translation_slot_repair_block(
         if cursor != len(residue):
             raise RuntimeError("translation slot repair offsets do not cover prior residue")
     else:
+        if offset_only:
+            raise RuntimeError("translation offset repair returned prose instead of residue offsets")
         # Compatibility for direct callers with v1 payloads. New model calls
         # are schema-constrained to offsets and cannot enter this branch.
         slots = [str(item.get("text") or "") for item in raw_slots]

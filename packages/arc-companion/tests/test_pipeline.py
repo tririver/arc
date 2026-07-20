@@ -51,6 +51,22 @@ def _inline_run(kind: str, content: str, order: int, *, tex: str = "") -> dict[s
     return value
 
 
+def _offset_slots(
+    block: dict[str, object], residue: str, cuts: list[int],
+) -> list[dict[str, str | int]]:
+    boundaries = [0, *cuts, len(residue)]
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    assert len(boundaries) == len(slot_ids) + 1
+    return [
+        {
+            "slot_id": slot_id,
+            "start_offset": boundaries[index],
+            "end_offset": boundaries[index + 1],
+        }
+        for index, slot_id in enumerate(slot_ids)
+    ]
+
+
 def test_translation_uses_and_validates_ordered_opaque_inline_tokens() -> None:
     block = {
         "block_id": "b",
@@ -317,7 +333,7 @@ def test_seg0007_adjacent_math_marker_is_not_an_ambiguous_citation_bracket() -> 
     assert methods == {block["block_id"]: "synthesized"}
 
 
-def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
+def test_v5_offset_repair_preserves_v4_audit_once_and_persists_response(
     tmp_path: Path,
 ) -> None:
     block = {
@@ -331,21 +347,32 @@ def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
     translation = {"blocks": [{"block_id": "body", "text": "译文。"}]}
     checkpoint_dir = tmp_path / "checkpoints"
     input_sha256 = "fixture-input"
-    old_marker = pipeline_module._translation_token_attempt_path(checkpoint_dir, segment["segment_id"])
+    old_marker = pipeline_module._legacy_translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
     old_marker.parent.mkdir(parents=True)
     old_marker.write_text(json.dumps({
         "schema_version": "arc.companion.translation-token-attempt.v1",
-        "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+        "prompt_version": "arc.companion.translation-retry-prompt.v4",
+        "segment_id": segment["segment_id"],
+        "input_sha256": input_sha256,
+        "status": "response_received",
+        "raw_response": {"repairs": [{"block_id": "body", "slots": [
+            {"slot_id": "legacy", "text": "改写过的译文。"},
+        ]}]},
     }), encoding="utf-8")
-    calls = []
+    old_marker_bytes = old_marker.read_bytes()
+    calls: list[str] = []
     def repair_llm(prompt: str, **kwargs):
         calls.append(str(kwargs["call_label"]))
-        assert '"text"' in json.dumps(kwargs["schema"])
-        assert "mutable portion of TOKEN-DELIMITED SLOT REGIONS" in prompt
-        slot_ids = pipeline_module._translation_repair_slot_ids(block)
+        schema_text = json.dumps(kwargs["schema"])
+        assert '"text"' not in schema_text
+        assert '"start_offset"' in schema_text
+        assert "PRIOR NATURAL LANGUAGE RESIDUE" in prompt
+        assert "INDEXED RESIDUE" in prompt
+        assert pipeline_module._opaque_inline_tokens(block)[0] in prompt
         return {"repairs": [{"block_id": "body", "slots": [
-            {"slot_id": slot_ids[0], "text": "译文"},
-            {"slot_id": slot_ids[1], "text": "。"},
+            *_offset_slots(block, "译文。", [2]),
         ]}]}
     repaired, provenance = pipeline_module._repair_translation_token_placement(
         segment, translation, blocks_by_id={"body": block}, protected_names=[],
@@ -353,25 +380,35 @@ def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
         checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
         input_sha256=input_sha256, llm=repair_llm,
     )
-    assert calls == ["companion-translation-seg-0016-retry-1"]
+    assert calls == ["companion-translation-seg-0016-retry-offset-1"]
+    assert pipeline_module._translation_natural_residue(
+        repaired["blocks"][0]["text"]
+    ) == "译文。"
+    assert provenance["attempt"] == 1
     persisted_path = pipeline_module._translation_token_repair_draft_path(
         checkpoint_dir, segment["segment_id"],
     )
     persisted = json.loads(persisted_path.read_text(encoding="utf-8"))
-    assert persisted["raw_response"]["repairs"][0]["slots"][0]["text"] == "译文"
-    assert json.loads(old_marker.read_text(encoding="utf-8"))["schema_version"] == (
-        "arc.companion.translation-token-attempt.v2"
+    assert persisted["raw_response"]["repairs"][0]["slots"][0]["end_offset"] == 2
+    assert old_marker.read_bytes() == old_marker_bytes
+    current_marker = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    marker = json.loads(current_marker.read_text(encoding="utf-8"))
+    assert marker["status"] == "validated"
+    assert marker["superseded_text_attempt"]["prompt_version"].endswith(".v4")
+    assert marker["superseded_text_attempt"]["sha256"] == pipeline_module.sha256_json(
+        json.loads(old_marker_bytes)
     )
 
     def forbidden_llm(prompt: str, **kwargs):
         raise AssertionError("persisted structural repair must resume without another model call")
 
-    old_marker.write_text(json.dumps({
-        "schema_version": "arc.companion.translation-token-attempt.v2",
-        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
-        "segment_id": segment["segment_id"], "input_sha256": input_sha256,
-        "status": "started",
-    }), encoding="utf-8")
+    tampered = json.loads(json.dumps(persisted))
+    tampered["translation"]["blocks"][0]["text"] = (
+        f"篡改{pipeline_module._opaque_inline_tokens(block)[0]}。"
+    )
+    persisted_path.write_text(json.dumps(tampered), encoding="utf-8")
     resumed, resumed_provenance = pipeline_module._repair_translation_token_placement(
         segment, translation, blocks_by_id={"body": block}, protected_names=[],
         options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
@@ -380,26 +417,28 @@ def test_v4_medium_repair_supersedes_old_marker_once_and_persists_response(
     )
     assert resumed == repaired
     assert resumed_provenance == provenance
-    recovered_marker = json.loads(old_marker.read_text(encoding="utf-8"))
+    recovered_marker = json.loads(current_marker.read_text(encoding="utf-8"))
     assert recovered_marker["status"] == "validated"
     assert recovered_marker["validated_translation_sha256"] == pipeline_module.sha256_json(
         repaired
     )
     assert recovered_marker["raw_response"] == persisted["raw_response"]
+    assert old_marker.read_bytes() == old_marker_bytes
 
 
-def test_v3_final_checkpoint_requires_v4_upgrade() -> None:
+@pytest.mark.parametrize("legacy_version", ["v3", "v4"])
+def test_legacy_final_checkpoint_requires_offset_upgrade(legacy_version: str) -> None:
+    repair = {
+        "kind": "token-placement",
+        "prompt_version": f"arc.companion.translation-retry-prompt.{legacy_version}",
+    }
     checkpoint = {
-        "generation_provenance": {"repairs": [{
-            "kind": "token-placement",
-            "prompt_version": "arc.companion.translation-retry-prompt.v3",
-        }]},
+        "generation_provenance": {"repairs": [repair]},
         "translation": {"blocks": []},
     }
     assert pipeline_module._translation_checkpoint_requires_v4_upgrade(checkpoint)
-    checkpoint["generation_provenance"]["repairs"][0]["prompt_version"] = (
-        pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION
-    )
+    repair["prompt_version"] = pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION
+    repair["repair_mode"] = "offset-only"
     assert not pipeline_module._translation_checkpoint_requires_v4_upgrade(checkpoint)
 
 
@@ -537,6 +576,56 @@ def test_v4_repairs_seg0007_and_seg0016_semantic_roles_in_mutable_clauses() -> N
     )
 
 
+def test_seg0017_offset_repair_keeps_prose_and_negation_byte_exact() -> None:
+    block = {
+        "block_id": "S2.SS1.p9.18", "type": "text",
+        "text": "Do not replace p with q except by r.",
+        "inline_runs": [
+            _inline_run("text", "Do not replace ", 1),
+            _inline_run("math", "p", 2, tex="p"),
+            _inline_run("text", " with ", 3),
+            _inline_run("math", "q", 4, tex="q"),
+            _inline_run("text", " except by ", 5),
+            _inline_run("math", "r", 6, tex="r"),
+            _inline_run("text", ".", 7),
+        ],
+    }
+    p_token, q_token, relation = pipeline_module._opaque_inline_tokens(block)
+    primary_text = f"不应将{q_token}替换为{p_token}，且仅利用{relation}。"
+    residue = pipeline_module._translation_natural_residue(primary_text)
+    cuts = [residue.index("替换"), residue.index("，"), residue.index("。")]
+
+    repaired = pipeline_module._apply_translation_slot_repairs(
+        {"blocks": [{"block_id": block["block_id"], "text": primary_text}]},
+        [block],
+        {"repairs": [{"block_id": block["block_id"], "slots": [
+            *_offset_slots(block, residue, cuts),
+        ]}]},
+        protected_names=[], offset_only=True,
+    )
+    repaired_text = repaired["blocks"][0]["text"]
+    repaired_residue = pipeline_module._translation_natural_residue(repaired_text)
+
+    assert repaired_text == (
+        f"不应将{p_token}替换为{q_token}，且仅利用{relation}。"
+    )
+    assert repaired_residue.encode("utf-8") == residue.encode("utf-8")
+    assert repaired_residue.count("不") == residue.count("不") == 1
+    assert repaired_residue.count("且") == residue.count("且") == 1
+
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    with pytest.raises(RuntimeError, match="returned prose"):
+        pipeline_module._apply_translation_slot_repairs(
+            {"blocks": [{"block_id": block["block_id"], "text": primary_text}]},
+            [block],
+            {"repairs": [{"block_id": block["block_id"], "slots": [
+                {"slot_id": slot_id, "text": "可以" if index == 0 else ""}
+                for index, slot_id in enumerate(slot_ids)
+            ]}]},
+            protected_names=[], offset_only=True,
+        )
+
+
 def test_v4_rejects_changes_outside_token_bearing_clause() -> None:
     block = {
         "block_id": "body", "type": "text", "text": "Value x. Stable sentence.",
@@ -672,7 +761,7 @@ def test_token_repair_persists_response_before_apply_and_reuses_failed_response(
     assert calls == 1
 
 
-def test_started_token_repair_retries_medium_and_corrupt_draft_recovers(
+def test_started_token_repair_is_lifetime_bounded_and_fails_closed(
     tmp_path: Path,
 ) -> None:
     block = {
@@ -702,11 +791,7 @@ def test_started_token_repair_retries_medium_and_corrupt_draft_recovers(
 
     def repair_llm(prompt: str, **kwargs):
         calls.append(str(kwargs["model_tier"]))
-        slot_ids = pipeline_module._translation_repair_slot_ids(block)
-        return {"repairs": [{"block_id": "body", "slots": [
-            {"slot_id": slot_ids[0], "text": "译文"},
-            {"slot_id": slot_ids[1], "text": "。"},
-        ]}]}
+        raise AssertionError("a started offset attempt must never call the model again")
 
     arguments = dict(
         segment=segment,
@@ -716,31 +801,12 @@ def test_started_token_repair_retries_medium_and_corrupt_draft_recovers(
         checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
         input_sha256="resume-input",
     )
-    repaired, _ = pipeline_module._repair_translation_token_placement(
-        **arguments, llm=repair_llm,
-    )
-    assert calls == ["medium"]
-    assert json.loads(attempt_path.read_text(encoding="utf-8"))["status"] == "validated"
-    repair_draft = pipeline_module._translation_token_repair_draft_path(
-        checkpoint_dir, segment["segment_id"],
-    )
-    repair_draft.write_text(json.dumps({
-        "schema_version": "arc.companion.translation-token-repair-draft.v1",
-        "segment_id": segment["segment_id"], "input_sha256": "resume-input",
-        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
-        "translation": {"blocks": []},
-        "repair_provenance": {"kind": "token-placement", "repaired_block_ids": ["body"]},
-        "raw_response": {"damaged": True},
-    }), encoding="utf-8")
-
-    def forbidden_llm(prompt: str, **kwargs):
-        raise AssertionError("validated raw response must recover a corrupt draft")
-
-    recovered, _ = pipeline_module._repair_translation_token_placement(
-        **arguments, llm=forbidden_llm,
-    )
-    assert recovered == repaired
-    assert json.loads(repair_draft.read_text(encoding="utf-8"))["translation"] == repaired
+    with pytest.raises(RuntimeError, match="already started"):
+        pipeline_module._repair_translation_token_placement(
+            **arguments, llm=repair_llm,
+        )
+    assert calls == []
+    assert json.loads(attempt_path.read_text(encoding="utf-8"))["status"] == "started"
 
 
 def test_v4_upgrade_without_primary_draft_blocks_before_low_model(tmp_path: Path) -> None:
@@ -783,7 +849,7 @@ def test_v4_upgrade_without_primary_draft_blocks_before_low_model(tmp_path: Path
         "segment_id": segment["segment_id"], "input_sha256": input_sha256,
         "generation_provenance": {"repairs": [{
             "kind": "token-placement",
-            "prompt_version": "arc.companion.translation-retry-prompt.v3",
+            "prompt_version": "arc.companion.translation-retry-prompt.v4",
         }]},
         "translation": {"blocks": [{"block_id": "body", "text": f"译文{token}。"}]},
     }), encoding="utf-8")
@@ -802,7 +868,7 @@ def test_v4_upgrade_without_primary_draft_blocks_before_low_model(tmp_path: Path
     assert "requires its stored primary draft" in str(exc_info.value.failures[0][1])
 
 
-def test_v3_attempt_v2_marker_migrates_to_v4_without_low(tmp_path: Path) -> None:
+def test_v3_attempt_v2_marker_migrates_to_v5_offsets_without_low(tmp_path: Path) -> None:
     block = {
         "block_id": "body", "type": "text", "text": "Value x.",
         "inline_runs": [
@@ -859,7 +925,7 @@ def test_v3_attempt_v2_marker_migrates_to_v4_without_low(tmp_path: Path) -> None
             input_sha256=input_sha256, origin="primary-model",
         )
     ), encoding="utf-8")
-    old_marker = pipeline_module._translation_token_attempt_path(
+    old_marker = pipeline_module._legacy_translation_token_attempt_path(
         checkpoint_dir, segment["segment_id"],
     )
     old_marker.parent.mkdir(parents=True)
@@ -869,32 +935,38 @@ def test_v3_attempt_v2_marker_migrates_to_v4_without_low(tmp_path: Path) -> None
         "segment_id": segment["segment_id"], "input_sha256": input_sha256,
         "status": "validated",
     }), encoding="utf-8")
+    old_marker_bytes = old_marker.read_bytes()
     calls: list[tuple[str, str]] = []
 
     def repair_llm(prompt: str, **kwargs):
         calls.append((str(kwargs["call_label"]), str(kwargs["model_tier"])))
-        slot_ids = pipeline_module._translation_repair_slot_ids(block)
         return {"repairs": [{"block_id": "body", "slots": [
-            {"slot_id": slot_ids[0], "text": "修复后的"},
-            {"slot_id": slot_ids[1], "text": "。"},
+            *_offset_slots(block, "缺少令牌。", [4]),
         ]}]}
 
     result = _generate_translations(
         [segment], options=options, bundle=bundle, glossary={"entries": []},
         protected_names=[], checkpoint_dir=checkpoint_dir, llm=repair_llm,
     )
-    assert calls == [("companion-translation-seg-v3-marker-retry-1", "medium")]
+    assert calls == [("companion-translation-seg-v3-marker-retry-offset-1", "medium")]
     assert result[segment["segment_id"]]["blocks"][0]["text"] == (
-        f"修复后的{token}。"
+        f"缺少令牌{token}。"
     )
-    migrated_marker = json.loads(old_marker.read_text(encoding="utf-8"))
+    assert old_marker.read_bytes() == old_marker_bytes
+    migrated_marker = json.loads(pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    ).read_text(encoding="utf-8"))
     assert migrated_marker["prompt_version"] == pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION
     assert migrated_marker["status"] == "validated"
+    assert migrated_marker["superseded_text_attempt"]["path"] == str(old_marker)
 
 
 @pytest.mark.parametrize(
     "marker_kind",
-    ["unreadable", "malformed-current", "current-missing-schema", "unknown-prompt"],
+    [
+        "unreadable", "malformed-current", "current-missing-schema",
+        "unknown-prompt", "legacy-v4",
+    ],
 )
 def test_token_attempt_marker_fails_closed_before_low_model(
     tmp_path: Path, marker_kind: str,
@@ -929,6 +1001,10 @@ def test_token_attempt_marker_fails_closed_before_low_model(
     marker_path = pipeline_module._translation_token_attempt_path(
         checkpoint_dir, segment["segment_id"],
     )
+    if marker_kind == "legacy-v4":
+        marker_path = pipeline_module._legacy_translation_token_attempt_path(
+            checkpoint_dir, segment["segment_id"],
+        )
     marker_path.parent.mkdir(parents=True)
     if marker_kind == "unreadable":
         marker_path.write_text("{broken", encoding="utf-8")
@@ -946,12 +1022,19 @@ def test_token_attempt_marker_fails_closed_before_low_model(
             "segment_id": segment["segment_id"], "input_sha256": input_sha256,
             "status": "started",
         }), encoding="utf-8")
-    else:
+    elif marker_kind == "unknown-prompt":
         marker_path.write_text(json.dumps({
             "schema_version": "arc.companion.translation-token-attempt.v2",
             "prompt_version": "arc.companion.translation-retry-prompt.v99",
             "segment_id": segment["segment_id"], "input_sha256": input_sha256,
             "status": "started",
+        }), encoding="utf-8")
+    else:
+        marker_path.write_text(json.dumps({
+            "schema_version": "arc.companion.translation-token-attempt.v2",
+            "prompt_version": "arc.companion.translation-retry-prompt.v4",
+            "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+            "status": "response_received", "raw_response": {"repairs": []},
         }), encoding="utf-8")
     calls: list[str] = []
 
@@ -969,8 +1052,12 @@ def test_token_attempt_marker_fails_closed_before_low_model(
             checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
         )
     assert calls == []
-    assert "marker" in str(exc_info.value.failures[0][1])
-    assert "refusing a primary model call" in str(exc_info.value.failures[0][1])
+    message = str(exc_info.value.failures[0][1])
+    if marker_kind == "legacy-v4":
+        assert "attempt already consumed" in message
+    else:
+        assert "marker" in message
+        assert "refusing a primary model call" in message
 
 
 def test_damaged_current_repair_draft_without_validated_raw_fails_closed(
@@ -994,8 +1081,12 @@ def test_damaged_current_repair_draft_without_validated_raw_fails_closed(
         "schema_version": "arc.companion.translation-token-repair-draft.v1",
         "segment_id": segment["segment_id"], "input_sha256": "damaged-input",
         "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": pipeline_module.TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
         "translation": {"blocks": []},
-        "repair_provenance": {"kind": "token-placement", "repaired_block_ids": ["body"]},
+        "repair_provenance": {
+            "kind": "token-placement", "repair_mode": "offset-only",
+            "repaired_block_ids": ["body"],
+        },
         "raw_response": {"repairs": []},
     }), encoding="utf-8")
     calls = 0
@@ -1534,6 +1625,40 @@ def test_slot_repair_rejects_bad_slot_coverage_opaque_content_and_rephrasing() -
             raise AssertionError(f"{label} slot repair must be rejected")
 
 
+@pytest.mark.parametrize(
+    "spans",
+    [
+        [(True, 2), (2, 4)],
+        [(0, 2), (3, 4)],
+        [(0, 3), (2, 4)],
+        [(0, 2), (2, 3)],
+        [(0, 2), (2, 5)],
+    ],
+)
+def test_offset_repair_rejects_non_integer_and_non_partition_spans(
+    spans: list[tuple[object, object]],
+) -> None:
+    block = {
+        "block_id": "offsets", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    slot_ids = pipeline_module._translation_repair_slot_ids(block)
+    slots = [
+        {"slot_id": slot_id, "start_offset": start, "end_offset": end}
+        for slot_id, (start, end) in zip(slot_ids, spans)
+    ]
+    with pytest.raises(RuntimeError, match="offset"):
+        pipeline_module._apply_translation_slot_repairs(
+            {"blocks": [{"block_id": "offsets", "text": "旧译文。"}]},
+            [block], {"repairs": [{"block_id": "offsets", "slots": slots}]},
+            protected_names=[], offset_only=True,
+        )
+
+
 def test_slot_repair_strips_a_bounded_mutated_marker_candidate() -> None:
     block = {
         "block_id": "mutated", "type": "text", "text": "A x B.",
@@ -1683,17 +1808,15 @@ def test_one_repair_call_handles_multiple_mismatched_blocks_and_preserves_valid_
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
         calls.append(label)
-        if label.endswith("retry-1"):
+        if label.endswith("retry-offset-1"):
             assert "GLOSSARY:" not in prompt
             assert "Target language:" not in prompt
             return {"repairs": [
                 {"block_id": "b1", "slots": [
-                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[0])[0], "text": "甲"},
-                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[0])[1], "text": ""},
+                    *_offset_slots(blocks[0], "甲", [1]),
                 ]},
                 {"block_id": "b2", "slots": [
-                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[1])[0], "text": ""},
-                    {"slot_id": pipeline_module._translation_repair_slot_ids(blocks[1])[1], "text": "乙"},
+                    *_offset_slots(blocks[1], "乙", [0]),
                 ]},
             ]}
         return {"blocks": [
@@ -1708,7 +1831,10 @@ def test_one_repair_call_handles_multiple_mismatched_blocks_and_preserves_valid_
         bundle=bundle, glossary={"entries": []}, protected_names=[],
         checkpoint_dir=tmp_path / "checkpoints", llm=llm,
     )
-    assert calls == ["companion-translation-seg-0001", "companion-translation-seg-0001-retry-1"]
+    assert calls == [
+        "companion-translation-seg-0001",
+        "companion-translation-seg-0001-retry-offset-1",
+    ]
     assert result["seg-0001"]["blocks"][2]["text"] == f"保留{tokens['b3']}原文"
     assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(
         result["seg-0001"]["blocks"][0]["text"]
@@ -2231,10 +2357,8 @@ def test_extra_nontranslatable_block_normalizes_then_repairs_tokens_only(tmp_pat
 
     def llm(prompt: str, **kwargs):
         calls.append(str(kwargs["call_label"]))
-        slot_ids = pipeline_module._translation_repair_slot_ids(blocks[1])
         return {"repairs": [{"block_id": "p2", "slots": [
-            {"slot_id": slot_ids[0], "text": "坏译文"},
-            {"slot_id": slot_ids[1], "text": "。"},
+            *_offset_slots(blocks[1], "坏译文。", [3]),
         ]}]}
 
     result = _generate_translations(
@@ -2242,7 +2366,7 @@ def test_extra_nontranslatable_block_normalizes_then_repairs_tokens_only(tmp_pat
         protected_names=[], checkpoint_dir=checkpoint_dir, llm=llm,
     )["seg-0063"]
 
-    assert calls == ["companion-translation-seg-0063-retry-1"]
+    assert calls == ["companion-translation-seg-0063-retry-offset-1"]
     assert result["blocks"][0] == p1
     assert result["blocks"][2] == p3
     assert [item["block_id"] for item in result["blocks"]] == ["p1", "p2", "p3"]
@@ -2254,7 +2378,7 @@ def test_extra_nontranslatable_block_normalizes_then_repairs_tokens_only(tmp_pat
         "coverage-normalization", "token-placement",
     ]
     assert not list((checkpoint_dir / "translation-coverage-attempts").glob("*.json"))
-    assert list((checkpoint_dir / "translation-token-attempts").glob("*.json"))
+    assert list((checkpoint_dir / "translation-token-offset-attempts").glob("*.json"))
 
 
 def test_token_invalid_draft_resumes_after_interruption_before_attempt(
@@ -2280,7 +2404,7 @@ def test_token_invalid_draft_resumes_after_interruption_before_attempt(
     original_write_json = pipeline_module.write_json
 
     def interrupted_write(path, value):
-        if "translation-token-attempts" in Path(path).parts:
+        if "translation-token-offset-attempts" in Path(path).parts:
             raise RuntimeError("simulated interruption before token attempt marker")
         original_write_json(path, value)
 
@@ -2299,24 +2423,22 @@ def test_token_invalid_draft_resumes_after_interruption_before_attempt(
         )
     assert first_calls == ["companion-translation-seg-0063"]
     assert list((checkpoint_dir / "translation-drafts").glob("*.json"))
-    assert not list((checkpoint_dir / "translation-token-attempts").glob("*.json"))
+    assert not list((checkpoint_dir / "translation-token-offset-attempts").glob("*.json"))
 
     monkeypatch.setattr(pipeline_module, "write_json", original_write_json)
     resume_calls: list[str] = []
 
     def repair_llm(prompt: str, **kwargs):
         resume_calls.append(str(kwargs["call_label"]))
-        slot_ids = pipeline_module._translation_repair_slot_ids(block)
         return {"repairs": [{"block_id": "body", "slots": [
-            {"slot_id": slot_ids[0], "text": "缺少令牌"},
-            {"slot_id": slot_ids[1], "text": "。"},
+            *_offset_slots(block, "缺少令牌。", [4]),
         ]}]}
 
     result = _generate_translations(
         [segment], options=options, bundle=bundle, glossary={"entries": []},
         protected_names=[], checkpoint_dir=checkpoint_dir, llm=repair_llm,
     )
-    assert resume_calls == ["companion-translation-seg-0063-retry-1"]
+    assert resume_calls == ["companion-translation-seg-0063-retry-offset-1"]
     assert pipeline_module._OPAQUE_INLINE_PATTERN.findall(
         result["seg-0063"]["blocks"][0]["text"]
     ) == pipeline_module._opaque_inline_tokens(block)
@@ -2366,8 +2488,10 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
         label = str(kwargs["call_label"])
         with calls_lock:
             calls[label] = calls.get(label, 0) + 1
-        is_retry = label.endswith("-retry-1")
-        segment_id = label.removeprefix("companion-translation-").removesuffix("-retry-1")
+        is_retry = label.endswith("-retry-offset-1")
+        segment_id = label.removeprefix("companion-translation-").removesuffix(
+            "-retry-offset-1"
+        )
         block_id_value = f"b{int(segment_id[-4:])}"
         if is_retry:
             assert pipeline_module._translation_token_attempt_path(
@@ -2375,22 +2499,21 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
             ).is_file()
             assert "VALIDATION ERROR" in prompt
             assert "opaque_inline_token_mismatch" in prompt
-            assert required_tokens[segment_id] not in prompt
+            assert required_tokens[segment_id] in prompt
             assert pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION in prompt
-            assert Path(kwargs["artifact_dir"]).name == "retry-1"
+            assert Path(kwargs["artifact_dir"]).name == "retry-offset-1"
             assert kwargs["env"]["ARC_CODEX_ENABLE_MCP"] == "false"
             assert kwargs["env"]["ARC_CLAUDE_ALLOW_MCP"] == "false"
             assert kwargs["env"]["ARC_CODEX_ALLOW_INTERNET"] == "false"
             assert kwargs["env"]["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
             assert kwargs["model_tier"] == pipeline_module.TRANSLATION_RETRY_TIER == "medium"
-            slots = [
-                {"slot_id": repair_slot_ids[segment_id][0], "text": "缺少控制器令牌"},
-                {"slot_id": repair_slot_ids[segment_id][1], "text": "。"},
-            ]
+            slots = _offset_slots(
+                blocks[int(segment_id[-4:]) - 1], "缺少控制器令牌。", [7],
+            )
             if segment_id == "seg-0003":
                 slots = slots[:-1]
             elif segment_id == "seg-0004":
-                slots[0]["text"] = required_tokens[segment_id]
+                slots[0]["start_offset"] = 1
             return {"repairs": [{"block_id": block_id_value, "slots": slots}]}
         else:
             assert kwargs["model_tier"] == pipeline_module.TRANSLATION_TIER == "low"
@@ -2425,11 +2548,11 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
     assert calls == {
         "companion-translation-seg-0001": 1,
         "companion-translation-seg-0002": 1,
-        "companion-translation-seg-0002-retry-1": 1,
+        "companion-translation-seg-0002-retry-offset-1": 1,
         "companion-translation-seg-0003": 1,
-        "companion-translation-seg-0003-retry-1": 1,
+        "companion-translation-seg-0003-retry-offset-1": 1,
         "companion-translation-seg-0004": 1,
-        "companion-translation-seg-0004-retry-1": 1,
+        "companion-translation-seg-0004-retry-offset-1": 1,
     }
     saved_ids = {
         json.loads(path.read_text(encoding="utf-8"))["segment_id"]
@@ -2439,13 +2562,13 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
 
     attempt_ids = {
         json.loads(path.read_text(encoding="utf-8"))["segment_id"]
-        for path in (checkpoint_dir / "translation-token-attempts").glob("*.json")
+        for path in (checkpoint_dir / "translation-token-offset-attempts").glob("*.json")
     }
     assert attempt_ids == {"seg-0002", "seg-0003", "seg-0004"}
     assert all(
         json.loads(path.read_text(encoding="utf-8"))["response_schema_version"]
         == pipeline_module.TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION
-        for path in (checkpoint_dir / "translation-token-attempts").glob("*.json")
+        for path in (checkpoint_dir / "translation-token-offset-attempts").glob("*.json")
     )
 
     def forbidden_recovery_llm(prompt: str, **kwargs):
