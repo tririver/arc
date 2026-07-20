@@ -9,7 +9,6 @@ from collections.abc import Callable, Mapping, Sequence
 from .base import LLMWorkerCancelled, LLMWorkerError, LLMWorkerTimeout
 
 
-DEFAULT_WORKER_CALL_TIMEOUT_SECONDS = 1800.0
 _PROVIDER_TIMEOUT_KEYS = {
     "codex-cli": "ARC_CODEX_TIMEOUT_SECONDS",
     "claude-cli": "ARC_CLAUDE_TIMEOUT_SECONDS",
@@ -19,7 +18,7 @@ _PROVIDER_TIMEOUT_KEYS = {
 
 def resolve_worker_call_timeout_seconds(
     explicit: float | int | None, *, env: Mapping[str, str] | None, provider: str | None = None
-) -> float:
+) -> float | None:
     if explicit is not None:
         return _positive_timeout(explicit, "worker_call_timeout_seconds")
     material = os.environ if env is None else env
@@ -28,22 +27,22 @@ def resolve_worker_call_timeout_seconds(
         return _positive_timeout(material[provider_key], provider_key)
     if material.get("ARC_LLM_TIMEOUT_SECONDS") not in {None, ""}:
         return _positive_timeout(material["ARC_LLM_TIMEOUT_SECONDS"], "ARC_LLM_TIMEOUT_SECONDS")
-    return DEFAULT_WORKER_CALL_TIMEOUT_SECONDS
+    return None
 
 
-def remaining_seconds(deadline: float) -> float:
-    return max(0.0, deadline - time.monotonic())
+def remaining_seconds(deadline: float | None) -> float:
+    return float("inf") if deadline is None else max(0.0, deadline - time.monotonic())
 
 
-def check_lifecycle(deadline: float, cancel_check: Callable[[], bool] | None) -> None:
+def check_lifecycle(deadline: float | None, cancel_check: Callable[[], bool] | None) -> None:
     if cancel_check is not None and cancel_check():
         raise LLMWorkerCancelled("LLM worker call was cancelled")
-    if remaining_seconds(deadline) <= 0:
+    if deadline is not None and remaining_seconds(deadline) <= 0:
         raise LLMWorkerTimeout("LLM worker call timed out")
 
 
 def run_process_group(
-    command: Sequence[str], *, input_text: str, env: Mapping[str, str], deadline: float,
+    command: Sequence[str], *, input_text: str, env: Mapping[str, str], deadline: float | None,
     cancel_check: Callable[[], bool] | None = None, poll_interval_seconds: float = 0.1,
     terminate_grace_seconds: float = 0.5,
 ) -> subprocess.CompletedProcess[str]:

@@ -331,7 +331,7 @@ def _run_with_retries(
     return_outcome: bool = False,
     timeout_seconds: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    call: Callable[[Any, LLMConfig, float], Any],
+    call: Callable[[Any, LLMConfig, float | None], Any],
 ) -> Any:
     failures: list[LLMAttemptFailure] = []
     attempt_records: list[dict[str, Any]] = []
@@ -340,7 +340,7 @@ def _run_with_retries(
         env=env,
         provider=configs[0].provider if configs else None,
     )
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
     for fallback_index, config in enumerate(configs):
         provider_env = _env_with_tier_reasoning_default(env, config.provider, model_tier_requested)
         selected = select_provider(config.provider, env=provider_env, process_chain=process_chain)
@@ -445,7 +445,7 @@ def _generate_json(
     artifact_dir: Path | None,
     call_label: str | None,
     static_prefix: str | None,
-    deadline: float,
+    deadline: float | None,
     cancel_check: Callable[[], bool] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
@@ -603,7 +603,7 @@ def _generate_text(
     artifact_dir: Path | None,
     call_label: str | None,
     static_prefix: str | None,
-    deadline: float,
+    deadline: float | None,
     cancel_check: Callable[[], bool] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(

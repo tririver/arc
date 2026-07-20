@@ -134,10 +134,13 @@ class KimiCodeCliProvider:
         resume_id = session.native_session_id if stateful else None
         work_dir = _work_dir(self.env)
         timeout = resolve_worker_call_timeout_seconds(timeout_seconds, env=self.env, provider=self.name)
+        effective_deadline = deadline if deadline is not None else (
+            time.monotonic() + timeout if timeout is not None else None
+        )
         client = _AcpProcess(
             self.env,
             artifact_dir=artifact_dir,
-            deadline=deadline if deadline is not None else time.monotonic() + timeout,
+            deadline=effective_deadline,
             cancel_check=cancel_check,
         )
         native_session_id: str | None = None
@@ -201,7 +204,7 @@ class KimiCodeCliProvider:
             client.cancel_and_stop(native_session_id)
             if isinstance(exc, LLMWorkerCancelled):
                 raise
-            raise LLMWorkerTimeout(f"kimi acp timed out after {timeout:g} seconds") from exc
+            raise LLMWorkerTimeout("kimi acp timed out") from exc
         finally:
             client.close()
 
@@ -230,7 +233,10 @@ class _AcpProcess:
         self.current_session_id: str | None = None
         self._next_id = 1
         self._write_lock = threading.Lock()
-        self._deadline = deadline if deadline is not None else time.monotonic() + _timeout_seconds(env)
+        fallback_timeout = _timeout_seconds(env)
+        self._deadline = deadline if deadline is not None else (
+            time.monotonic() + fallback_timeout if fallback_timeout is not None else None
+        )
         self._cancel_check = cancel_check
         self._threads: list[threading.Thread] = []
         self._stopped = False
@@ -295,12 +301,18 @@ class _AcpProcess:
         while True:
             if self._cancel_check is not None and self._cancel_check():
                 raise LLMWorkerCancelled("Kimi ACP call was cancelled")
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = None if self._deadline is None else self._deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 raise _AcpTimeout()
             try:
                 line = self.stdout_queue.get(
-                    timeout=min(remaining, 0.1 if self._cancel_check is not None else remaining)
+                    timeout=(
+                        0.1
+                        if remaining is None and self._cancel_check is not None
+                        else None
+                        if remaining is None
+                        else min(remaining, 0.1 if self._cancel_check is not None else remaining)
+                    )
                 )
             except queue.Empty as exc:
                 if self._cancel_check is not None:
@@ -511,18 +523,8 @@ def _worker_error(message: str, *, retryable: bool) -> LLMWorkerError:
         return error
 
 
-def _timeout_seconds(env: Mapping[str, str]) -> float:
-    key = "ARC_KIMI_TIMEOUT_SECONDS" if env.get("ARC_KIMI_TIMEOUT_SECONDS") not in {None, ""} else "ARC_LLM_TIMEOUT_SECONDS"
-    raw = env.get(key)
-    if raw is None or not raw.strip():
-        return 1800.0
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise _worker_error(f"{key} must be a positive number", retryable=False) from exc
-    if value <= 0:
-        raise _worker_error(f"{key} must be a positive number", retryable=False)
-    return value
+def _timeout_seconds(env: Mapping[str, str]) -> float | None:
+    return resolve_worker_call_timeout_seconds(None, env=env, provider="kimi-code-cli")
 
 
 def _work_dir(env: Mapping[str, str]) -> Path:

@@ -55,6 +55,30 @@ def test_schema_formatter_preserves_explicit_numbers() -> None:
     assert calls
 
 
+def test_schema_formatter_forwards_finite_timeout_and_cancellation() -> None:
+    captured = {}
+
+    def fake_runner(prompt: str, *, timeout_seconds=None, cancel_check=None, **_kwargs):
+        captured["timeout_seconds"] = timeout_seconds
+        captured["cancel_check"] = cancel_check
+        return {
+            "schema_version": "arc.llm.review_envelope.v1",
+            "review_payload": {"marks": {"total_score": 92, "novelty": 13}},
+        }
+
+    cancel_check = lambda: False
+    result = format_to_schema(
+        raw_text="Final review. Total 92/100. Novelty 13/15.",
+        schema=_review_schema(),
+        json_runner=fake_runner,
+        timeout_seconds=7.5,
+        cancel_check=cancel_check,
+    )
+
+    assert result.value["review_payload"]["marks"]["total_score"] == 92
+    assert captured == {"timeout_seconds": 7.5, "cancel_check": cancel_check}
+
+
 def test_schema_formatter_rejects_numbers_not_present_in_source() -> None:
     def fake_runner(prompt: str, **kwargs):
         return {

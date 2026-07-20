@@ -365,6 +365,7 @@ Exact-model options:
 Runtime capability options:
 
 ```text
+--timeout-seconds <positive-seconds>
 --allow-internet
 --allow-mcp
 --mcp-mode arc-only
@@ -376,12 +377,30 @@ Runtime capability options:
 --claude-effort low
 ```
 
+`--timeout-seconds` is one monotonic deadline for the complete worker call,
+including retries, resume attempts, and schema formatting. When the option and
+all applicable timeout environment variables are unset, ARC does not impose a
+worker-call deadline. Cancellation and process cleanup remain active while a
+call is otherwise unlimited.
+
+Provider timeout environment variables:
+
+```text
+ARC_CODEX_TIMEOUT_SECONDS            Codex call deadline
+ARC_CLAUDE_TIMEOUT_SECONDS           Claude call deadline
+ARC_KIMI_TIMEOUT_SECONDS             Kimi call deadline
+ARC_LLM_TIMEOUT_SECONDS              General fallback for every provider
+```
+
+An explicit CLI or worker timeout takes precedence, followed by the
+provider-specific variable and then `ARC_LLM_TIMEOUT_SECONDS`.
+
 Kimi runtime environment variables:
 
 ```text
 ARC_KIMI_BIN                         Kimi executable; default: kimi
 ARC_KIMI_WORK_DIR                    Working directory for new sessions; default: current directory
-ARC_KIMI_TIMEOUT_SECONDS             Call timeout; falls back to ARC_LLM_TIMEOUT_SECONDS
+ARC_KIMI_TIMEOUT_SECONDS             Call deadline; falls back to ARC_LLM_TIMEOUT_SECONDS
 ARC_LLM_KIMI_LOW_MODEL               Low-tier model alias
 ARC_LLM_KIMI_MEDIUM_MODEL            Medium-tier model alias
 ARC_LLM_KIMI_HIGH_MODEL              High-tier model alias

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from arc_llm import cli
+from arc_llm.providers.base import LLMWorkerCancelled
 
 
 def test_main_returns_nonzero_for_error_envelope(monkeypatch, capsys):
@@ -144,6 +145,16 @@ def test_doctor_json_is_accepted_after_each_doctor_subcommand(monkeypatch, capsy
     parser = cli._build_parser()
     assert parser.parse_args(["doctor", "provider", "--json"]).json is True
     assert parser.parse_args(["doctor", "config", "--json"]).json is True
+
+
+@pytest.mark.parametrize("command", ["run-text", "run-json", "proposers-reviewer-loop"])
+def test_timeout_help_documents_unlimited_default(command, capsys):
+    with pytest.raises(SystemExit) as caught:
+        cli._build_parser().parse_args([command, "--help"])
+
+    assert caught.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "default is unlimited" in help_text
 
 
 def test_runtime_env_merges_cli_llm_options(monkeypatch):
@@ -311,7 +322,19 @@ def test_schema_format_cli_passes_schema_and_model_tier(monkeypatch):
     monkeypatch.setattr(cli, "format_to_schema", fake_format_to_schema)
 
     args = cli._build_parser().parse_args(
-        ["schema-format", "--input", "-", "--schema", "schema.json", "--model-tier", "medium", "--role-hint", "reviewer"]
+        [
+            "schema-format",
+            "--input",
+            "-",
+            "--schema",
+            "schema.json",
+            "--model-tier",
+            "medium",
+            "--role-hint",
+            "reviewer",
+            "--timeout-seconds",
+            "12.5",
+        ]
     )
 
     result = cli._dispatch(args)
@@ -321,6 +344,41 @@ def test_schema_format_cli_passes_schema_and_model_tier(monkeypatch):
     assert captured["schema"] == {"type": "object"}
     assert captured["model_tier"] == "medium"
     assert captured["role_hint"] == "reviewer"
+    assert captured["timeout_seconds"] == 12.5
+    assert captured["cancel_check"] is cli._job_cancel_check
+
+
+def test_schema_format_cli_finite_timeout_and_cancellation_reach_json_runner(monkeypatch):
+    captured = {}
+
+    def fake_run_json(prompt, *, timeout_seconds=None, cancel_check=None, **_kwargs):
+        captured["timeout_seconds"] = timeout_seconds
+        captured["cancel_check"] = cancel_check
+        if cancel_check is not None and cancel_check():
+            raise LLMWorkerCancelled("cancelled by test")
+        raise AssertionError("cancellation check was not forwarded")
+
+    cancel_check = lambda: True
+    monkeypatch.setattr(cli, "_read_prompt", lambda _value: "raw text")
+    monkeypatch.setattr(cli, "_read_schema", lambda _value: {"type": "object"})
+    monkeypatch.setattr(cli, "_job_cancel_check", cancel_check)
+    monkeypatch.setattr(cli, "run_json", fake_run_json)
+    args = cli._build_parser().parse_args(
+        [
+            "schema-format",
+            "--input",
+            "-",
+            "--schema",
+            "schema.json",
+            "--timeout-seconds",
+            "0.25",
+        ]
+    )
+
+    with pytest.raises(LLMWorkerCancelled, match="cancelled by test"):
+        cli._dispatch(args)
+
+    assert captured == {"timeout_seconds": 0.25, "cancel_check": cancel_check}
 
 
 def test_claude_session_persistence_flags_are_consistent():

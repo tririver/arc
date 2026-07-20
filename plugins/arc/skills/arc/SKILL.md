@@ -53,6 +53,12 @@ explicitly asks to review or confirm steps. Example: `use arc to download
 papers that cited 0911.3380 since 2024 and create a full summary of these
 papers` is direct ARC tool orchestration, not a managed workflow mode prompt.
 
+ARC LLM calls wait indefinitely by default. Do not infer a time limit from a
+quiet progress interval. When a bounded call is required, use an explicit
+`--timeout-seconds` option where the owning CLI exposes it, or an applicable
+`ARC_*_TIMEOUT_SECONDS` environment variable. Explicit cancellation remains
+available for foreground and background work.
+
 ## Required References
 
 Read the relevant reference before calling ARC tools. These reads are required,

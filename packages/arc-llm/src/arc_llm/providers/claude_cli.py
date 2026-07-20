@@ -22,10 +22,13 @@ from .lifecycle import resolve_worker_call_timeout_seconds, run_process_group
 
 def _run_claude(cmd, prompt, *, env, timeout_seconds, deadline, cancel_check):
     timeout = resolve_worker_call_timeout_seconds(timeout_seconds, env=env, provider="claude-cli")
-    if deadline is not None or cancel_check is not None or timeout_seconds is not None:
+    effective_deadline = deadline if deadline is not None else (
+        time.monotonic() + timeout if timeout is not None else None
+    )
+    if effective_deadline is not None or cancel_check is not None:
         return run_process_group(
             cmd, input_text=prompt, env=env,
-            deadline=deadline if deadline is not None else time.monotonic() + timeout,
+            deadline=effective_deadline,
             cancel_check=cancel_check,
         )
     try:

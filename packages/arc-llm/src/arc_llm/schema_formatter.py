@@ -62,6 +62,8 @@ def format_to_schema(
     model: str | None = None,
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
+    timeout_seconds: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> SchemaFormatResult:
     source = str(raw_text or "").strip()
     if not source:
@@ -78,6 +80,8 @@ def format_to_schema(
         "validate_schema": True,
         "output_recovery": "warn",
         "role_hint": "schema_formatter",
+        "timeout_seconds": timeout_seconds,
+        "cancel_check": cancel_check,
     }.items():
         if _accepts_keyword(json_runner, key):
             kwargs[key] = value
@@ -114,6 +118,8 @@ def format_to_schema_or_retry(
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: list[str] | None = None,
+    timeout_seconds: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> SchemaFormatDecision:
     source = str(raw_text or "").strip()
     if not source:
@@ -131,6 +137,8 @@ def format_to_schema_or_retry(
         "output_recovery": "strict",
         "role_hint": "schema_formatter",
         "process_chain": process_chain,
+        "timeout_seconds": timeout_seconds,
+        "cancel_check": cancel_check,
     }.items():
         if _accepts_keyword(json_runner, key):
             kwargs[key] = value

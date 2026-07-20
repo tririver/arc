@@ -61,6 +61,12 @@ python3 <skill-dir>/workflows/scripts/ideas_runner.py \
   --json
 ```
 
+LLM calls wait indefinitely by default. If this run needs a finite bound, set
+an explicit timeout through the owning batch configuration, a CLI's
+`--timeout-seconds` option where exposed, or an applicable
+`ARC_*_TIMEOUT_SECONDS` environment variable. `SIGINT`, `SIGTERM`, and
+background job cancellation remain available without a default deadline.
+
 Step 2: Print any returned `WARNING:` messages. For loop concurrency, see
 `manuals/arc-llm.md`.
 

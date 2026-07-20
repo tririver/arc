@@ -58,6 +58,12 @@ returned `next.cli_command`. Watch all launched jobs to a terminal result. If
 the host cannot run jobs concurrently, fall back to sequential
 watching/running without changing the artifact contract.
 
+Domain LLM calls wait indefinitely by default. A quiet job is not timed out;
+continue watching unless it reaches a terminal state or receives an explicit
+timeout or cancellation. Optional bounds may be supplied through an owning
+CLI's `--timeout-seconds` option where available or an applicable
+`ARC_*_TIMEOUT_SECONDS` environment variable.
+
 Step 4: Inspect each returned JSON body. Do not treat command exit code alone
 as success. Continue only when every domain job result is successful. If any
 job failed, was cancelled, or returned `needs_llm`, print `WARNING:` with the

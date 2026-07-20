@@ -731,9 +731,12 @@ Useful environment variables:
 
 ```text
 ARC_AGENT_HOST                    Force host detection, for example codex, claude-code, or kimi-code.
+ARC_LLM_TIMEOUT_SECONDS           Optional general LLM call deadline; unset means no ARC-imposed deadline.
+ARC_CODEX_TIMEOUT_SECONDS         Optional Codex call deadline; overrides the general deadline.
+ARC_CLAUDE_TIMEOUT_SECONDS        Optional Claude call deadline; overrides the general deadline.
 ARC_KIMI_BIN                      Kimi Code CLI executable (default kimi).
 ARC_KIMI_WORK_DIR                 Working directory for new Kimi ACP sessions (default current directory).
-ARC_KIMI_TIMEOUT_SECONDS          Kimi call timeout; falls back to ARC_LLM_TIMEOUT_SECONDS.
+ARC_KIMI_TIMEOUT_SECONDS          Optional Kimi call deadline; overrides the general deadline.
 ARC_LLM_KIMI_LOW_MODEL            Kimi model alias for the low tier.
 ARC_LLM_KIMI_MEDIUM_MODEL         Kimi model alias for the medium tier.
 ARC_LLM_KIMI_HIGH_MODEL           Kimi model alias for the high tier.

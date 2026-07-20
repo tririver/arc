@@ -45,11 +45,11 @@ configuration.
 
 Status includes the latest phase, round, worker counts, and validated progress
 events when the child CLI supplies them. `watch --progress-jsonl` streams those
-events without changing the run. Proposer/reviewer calls have one monotonic
-30-minute (1800-second) budget covering retries and structured-output
-formatting. Set
-`worker_call_timeout_seconds` in a batch config, or `--timeout-seconds` on the
-owning `arc-llm` CLI, for an explicit override.
+events without changing the run. Calls have no wall-clock timeout when unspecified.
+Set `worker_call_timeout_seconds` in a batch config,
+`--timeout-seconds` on the owning `arc-llm` CLI, or a documented provider timeout
+environment variable to establish an explicit monotonic budget covering
+retries and structured-output formatting.
 
 `SIGINT`, `SIGTERM`, and `arc-jobs cancel` request cancellation and terminate
 the full provider process group before the job reaches terminal `cancelled`.

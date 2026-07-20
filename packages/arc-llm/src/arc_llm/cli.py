@@ -132,7 +132,12 @@ def _build_parser() -> argparse.ArgumentParser:
     loop_parser.add_argument("--history-mode", choices=["auto", "delta", "full"], default=None)
     loop_parser.add_argument("--session-scope-id", default=None)
     loop_parser.add_argument("--max-concurrent-same-prefix", type=int, default=None)
-    loop_parser.add_argument("--timeout-seconds", type=float, default=None)
+    loop_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=None,
+        help="Positive total deadline per worker call; default is unlimited unless an ARC timeout environment variable is set.",
+    )
 
     bench_parser = sub.add_parser("proposers-reviewer-bench")
     bench_parser.add_argument("--config", required=True)
@@ -215,6 +220,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             model=args.model,
             model_tier=args.model_tier,
             env=_runtime_env(args),
+            timeout_seconds=args.timeout_seconds,
+            cancel_check=_job_cancel_check,
         ).value
     if args.command == "proposers-reviewer-loop":
         config = _read_json_file(args.config)
@@ -357,7 +364,12 @@ def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--timeout-seconds", type=float, default=None)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=None,
+        help="Positive monotonic total call deadline; default is unlimited unless an ARC timeout environment variable is set.",
+    )
     parser.add_argument("--codex-sandbox", default=None)
     parser.add_argument("--codex-profile", default=None)
     parser.add_argument("--codex-profile-v2", default=None)

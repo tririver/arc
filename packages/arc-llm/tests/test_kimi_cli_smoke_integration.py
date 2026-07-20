@@ -165,7 +165,7 @@ def _smoke_env(work_dir: Path) -> dict[str, str]:
 
 def _run_cli(args: list[str], *, env: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
-        [sys.executable, "-m", "arc_llm.cli", *args],
+        [sys.executable, "-m", "arc_llm.cli", *args, "--timeout-seconds", "300"],
         cwd=cwd,
         env=env,
         text=True,

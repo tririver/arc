@@ -12,12 +12,8 @@ from arc_llm import runner as core_runner
 from arc_llm.evidence import EVIDENCE_REQUESTS_FIELD, allow_evidence_requests, evidence_requests_schema
 from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, validate_codex_strict_schema
 from arc_llm.proposers_reviewer.runner import _batch_status, run_proposers_reviewer_batch
-from arc_llm.providers.lifecycle import (
-    DEFAULT_WORKER_CALL_TIMEOUT_SECONDS,
-    resolve_worker_call_timeout_seconds,
-    run_process_group,
-)
-from arc_llm.providers.base import LLMSchemaError, LLMWorkerError, LLMWorkerTimeout
+from arc_llm.providers.lifecycle import resolve_worker_call_timeout_seconds, run_process_group
+from arc_llm.providers.base import LLMSchemaError, LLMWorkerCancelled, LLMWorkerError, LLMWorkerTimeout
 
 from .test_proposers_reviewer_runner import FakeJsonRunner, _context_from_prompt, base_config
 
@@ -53,8 +49,8 @@ def test_recursive_codex_validator_rejects_optional_nested_property() -> None:
         validate_codex_strict_schema(schema)
 
 
-def test_worker_timeout_precedence_and_default() -> None:
-    assert resolve_worker_call_timeout_seconds(None, env={}, provider="codex-cli") == DEFAULT_WORKER_CALL_TIMEOUT_SECONDS
+def test_worker_timeout_precedence_and_unlimited_default() -> None:
+    assert resolve_worker_call_timeout_seconds(None, env={}, provider="codex-cli") is None
     assert resolve_worker_call_timeout_seconds(None, env={"ARC_LLM_TIMEOUT_SECONDS": "22"}, provider="codex-cli") == 22
     assert resolve_worker_call_timeout_seconds(
         None,
@@ -80,6 +76,56 @@ def test_process_group_deadline_covers_blocked_stdin_delivery() -> None:
             terminate_grace_seconds=0.2,
         )
     assert time.monotonic() - started < 2
+
+
+def test_process_group_allows_no_deadline() -> None:
+    result = run_process_group(
+        [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+        input_text="unlimited",
+        env=os.environ,
+        deadline=None,
+        poll_interval_seconds=0.02,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "unlimited"
+
+
+def test_process_group_cancellation_remains_active_without_deadline() -> None:
+    cancelled = threading.Event()
+    timer = threading.Timer(0.1, cancelled.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(LLMWorkerCancelled, match="cancelled"):
+            run_process_group(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                input_text="",
+                env=os.environ,
+                deadline=None,
+                cancel_check=cancelled.is_set,
+                poll_interval_seconds=0.02,
+                terminate_grace_seconds=0.2,
+            )
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started < 2
+
+
+def test_runner_passes_no_deadline_when_timeout_is_unset(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Provider:
+        def generate_text_result(self, prompt, *, deadline=None, cancel_check=None, **_kwargs):
+            captured["deadline"] = deadline
+            captured["cancel_check"] = cancel_check
+            return core_runner.LLMProviderResponse(value="ok")
+
+    monkeypatch.setattr(core_runner, "select_provider", lambda *_args, **_kwargs: Provider())
+
+    assert core_runner.run_text("prompt", provider="codex-cli", env={}, process_chain=[]) == "ok"
+    assert captured == {"deadline": None, "cancel_check": None}
 
 
 def test_retry_loop_uses_one_total_monotonic_deadline(monkeypatch) -> None:

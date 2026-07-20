@@ -25,6 +25,10 @@ def reset_experimental_warning(monkeypatch):
     monkeypatch.setattr(kimi_module, "_WARNING_EMITTED", False)
 
 
+def test_kimi_timeout_is_unlimited_when_timeout_environment_is_unset():
+    assert kimi_module._timeout_seconds({}) is None
+
+
 def fake_env(tmp_path: Path, *, scenario: str = "happy", output: str = "hello") -> dict[str, str]:
     env = dict(os.environ)
     env.update(
