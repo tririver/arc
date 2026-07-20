@@ -1364,6 +1364,13 @@ def _render_html_fragment(
     return re.sub(r"[ \t]+\n", "\n", rendered).strip() + ("\n\n" if not contents_only else "")
 
 
+def _trim_outer_html_line_breaks(value: str) -> str:
+    """Drop HTML ``br`` nodes that cannot carry layout at a block edge."""
+    value = re.sub(r"^(?:\\\\[ \t]*(?:\n|$))+", "", value)
+    value = re.sub(r"(?:\n?[ \t]*\\\\[ \t]*)+$", "", value)
+    return value.strip()
+
+
 def _render_html_node(
     node: Any,
     *,
@@ -1471,7 +1478,7 @@ def _render_html_node(
         item = "\\item[]" if markerless_list_item else "\\item"
         return anchor + f"{item} {children}\n"
     if name == "p":
-        return anchor + children.strip() + "\n\n"
+        return anchor + _trim_outer_html_line_breaks(children) + "\n\n"
     if name in {"img", "source", "object"}:
         return anchor
     return anchor + children

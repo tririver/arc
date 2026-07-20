@@ -242,6 +242,23 @@ def test_markdown_escaped_detail_markup_is_cleaned_in_rich_html_renderer() -> No
     assert "natural" not in rendered
 
 
+def test_cleaned_html_wrappers_do_not_leave_bare_line_break_commands() -> None:
+    empty_wrapper = _render_html_fragment(
+        '<p id="wrapper">&lt;details&gt;<br/>'
+        '&lt;summary&gt;natural_image&lt;/summary&gt;</p>',
+        rendered_links=[],
+    )
+    described_image = _render_html_fragment(
+        "<p>Meaningful image description.<br/>&lt;/details&gt;</p>",
+        rendered_links=[],
+    )
+
+    assert empty_wrapper.strip() == r"\phantomsection\label{wrapper}"
+    assert described_image.strip() == "Meaningful image description."
+    assert r"\\" not in empty_wrapper
+    assert r"\\" not in described_image
+
+
 def test_reader_cleanup_replaces_bare_unwrapped_and_soft_wrapped_registered_ids() -> None:
     annotation = {
         "explanation": "Bare context-abc. 证据：prior-001。软换行【context-\nabc】。",
