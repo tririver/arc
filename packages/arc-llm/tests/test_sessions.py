@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import signal
 import threading
+import time
 
 import pytest
 
@@ -65,6 +69,17 @@ def _attempt_lock_for_process(root_text, key, timeout, queue):
             queue.put("acquired")
     except TimeoutError as exc:
         queue.put(f"timeout:{exc}")
+
+
+def _hold_lock_for_process(root_text, key, queue):
+    from pathlib import Path
+
+    from arc_llm.sessions import LLMSessionManager
+
+    manager = LLMSessionManager(Path(root_text))
+    with manager.lock(key):
+        queue.put(os.getpid())
+        time.sleep(60)
 
 
 def test_session_manager_persists_native_id_and_turns(tmp_path):
@@ -231,6 +246,92 @@ def test_session_lock_times_out_on_unrecoverable_foreign_lock(tmp_path):
 
     assert process.exitcode == 0
     assert str(queue.get()).startswith("timeout:")
+
+
+def test_session_lock_owner_metadata_includes_process_start_identity(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    lock_path = manager.root / "locks" / f"{sessions_module._safe_lock_name('owned')}.lock"
+
+    with manager.lock("owned"):
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+
+    assert payload["pid"] == os.getpid()
+    process_start_id = sessions_module._process_start_identity(os.getpid())  # noqa: SLF001
+    if process_start_id is not None:
+        assert payload["process_start_id"] == process_start_id
+
+
+def test_session_lock_does_not_recover_live_owner(tmp_path):
+    lock_path = tmp_path / "live.lock"
+    lock_path.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "thread_id": 1,
+            "host": sessions_module._hostname(),  # noqa: SLF001
+            "process_start_id": sessions_module._process_start_identity(os.getpid()),  # noqa: SLF001
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    assert sessions_module._recover_dead_process_lock(lock_path) is False  # noqa: SLF001
+    assert lock_path.exists()
+
+
+def test_session_lock_recovers_reused_pid_identity(tmp_path):
+    lock_path = tmp_path / "reused.lock"
+    lock_path.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "thread_id": 1,
+            "host": sessions_module._hostname(),  # noqa: SLF001
+            "process_start_id": "procfs:different-boot:1",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    if sessions_module._process_start_identity(os.getpid()) is None:  # noqa: SLF001
+        pytest.skip("host does not expose process-start identity")
+    assert sessions_module._recover_dead_process_lock(lock_path) is True  # noqa: SLF001
+    assert not lock_path.exists()
+
+
+@pytest.mark.parametrize("content", ["", "{}\n", "[]\n", "not-json\n"])
+def test_session_lock_keeps_ownerless_legacy_lock_fail_closed(tmp_path, content):
+    lock_path = tmp_path / "legacy.lock"
+    lock_path.write_text(content, encoding="utf-8")
+
+    assert sessions_module._recover_dead_process_lock(lock_path) is False  # noqa: SLF001
+    assert lock_path.exists()
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").is_file(), reason="requires procfs zombie state")
+def test_sigterm_zombie_owner_does_not_leave_permanent_session_lock(tmp_path):
+    from multiprocessing import get_context
+
+    root = tmp_path / "sessions"
+    key = "interrupted"
+    ctx = get_context("fork")
+    queue = ctx.Queue()
+    process = ctx.Process(target=_hold_lock_for_process, args=(str(root), key, queue))
+    process.start()
+    pid = queue.get(timeout=2)
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 2
+    state = None
+    while time.monotonic() < deadline:
+        _identity, state = sessions_module._process_identity(pid)  # noqa: SLF001
+        if state == "Z":
+            break
+        time.sleep(0.01)
+    try:
+        assert state == "Z"
+        with LLMSessionManager(root).lock(key):
+            pass
+    finally:
+        process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join()
 
 
 def test_locked_turn_serializes_turn_count_across_manager_instances(tmp_path):

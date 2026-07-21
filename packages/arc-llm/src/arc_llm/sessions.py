@@ -645,6 +645,8 @@ def _file_lock(lock_path: Path) -> Iterator[None]:
         "host": _hostname(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if process_start_id := _process_start_identity(os.getpid()):
+        payload["process_start_id"] = process_start_id
     timeout = _lock_timeout_seconds()
     started = time.monotonic()
     while True:
@@ -688,25 +690,117 @@ def _file_lock(lock_path: Path) -> Iterator[None]:
 
 def _recover_dead_process_lock(lock_path: Path) -> bool:
     try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if payload.get("host") != _hostname():
-        return False
-    pid = payload.get("pid")
-    if not isinstance(pid, int) or pid <= 0:
+        handle = lock_path.open("r+b")
+    except OSError:
         return False
     try:
-        os.kill(pid, 0)
-        return False
-    except ProcessLookupError:
+        if not _try_lock_recovery_handle(handle):
+            return False
         try:
+            owner_stat = os.fstat(handle.fileno())
+            handle.seek(0)
+            payload = json.loads(handle.read().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("host") != _hostname():
+            return False
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        stale = False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            stale = True
+        except PermissionError:
+            return False
+        if not stale:
+            current_start_id, process_state = _process_identity(pid)
+            recorded_start_id = payload.get("process_start_id")
+            if (
+                isinstance(recorded_start_id, str)
+                and recorded_start_id
+                and current_start_id is not None
+                and recorded_start_id != current_start_id
+            ):
+                stale = True
+            elif process_state in {"Z", "X", "x"}:
+                # A zombie has exited and cannot still own application state,
+                # even though kill(pid, 0) reports that its PID exists.
+                stale = True
+        if not stale:
+            return False
+        try:
+            path_stat = lock_path.stat()
+            if (path_stat.st_dev, path_stat.st_ino) != (owner_stat.st_dev, owner_stat.st_ino):
+                return False
             lock_path.unlink()
             return True
         except OSError:
             return False
-    except PermissionError:
+    finally:
+        _unlock_recovery_handle(handle)
+        handle.close()
+
+
+def _process_start_identity(pid: int) -> str | None:
+    identity, _state = _process_identity(pid)
+    return identity
+
+
+def _process_identity(pid: int) -> tuple[str | None, str | None]:
+    """Return a process-start identity and state when the host exposes them."""
+
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return None, None
+    close = stat_text.rfind(")")
+    if close < 0:
+        return None, None
+    fields = stat_text[close + 1 :].split()
+    if len(fields) <= 19 or not boot_id:
+        return None, fields[0] if fields else None
+    return f"procfs:{boot_id}:{fields[19]}", fields[0]
+
+
+def _try_lock_recovery_handle(handle: Any) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            if not handle.read(1):
+                return False
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
         return False
+
+
+def _unlock_recovery_handle(handle: Any) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 def _lock_timeout_seconds() -> float | None:
@@ -728,7 +822,7 @@ def _lock_timeout_message(lock_path: Path, timeout: float) -> str:
     except (OSError, json.JSONDecodeError):
         owner = {}
     owner_bits = []
-    for key in ("host", "pid", "thread_id", "created_at"):
+    for key in ("host", "pid", "process_start_id", "thread_id", "created_at"):
         if owner.get(key) is not None:
             owner_bits.append(f"{key}={owner[key]}")
     owner_text = ", ".join(owner_bits) if owner_bits else "owner=unknown"
