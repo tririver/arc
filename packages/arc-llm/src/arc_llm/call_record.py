@@ -5,7 +5,7 @@ from typing import Any
 
 
 ARC_LLM_CALL_RECORD_FIELD = "arc_llm_call_record"
-ARC_LLM_CALL_RECORD_SCHEMA_VERSION = "arc.llm.call_record.v3"
+ARC_LLM_CALL_RECORD_SCHEMA_VERSION = "arc.llm.call_record.v4"
 
 ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -23,6 +23,10 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
         "signals",
         "attempts",
         "session_policy",
+        "idempotency_key",
+        "generation",
+        "prompt_bytes",
+        "logical_receipt",
         "usage",
         "warnings",
         "call_status",
@@ -71,6 +75,10 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
         "static_prefix_sha256": {"type": ["string", "null"]},
         "schema_sha256": {"type": ["string", "null"]},
         "runtime_fingerprint": {"type": ["string", "null"]},
+        "idempotency_key": {"type": ["string", "null"]},
+        "generation": {"type": ["integer", "null"], "minimum": 1},
+        "prompt_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "logical_receipt": {"type": ["object", "null"]},
         "usage": {"type": "object"},
         "warnings": {"type": "array", "items": {"type": "string"}},
         "call_status": {"enum": ["valid", "recovered", "provider_error", "schema_error", "timeout", "cancelled"]},

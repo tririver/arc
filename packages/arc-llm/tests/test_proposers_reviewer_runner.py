@@ -1566,9 +1566,10 @@ def test_custom_json_runner_that_calls_run_json_does_not_double_record_turns(tmp
             session_manager=session_manager,
             session_key=session_key,
             call_label=call_label,
-            artifact_dir=artifact_dir,
-            static_prefix=static_prefix,
-        )
+                artifact_dir=artifact_dir,
+                static_prefix=static_prefix,
+                idempotency_key=call_label,
+            )
 
     monkeypatch.setattr(core_runner, "select_provider", lambda provider, **kwargs: Provider())
 

@@ -602,6 +602,31 @@ def test_worker_preserves_needs_llm_terminal_status(tmp_path, monkeypatch):
     assert manager.result(job_id)["result"]["output"]["status"] == "needs_llm"
 
 
+@pytest.mark.parametrize(
+    ("reported", "ok_value", "exit_status"),
+    [("first_chapter_ready", True, 0), ("needs_supervision", False, 1)],
+)
+def test_worker_preserves_companion_controlled_terminal_status(
+    tmp_path, monkeypatch, reported, ok_value, exit_status
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(
+        tmp_path,
+        monkeypatch,
+        body=(
+            f"printf '%s' '{{\"ok\":{str(ok_value).lower()},"
+            f"\"status\":\"{reported}\"}}'; exit {exit_status}"
+        ),
+    )
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+
+    assert worker.run_job(job_id) == 0
+    assert manager.status(job_id)["status"] == reported
+    assert manager.result(job_id)["result"]["output"]["status"] == reported
+
+
 def test_cancel_terminal_job_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path))
     manager = JobManager(worker_mode="thread")
@@ -935,6 +960,36 @@ def test_worker_forwards_progress_sidechannel(tmp_path, monkeypatch):
     assert status["last_substantive_excerpt"] == "checked the first derivation"
     assert status["last_activity_at"] == status["last_substantive_at"]
     assert any(event["event"] == "provider_progress" for event in status["events"])
+
+
+def test_worker_accepts_companion_progress_schema(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(
+        tmp_path,
+        monkeypatch,
+        body=(
+            "printf '%s\\n' '{\"schema_version\":\"arc.companion.progress.v1\","
+            "\"event\":\"block_accepted\",\"current\":2,\"chapter_id\":\"ch-0001\","
+            "\"segment_id\":\"ch-0001.seg-0002\",\"lane\":\"companion\","
+            "\"generation\":3,\"block_status\":\"accepted\",\"substantive\":true,"
+            "\"summary\":\"accepted chapter block\"}' > \"$ARC_JOB_PROGRESS_FILE\"; "
+            "printf '%s' '{\"ok\":true,\"status\":\"first_chapter_ready\"}'"
+        ),
+    )
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+
+    assert worker.run_job(job_id) == 0
+    status = manager.status(job_id)
+    assert status["status"] == "first_chapter_ready"
+    assert status["current"] == 2
+    assert status["chapter_id"] == "ch-0001"
+    assert status["segment_id"] == "ch-0001.seg-0002"
+    assert status["lane"] == "companion"
+    assert status["generation"] == 3
+    assert status["block_status"] == "accepted"
+    assert any(event["event"] == "block_accepted" for event in status["events"])
 
 
 def test_non_substantive_progress_does_not_replace_last_excerpt(tmp_path, monkeypatch):

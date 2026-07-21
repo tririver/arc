@@ -21,6 +21,24 @@ from arc_paper.parse.source import parse_source_input
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def _current_parsed(source_id: str, *, document: dict | None = None, kind: str = "auto") -> dict:
+    return {
+        "paper_id": source_id,
+        "source_hash": "a" * 64,
+        "structure": {
+            "schema_version": "arc.paper.structure.v1",
+            "requested_document_kind": kind,
+            "resolved_document_kind": "article",
+            "chapters": [],
+        },
+        "index_entries": {"schema_version": "arc.paper.index_entries.v1", "entries": []},
+        "document": document or {
+            "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
+            "integrity": {"status": "complete"},
+        },
+    }
+
+
 def test_markdown_rich_block_escaped_details_are_reader_clean(tmp_path: Path) -> None:
     markdown_path = tmp_path / "book.md"
     markdown_path.write_text(
@@ -51,10 +69,7 @@ def test_source_adapter_requests_complete_ar5iv_document() -> None:
 
     def parse(**kwargs):
         calls.update(kwargs)
-        return {"ok": True, "data": {"paper_id": "arXiv:1", "document": {
-            "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
-            "integrity": {"status": "complete"},
-        }}}
+        return {"ok": True, "data": _current_parsed("arXiv:1")}
 
     bundle = load_source_bundle(
         "arXiv:1",
@@ -66,40 +81,53 @@ def test_source_adapter_requests_complete_ar5iv_document() -> None:
         citers_getter=lambda *args, **kwargs: {"ok": True, "data": []},
     )
     assert bundle.paper_id == "arXiv:1"
-    assert calls == {"source": "ar5iv", "paper_id": "arXiv:1", "include_document": True, "refresh": False, "recache": True}
+    assert calls == {
+        "source": "ar5iv",
+        "paper_id": "arXiv:1",
+        "include_document": True,
+        "refresh": False,
+        "recache": True,
+        "document_kind": "auto",
+    }
 
 
-@pytest.mark.parametrize("source_id", ["local:david-tong-qft-notes", "isbn:9780521850827"])
-def test_source_adapter_reads_non_arxiv_sources_only_from_local_cache(source_id: str) -> None:
+@pytest.mark.parametrize("source_id", ["local:test-book", "isbn:9780521850827"])
+def test_source_adapter_reparses_local_provenance_through_arc_paper(
+    source_id: str, tmp_path: Path,
+) -> None:
     calls: list[tuple[str, dict]] = []
-
-    def forbidden(name):
-        def fail(*args, **kwargs):
-            calls.append((name, kwargs))
-            raise AssertionError(f"{name} must not be called for a cached local source")
-
-        return fail
+    markdown = tmp_path / "book.md"
+    markdown.write_text("# Chapter\n\nBody\n", encoding="utf-8")
+    document = {
+        "source": {"format": "markdown", "path": str(markdown)},
+        "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
+        "integrity": {"status": "complete"},
+    }
 
     def get_cached(requested_id, **kwargs):
         calls.append(("cached", {"source_id": requested_id, **kwargs}))
-        return {"ok": True, "data": {
-            "paper_id": source_id,
-            "document": {
-                "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
-                "integrity": {"status": "complete"},
-            },
-        }}
+        return {"ok": True, "data": _current_parsed(source_id, document=document)}
+
+    def parse(**kwargs):
+        calls.append(("parse", kwargs))
+        return {"ok": True, "data": _current_parsed(source_id, document=document)}
 
     bundle = load_source_bundle(
         source_id,
         parsed_getter=get_cached,
-        parse=forbidden("parse"),
-        metadata_getter=forbidden("metadata"),
-        references_getter=forbidden("references"),
-        citers_getter=forbidden("citers"),
+        parse=parse,
+        metadata_getter=lambda *args, **kwargs: pytest.fail("metadata must remain local"),
+        references_getter=lambda *args, **kwargs: pytest.fail("references must remain local"),
+        citers_getter=lambda *args, **kwargs: pytest.fail("citers must remain local"),
     )
 
-    assert calls == [("cached", {"source_id": source_id, "include_document": True})]
+    assert calls[0] == ("cached", {"source_id": source_id, "include_document": True})
+    assert calls[1][0] == "parse"
+    assert calls[1][1] == {
+        "source": "markdown", "source_id": source_id, "markdown_path": str(markdown),
+        "include_document": True, "refresh": False, "recache": False,
+        "document_kind": "auto",
+    }
     assert bundle.paper_id == source_id
     assert bundle.metadata == {"_arc_companion_metadata_source": "unavailable"}
     assert bundle.references == []
@@ -113,10 +141,7 @@ def test_resolvable_colon_ids_are_not_mistaken_for_local_only_sources(source_id:
 
     def parse(**kwargs):
         parse_calls.append(kwargs)
-        return {"ok": True, "data": {"paper_id": source_id, "document": {
-            "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
-            "integrity": {"status": "complete"},
-        }}}
+        return {"ok": True, "data": _current_parsed(source_id)}
 
     bundle = load_source_bundle(
         source_id,
@@ -131,21 +156,25 @@ def test_resolvable_colon_ids_are_not_mistaken_for_local_only_sources(source_id:
     assert parse_calls[0]["paper_id"] == source_id
 
 
-def test_any_identifier_uses_an_existing_rich_cache_entry_and_audits_metadata_fallback() -> None:
+def test_any_identifier_revalidates_an_existing_rich_cache_entry() -> None:
     def cached(*args, **kwargs):
-        return {"ok": True, "data": {
-            "paper_id": "doi:10.1000/cached",
-            "document": {
+        return {"ok": True, "data": _current_parsed(
+            "doi:10.1000/cached", document={
                 "metadata": {"authors": ["A. Author"], "year": 2024},
                 "toc": [{"title": "Cached document title"}],
                 "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
                 "integrity": {"status": "complete"},
             },
-        }}
+        )}
+
+    parse_calls = []
+    def parse(**kwargs):
+        parse_calls.append(kwargs)
+        return cached()
 
     bundle = load_source_bundle(
         "doi:10.1000/cached", parsed_getter=cached,
-        parse=lambda **kwargs: pytest.fail("rich cache must avoid parsing"),
+        parse=parse,
         metadata_getter=lambda *args, **kwargs: pytest.fail("rich cache must avoid metadata fetch"),
         references_getter=lambda *args, **kwargs: pytest.fail("rich cache must avoid reference fetch"),
         citers_getter=lambda *args, **kwargs: pytest.fail("rich cache must avoid citer fetch"),
@@ -158,6 +187,7 @@ def test_any_identifier_uses_an_existing_rich_cache_entry_and_audits_metadata_fa
         "year": "document.metadata",
         "title": "document.toc",
     }
+    assert parse_calls[0]["document_kind"] == "auto"
 
 
 @pytest.mark.parametrize(
@@ -171,10 +201,7 @@ def test_source_adapter_surfaces_required_seed_evidence_failures(
     failed_getter: str, message: str
 ) -> None:
     def parse(**kwargs):
-        return {"ok": True, "data": {"paper_id": "arXiv:1", "document": {
-            "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
-            "integrity": {"status": "complete"},
-        }}}
+        return {"ok": True, "data": _current_parsed("arXiv:1")}
 
     metadata = {"ok": True, "data": {"title": "T"}}
     references = {"ok": True, "data": []}
@@ -195,10 +222,7 @@ def test_source_adapter_surfaces_required_seed_evidence_failures(
 
 def test_source_adapter_records_optional_citer_failure_as_warning() -> None:
     def parse(**kwargs):
-        return {"ok": True, "data": {"paper_id": "arXiv:1", "document": {
-            "blocks": [{"block_id": "b1", "type": "text", "text": "x"}],
-            "integrity": {"status": "complete"},
-        }}}
+        return {"ok": True, "data": _current_parsed("arXiv:1")}
 
     bundle = load_source_bundle(
         "arXiv:1",
@@ -226,14 +250,13 @@ def test_source_adapter_keeps_related_metadata_without_parsing_related_full_text
     def parse(**kwargs):
         paper_id = kwargs["paper_id"]
         calls.append(dict(kwargs))
-        data = {"paper_id": paper_id, "source_hash": "d" * 64, "sections": [{
+        data = {**_current_parsed(paper_id), "source_hash": "d" * 64, "sections": [{
             "section_id": f"{paper_id}-s1", "title": "Result", "text": "field theory"
         }]}
-        if kwargs.get("include_document"):
-            data["document"] = {
+        data["document"] = {
             "blocks": [{"block_id": f"{paper_id}-b1", "type": "text", "text": "field theory"}],
             "integrity": {"status": "complete"},
-            }
+        }
         return {"ok": True, "data": data}
 
     references = [
@@ -279,6 +302,55 @@ def test_source_adapter_keeps_related_metadata_without_parsing_related_full_text
 def test_incomplete_documents_are_rejected(integrity) -> None:
     with pytest.raises(SourceError):
         validate_complete_document({"blocks": [{"block_id": "b"}], "integrity": integrity})
+
+
+def test_source_adapter_rejects_response_without_current_structure_contract() -> None:
+    with pytest.raises(SourceError, match="current structure contract"):
+        load_source_bundle(
+            "arXiv:1",
+            parsed_getter=lambda *args, **kwargs: {"ok": False, "error": {"message": "miss"}},
+            parse=lambda **kwargs: {"ok": True, "data": {
+                "paper_id": "arXiv:1", "document": {
+                    "blocks": [{"block_id": "b1", "text": "x"}],
+                    "integrity": {"status": "complete"},
+                },
+            }},
+            metadata_getter=lambda *args, **kwargs: pytest.fail("must validate before metadata"),
+            references_getter=lambda *args, **kwargs: pytest.fail("must validate before references"),
+            citers_getter=lambda *args, **kwargs: pytest.fail("must validate before citers"),
+        )
+
+
+def test_source_adapter_rejects_changed_paired_pdf_hash(tmp_path: Path) -> None:
+    markdown = tmp_path / "book.md"
+    pdf = tmp_path / "book.pdf"
+    markdown.write_text("# One\n", encoding="utf-8")
+    pdf.write_bytes(b"changed pdf")
+    document = {
+        "source": {
+            "format": "markdown", "path": str(markdown), "pdf_path": str(pdf),
+            "pdf_sha256": "0" * 64,
+        },
+        "blocks": [{"block_id": "b1", "text": "x"}],
+        "integrity": {"status": "complete"},
+    }
+    parsed = _current_parsed("local:book", document=document)
+    parsed["structure"]["reconciliation"] = {
+        "schema_version": "arc.paper.reconciliation.v1", "status": "complete",
+        "proof_sha256": "proof", "source_hash": parsed["source_hash"],
+        "pdf_sha256": "0" * 64,
+        "section_coverage": {"status": "complete"},
+        "block_coverage": {"status": "complete"},
+    }
+    with pytest.raises(SourceError, match="PDF hash changed"):
+        load_source_bundle(
+            "local:book",
+            parsed_getter=lambda *args, **kwargs: {"ok": True, "data": parsed},
+            parse=lambda **kwargs: {"ok": True, "data": parsed},
+            metadata_getter=lambda *args, **kwargs: pytest.fail("local only"),
+            references_getter=lambda *args, **kwargs: pytest.fail("local only"),
+            citers_getter=lambda *args, **kwargs: pytest.fail("local only"),
+        )
 
 
 def test_cli_prints_default_language_notice_without_pausing(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -364,8 +436,10 @@ def test_cli_json_wraps_dispatch_exception(monkeypatch, capsys) -> None:
     }
 
 
-def test_cli_passes_stop_after_preview(tmp_path: Path, monkeypatch) -> None:
+def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
     captured = {}
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
 
     def fake_build(options):
         captured["options"] = options
@@ -377,9 +451,31 @@ def test_cli_passes_stop_after_preview(tmp_path: Path, monkeypatch) -> None:
         "local:david-tong-qft-notes",
         "--project-dir",
         str(tmp_path),
-        "--stop-after-preview",
+        "--stop-after-first-chapter",
+        "--document-kind",
+        "book",
+        "--idle-timeout-seconds",
+        "90",
+        "--regenerate-commentary",
+        "--legacy-checkpoint",
+        str(legacy),
     ]) == 0
-    assert captured["options"].stop_after_preview is True
+    options = captured["options"]
+    assert options.stop_after_first_chapter is True
+    assert options.document_kind == "book"
+    assert options.idle_timeout_seconds == 90
+    assert options.regenerate_commentary is True
+    assert options.legacy_checkpoint == legacy.resolve()
+
+
+def test_cli_resume_requires_duplicate_charge_confirmation(tmp_path: Path, capsys) -> None:
+    (tmp_path / "state.json").write_text('{"status":"needs_supervision"}', encoding="utf-8")
+    assert cli.main([
+        "resume", "--project-dir", str(tmp_path), "--action", "restart-generation", "--json",
+    ]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "needs_supervision"
+    assert result["error"]["code"] == "duplicate_charge_confirmation_required"
 
 
 def test_cli_prints_structured_evidence_warnings(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -411,30 +507,36 @@ def test_cli_prints_structured_evidence_warnings(tmp_path: Path, monkeypatch, ca
     assert json.loads(streams.out)["meta"]["diagnostics"][0]["code"] == "citer_context_unavailable"
 
 
-def test_companion_docs_describe_bounded_full_text_evidence_and_package_contents() -> None:
+def test_companion_docs_describe_chaptered_stateful_cli_contract() -> None:
     manual = (ROOT / "plugins/arc/skills/arc/manuals/arc-companion.md").read_text(encoding="utf-8")
     workflow = (ROOT / "plugins/arc/skills/arc/workflows/companion.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    manual_text = " ".join(manual.split())
+    workflow_text = " ".join(workflow.split())
+    readme_text = " ".join(readme.split())
 
-    assert "related-paper full texts cached through existing `arc-paper` APIs" in manual
-    assert "at most 24 ARC model calls in flight" in manual
-    assert "first_round_preview.pdf" in manual
-    assert "first `min(workers, unit_count)`" in manual
-    assert "before any remaining unit is submitted" in manual
-    assert "`--stop-after-preview`" in manual
-    assert "materially useful current understanding or development" in manual
-    assert "merely restates the source" in manual
-    assert "historical story or interesting fact" in manual
-    assert "what specifically changed" in manual
-    assert "Table-of-contents blocks, acknowledgment sections, and\nreference-list headings" in manual
-    assert "lanes drain all\n  submitted units before reporting their aggregated failures" in manual
-    assert "targeted reference and citer full text cached through `arc-paper`" in readme
-    assert "default permits at most 24 ARC model calls in flight" in workflow
-    assert "preview before submitting any remaining unit" in workflow
-    assert "`--stop-after-preview`" in workflow
-    assert "registered,\nverifiable evidence supports it" in workflow
-    assert "source-only table-of-contents blocks" in workflow
-    assert "fix the scheduler in `packages/arc-companion`" in workflow
+    assert "paper, lecture note, or book" in manual_text
+    assert "rich source plus its paired PDF" in manual_text
+    assert "PDF is authoritative" in workflow_text
+    assert "CLI-only" in manual_text
+    assert "There is no entry cap" in manual_text
+    assert "chapter-glossary.json" in manual_text
+    assert "`first_chapter_ready`" in manual_text
+    assert "`needs_supervision`" in manual_text
+    assert "`--stop-after-first-chapter`" in manual_text
+    assert "--action resume-native" in manual_text
+    assert "--action restart-generation" in manual_text
+    assert "--confirm-possible-duplicate-charge" in manual_text
+    assert "after every 30 minutes" in manual_text
+    assert "`arc-jobs watch <job-id> --until-review --json`" in readme_text
+    assert "chapter-aware" in readme_text
+    assert "A real Index becomes the complete global glossary" in readme_text
+    assert "stateful guide session" in workflow_text
+    assert "strictly in segment order" in workflow_text
+    assert "`--stop-after-first-chapter`" in workflow_text
+    assert "must stop automatic advancement and write `needs_supervision`" in workflow_text
+    assert "after each 30 minutes" in workflow_text
+    assert "MCP is not part of this workflow" in workflow_text
 
 
 def test_package_includes_only_validated_deliverables(tmp_path: Path) -> None:

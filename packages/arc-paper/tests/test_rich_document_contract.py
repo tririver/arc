@@ -29,6 +29,8 @@ LEGACY_PARSED_SOURCE_KEYS = {
     "toc",
     "sections",
     "equations",
+    "structure",
+    "index_entries",
 }
 
 
@@ -88,9 +90,9 @@ RICH_HTML = """
 def test_rich_html_parse_stores_versioned_document_without_removing_legacy_fields():
     parsed = parse_source_input(html_text=RICH_HTML, source_id="rich-paper")
 
-    assert PARSER_VERSION == 20
+    assert PARSER_VERSION == 21
     assert LEGACY_PARSED_SOURCE_KEYS <= set(parsed)
-    assert parsed["parser_version"] == 20
+    assert parsed["parser_version"] == 21
 
     document = parsed["document"]
     assert document["schema_version"] == "arc.paper.document.v2"
@@ -705,9 +707,9 @@ def test_recache_upgrades_v12_ar5iv_cache_without_refreshing_source(monkeypatch,
 
     assert result["ok"] is True
     assert provider.calls == [False]
-    assert result["data"]["parser_version"] == 20
+    assert result["data"]["parser_version"] == 21
     assert result["data"]["document"]["schema_version"] == DOCUMENT_SCHEMA_VERSION
-    assert read_json(path)["parser_version"] == 20
+    assert read_json(path)["parser_version"] == 21
 
 
 def test_refresh_and_recache_are_mutually_exclusive(monkeypatch, tmp_path):
@@ -736,7 +738,7 @@ def test_equation_annotations_are_bound_to_parser_version_and_equation_fingerpri
     marked = service.mark_parsed_equation("rich-paper", equation_id, reason="Verify the sign.")
 
     assert marked["ok"] is True
-    assert marked["data"]["parser_version"] == 20
+    assert marked["data"]["parser_version"] == 21
     assert marked["data"]["equation_fingerprint"]
     assert service.get_parsed_source_equation("rich-paper", equation_id)["data"]["annotations"] == [marked["data"]]
 

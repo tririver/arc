@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -20,6 +20,27 @@ from bs4 import BeautifulSoup
 from arc_llm.evidence import EvidenceRequest, EvidenceResponse, resolve_evidence_round
 
 from .context_sources import load_context_evidence
+from .chapters import build_chapters
+from .chapter_glossary import generate_index_glossary, project_chapter_glossary
+from .chapter_guide import generate_chapter_guide
+from .chapter_scheduler import run_chapter_pipeline
+from .ledger import (
+    advance_block,
+    clear_needs_supervision,
+    initialize_lane_ledger,
+    invalidate_suffix,
+    mark_needs_supervision,
+)
+from .progress import CompanionProgress
+from .migration import (
+    MIGRATION_VERSION,
+    NEVER_MIGRATED_ARTIFACTS,
+    legacy_translation_candidates,
+    migrate_legacy_cuts,
+    migrate_legacy_glossary,
+    migrate_legacy_translations,
+    read_legacy_checkpoint,
+)
 from .glossary import generate_glossary
 from .domain import load_domain_context
 from .evidence import (
@@ -70,12 +91,26 @@ from .projection import (
 from .reader_text import clean_reader_annotation, clean_reader_translation
 from .results import err, ok
 from .run_lock import BuildInProgressError, ProjectBuildLock
-from .segmentation import SegmentationError, segment_document, validate_exact_coverage
+from .segmentation import (
+    SEGMENT_HARD_MAX_BLOCKS,
+    SEGMENT_HARD_MAX_SOURCE_CHARS,
+    SegmentationError,
+    segment_document,
+    validate_exact_coverage,
+)
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
 from .substantive import non_substantive_block_ids
+from .stateful_pipeline import (
+    ContextRolloverBudget,
+    CorrectionBudget,
+    LLMSubmissionLimiter,
+    StatefulPromptStream,
+    StatefulSessionError,
+    continuity_capsule,
+)
 
 
-WORKFLOW_VERSION = "arc.companion.workflow.v9"
+WORKFLOW_VERSION = "arc.companion.workflow.v10"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -97,8 +132,8 @@ ANNOTATION_PROMPT_MAX_BYTES = 60 * 1024
 ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
 ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
 REVIEW_TIER = "medium"
-REVIEW_VERSION = "arc.companion.review.v3"
-ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v5"
+REVIEW_VERSION = "arc.companion.review.v4"
+ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v6"
 SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
 SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MAX_BYTES = 60 * 1024
@@ -106,10 +141,11 @@ REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
-FINAL_RENDER_VERSION = "arc.companion.final-render.v3"
+FINAL_RENDER_VERSION = "arc.companion.final-render.v4"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
 CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
 CONTEXT_SEGMENT_CHARS_TOTAL = 12_000
+LEGACY_MIGRATION_VALIDATOR_VERSION = "arc.companion.legacy-validator.v1"
 
 _MCP_CONFIG_ENV_KEYS = (
     "ARC_CODEX_PROFILE",
@@ -216,7 +252,12 @@ class BuildOptions:
     domain_manifest: Path | None = None
     allow_internet: bool = True
     context_paper_ids: tuple[str, ...] = ()
-    stop_after_preview: bool = False
+    stop_after_first_chapter: bool = False
+    document_kind: str = "auto"
+    idle_timeout_seconds: float | None = None
+    regenerate_commentary: bool = False
+    supervised_native_resume_keys: tuple[str, ...] = ()
+    legacy_checkpoint: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.paper_id.strip():
@@ -227,6 +268,10 @@ class BuildOptions:
             raise ValueError("refresh and recache are mutually exclusive")
         if self.domain_id and self.domain_manifest is not None:
             raise ValueError("domain_id and domain_manifest are mutually exclusive")
+        if self.document_kind not in {"auto", "article", "book"}:
+            raise ValueError("document_kind must be auto, article, or book")
+        if self.idle_timeout_seconds is not None and self.idle_timeout_seconds <= 0:
+            raise ValueError("idle_timeout_seconds must be positive")
         normalized_context_ids = tuple(
             dict.fromkeys(str(value).strip() for value in self.context_paper_ids if str(value).strip())
         )
@@ -235,6 +280,23 @@ class BuildOptions:
         if self.paper_id.strip() in normalized_context_ids:
             raise ValueError("the source paper cannot also be a context paper")
         object.__setattr__(self, "context_paper_ids", normalized_context_ids)
+        normalized_resume_keys = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in self.supervised_native_resume_keys
+                if str(value).strip()
+            )
+        )
+        if len(normalized_resume_keys) != len(self.supervised_native_resume_keys):
+            raise ValueError("supervised_native_resume_keys must be non-empty and unique")
+        object.__setattr__(self, "supervised_native_resume_keys", normalized_resume_keys)
+        if self.legacy_checkpoint is not None:
+            legacy_checkpoint = self.legacy_checkpoint.expanduser().resolve()
+            if not legacy_checkpoint.exists():
+                raise ValueError(f"legacy_checkpoint does not exist: {legacy_checkpoint}")
+            if not (legacy_checkpoint.is_file() or legacy_checkpoint.is_dir()):
+                raise ValueError("legacy_checkpoint must be a file or directory")
+            object.__setattr__(self, "legacy_checkpoint", legacy_checkpoint)
 
 
 def build_companion(
@@ -245,6 +307,7 @@ def build_companion(
     compiler: Callable[[Path, Path], None] = compile_latex,
     pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf,
     evidence_controller: EvidenceRequestController | None = None,
+    result_llm: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Build or resume one companion under an exclusive project lock."""
     project_dir = options.project_dir.resolve()
@@ -266,6 +329,7 @@ def build_companion(
             compiler=compiler,
             pdf_validator=pdf_validator,
             evidence_controller=evidence_controller,
+            result_llm=result_llm,
         )
     finally:
         lock.release()
@@ -279,12 +343,16 @@ def _build_companion_unlocked(
     compiler: Callable[[Path, Path], None] = compile_latex,
     pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf,
     evidence_controller: EvidenceRequestController | None = None,
+    result_llm: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Build or resume one companion while keeping source and annotations separate."""
+    chapter_result_llm = result_llm
     if llm is None:
         from arc_llm import run_json
+        from arc_llm import run_json_result
 
         llm = run_json
+        chapter_result_llm = chapter_result_llm or run_json_result
     llm = _limit_llm_concurrency(llm, options.workers)
     project_dir = options.project_dir.resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -303,7 +371,12 @@ def _build_companion_unlocked(
     )
 
     try:
-        bundle = source_loader(options.paper_id, refresh=options.refresh, recache=options.recache)
+        bundle = source_loader(
+            options.paper_id,
+            refresh=options.refresh,
+            recache=options.recache,
+            document_kind=options.document_kind,
+        )
         generation_document = _generation_document(bundle.document)
         diagnostics = bundle.diagnostics
         context_evidence = (
@@ -330,7 +403,10 @@ def _build_companion_unlocked(
             and previous_state.get("status") == "complete"
             and previous_state.get("fingerprint") == fingerprint
             and _completion_outputs_match(previous_state)
-            and _first_wave_preview_outputs_match(previous_state)
+            and (
+                isinstance(bundle.parsed.get("structure"), dict)
+                or _first_wave_preview_outputs_match(previous_state)
+            )
         ):
             resumed_state = {**previous_state, "diagnostics": list(diagnostics)}
             _state(state_path, **resumed_state)
@@ -345,6 +421,17 @@ def _build_companion_unlocked(
         write_json(checkpoint_dir / "evidence.json", evidence)
         if domain_context is not None:
             write_json(checkpoint_dir / "domain-context.json", domain_context)
+        if isinstance(bundle.parsed.get("structure"), dict):
+            return _build_chaptered_companion(
+                options=options, bundle=bundle, evidence=evidence,
+                domain_context=domain_context, checkpoint_dir=checkpoint_dir,
+                fingerprint=fingerprint, notice=notice, diagnostics=diagnostics,
+                llm=llm, compiler=compiler, pdf_validator=pdf_validator,
+                result_llm=chapter_result_llm,
+                require_first_chapter_freeze=(
+                    previous_state.get("status") == "first_chapter_ready"
+                ),
+            )
         _state(
             state_path,
             status="segmenting",
@@ -462,7 +549,7 @@ def _build_companion_unlocked(
             preview_validation_path=preview["validation_path"],
             preview_validation_sha256=preview["validation_sha256"],
         )
-        if options.stop_after_preview:
+        if options.stop_after_first_chapter:
             return ok(
                 preview_state,
                 resumed=False,
@@ -507,9 +594,14 @@ def _build_companion_unlocked(
 
         _state(state_path, status="reviewing", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
                segment_count=len(expanded))
-        reviewed_path = checkpoint_dir / "annotations.reviewed.v3.json"
-        review_path = checkpoint_dir / "review.v3.json"
-        if reviewed_path.is_file() and review_path.is_file() and not options.force:
+        reviewed_path = checkpoint_dir / "annotations.reviewed.v4.json"
+        review_path = checkpoint_dir / "review.v4.json"
+        if (
+            reviewed_path.is_file()
+            and review_path.is_file()
+            and not options.force
+            and not options.regenerate_commentary
+        ):
             cached_reviewed = read_json(reviewed_path)
             review = read_json(review_path)
             if (
@@ -659,6 +751,742 @@ def _build_companion_unlocked(
         )
 
 
+def _build_chaptered_companion(
+    *, options: BuildOptions, bundle: SourceBundle, evidence: dict[str, Any],
+    domain_context: dict[str, Any] | None, checkpoint_dir: Path,
+    fingerprint: str, notice: str | None, diagnostics: tuple[dict[str, str], ...],
+    llm: Callable[..., dict[str, Any]], compiler: Callable[[Path, Path], None],
+    pdf_validator: Callable[[Path], dict[str, object]],
+    result_llm: Callable[..., Any] | None = None,
+    require_first_chapter_freeze: bool = False,
+) -> dict[str, Any]:
+    """Execute the chapter contract while retaining legacy runs for old caches."""
+    state_path = options.project_dir.resolve() / "state.json"
+    document = bundle.document
+    structure = bundle.parsed.get("structure") or {}
+    index_pack = bundle.parsed.get("index_entries") or {}
+    index_entries = (
+        list(index_pack.get("entries") or []) if isinstance(index_pack, dict)
+        else list(index_pack)
+    )
+    chapters_pack = build_chapters(document, structure=structure)
+    write_json(checkpoint_dir / "chapters.json", chapters_pack)
+    migration_lock = threading.RLock()
+    legacy = (
+        read_legacy_checkpoint(options.legacy_checkpoint)
+        if options.legacy_checkpoint is not None else None
+    )
+    migration_source_hash = _legacy_migration_source_hash(bundle)
+    migration_prompt_hash = sha256_json({
+        "prompt_version": PROMPT_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "workflow_version": WORKFLOW_VERSION,
+    })
+    migration_validator_hash = sha256_json({
+        "validator_version": LEGACY_MIGRATION_VALIDATOR_VERSION,
+        "translation_retry_prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
+        "translation_token_repair_version": TRANSLATION_TOKEN_REPAIR_VERSION,
+    })
+    write_json(checkpoint_dir / "migration-metadata.json", {
+        "schema_version": "arc.companion.migration-metadata.v1",
+        "source_hash": migration_source_hash,
+        "language": options.annotation_language,
+        "prompt_hash": migration_prompt_hash,
+        "validator_hash": migration_validator_hash,
+    })
+    cut_migration = {"reused": {}, "receipts": []}
+    glossary_migration = {
+        "accepted": False, "reason": "legacy_checkpoint_not_requested", "value": None,
+    }
+    migration_report: dict[str, Any] | None = None
+    if legacy is not None:
+        cut_migration = migrate_legacy_cuts(
+            legacy.get("cuts") or (legacy.get("segmentation") or {}).get("cuts") or [],
+            blocks=[dict(item) for item in document.get("blocks") or []],
+            chapters=chapters_pack["chapters"],
+            max_segment_blocks=SEGMENT_HARD_MAX_BLOCKS,
+            max_segment_source_chars=SEGMENT_HARD_MAX_SOURCE_CHARS,
+        )
+        glossary_migration = migrate_legacy_glossary(
+            legacy.get("glossary"), metadata=_legacy_metadata_view(legacy),
+            source_hash=migration_source_hash, language=options.annotation_language,
+            prompt_hash=migration_prompt_hash, validator_hash=migration_validator_hash,
+            index_entries=index_pack,
+        )
+        migration_report = {
+            "schema_version": MIGRATION_VERSION,
+            "source_checkpoint_sha256": sha256_json(legacy),
+            "read_only_source": True,
+            "cuts": cut_migration,
+            "glossary": glossary_migration,
+            "translations": {"ledgers": {}, "receipts": []},
+            "never_migrated": list(NEVER_MIGRATED_ARTIFACTS),
+        }
+        write_json(checkpoint_dir / "legacy-migration.json", migration_report)
+    progress = CompanionProgress()
+    supervision_event = threading.Event()
+    session_manager = None
+    submission_limiter = LLMSubmissionLimiter(options.workers)
+    if result_llm is not None:
+        from arc_llm.sessions import LLMSessionManager
+        session_manager = LLMSessionManager(checkpoint_dir / "sessions")
+    initial_names = _protected_names(bundle)
+
+    def model(prompt, schema, artifact_dir, call_label, tier):
+        with submission_limiter.permit():
+            return _llm_call(llm, prompt, schema, options=options,
+                             artifact_dir=artifact_dir, call_label=call_label,
+                             model_tier=tier)
+
+    if glossary_migration.get("accepted"):
+        glossary = dict(glossary_migration["value"])
+    elif index_entries:
+        glossary = generate_index_glossary(
+            index_entries, language=options.annotation_language,
+            checkpoint_dir=checkpoint_dir, force=options.force,
+            call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
+        )
+    else:
+        glossary = generate_glossary(
+            _generation_document(document), language=options.annotation_language,
+            protected_names=initial_names, checkpoint_dir=checkpoint_dir,
+            workers=options.workers, force=options.force, page_count=_page_count(bundle),
+            call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
+        )
+    protected_names = _protected_names(bundle, glossary=glossary)
+    blocks_by_id = {block_id(item): item for item in document.get("blocks") or []}
+    chapter_glossaries: dict[str, dict[str, Any]] = {}
+
+    def chapter_glossary_for(chapter: dict[str, Any]) -> dict[str, Any]:
+        chapter_id = str(chapter["chapter_id"])
+        with migration_lock:
+            current = chapter_glossaries.get(chapter_id)
+            if current is None:
+                current = project_chapter_glossary(
+                    chapter, document, glossary, index_entries=index_entries,
+                )
+                chapter_glossaries[chapter_id] = current
+                write_json(
+                    checkpoint_dir / "chapters" / chapter_id / "chapter-glossary.json",
+                    current,
+                )
+            return current
+
+    def prepare_segments(chapter):
+        chapter_id = str(chapter["chapter_id"])
+        current_chapter_glossary = chapter_glossary_for(chapter)
+        chapter_document = {**_generation_document(document), "blocks": [
+            blocks_by_id[value] for value in chapter["block_ids"] if value in blocks_by_id
+        ]}
+        raw = segment_document(
+            chapter_document, checkpoint_dir=checkpoint_dir / "chapters" / chapter_id,
+            workers=options.workers, force=options.force,
+            call_model=lambda p, s, a, l: model(p, s, a, l, SEGMENTATION_TIER),
+            seed_cuts=(
+                list(cut_migration.get("reused", {}).get(chapter_id) or [])
+                if chapter_id in cut_migration.get("reused", {}) else None
+            ),
+        )
+        segments = [{**item, "chapter_id": chapter_id,
+                     "segment_id": f"{chapter_id}.seg-{index:04d}"}
+                    for index, item in enumerate(raw, 1)]
+        if legacy is not None:
+            translation_migration = migrate_legacy_translations(
+                legacy_translation_candidates(legacy),
+                metadata=_legacy_metadata_view(legacy),
+                blocks=[dict(item) for item in document.get("blocks") or []],
+                chapters=[chapter], segments=segments,
+                source_hash=migration_source_hash, language=options.annotation_language,
+                glossary=current_chapter_glossary, protected_names=protected_names,
+                segment_input_hash=lambda item: _segment_input_hash(
+                    dict(item), blocks_by_id, glossary=current_chapter_glossary,
+                ),
+            )
+            migrated_ledger = translation_migration["ledgers"].get(chapter_id)
+            ledger_path = (
+                checkpoint_dir / "chapters" / chapter_id / "translation-ledger.json"
+            )
+            with migration_lock:
+                if migrated_ledger is not None and not ledger_path.exists():
+                    write_json(ledger_path, migrated_ledger)
+                assert migration_report is not None
+                migration_report["translations"]["ledgers"][chapter_id] = (
+                    migrated_ledger or {}
+                )
+                migration_report["translations"]["receipts"].extend(
+                    translation_migration.get("receipts") or []
+                )
+                write_json(checkpoint_dir / "legacy-migration.json", migration_report)
+        return segments
+
+    def prepare_guide(chapter):
+        chapter_id = str(chapter["chapter_id"])
+        chapter_glossary_for(chapter)
+        guide_segment_id = f"{chapter_id}:guide"
+        guide_ledger_path = checkpoint_dir / "chapters" / chapter_id / "guide-ledger.json"
+        guide_ledger = None
+        if result_llm is not None:
+            guide_ledger = initialize_lane_ledger(
+                guide_ledger_path, chapter_id=chapter_id, lane="guide",
+                segment_ids=[guide_segment_id],
+            )
+            if guide_ledger["blocks"][0]["state"] == "pending":
+                guide_ledger = advance_block(
+                    guide_ledger_path, segment_id=guide_segment_id, state="submitted"
+                )
+        guide_receipt: dict[str, Any] = {}
+        last_guide_call: dict[str, str] = {}
+        def guide_model(prompt, schema, artifact_dir, call_label):
+            if result_llm is None or session_manager is None:
+                return model(prompt, schema, artifact_dir, call_label, ANNOTATION_TIER)
+            session_key = f"{chapter_id}:guide"
+            existing_session = session_manager.get_existing(session_key)
+            generation = existing_session.generation if existing_session else 1
+            idempotency_key = f"{chapter_id}:guide:{call_label}:generation-{generation}"
+            last_guide_call.update({
+                "idempotency_key": idempotency_key, "artifact_dir": str(artifact_dir),
+                "generation": str(generation),
+            })
+            try:
+                with submission_limiter.permit():
+                    outcome = result_llm(
+                        prompt, schema=schema, provider=options.provider, model=options.model,
+                        model_tier=None if options.model else ANNOTATION_TIER,
+                        env=_llm_runtime_env(allow_internet=False, force_disable_internet=True),
+                        artifact_dir=artifact_dir, call_label=call_label,
+                        idle_timeout_seconds=options.idle_timeout_seconds,
+                        session_policy="stateful", session_manager=session_manager,
+                        session_key=session_key, idempotency_key=idempotency_key,
+                        progress_contract_scope="session",
+                        supervised_native_resume=(
+                            idempotency_key in options.supervised_native_resume_keys
+                        ),
+                        progress_callback=lambda event: progress.provider_event(event),
+                    )
+            except BaseException as exc:
+                if _chapter_failure_requires_supervision(exc):
+                    from arc_llm import read_recovery_context
+                    recovery = read_recovery_context(
+                        artifact_dir, idempotency_key=idempotency_key,
+                        session_manager=session_manager, session_key=session_key,
+                    )
+                    mark_needs_supervision(
+                        guide_ledger_path, segment_id=guide_segment_id, reason=str(exc),
+                        recovery_context=_recovery_context_json(recovery),
+                    )
+                    supervision_event.set()
+                raise
+            guide_receipt.clear()
+            guide_receipt.update(dict(outcome.logical_receipt or {}))
+            return dict(outcome.value)
+        try:
+            guide = generate_chapter_guide(
+                chapter, [blocks_by_id[value] for value in chapter["block_ids"]],
+                language=options.annotation_language, evidence=evidence,
+                checkpoint_dir=checkpoint_dir / "chapters" / chapter_id,
+                force=options.force, call_model=guide_model,
+                stateful=result_llm is not None,
+            )
+        except StatefulSessionError as exc:
+            mark_needs_supervision(
+                guide_ledger_path, segment_id=guide_segment_id, reason=str(exc),
+                recovery_context={
+                    **last_guide_call, "submission_state": "response_received",
+                    "session_key": f"{chapter_id}:guide", "resumable": True,
+                },
+            )
+            supervision_event.set()
+            raise
+        if result_llm is not None and guide_ledger is not None:
+            current = initialize_lane_ledger(
+                guide_ledger_path, chapter_id=chapter_id, lane="guide",
+                segment_ids=[guide_segment_id],
+            )["blocks"][0]["state"]
+            if current != "accepted":
+                advance_block(guide_ledger_path, segment_id=guide_segment_id, state="schema_valid")
+                advance_block(guide_ledger_path, segment_id=guide_segment_id, state="invariant_valid")
+                advance_block(
+                    guide_ledger_path, segment_id=guide_segment_id, state="accepted",
+                    receipt=guide_receipt, input_sha256=sha256_json(chapter),
+                    output_sha256=sha256_json(guide),
+                    validation_receipt={"local_validation": True},
+                )
+        return guide
+
+    ledger_paths: dict[tuple[str, str], Path] = {}
+    logical_receipts: dict[str, dict[str, Any]] = {}
+    prepared_reported: set[str] = set()
+    prepared_report_lock = threading.Lock()
+    evidence_merge_lock = threading.Lock()
+    stream_lock = threading.Lock()
+    prompt_streams: dict[tuple[str, str, int], StatefulPromptStream] = {}
+    rollover_budgets: dict[tuple[str, str, int], ContextRolloverBudget] = {}
+    correction_budget = CorrectionBudget()
+    setup_schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["setup_received"],
+        "properties": {"setup_received": {"type": "integer", "minimum": 1}},
+    }
+
+    def lane_stream(prepared, lane: str, generation: int) -> StatefulPromptStream:
+        key = (str(prepared.chapter["chapter_id"]), lane, generation)
+        with stream_lock:
+            stream = prompt_streams.get(key)
+            if stream is None:
+                stream = StatefulPromptStream(
+                    chapter_id=key[0], lane=lane, generation=generation,
+                    fixed_rules={
+                        "source_is_immutable": True,
+                        "advance_only_after_local_validation": True,
+                        "preserve_equations_names_and_opaque_tokens": True,
+                        "task_contract": (
+                            "Translate every supplied natural-language block exactly once in source order; "
+                            "use the glossary mapping, preserve protected names and opaque tokens byte-for-byte."
+                            if lane == "translation" else
+                            "Write rigorous optional reader commentary that adds reasoning rather than paraphrase; "
+                            "bind every literature claim to supplied verified evidence and request missing evidence."
+                        ),
+                        "target_language": options.annotation_language,
+                    },
+                    chapter=prepared.chapter, guide=prepared.guide,
+                    compact_glossary=list(
+                        chapter_glossaries[key[0]].get("compact_mapping") or []
+                    ),
+                )
+                prompt_streams[key] = stream
+                rollover_budgets[key] = ContextRolloverBudget()
+            return stream
+
+    def run_lane(prepared, segment, lane):
+        chapter_id, segment_id = prepared.chapter["chapter_id"], segment["segment_id"]
+        with prepared_report_lock:
+            if chapter_id not in prepared_reported:
+                progress.safe_boundary("chapter_prepared", chapter_id=chapter_id,
+                                       segment_count=len(prepared.segments), substantive=True)
+                prepared_reported.add(chapter_id)
+        key = (chapter_id, lane)
+        path = ledger_paths.setdefault(
+            key, checkpoint_dir / "chapters" / chapter_id / f"{lane}-ledger.json")
+        ledger = initialize_lane_ledger(
+            path, chapter_id=chapter_id, lane=lane,
+            segment_ids=[item["segment_id"] for item in prepared.segments])
+        block_state = next(
+            str(item.get("state") or "pending") for item in ledger["blocks"]
+            if item["segment_id"] == segment_id
+        )
+        block_generation = next(
+            int(item.get("generation") or ledger.get("generation") or 1)
+            for item in ledger["blocks"] if item["segment_id"] == segment_id
+        )
+        newly_accepted = block_state != "accepted"
+        migrated_translation = None
+        if lane == "translation" and not newly_accepted:
+            ledger_block = next(
+                item for item in ledger["blocks"] if item["segment_id"] == segment_id
+            )
+            if isinstance(ledger_block.get("translation"), dict):
+                migrated_translation = dict(ledger_block["translation"])
+        segment_glossary = _chapter_segment_glossary(
+            chapter_glossaries[chapter_id], segment, blocks_by_id,
+        )
+        if newly_accepted:
+            advance_block(path, segment_id=segment_id, state="submitted")
+        lane_llm = llm
+        if result_llm is not None and session_manager is not None:
+            stream = lane_stream(prepared, lane, block_generation)
+            setup_turns = stream.setup_turns()
+            for setup_index, setup_prompt in enumerate(setup_turns, 1):
+                setup_label = f"companion-{lane}-{chapter_id}-glossary-setup-{setup_index:04d}"
+                setup_idempotency_key = (
+                    f"{chapter_id}:{lane}:glossary-setup-{setup_index:04d}:"
+                    f"generation-{block_generation}"
+                )
+                setup_artifact_dir = (
+                    checkpoint_dir / "chapters" / chapter_id / "llm" / lane / "glossary-setup"
+                )
+                try:
+                    with submission_limiter.permit():
+                        setup_outcome = result_llm(
+                            setup_prompt, schema=setup_schema, provider=options.provider,
+                            model=options.model,
+                            model_tier=None if options.model else (
+                                TRANSLATION_TIER if lane == "translation" else ANNOTATION_TIER
+                            ),
+                            env=_llm_runtime_env(allow_internet=False, force_disable_internet=True),
+                            artifact_dir=setup_artifact_dir,
+                            call_label=setup_label, idle_timeout_seconds=options.idle_timeout_seconds,
+                            session_policy="stateful", session_manager=session_manager,
+                            session_key=f"{chapter_id}:{lane}",
+                            idempotency_key=setup_idempotency_key,
+                            progress_contract_scope="session", schema_formatter_enabled=False,
+                            supervised_native_resume=(
+                                setup_idempotency_key in options.supervised_native_resume_keys
+                            ),
+                            progress_callback=lambda event: progress.provider_event(event),
+                        )
+                except BaseException as exc:
+                    if _chapter_failure_requires_supervision(exc):
+                        from arc_llm import read_recovery_context
+                        recovery = read_recovery_context(
+                            setup_artifact_dir, idempotency_key=setup_idempotency_key,
+                            session_manager=session_manager, session_key=f"{chapter_id}:{lane}",
+                        )
+                        mark_needs_supervision(
+                            path, segment_id=segment_id, reason=str(exc),
+                            recovery_context=_recovery_context_json(recovery),
+                        )
+                        supervision_event.set()
+                    raise
+                if int(setup_outcome.value.get("setup_received") or 0) != setup_index:
+                    mark_needs_supervision(
+                        path, segment_id=segment_id,
+                        reason="stateful glossary setup acknowledgement changed its ordinal",
+                        recovery_context={
+                            "idempotency_key": setup_idempotency_key,
+                            "submission_state": "response_received",
+                            "session_key": f"{chapter_id}:{lane}",
+                            "generation": block_generation,
+                            "resumable": True,
+                        },
+                    )
+                    supervision_event.set()
+                    raise StatefulSessionError(
+                        "stateful glossary setup acknowledgement changed its ordinal"
+                    )
+                rollover_budgets[(chapter_id, lane, block_generation)].record(
+                    getattr(setup_outcome, "usage", {}),
+                    prompt_bytes=getattr(setup_outcome, "prompt_bytes", None),
+                )
+            def lane_llm(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                call_label = str(kwargs.get("call_label") or segment_id)
+                artifact_dir = Path(kwargs["artifact_dir"])
+                session_key = f"{chapter_id}:{lane}"
+                if "repair" in call_label.casefold() or "correction" in call_label.casefold():
+                    correction_budget.consume(f"{chapter_id}:{lane}:{segment_id}")
+                idempotency_key = (
+                    f"{chapter_id}:{lane}:{call_label}:generation-{block_generation}"
+                )
+                stateful_prompt = stream.request(
+                    prompt, cursor=segment_id,
+                    source_sha256=_segment_input_hash(
+                        segment, blocks_by_id, glossary=chapter_glossaries[chapter_id]
+                    ),
+                    block_glossary=list(
+                        segment_glossary.get("entries") or []
+                    ),
+                    preserve_delta_instructions=(
+                        "repair" in call_label.casefold()
+                        or "correction" in call_label.casefold()
+                    ),
+                )
+                try:
+                    with submission_limiter.permit():
+                        outcome = result_llm(
+                            stateful_prompt, schema=kwargs.get("schema"), provider=kwargs.get("provider", "auto"),
+                            model=kwargs.get("model"), model_tier=kwargs.get("model_tier"),
+                            env=kwargs.get("env"), artifact_dir=artifact_dir, call_label=call_label,
+                            idle_timeout_seconds=kwargs.get("idle_timeout_seconds"),
+                            session_policy="stateful", session_manager=session_manager,
+                            session_key=session_key, idempotency_key=idempotency_key,
+                            progress_contract_scope="session", schema_formatter_enabled=False,
+                            supervised_native_resume=(
+                                idempotency_key in options.supervised_native_resume_keys
+                            ),
+                            progress_callback=lambda event: progress.provider_event(event),
+                        )
+                except BaseException as exc:
+                    if _chapter_failure_requires_supervision(exc):
+                        from arc_llm import read_recovery_context
+                        recovery = read_recovery_context(
+                            artifact_dir, idempotency_key=idempotency_key,
+                            session_manager=session_manager, session_key=session_key,
+                        )
+                        mark_needs_supervision(
+                            path, segment_id=segment_id, reason=str(exc),
+                            recovery_context=_recovery_context_json(recovery),
+                        )
+                        supervision_event.set()
+                    raise
+                logical_receipts[call_label] = dict(outcome.logical_receipt or {})
+                if not logical_receipts[call_label]:
+                    raise RuntimeError(f"stateful call {call_label} returned no logical receipt")
+                rollover_budgets[(chapter_id, lane, block_generation)].record(
+                    getattr(outcome, "usage", {}),
+                    prompt_bytes=getattr(outcome, "prompt_bytes", None),
+                )
+                return dict(outcome.value)
+        if migrated_translation is not None:
+            value = migrated_translation
+        elif lane == "translation":
+            value = _generate_translations(
+                [segment], options=options, bundle=bundle,
+                glossary=segment_glossary, protected_names=protected_names,
+                checkpoint_dir=checkpoint_dir, llm=lane_llm,
+            )[segment_id]
+        else:
+            value = _generate_annotations(
+                [segment], options=options, bundle=bundle, evidence=evidence,
+                domain_context=domain_context, glossary=segment_glossary,
+                # Only current-block explanations are repeated on delta turns; the
+                # complete source-to-target mapping lives in the generation bootstrap.
+                protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=lane_llm,
+            )[segment_id]
+            resolved, _segment_evidence = _resolve_and_rerun_evidence_requests(
+                [segment], {segment_id: value}, options=options, bundle=bundle,
+                evidence=evidence, domain_context=domain_context,
+                glossary=segment_glossary, protected_names=protected_names,
+                checkpoint_dir=checkpoint_dir / "chapters" / chapter_id / "evidence" / segment_id,
+                llm=lane_llm,
+                controller=EvidenceRequestController(
+                    domain_paper_ids=(domain_context or {}).get("paper_ids") or (),
+                    seed_paper_ids=(bundle.paper_id,),
+                ),
+            )
+            value = resolved[segment_id]
+            with evidence_merge_lock:
+                evidence.update(_segment_evidence)
+        input_hash = _segment_input_hash(segment, blocks_by_id,
+                                         glossary=chapter_glossaries[chapter_id])
+        accepted_ledger = None
+        if newly_accepted:
+            advance_block(path, segment_id=segment_id, state="schema_valid")
+            advance_block(path, segment_id=segment_id, state="invariant_valid")
+            accepted_ledger = advance_block(
+                path, segment_id=segment_id, state="accepted",
+                receipt=logical_receipts.get(
+                    f"companion-{'translation' if lane == 'translation' else 'annotation'}-{segment_id}"
+                ), input_sha256=input_hash, output_sha256=sha256_json(value),
+                validation_receipt={"local_validation": True, "correction_turns_max": 1},
+            )
+        if newly_accepted:
+            progress.safe_boundary("block_accepted", chapter_id=chapter_id,
+                                   segment_id=segment_id, lane=lane,
+                                   block_status="accepted", substantive=True)
+            current_index = next(
+                index for index, item in enumerate(prepared.segments)
+                if item["segment_id"] == segment_id
+            )
+            budget = rollover_budgets.get((chapter_id, lane, block_generation))
+            if (
+                result_llm is not None and session_manager is not None
+                and budget is not None and budget.rollover_due()
+                and current_index + 1 < len(prepared.segments)
+            ):
+                next_segment_id = str(prepared.segments[current_index + 1]["segment_id"])
+                rotated = session_manager.rotate(
+                    f"{chapter_id}:{lane}", reason="70-percent-context-boundary",
+                )
+                invalidate_suffix(
+                    path, from_segment_id=next_segment_id, generation=rotated.generation,
+                )
+                accepted_block = next(
+                    item for item in (accepted_ledger or {}).get("blocks") or []
+                    if item.get("segment_id") == segment_id
+                )
+                with stream_lock:
+                    prompt_streams[(chapter_id, lane, rotated.generation)] = StatefulPromptStream(
+                        chapter_id=chapter_id, lane=lane, generation=rotated.generation,
+                        fixed_rules=dict(stream.fixed_rules), chapter=prepared.chapter,
+                        guide=prepared.guide,
+                        compact_glossary=list(stream.compact_glossary),
+                        continuity_capsule=continuity_capsule(
+                            accepted_chain_sha256=str(accepted_block.get("accepted_chain_sha256") or ""),
+                            segment_id=segment_id, input_sha256=input_hash,
+                            output_sha256=sha256_json(value),
+                        ),
+                    )
+                    rollover_budgets[(chapter_id, lane, rotated.generation)] = ContextRolloverBudget()
+        return value
+
+    try:
+        scheduler_kwargs = {
+            "workers": options.workers,
+            "prepare_guide": prepare_guide,
+            "prepare_segments": prepare_segments,
+            "run_translation": lambda prepared, segment: run_lane(prepared, segment, "translation"),
+            "run_companion": lambda prepared, segment: run_lane(prepared, segment, "companion"),
+            "stop_event": supervision_event,
+        }
+        freeze_path = checkpoint_dir / "first-chapter-freeze.json"
+        existing_freeze = _load_first_chapter_freeze(
+            freeze_path, chapters_pack["chapters"], required=require_first_chapter_freeze
+        )
+        if existing_freeze is not None and not options.stop_after_first_chapter:
+            first_results = run_chapter_pipeline(
+                chapters_pack["chapters"][:1], **scheduler_kwargs,
+            )
+            _verify_frozen_first_chapter_pre_review(existing_freeze, first_results)
+            remaining_results = run_chapter_pipeline(
+                chapters_pack["chapters"][1:], **scheduler_kwargs,
+            )
+            chapter_results = {**first_results, **remaining_results}
+        else:
+            chapter_results = run_chapter_pipeline(
+                chapters_pack["chapters"],
+                stop_after_first_chapter=options.stop_after_first_chapter,
+                **scheduler_kwargs,
+            )
+    except Exception as exc:
+        if not _chapter_failure_requires_supervision(exc):
+            raise
+        progress.safe_boundary("needs_supervision", reason=str(exc), substantive=True)
+        supervised = _state(
+            state_path, status="needs_supervision", paper_id=bundle.paper_id,
+            fingerprint=fingerprint, checkpoint_dir=str(checkpoint_dir), error=str(exc),
+            notice=notice, diagnostics=list(diagnostics),
+            recovery_options=_recovery_options(options),
+        )
+        return {"ok": False, "status": "needs_supervision", "data": supervised,
+                "error": {"code": "companion_needs_supervision", "message": str(exc)},
+                "errors": [], "meta": {"diagnostics": list(diagnostics)}}
+    segments = [item for chapter in chapter_results.values() for item in chapter["segments"]]
+    translations = {key: value for chapter in chapter_results.values()
+                    for key, value in chapter["translation"].items()}
+    annotations = {key: value for chapter in chapter_results.values()
+                   for key, value in chapter["companion"].items()}
+    annotations, evidence = _resolve_and_rerun_evidence_requests(
+        segments, annotations, options=options, bundle=bundle, evidence=evidence,
+        domain_context=domain_context, glossary=glossary,
+        protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=llm,
+        controller=EvidenceRequestController(
+            domain_paper_ids=(domain_context or {}).get("paper_ids") or (),
+            seed_paper_ids=(bundle.paper_id,),
+        ),
+    )
+    translations, annotations, chapter_review = _review(
+        segments, translations, annotations, document=document, glossary=glossary,
+        protected_names=protected_names, evidence=evidence, options=options,
+        llm=llm, checkpoint_dir=checkpoint_dir,
+    )
+    write_json(checkpoint_dir / "chapter-review.json", chapter_review)
+    _write_review_overlays(
+        checkpoint_dir, chapter_results, translations=translations, annotations=annotations,
+    )
+    selected_chapters = [item for item in chapters_pack["chapters"]
+                         if item["chapter_id"] in chapter_results]
+    guides = {key: value["guide"] for key, value in chapter_results.items()}
+    index_block_ids = {
+        block_id(item) for item in document.get("blocks") or []
+        if str(item.get("source_role") or item.get("role") or "").casefold() == "index"
+    }
+    index_block_ids.update(str(value) for value in structure.get("index_block_ids") or [])
+    render_document = (
+        {**document, "blocks": [item for item in document.get("blocks") or []
+                                if block_id(item) not in index_block_ids]}
+        if index_entries else document
+    )
+    stem = f"{safe_name(bundle.paper_id)}_companion_{safe_name(options.annotation_language)}"
+    artifact = _publish_pdf_artifact(
+        document=render_document, segments=segments, annotations=annotations,
+        translations=translations, evidence=evidence, glossary=glossary,
+        metadata=bundle.metadata, language=options.annotation_language,
+        output_dir=options.project_dir.resolve(), stem=stem,
+        manifest_name="source-manifest.json", validation_name="validation.json",
+        compiler=compiler, pdf_validator=pdf_validator, augmentation_scope="substantive",
+        chapters=selected_chapters, chapter_guides=guides,
+    )
+    if existing_freeze is not None:
+        _verify_frozen_first_chapter_final(
+            existing_freeze, chapter_results, translations=translations, annotations=annotations,
+        )
+    if options.stop_after_first_chapter:
+        freeze_path = checkpoint_dir / "first-chapter-freeze.json"
+        first_id = selected_chapters[0]["chapter_id"]
+        first_segment_ids = [item["segment_id"] for item in chapter_results[first_id]["segments"]]
+        freeze = {
+            "schema_version": "arc.companion.first-chapter-freeze.v2",
+            "chapter_id": first_id,
+            "chapter_sha256": sha256_json(selected_chapters[0]),
+            "guide_sha256": sha256_json(guides[first_id]),
+            "pre_review_translation_sha256": sha256_json(chapter_results[first_id]["translation"]),
+            "pre_review_annotation_sha256": sha256_json(chapter_results[first_id]["companion"]),
+            "translation_sha256": sha256_json({value: translations[value] for value in first_segment_ids}),
+            "annotation_sha256": sha256_json({value: annotations[value] for value in first_segment_ids}),
+            "tex_sha256": artifact["tex_sha256"], "pdf_sha256": artifact["pdf_sha256"],
+            "manifest_sha256": artifact["manifest_sha256"],
+        }
+        if freeze_path.is_file() and read_json(freeze_path) != freeze:
+            raise RuntimeError("the confirmed first chapter freeze manifest changed")
+        write_json(freeze_path, freeze)
+    for chapter_id in chapter_results:
+        progress.safe_boundary("chapter_complete", chapter_id=chapter_id,
+                               artifact_paths=[artifact["pdf_path"]], substantive=True)
+    status = "first_chapter_ready" if options.stop_after_first_chapter else "complete"
+    final = _state(state_path, status=status, paper_id=bundle.paper_id,
+                   fingerprint=fingerprint, checkpoint_dir=str(checkpoint_dir),
+                   chapter_count=len(selected_chapters), segment_count=len(segments),
+                   output_tex=artifact["tex_path"], output_pdf=artifact["pdf_path"],
+                   output_tex_sha256=artifact["tex_sha256"],
+                   output_pdf_sha256=artifact["pdf_sha256"],
+                   source_manifest_path=artifact["manifest_path"],
+                   source_manifest_sha256=artifact["manifest_sha256"],
+                   validation_path=artifact["validation_path"],
+                   validation_sha256=artifact["validation_sha256"],
+                   final_render_version=FINAL_RENDER_VERSION,
+                   notice=notice, diagnostics=list(diagnostics))
+    progress.safe_boundary(status, artifact_paths=[artifact["pdf_path"]], substantive=True)
+    return {"ok": True, "status": status, "data": final, "errors": [],
+            "meta": {"diagnostics": list(diagnostics), "notice": notice}}
+
+
+def _chapter_segment_glossary(
+    chapter_glossary: dict[str, Any],
+    segment: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Keep the complete compact mapping and only current-block explanations."""
+    source = "\n".join(
+        " ".join(
+            str(blocks_by_id[value].get(key) or "")
+            for key in ("title", "text", "tex", "markdown")
+        )
+        for value in segment.get("block_ids") or []
+        if value in blocks_by_id
+    ).casefold()
+    selected = []
+    for item in chapter_glossary.get("entries") or []:
+        terms = [
+            str(item.get("source") or item.get("term") or item.get("source_term") or ""),
+            *[
+                str(value)
+                for value in (item.get("aliases") or item.get("source_aliases") or [])
+            ],
+        ]
+        if any(term.strip() and term.casefold() in source for term in terms):
+            selected.append(dict(item))
+    return {
+        "schema_version": chapter_glossary.get("schema_version"),
+        "chapter_id": chapter_glossary.get("chapter_id"),
+        "entries": selected,
+        "compact_mapping": list(chapter_glossary.get("compact_mapping") or []),
+    }
+
+
+def _chapter_failure_requires_supervision(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        from arc_llm import LLMWorkerError
+        if isinstance(exc, LLMWorkerError):
+            return True
+    except ImportError:
+        pass
+    name = type(exc).__name__.casefold()
+    if any(token in name for token in ("cancel", "session", "provider")):
+        return True
+    failures = getattr(exc, "failures", None)
+    if isinstance(failures, dict):
+        return any(_chapter_failure_requires_supervision(value) for value in failures.values())
+    if isinstance(failures, list):
+        return any(
+            _chapter_failure_requires_supervision(
+                value[1] if isinstance(value, tuple) and len(value) == 2 else value
+            )
+            for value in failures
+        )
+    return bool(exc.__cause__ and _chapter_failure_requires_supervision(exc.__cause__))
+
+
 def validate_and_expand_segments(
     segments: list[dict[str, Any]], blocks: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -695,6 +1523,256 @@ def read_status(project_dir: Path) -> dict[str, Any]:
     if not path.is_file():
         return err("companion_state_not_found", f"No companion state found in {project_dir}")
     return ok(read_json(path))
+
+
+def resume_companion(
+    project_dir: Path,
+    *,
+    action: str,
+    confirm_possible_duplicate_charge: bool = False,
+) -> dict[str, Any]:
+    """Resolve supervised lane ledgers and continue the saved build."""
+    if action not in {"resume-native", "restart-generation"}:
+        raise ValueError("action must be resume-native or restart-generation")
+    if action == "restart-generation" and not confirm_possible_duplicate_charge:
+        return {
+            "ok": False,
+            "status": "needs_supervision",
+            "data": None,
+            "error": {
+                "code": "duplicate_charge_confirmation_required",
+                "message": (
+                    "restart-generation may repeat a submitted paid call; pass "
+                    "--confirm-possible-duplicate-charge to continue"
+                ),
+            },
+            "errors": [],
+            "meta": {"project_dir": str(project_dir.resolve()), "action": action},
+        }
+    state_path = project_dir.resolve() / "state.json"
+    if not state_path.is_file():
+        return err(
+            "companion_state_not_found",
+            f"No companion state found in {project_dir}",
+            action=action,
+        )
+    state = read_json(state_path)
+    if state.get("status") != "needs_supervision":
+        return err("companion_not_supervised", "The companion build does not need supervision")
+    checkpoint_dir = Path(str(state.get("checkpoint_dir") or ""))
+    if not checkpoint_dir.is_dir():
+        return err("companion_checkpoint_not_found", "The supervised checkpoint directory is missing")
+    ledger_paths = sorted((checkpoint_dir / "chapters").glob("*/**/*-ledger.json"))
+    supervised_ledgers = []
+    for path in ledger_paths:
+        ledger = read_json(path)
+        if ledger.get("needs_supervision"):
+            supervised_ledgers.append((path, ledger))
+    if not supervised_ledgers:
+        return err("companion_supervision_context_missing", "No supervised chapter lane was found")
+
+    saved = state.get("recovery_options")
+    if not isinstance(saved, dict):
+        return err(
+            "companion_recovery_options_missing",
+            "This supervised build predates resumable option checkpoints; rerun build explicitly",
+        )
+
+    from arc_llm.sessions import LLMSessionManager
+    manager = LLMSessionManager(checkpoint_dir / "sessions")
+    if action == "resume-native":
+        native_resume_keys: list[str] = []
+        for _path, ledger in supervised_ledgers:
+            context = dict(ledger["needs_supervision"].get("recovery_context") or {})
+            session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+            if not context.get("resumable") or not (
+                context.get("native_session_id") or manager.has_native_session(session_key)
+            ):
+                return err(
+                    "native_session_not_resumable",
+                    f"The supervised call for {session_key} has no resumable native session",
+                )
+            idempotency_key = str(context.get("idempotency_key") or "")
+            if not idempotency_key:
+                return err(
+                    "native_resume_idempotency_key_missing",
+                    f"The supervised call for {session_key} has no logical call key",
+                )
+            native_resume_keys.append(idempotency_key)
+    resumed: list[dict[str, Any]] = []
+    for path, ledger in supervised_ledgers:
+        supervision = dict(ledger["needs_supervision"])
+        segment_id = str(supervision.get("segment_id") or "")
+        session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+        context = dict(supervision.get("recovery_context") or {})
+        if action == "resume-native":
+            updated = clear_needs_supervision(path)
+        else:
+            try:
+                rotated = manager.rotate(session_key, reason="supervised restart-generation")
+            except KeyError:
+                return err(
+                    "native_session_not_found",
+                    f"No saved logical session exists for {session_key}",
+                )
+            updated = invalidate_suffix(
+                path, from_segment_id=segment_id, generation=rotated.generation,
+            )
+        resumed.append({
+            "ledger_path": str(path), "session_key": session_key,
+            "segment_id": segment_id, "generation": updated["generation"],
+        })
+
+    options = _options_from_recovery(project_dir.resolve(), saved)
+    if action == "resume-native":
+        options = replace(
+            options,
+            supervised_native_resume_keys=tuple(native_resume_keys),
+        )
+    return build_companion(options)
+
+
+def _recovery_context_json(context: Any) -> dict[str, Any]:
+    return {
+        "idempotency_key": context.idempotency_key,
+        "checkpoint_path": str(context.checkpoint_path) if context.checkpoint_path else None,
+        "checkpoint_state": context.checkpoint_state,
+        "submission_state": context.submission_state,
+        "native_session_id": context.native_session_id,
+        "resumable": bool(context.resumable),
+        "progress_journal": str(context.progress_journal) if context.progress_journal else None,
+        "latest_progress": context.latest_progress,
+        "session_key": context.session_key,
+        "generation": context.generation,
+    }
+
+
+def _recovery_options(options: BuildOptions) -> dict[str, Any]:
+    return {
+        "paper_id": options.paper_id,
+        "annotation_language": options.annotation_language,
+        "language_was_defaulted": options.language_was_defaulted,
+        "provider": options.provider,
+        "model": options.model,
+        "workers": options.workers,
+        "review_context_chars": options.review_context_chars,
+        "domain_id": options.domain_id,
+        "domain_manifest": str(options.domain_manifest) if options.domain_manifest else None,
+        "allow_internet": options.allow_internet,
+        "context_paper_ids": list(options.context_paper_ids),
+        "stop_after_first_chapter": options.stop_after_first_chapter,
+        "document_kind": options.document_kind,
+        "idle_timeout_seconds": options.idle_timeout_seconds,
+        "regenerate_commentary": options.regenerate_commentary,
+        "legacy_checkpoint": (
+            str(options.legacy_checkpoint) if options.legacy_checkpoint else None
+        ),
+    }
+
+
+def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOptions:
+    return BuildOptions(
+        paper_id=str(value["paper_id"]), project_dir=project_dir,
+        annotation_language=str(value.get("annotation_language") or DEFAULT_LANGUAGE),
+        language_was_defaulted=bool(value.get("language_was_defaulted")),
+        provider=str(value.get("provider") or "auto"), model=value.get("model"),
+        workers=int(value.get("workers") or DEFAULT_WORKERS),
+        review_context_chars=int(value.get("review_context_chars") or DEFAULT_REVIEW_CONTEXT_CHARS),
+        domain_id=value.get("domain_id"),
+        domain_manifest=Path(value["domain_manifest"]) if value.get("domain_manifest") else None,
+        allow_internet=bool(value.get("allow_internet", True)),
+        context_paper_ids=tuple(value.get("context_paper_ids") or ()),
+        stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
+        document_kind=str(value.get("document_kind") or "auto"),
+        idle_timeout_seconds=value.get("idle_timeout_seconds"),
+        regenerate_commentary=bool(value.get("regenerate_commentary")),
+        legacy_checkpoint=(
+            Path(value["legacy_checkpoint"]) if value.get("legacy_checkpoint") else None
+        ),
+    )
+
+
+def _load_first_chapter_freeze(
+    path: Path, chapters: list[dict[str, Any]], *, required: bool,
+) -> dict[str, Any] | None:
+    if not path.is_file():
+        if required:
+            raise RuntimeError("the confirmed first chapter freeze manifest is missing")
+        return None
+    freeze = read_json(path)
+    if (
+        freeze.get("schema_version") != "arc.companion.first-chapter-freeze.v2"
+        or not chapters or freeze.get("chapter_id") != chapters[0].get("chapter_id")
+        or freeze.get("chapter_sha256") != sha256_json(chapters[0])
+    ):
+        raise RuntimeError("the confirmed first chapter freeze manifest is invalid")
+    return freeze
+
+
+def _verify_frozen_first_chapter_pre_review(
+    freeze: dict[str, Any], results: dict[str, dict[str, Any]],
+) -> None:
+    chapter_id = str(freeze["chapter_id"])
+    result = results.get(chapter_id)
+    if not result or any((
+        sha256_json(result["guide"]) != freeze.get("guide_sha256"),
+        sha256_json(result["translation"]) != freeze.get("pre_review_translation_sha256"),
+        sha256_json(result["companion"]) != freeze.get("pre_review_annotation_sha256"),
+    )):
+        raise RuntimeError("the confirmed first chapter changed before remaining chapters started")
+
+
+def _verify_frozen_first_chapter_final(
+    freeze: dict[str, Any], results: dict[str, dict[str, Any]], *,
+    translations: dict[str, Any], annotations: dict[str, Any],
+) -> None:
+    chapter_id = str(freeze["chapter_id"])
+    segment_ids = [item["segment_id"] for item in results[chapter_id]["segments"]]
+    if (
+        sha256_json({value: translations[value] for value in segment_ids})
+        != freeze.get("translation_sha256")
+        or sha256_json({value: annotations[value] for value in segment_ids})
+        != freeze.get("annotation_sha256")
+    ):
+        raise RuntimeError("final review attempted to rewrite the confirmed first chapter")
+
+
+def _write_review_overlays(
+    checkpoint_dir: Path, chapter_results: dict[str, dict[str, Any]], *,
+    translations: dict[str, Any], annotations: dict[str, Any],
+) -> None:
+    for chapter_id, result in chapter_results.items():
+        segment_ids = [str(item["segment_id"]) for item in result["segments"]]
+        for lane, values in (("translation", translations), ("companion", annotations)):
+            ledger_path = checkpoint_dir / "chapters" / chapter_id / f"{lane}-ledger.json"
+            ledger = read_json(ledger_path)
+            reviewed = {value: values[value] for value in segment_ids}
+            ledger_blocks = {str(item["segment_id"]): item for item in ledger["blocks"]}
+            if any(ledger_blocks[value].get("state") != "accepted" for value in segment_ids):
+                raise RuntimeError(f"review overlay requires an accepted {chapter_id}:{lane} ledger")
+            write_json(
+                checkpoint_dir / "chapters" / chapter_id / f"{lane}-review-overlay.json",
+                {
+                    "schema_version": "arc.companion.chapter-review-overlay.v1",
+                    "chapter_id": chapter_id, "lane": lane,
+                    "base_accepted_chain_sha256": ledger.get("accepted_chain_sha256"),
+                    "reviewed_output_sha256": sha256_json(reviewed),
+                    "blocks": [{
+                        "segment_id": value,
+                        "base_output_sha256": ledger_blocks[value].get("output_sha256"),
+                        "accepted_chain_sha256": ledger_blocks[value].get("accepted_chain_sha256"),
+                        "reviewed_output_sha256": sha256_json(values[value]),
+                        "validation_receipt": {
+                            "review_applied": True,
+                            "reviewed_output_matches_sha256": True,
+                        },
+                    } for value in segment_ids],
+                    "validation_receipt": {
+                        "reviewed_segment_ids": segment_ids,
+                        "review_output_matches_sha256": True,
+                    },
+                },
+            )
 
 
 def _generate_first_round_lanes(
@@ -856,6 +1934,8 @@ def _publish_pdf_artifact(
     pdf_validator: Callable[[Path], dict[str, object]],
     evidence: dict[str, Any] | None = None,
     augmentation_scope: str = "all",
+    chapters: list[dict[str, Any]] | None = None,
+    chapter_guides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Render, validate, and atomically publish one preview or final PDF artifact."""
     evidence_by_segment = _reader_evidence_by_segment(
@@ -875,6 +1955,8 @@ def _publish_pdf_artifact(
         glossary=glossary,
         evidence_by_segment=evidence_by_segment,
         augmentation_scope=augmentation_scope,
+        chapters=chapters,
+        chapter_guides=chapter_guides,
     )
     fidelity_errors = validate_tex_fidelity(tex, document, source_manifest)
     if fidelity_errors:
@@ -1033,7 +2115,7 @@ def _generate_annotations(
                 "evidence": segment_evidence,
             },
         )
-        if path.is_file() and not options.force:
+        if path.is_file() and not options.force and not options.regenerate_commentary:
             checkpoint = read_json(path)
             paper_context = _full_paper_context(
                 bundle.document, segment, blocks_by_id=by_id, options=options
@@ -2955,6 +4037,7 @@ def _llm_call(
         session_policy="stateless",
         artifact_dir=artifact_dir,
         call_label=call_label,
+        idle_timeout_seconds=options.idle_timeout_seconds,
     )
 
 
@@ -3086,6 +4169,28 @@ def _fingerprint(
     )
 
 
+def _legacy_migration_source_hash(bundle: SourceBundle) -> str:
+    """Return the strongest stable rich-source identity available to migration."""
+    integrity = bundle.document.get("integrity") or {}
+    return str(
+        bundle.parsed.get("source_hash")
+        or bundle.document.get("source_hash")
+        or integrity.get("document_hash")
+        or sha256_json(_generation_document(bundle.document))
+    )
+
+
+def _legacy_metadata_view(legacy: dict[str, Any]) -> dict[str, Any]:
+    metadata = (
+        dict(legacy.get("metadata") or {})
+        if isinstance(legacy.get("metadata"), dict) else {}
+    )
+    for key in ("source_hash", "language", "prompt_hash", "validator_hash"):
+        if legacy.get(key) not in (None, ""):
+            metadata[key] = legacy[key]
+    return metadata
+
+
 def _fingerprint_payload(
     bundle: SourceBundle,
     options: BuildOptions,
@@ -3094,6 +4199,11 @@ def _fingerprint_payload(
     domain_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     integrity = bundle.document.get("integrity") or {}
+    legacy_migration_sha256 = None
+    if options.legacy_checkpoint is not None:
+        legacy_migration_sha256 = sha256_json(
+            read_legacy_checkpoint(options.legacy_checkpoint)
+        )
     return {
         "workflow_version": WORKFLOW_VERSION,
         "prompt_version": PROMPT_VERSION,
@@ -3138,6 +4248,7 @@ def _fingerprint_payload(
         "metadata_hash": sha256_json(bundle.metadata),
         "evidence_hash": sha256_json(evidence),
         "domain_context_hash": sha256_json(domain_context) if domain_context is not None else None,
+        "legacy_migration_sha256": legacy_migration_sha256,
     }
 
 
@@ -3340,7 +4451,7 @@ def _evidence(
     bibliography = [
         {
             key: item[key]
-            for key in ("id", "label", "text", "doi", "arxiv_id", "links")
+            for key in ("id", "label", "title", "text", "doi", "arxiv_id", "links")
             if key in item
         }
         for item in bundle.document.get("bibliography") or []
@@ -5736,7 +6847,7 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
         **previous,
         **{key: value for key, value in values.items() if value is not None},
     }
-    if values.get("status") and values.get("status") != "failed":
+    if values.get("status") and values.get("status") not in {"failed", "needs_supervision"}:
         state.pop("error", None)
     state["schema_version"] = "arc.companion.state.v1"
     state["updated_at"] = datetime.now(timezone.utc).isoformat()

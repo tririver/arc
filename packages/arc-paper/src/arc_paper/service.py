@@ -39,6 +39,7 @@ from .parse.source import PARSER_VERSION as SOURCE_PARSER_VERSION
 from .parse.source import parse_source_input
 from .parse.source import parse_source_input_with_warnings
 from .parse.source import source_input_hash
+from .parse.structure import has_reconciliation_proof, normalize_document_kind
 from .providers import Ar5ivProvider, ArxivSourceProvider, InspireProvider
 from .providers.ar5iv import ar5iv_url
 from .providers.base import ProviderError
@@ -56,7 +57,12 @@ _inspire = InspireProvider()
 _ar5iv = Ar5ivProvider()
 _arxiv_source = ArxivSourceProvider()
 ProgressCallback = Callable[[dict[str, Any]], None]
-LEGACY_PARSED_SOURCE_KEYS = ("paper_id", "parser_version", "source_hash", "toc", "sections", "equations")
+PARSED_SOURCE_KEYS = (
+    "paper_id", "parser_version", "source_hash", "toc", "sections", "equations",
+    "structure", "index_entries",
+)
+# Kept as a public module alias for callers that imported the old name.
+LEGACY_PARSED_SOURCE_KEYS = PARSED_SOURCE_KEYS
 RICH_PARSER_VERSION = RICH_DOCUMENT_PARSER_VERSION
 
 
@@ -338,8 +344,10 @@ def parse_source(
     refresh: bool = False,
     include_document: bool = False,
     recache: bool = False,
+    document_kind: str = "auto",
 ) -> dict[str, Any]:
     try:
+        document_kind = normalize_document_kind(document_kind)
         if refresh and recache:
             raise ValueError("--refresh and --recache are mutually exclusive")
         warnings: list[dict[str, Any]] = []
@@ -353,7 +361,7 @@ def parse_source(
             with parsed_source_lock(cache_id, namespace=f"light-v{SOURCE_PARSER_VERSION}"):
                 path = parsed_source_cache_path(cache_id)
                 cached = read_json(path) if not refresh and not recache else None
-                if _is_current_light_cache(cached, cache_id):
+                if _is_current_light_cache(cached, cache_id, document_kind=document_kind):
                     if not include_document:
                         return ok(
                             _parsed_source_view(cached, include_document=False),
@@ -374,9 +382,10 @@ def parse_source(
                     resolved_id,
                     refresh=refresh,
                     include_document=include_document,
+                    document_kind=document_kind,
                 )
                 if (
-                    _is_current_light_cache(cached, cache_id)
+                    _is_current_light_cache(cached, cache_id, document_kind=document_kind)
                     and not recache
                     and cached.get("source_hash") == parsed.get("source_hash")
                 ):
@@ -405,7 +414,18 @@ def parse_source(
                 path = parsed_source_cache_path(resolved_id) if resolved_id else None
                 cached = read_json(path) if path is not None and not refresh and not recache else None
                 if (
-                    _is_current_light_cache(cached, resolved_id)
+                    _is_current_light_cache(
+                        cached,
+                        resolved_id,
+                        document_kind=document_kind,
+                        paired_pdf=_is_paired_pdf_input(
+                            source_path=source_path,
+                            html_path=html_path,
+                            tex_path=tex_path,
+                            markdown_path=markdown_path,
+                            pdf_path=pdf_path,
+                        ),
+                    )
                     and cached.get("source_hash") == current_hash
                 ):
                     if not include_document:
@@ -433,6 +453,7 @@ def parse_source(
                     markdown_path=markdown_path,
                     pdf_path=pdf_path,
                     include_document=include_document,
+                    document_kind=document_kind,
                 )
                 path, rich_path = _write_parsed_caches(parsed, include_document=include_document)
         return ok(
@@ -1203,6 +1224,7 @@ def _parse_local_source(
     markdown_path: str | Path | None,
     pdf_path: str | Path | None,
     include_document: bool,
+    document_kind: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     _validate_local_source(
         source,
@@ -1220,6 +1242,7 @@ def _parse_local_source(
         markdown_path=markdown_path,
         pdf_path=pdf_path,
         include_document=include_document,
+        document_kind=document_kind,
     )
 
 
@@ -1261,11 +1284,26 @@ def _validate_local_source(
             raise ValueError("source=markdown-pdf requires Markdown input plus --pdf")
 
 
+def _is_paired_pdf_input(
+    *,
+    source_path: str | Path | None,
+    html_path: str | Path | None,
+    tex_path: str | Path | None,
+    markdown_path: str | Path | None,
+    pdf_path: str | Path | None,
+) -> bool:
+    if not pdf_path:
+        return False
+    suffix = Path(source_path).suffix.lower() if source_path else ""
+    return bool(html_path or tex_path or markdown_path or suffix in {".html", ".htm", ".tex", ".md", ".markdown"})
+
+
 def _parse_ar5iv_source(
     paper_id: str | None,
     *,
     refresh: bool,
     include_document: bool = False,
+    document_kind: str = "auto",
 ) -> dict[str, Any]:
     if not paper_id:
         raise ValueError("ar5iv parsing requires paper_id")
@@ -1283,6 +1321,7 @@ def _parse_ar5iv_source(
         include_document=include_document,
         source_url=ar5iv_url(normalized),
         assets=assets,
+        document_kind=document_kind,
     )
 
 
@@ -1307,12 +1346,23 @@ def _parsed(paper_id: str, *, refresh: bool, require_document: bool = False) -> 
         return parsed
 
 
-def _is_current_light_cache(cached: Any, paper_id: str | None) -> bool:
+def _is_current_light_cache(
+    cached: Any,
+    paper_id: str | None,
+    *,
+    document_kind: str = "auto",
+    paired_pdf: bool = False,
+) -> bool:
+    structure = cached.get("structure") if isinstance(cached, dict) else None
     return bool(
         isinstance(cached, dict)
         and cached.get("paper_id") == paper_id
         and cached.get("parser_version") == SOURCE_PARSER_VERSION
         and cached.get("source_hash")
+        and isinstance(structure, dict)
+        and structure.get("requested_document_kind") == document_kind
+        and isinstance(cached.get("index_entries"), dict)
+        and (not paired_pdf or has_reconciliation_proof(structure))
     )
 
 
@@ -1409,7 +1459,7 @@ def _write_parsed_caches(
     include_document: bool,
 ) -> tuple[Path, Path | None]:
     paper_id = str(parsed["paper_id"])
-    light = {key: parsed.get(key) for key in LEGACY_PARSED_SOURCE_KEYS}
+    light = {key: parsed.get(key) for key in PARSED_SOURCE_KEYS}
     light_path = parsed_source_cache_path(paper_id)
     write_json(light_path, light)
     rich_path: Path | None = None
@@ -1442,7 +1492,7 @@ def _parsed_source_view(parsed: dict[str, Any], *, include_document: bool) -> di
         document = parsed.get("document")
         if isinstance(document, dict):
             return _parsed_source_with_document(parsed, document)
-    return {key: parsed.get(key) for key in LEGACY_PARSED_SOURCE_KEYS}
+    return {key: parsed.get(key) for key in PARSED_SOURCE_KEYS}
 
 
 def _parsed_source_lookup_id(source_id: str) -> str:

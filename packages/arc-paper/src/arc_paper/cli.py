@@ -131,6 +131,9 @@ def main(argv: list[str] | None = None) -> int:
     parse.add_argument("--refresh", action="store_true")
     parse.add_argument("--recache", action="store_true")
     parse.add_argument("--include-document", action="store_true")
+    parse.add_argument(
+        "--document-kind", choices=["auto", "article", "book"], default="auto"
+    )
     parse.add_argument("--json", action="store_true")
     get_parsed = sub.add_parser("get-parsed")
     get_parsed.add_argument("source_id")
@@ -400,6 +403,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             "pdf_path": args.pdf,
             "refresh": args.refresh,
         }
+        if args.document_kind != "auto":
+            kwargs["document_kind"] = args.document_kind
         if args.markdown:
             kwargs["markdown_path"] = args.markdown
         if args.recache:

@@ -1,8 +1,11 @@
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from arc_llm.call_checkpoint import LLMCallNeedsSupervision, LLMCallRetryExhausted
 
 from arc_llm.call_record import (
     ARC_LLM_CALL_RECORD_FIELD,
@@ -29,6 +32,34 @@ from arc_llm.usage import LLMProviderResponse, LLMUsage
 @pytest.fixture(autouse=True)
 def no_retry_sleep(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMCallNeedsSupervision(checkpoint_path=Path("/tmp/uncertain.json")),
+        LLMCallRetryExhausted(
+            "terminal checkpoint",
+            checkpoint_path=Path("/tmp/terminal.json"),
+        ),
+    ],
+)
+def test_runner_preserves_checkpoint_supervision_errors(monkeypatch, tmp_path, error):
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: FakeResultProvider())
+    monkeypatch.setattr(runner, "prepare_call", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    with pytest.raises(type(error)) as caught:
+        run_json(
+            "prompt",
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            artifact_dir=tmp_path,
+            call_label="supervised",
+        )
+
+    assert caught.value is error
+    assert caught.value.checkpoint_path == error.checkpoint_path
 
 
 def without_call_record(result):
@@ -329,6 +360,8 @@ def test_stateful_run_json_self_heals_missing_session_on_native_id_update(monkey
         session_policy="stateful",
         session_manager=manager,
         session_key="idea_loops/loop/proposer/proposer_001",
+        artifact_dir=tmp_path / "artifacts",
+        idempotency_key="self-heal",
     )
 
     assert result["ok"] is True
@@ -997,7 +1030,7 @@ def test_call_record_v3_requires_warnings_and_existing_provider_emits_empty_list
     result = run_json("prompt", provider="codex-cli", env={}, process_chain=[])
     record = result[ARC_LLM_CALL_RECORD_FIELD]
 
-    assert ARC_LLM_CALL_RECORD_SCHEMA_VERSION == "arc.llm.call_record.v3"
+    assert ARC_LLM_CALL_RECORD_SCHEMA_VERSION == "arc.llm.call_record.v4"
     assert "warnings" in ARC_LLM_CALL_RECORD_SCHEMA["required"]
     assert record["warnings"] == []
 
@@ -1045,6 +1078,7 @@ def test_run_json_stateful_records_session_usage_and_call_record(tmp_path, monke
         session_key="scope/proposer/proposer_001",
         call_label="round_001/proposer_001",
         artifact_dir=tmp_path / "artifacts",
+        idempotency_key="usage-call",
     )
 
     call_record = result[ARC_LLM_CALL_RECORD_FIELD]
@@ -1072,13 +1106,14 @@ def test_run_json_stateful_records_static_prefix(tmp_path, monkeypatch):
         session_key="scope/proposer/proposer_001",
         call_label="round_001/proposer_001",
         artifact_dir=tmp_path / "artifacts",
+        idempotency_key="prefix-call",
         static_prefix="stable prefix",
     )
 
     line = (tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8").splitlines()[0]
     call = json.loads(line)
 
-    effective_prefix = ensure_runtime_progress_contract("stable prefix")
+    effective_prefix = "stable prefix"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["static_prefix_sha256"] == sha256_text(effective_prefix)
     assert call["static_prefix_sha256"] == sha256_text(effective_prefix)
 
@@ -1098,6 +1133,8 @@ def test_run_json_records_provider_prompt_hash_when_prompt_is_rewritten(tmp_path
         session_manager=manager,
         session_key="scope/proposer/proposer_001",
         call_label="round_001/proposer_001",
+        artifact_dir=tmp_path / "artifacts",
+        idempotency_key="prompt-hash-call",
     )
 
     expected = sha256_text(f"{ensure_runtime_progress_contract('prompt')}\nprovider contract")
@@ -1127,6 +1164,8 @@ def test_run_json_stateful_does_not_retry_after_invalid_output(tmp_path, monkeyp
             session_policy="stateful",
             session_manager=manager,
             session_key="scope/proposer/proposer_001",
+            artifact_dir=tmp_path / "artifacts",
+            idempotency_key="invalid-output-call",
         )
 
     assert invalid.attempts == 1
@@ -1147,15 +1186,15 @@ def test_run_text_result_returns_usage_and_records_stateful_call(tmp_path, monke
         session_manager=manager,
         session_key="scope/reviewer/reviewer_001",
         static_prefix="stable text",
+        artifact_dir=tmp_path / "artifacts",
+        idempotency_key="text-call",
     )
 
     call = json.loads((tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8"))
 
     assert outcome.value == f"m:{ensure_runtime_progress_contract('prompt')}"
     assert outcome.usage.cached_input_ratio == 0.75
-    assert outcome.static_prefix_sha256 == sha256_text(
-        ensure_runtime_progress_contract("stable text")
-    )
+    assert outcome.static_prefix_sha256 == sha256_text("stable text")
     assert call["usage"]["cached_input_ratio"] == 0.75
 
 
@@ -1171,6 +1210,8 @@ def test_run_json_stateful_requires_provider_result_support(tmp_path, monkeypatc
             session_policy="stateful",
             session_manager=LLMSessionManager(tmp_path / "sessions"),
             session_key="scope/proposer/proposer_001",
+            artifact_dir=tmp_path / "artifacts",
+            idempotency_key="unsupported-provider",
         )
 
 

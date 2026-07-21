@@ -12,7 +12,7 @@ from .projection import annotation_input_block, is_translatable, translation_inp
 from .source import block_id
 
 
-SEGMENTATION_VERSION = "arc.companion.segmentation.v4"
+SEGMENTATION_VERSION = "arc.companion.segmentation.v5"
 WINDOW_MAX_BLOCKS = 100
 WINDOW_MAX_PROJECTED_CHARS = 30_000
 SEGMENT_HARD_MAX_BLOCKS = 24
@@ -209,6 +209,7 @@ def segment_document(
     workers: int,
     force: bool,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+    seed_cuts: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Run bounded medium calls and return validated downstream segment records."""
     inventory = build_block_inventory(document)
@@ -216,6 +217,29 @@ def segment_document(
     inventory_hash = sha256_json(inventory)
     windows_hash = sha256_json(windows)
     final_path = checkpoint_dir / "segmentation.json"
+    if seed_cuts is not None:
+        canonical = (
+            not any(isinstance(value, bool) or not isinstance(value, int) for value in seed_cuts)
+            and seed_cuts == sorted(set(seed_cuts))
+        )
+        if not canonical:
+            raise SegmentationError("migrated segmentation cuts are not canonical")
+        segments = construct_segments_from_cuts(seed_cuts, document, inventory=inventory)
+        if _oversized_segments(segments, document):
+            raise SegmentationError("migrated segmentation exceeds current hard limits")
+        write_json(final_path, {
+            "schema_version": SEGMENTATION_VERSION,
+            "inventory_sha256": inventory_hash,
+            "windows_sha256": windows_hash,
+            "cuts": list(seed_cuts),
+            "segments": segments,
+            "refinements": [],
+            "migration": {
+                "kind": "validated_legacy_cuts",
+                "provider_calls": 0,
+            },
+        })
+        return segments
     if final_path.is_file() and not force:
         cached = _read_optional_json(final_path)
         if _valid_final_envelope(cached, inventory_hash=inventory_hash, windows_hash=windows_hash):

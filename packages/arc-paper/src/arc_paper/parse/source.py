@@ -9,9 +9,11 @@ from typing import Any
 
 from .ar5iv_html import parse_html
 from .markdown_document import build_markdown_document
+from .pdf_structure import parse_index_entries, read_embedded_outline
+from .structure import build_structure, empty_index_entries, normalize_document_kind
 
 
-PARSER_VERSION = 20
+PARSER_VERSION = 21
 PDF_PAGE_MATCH_MIN_SCORE = 8
 DISPLAY_ENVIRONMENTS = ("equation", "align", "gather", "multline", "eqnarray")
 SECTION_LEVELS = {"section": 1, "subsection": 2, "subsubsection": 3}
@@ -58,7 +60,9 @@ def parse_source_input(
     include_document: bool = True,
     source_url: str = "",
     assets: list[dict[str, Any]] | None = None,
+    document_kind: str = "auto",
 ) -> dict[str, Any]:
+    document_kind = normalize_document_kind(document_kind)
     resolved = _resolve_inputs(
         source_path=source_path,
         html_path=html_path,
@@ -75,23 +79,44 @@ def parse_source_input(
             source_url=source_url,
             assets=assets,
         )
-        return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_text(html_text))
+        return _attach_structure(
+            _canonical(parsed, paper_id=paper_id, source_hash=_sha256_text(html_text)),
+            document_kind=document_kind,
+        )
     if resolved["html_path"]:
         path = Path(resolved["html_path"])
         data = path.read_bytes()
         parsed = parse_html(data.decode("utf-8"), paper_id=paper_id, include_document=include_document)
-        return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_bytes(data))
+        return _attach_structure(
+            _canonical(parsed, paper_id=paper_id, source_hash=_sha256_bytes(data)),
+            document_kind=document_kind,
+        )
     if resolved["tex_path"]:
-        return parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"])
+        return _attach_structure(
+            parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]),
+            document_kind=document_kind,
+            pdf_path=resolved["pdf_path"],
+            require_pdf_reconciliation=True,
+        )
     if resolved["markdown_path"]:
-        return parse_markdown_document(
+        parsed = parse_markdown_document(
             Path(resolved["markdown_path"]),
             paper_id=paper_id,
             pdf_path=resolved["pdf_path"],
             include_document=include_document,
         )
+        return _attach_structure(
+            parsed,
+            document_kind=document_kind,
+            pdf_path=resolved["pdf_path"],
+            require_pdf_reconciliation=bool(resolved["pdf_path"]),
+        )
     if resolved["pdf_path"]:
-        return parse_pdf_document(Path(resolved["pdf_path"]), paper_id=paper_id)
+        return _attach_structure(
+            parse_pdf_document(Path(resolved["pdf_path"]), paper_id=paper_id),
+            document_kind=document_kind,
+            pdf_path=resolved["pdf_path"],
+        )
     raise ValueError("parse_source_input requires an HTML, TeX, Markdown, PDF, or ar5iv source")
 
 
@@ -105,7 +130,9 @@ def parse_source_input_with_warnings(
     markdown_path: str | Path | None = None,
     pdf_path: str | Path | None = None,
     include_document: bool = True,
+    document_kind: str = "auto",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    document_kind = normalize_document_kind(document_kind)
     resolved = _resolve_inputs(
         source_path=source_path,
         html_path=html_path,
@@ -116,31 +143,58 @@ def parse_source_input_with_warnings(
     paper_id = source_id or _generated_source_id()
     if html_text is not None:
         parsed = parse_html(html_text, paper_id=paper_id, include_document=include_document)
-        return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_text(html_text)), []
+        return _attach_structure(
+            _canonical(parsed, paper_id=paper_id, source_hash=_sha256_text(html_text)),
+            document_kind=document_kind,
+        ), []
     if resolved["html_path"]:
         path = Path(resolved["html_path"])
         data = path.read_bytes()
         parsed = parse_html(data.decode("utf-8"), paper_id=paper_id, include_document=include_document)
-        return _canonical(parsed, paper_id=paper_id, source_hash=_sha256_bytes(data)), []
+        return _attach_structure(
+            _canonical(parsed, paper_id=paper_id, source_hash=_sha256_bytes(data)),
+            document_kind=document_kind,
+        ), []
     if resolved["tex_path"]:
         if resolved["pdf_path"]:
-            return parse_tex_document_with_warnings(
+            parsed, warnings = parse_tex_document_with_warnings(
                 Path(resolved["tex_path"]), paper_id=paper_id, pdf_path=resolved["pdf_path"]
             )
-        return parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id), []
+            return _attach_structure(
+                parsed,
+                document_kind=document_kind,
+                pdf_path=resolved["pdf_path"],
+                require_pdf_reconciliation=True,
+            ), warnings
+        return _attach_structure(
+            parse_tex_document(Path(resolved["tex_path"]), paper_id=paper_id),
+            document_kind=document_kind,
+        ), []
     if resolved["markdown_path"]:
         if resolved["pdf_path"]:
-            return parse_markdown_document_with_warnings(
+            parsed, warnings = parse_markdown_document_with_warnings(
                 Path(resolved["markdown_path"]),
                 paper_id=paper_id,
                 pdf_path=resolved["pdf_path"],
                 include_document=include_document,
             )
-        return parse_markdown_document(
-            Path(resolved["markdown_path"]), paper_id=paper_id, include_document=include_document
+            return _attach_structure(
+                parsed,
+                document_kind=document_kind,
+                pdf_path=resolved["pdf_path"],
+                require_pdf_reconciliation=True,
+            ), warnings
+        return _attach_structure(
+            parse_markdown_document(
+                Path(resolved["markdown_path"]), paper_id=paper_id, include_document=include_document
+            ),
+            document_kind=document_kind,
         ), []
     if resolved["pdf_path"]:
-        return parse_pdf_document_with_warnings(Path(resolved["pdf_path"]), paper_id=paper_id)
+        parsed, warnings = parse_pdf_document_with_warnings(Path(resolved["pdf_path"]), paper_id=paper_id)
+        return _attach_structure(
+            parsed, document_kind=document_kind, pdf_path=resolved["pdf_path"]
+        ), warnings
     raise ValueError("parse_source_input requires an HTML, TeX, Markdown, PDF, or ar5iv source")
 
 
@@ -391,6 +445,39 @@ def _canonical(parsed: dict[str, Any], *, paper_id: str, source_hash: str) -> di
     if isinstance(parsed.get("document"), dict):
         result["document"] = dict(parsed["document"])
     return result
+
+
+def _attach_structure(
+    parsed: dict[str, Any],
+    *,
+    document_kind: str,
+    pdf_path: str | Path | None = None,
+    require_pdf_reconciliation: bool = False,
+) -> dict[str, Any]:
+    pdf_pages: list[str] = []
+    index_entries = empty_index_entries()
+    embedded_outline: list[dict[str, Any]] = []
+    page_labels: list[str] = []
+    if pdf_path:
+        pdf_pages = extract_pdf_pages(pdf_path)
+        if not pdf_pages and require_pdf_reconciliation:
+            raise ValueError(
+                "Paired PDF reconciliation requires an extractable PDF text layer; PDF extraction failed."
+            )
+        if pdf_pages:
+            embedded_outline, page_labels = read_embedded_outline(pdf_path)
+            index_entries = parse_index_entries(pdf_pages, page_labels=page_labels)
+    parsed["structure"] = build_structure(
+        parsed,
+        requested_document_kind=document_kind,
+        pdf_path=pdf_path,
+        pdf_pages=pdf_pages,
+        index_source_pages=index_entries.get("source_pages") or [],
+        embedded_outline=embedded_outline,
+        pdf_page_labels=page_labels,
+    )
+    parsed["index_entries"] = index_entries
+    return parsed
 
 
 def _resolve_inputs(

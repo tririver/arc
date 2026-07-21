@@ -18,6 +18,25 @@ class LLMUsage:
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def status(self) -> str:
+        """Describe whether provider token accounting is available."""
+
+        values = (
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+        )
+        present = sum(value is not None for value in values)
+        if present == 0:
+            return "unknown"
+        if self.input_tokens is not None and self.output_tokens is not None:
+            return "known"
+        return "partial"
+
+    @property
     def has_claude_cache_fields(self) -> bool:
         return self.cache_creation_input_tokens is not None or self.cache_read_input_tokens is not None
 
@@ -47,6 +66,7 @@ class LLMUsage:
 
     def to_json(self) -> dict[str, Any]:
         return {
+            "status": self.status,
             "input_tokens": self.input_tokens,
             "total_input_tokens": self.total_input_tokens,
             "cached_input_tokens": self.cached_input_tokens,
@@ -71,4 +91,5 @@ class LLMProviderResponse(Generic[T]):
     # Recovery must never prefer wrapper diagnostics over this value.
     raw_model_output: str = ""
     prompt_sent_sha256: str | None = None
+    prompt_sent_bytes: int | None = None
     structured_output: dict[str, Any] | None = None

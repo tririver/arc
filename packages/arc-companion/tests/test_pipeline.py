@@ -4290,7 +4290,7 @@ def test_first_wave_uses_first_substantive_unit_and_preserves_leading_source(tmp
     result = build_companion(
         BuildOptions(
             paper_id=bundle.paper_id, project_dir=project, workers=1,
-            review_context_chars=1, stop_after_preview=True,
+            review_context_chars=1, stop_after_first_chapter=True,
         ),
         source_loader=lambda *args, **kwargs: bundle,
         llm=llm,
@@ -4318,7 +4318,7 @@ def test_first_wave_uses_first_substantive_unit_and_preserves_leading_source(tmp
     assert manifest["companion_layers"]["semantic_segment_ids"] == ["seg-0001"]
 
 
-def test_stop_after_preview_returns_before_remaining_work_and_resumes(tmp_path: Path) -> None:
+def test_stop_after_first_chapter_returns_before_remaining_work_and_resumes(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
     fake.annotation_barrier = threading.Barrier(1)
@@ -4345,7 +4345,7 @@ def test_stop_after_preview_returns_before_remaining_work_and_resumes(tmp_path: 
             project_dir=project,
             workers=1,
             review_context_chars=1,
-            stop_after_preview=True,
+            stop_after_first_chapter=True,
         ),
         source_loader=lambda *args, **kwargs: bundle,
         llm=fake,

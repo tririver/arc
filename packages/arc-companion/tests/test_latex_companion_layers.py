@@ -10,7 +10,9 @@ import unicodedata
 import pytest
 
 from arc_companion.latex import (
+    _equation_environment,
     _layer_region,
+    _preamble,
     _png_needs_latex_flattening,
     _render_annotation,
     _render_equation,
@@ -60,7 +62,7 @@ def test_annotation_merges_distinct_explanation_and_commentary_without_repetitio
 
     assert "EXPLANATION-UNIQUE" in rendered
     assert "COMMENTARY-UNIQUE" in rendered
-    assert rendered.count(r"\textbf{本段解释}") == 1
+    assert rendered.count(r"\textbf{解释}") == 1
     assert repeated.count("共享解释") == 1
     assert r"\Needspace{6\baselineskip}" in rendered
 
@@ -127,7 +129,7 @@ def test_companion_heading_stays_with_body_when_page_space_is_short(tmp_path: Pa
     heading_page = next(
         index
         for index, page in enumerate(extracted)
-        if any(line.strip() == "伴读" for line in page.splitlines())
+        if any(line.strip() == "解释" for line in page.splitlines())
     )
     explanation_page = next(
         index for index, page in enumerate(extracted) if "EXPLANATION-FIRST-LINE" in page
@@ -195,7 +197,9 @@ def test_renderer_orders_layers_and_repeats_only_unnumbered_equations(tmp_path: 
         language="zh-CN",
     )
 
-    assert tex.index("An equation follows") < tex.index(r"\textbf{译文}") < tex.index(r"\textbf{伴读}")
+    assert r"\textbf{译文}" not in tex
+    assert r"\textbf{伴读}" not in tex
+    assert tex.index("An equation follows") < tex.index("随后是公式") < tex.index("这解释了结果")
     assert r"\textbf{原文}" not in tex
     assert "伴读单元" not in tex
     assert tex.count("x=y") == 2
@@ -968,9 +972,9 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     assert r"{}^{n}" in rendered
     assert r"\mathcal{O}" in rendered
     assert r"\mathbf{k}" in rendered
-    assert escape_tex("ℏ") == r"\(\hbar\)"
+    assert escape_tex("ℏ") == r"{\rmfamily\(\hbar\)}"
     assert r"\textsubscript{2}" in rendered
-    assert r"\textsuperscript{\(\prime\)}" in rendered
+    assert r"\textsuperscript{{\rmfamily\(\prime\)}}" in rendered
 
     glossary_math = _render_glossary({"entries": [{
         "source_term": "Dirac adjoint",
@@ -984,6 +988,19 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     equation = _render_equation({"tex": r"x=y", "number": "(A.12)", "label": "eq:a12"})
     assert r"\tag{A.12}" in equation
     assert r"\label{eq:a12}" in equation
+
+
+def test_preamble_uses_sans_body_and_serif_math_with_cjk_fallbacks() -> None:
+    tex = _preamble(title="T", authors="A", language="zh-CN")
+
+    assert r"\setCJKsansfont{Noto Sans CJK SC}" in tex
+    assert "Source Han Sans SC" in tex
+    assert "Source Han Sans CN" in tex
+    assert "FandolHei-Regular" in tex
+    assert "\\begin{document}\n\\sffamily" in tex
+    assert r"\setCJKmainfont{Noto Serif CJK SC}" in tex
+    equation = _equation_environment(r"x=\text{mass}", number=None, label=None)
+    assert r"\begingroup\rmfamily" in equation
 
 
 @pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")

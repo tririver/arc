@@ -13,8 +13,9 @@ separately installed adapter exposes the same services through optional MCP:
   proposers-reviewer workflows.
 - `arc-typeset`: deterministic typesetting utilities, including Markdown to PDF
   conversion through Pandoc and XeLaTeX.
-- `arc-companion`: builds a source-faithful original/translation/commentary PDF
-  from INSPIRE/ar5iv papers with a unified glossary and deterministic LaTeX.
+- `arc-companion`: builds a source-faithful, chapter-aware
+  original/translation/commentary PDF for papers, lecture notes, and books from
+  a paired rich source and PDF.
 - `arc-jobs`: protocol-neutral persistent background execution for ARC CLIs.
 - `arc-mcp` (optional): exposes ARC services to MCP clients; it delegates
   background work to `arc-jobs`.
@@ -27,9 +28,9 @@ Use ARC when you want to:
 
 - Look up reliable paper metadata, references, citers, sections, or equations.
 - Summarize a paper from cached ar5iv/INSPIRE data.
-- Generate a Chinese-by-default companion-reading PDF with a glossary and an
-  original, translation, companion sequence while retaining the paper's
-  equations, equation numbers, figures, tables, and bibliography.
+- Generate a Chinese-by-default companion-reading PDF with chapter guides, a
+  unified glossary, and an original/translation/commentary sequence while
+  retaining source equations, figures, tables, links, and bibliography.
 - Build a research-domain overview from a seed paper.
 - Generate ideas using domain context and reviewer scoring.
 - Plan and execute a careful symbolic or numerical research calculation with
@@ -269,42 +270,64 @@ the same folder and `<name>.zh_CN.pdf` is missing:
 arc-typeset batch-translate <project-dir> --json
 ```
 
-Build or resume a companion-reading PDF. If `--annotation-language` is omitted,
-ARC prints a language-switch notice and continues in Chinese:
+Build or resume a companion-reading PDF for a paper, lecture note, or book. A
+formal build pairs a rich Markdown/TeX/HTML source with its PDF: the rich source
+provides faithful content and the PDF is authoritative for hierarchy, printed
+pages, and chapter-boundary reconciliation. If `--annotation-language` is
+omitted, ARC prints a language-switch notice and continues in Chinese:
 
 ```bash
 arc-companion build arXiv:0911.3380 --project-dir ./0911.3380-companion --json
 arc-companion validate --project-dir ./0911.3380-companion --json
 ```
 
-Companion generation starts medium semantic segmentation and medium-tier full-
-paper glossary construction concurrently, then starts low-tier translation and
-high-tier commentary in independent parallel waves. All active stages and lanes
-share one total concurrency budget; the default permits at most 24 model calls
-at once, followed by a high-tier
-whole-document review. Each lane drains submitted work and retains successful
-checkpoints before reporting aggregated failures, so a retry schedules only
-missing or stale units. Commentary can use bounded,
-targeted reference and citer full text cached through `arc-paper`, with bounded
-per-paper/per-unit selection and verified abstract fallback.
+Use `--document-kind auto|article|book` to select the structure policy,
+`--idle-timeout-seconds` to override provider inactivity timeout, and
+`--regenerate-commentary` to rebuild commentary while retaining reusable
+translations. `--stop-after-first-chapter` provides the interactive validation
+boundary.
 
-Every translation and commentary call also receives bounded full-paper
-navigation context. Workers do not receive MCP access. When they need more
-evidence, they emit structured requests that the companion controller resolves
-through `arc-paper` services and returns with provenance.
-Translations may consult external sources only for terminology and source
-disambiguation, while external commentary claims require captured provenance.
-If web access is unavailable, ARC uses the segment, glossary, paper map,
-contextual anchors, ARC cache, and evidence already embedded in the portable
-prompt.
+ARC reconciles PDF structure with rich-source blocks and validates exact
+chapter and segment coverage. Chapters may prepare concurrently under one
+global `workers` budget. Within each chapter, semantic segmentation and a
+stateful guide prepare independent, source-ordered translation and commentary
+sessions. A bootstrap turn carries fixed chapter context; later turns carry
+only the current segment, cursor, source hash, terms, and evidence. Stable
+idempotency keys and accepted-block ledgers make routine resume automatic
+without repeating accepted provider calls.
 
-Each unit is rendered as original, translation, then companion, using three
-distinct light background colors suitable for printing. The renderer copies
-displayed formulas into translations without their equation numbers and does
-not clone figures, tables, or other floating objects. Personal names remain in
-their Latin-script source form. The default deliverable is one PDF. A
-reproducibility ZIP is generated only through an explicit
-`arc-companion package` request.
+A real Index becomes the complete global glossary, including nested entries,
+page ranges, `see`, and `see also`; it is never truncated. Documents without an
+Index use the page-scaled 50/100/200 terminology limits. Each chapter receives
+only its deterministic source-term projection, while commentary evidence is
+resolved by the controller through CLI package services and must retain
+captured provenance. Companion workers do not depend on MCP or file-reading
+tools.
+
+Timeout, cancellation, unknown submission state, provider failure, and native
+session loss return `needs_supervision` instead of automatically repeating a
+possibly paid call. Resume explicitly:
+
+```bash
+arc-companion resume --project-dir ./0911.3380-companion \
+  --action resume-native --json
+arc-companion resume --project-dir ./0911.3380-companion \
+  --action restart-generation --confirm-possible-duplicate-charge --json
+```
+
+`--stop-after-first-chapter` schedules no later chapter and returns
+`first_chapter_ready` only after the first substantive chapter passes guide,
+both lanes, evidence, review, typesetting, and PDF validation. Long background
+builds emit a build-level `review_due` at the next safe boundary after each 30
+minutes of cumulative runtime; `arc-jobs watch <job-id> --until-review --json`
+returns for inspection without pausing the job.
+
+Each chapter guide appears once after its title. Every segment renders original,
+translation, then commentary without visible controller layer labels. Text uses
+sans-serif fonts while mathematics remains LaTeX serif. Personal names remain
+in Latin script. The default deliverable is the validated full-document PDF; a
+reproducibility ZIP is generated only by an explicit `arc-companion package`
+request.
 
 Run slow conversion through `arc-jobs` when the caller should not block. The
 optional MCP adapter exposes the same `md2pdf`, `translate`, and
@@ -819,11 +842,11 @@ Package boundaries:
   foundation selection, domain paper selection, graph artifacts, evidence
   packs, HTML rendering, and domain summaries. It calls `arc-paper` for
   single-paper work and `arc-llm` for LLM work.
-- `packages/arc-companion` owns companion-specific evidence selection,
-  semantic segmentation, glossary construction, parallel translation and
-  commentary, whole-document review, checkpoints, deterministic LaTeX
-  rendering, and PDF validation. It consumes full-document and asset caches
-  from `arc-paper` and LLM calls from `arc-llm`.
+- `packages/arc-companion` owns paired-source/PDF chapter orchestration,
+  Index-aware glossary projection, ordered stateful translation and commentary
+  lanes, evidence selection, supervised resume, review checkpoints,
+  deterministic LaTeX rendering, and PDF validation. It consumes document and
+  asset caches from `arc-paper` and LLM calls from `arc-llm`.
 - `packages/arc-jobs` owns protocol-neutral persistent CLI execution, status,
   cancellation, output capture, and ETA. It has no core package dependency.
 - `packages/arc-mcp` stays a thin MCP adapter over package service functions

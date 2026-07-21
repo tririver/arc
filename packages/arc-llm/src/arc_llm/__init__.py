@@ -18,6 +18,7 @@ from .evidence import (
 from .failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from .host import HostDetection, ProviderSelection, detect_host, select_llm_provider
 from .model import ModelTierError, resolve_model
+from .recovery_context import LLMRecoveryContext, read_recovery_context
 from .providers.base import (
     LLMAbortScope,
     LLMFailureCategory,
@@ -33,6 +34,7 @@ _LAZY_EXPORTS = {
     "LLMConfig": ("arc_llm.runner", "LLMConfig"),
     "resolve_llm_config": ("arc_llm.runner", "resolve_llm_config"),
     "run_json": ("arc_llm.runner", "run_json"),
+    "run_json_result": ("arc_llm.runner", "run_json_result"),
     "run_text": ("arc_llm.runner", "run_text"),
     "run_text_result": ("arc_llm.runner", "run_text_result"),
     "run_proposers_reviewer_batch": ("arc_llm.proposers_reviewer.runner", "run_proposers_reviewer_batch"),
@@ -60,6 +62,7 @@ __all__ = [
     "LLMCircuitOpen",
     "LLMFailureCategory",
     "LLMFailureDisposition",
+    "LLMRecoveryContext",
     "LLMSafetyController",
     "LLMSubmissionState",
     "LLMWorkerError",
@@ -78,9 +81,11 @@ __all__ = [
     "resolve_llm_config",
     "resolve_evidence_round",
     "resolve_model",
+    "read_recovery_context",
     "run_proposers_reviewer_batch",
     "run_proposers_reviewer_bench",
     "run_json",
+    "run_json_result",
     "run_text",
     "run_text_result",
     "select_llm_provider",

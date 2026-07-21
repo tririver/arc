@@ -11,7 +11,7 @@ from .segmentation import build_block_inventory, build_segmentation_windows
 from .source import block_id
 
 
-GLOSSARY_VERSION = "arc.companion.glossary.v6"
+GLOSSARY_VERSION = "arc.companion.glossary.v7"
 ABSOLUTE_GLOSSARY_LIMIT = 200
 CONSOLIDATION_MAX_ENTRIES = 100
 CONSOLIDATION_PROMPT_MAX_BYTES = 60 * 1024

@@ -142,6 +142,51 @@ def test_session_manager_refuses_native_id_overwrite_from_other_manager(tmp_path
         second.update_native_session_id(ref.key, "native-2")
 
 
+def test_session_receipt_is_idempotent_and_rotate_starts_generation(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    ref = manager.get_or_create(key="k", provider="codex-cli", model="m", runtime_fingerprint="fp")
+    manager.update_native_session_id("k", "native-1")
+    kwargs = dict(
+        call_label="turn",
+        prompt_sha256="prompt",
+        static_prefix_sha256=None,
+        schema_sha256=None,
+        usage={"status": "unknown"},
+        provider_used="codex-cli",
+        model_used="m",
+        native_session_id="native-1",
+        idempotency_key="idem",
+        generation=ref.generation,
+    )
+    assert manager.record_turn("k", **kwargs) is True
+    assert manager.record_turn("k", **kwargs) is False
+    assert manager.turn_count("k", generation=1) == 1
+
+    rotated = manager.rotate("k", reason="context rollover")
+    assert rotated.generation == 2
+    assert rotated.native_session_id is None
+    assert manager.turn_count("k", generation=2) == 0
+
+
+def test_session_receipt_rejects_same_key_with_different_turn(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(key="k", provider="codex-cli", model="m", runtime_fingerprint="fp")
+    common = dict(
+        call_label="turn",
+        static_prefix_sha256=None,
+        schema_sha256=None,
+        usage={},
+        provider_used="codex-cli",
+        model_used="m",
+        native_session_id=None,
+        idempotency_key="idem",
+        generation=1,
+    )
+    manager.record_turn("k", prompt_sha256="a", **common)
+    with pytest.raises(ValueError, match="receipt identity changed"):
+        manager.record_turn("k", prompt_sha256="b", **common)
+
+
 def test_session_lock_serializes_threads(tmp_path):
     manager = LLMSessionManager(tmp_path / "sessions")
     events: list[str] = []

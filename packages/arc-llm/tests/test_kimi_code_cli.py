@@ -161,6 +161,8 @@ def test_runner_stateful_second_turn_resumes_provider_session(tmp_path):
         session_policy="stateful",
         session_manager=manager,
         session_key="scope/worker",
+        artifact_dir=tmp_path / "artifacts",
+        idempotency_key="turn-1",
     )
     second = run_text_result(
         "second turn",
@@ -169,6 +171,8 @@ def test_runner_stateful_second_turn_resumes_provider_session(tmp_path):
         session_policy="stateful",
         session_manager=manager,
         session_key="scope/worker",
+        artifact_dir=tmp_path / "artifacts",
+        idempotency_key="turn-2",
     )
 
     assert first.native_session_id == "fake-kimi-session-1"

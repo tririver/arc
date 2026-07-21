@@ -63,11 +63,16 @@ def validate_pdf(pdf_path: Path, *, runner: Callable[..., subprocess.CompletedPr
 
     text_path = pdf_path.with_suffix(".validation.txt")
     _run(runner, [str(tools["pdftotext"]), str(pdf_path), str(text_path)])
-    if not text_path.is_file() or not text_path.read_text(encoding="utf-8", errors="ignore").strip():
+    extracted_text = text_path.read_text(encoding="utf-8", errors="ignore") if text_path.is_file() else ""
+    if not extracted_text.strip():
         raise PDFError("PDF contains no searchable text")
+    forbidden = [value for value in ("译文", "伴读", "本段解释") if value in extracted_text]
+    if forbidden:
+        raise PDFError(f"PDF contains removed visible layer labels: {', '.join(forbidden)}")
 
     fonts = _run(runner, [str(tools["pdffonts"]), str(pdf_path)])
     font_count = _validate_embedded_fonts(fonts)
+    font_roles = _validate_font_roles(fonts)
 
     render_paths: list[str] = []
     for page in range(1, pages + 1):
@@ -83,7 +88,7 @@ def validate_pdf(pdf_path: Path, *, runner: Callable[..., subprocess.CompletedPr
                 "-singlefile",
                 "-png",
                 "-r",
-                "72",
+                "144",
                 str(pdf_path),
                 str(raster_prefix),
             ],
@@ -98,6 +103,7 @@ def validate_pdf(pdf_path: Path, *, runner: Callable[..., subprocess.CompletedPr
         "encrypted": False,
         "fonts": fonts,
         "embedded_font_count": font_count,
+        "font_roles": font_roles,
         "text_path": str(text_path),
         "render_paths": render_paths,
     }
@@ -149,6 +155,21 @@ def _validate_embedded_fonts(output: str) -> int:
             font_name = row.split(maxsplit=1)[0]
             raise PDFError(f"PDF font is not embedded: {font_name}")
     return parsed
+
+
+def _validate_font_roles(output: str) -> dict[str, list[str]]:
+    names = [
+        line.split(maxsplit=1)[0].split("+", 1)[-1]
+        for line in output.splitlines()
+        if re.search(r"\s+(?:yes|no)\s+(?:yes|no)\s+(?:yes|no)\s+\d+\s+\d+\s*$", line, re.IGNORECASE)
+    ]
+    sans = [name for name in names if re.search(r"sans|hei|gothic", name, re.IGNORECASE)]
+    serif = [name for name in names if not re.search(r"sans|hei|gothic", name, re.IGNORECASE)]
+    if not sans:
+        raise PDFError("PDF font report contains no sans-serif body font")
+    if not serif:
+        raise PDFError("PDF font report contains no serif mathematics font")
+    return {"sans": sans, "serif": serif}
 
 
 def _run(runner: Callable[..., subprocess.CompletedProcess[str]], command: list[str]) -> str:

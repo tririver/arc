@@ -1,4 +1,4 @@
-"""Generate source-faithful annotated companions for arXiv papers."""
+"""Build source-faithful, chapter-aware companions for papers and books."""
 
 from .pipeline import BuildOptions, build_companion
 

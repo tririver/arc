@@ -3,14 +3,22 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import inspect
 import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record, strip_arc_llm_call_records
-from .call_checkpoint import checkpoint_path, prepare_call, record_failure, record_response, record_validated
+from .call_checkpoint import (
+    LLMCallNeedsSupervision,
+    LLMCallRetryExhausted,
+    checkpoint_path,
+    prepare_call,
+    record_failure,
+    record_response,
+    record_validated,
+)
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
 from .model import reasoning_effort_for_model_tier, resolve_model_with_warnings
@@ -23,7 +31,7 @@ from .providers.base import (
     LLMWorkerTimeout,
 )
 from .progress_journal import ProgressJournal
-from .progress_prompt import ensure_runtime_progress_contract
+from .progress_prompt import apply_runtime_progress_contract
 from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
@@ -36,6 +44,11 @@ from .usage import LLMProviderResponse, LLMUsage
 MAX_ATTEMPTS_PER_PROVIDER = 1
 RETRY_INTERVAL_SECONDS = 10
 LOW_CONTENT_TOKEN_THRESHOLD = 10
+NATIVE_RESUME_RECONCILIATION_PROMPT = (
+    "Supervised native-session recovery: the preceding turn may already have run. "
+    "Do not repeat its work. Reconcile the native session and return the final answer "
+    "for that preceding request in the required format."
+)
 
 
 class LLMTaskError(RuntimeError):
@@ -89,6 +102,11 @@ class LLMCallOutcome:
     static_prefix_sha256: str | None
     schema_sha256: str | None
     runtime_fingerprint: str | None
+    idempotency_key: str | None = None
+    generation: int | None = None
+    prompt_bytes: int | None = None
+    logical_receipt: dict[str, Any] | None = None
+    call_record: dict[str, Any] | None = None
     structured_output: dict[str, Any] | None = None
     warnings: tuple[str, ...] = ()
 
@@ -167,15 +185,84 @@ def run_json(
     idle_timeout_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    idempotency_key: str | None = None,
+    progress_contract_scope: str = "call",
+    supervised_native_resume: bool = False,
 ) -> dict[str, Any]:
+    """Convenience wrapper returning the JSON value with its audit record."""
+
+    outcome = run_json_result(
+        prompt,
+        schema=schema,
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        validate_schema=validate_schema,
+        output_recovery=output_recovery,
+        schema_formatter_enabled=schema_formatter_enabled,
+        role_hint=role_hint,
+        env=env,
+        process_chain=process_chain,
+        session_policy=session_policy,
+        session_manager=session_manager,
+        session_key=session_key,
+        session_name=session_name,
+        session_metadata=session_metadata,
+        artifact_dir=artifact_dir,
+        call_label=call_label,
+        static_prefix=static_prefix,
+        idle_timeout_seconds=idle_timeout_seconds,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        idempotency_key=idempotency_key,
+        progress_contract_scope=progress_contract_scope,
+        supervised_native_resume=supervised_native_resume,
+    )
+    return attach_arc_llm_call_record(outcome.value, dict(outcome.call_record or {}))
+
+
+def run_json_result(
+    prompt: str,
+    *,
+    schema: dict[str, Any] | None = None,
+    provider: str = "auto",
+    model: str | None = None,
+    model_tier: str | None = None,
+    validate_schema: bool = True,
+    output_recovery: str = "strict",
+    schema_formatter_enabled: bool = True,
+    role_hint: str | None = None,
+    env: Mapping[str, str] | None = None,
+    process_chain: Sequence[str] | None = None,
+    session_policy: str = "stateless",
+    session_manager: LLMSessionManager | None = None,
+    session_key: str | None = None,
+    session_name: str | None = None,
+    session_metadata: Mapping[str, Any] | None = None,
+    artifact_dir: Path | str | None = None,
+    call_label: str | None = None,
+    static_prefix: str | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    idempotency_key: str | None = None,
+    progress_contract_scope: str = "call",
+    supervised_native_resume: bool = False,
+) -> LLMCallOutcome:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
     if output_recovery not in {"strict", "warn"}:
         raise ValueError("output_recovery must be strict or warn")
     if session_policy == "stateful" and (session_manager is None or not session_key):
         raise ValueError("stateful run_json requires session_manager and session_key")
-    prompt = ensure_runtime_progress_contract(prompt)
-    static_prefix = ensure_runtime_progress_contract(static_prefix or "")
+    if progress_contract_scope not in {"call", "session"}:
+        raise ValueError("progress_contract_scope must be call or session")
+    if session_policy == "stateful" and (not idempotency_key or artifact_dir is None):
+        raise ValueError("stateful run_json requires idempotency_key and artifact_dir")
+    if idempotency_key and artifact_dir is None:
+        raise ValueError("idempotency_key requires artifact_dir")
+    if supervised_native_resume and session_policy != "stateful":
+        raise ValueError("supervised_native_resume requires a stateful session")
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -189,10 +276,11 @@ def run_json(
         provider_requested=provider,
         model_requested=model,
         model_tier_requested=model_tier,
-        attach_call_record=True,
+        attach_call_record=False,
         env=env,
         process_chain=process_chain,
         max_attempts=MAX_ATTEMPTS_PER_PROVIDER,
+        return_outcome=True,
         idle_timeout_seconds=idle_timeout_seconds,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
@@ -220,6 +308,9 @@ def run_json(
             idle_timeout_seconds=effective_idle_timeout_seconds,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
+            idempotency_key=idempotency_key,
+            progress_contract_scope=progress_contract_scope,
+            supervised_native_resume=supervised_native_resume,
         ),
     )
 
@@ -243,6 +334,9 @@ def run_text(
     idle_timeout_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    idempotency_key: str | None = None,
+    progress_contract_scope: str = "call",
+    supervised_native_resume: bool = False,
 ) -> str:
     return run_text_result(
         prompt,
@@ -262,6 +356,9 @@ def run_text(
         idle_timeout_seconds=idle_timeout_seconds,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        idempotency_key=idempotency_key,
+        progress_contract_scope=progress_contract_scope,
+        supervised_native_resume=supervised_native_resume,
     ).value
 
 
@@ -284,13 +381,22 @@ def run_text_result(
     idle_timeout_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    idempotency_key: str | None = None,
+    progress_contract_scope: str = "call",
+    supervised_native_resume: bool = False,
 ) -> LLMCallOutcome:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
     if session_policy == "stateful" and (session_manager is None or not session_key):
         raise ValueError("stateful run_text requires session_manager and session_key")
-    prompt = ensure_runtime_progress_contract(prompt)
-    static_prefix = ensure_runtime_progress_contract(static_prefix or "")
+    if progress_contract_scope not in {"call", "session"}:
+        raise ValueError("progress_contract_scope must be call or session")
+    if session_policy == "stateful" and (not idempotency_key or artifact_dir is None):
+        raise ValueError("stateful run_text requires idempotency_key and artifact_dir")
+    if idempotency_key and artifact_dir is None:
+        raise ValueError("idempotency_key requires artifact_dir")
+    if supervised_native_resume and session_policy != "stateful":
+        raise ValueError("supervised_native_resume requires a stateful session")
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -331,6 +437,9 @@ def run_text_result(
             idle_timeout_seconds=effective_idle_timeout_seconds,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
+            idempotency_key=idempotency_key,
+            progress_contract_scope=progress_contract_scope,
+            supervised_native_resume=supervised_native_resume,
         ),
     )
 
@@ -383,6 +492,21 @@ def _run_with_retries(
                     status="success",
                 )
                 attempt_records.append(attempt_record)
+                if isinstance(result, LLMCallOutcome):
+                    result = replace(
+                        result,
+                        call_record=_call_record(
+                            config,
+                            provider_requested=provider_requested,
+                            model_requested=model_requested,
+                            model_tier_requested=model_tier_requested,
+                            fallback_index=fallback_index,
+                            attempt=attempt,
+                            attempts=attempt_records,
+                            outcome=result,
+                        ),
+                    )
+                    value = result.value
                 if attach_call_record and isinstance(value, dict):
                     outcome = result if isinstance(result, LLMCallOutcome) else None
                     return attach_arc_llm_call_record(
@@ -410,7 +534,16 @@ def _run_with_retries(
                         error=exc,
                     )
                 )
-                if isinstance(exc, (LLMSchemaError, LLMWorkerCancelled, LLMWorkerTimeout)):
+                if isinstance(
+                    exc,
+                    (
+                        LLMSchemaError,
+                        LLMWorkerCancelled,
+                        LLMWorkerTimeout,
+                        LLMCallNeedsSupervision,
+                        LLMCallRetryExhausted,
+                    ),
+                ):
                     raise
                 if isinstance(exc, LLMOutputValidationError) or (
                     isinstance(exc, LLMWorkerError) and not exc.retryable
@@ -478,6 +611,9 @@ def _generate_json(
     idle_timeout_seconds: float | None,
     progress_callback: Callable[[dict[str, Any]], None] | None,
     cancel_check: Callable[[], bool] | None,
+    idempotency_key: str | None,
+    progress_contract_scope: str,
+    supervised_native_resume: bool,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
         provider_used=provider_used,
@@ -490,6 +626,10 @@ def _generate_json(
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
     provider_schema = to_provider_json_schema(schema)
     prepared_checkpoint = None
+    effective_prompt = apply_runtime_progress_contract(
+        prompt, scope=progress_contract_scope, generation_bootstrap=True
+    )
+    generation: int | None = None
     progress = _progress_journal(
         artifact_dir=artifact_dir,
         call_label=call_label,
@@ -501,7 +641,7 @@ def _generate_json(
         session: LLMSessionRef | None, session_turn: int | None = None
     ) -> LLMProviderResponse[dict[str, Any]]:
         nonlocal prepared_checkpoint
-        if artifact_dir is not None and call_label:
+        if artifact_dir is not None and (call_label or idempotency_key):
             path, identity = checkpoint_path(
                 artifact_dir,
                 prompt=prompt,
@@ -513,10 +653,29 @@ def _generate_json(
                 session_key=session.key if session is not None else None,
                 session_turn=session_turn,
                 runtime_fingerprint=runtime_fp,
+                idempotency_key=idempotency_key,
+                generation=session.generation if session is not None else None,
+                progress_contract_scope=progress_contract_scope,
             )
-            prepared_checkpoint = prepare_call(path, identity=identity, cancel_check=cancel_check)
+            prepared_checkpoint = prepare_call(
+                path,
+                identity=identity,
+                cancel_check=cancel_check,
+                supervised_native_resume=supervised_native_resume,
+                native_session_available=bool(session and session.native_session_id),
+            )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
+            if supervised_native_resume and (session is None or not session.native_session_id):
+                prepared_checkpoint.release_lock()
+                raise LLMTaskError(
+                    "supervised native resume requires an existing provider session id"
+                )
+        provider_prompt = (
+            NATIVE_RESUME_RECONCILIATION_PROMPT
+            if supervised_native_resume
+            else effective_prompt
+        )
         def invoke() -> LLMProviderResponse[dict[str, Any]]:
             if hasattr(selected, "generate_json_result"):
                 kwargs = {
@@ -535,8 +694,8 @@ def _generate_json(
                     kwargs["progress_callback"] = progress
                 if _accepts_keyword(selected.generate_json_result, "cancel_check"):
                     kwargs["cancel_check"] = cancel_check
-                return selected.generate_json_result(prompt, **kwargs)
-            return LLMProviderResponse(selected.generate_json(prompt, schema=provider_schema, model=model))
+                return selected.generate_json_result(provider_prompt, **kwargs)
+            return LLMProviderResponse(selected.generate_json(provider_prompt, schema=provider_schema, model=model))
 
         try:
             response = _controlled_provider_call(
@@ -550,6 +709,12 @@ def _generate_json(
             if prepared_checkpoint is not None:
                 record_failure(prepared_checkpoint, exc)
             raise
+        if response.prompt_sent_bytes is None or response.prompt_sent_sha256 is None:
+            response = replace(
+                response,
+                prompt_sent_bytes=response.prompt_sent_bytes or len(provider_prompt.encode("utf-8")),
+                prompt_sent_sha256=response.prompt_sent_sha256 or sha256_text(provider_prompt),
+            )
         if prepared_checkpoint is not None:
             record_response(prepared_checkpoint, response)
         progress({"event": "call_finished", "substantive": False, "resumable": False})
@@ -566,9 +731,15 @@ def _generate_json(
             name=session_name,
             metadata=session_metadata,
         ) as (session, turn_count):
+            generation = session.generation
+            effective_prompt = apply_runtime_progress_contract(
+                prompt,
+                scope=progress_contract_scope,
+                generation_bootstrap=turn_count == 0,
+            )
             response = call_provider(session, turn_count)
             result = response.value
-            prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
+            prompt_sha = response.prompt_sent_sha256 or sha256_text(effective_prompt)
             native_session_id = response.native_session_id
             session_warnings: list[str] = []
             if native_session_id:
@@ -602,6 +773,8 @@ def _generate_json(
                     provider_used=provider_used,
                     model_used=model,
                     native_session_id=recorded_native_session_id,
+                    idempotency_key=idempotency_key,
+                    generation=session.generation,
                     extra=extra,
                 )
 
@@ -624,6 +797,7 @@ def _generate_json(
                     idle_timeout_seconds=idle_timeout_seconds,
                     progress_callback=progress,
                     cancel_check=cancel_check,
+                    idempotency_key=idempotency_key,
                 )
             except Exception:
                 record_turn(response.structured_output)
@@ -651,9 +825,10 @@ def _generate_json(
             idle_timeout_seconds=idle_timeout_seconds,
             progress_callback=progress,
             cancel_check=cancel_check,
+            idempotency_key=idempotency_key,
         )
         native_session_id = response.native_session_id
-        prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
+        prompt_sha = response.prompt_sent_sha256 or sha256_text(effective_prompt)
     if prepared_checkpoint is not None:
         record_validated(prepared_checkpoint)
     return LLMCallOutcome(
@@ -667,6 +842,15 @@ def _generate_json(
         static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
         schema_sha256=schema_hash(schema),
         runtime_fingerprint=runtime_fp,
+        idempotency_key=idempotency_key,
+        generation=generation,
+        prompt_bytes=response.prompt_sent_bytes,
+        logical_receipt=_logical_receipt(
+            idempotency_key=idempotency_key,
+            generation=generation,
+            prepared=prepared_checkpoint,
+            response=response,
+        ),
         structured_output=structured_output,
     )
 
@@ -691,6 +875,9 @@ def _generate_text(
     idle_timeout_seconds: float | None,
     progress_callback: Callable[[dict[str, Any]], None] | None,
     cancel_check: Callable[[], bool] | None,
+    idempotency_key: str | None,
+    progress_contract_scope: str,
+    supervised_native_resume: bool,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
         provider_used=provider_used,
@@ -703,6 +890,10 @@ def _generate_text(
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
 
     prepared_checkpoint = None
+    effective_prompt = apply_runtime_progress_contract(
+        prompt, scope=progress_contract_scope, generation_bootstrap=True
+    )
+    generation: int | None = None
     progress = _progress_journal(
         artifact_dir=artifact_dir,
         call_label=call_label,
@@ -714,7 +905,7 @@ def _generate_text(
         session: LLMSessionRef | None, session_turn: int | None = None
     ) -> LLMProviderResponse[str]:
         nonlocal prepared_checkpoint
-        if artifact_dir is not None and call_label:
+        if artifact_dir is not None and (call_label or idempotency_key):
             path, identity = checkpoint_path(
                 artifact_dir,
                 prompt=prompt,
@@ -726,10 +917,29 @@ def _generate_text(
                 session_key=session.key if session is not None else None,
                 session_turn=session_turn,
                 runtime_fingerprint=runtime_fp,
+                idempotency_key=idempotency_key,
+                generation=session.generation if session is not None else None,
+                progress_contract_scope=progress_contract_scope,
             )
-            prepared_checkpoint = prepare_call(path, identity=identity, cancel_check=cancel_check)
+            prepared_checkpoint = prepare_call(
+                path,
+                identity=identity,
+                cancel_check=cancel_check,
+                supervised_native_resume=supervised_native_resume,
+                native_session_available=bool(session and session.native_session_id),
+            )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
+            if supervised_native_resume and (session is None or not session.native_session_id):
+                prepared_checkpoint.release_lock()
+                raise LLMTaskError(
+                    "supervised native resume requires an existing provider session id"
+                )
+        provider_prompt = (
+            NATIVE_RESUME_RECONCILIATION_PROMPT
+            if supervised_native_resume
+            else effective_prompt
+        )
         def invoke() -> LLMProviderResponse[str]:
             if hasattr(selected, "generate_text_result"):
                 kwargs = {
@@ -744,8 +954,8 @@ def _generate_text(
                     kwargs["progress_callback"] = progress
                 if _accepts_keyword(selected.generate_text_result, "cancel_check"):
                     kwargs["cancel_check"] = cancel_check
-                return selected.generate_text_result(prompt, **kwargs)
-            return LLMProviderResponse(selected.generate_text(prompt, model=model))
+                return selected.generate_text_result(provider_prompt, **kwargs)
+            return LLMProviderResponse(selected.generate_text(provider_prompt, model=model))
 
         try:
             response = _controlled_provider_call(
@@ -759,6 +969,12 @@ def _generate_text(
             if prepared_checkpoint is not None:
                 record_failure(prepared_checkpoint, exc)
             raise
+        if response.prompt_sent_bytes is None or response.prompt_sent_sha256 is None:
+            response = replace(
+                response,
+                prompt_sent_bytes=response.prompt_sent_bytes or len(provider_prompt.encode("utf-8")),
+                prompt_sent_sha256=response.prompt_sent_sha256 or sha256_text(provider_prompt),
+            )
         if prepared_checkpoint is not None:
             record_response(prepared_checkpoint, response)
         progress({"event": "call_finished", "substantive": False, "resumable": False})
@@ -775,8 +991,14 @@ def _generate_text(
             name=session_name,
             metadata=session_metadata,
         ) as (session, turn_count):
+            generation = session.generation
+            effective_prompt = apply_runtime_progress_contract(
+                prompt,
+                scope=progress_contract_scope,
+                generation_bootstrap=turn_count == 0,
+            )
             response = call_provider(session, turn_count)
-            prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
+            prompt_sha = response.prompt_sent_sha256 or sha256_text(effective_prompt)
             session_warnings: list[str] = []
             if response.native_session_id:
                 warning = _update_native_session_id_with_self_heal(
@@ -805,12 +1027,14 @@ def _generate_text(
                 provider_used=provider_used,
                 model_used=model,
                 native_session_id=recorded_native_session_id,
+                idempotency_key=idempotency_key,
+                generation=session.generation,
                 extra=extra,
             )
     else:
         session = None
         response = call_provider(None)
-        prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
+        prompt_sha = response.prompt_sent_sha256 or sha256_text(effective_prompt)
     if not str(response.value or "").strip():
         raise LLMOutputValidationError("LLM text output was empty")
     if prepared_checkpoint is not None:
@@ -826,6 +1050,15 @@ def _generate_text(
         static_prefix_sha256=sha256_text(static_prefix) if static_prefix else None,
         schema_sha256=None,
         runtime_fingerprint=runtime_fp,
+        idempotency_key=idempotency_key,
+        generation=generation,
+        prompt_bytes=response.prompt_sent_bytes,
+        logical_receipt=_logical_receipt(
+            idempotency_key=idempotency_key,
+            generation=generation,
+            prepared=prepared_checkpoint,
+            response=response,
+        ),
     )
 
 
@@ -844,6 +1077,32 @@ def _runtime_fp(
         env=env,
         process_chain=process_chain,
     )
+
+
+def _logical_receipt(
+    *,
+    idempotency_key: str | None,
+    generation: int | None,
+    prepared: Any,
+    response: LLMProviderResponse[Any],
+) -> dict[str, Any] | None:
+    if idempotency_key is None:
+        return None
+    value = response.value
+    if isinstance(value, str):
+        response_sha = sha256_text(value)
+    else:
+        from .schema_cache import canonical_json
+
+        response_sha = sha256_text(canonical_json(value))
+    return {
+        "schema_version": "arc.llm.logical_receipt.v1",
+        "idempotency_key": idempotency_key,
+        "generation": generation,
+        "checkpoint_state": "validated",
+        "replayed": bool(prepared and prepared.replayed),
+        "response_sha256": response_sha,
+    }
 
 
 def _progress_journal(
@@ -959,6 +1218,7 @@ def _recover_or_validate_json_output(
     idle_timeout_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     structured_output = response.structured_output
     provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
@@ -1006,6 +1266,7 @@ def _recover_or_validate_json_output(
             idle_timeout_seconds=idle_timeout_seconds,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
+            idempotency_key=idempotency_key,
         )
         if schema is not None:
             _validate_json_output(result, schema)
@@ -1037,6 +1298,7 @@ def _recover_or_validate_json_output(
                 idle_timeout_seconds=idle_timeout_seconds,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
+                idempotency_key=idempotency_key,
             )
             _validate_json_output(result, schema)
             return result, structured_output
@@ -1072,6 +1334,7 @@ def _recover_warn_schema_output(
     idle_timeout_seconds: float | None,
     progress_callback: Callable[[dict[str, Any]], None] | None,
     cancel_check: Callable[[], bool] | None,
+    idempotency_key: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     source = _schema_recovery_source_text(result, response=response, provider_metadata=provider_metadata)
     if _is_low_content_source(source):
@@ -1105,6 +1368,8 @@ def _recover_warn_schema_output(
             if artifact_dir is not None and call_label:
                 formatter_kwargs["artifact_dir"] = artifact_dir
                 formatter_kwargs["call_label"] = f"{call_label}/schema_formatter"
+            if idempotency_key:
+                formatter_kwargs["idempotency_key"] = f"{idempotency_key}/schema_formatter"
             return run_json(format_prompt, **formatter_kwargs)
 
         formatted = format_to_schema_or_retry(
@@ -1280,6 +1545,10 @@ def _call_record(
         "static_prefix_sha256": outcome.static_prefix_sha256 if outcome else None,
         "schema_sha256": outcome.schema_sha256 if outcome else None,
         "runtime_fingerprint": outcome.runtime_fingerprint if outcome else None,
+        "idempotency_key": outcome.idempotency_key if outcome else None,
+        "generation": outcome.generation if outcome else None,
+        "prompt_bytes": outcome.prompt_bytes if outcome else None,
+        "logical_receipt": outcome.logical_receipt if outcome else None,
         "usage": outcome.usage.to_json() if outcome else LLMUsage().to_json(),
         "structured_output": outcome.structured_output if outcome else None,
         "warnings": list(

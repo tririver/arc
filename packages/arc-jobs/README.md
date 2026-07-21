@@ -21,6 +21,11 @@ returned `review_sequence` as the next cursor and watch again. `watch
 without cancelling the job. Use `cancel` when activity is repetitive, stalled,
 or off task; a terminal result returns normally and ends the watch loop.
 
+Companion jobs may finish at the controlled, resumable `first_chapter_ready` or
+`needs_supervision` states. Chapter progress uses the
+`arc.companion.progress.v1` side-channel schema and retains chapter, segment,
+lane, generation, and accepted-block status in job state.
+
 Successful submit, status, cancel, and list operations return `ok: true`.
 Failed/cancelled job status and result commands use a nonzero process exit code
 so shell callers do not mistake a terminal command failure for success.

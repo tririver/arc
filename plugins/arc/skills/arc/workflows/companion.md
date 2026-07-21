@@ -1,303 +1,206 @@
 # Companion-Reading Workflow
 
-Use this workflow only for an explicit companion-reading request. It produces
-an original-text, translation, and companion-commentary PDF for an arXiv paper
-available through INSPIRE and ar5iv. Read `manuals/arc-companion.md` before
-running a command.
+Use this workflow only for an explicit companion-reading request. It builds a
+source-faithful PDF for a paper, lecture note, or book from a paired rich source
+and PDF. Read `manuals/arc-companion.md` before running it. Use the CLI only;
+MCP is not part of this workflow.
 
-## Phase 1: Set Up
+## Phase 1: Prepare the Run
 
-### Step 1: Resolve the run
+### Step 1: Record intent
 
-Follow the automation and project-directory rules in `rules/interaction.md`.
-Set `workflow` to `companion`, preserve the requested paper identifier, and
-record `annotation_language`, `provider`, `workers`, and `refresh` in
-`<project-dir>/context.json`.
+Follow `rules/interaction.md`. Set `workflow` to `companion` and record the
+source identifier or path, annotation language, provider, workers, document
+kind, and cache policy in `<project-dir>/context.json`.
 
-If the user did not specify an annotation language, print this notice before
-any paper or LLM work and continue without asking:
+If no annotation language is given, print the following notice and continue
+with `zh-CN`:
 
 ```text
 默认使用中文生成伴读；如需切换伴读语言，请直接指定目标语言。
 ```
 
-Use `zh-CN` after printing the notice. This language applies to both the
-translation and companion commentary; the source text remains in its original
-language. Default to `workers=24`, `provider=auto`, and
-`include_reproducibility_package=false`.
+The language applies to translation and commentary. Keep source text in its
+original language. Default to `provider=auto` and `workers=24`. Reuse a domain
+only when the user explicitly supplies `--domain-id` or `--domain-manifest`.
 
-When the user explicitly supplies an existing domain, pass exactly one of
-`--domain-id <id>` or `--domain-manifest <path>`. Never discover or build a
-domain automatically for companion use.
+### Step 2: Establish the authoritative source
 
-### Step 2: Confirm the supported source
+Require a rich Markdown/TeX/HTML source paired with its PDF. The rich source
+provides faithful text, mathematics, links, tables, and assets; the PDF is
+authoritative for document structure, printed page ranges, and boundary
+reconciliation. Confirm that reproducing the source is authorized.
 
-The initial implementation supports papers that INSPIRE can resolve to an
-arXiv identifier and that have usable ar5iv full text. Do not substitute a
-local PDF, OCR, publisher copy, or another version. Confirm that reproducing
-the full source is authorized by the user or supported by a verifiable reuse
-basis. Otherwise print `WARNING:` and stop.
+Run parsing with `--document-kind auto|article|book`. If automatic
+classification is ambiguous, stop before any LLM call and ask for an explicit
+kind. A paired-PDF cache without a PDF hash and reconciliation proof is stale
+and must be recached. Never silently substitute rich-source headings when PDF
+boundaries conflict or alignment is ambiguous.
 
-## Phase 2: Build the Companion
+## Phase 2: Build by Chapter
 
-### Step 1: Run the resumable build
+### Step 1: Start or resume the build
 
 ```bash
-arc-companion build <paper-id> \
+arc-companion build <source-id> \
   --project-dir <project-dir> \
   --annotation-language <language> \
+  --document-kind auto \
   --provider <provider> \
   --workers <workers> \
   --json
 ```
 
-Add `--recache` to rebuild the rich parsed document from cached ar5iv HTML and
-retry missing assets. Add `--refresh` only when the user requested fresh
-ar5iv/INSPIRE data. Do not use both.
+Use `--recache` to rebuild cached parsing and PDF reconciliation, `--refresh`
+only when fresh remote data was requested, and never both. Useful controls are
+`--idle-timeout-seconds <seconds>` and `--regenerate-commentary`.
 
-The command must obtain the versioned rich document through `arc-paper` and
-stop unless its integrity status is `complete`. It then starts two independent
-tasks from the immutable paper source: medium-tier semantic segmentation and a
-medium-tier comprehensive terminology glossary. The glossary records the English
-term, its standard target-language equivalent, and a short target-language
-explanation. Keep every personal name in its Latin-script source form,
-including name roots in eponymous technical terms.
-Keep only specialist concepts, methods, non-standard parameters, key
-approximations, and translation-ambiguous terms useful to a field reader. Do
-not pad the glossary; cap it at 50 entries through 50 pages, 100 through 100
-pages, and 200 above 100 pages or when page count is unavailable.
-Build the global protected-name inventory only from seed-paper metadata,
-front matter, and glossary-recognized names. Ignore bibliography, reference,
-and citer authors when generating that inventory; related-work authors remain
-only in the per-unit evidence supplied to commentary.
+The controller must derive real chapters from the reconciled structure. An
+article without substantive top-level sections is one chapter; a sectioned
+article uses substantive top-level sections. For a book, exclude front matter,
+bibliography, and Index, then choose a real repeated structural level without
+inventing titles. Validate that chapters cover eligible source blocks exactly
+once and that each chapter's semantic segments cover that chapter exactly once.
 
-Segmentation divides the immutable block order into section-aligned windows
-and submits medium, stateless calls in parallel, bounded by `workers`. Each
-call returns only unique internal cuts from the inventory's stable global
-1-based ordinals; the controller adds window and paper endpoints and
-deterministically constructs source ranges.
-It locally refines any unit that exceeds the fine-grain hard limits, with at
-most three refinement rounds for that unit. The 60,000-character guard
-counts the serialized semantic source payload and excludes preservation-only
-raw HTML from size accounting; this does not remove or alter any pinned source
-content.
+### Step 2: Build the glossary and chapter context
 
-Require exact, ordered, one-time coverage and a validated glossary before unit
-generation. Also use `arc-paper` to cache a bounded, relevance-selected set of
-reference and citer full texts for evidence about prior and subsequent work;
-select at most eight references and eight citers for the paper, then expose at
-most two of each and at most 4,000 relevant source characters per related paper
-to any one unit. Fall back to verified INSPIRE abstracts when a related full
-text is unavailable.
-Only the primary paper requests a rich document. References, citers, and
-explicit-domain papers remain on lightweight parsed sections.
+When the PDF contains a real Index, preserve every main entry, subentry, page
+range, `see`, and `see also` relation as the global glossary. Do not cap,
+deduplicate, merge, or place Index pages in ordinary generation lanes. Add a
+standard target-language term and short explanation in bounded batches.
 
-Start two independent bounded waves together. Translate every unit with the
-low tier and generate companion commentary with the high tier; both receive
-the same unit and frozen glossary. All active stages and lanes share one total
-`workers` budget, so the default permits at most 24 ARC model calls in flight.
-An exception opens the build-wide submission circuit only when its wrapped
-exception chain contains the explicit `abort_batch=True` marker. In that case,
-queued calls fail locally and cancellable in-flight calls stop; ordinary unit
-failures continue to drain and checkpoint independent work.
-Each call also receives bounded full-paper navigation context: the paper's
-section map plus compact neighboring and global anchors. On hosts that support
-it, these two waves may use ARC-only MCP/cache access and internet lookup;
-segmentation, glossary generation, and review remain tool-disabled.
+Without an Index, build a concise whole-document glossary capped at 50 entries
+through 50 pages, 100 through 100 pages, and 200 above 100 pages or when page
+count is unknown. Keep personal names in their Latin-script source form.
 
-Translation may use external access only to resolve standard terminology or
-disambiguate the supplied source context. Its translation must remain a
-complete, source-faithful rendering of the supplied blocks and must never add,
-replace, or correct source content from an external page. Commentary is
-optional for an already evident passage and discusses supported prior and
-subsequent work only when this adds reader value. Never manufacture an
-explanation merely to fill every unit. A commentary that only restates the
-source with different wording, gives the same reasoning in different prose, or
-offers a generic teaching summary is prohibited: every non-empty explanation
-must add concrete information, a genuinely new reasoning step, or a useful
-connection for the reader. When explanation is useful, select the relevant
-emphasis rather than mechanically covering a checklist: explain the material's
-motivation and role in the argument, with motivation preferred at a section or
-chapter opening; compare a reference's alternative only when it starts from a
-clearly different logical motivation, viewpoint, or organization (not when it is
-merely an equivalent restatement); cautiously flag deeper incompatibilities
-between sources while treating mere convention, notation, normalization, and
-equivalent formulations as differences rather than inconsistencies; fill in
-non-evident intermediate mathematics; connect the passage to other useful
-concepts, courses, or disciplines when the relationship is concrete rather
-than a loose analogy; or add a reliable historical story or interesting fact
-when it is directly relevant and supported by a verifiable source, avoiding
-folklore and uncertain attribution. Consider current understanding or
-developments proactively, but include one only after identifying a registered,
-verifiable source, stating what specifically changed, and explaining exactly
-how it materially changes the interpretation of this passage; registered,
-verifiable evidence supports it. Do not use a
-vague "recent progress" remark, rely on model memory, chase novelty, or call
-an ordinary reformulation progress. Keep stable
-evidence identifiers only in structured evidence fields
-and manifests; never
-show controller IDs or hashes to the reader. Reader-facing citations use the
-source title plus a section or other human-readable location when available,
-and at minimum the source title. Every external commentary claim must have captured
-provenance before review and typesetting; omit a claim whose source cannot be
-captured and verified. Register such material in the global `evidence.json`
-registry and the unit's `segment-evidence/<segment>.json`; models may bind
-claims only to controller-registered evidence IDs in structured output, never
-to a URL or descriptor invented in their output.
+For each chapter, deterministically project only terms found in its source
+blocks or whose Index page range intersects the chapter. Preserve a parent when
+its subentry matches. Store the complete result in `chapter-glossary.json`.
+Every block prompt receives the compact source-to-target mapping; detailed
+explanations are limited to terms needed by that block. If the mapping exceeds
+60 KiB, send bounded stateful setup turns instead of dropping terms.
 
-Require each new primary medium-tier translation call to check exact block
-coverage/order, byte-exact opaque-token coverage/order, cross-block token
-isolation, and protected-name spelling before returning. Keep existing valid
-checkpoints because they already passed the unchanged deterministic validator;
-do not invalidate all content merely to add this instruction checklist.
+### Step 3: Prepare each chapter
 
-When a medium-tier translation changes, drops, or reorders an opaque formula,
-citation, or link token, collect every mismatched block in the segment into one
-medium-tier repair call, using the same provider selection but no MCP or internet
-access. Preserve all valid blocks. Do not
-retranslate it. Give the specialized agent the prior text, its token-stripped
-natural-language residue, inert source-run context, and `N+1` stable slot IDs
-for `N` required tokens. Require the returned slots to concatenate byte-for-byte
-to the prior residue; allow only exact insertion of explicitly missing protected
-names, with no other textual change. The controller interleaves immutable source
-tokens, preserves every other block byte-for-byte, and applies the unchanged
-strict whole-block validation. Reject opaque content in slots, coverage/order
-changes, rephrasing, or a second repair. Record the failure-only prompt version
-and medium-tier route without changing the global prompt version or invalidating
-valid content checkpoints.
+Chapters may run concurrently, subject to the single global `workers` budget.
+Within each chapter, run medium-tier semantic segmentation and a high-tier
+stateful guide session in parallel. Long guides advance through bounded source
+windows, then produce an optional-field guide covering motivation, contents,
+section logic, place in the document, prerequisites, and verified supplementary
+reading when useful.
 
-Strip both well-formed and bounded malformed `[[ARC_INLINE:...]]` candidates
-when deriving prior natural-language residue. Determine missing protected names
-from natural text runs only; controller-owned link, citation, and formula content
-must not trigger duplicate name insertion. Keep text runs separated, require
-case-sensitive canonical Latin spelling, and verify insertion deltas with exact
-name boundaries rather than substring counts. Run segment-wide coverage, type,
-and conditional non-empty natural-residue preflight before invoking any slot
-repair: require residue only when the source has natural text, and allow a pure
-controller-owned link/citation block to remain token-only.
+Deduplicate supplementary reading against the bibliography by DOI, arXiv ID,
+and normalized title. Include only controller-verified sources and label them
+as supplementary reading. Once guide and segmentation validate, write stable
+chapter and segment IDs such as `ch-0001` and `ch-0001.seg-0001`.
 
-If a high-tier unit finds that a useful related-work claim needs an unregistered
-source, it must leave that claim out and return at most two structured evidence
-requests. Batch all requests after the first commentary wave. Run the ARC,
-INSPIRE, and web-discovery verification lanes independently even when another
-lane has already found a candidate. Register only validated, auditable source
-content; a search snippet is discovery data, not claim evidence. Rerun only
-units whose requests produced registered evidence, once, with the same high
-tier. Clear unsupported related work after that round and never start a third
-search/rerun cycle. Do not rerun translation, segmentation, glossary, or
-unaffected commentary units.
+### Step 4: Run ordered stateful lanes
 
-MCP and web access are optional capabilities, not workflow prerequisites. If
-the host cannot provide them, continue with the current segment, frozen
-glossary, full-paper navigation context, and prepared evidence embedded in the
-portable prompt. Preserve any capability diagnostic and do not infer
-unsupported related-work claims. Then perform a medium-tier whole-document review
-of both tracks and render with the deterministic LaTeX pipeline. Never
-reconstruct missing source text, equation numbers, tables, figures, or
-bibliography with an LLM.
+Start independent translation and commentary sessions for the chapter.
+Translation uses the medium tier; commentary uses the high tier. The two lanes
+may run concurrently, but each lane advances strictly in segment order.
 
-During review normalization and again during deterministic rendering, unwrap
-reader-visible HTML/Markdown containers while preserving their meaningful body
-text, discard machine-only container summaries, and replace legacy inline
-evidence-ID markers with human-readable source-title and section/location
-citations. Keep the original source blocks and structured evidence bindings
-unchanged for audit.
+The bootstrap turn contains fixed rules, chapter guide, chapter structure,
+chapter glossary, and the first segment. Later turns contain only the current
+segment, its terms and evidence, cursor, source hash, and a short instruction.
+The model does not read project files. Every turn uses a stable idempotency key.
 
-Render every semantic unit in this order: original, translation, companion.
-Use the layer styling itself to distinguish them; do not print a controller
-unit heading (including its segment ID) or an `Original` field before each
-source passage.
-Before segmentation, exclude durable source-only table-of-contents blocks,
-acknowledgment sections, and reference-list headings and entries from every LLM
-lane, evidence input, and review payload. Keep title, author, and affiliation
-blocks under the same existing non-generative front-matter policy. Render all
-of this excluded material exactly once from the pinned source; preserve nested
-TOC hierarchy and internal links instead of regenerating or translating them.
-The renderer copies displayed formulas from the pinned source into the
-translation for local readability but omits their equation numbers. It does not
-repeat figures, tables, or other floating objects. Preserve every original
-formula, visible equation number, figure, table, caption, citation, and
-bibliography entry unchanged in the original track. Use distinct light
-background colors for translation and companion commentary, following the
-visual rhythm of the reference design. Keep original text on the plain page
-without a background or left rule. Render paper headings with unnumbered
-LaTeX section commands, preserving their source number and hierarchy through
-explicit table-of-contents entries rather than adding a second number.
+Each segment advances through `pending`, `submitted`, `schema_valid`,
+`invariant_valid`, and `accepted`. After acceptance, atomically update the lane
+ledger and automatically submit the next segment. Validate coverage, order,
+opaque tokens, protected names, language, and evidence locally. Attempt local
+JSON repair first; aggregate remaining errors into at most one correction turn
+in the same session. Do not use a paid formatter for routine blocks.
 
-### Step 2: Handle interruption or failure
+Resolve a commentary segment's bounded evidence requests before accepting that
+segment. External claims require controller-captured provenance; omit unsupported
+claims. Never let evidence resolution reorder or revisit an accepted cursor.
 
-Rerun the same build command. Valid segmentation windows, glossary work,
-refinements, translations, and commentaries are cached independently; the
-final merged segmentation is cached only after exact coverage validation.
-Changing `workers` changes only the total runtime concurrency budget and must
-not invalidate content checkpoints. Migrate a legacy per-lane checkpoint only
-when the worker count in `context.json`, or a bounded reconstruction over old
-worker values, exactly reproduces its old fingerprint and recorded local path.
-Translation and commentary lanes finish every submitted unit before aggregating
-failures, preserving all successful checkpoints; a retry submits only missing
-or stale units. Submit exactly the first `min(workers, unit_count)` source-order
-units to both lanes as the first wave. Once both lanes finish that wave, the
-pipeline must immediately render the source prefix through its final block,
-source-fidelity check, compile, and PDF-validate the persistent first-round
-preview before submitting any remaining unit, resolving evidence, or reviewing.
-Inspect its `preview_pdf` path from build state when early visual QA is
-requested. Treat it as diagnostic and never as the final deliverable. Preview
-validation failure must stop the run at that boundary. When explicit visual QA
-is required before continuing, add `--stop-after-preview`; the successful
-command returns with status `preview_ready` without submitting remaining units,
-resolving evidence, or reviewing. Inspect the PDF and, after any ARC correction,
-rerun the same command without that flag to resume from valid checkpoints. If a
-traceback and checkpoint inventory show that an early
-failure cancelled unrelated units, reproduce it with a minimal package test and
-fix the scheduler in `packages/arc-companion`, never only in the current run
-directory.
-Checkpoints are keyed by source, asset, evidence, glossary, language, model,
-prompt, schema, and workflow hashes, so only failed or stale work runs again.
-Print every returned `WARNING:`. A segmentation warning must name the affected
-window or local refinement and the rejected cut condition. Do not report the
-first-round preview as the completed companion PDF.
+At a safe accepted boundary, roll over a session at 70% of a known context
+window, or a conservative 128k-token estimate when unknown. The new generation
+receives fixed context and a bounded continuity capsule, not the accepted
+prefix. A changed earlier segment preserves the valid prefix, invalidates the
+suffix, and starts a new generation.
 
-Inspect progress without changing the run:
+### Step 5: Supervise exceptional states
+
+Timeout, cancellation, unknown submission state, provider error, or native
+session loss must stop automatic advancement and write `needs_supervision`.
+Never automatically resubmit an uncertain paid call. Inspect without mutation:
 
 ```bash
 arc-companion status --project-dir <project-dir> --json
 ```
 
-## Phase 3: Validate and Deliver
+Then explicitly choose native recovery or a new generation:
 
-### Step 1: Validate independently
+```bash
+arc-companion resume --project-dir <project-dir> --action resume-native --json
+arc-companion resume --project-dir <project-dir> --action restart-generation \
+  --confirm-possible-duplicate-charge --json
+```
+
+Use restart only after accepting that an uncertain submitted call may be billed
+twice. The ledger must retain call IDs, hashes, accepted-chain predecessor,
+session and generation, native ID, usage, and validation receipt.
+
+For background builds, forward provider progress plus `chapter_prepared`,
+`block_accepted`, `chapter_complete`, and `needs_supervision` to
+`ARC_JOB_PROGRESS_FILE`. Long builds emit build-level `review_due` at the next
+safe boundary after each 30 minutes of cumulative runtime. This command returns
+for inspection without pausing or cancelling the job:
+
+```bash
+arc-jobs watch <job-id> --until-review --json
+```
+
+### Step 6: Use the first-chapter review boundary
+
+For interactive review, add `--stop-after-first-chapter`. Schedule only the
+first substantive chapter. Return `first_chapter_ready` only after its guide,
+both ordered lanes, evidence, chapter review, typesetting, and PDF validation
+finish. Do not start chapter two. After approval, rerun without the flag; the
+accepted first chapter remains frozen. Never present the first-chapter PDF as
+the completed document.
+
+## Phase 3: Render and Validate
+
+### Step 1: Render the reader document
+
+Place one chapter guide immediately after each chapter title and before its
+first source segment. Render each segment as original, translation, then
+commentary. Distinguish layers by styling without visible `译文`, `伴读`, or
+controller labels; use `解释` where an explanation heading is needed.
+
+Use sans-serif text for source, guide, translation, commentary, and glossary,
+with CJK fallbacks `Noto Sans CJK SC`, `Source Han Sans SC/CN`, then
+`FandolHei-Regular`. Keep mathematics and formula `\\text{}` in LaTeX serif.
+Copy original text and source objects only from the pinned rich source.
+
+### Step 2: Validate independently
 
 ```bash
 arc-companion validate --project-dir <project-dir> --json
 ```
 
-Require exact ordered source-block coverage, original visible equation
-numbers, table grids and spans, figure asset hashes and captions, bibliography
-labels and order, resolved internal references, protected personal names,
-translation and annotation-record coverage (with intentionally empty commentary
-prose permitted), and a readable searchable PDF with valid
-fonts and no detected clipping or overlap. Also require repeated translation
-formulas to omit equation numbers and require the translation track not to
-repeat floating objects.
+Require exact chapter and segment coverage, one guide per chapter in the right
+position, faithful source objects and links, glossary completeness, accepted
+lane ledgers, protected names, searchable text, valid fonts, and no clipping or
+overlap. Use invisible manifest or TeX markers for hierarchy checks rather than
+reader-visible labels.
 
-### Step 2: Deliver only the PDF
+### Step 3: Deliver
 
-Return the validated `<paper-safe>_companion_<language>.pdf`. Do not list
-internal checkpoints, JSON, TeX, logs, or evidence files unless the user asks
-or a warning requires explanation.
-
-Only when the user explicitly requests a reproducibility package, run:
+Return only the validated full-document PDF. Do not list internal JSON, TeX,
+logs, ledgers, or evidence unless requested. Create a reproducibility package
+only on explicit request:
 
 ```bash
 arc-companion package --project-dir <project-dir> --json
 ```
 
-The ZIP contains the validated PDF and TeX, the primary paper assets used by
-TeX, manifests, validation, and build state. It does not include cached related
-reference/citer full texts. Test the ZIP before reporting it.
-
 ## Phase 4: Self-Reflection
 
 Read `rules/self-reflection.md`. Record coverage, page count, warnings,
-missing evidence, and improvement notes in the internal run artifacts without
-putting implementation details in the companion commentary.
+supervision events, unresolved evidence, and improvement notes in run artifacts,
+not in reader commentary.

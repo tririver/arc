@@ -5,6 +5,9 @@ RUNTIME_PROGRESS_CONTRACT_VERSION = "1"
 RUNTIME_PROGRESS_CONTRACT_MARKER = (
     f'<arc_llm_runtime_progress_contract version="{RUNTIME_PROGRESS_CONTRACT_VERSION}">'
 )
+RUNTIME_PROGRESS_SESSION_MARKER = (
+    f'<arc_llm_runtime_progress_contract version="{RUNTIME_PROGRESS_CONTRACT_VERSION}" scope="session" />'
+)
 
 
 def runtime_progress_contract() -> str:
@@ -38,3 +41,25 @@ def ensure_runtime_progress_contract(prompt: str) -> str:
     if has_runtime_progress_contract(text):
         return text
     return text.rstrip() + "\n\n" + runtime_progress_contract() + "\n"
+
+
+def ensure_runtime_progress_marker(prompt: str) -> str:
+    """Append the compact marker used after a session-generation bootstrap."""
+
+    text = str(prompt)
+    if has_runtime_progress_contract(text) or RUNTIME_PROGRESS_SESSION_MARKER in text:
+        return text
+    return text.rstrip() + "\n\n" + RUNTIME_PROGRESS_SESSION_MARKER + "\n"
+
+
+def apply_runtime_progress_contract(
+    prompt: str,
+    *,
+    scope: str,
+    generation_bootstrap: bool = True,
+) -> str:
+    if scope not in {"call", "session"}:
+        raise ValueError("progress_contract_scope must be call or session")
+    if scope == "call" or generation_bootstrap:
+        return ensure_runtime_progress_contract(prompt)
+    return ensure_runtime_progress_marker(prompt)

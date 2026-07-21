@@ -21,9 +21,7 @@ from .providers.base import (
 )
 
 
-SCHEMA_VERSION = "arc.llm.call_checkpoint.v1"
-DEFAULT_UNCERTAIN_RETRY_DELAY_SECONDS = 3600
-MAX_SUBMITTED_ATTEMPTS = 2
+SCHEMA_VERSION = "arc.llm.call_checkpoint.v2"
 
 
 class LLMCallCheckpointError(LLMWorkerError):
@@ -37,23 +35,27 @@ class LLMCallCheckpointError(LLMWorkerError):
         )
 
 
-class LLMCallRetryDeferred(LLMCallCheckpointError):
-    def __init__(self, *, eligible_at: float, checkpoint_path: Path) -> None:
-        self.eligible_at = eligible_at
+class LLMCallNeedsSupervision(LLMCallCheckpointError):
+    def __init__(self, *, checkpoint_path: Path) -> None:
         self.checkpoint_path = checkpoint_path
         LLMWorkerError.__init__(
             self,
-            f"Submitted LLM call has no recorded response; retry is deferred until {eligible_at:.3f}",
+            "Submitted LLM call has no recorded response and needs explicit supervision",
             retryable=False,
             category=LLMFailureCategory.TIMEOUT,
             abort_scope=LLMAbortScope.BATCH,
             submission_state=LLMSubmissionState.UNKNOWN,
-            retry_after_seconds=max(0.0, eligible_at - time.time()),
         )
 
 
+# Backward-compatible import name. The call is no longer retried after a delay.
+LLMCallRetryDeferred = LLMCallNeedsSupervision
+
+
 class LLMCallRetryExhausted(LLMCallCheckpointError):
-    pass
+    def __init__(self, message: str, *, checkpoint_path: Path | None = None) -> None:
+        self.checkpoint_path = checkpoint_path
+        super().__init__(message)
 
 
 @dataclass
@@ -62,6 +64,7 @@ class PreparedCall:
     identity: str
     attempt: int
     replay_response: LLMProviderResponse[Any] | None = None
+    replayed: bool = False
     _lock_handle: BinaryIO | None = None
 
     def release_lock(self) -> None:
@@ -84,6 +87,9 @@ def checkpoint_path(
     session_key: str | None = None,
     session_turn: int | None = None,
     runtime_fingerprint: str | None = None,
+    idempotency_key: str | None = None,
+    generation: int | None = None,
+    progress_contract_scope: str | None = None,
 ) -> tuple[Path, str]:
     identity_payload = {
         "prompt_sha256": sha256_text(prompt),
@@ -93,15 +99,25 @@ def checkpoint_path(
         "call_label": call_label,
         "session_policy": session_policy,
         "session_key": session_key,
-        "session_turn": session_turn,
+        # A stable logical key must survive a crash after the session receipt
+        # advanced the observable turn count.
+        "session_turn": None if idempotency_key else session_turn,
         "runtime_fingerprint": runtime_fingerprint,
+        "idempotency_key": idempotency_key,
+        "generation": generation,
+        "progress_contract_scope": progress_contract_scope,
     }
     identity = sha256_text(canonical_json(identity_payload))
     safe_label = "".join(
         character if character.isalnum() or character in "-_." else "_"
         for character in str(call_label or "call")
     )[:80]
-    return artifact_dir / "call-checkpoints" / f"{safe_label}-{identity[:16]}.json", identity
+    if idempotency_key:
+        key_hash = sha256_text(idempotency_key)
+        filename = f"idempotency-{key_hash}.json"
+    else:
+        filename = f"{safe_label}-{identity[:16]}.json"
+    return artifact_dir / "call-checkpoints" / filename, identity
 
 
 def prepare_call(
@@ -109,10 +125,13 @@ def prepare_call(
     *,
     identity: str,
     now: float | None = None,
-    retry_delay_seconds: int = DEFAULT_UNCERTAIN_RETRY_DELAY_SECONDS,
+    retry_delay_seconds: int | None = None,
     deadline: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    supervised_native_resume: bool = False,
+    native_session_available: bool = False,
 ) -> PreparedCall:
+    del retry_delay_seconds
     current_time = time.time() if now is None else now
     lock_handle = _acquire_lock(path, deadline=deadline, cancel_check=cancel_check)
     try:
@@ -129,20 +148,40 @@ def prepare_call(
                     identity=identity,
                     attempt=int(existing.get("attempt") or 1),
                     replay_response=response,
+                    replayed=True,
                 )
-            if state == "started":
-                attempt = int(existing.get("attempt") or 1)
-                eligible_at = float(existing.get("started_at") or current_time) + retry_delay_seconds
-                if current_time < eligible_at:
-                    raise LLMCallRetryDeferred(eligible_at=eligible_at, checkpoint_path=path)
-                if attempt >= MAX_SUBMITTED_ATTEMPTS:
-                    raise LLMCallRetryExhausted(
-                        f"LLM call remained uncertain after {attempt} submitted attempts: {path}"
+            if state in {"started", "resuming"}:
+                if supervised_native_resume:
+                    if not native_session_available:
+                        raise LLMCallCheckpointError(
+                            "supervised native resume requires an existing provider session id"
+                        )
+                    _authorize_native_resume(existing, current_time=current_time)
+                    _write(path, existing)
+                    return PreparedCall(
+                        path=path,
+                        identity=identity,
+                        attempt=int(existing.get("attempt") or 1),
+                        _lock_handle=lock_handle,
                     )
-                next_attempt = attempt + 1
+                raise LLMCallNeedsSupervision(checkpoint_path=path)
             elif state == "failed":
+                if supervised_native_resume and bool(existing.get("resumable")):
+                    if not native_session_available:
+                        raise LLMCallCheckpointError(
+                            "supervised native resume requires an existing provider session id"
+                        )
+                    _authorize_native_resume(existing, current_time=current_time)
+                    _write(path, existing)
+                    return PreparedCall(
+                        path=path,
+                        identity=identity,
+                        attempt=int(existing.get("attempt") or 1),
+                        _lock_handle=lock_handle,
+                    )
                 raise LLMCallRetryExhausted(
-                    f"LLM call reached a known terminal failure and will not be submitted again: {path}"
+                    f"LLM call reached a known terminal failure and will not be submitted again: {path}",
+                    checkpoint_path=path,
                 )
             else:
                 raise LLMCallCheckpointError(f"Invalid LLM call checkpoint state {state!r}: {path}")
@@ -192,7 +231,7 @@ def record_failure(prepared: PreparedCall, exc: BaseException) -> None:
                 prepared.path.unlink(missing_ok=True)
         elif disposition is not None and disposition.submission_state == LLMSubmissionState.SUBMITTED:
             current = _require_current(prepared)
-            if current.get("state") == "started":
+            if current.get("state") in {"started", "resuming"}:
                 current.update(
                     {
                         "state": "failed",
@@ -209,6 +248,20 @@ def record_failure(prepared: PreparedCall, exc: BaseException) -> None:
                 _write(prepared.path, current)
     finally:
         prepared.release_lock()
+
+
+def _authorize_native_resume(checkpoint: dict[str, Any], *, current_time: float) -> None:
+    """Record the explicit, single invocation that may reconcile a submitted turn."""
+
+    checkpoint.update(
+        {
+            "state": "resuming",
+            "submission_state": "submitted",
+            "resume_count": int(checkpoint.get("resume_count") or 0) + 1,
+            "resume_authorized_at": current_time,
+            "updated_at": current_time,
+        }
+    )
 
 
 def record_validated(prepared: PreparedCall) -> None:
@@ -237,6 +290,7 @@ def _response_to_json(response: LLMProviderResponse[Any]) -> dict[str, Any]:
         "raw_output": response.raw_output,
         "raw_model_output": response.raw_model_output,
         "prompt_sent_sha256": response.prompt_sent_sha256,
+        "prompt_sent_bytes": response.prompt_sent_bytes,
         "structured_output": response.structured_output,
     }
 
@@ -261,6 +315,7 @@ def _response_from_json(value: Any) -> LLMProviderResponse[Any]:
         raw_output=str(value.get("raw_output") or ""),
         raw_model_output=str(value.get("raw_model_output") or ""),
         prompt_sent_sha256=value.get("prompt_sent_sha256"),
+        prompt_sent_bytes=value.get("prompt_sent_bytes"),
         structured_output=(
             dict(value["structured_output"])
             if isinstance(value.get("structured_output"), Mapping)

@@ -230,6 +230,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             idle_timeout_seconds=args.idle_timeout_seconds,
             progress_callback=_job_progress_callback(),
             cancel_check=_job_cancel_check,
+            idempotency_key=args.idempotency_key,
+            progress_contract_scope="session" if args.session_policy == "stateful" else "call",
         )
     if args.command == "run-text":
         session_manager = _session_manager(args)
@@ -248,6 +250,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             idle_timeout_seconds=args.idle_timeout_seconds,
             progress_callback=_job_progress_callback(),
             cancel_check=_job_cancel_check,
+            idempotency_key=args.idempotency_key,
+            progress_contract_scope="session" if args.session_policy == "stateful" else "call",
         )
     if args.command == "schema-format":
         return format_to_schema(
@@ -294,6 +298,7 @@ def _session_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-key", default=None)
     parser.add_argument("--session-name", default=None)
     parser.add_argument("--call-label", default=None)
+    parser.add_argument("--idempotency-key", default=None)
 
 
 def _prompt_args(parser: argparse.ArgumentParser) -> None:

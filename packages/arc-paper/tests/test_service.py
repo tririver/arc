@@ -13,6 +13,7 @@ from arc_paper.cache import (
     write_json,
 )
 from arc_paper.parse.source import PARSER_VERSION
+from arc_paper.parse.structure import build_structure, empty_index_entries
 from arc_paper.providers.base import ProviderError
 
 
@@ -433,7 +434,7 @@ def test_parse_source_tex_rejects_pdf_companion(monkeypatch, tmp_path):
     assert "source=tex" in result["error"]["message"]
 
 
-def test_parse_source_warns_when_given_pdf_is_not_used(monkeypatch, tmp_path):
+def test_parse_source_fails_when_paired_pdf_is_not_extractable(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
     tex_path = tmp_path / "note.tex"
     tex_path.write_text(r"\section{Only TeX}", encoding="utf-8")
@@ -447,14 +448,9 @@ def test_parse_source_warns_when_given_pdf_is_not_used(monkeypatch, tmp_path):
 
     result = service.parse_source(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
 
-    assert result["ok"] is True
-    assert result["meta"]["warnings"] == [
-        {
-            "code": "pdf_not_used",
-            "message": "PDF input was provided but pdftotext is not installed; PDF was not used.",
-            "pdf_path": str(pdf_path),
-        }
-    ]
+    assert result["ok"] is False
+    assert result["error"]["code"] == "parse_source_invalid"
+    assert "Paired PDF reconciliation requires" in result["error"]["message"]
 
 
 def test_get_parsed_source_reads_sources_cache(monkeypatch, tmp_path):
@@ -533,7 +529,7 @@ def test_equation_context_uses_cached_parsed_json_without_fetch(monkeypatch, tmp
 
 
 def parsed_cache(paper_id: str, sections: list[dict], equations: list[dict] | None = None):
-    return {
+    parsed = {
         "paper_id": paper_id,
         "parser_version": PARSER_VERSION,
         "source_hash": "test-source",
@@ -541,6 +537,26 @@ def parsed_cache(paper_id: str, sections: list[dict], equations: list[dict] | No
         "sections": sections,
         "equations": equations or [],
     }
+    parsed["structure"] = build_structure(parsed)
+    parsed["index_entries"] = empty_index_entries()
+    return parsed
+
+
+def test_paired_pdf_cache_requires_reconciliation_proof() -> None:
+    cached = parsed_cache(
+        "local-book", [{"section_id": "s1", "title": "One", "level": 1, "text": "Body"}]
+    )
+
+    assert service._is_current_light_cache(cached, "local-book") is True
+    assert service._is_current_light_cache(cached, "local-book", paired_pdf=True) is False
+
+
+def test_cache_document_kind_must_match_request() -> None:
+    cached = parsed_cache(
+        "local-book", [{"section_id": "s1", "title": "One", "level": 1, "text": "Body"}]
+    )
+
+    assert service._is_current_light_cache(cached, "local-book", document_kind="book") is False
 
 
 def test_search_full_text_uses_cached_parsed_json_without_fetch(monkeypatch, tmp_path):

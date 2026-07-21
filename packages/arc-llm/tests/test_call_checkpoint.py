@@ -8,6 +8,8 @@ import time
 import pytest
 
 from arc_llm.call_checkpoint import (
+    LLMCallCheckpointError,
+    LLMCallNeedsSupervision,
     LLMCallRetryDeferred,
     LLMCallRetryExhausted,
     checkpoint_path,
@@ -57,19 +59,14 @@ def test_response_received_replays_without_provider_call(tmp_path: Path) -> None
     record_validated(replay)
 
 
-def test_uncertain_call_waits_one_hour_then_retries_once(tmp_path: Path) -> None:
+def test_uncertain_call_never_retries_without_supervision(tmp_path: Path) -> None:
     path, identity = _identity(tmp_path)
     first = prepare_call(path, identity=identity, now=100)
     assert first.attempt == 1
     first.release_lock()  # simulate the owning process exiting without a response
-    with pytest.raises(LLMCallRetryDeferred) as deferred:
+    with pytest.raises(LLMCallRetryDeferred):
         prepare_call(path, identity=identity, now=3699)
-    assert deferred.value.eligible_at == 3700
-
-    second = prepare_call(path, identity=identity, now=3700)
-    assert second.attempt == 2
-    second.release_lock()
-    with pytest.raises(LLMCallRetryExhausted):
+    with pytest.raises(LLMCallRetryDeferred):
         prepare_call(path, identity=identity, now=7300)
 
 
@@ -182,8 +179,21 @@ def test_known_submitted_failure_is_terminal_and_never_replayed(tmp_path: Path) 
             submission_state=LLMSubmissionState.SUBMITTED,
         ),
     )
-    with pytest.raises(LLMCallRetryExhausted, match="known terminal failure"):
+    with pytest.raises(LLMCallRetryExhausted, match="known terminal failure") as caught:
         prepare_call(path, identity=identity, now=10_000)
+    assert caught.value.checkpoint_path == path
+
+
+def test_uncertain_checkpoint_exposes_supervision_path_and_disposition(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    prepared.release_lock()
+
+    with pytest.raises(LLMCallNeedsSupervision) as caught:
+        prepare_call(path, identity=identity, now=10_000)
+
+    assert caught.value.checkpoint_path == path
+    assert caught.value.submission_state == LLMSubmissionState.UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -206,3 +216,37 @@ def test_interrupted_submitted_call_records_recovery_metadata(
     assert payload["state"] == "failed"
     assert payload["resumable"] is True
     assert payload["progress_journal"] == str(artifact_dir / "progress.jsonl")
+
+
+def test_resumable_submitted_checkpoint_requires_explicit_native_resume(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    record_failure(
+        prepared,
+        LLMWorkerTimeout("idle", submission_state=LLMSubmissionState.SUBMITTED),
+    )
+
+    with pytest.raises(LLMCallRetryExhausted):
+        prepare_call(path, identity=identity, now=101)
+    with pytest.raises(LLMCallCheckpointError, match="existing provider session id"):
+        prepare_call(
+            path,
+            identity=identity,
+            now=102,
+            supervised_native_resume=True,
+        )
+
+    resumed = prepare_call(
+        path,
+        identity=identity,
+        now=103,
+        supervised_native_resume=True,
+        native_session_available=True,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["state"] == "resuming"
+    assert payload["resume_count"] == 1
+    resumed.release_lock()
+
+    with pytest.raises(LLMCallNeedsSupervision):
+        prepare_call(path, identity=identity, now=104)

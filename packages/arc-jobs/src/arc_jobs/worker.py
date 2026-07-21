@@ -105,6 +105,9 @@ def run_job(job_id: str) -> int:
                 paths=paths,
             )
             return 1
+        if reported_status == "needs_supervision":
+            finish_job(job_id, result, "needs_supervision")
+            return 0
         if exit_code != 0:
             set_error(
                 job_id,
@@ -114,7 +117,14 @@ def run_job(job_id: str) -> int:
                 paths=paths,
             )
             return 1
-        if reported_status in {"done", "completed", "degraded", "stopped", "needs_llm"}:
+        if reported_status in {
+            "done",
+            "completed",
+            "degraded",
+            "stopped",
+            "needs_llm",
+            "first_chapter_ready",
+        }:
             finish_job(job_id, result, str(reported_status))
             return 0
         if isinstance(output, dict) and output.get("ok") is False:
@@ -269,6 +279,7 @@ def _validated_progress_event(value: Any) -> dict[str, Any]:
         None,
         "arc.llm.progress.v1",
         "arc.llm.proposers_reviewer.progress.v1",
+        "arc.companion.progress.v1",
     }:
         raise ValueError("ARC job progress event has an unsupported schema_version")
     forbidden = {"job_id", "status", "environment", "argv", "command"}

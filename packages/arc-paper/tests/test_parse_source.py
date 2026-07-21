@@ -64,7 +64,10 @@ def test_parse_tex_pdf_returns_same_shape_with_optional_details(monkeypatch, tmp
 
     parsed = parse_source_input(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
 
-    assert set(parsed) == {"paper_id", "parser_version", "source_hash", "toc", "sections", "equations"}
+    assert set(parsed) == {
+        "paper_id", "parser_version", "source_hash", "toc", "sections", "equations",
+        "structure", "index_entries",
+    }
     assert parsed["paper_id"] == "lecture-9"
     assert parsed["toc"] == [{"id": "sec:dynamics", "title": "Dynamics", "level": 1}]
     assert parsed["sections"][0]["section_id"] == "sec:dynamics"
@@ -407,7 +410,7 @@ def test_parse_tex_pdf_records_all_printed_numbers_for_multirow_align(monkeypatc
     assert parsed["equations"][0]["printed_equation_numbers"] == ["9.36", "9.37", "9.38"]
 
 
-def test_parse_tex_pdf_reports_warning_when_pdf_text_is_unavailable(monkeypatch, tmp_path):
+def test_parse_tex_pdf_fails_when_pdf_text_is_unavailable(monkeypatch, tmp_path):
     tex_path = tmp_path / "lecture9.tex"
     tex_path.write_text(
         "\n".join(
@@ -428,17 +431,10 @@ def test_parse_tex_pdf_reports_warning_when_pdf_text_is_unavailable(monkeypatch,
 
     monkeypatch.setattr(source.subprocess, "run", missing_pdftotext)
 
-    parsed, warnings = parse_source_input_with_warnings(tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9")
-
-    assert set(parsed) == {"paper_id", "parser_version", "source_hash", "toc", "sections", "equations"}
-    assert "pdf_page" not in parsed["equations"][0]
-    assert warnings == [
-        {
-            "code": "pdf_not_used",
-            "message": "PDF input was provided but pdftotext is not installed; PDF was not used.",
-            "pdf_path": str(pdf_path),
-        }
-    ]
+    with pytest.raises(ValueError, match="Paired PDF reconciliation requires"):
+        parse_source_input_with_warnings(
+            tex_path=tex_path, pdf_path=pdf_path, source_id="lecture-9"
+        )
 
 
 def test_parse_pdf_only_returns_best_effort_shape(monkeypatch, tmp_path):
@@ -455,7 +451,10 @@ def test_parse_pdf_only_returns_best_effort_shape(monkeypatch, tmp_path):
 
     parsed = parse_source_input(pdf_path=pdf_path, source_id="lecture-pdf")
 
-    assert set(parsed) == {"paper_id", "parser_version", "source_hash", "toc", "sections", "equations"}
+    assert set(parsed) == {
+        "paper_id", "parser_version", "source_hash", "toc", "sections", "equations",
+        "structure", "index_entries",
+    }
     assert parsed["paper_id"] == "lecture-pdf"
     assert parsed["toc"][0]["title"] == "1 Dynamics"
     assert parsed["sections"][0]["pdf_page_start"] == 1
@@ -486,7 +485,7 @@ def test_parse_markdown_records_sections_equations_and_line_anchors(tmp_path):
 
     parsed = parse_source_input(source_path=markdown_path, source_id="notes")
 
-    assert parsed["parser_version"] == 20
+    assert parsed["parser_version"] == 21
     assert parsed["toc"] == [
         {"id": "sec_0001", "title": "Notes", "level": 1},
         {"id": "sec_0002", "title": "Details", "level": 2},

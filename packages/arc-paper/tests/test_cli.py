@@ -300,6 +300,16 @@ def test_cli_parse_accepts_markdown_pdf_source(monkeypatch, capsys):
     assert output["data"]["pdf_path"] == "note.pdf"
 
 
+def test_cli_parse_passes_explicit_document_kind(monkeypatch, capsys):
+    def parse_source(source_path=None, **kwargs):
+        return {"ok": True, "data": kwargs, "errors": [], "meta": {}}
+
+    monkeypatch.setattr(cli.service, "parse_source", parse_source)
+
+    assert cli.main(["parse", "--markdown", "book.md", "--document-kind", "book", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["document_kind"] == "book"
+
+
 def test_cli_prints_parse_warnings_to_stderr(monkeypatch, capsys):
     def parse_source(
         source_path=None,

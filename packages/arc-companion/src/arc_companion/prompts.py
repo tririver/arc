@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "arc.companion.prompts.v12"
-SCHEMA_VERSION = "arc.companion.schemas.v9"
+PROMPT_VERSION = "arc.companion.prompts.v13"
+SCHEMA_VERSION = "arc.companion.schemas.v10"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v5"
 TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v4"
 TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION = (

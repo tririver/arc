@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +29,7 @@ def load_source_bundle(
     *,
     refresh: bool = False,
     recache: bool = False,
+    document_kind: str = "auto",
     parse: Callable[..., dict[str, Any]] | None = None,
     metadata_getter: Callable[..., dict[str, Any]] | None = None,
     references_getter: Callable[..., dict[str, Any]] | None = None,
@@ -57,18 +59,32 @@ def load_source_bundle(
         and isinstance(cached_result["data"].get("document"), dict)
     )
     if _is_explicit_local_source_id(paper_id) or cached_available:
-        parsed = _unwrap(cached_result, "complete cached source")
+        cached = _unwrap(cached_result, "complete cached source")
+        if not isinstance(cached, dict):
+            raise SourceError("arc-paper returned a non-object parsed source")
+        if _is_explicit_local_source_id(paper_id):
+            parse_kwargs = _local_reparse_kwargs(cached, paper_id)
+        else:
+            parse_kwargs = {"source": "ar5iv", "paper_id": paper_id}
+        result = parse(
+            **parse_kwargs,
+            include_document=True,
+            refresh=refresh,
+            recache=recache,
+            document_kind=document_kind,
+        )
+        parsed = _unwrap(result, "current parsed source")
         if not isinstance(parsed, dict):
             raise SourceError("arc-paper returned a non-object parsed source")
-        document = parsed.get("document")
-        if not isinstance(document, dict):
-            raise SourceError(
-                "arc-paper did not return document; recache this source with the current parser"
-            )
-        validate_complete_document(document)
+        document = _validated_document(parsed, document_kind=document_kind)
+        # A reparsed local source normally carries these values itself.  Retain
+        # cached evidence metadata when ARC-Paper intentionally returns only
+        # source structure and content.
         metadata = _cached_source_metadata(parsed)
-        references = _cached_source_list(parsed, "references")
-        citers = _cached_source_list(parsed, "citers")
+        if metadata == {"_arc_companion_metadata_source": "unavailable"}:
+            metadata = _cached_source_metadata(cached)
+        references = _cached_source_list(parsed, "references") or _cached_source_list(cached, "references")
+        citers = _cached_source_list(parsed, "citers") or _cached_source_list(cached, "citers")
         return SourceBundle(
             paper_id=str(parsed.get("paper_id") or paper_id),
             parsed=parsed,
@@ -84,14 +100,12 @@ def load_source_bundle(
         include_document=True,
         refresh=refresh,
         recache=recache,
+        document_kind=document_kind,
     )
     parsed = _unwrap(result, "complete parsed source")
     if not isinstance(parsed, dict):
         raise SourceError("arc-paper returned a non-object parsed source")
-    document = parsed.get("document")
-    if not isinstance(document, dict):
-        raise SourceError("arc-paper did not return document; recache this paper with the current parser")
-    validate_complete_document(document)
+    document = _validated_document(parsed, document_kind=document_kind)
 
     metadata = _required_data(
         metadata_getter(paper_id, refresh=refresh),
@@ -139,6 +153,71 @@ def _is_explicit_local_source_id(source_id: str) -> bool:
     """
     namespace, separator, _ = source_id.strip().partition(":")
     return bool(separator) and namespace.casefold() in {"local", "isbn"}
+
+
+def _local_reparse_kwargs(parsed: dict[str, Any], source_id: str) -> dict[str, Any]:
+    document = parsed.get("document") if isinstance(parsed.get("document"), dict) else {}
+    source = document.get("source") if isinstance(document.get("source"), dict) else {}
+    path_text = str(source.get("path") or "").strip()
+    pdf_text = str(source.get("pdf_path") or "").strip()
+    source_format = str(source.get("format") or "").strip().casefold()
+    if not source_format and path_text:
+        source_format = Path(path_text).suffix.lower().lstrip(".")
+    if source_format in {"md", "markdown"} and path_text:
+        return {
+            "source": "markdown-pdf" if pdf_text else "markdown",
+            "source_id": source_id,
+            "markdown_path": path_text,
+            **({"pdf_path": pdf_text} if pdf_text else {}),
+        }
+    if source_format == "tex" and path_text:
+        return {
+            "source": "tex-pdf" if pdf_text else "tex",
+            "source_id": source_id,
+            "tex_path": path_text,
+            **({"pdf_path": pdf_text} if pdf_text else {}),
+        }
+    if source_format in {"html", "htm"} and path_text and not pdf_text:
+        return {"source": "html", "source_id": source_id, "html_path": path_text}
+    if source_format == "pdf" and (pdf_text or path_text):
+        return {"source": "pdf", "source_id": source_id, "pdf_path": pdf_text or path_text}
+    raise SourceError(
+        "cached local source lacks reusable source provenance; recache it with the current arc-paper parser"
+    )
+
+
+def _validated_document(parsed: dict[str, Any], *, document_kind: str) -> dict[str, Any]:
+    document = parsed.get("document")
+    if not isinstance(document, dict):
+        raise SourceError("arc-paper did not return document; recache this source with the current parser")
+    validate_complete_document(document)
+    structure = parsed.get("structure")
+    if not isinstance(structure, dict) or structure.get("schema_version") != "arc.paper.structure.v1":
+        raise SourceError("arc-paper source lacks the current structure contract; recache it")
+    if structure.get("requested_document_kind") != document_kind:
+        raise SourceError("arc-paper structure does not match the requested document kind; recache it")
+    source = document.get("source") if isinstance(document.get("source"), dict) else {}
+    pdf_path_text = str(source.get("pdf_path") or "").strip()
+    source_pdf_hash = str(source.get("pdf_sha256") or "").strip()
+    if pdf_path_text or source_pdf_hash:
+        if not pdf_path_text:
+            raise SourceError("paired PDF provenance has no path; recache it")
+        pdf_path = Path(pdf_path_text)
+        if not pdf_path.is_file():
+            raise SourceError(f"paired PDF is unavailable: {pdf_path}")
+        current_pdf_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+        if source_pdf_hash != current_pdf_hash:
+            raise SourceError("paired PDF hash changed; recache the source before companion generation")
+        try:
+            from arc_paper import service as paper_service
+        except ImportError as exc:  # pragma: no cover - packaging failure
+            raise SourceError("arc-paper structure validator is unavailable") from exc
+        if not paper_service.has_reconciliation_proof(structure, pdf_hash=current_pdf_hash):
+            raise SourceError("paired PDF lacks a current complete reconciliation proof; recache it")
+        proof = structure.get("reconciliation") or {}
+        if proof.get("source_hash") != parsed.get("source_hash"):
+            raise SourceError("paired PDF reconciliation proof does not match the parsed source")
+    return document
 
 
 def _cached_source_metadata(parsed: dict[str, Any]) -> dict[str, Any]:

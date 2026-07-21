@@ -1132,6 +1132,8 @@ def _call_json_runner(
             idle_timeout_seconds=idle_timeout_seconds,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
+            idempotency_key=call_label if effective_session_policy == "stateful" else None,
+            progress_contract_scope="session" if effective_session_policy == "stateful" else "call",
         )
         _maybe_record_cache_warning(
             result,

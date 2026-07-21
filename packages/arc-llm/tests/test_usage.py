@@ -19,3 +19,10 @@ def test_codex_cache_ratio_uses_cached_input_tokens():
     assert usage.total_input_tokens == 100
     assert usage.effective_cached_input_tokens == 70
     assert usage.cached_input_ratio == 0.7
+
+
+def test_missing_provider_usage_is_explicitly_unknown_not_zero():
+    usage = LLMUsage()
+    assert usage.status == "unknown"
+    assert usage.to_json()["status"] == "unknown"
+    assert usage.to_json()["input_tokens"] is None

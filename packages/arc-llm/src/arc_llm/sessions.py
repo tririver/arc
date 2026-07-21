@@ -12,7 +12,7 @@ from pathlib import Path
 from threading import Lock, RLock, get_ident
 from typing import Any, Iterator, Mapping, Sequence
 
-from .schema_cache import sha256_text
+from .schema_cache import canonical_json, sha256_text
 
 
 SessionPolicy = str
@@ -52,6 +52,7 @@ class LLMSessionManager:
         self.root = Path(root).expanduser()
         self.sessions_path = self.root / "sessions.json"
         self.calls_path = self.root / "calls.jsonl"
+        self.receipts_dir = self.root / "receipts"
         self.root.mkdir(parents=True, exist_ok=True)
         self._state_lock = Lock()
         self._sessions = self._load_sessions()
@@ -132,8 +133,10 @@ class LLMSessionManager:
         provider_used: str,
         model_used: str | None,
         native_session_id: str | None,
+        idempotency_key: str | None = None,
+        generation: int | None = None,
         extra: Mapping[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         item = {
             "session_key": key,
             "call_label": call_label,
@@ -144,29 +147,108 @@ class LLMSessionManager:
             "provider_used": provider_used,
             "model_used": model_used,
             "native_session_id": native_session_id,
+            "idempotency_key": idempotency_key,
+            "generation": generation,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         if extra:
             item.update(dict(extra))
         with self.lock(key):
             with self._calls_store_lock():
+                if idempotency_key:
+                    receipt_path = self._receipt_path(idempotency_key)
+                    existing = _read_json(receipt_path)
+                    fingerprint = _turn_fingerprint(item)
+                    if existing is not None:
+                        if (
+                            existing.get("idempotency_key") != idempotency_key
+                            or existing.get("fingerprint") != fingerprint
+                        ):
+                            raise ValueError(
+                                f"session receipt identity changed for idempotency key {idempotency_key}"
+                            )
+                        if not _jsonl_has_idempotency_key(self.calls_path, idempotency_key):
+                            stored_turn = existing.get("turn")
+                            if isinstance(stored_turn, dict):
+                                _append_jsonl(self.calls_path, stored_turn)
+                        return False
+                    _atomic_write_json(
+                        receipt_path,
+                        {
+                            "schema_version": "arc.llm.session_receipt.v1",
+                            "idempotency_key": idempotency_key,
+                            "fingerprint": fingerprint,
+                            "turn": item,
+                        },
+                    )
                 _append_jsonl(self.calls_path, item)
+                return True
 
-    def turn_count(self, key: str) -> int:
+    def turn_count(self, key: str, *, generation: int | None = None) -> int:
         with self._calls_store_lock():
             try:
                 lines = self.calls_path.read_text(encoding="utf-8").splitlines()
             except OSError:
                 return 0
-        count = 0
+        records: list[dict[str, Any]] = []
         for line in lines:
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict) and payload.get("session_key") == key:
-                count += 1
-        return count
+                records.append(payload)
+        seen = {
+            str(record["idempotency_key"])
+            for record in records
+            if record.get("idempotency_key")
+        }
+        if self.receipts_dir.exists():
+            for path in self.receipts_dir.glob("*.json"):
+                receipt = _read_json(path)
+                turn = receipt.get("turn") if isinstance(receipt, dict) else None
+                if not isinstance(turn, dict) or turn.get("session_key") != key:
+                    continue
+                idem = str(turn.get("idempotency_key") or "")
+                if idem and idem not in seen:
+                    records.append(turn)
+                    seen.add(idem)
+        if generation is not None:
+            records = [record for record in records if int(record.get("generation") or 1) == generation]
+        return len(records)
+
+    def rotate(
+        self,
+        key: str,
+        *,
+        reason: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LLMSessionRef:
+        """Start a new logical generation without reusing the native session."""
+
+        with self.lock(key):
+            with self._sessions_store_lock():
+                with self._state_lock:
+                    self._reload_sessions_from_disk_locked()
+                    ref = self._require_ref(key)
+                    updated_metadata = dict(ref.metadata)
+                    if metadata:
+                        updated_metadata.update(dict(metadata))
+                    if reason:
+                        updated_metadata["last_rotation_reason"] = reason
+                    updated = LLMSessionRef(
+                        key=ref.key,
+                        provider=ref.provider,
+                        model=ref.model,
+                        runtime_fingerprint=ref.runtime_fingerprint,
+                        native_session_id=None,
+                        name=ref.name,
+                        metadata=updated_metadata,
+                        generation=ref.generation + 1,
+                    )
+                    self._sessions[key] = updated
+                    self._write_sessions()
+                    return updated
 
     def has_native_session(self, key: str) -> bool:
         with self._sessions_store_lock():
@@ -223,7 +305,10 @@ class LLMSessionManager:
                         name=name,
                         metadata=metadata,
                     )
-            yield ref, self.turn_count(key)
+            yield ref, self.turn_count(key, generation=ref.generation)
+
+    def _receipt_path(self, idempotency_key: str) -> Path:
+        return self.receipts_dir / f"{sha256_text(idempotency_key)}.json"
 
     def _get_or_create_locked(
         self,
@@ -591,6 +676,38 @@ def _append_jsonl(path: Path, item: Any) -> None:
         handle.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read session receipt {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"session receipt is not an object: {path}")
+    return value
+
+
+def _jsonl_has_idempotency_key(path: Path, idempotency_key: str) -> bool:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("idempotency_key") == idempotency_key:
+            return True
+    return False
+
+
+def _turn_fingerprint(item: Mapping[str, Any]) -> str:
+    stable = {key: value for key, value in item.items() if key != "created_at"}
+    return sha256_text(canonical_json(stable))
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:

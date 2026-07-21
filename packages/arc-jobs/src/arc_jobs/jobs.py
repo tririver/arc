@@ -35,7 +35,15 @@ ALLOWED_COMMANDS = frozenset(
     }
 )
 SUCCESS_TERMINAL_STATUSES = frozenset(
-    {"done", "completed", "degraded", "stopped", "needs_llm"}
+    {
+        "done",
+        "completed",
+        "degraded",
+        "stopped",
+        "needs_llm",
+        "first_chapter_ready",
+        "needs_supervision",
+    }
 )
 FAILURE_TERMINAL_STATUSES = frozenset({"failed", "cancelled"})
 TERMINAL_STATUSES = SUCCESS_TERMINAL_STATUSES | FAILURE_TERMINAL_STATUSES
@@ -906,6 +914,11 @@ def record_progress(job_id: str, event: Mapping[str, Any]) -> None:
             "current",
             "title",
             "section_id",
+            "chapter_id",
+            "segment_id",
+            "lane",
+            "generation",
+            "block_status",
             "warning",
             "warnings",
             "failure_count",

@@ -21,6 +21,7 @@ FONT_REPORT = """name                                 type              encoding
 ------------------------------------ ----------------- ---------------- --- --- --- ---------
 ABCDEE+FandolSong-Regular            CID TrueType      Identity-H       yes yes yes      8  0
 XYZZY+LatinModernRoman               Type 1C           Custom           yes yes yes      9  0
+QWERTY+NotoSansCJKSC                 CID TrueType      Identity-H       yes yes yes     10  0
 """
 
 
@@ -57,11 +58,27 @@ def test_validate_pdf_checks_fonts_and_renders_every_page(tmp_path: Path, monkey
 
     assert report["pages"] == 3
     assert report["encrypted"] is False
-    assert report["embedded_font_count"] == 2
+    assert report["embedded_font_count"] == 3
+    assert report["font_roles"]["sans"] == ["NotoSansCJKSC"]
     assert len(report["render_paths"]) == 3
     render_calls = [call for call in calls if Path(call[0]).name == "pdftoppm"]
     assert [call[call.index("-f") + 1] for call in render_calls] == ["1", "2", "3"]
     assert all(Path(path).is_file() for path in report["render_paths"])
+    assert all(call[call.index("-r") + 1] == "144" for call in render_calls)
+
+
+def test_validate_pdf_rejects_removed_visible_labels(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF fixture")
+    monkeypatch.setattr(pdf_module.shutil, "which", lambda name: f"/tools/{name}")
+    runner, _ = _pdf_runner(tmp_path)
+    def labeled_runner(command, **kwargs):
+        result = runner(command, **kwargs)
+        if Path(command[0]).name == "pdftotext":
+            Path(command[-1]).write_text("原文\n译文\n", encoding="utf-8")
+        return result
+    with pytest.raises(PDFError, match="visible layer labels"):
+        validate_pdf(source, runner=labeled_runner)
 
 
 def test_compile_latex_uses_non_hidden_unique_jobname_and_cleans_sidecars(

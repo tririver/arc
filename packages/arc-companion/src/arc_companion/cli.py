@@ -60,14 +60,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     build.add_argument("--force", action="store_true")
     build.add_argument(
-        "--stop-after-preview",
+        "--stop-after-first-chapter",
         action="store_true",
         help=(
-            "return successfully after the first wave's preview passes source, "
+            "return successfully after the first chapter artifact passes source, "
             "compile, and PDF validation; rerun without this flag to resume"
         ),
     )
+    build.add_argument(
+        "--document-kind",
+        choices=("auto", "article", "book"),
+        default="auto",
+    )
+    build.add_argument("--idle-timeout-seconds", type=float, default=None)
+    build.add_argument("--regenerate-commentary", action="store_true")
+    build.add_argument(
+        "--legacy-checkpoint",
+        default=None,
+        help=(
+            "read-only legacy checkpoint file or directory used only to seed "
+            "eligible cuts, glossary data, and validated translations"
+        ),
+    )
     build.add_argument("--json", action="store_true")
+
+    resume = sub.add_parser("resume", help="Resume a supervised companion generation")
+    resume.add_argument("--project-dir", required=True)
+    resume.add_argument(
+        "--action", required=True, choices=("resume-native", "restart-generation")
+    )
+    resume.add_argument(
+        "--confirm-possible-duplicate-charge",
+        action="store_true",
+        help="required when restarting a generation because a submitted call may be billed twice",
+    )
+    resume.add_argument("--json", action="store_true")
 
     status = sub.add_parser("status", help="Show checkpoint/build status")
     status.add_argument("--project-dir", required=True)
@@ -119,12 +146,26 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 domain_manifest=Path(args.domain_manifest) if args.domain_manifest else None,
                 allow_internet=not args.no_internet,
                 context_paper_ids=tuple(args.context_paper_id),
-                stop_after_preview=args.stop_after_preview,
+                stop_after_first_chapter=args.stop_after_first_chapter,
+                document_kind=args.document_kind,
+                idle_timeout_seconds=args.idle_timeout_seconds,
+                regenerate_commentary=args.regenerate_commentary,
+                legacy_checkpoint=(
+                    Path(args.legacy_checkpoint) if args.legacy_checkpoint else None
+                ),
             )
         except ValueError as exc:
             result = {"ok": False, "data": None, "error": {"code": "invalid_options", "message": str(exc)}, "errors": []}
         else:
             result = build_companion(options)
+    elif args.command == "resume":
+        from .pipeline import resume_companion
+
+        result = resume_companion(
+            Path(args.project_dir),
+            action=args.action,
+            confirm_possible_duplicate_charge=args.confirm_possible_duplicate_charge,
+        )
     elif args.command == "status":
         result = read_status(Path(args.project_dir))
     elif args.command == "validate":

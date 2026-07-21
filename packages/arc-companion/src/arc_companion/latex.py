@@ -44,7 +44,7 @@ def escape_tex(value: Any) -> str:
 
     def flush_math() -> None:
         if math_atoms:
-            rendered.append("\\(" + "".join(math_atoms) + "\\)")
+            rendered.append("{\\rmfamily\\(" + "".join(math_atoms) + "\\)}")
             math_atoms.clear()
 
     for char in text:
@@ -64,7 +64,7 @@ def escape_tex(value: Any) -> str:
             rendered.append("\\textsuperscript{i}")
             continue
         if char == "′":
-            rendered.append("\\textsuperscript{\\(\\prime\\)}")
+            rendered.append("\\textsuperscript{{\\rmfamily\\(\\prime\\)}}")
             continue
         rendered.append(replacements.get(char, char))
     flush_math()
@@ -158,6 +158,8 @@ def render_companion_tex(
     glossary: dict[str, Any] | list[dict[str, Any]] | None = None,
     evidence_by_segment: dict[str, list[dict[str, Any]]] | None = None,
     augmentation_scope: str = "all",
+    chapters: list[dict[str, Any]] | None = None,
+    chapter_guides: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     if augmentation_scope not in {"all", "substantive"}:
         raise ValueError(f"unsupported companion augmentation scope: {augmentation_scope}")
@@ -217,6 +219,12 @@ def render_companion_tex(
     rendered_annotation_ids: list[str] = []
     translation_audits: list[dict[str, Any]] = []
     source_box_open = False
+    chapter_guides = chapter_guides or {}
+    chapter_after_block = {
+        str(item.get("block_ids", [""])[0]): str(item.get("chapter_id") or "")
+        for item in chapters or [] if item.get("block_ids")
+    }
+    rendered_chapter_guides: list[str] = []
     for block in blocks:
         bid = block_id(block)
         source_hash = sha256_json(block)
@@ -243,6 +251,10 @@ def render_companion_tex(
                 copied_assets=copied_assets,
                 rendered_links=rendered_links,
             ))
+            chapter_id = chapter_after_block.get(bid)
+            if chapter_id:
+                body.append(_render_chapter_guide(chapter_guides.get(chapter_id) or {}, language=language))
+                rendered_chapter_guides.append(chapter_id)
             if segment_id and last_by_segment.get(segment_id) == bid:
                 if source_box_open:
                     body.append("\\end{arcsource}\n")
@@ -305,7 +317,9 @@ def render_companion_tex(
     else:
         author_text = str(authors)
     front_body = _render_front_matter(front, represented_roles=set(front_roles.values()))
-    guide = _render_reading_guide(language=language, include_translation=bool(translations))
+    guide = "" if chapters else _render_reading_guide(
+        language=language, include_translation=bool(translations)
+    )
     glossary_tex = _render_glossary(glossary, language=language)
     tex = (
         _preamble(title=title, authors=author_text, language=language)
@@ -342,6 +356,8 @@ def render_companion_tex(
             "rendered_translation_segment_ids": rendered_translation_ids,
             "rendered_annotation_segment_ids": rendered_annotation_ids,
             "translations": translation_audits,
+            "chapter_ids": [str(item.get("chapter_id") or "") for item in chapters or []],
+            "rendered_chapter_guide_ids": rendered_chapter_guides,
         },
     }
     return tex, manifest
@@ -422,6 +438,17 @@ def _preamble(*, title: Any, authors: str, language: str) -> str:
 }}{{
   \PackageError{{arc-companion}}{{No supported CJK serif font found}}{{Install Noto Serif CJK SC, Source Han Serif SC/CN, or FandolSong-Regular.}}
 }}}}}}}}
+\IfFontExistsTF{{Noto Sans CJK SC}}{{
+  \setCJKsansfont{{Noto Sans CJK SC}}
+}}{{\IfFontExistsTF{{Source Han Sans SC}}{{
+  \setCJKsansfont{{Source Han Sans SC}}
+}}{{\IfFontExistsTF{{Source Han Sans CN}}{{
+  \setCJKsansfont{{Source Han Sans CN}}
+}}{{\IfFontExistsTF{{FandolHei-Regular}}{{
+  \setCJKsansfont{{FandolHei-Regular}}
+}}{{
+  \PackageError{{arc-companion}}{{No supported CJK sans font found}}{{Install Noto Sans CJK SC, Source Han Sans SC/CN, or FandolHei-Regular.}}
+}}}}}}}}
 \usepackage[margin=25mm]{{geometry}}
 \hypersetup{{hidelinks}}
 \definecolor{{ArcTranslationBackground}}{{HTML}}{{F0F7F3}}
@@ -438,6 +465,7 @@ def _preamble(*, title: Any, authors: str, language: str) -> str:
 \setlength{{\parindent}}{{1.5em}}
 \setlength{{\parskip}}{{0.35em}}
 \begin{{document}}
+\sffamily
 \begin{{titlepage}}
 \centering
 \vspace*{{\fill}}
@@ -601,7 +629,7 @@ def _equation_environment(tex: str, *, number: Any, label: Any) -> str:
         tex = _strip_equation_identity(tex, strip_numbers=True, strip_labels=False)
     tag = f"\n\\tag{{{escape_tex(_clean_tag(number))}}}" if number not in {None, ""} else ""
     label_tex = f"\n\\label{{{_safe_label(label)}}}" if label else ""
-    return f"\\begin{{equation*}}\n{tex}{tag}{label_tex}\n\\end{{equation*}}\n"
+    return f"\\begingroup\\rmfamily\n\\begin{{equation*}}\n{tex}{tag}{label_tex}\n\\end{{equation*}}\n\\endgroup\n"
 
 
 def _disambiguate_math_row_starts(tex: str) -> str:
@@ -902,7 +930,7 @@ def _render_annotation(
         _layer_marker("COMPANION", "BEGIN", segment_id)
         +
         f"\\Needspace{{6\\baselineskip}}\n"
-        f"\\begin{{arccompanion}}\n\\noindent\\textbf{{{escape_tex(labels['companion'])}}}\\par\n"
+        f"\\begin{{arccompanion}}\n"
         + "\n".join(sections)
         + "\n\\end{arccompanion}\n"
         + _layer_marker("COMPANION", "END", segment_id)
@@ -943,7 +971,7 @@ def _render_translation(
     }
     source_blocks = {block_id(item): item for item in document.get("blocks") or []}
     parts = [_layer_marker("TRANSLATION", "BEGIN", segment_id),
-             f"\\begin{{arctranslation}}\n\\noindent\\textbf{{{escape_tex(labels['translation'])}}}\\par\n"]
+             "\\begin{arctranslation}\n"]
     translated_block_ids: list[str] = []
     equation_block_ids: list[str] = []
     excluded_float_block_ids: list[str] = []
@@ -1005,7 +1033,7 @@ def _render_translated_inline_runs(value: Any, source: dict[str, Any]) -> str:
         content = str(run.get("content") or "")
         if kind == "math":
             tex = str(run.get("tex") or content)
-            output.append(f"\\({_strip_equation_identity(tex, strip_numbers=True, strip_labels=True)}\\)")
+            output.append(f"{{\\rmfamily\\({_strip_equation_identity(tex, strip_numbers=True, strip_labels=True)}\\)}}")
         elif kind == "link":
             href = str(run.get("href") or "")
             visible = escape_tex(content or href)
@@ -1045,7 +1073,7 @@ def _render_rich_text(value: Any) -> str:
     position = 0
     for match in pattern.finditer(text):
         result.append(_render_undelimited_math_tokens(text[position:match.start()]))
-        result.append(_strip_translation_equation_identity(match.group(0)))
+        result.append("{\\rmfamily" + _strip_translation_equation_identity(match.group(0)) + "}")
         position = match.end()
     result.append(_render_undelimited_math_tokens(text[position:]))
     return "".join(result).replace("\n\n", "\\par\n")
@@ -1070,7 +1098,7 @@ def _render_undelimited_math_tokens(text: str) -> str:
             position += 1
             continue
         rendered.append(escape_tex(text[plain_start:position]))
-        rendered.append(f"\\({_strip_translation_equation_identity(token)}\\)")
+        rendered.append(f"{{\\rmfamily\\({_strip_translation_equation_identity(token)}\\)}}")
         position = end
         plain_start = end
     rendered.append(escape_tex(text[plain_start:]))
@@ -1213,6 +1241,15 @@ def _validate_companion_layers(tex: str, audit: dict[str, Any]) -> list[str]:
     provided_annotations = {str(value) for value in audit.get("provided_annotation_segment_ids") or []}
     provided_translations = {str(value) for value in audit.get("provided_translation_segment_ids") or []}
     known_ids = set(semantic_ids) | preservation_ids
+    chapter_ids = [str(value) for value in audit.get("chapter_ids") or []]
+    rendered_guides = [str(value) for value in audit.get("rendered_chapter_guide_ids") or []]
+    if chapter_ids:
+        if rendered_guides != chapter_ids:
+            errors.append("chapter guides do not cover every rendered chapter exactly once")
+        if tex.count("% ARC-CHAPTER-GUIDE-BEGIN") != len(chapter_ids):
+            errors.append("chapter guide begin markers do not match rendered chapters")
+        if tex.count("% ARC-CHAPTER-GUIDE-END") != len(chapter_ids):
+            errors.append("chapter guide end markers do not match rendered chapters")
 
     if rendered_annotations != semantic_ids:
         errors.append("companion commentary does not cover every semantic segment exactly once")
@@ -1291,6 +1328,30 @@ def _render_reading_guide(*, language: str, include_translation: bool) -> str:
     return f"\\section*{{{escape_tex(labels['guide'])}}}\n{escape_tex(text)}\\par\n"
 
 
+def _render_chapter_guide(guide: dict[str, Any], *, language: str) -> str:
+    fields = (
+        ("motivation", "学习动机"), ("main_content", "主要内容"),
+        ("section_logic", "节间逻辑"), ("book_position", "全书位置"),
+        ("prerequisites", "前置知识"),
+    )
+    parts = [
+        f"\\medskip\\noindent\\textbf{{{escape_tex(title)}}}\\par\n{_render_rich_text(guide[key])}\n"
+        for key, title in fields if str(guide.get(key) or "").strip()
+    ]
+    reading = guide.get("supplementary_reading") or []
+    if reading:
+        items = "\n".join(
+            f"\\item {_render_rich_text(item.get('title'))}: {_render_rich_text(item.get('reason'))}"
+            for item in reading if isinstance(item, dict)
+        )
+        parts.append(f"\\medskip\\noindent\\textbf{{补充阅读}}\\par\n\\begin{{itemize}}\n{items}\n\\end{{itemize}}\n")
+    heading = "章导读" if str(language).lower().startswith("zh") else "Chapter guide"
+    return (
+        f"% ARC-CHAPTER-GUIDE-BEGIN\n\\begin{{quote}}\\noindent\\textbf{{{heading}}}\\par\n"
+        + "".join(parts) + "\\end{quote}\n% ARC-CHAPTER-GUIDE-END\n"
+    )
+
+
 def _render_glossary(
     glossary: dict[str, Any] | list[dict[str, Any]] | None,
     *,
@@ -1330,7 +1391,7 @@ def _labels(language: str) -> dict[str, Any]:
             "is_chinese": True, "language": "伴读语言", "guide": "阅读导览", "glossary": "术语表",
             "source": "原文", "translation": "译文", "companion": "伴读", "unit": "伴读单元",
             "source_term": "英文术语", "target_term": "中文译法", "glossary_explanation": "简要解释",
-            "explanation": "本段解释",
+            "explanation": "解释",
             "prior": "前人工作", "later": "后续工作",
         }
     return {
@@ -1448,7 +1509,7 @@ def _render_html_node(
         if not tex:
             raise LatexError("inline MathML has no TeX annotation or alttext")
         display = str(node.get("display") or "").lower() == "block"
-        return anchor + (f"\\[{tex}\\]" if display else f"\\({tex}\\)")
+        return anchor + (f"{{\\rmfamily\\[{tex}\\]}}" if display else f"{{\\rmfamily\\({tex}\\)}}")
     if name in {"ul", "ol"}:
         class_parts = {
             part.casefold()
