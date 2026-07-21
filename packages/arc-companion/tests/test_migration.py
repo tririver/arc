@@ -131,7 +131,7 @@ def test_translation_rejects_terminology_and_protected_name_failures(text: str, 
         protected_names=["Einstein"],
     )
     assert result["receipts"][0]["reason"] == reason
-    assert result["ledgers"]["ch-0001"]["blocks"][0]["state"] == "pending"
+    assert result["ledgers"]["ch-0001"]["blocks"][0]["state"] == "prepared"
 
 
 def test_translation_rejects_opaque_token_loss() -> None:
@@ -184,7 +184,7 @@ def test_plan_is_read_only_and_never_migrates_generated_layers(tmp_path) -> None
 
     assert path.read_bytes() == original
     assert plan["read_only_source"] is True
-    assert plan["never_migrated"] == ["guides", "annotations", "reviews", "tex", "pdf"]
+    assert plan["never_migrated"] == ["tex", "pdf"]
     assert not any(key in plan for key in ("guides", "annotations", "reviews", "tex", "pdf"))
 
 

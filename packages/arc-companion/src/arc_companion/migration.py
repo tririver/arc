@@ -6,7 +6,14 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .io import sha256_json
+from .artifact_store import AcceptedArtifactStore, ArtifactStoreError, canonical_sha256
+from .content import (
+    ContentBundleError,
+    checkpoint_receipts,
+    reader_content_from_overrides,
+    store_reader_content,
+)
+from .io import sha256_file, sha256_json
 from .ledger import LANE_LEDGER_VERSION
 from .projection import is_translatable, opaque_inline_tokens, translation_input_block
 from .source import block_id
@@ -14,11 +21,13 @@ from .source import block_id
 
 MIGRATION_VERSION = "arc.companion.legacy-migration.v1"
 NEVER_MIGRATED_ARTIFACTS = (
-    "guides",
-    "annotations",
-    "reviews",
     "tex",
     "pdf",
+)
+MIGRATION_CANDIDATE_ARTIFACTS = ("guide", "translation", "commentary", "review")
+MIGRATABLE_LEDGER_VERSIONS = (
+    "arc.companion.chapter-lane-ledger.v1",
+    LANE_LEDGER_VERSION,
 )
 
 
@@ -157,6 +166,372 @@ def legacy_translation_candidates(legacy: Mapping[str, Any]) -> Any:
     return _translations_with_segment_blocks(
         legacy.get("translations") or {}, legacy.get("segmentation")
     )
+
+
+def import_accepted_checkpoint_objects(
+    project_dir: Path,
+    *,
+    validators: Mapping[str, Callable[[Any], bool]],
+    contract_versions: Mapping[str, str],
+) -> dict[str, Any]:
+    """Strictly import accepted lane artifacts from every old fingerprint.
+
+    No legacy provider session or non-accepted result is considered. Every
+    imported value must be tied to a valid accepted ledger chain, match its
+    recorded output hash, and pass the caller's current deterministic contract.
+    The function makes no provider calls and never modifies old checkpoints.
+    """
+
+    store = AcceptedArtifactStore(project_dir)
+    checkpoint_root = project_dir.resolve() / ".arc-companion" / "checkpoints"
+    receipts: list[dict[str, Any]] = []
+    if not checkpoint_root.is_dir():
+        return {
+            "schema_version": "arc.companion.object-migration.v1",
+            "provider_calls": 0,
+            "receipts": receipts,
+        }
+    for checkpoint in sorted(path for path in checkpoint_root.iterdir() if path.is_dir()):
+        metadata = _optional_object(checkpoint / "migration-metadata.json")
+        recipe_sha = canonical_sha256({
+            "legacy_checkpoint_recipe": {
+                key: metadata.get(key)
+                for key in ("prompt_hash", "validator_hash", "provider", "model")
+            }
+        })
+        for ledger_path in sorted((checkpoint / "chapters").glob("*/*-ledger.json")):
+            receipts.extend(_import_accepted_ledger(
+                checkpoint,
+                ledger_path,
+                store=store,
+                validators=validators,
+                contract_versions=contract_versions,
+                recipe_sha256=recipe_sha,
+                metadata=metadata,
+            ))
+        overlays = sorted((checkpoint / "chapters").glob("*/*-review-overlay.json"))
+        receipts.extend(_review_overlay_receipt(checkpoint, path) for path in overlays)
+        review_path = checkpoint / "chapter-review.json"
+        if review_path.is_file() and not overlays:
+            receipts.append({
+                "checkpoint": checkpoint.name,
+                "lane": "review",
+                "accepted": False,
+                "reason": "review_response_unbound_to_base_artifacts",
+                "source_path": str(review_path),
+            })
+        reader_path = checkpoint / "reader-final.json"
+        if reader_path.is_file():
+            receipts.append(_reader_final_receipt(
+                project_dir.resolve(), checkpoint, reader_path,
+            ))
+    return {
+        "schema_version": "arc.companion.object-migration.v1",
+        "provider_calls": 0,
+        "receipts": receipts,
+        "imported_artifact_ids": [
+            item["artifact_id"] for item in receipts
+            if item.get("accepted") and item.get("artifact_id")
+        ],
+        "imported_content_sha256": [
+            item["content_sha256"] for item in receipts
+            if item.get("accepted") and item.get("content_sha256")
+        ],
+    }
+
+
+def _import_accepted_ledger(
+    checkpoint: Path,
+    ledger_path: Path,
+    *,
+    store: AcceptedArtifactStore,
+    validators: Mapping[str, Callable[[Any], bool]],
+    contract_versions: Mapping[str, str],
+    recipe_sha256: str,
+    metadata: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    ledger = _optional_object(ledger_path)
+    legacy_lane = str(ledger.get("lane") or "")
+    lane = "commentary" if legacy_lane == "companion" else legacy_lane
+    base = {
+        "checkpoint": checkpoint.name,
+        "chapter_id": str(ledger.get("chapter_id") or ledger_path.parent.name),
+        "lane": lane,
+        "ledger_path": str(ledger_path),
+    }
+    if (
+        ledger.get("schema_version") not in MIGRATABLE_LEDGER_VERSIONS
+        or lane not in MIGRATION_CANDIDATE_ARTIFACTS
+    ):
+        return [{**base, "accepted": False, "reason": "unsupported_ledger_identity"}]
+    validator = validators.get(lane)
+    contract = str(contract_versions.get(lane) or "")
+    if validator is None or not contract:
+        return [{**base, "accepted": False, "reason": "current_contract_unavailable"}]
+    expected_predecessor = hashlib.sha256(b"").hexdigest()
+    receipts = []
+    accepted_prefix_open = True
+    for block in ledger.get("blocks") or []:
+        segment_id = str(block.get("segment_id") or "")
+        item = {**base, "segment_id": segment_id}
+        if not accepted_prefix_open or block.get("state") != "accepted":
+            accepted_prefix_open = False
+            receipts.append({**item, "accepted": False, "reason": "ledger_state_not_accepted"})
+            continue
+        reason = _validate_accepted_ledger_block(block, expected_predecessor)
+        if reason:
+            accepted_prefix_open = False
+            receipts.append({**item, "accepted": False, "reason": reason})
+            continue
+        expected_predecessor = str(block["accepted_chain_sha256"])
+        candidate = _legacy_lane_candidate(
+            checkpoint, lane=lane, chapter_id=base["chapter_id"], segment_id=segment_id,
+            output_sha256=str(block.get("output_sha256") or ""),
+        )
+        if candidate is None:
+            receipts.append({**item, "accepted": False, "reason": "output_checkpoint_not_proven"})
+            continue
+        try:
+            valid = validator(candidate["output"])
+        except Exception:
+            valid = False
+        if not valid:
+            receipts.append({**item, "accepted": False, "reason": "current_contract_rejected"})
+            continue
+        try:
+            record = store.put_accepted(
+                kind=lane,
+                semantic_input_sha256=str(block["input_sha256"]),
+                recipe_sha256=recipe_sha256,
+                contract_version=contract,
+                output=candidate["output"],
+                ledger_block=block,
+                provider_receipt={
+                    "provider": str(metadata.get("provider") or "legacy-provider-not-recorded"),
+                    "model": str(metadata.get("model") or "legacy-model-not-recorded"),
+                    "call_id": str(
+                        (block.get("logical_receipt") or {}).get("idempotency_key")
+                        or (block.get("logical_receipt") or {}).get("call_id")
+                        or f"legacy:{checkpoint.name}:{lane}:{segment_id}"
+                    ),
+                    "usage": {"availability": "not_recorded_in_legacy_checkpoint"},
+                },
+                provenance={
+                    "migration_version": MIGRATION_VERSION,
+                    "checkpoint_dir": str(checkpoint),
+                    "ledger": str(ledger_path),
+                    "output_checkpoint": candidate["source_path"],
+                    "legacy_lane": legacy_lane,
+                },
+            )
+        except ArtifactStoreError as exc:
+            receipts.append({**item, "accepted": False, "reason": "object_store_rejected", "detail": str(exc)})
+            continue
+        receipts.append({
+            **item,
+            "accepted": True,
+            "reason": "accepted_ledger_and_current_contract_valid",
+            "artifact_id": record["artifact_id"],
+            "source_path": candidate["source_path"],
+        })
+    return receipts
+
+
+def _validate_accepted_ledger_block(block: Mapping[str, Any], predecessor: str) -> str | None:
+    if str(block.get("predecessor_accepted_chain_sha256") or "") != predecessor:
+        return "accepted_chain_predecessor_mismatch"
+    input_sha = str(block.get("input_sha256") or "")
+    output_sha = str(block.get("output_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", input_sha) or not re.fullmatch(r"[0-9a-f]{64}", output_sha):
+        return "input_or_output_hash_invalid"
+    validation = block.get("validation_receipt")
+    logical = block.get("logical_receipt")
+    if not isinstance(validation, Mapping) or not validation:
+        return "validation_receipt_missing"
+    if not isinstance(logical, Mapping) or not logical:
+        return "logical_receipt_missing"
+    expected_chain = hashlib.sha256(json.dumps({
+        "predecessor": predecessor,
+        "segment_id": block.get("segment_id"),
+        "input_sha256": input_sha,
+        "output_sha256": output_sha,
+        "generation": block.get("generation"),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if block.get("accepted_chain_sha256") != expected_chain:
+        return "accepted_chain_hash_mismatch"
+    return None
+
+
+def _legacy_lane_candidate(
+    checkpoint: Path,
+    *,
+    lane: str,
+    chapter_id: str,
+    segment_id: str,
+    output_sha256: str,
+) -> dict[str, Any] | None:
+    candidates: list[tuple[Path, str | None]] = []
+    if lane == "commentary":
+        candidates.extend((path, "annotation") for path in (checkpoint / "annotations").glob("*.json"))
+    elif lane == "translation":
+        candidates.extend((path, "translation") for path in (checkpoint / "translations").glob("*.json"))
+        candidates.extend((path, "translation") for path in (checkpoint / "translation-drafts").glob("*.json"))
+    elif lane == "guide":
+        candidates.append((checkpoint / "chapters" / chapter_id / "chapter-guide.json", None))
+    for path, output_key in candidates:
+        value = _optional_object(path)
+        if not value:
+            continue
+        if lane != "guide" and str(value.get("segment_id") or "") != segment_id:
+            continue
+        output = value.get(output_key) if output_key else value
+        if canonical_sha256(output) == output_sha256:
+            return {"output": output, "source_path": str(path)}
+    return None
+
+
+def _optional_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _review_overlay_receipt(checkpoint: Path, path: Path) -> dict[str, Any]:
+    overlay = _optional_object(path)
+    lane = str(overlay.get("lane") or "")
+    ledger_path = path.with_name(f"{lane}-ledger.json")
+    ledger = _optional_object(ledger_path)
+    base = {
+        "checkpoint": checkpoint.name,
+        "chapter_id": str(overlay.get("chapter_id") or path.parent.name),
+        "lane": "review",
+        "reviewed_lane": "commentary" if lane == "companion" else lane,
+        "source_path": str(path),
+    }
+    if overlay.get("schema_version") != "arc.companion.chapter-review-overlay.v1":
+        return {**base, "accepted": False, "reason": "review_overlay_schema_invalid"}
+    blocks = (
+        ledger.get("blocks")
+        if ledger.get("schema_version") in MIGRATABLE_LEDGER_VERSIONS else None
+    )
+    if not isinstance(blocks, list) or not blocks:
+        return {**base, "accepted": False, "reason": "review_base_ledger_missing"}
+    by_segment = {str(item.get("segment_id") or ""): item for item in blocks}
+    if overlay.get("base_accepted_chain_sha256") != ledger.get("accepted_chain_sha256"):
+        return {**base, "accepted": False, "reason": "review_base_chain_mismatch"}
+    reviewed_blocks = overlay.get("blocks")
+    if not isinstance(reviewed_blocks, list) or set(by_segment) != {
+        str(item.get("segment_id") or "") for item in reviewed_blocks if isinstance(item, Mapping)
+    }:
+        return {**base, "accepted": False, "reason": "review_segment_coverage_mismatch"}
+    for reviewed in reviewed_blocks:
+        source = by_segment[str(reviewed.get("segment_id") or "")]
+        if (
+            source.get("state") != "accepted"
+            or reviewed.get("base_output_sha256") != source.get("output_sha256")
+            or reviewed.get("accepted_chain_sha256") != source.get("accepted_chain_sha256")
+            or not re.fullmatch(r"[0-9a-f]{64}", str(reviewed.get("reviewed_output_sha256") or ""))
+        ):
+            return {**base, "accepted": False, "reason": "review_base_artifact_binding_invalid"}
+    # Old overlays prove the base binding but do not contain the applied output.
+    # They are useful provenance, never reusable review content by themselves.
+    return {
+        **base,
+        "accepted": False,
+        "base_binding_valid": True,
+        "reason": "reviewed_output_checkpoint_missing",
+        "overlay_sha256": canonical_sha256(overlay),
+    }
+
+
+def _reader_final_receipt(project_dir: Path, checkpoint: Path, path: Path) -> dict[str, Any]:
+    value = _optional_object(path)
+    base = {
+        "checkpoint": checkpoint.name,
+        "lane": "reader-content",
+        "source_path": str(path),
+    }
+    overrides = value.get("final_overrides")
+    if not isinstance(overrides, Mapping):
+        return {**base, "accepted": False, "reason": "reader_final_payload_missing"}
+    chains, overlays = checkpoint_receipts(checkpoint)
+    if not chains or not overlays:
+        return {
+            **base, "accepted": False,
+            "reason": "reader_final_accepted_receipts_missing",
+        }
+    reviewed_hashes: dict[tuple[str, str], str] = {}
+    for overlay_path in sorted((checkpoint / "chapters").glob("*/*-review-overlay.json")):
+        overlay = _optional_object(overlay_path)
+        reviewed_lane = "commentary" if overlay.get("lane") == "companion" else str(overlay.get("lane") or "")
+        receipt = _review_overlay_receipt(checkpoint, overlay_path)
+        if not receipt.get("base_binding_valid"):
+            return {**base, "accepted": False, "reason": "reader_final_review_binding_invalid"}
+        for block in overlay.get("blocks") or []:
+            if isinstance(block, Mapping):
+                reviewed_hashes[(reviewed_lane, str(block.get("segment_id") or ""))] = str(
+                    block.get("reviewed_output_sha256") or ""
+                )
+    annotations = overrides.get("annotations")
+    if not isinstance(annotations, Mapping) or any(
+        canonical_sha256(output) != reviewed_hashes.get(("commentary", str(segment_id)))
+        for segment_id, output in annotations.items()
+    ):
+        return {**base, "accepted": False, "reason": "reader_final_commentary_not_review_bound"}
+    translations = overrides.get("translations")
+    if translations is not None and (
+        not isinstance(translations, Mapping) or any(
+            canonical_sha256(output) != reviewed_hashes.get(("translation", str(segment_id)))
+            for segment_id, output in translations.items()
+        )
+    ):
+        return {**base, "accepted": False, "reason": "reader_final_translation_not_review_bound"}
+    segment_ids = [
+        str(item.get("segment_id") or "")
+        for item in overrides.get("segments") or []
+        if isinstance(item, Mapping)
+    ]
+    reader_evidence = {
+        segment_id: {
+            "commentary_sources": list(
+                ((annotations or {}).get(segment_id) or {}).get("commentary_sources") or []
+            )
+        }
+        for segment_id in segment_ids
+    }
+    content = reader_content_from_overrides(
+        overrides,
+        reader_evidence_by_segment=reader_evidence,
+        accepted_ledger_chains=chains,
+        review_overlay_hashes=overlays,
+    )
+    try:
+        stored = store_reader_content(
+            project_dir,
+            content=content,
+            checkpoint_dir=checkpoint,
+            review_receipts={
+                "legacy_reader_final": {
+                    "sha256": sha256_file(path),
+                    "bytes": path.stat().st_size,
+                }
+            },
+        )
+    except (ContentBundleError, OSError, ValueError) as exc:
+        return {
+            **base,
+            "accepted": False,
+            "reason": "reader_final_current_contract_rejected",
+            "detail": str(exc),
+        }
+    return {
+        **base,
+        "accepted": True,
+        "reason": "reader_final_deterministically_revalidated",
+        "content_sha256": stored["content_sha256"],
+    }
 
 
 def migrate_legacy_cuts(
@@ -337,7 +712,12 @@ def migrate_legacy_translations(
                 block_record["translation"] = translation
                 ledger_blocks.append(block_record)
             else:
-                ledger_blocks.append({"segment_id": segment_id, "state": "pending", "generation": 1})
+                ledger_blocks.append({
+                    "segment_id": segment_id,
+                    "state": "prepared",
+                    "submission_state": "not_submitted",
+                    "generation": 1,
+                })
         ledgers[chapter_id] = {
             "schema_version": LANE_LEDGER_VERSION,
             "chapter_id": chapter_id,
