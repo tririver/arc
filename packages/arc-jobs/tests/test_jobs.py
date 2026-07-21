@@ -28,6 +28,13 @@ from arc_jobs.jobs import (
 )
 
 
+_TIER_MODEL_ENV_KEYS = tuple(
+    f"ARC_LLM_{provider}_{tier}_MODEL"
+    for provider in ("CODEX", "CLAUDE", "KIMI")
+    for tier in ("LOW", "MEDIUM", "HIGH", "MAX")
+)
+
+
 def _install_fake_cli(tmp_path: Path, monkeypatch, *, body: str) -> Path:
     scripts = tmp_path / "bin"
     scripts.mkdir(exist_ok=True)
@@ -579,6 +586,44 @@ def test_environment_snapshot_excludes_secrets_and_persists_host(tmp_path, monke
     assert persisted["ARC_AGENT_HOST"] == "kimi-code"
     assert persisted["ARC_LLM_TIMEOUT_SECONDS"] == "41"
     assert "OPENAI_API_KEY" not in persisted
+
+
+def test_environment_snapshot_preserves_explicit_provider_reasoning_effort(monkeypatch):
+    monkeypatch.setenv("ARC_CODEX_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("ARC_CLAUDE_EFFORT", "high")
+
+    persisted = snapshot_environment()
+    restored = restored_environment(persisted, base={"PATH": os.environ["PATH"]})
+
+    assert persisted["ARC_CODEX_REASONING_EFFORT"] == "medium"
+    assert persisted["ARC_CLAUDE_EFFORT"] == "high"
+    assert restored["ARC_CODEX_REASONING_EFFORT"] == "medium"
+    assert restored["ARC_CLAUDE_EFFORT"] == "high"
+
+
+@pytest.mark.parametrize("env_key", _TIER_MODEL_ENV_KEYS)
+def test_environment_snapshot_preserves_tier_model_override(monkeypatch, env_key):
+    monkeypatch.setenv(env_key, "custom-tier-model")
+
+    persisted = snapshot_environment()
+    restored = restored_environment(persisted, base={"PATH": os.environ["PATH"]})
+
+    assert persisted[env_key] == "custom-tier-model"
+    assert restored[env_key] == "custom-tier-model"
+
+
+@pytest.mark.parametrize("env_key", _TIER_MODEL_ENV_KEYS)
+def test_submit_persists_tier_model_override(tmp_path, monkeypatch, env_key):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(env_key, "custom-tier-model")
+    _install_fake_cli(tmp_path, monkeypatch, body="printf '%s' '{\"ok\":true}'")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+
+    job_id = manager.submit(["arc-paper", "--json"])
+    persisted = read_json(JobPaths.for_job(job_id).job)["environment"]
+
+    assert persisted[env_key] == "custom-tier-model"
 
 
 def test_detached_kimi_context_matches_foreground_runtime(tmp_path, monkeypatch):
