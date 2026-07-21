@@ -53,9 +53,10 @@ explicitly asks to review or confirm steps. Example: `use arc to download
 papers that cited 0911.3380 since 2024 and create a full summary of these
 papers` is direct ARC tool orchestration, not a managed workflow mode prompt.
 
-ARC LLM calls wait indefinitely by default. Do not infer a time limit from a
-quiet progress interval. When a bounded call is required, use an explicit
-`--timeout-seconds` option where the owning CLI exposes it, or an applicable
+ARC LLM calls use a one-hour monotonic deadline by default. The deadline covers
+the complete logical call, including recovery and schema formatting; nested
+steps do not receive a fresh hour. Override it with `--timeout-seconds` where
+the owning CLI exposes that option, or an applicable
 `ARC_*_TIMEOUT_SECONDS` environment variable. Explicit cancellation remains
 available for foreground and background work.
 

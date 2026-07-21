@@ -182,6 +182,10 @@ def run_acp() -> int:
             if SCENARIO == "rpc_rate_limit":
                 respond_error(request, -32000, "429 rate-limit exceeded")
                 continue
+            if SCENARIO == "stderr_rate_limit_hang":
+                sys.stderr.write("HTTP 429 rate-limit exceeded\n")
+                sys.stderr.flush()
+                hang_with_child()
             if SCENARIO == "timeout":
                 hang_with_child()
             if SCENARIO == "reverse_permission":
@@ -221,7 +225,10 @@ def main() -> int:
     if sys.argv[1:] == ["--version"]:
         print("0.28.0")
         return 0
-    if sys.argv[1:] != ["acp"]:
+    if sys.argv[1:] == ["--help"]:
+        print("usage: kimi [--max-retries-per-step N] acp")
+        return 0
+    if sys.argv[1:] not in (["acp"], ["--max-retries-per-step", "1", "acp"]):
         print("expected `acp`", file=sys.stderr)
         return 2
     return run_acp()

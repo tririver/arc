@@ -69,6 +69,7 @@ from .projection import (
 )
 from .reader_text import clean_reader_annotation, clean_reader_translation
 from .results import err, ok
+from .run_lock import BuildInProgressError, ProjectBuildLock
 from .segmentation import SegmentationError, segment_document, validate_exact_coverage
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
 from .substantive import non_substantive_block_ids
@@ -237,6 +238,40 @@ class BuildOptions:
 
 
 def build_companion(
+    options: BuildOptions,
+    *,
+    source_loader: Callable[..., SourceBundle] = load_source_bundle,
+    llm: Callable[..., dict[str, Any]] | None = None,
+    compiler: Callable[[Path, Path], None] = compile_latex,
+    pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf,
+    evidence_controller: EvidenceRequestController | None = None,
+) -> dict[str, Any]:
+    """Build or resume one companion under an exclusive project lock."""
+    project_dir = options.project_dir.resolve()
+    lock = ProjectBuildLock(project_dir / ".arc-companion-build.lock")
+    try:
+        lock.acquire()
+    except BuildInProgressError as exc:
+        return err(
+            "build_in_progress",
+            str(exc),
+            project_dir=str(project_dir),
+            retryable=True,
+        )
+    try:
+        return _build_companion_unlocked(
+            options,
+            source_loader=source_loader,
+            llm=llm,
+            compiler=compiler,
+            pdf_validator=pdf_validator,
+            evidence_controller=evidence_controller,
+        )
+    finally:
+        lock.release()
+
+
+def _build_companion_unlocked(
     options: BuildOptions,
     *,
     source_loader: Callable[..., SourceBundle] = load_source_bundle,

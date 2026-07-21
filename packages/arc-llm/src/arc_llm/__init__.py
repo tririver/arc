@@ -15,8 +15,18 @@ from .evidence import (
     evidence_requests_from_output,
     resolve_evidence_round,
 )
+from .failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from .host import HostDetection, ProviderSelection, detect_host, select_llm_provider
 from .model import ModelTierError, resolve_model
+from .providers.base import (
+    LLMAbortScope,
+    LLMFailureCategory,
+    LLMFailureDisposition,
+    LLMSubmissionState,
+    LLMWorkerError,
+    failure_disposition,
+)
+from .safety import LLMCircuitOpen, LLMSafetyController
 
 
 _LAZY_EXPORTS = {
@@ -46,14 +56,24 @@ __all__ = [
     "EvidenceRequest",
     "EvidenceResponse",
     "LLMConfig",
+    "LLMAbortScope",
+    "LLMCircuitOpen",
+    "LLMFailureCategory",
+    "LLMFailureDisposition",
+    "LLMSafetyController",
+    "LLMSubmissionState",
+    "LLMWorkerError",
     "ModelTierError",
     "MAX_EVIDENCE_ROUNDS",
     "ProviderSelection",
     "ARC_LLM_CALL_RECORD_FIELD",
     "ARC_LLM_CALL_RECORD_SCHEMA_VERSION",
     "detect_host",
+    "classify_provider_diagnostic",
+    "disposition_error_kwargs",
     "allow_evidence_requests",
     "evidence_requests_from_output",
+    "failure_disposition",
     "install_signal_cancel_chain",
     "resolve_llm_config",
     "resolve_evidence_round",

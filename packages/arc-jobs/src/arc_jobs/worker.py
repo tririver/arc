@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -167,6 +168,7 @@ def _run_command(
             cwd=cwd,
             env=environment,
         )
+        watchdog = _start_process_watchdog(process)
         update_status(
             job_id,
             paths=paths,
@@ -185,12 +187,17 @@ def _run_command(
                     )
                 time.sleep(0.1)
             exit_code = int(process.returncode or 0)
+            # A successful CLI leader can still leave helpers in its process
+            # group.  Clear the group before finalizing the persisted job.
+            _terminate_process(process)
             _drain_progress(
                 job_id, paths, offset=progress_offset, buffer=progress_buffer, final=True
             )
         except BaseException:
             _terminate_process(process)
             raise
+        finally:
+            _stop_process_watchdog(watchdog)
 
     output = _read_json_output(paths.stdout)
     result: dict[str, Any] = {
@@ -288,27 +295,87 @@ def _validated_cwd(value: Any) -> str:
 
 
 def _terminate_process(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
+    process.poll()
+    if os.name != "posix" and process.returncode is not None:
         return
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGTERM)
         else:
             process.terminate()
-        process.wait(timeout=5)
+    except OSError:
+        pass
+    if _wait_for_process_group_exit(process, timeout=0.25):
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except OSError:
+        pass
+    _wait_for_process_group_exit(process, timeout=0.25)
+
+
+def _wait_for_process_group_exit(process: subprocess.Popen[Any], *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        process.poll()
+        if os.name != "posix":
+            if process.returncode is not None:
+                return True
+        else:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _start_process_watchdog(process: subprocess.Popen[Any]) -> subprocess.Popen[Any] | None:
+    if os.name != "posix":
+        return None
+    try:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "arc_jobs.process_watchdog",
+                str(os.getpid()),
+                str(process.pid),
+                "0.25",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        _terminate_process(process)
+        raise
+
+
+def _stop_process_watchdog(watchdog: subprocess.Popen[Any] | None) -> None:
+    if watchdog is None:
+        return
+    try:
+        watchdog.wait(timeout=0.5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        watchdog.terminate()
+        watchdog.wait(timeout=0.2)
     except (OSError, subprocess.TimeoutExpired):
-        if process.poll() is None:
-            try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                pass
+        try:
+            watchdog.kill()
+        except OSError:
+            pass
 
 
 def _read_json_output(path: Path, *, max_bytes: int = 64 * 1024 * 1024) -> Any:

@@ -165,7 +165,20 @@ def write_domain_manifest(project_dir: Path, output: Path | None = None) -> Path
         else:
             grouping_result = _llm_grouping(preliminary["domain_packages"], preliminary["user_intent"])
             payload = build_domain_manifest(project_dir, grouping_result=grouping_result)
-    except Exception:
+    except Exception as exc:
+        # Schema/classification failures conservatively merge fields, but an
+        # account-wide LLM failure must stop the workflow before ideas starts.
+        try:
+            from arc_llm.providers.base import LLMAbortScope, failure_disposition
+
+            disposition = failure_disposition(exc)
+        except ImportError:
+            disposition = None
+        if disposition is not None and disposition.abort_scope in {
+            LLMAbortScope.BATCH,
+            LLMAbortScope.PROVIDER,
+        }:
+            raise
         payload = build_domain_manifest(project_dir)
     destination.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return destination

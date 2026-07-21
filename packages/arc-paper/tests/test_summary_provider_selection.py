@@ -17,10 +17,7 @@ def test_select_summary_provider_auto_uses_agent_host_env():
     assert provider.name == "claude-cli"
 
 
-def test_select_summary_provider_auto_uses_kimi_code_host(monkeypatch):
-    prompt_provider = type("PromptProvider", (), {"name": "kimi-code-cli"})()
-    monkeypatch.setattr(select_module, "select_prompt_provider", lambda *args, **kwargs: prompt_provider)
-
+def test_select_summary_provider_auto_uses_kimi_code_host():
     provider = select_summary_provider(
         "auto",
         env={"ARC_AGENT_HOST": "kimi-code"},
@@ -54,21 +51,12 @@ def test_select_summary_provider_passes_env_to_claude_native_provider():
     assert provider.prompt_provider is None
 
 
-def test_select_summary_provider_passes_env_to_kimi_prompt_provider(monkeypatch):
+def test_select_summary_provider_passes_env_to_kimi_prompt_provider():
     env = {"ARC_KIMI_BIN": "/opt/kimi/bin/kimi", "CUSTOM_SETTING": "value"}
-    captured = {}
-    prompt_provider = type("PromptProvider", (), {"name": "kimi-code-cli"})()
-
-    def select_prompt_provider(name, **kwargs):
-        captured["name"] = name
-        captured.update(kwargs)
-        return prompt_provider
-
-    monkeypatch.setattr(select_module, "select_prompt_provider", select_prompt_provider)
 
     provider = select_summary_provider("kimi-code-cli", env=env, process_chain=[])
 
     assert isinstance(provider, PromptProviderSummaryAdapter)
-    assert provider.prompt_provider is prompt_provider
+    assert provider.prompt_provider is None
     assert provider.env is env
-    assert captured == {"name": "kimi-code-cli", "env": env, "process_chain": []}
+    assert provider.process_chain == []

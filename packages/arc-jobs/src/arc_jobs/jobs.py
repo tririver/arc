@@ -424,7 +424,9 @@ class JobManager:
             status = latest
         process = status.get("process")
         process_started = isinstance(process, Mapping) and isinstance(process.get("pid"), int)
-        process_alive = process_started and _pid_record_alive(process)
+        process_alive = process_started and (
+            _pid_record_alive(process) or _recorded_process_group_alive(process)
+        )
         if paths.cancel_request.exists() or status.get("status") == "cancel_requested":
             if process_alive:
                 _terminate_recorded_process(process)
@@ -553,11 +555,16 @@ _SNAPSHOT_ENV_KEYS = frozenset(
         "ARC_LLM_TMP_DIR",
         "ARC_LLM_SCHEMA_CACHE_DIR",
         "ARC_LLM_TIMEOUT_SECONDS",
+        "ARC_LLM_MAX_CONCURRENCY",
         "ARC_CODEX_TIMEOUT_SECONDS",
+        "ARC_CODEX_MAX_CONCURRENCY",
         "ARC_CODEX_REASONING_EFFORT",
         "ARC_CLAUDE_TIMEOUT_SECONDS",
+        "ARC_CLAUDE_MAX_CONCURRENCY",
         "ARC_CLAUDE_EFFORT",
         "ARC_KIMI_TIMEOUT_SECONDS",
+        "ARC_KIMI_MAX_CONCURRENCY",
+        "ARC_KIMI_ALLOW_INTERNAL_RETRIES",
         "ARC_KIMI_WORK_DIR",
         "ARC_CODEX_BIN",
         "ARC_CLAUDE_BIN",
@@ -1254,9 +1261,15 @@ def _release_pid_lock(path: Path) -> None:
 
 
 def _terminate_recorded_process(record: Mapping[str, Any]) -> bool:
+    raw_pid = record.get("pid")
+    if not isinstance(raw_pid, int) or raw_pid <= 0:
+        return False
+    pid = raw_pid
+    # Never signal a historic process group after its recorded leader identity
+    # disappeared: the numeric PGID may already belong to an unrelated process.
+    # The worker watchdog owns descendant cleanup after a verified leader exits.
     if not _pid_record_alive(record):
         return False
-    pid = int(record["pid"])
     try:
         if os.name == "posix":
             os.killpg(pid, signal.SIGTERM)
@@ -1266,7 +1279,7 @@ def _terminate_recorded_process(record: Mapping[str, Any]) -> bool:
         return False
     deadline = time.monotonic() + 0.25
     while time.monotonic() < deadline:
-        if not _pid_record_alive(record):
+        if not _recorded_process_group_alive(record):
             return True
         time.sleep(0.01)
     try:
@@ -1276,6 +1289,21 @@ def _terminate_recorded_process(record: Mapping[str, Any]) -> bool:
             os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
+    return True
+
+
+def _recorded_process_group_alive(record: Mapping[str, Any]) -> bool:
+    if os.name != "posix":
+        return _pid_record_alive(record)
+    pid = record.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
     return True
 
 

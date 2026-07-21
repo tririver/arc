@@ -122,7 +122,16 @@ def translate_markdown(
             model=model,
             model_tier=model_tier,
         )
-        translated = str(quality_result.get("revised_markdown", translated))
+        revised_prefix = str(
+            quality_result.get(
+                "revised_markdown",
+                draft_for_quality[:QUALITY_MAX_CHARS],
+            )
+        )
+        # The quality prompt is explicitly prefix-bounded. Its response may
+        # replace only that reviewed prefix; otherwise a normal long report
+        # silently loses every unchecked character after the limit.
+        translated = revised_prefix + draft_for_quality[QUALITY_MAX_CHARS:]
         quality_issues = list(quality_result.get("issues") or [])
 
     translated = normalize_markdown_for_pdf(translated)

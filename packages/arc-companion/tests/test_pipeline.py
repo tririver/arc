@@ -43,6 +43,7 @@ from arc_companion.pipeline import (
 )
 from arc_companion.prompts import ANNOTATION_SCHEMA
 from arc_companion.source import SourceBundle
+from arc_companion.run_lock import ProjectBuildLock
 
 
 def _inline_run(kind: str, content: str, order: int, *, tex: str = "") -> dict[str, str | int]:
@@ -3318,6 +3319,33 @@ class FakeLLM:
                 "reason": "precision",
             }], "issues": []}
         raise AssertionError(label)
+
+
+def test_build_fails_typed_and_before_source_or_llm_when_project_is_locked(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "run"
+    calls: list[str] = []
+
+    def source_loader(*args, **kwargs):
+        calls.append("source")
+        raise AssertionError("source loading must not start while the project is locked")
+
+    def llm(*args, **kwargs):
+        calls.append("llm")
+        raise AssertionError("LLM must not start while the project is locked")
+
+    with ProjectBuildLock(project_dir / ".arc-companion-build.lock"):
+        result = build_companion(
+            BuildOptions(paper_id="arXiv:0000.00000", project_dir=project_dir),
+            source_loader=source_loader,
+            llm=llm,
+        )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "build_in_progress"
+    assert result["meta"]["retryable"] is True
+    assert calls == []
 
 
 def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(tmp_path: Path) -> None:

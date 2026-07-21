@@ -67,5 +67,8 @@ class LLMProviderResponse(Generic[T]):
     native_session_id: str | None = None
     raw_events: tuple[dict[str, Any], ...] = ()
     raw_output: str = ""
+    # The agent's actual message, distinct from a CLI JSON envelope or stderr.
+    # Recovery must never prefer wrapper diagnostics over this value.
+    raw_model_output: str = ""
     prompt_sent_sha256: str | None = None
     structured_output: dict[str, Any] | None = None

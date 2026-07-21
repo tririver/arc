@@ -11,6 +11,7 @@ from arc_llm.runner import LLMNeedsLLM
 from .cache import DomainPaths, domain_id_for, now_iso, read_json, update_status, write_json
 from .evidence import build_evidence_pack as _build_evidence_pack
 from .foundation import identify_foundation as _identify_foundation
+from .llm_safety import raise_if_llm_fatal
 from .network import build_network as _build_network
 from .paper_pack import build_paper_json_pack as _build_paper_json_pack
 from .render import render_network_html
@@ -272,6 +273,7 @@ def build_domain(
         except LLMNeedsLLM:
             raise
         except Exception as exc:
+            raise_if_llm_fatal(exc)
             warning = _record_domain_summary_warning(paths, exc)
             warnings.append(warning)
             summary = _domain_summary_unavailable_result(paths, warning)

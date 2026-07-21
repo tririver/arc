@@ -7,6 +7,7 @@ from typing import Any, Callable
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA, strip_arc_llm_call_records
 from jsonschema import Draft202012Validator
 
+from ..checkpoint import run_json_checkpointed
 from ..store import read_section_summary, store_section_summary
 
 RunJson = Callable[[str, dict[str, Any], str | None], dict[str, Any]]
@@ -103,8 +104,22 @@ def generate_summary_with_section_pipeline(
         },
     )
     final_task = _final_task(task, section_summaries)
-    synthesis = run_json(_task_prompt(final_task), final_task.get("output_schema") or {}, model)
-    Draft202012Validator(PAPER_SYNTHESIS_SCHEMA).validate(synthesis)
+    final_prompt = _task_prompt(final_task)
+    synthesis = run_json_checkpointed(
+        paper_id=str(input_pack.get("paper_id") or ""),
+        call_kind="paper-synthesis",
+        identity={
+            "prompt_version": str(task.get("prompt_version") or "paper-summary-v1"),
+            "source_hash": str(input_pack.get("source_hash") or ""),
+            "provider": provider,
+        },
+        prompt=final_prompt,
+        schema=PAPER_SYNTHESIS_SCHEMA,
+        model=model,
+        run_json=run_json,
+        validate=Draft202012Validator(PAPER_SYNTHESIS_SCHEMA).validate,
+        use_cache=not _bool_value(task.get("refresh"), False),
+    )
     summary = _assemble_summary(task, section_summaries, synthesis)
     _emit(
         progress_callback,
@@ -203,30 +218,29 @@ def summarize_sections(
                 "sections_completed": len(section_summaries),
             },
         )
-        summary = _summarize_section(input_pack, section, model=model, run_json=run_json)
-        section_summaries.append(summary)
+        summary = _summarize_section(
+            input_pack,
+            section,
+            prompt_version=prompt_version,
+            provider=provider,
+            model=model,
+            run_json=run_json,
+            use_cache=use_cache,
+        )
         if paper_id and source_hash:
-            try:
-                store_section_summary(
-                    paper_id,
-                    prompt_version=prompt_version,
-                    source_hash=source_hash,
-                    provider=provider,
-                    model=model,
-                    section_index=index,
-                    section_id=section_id,
-                    summary=summary,
-                )
-            except Exception as exc:
-                _emit(
-                    progress_callback,
-                    {
-                        "event": "section_cache_write_failed",
-                        **event_base,
-                        "sections_completed": len(section_summaries),
-                        "error": str(exc),
-                    },
-                )
+            # A paid response that cannot be persisted must stop the workflow;
+            # continuing would make a resume silently pay for it again.
+            store_section_summary(
+                paper_id,
+                prompt_version=prompt_version,
+                source_hash=source_hash,
+                provider=provider,
+                model=model,
+                section_index=index,
+                section_id=section_id,
+                summary=summary,
+            )
+        section_summaries.append(summary)
         _emit(
             progress_callback,
             {
@@ -243,8 +257,11 @@ def _summarize_section(
     input_pack: dict[str, Any],
     section: dict[str, Any],
     *,
+    prompt_version: str,
+    provider: str | None,
     model: str | None,
     run_json: RunJson,
+    use_cache: bool,
 ) -> dict[str, Any]:
     prompt = "\n\n".join(
         [
@@ -258,8 +275,22 @@ def _summarize_section(
             json.dumps(section, ensure_ascii=False, indent=2),
         ]
     )
-    summary = run_json(prompt, SECTION_SUMMARY_SCHEMA, model)
-    Draft202012Validator(SECTION_SUMMARY_SCHEMA).validate(summary)
+    summary = run_json_checkpointed(
+        paper_id=str(input_pack.get("paper_id") or ""),
+        call_kind="section-summary",
+        identity={
+            "prompt_version": prompt_version,
+            "source_hash": str(input_pack.get("source_hash") or ""),
+            "provider": provider,
+            "section_id": str(section.get("section_id") or ""),
+        },
+        prompt=prompt,
+        schema=SECTION_SUMMARY_SCHEMA,
+        model=model,
+        run_json=run_json,
+        validate=Draft202012Validator(SECTION_SUMMARY_SCHEMA).validate,
+        use_cache=use_cache,
+    )
     result = {
         "section_id": str(summary.get("section_id") or section.get("section_id") or ""),
         "title": str(summary.get("title") or section.get("title") or ""),

@@ -11,12 +11,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.sessions import LLMSessionRef
+from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.paths import llm_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
-from .base import LLMWorkerError
+from .base import LLMFailureCategory, LLMSubmissionState, LLMWorkerError
 from .lifecycle import resolve_worker_call_timeout_seconds, run_process_group
 
 
@@ -25,19 +26,11 @@ def _run_claude(cmd, prompt, *, env, timeout_seconds, deadline, cancel_check):
     effective_deadline = deadline if deadline is not None else (
         time.monotonic() + timeout if timeout is not None else None
     )
-    if effective_deadline is not None or cancel_check is not None:
-        return run_process_group(
-            cmd, input_text=prompt, env=env,
-            deadline=effective_deadline,
-            cancel_check=cancel_check,
-        )
-    try:
-        return subprocess.run(
-            cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=dict(env), timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise LLMWorkerError(f"claude -p timed out after {exc.timeout} seconds") from exc
+    return run_process_group(
+        cmd, input_text=prompt, env=env,
+        deadline=effective_deadline,
+        cancel_check=cancel_check,
+    )
 
 
 class ClaudeCliProvider:
@@ -99,7 +92,7 @@ class ClaudeCliProvider:
         )
         _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
-            raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
+            raise _claude_failure(result.stderr or result.stdout or "claude -p failed")
         value, usage, returned_session_id, structured_output = _extract_claude_metadata(
             result.stdout,
             output_recovery=output_recovery,
@@ -109,6 +102,7 @@ class ClaudeCliProvider:
             usage=usage,
             native_session_id=returned_session_id or native_id,
             raw_output=result.stdout,
+            raw_model_output=_claude_model_text(result.stdout),
             prompt_sent_sha256=sha256_text(effective_prompt),
             structured_output=structured_output,
         )
@@ -149,7 +143,7 @@ class ClaudeCliProvider:
         )
         _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
-            raise LLMWorkerError(result.stderr or result.stdout or "claude -p failed")
+            raise _claude_failure(result.stderr or result.stdout or "claude -p failed")
         if json_output:
             value, usage, returned_session_id = _extract_claude_text_metadata(result.stdout)
             return LLMProviderResponse(
@@ -157,15 +151,60 @@ class ClaudeCliProvider:
                 usage=usage,
                 native_session_id=returned_session_id or native_id,
                 raw_output=result.stdout,
+                raw_model_output=value,
             )
-        return LLMProviderResponse(result.stdout, native_session_id=native_id, raw_output=result.stdout)
+        return LLMProviderResponse(
+            result.stdout,
+            native_session_id=native_id,
+            raw_output=result.stdout,
+            raw_model_output=result.stdout,
+        )
+
+
+def _claude_failure(message: str) -> LLMWorkerError:
+    disposition = classify_provider_diagnostic(
+        message,
+        submission_state=LLMSubmissionState.SUBMITTED,
+    )
+    if disposition is not None:
+        return LLMWorkerError(message, **disposition_error_kwargs(disposition))
+    return LLMWorkerError(
+        message,
+        retryable=False,
+        category=LLMFailureCategory.PROVIDER_INTERNAL,
+        submission_state=LLMSubmissionState.SUBMITTED,
+    )
+
+
+def _submitted_output_error(message: str) -> LLMWorkerError:
+    return LLMWorkerError(
+        message,
+        retryable=False,
+        category=LLMFailureCategory.OUTPUT_INVALID,
+        submission_state=LLMSubmissionState.SUBMITTED,
+    )
+
+
+def _claude_model_text(stdout: str) -> str:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return stdout
+    if isinstance(payload, Mapping):
+        result = payload.get("result")
+        if isinstance(result, str):
+            return result
+        structured = payload.get("structured_output")
+        if isinstance(structured, Mapping):
+            return json.dumps(structured, ensure_ascii=False, sort_keys=True, default=str)
+    return ""
 
 
 def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict[str, Any], dict[str, Any] | None]:
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
+        raise _submitted_output_error(f"Claude output was not JSON: {exc}") from exc
     if (
         isinstance(payload, dict)
         and payload.get("type") == "result"
@@ -177,7 +216,7 @@ def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict
             nested = json.loads(payload["result"])
         except json.JSONDecodeError as exc:
             if output_recovery != "warn":
-                raise LLMWorkerError(f"Claude result field was not JSON: {exc}") from exc
+                raise _submitted_output_error(f"Claude result field was not JSON: {exc}") from exc
             extracted, warnings = parse_json_object_relaxed(payload["result"])
             if isinstance(extracted, dict):
                 return extracted, structured_metadata(
@@ -204,13 +243,13 @@ def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict
                     strategy="natural_language_fallback",
                     provider_error_type=type(nested).__name__,
                 )
-            raise LLMWorkerError("Claude result JSON was not an object")
+            raise _submitted_output_error("Claude result JSON was not an object")
         return nested, None
     if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
         return payload["result"], None
     if isinstance(payload, dict):
         return payload, None
-    raise LLMWorkerError("Claude JSON output was not an object")
+    raise _submitted_output_error("Claude JSON output was not an object")
 
 
 def _extract_claude_metadata(stdout: str, *, output_recovery: str = "strict") -> tuple[dict[str, Any], LLMUsage, str | None, dict[str, Any] | None]:
@@ -218,7 +257,7 @@ def _extract_claude_metadata(stdout: str, *, output_recovery: str = "strict") ->
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         if output_recovery != "warn":
-            raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
+            raise _submitted_output_error(f"Claude output was not JSON: {exc}") from exc
         return (
             {},
             LLMUsage(),
@@ -233,6 +272,13 @@ def _extract_claude_metadata(stdout: str, *, output_recovery: str = "strict") ->
                 provider_error_type="JSONDecodeError",
             ),
         )
+    if isinstance(payload, dict) and payload.get("subtype") == "error_max_structured_output_retries":
+        raise LLMWorkerError(
+            "Claude provider exhausted structured-output retries",
+            retryable=False,
+            category=LLMFailureCategory.OUTPUT_INVALID,
+            submission_state=LLMSubmissionState.SUBMITTED,
+        )
     value, structured_output = _extract_json(stdout, output_recovery=output_recovery)
     return value, _usage_from_payload(payload), _session_id_from_payload(payload), structured_output
 
@@ -241,13 +287,13 @@ def _extract_claude_text_metadata(stdout: str) -> tuple[str, LLMUsage, str | Non
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise LLMWorkerError(f"Claude output was not JSON: {exc}") from exc
+        raise _submitted_output_error(f"Claude output was not JSON: {exc}") from exc
     if not isinstance(payload, dict):
-        raise LLMWorkerError("Claude text output JSON was not an object")
+        raise _submitted_output_error("Claude text output JSON was not an object")
     usage = _usage_from_payload(payload)
     result = payload.get("result", "")
     if not isinstance(result, str):
-        raise LLMWorkerError("Claude text result field was not a string")
+        raise _submitted_output_error("Claude text result field was not a string")
     native_session_id = payload.get("session_id") or payload.get("sessionId")
     return result, usage, str(native_session_id) if native_session_id is not None else None
 

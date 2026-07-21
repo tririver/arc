@@ -482,13 +482,13 @@ class RecoverableTextResultProvider:
         self.attempts += 1
         return LLMProviderResponse(
             {},
-            raw_output=json.dumps({"type": "result", "result": "Recovered idea text"}),
+            raw_output=json.dumps({"type": "result", "result": "Too short"}),
             structured_output={
                 "schema_version": "arc.llm.structured_output.v1",
                 "mode": "recovered",
                 "severity": "major",
                 "warnings": ["provider returned natural language"],
-                "raw_text_excerpt": "Recovered idea text",
+                "raw_text_excerpt": "Too short",
                 "provider_error_type": None,
                 "recovery_strategy": "natural_language_fallback",
             },
@@ -715,26 +715,28 @@ def test_run_json_recovery_warn_valid_json_is_unchanged(monkeypatch):
     assert result[ARC_LLM_CALL_RECORD_FIELD].get("structured_output") is None
 
 
-def test_run_json_retries_provider_failure_text_before_recovery(monkeypatch):
+def test_run_json_does_not_replay_provider_failure_text(monkeypatch):
     provider = ServiceUnavailableThenOkProvider()
     monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
 
-    result = run_json(
-        "prompt",
-        schema={
-            "type": "object",
-            "required": ["ok"],
-            "properties": {"ok": {"type": "boolean"}},
-            "additionalProperties": False,
-        },
-        provider="codex-cli",
-        env={},
-        process_chain=[],
-        output_recovery="warn",
-    )
+    with pytest.raises(LLMTaskError):
+        run_json(
+            "prompt",
+            schema={
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": False,
+            },
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            output_recovery="warn",
+        )
 
+    # One original provider response plus one formatter submission; the
+    # original worker itself was not replayed.
     assert provider.attempts == 2
-    assert result["ok"] is True
 
 
 def test_run_json_warn_retries_short_provider_text_without_status_code_policy(monkeypatch):
@@ -761,7 +763,7 @@ def test_run_json_warn_retries_short_provider_text_without_status_code_policy(mo
             output_recovery="warn",
         )
 
-    assert provider.attempts == 3
+    assert provider.attempts == 1
 
 
 def test_run_json_warn_retries_empty_schema_failure_before_formatter(monkeypatch):
@@ -773,22 +775,22 @@ def test_run_json_warn_retries_empty_schema_failure_before_formatter(monkeypatch
 
     monkeypatch.setattr(runner, "format_to_schema_or_retry", formatter_should_not_run, raising=False)
 
-    result = run_json(
-        "prompt",
-        schema={
-            "type": "object",
-            "required": ["ok"],
-            "properties": {"ok": {"type": "boolean"}},
-            "additionalProperties": False,
-        },
-        provider="codex-cli",
-        env={},
-        process_chain=[],
-        output_recovery="warn",
-    )
+    with pytest.raises(LLMTaskError, match="empty or low-content output"):
+        run_json(
+            "prompt",
+            schema={
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": False,
+            },
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            output_recovery="warn",
+        )
 
-    assert provider.attempts == 2
-    assert result["ok"] is True
+    assert provider.attempts == 1
 
 
 def test_run_json_warn_uses_schema_formatter_for_rich_schema_failure(monkeypatch):
@@ -857,7 +859,7 @@ def test_run_json_warn_can_disable_schema_formatter(monkeypatch):
     assert provider.attempts == 1
 
 
-def test_run_json_warn_retries_when_schema_formatter_requests_retry(monkeypatch):
+def test_run_json_warn_does_not_replay_when_schema_formatter_requests_retry(monkeypatch):
     provider = RichInvalidResultProvider()
     monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
 
@@ -876,22 +878,22 @@ def test_run_json_warn_retries_when_schema_formatter_requests_retry(monkeypatch)
 
     monkeypatch.setattr(runner, "format_to_schema_or_retry", fake_formatter, raising=False)
 
-    result = run_json(
-        "prompt",
-        schema={
-            "type": "object",
-            "required": ["ok"],
-            "properties": {"ok": {"type": "boolean"}},
-            "additionalProperties": False,
-        },
-        provider="codex-cli",
-        env={},
-        process_chain=[],
-        output_recovery="warn",
-    )
+    with pytest.raises(LLMTaskError, match="could not repair output"):
+        run_json(
+            "prompt",
+            schema={
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": False,
+            },
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            output_recovery="warn",
+        )
 
-    assert provider.attempts == 2
-    assert result["ok"] is True
+    assert provider.attempts == 1
 
 
 def test_run_json_recovery_warn_retries_low_content_natural_language(monkeypatch):
@@ -924,7 +926,25 @@ def test_run_json_recovery_warn_retries_low_content_natural_language(monkeypatch
             role_hint="proposer",
         )
 
-    assert provider.attempts == 3
+    assert provider.attempts == 1
+
+
+def test_low_content_detection_counts_unicode_letters() -> None:
+    assert runner._is_low_content_source("这是一个包含充分信息的中文模型响应") is False  # noqa: SLF001
+    assert runner._is_low_content_source("错误") is True  # noqa: SLF001
+
+
+def test_schema_recovery_prefers_full_model_output_over_excerpt() -> None:
+    response = LLMProviderResponse(
+        {},
+        raw_output='{"result":"wrapper output"}',
+        raw_model_output="完整模型输出，包含足够的上下文与结论。",
+        structured_output={"raw_text_excerpt": "short excerpt"},
+    )
+    source = runner._schema_recovery_source_text(  # noqa: SLF001
+        {}, response=response, provider_metadata=response.structured_output
+    )
+    assert source == "完整模型输出，包含足够的上下文与结论。"
 
 
 def test_run_json_without_schema_passes_none_and_adds_call_record(monkeypatch):
@@ -978,8 +998,8 @@ def test_non_retryable_worker_error_stops_after_first_attempt(monkeypatch):
     assert provider.attempts == 1
 
 
-def test_worker_error_is_retryable_by_default():
-    assert LLMWorkerError("transient provider failure").retryable is True
+def test_worker_error_is_non_retryable_by_default():
+    assert LLMWorkerError("transient provider failure").retryable is False
     assert LLMWorkerError("transient provider failure").abort_batch is False
 
 
@@ -1237,71 +1257,66 @@ def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):
     assert result == "gpt-5.6-luna:prompt"
 
 
-def test_run_text_retries_selected_provider_twice_before_success(tmp_path, monkeypatch):
+def test_run_text_does_not_replay_unknown_provider_failure(tmp_path, monkeypatch):
     flaky = FlakyTextProvider(name="codex-cli", failures_before_success=2)
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: flaky)
 
-    result = run_text(
-        "prompt",
-        env={"ARC_AGENT_HOST": "codex"},
-        process_chain=[],
-    )
+    with pytest.raises(LLMTaskError):
+        run_text(
+            "prompt",
+            env={"ARC_AGENT_HOST": "codex"},
+            process_chain=[],
+        )
 
-    assert result == "codex-cli:gpt-5.6-luna:prompt"
-    assert flaky.attempts == 3
+    assert flaky.attempts == 1
 
 
-def test_run_text_waits_ten_seconds_between_retry_attempts(monkeypatch):
+def test_run_text_does_not_sleep_to_replay_unknown_failure(monkeypatch):
     flaky = FlakyTextProvider(name="codex-cli", failures_before_success=2)
     sleep_calls = []
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: flaky)
     monkeypatch.setattr("time.sleep", lambda seconds: sleep_calls.append(seconds))
 
-    result = run_text("prompt", provider="codex-cli", env={}, process_chain=[])
+    with pytest.raises(LLMTaskError):
+        run_text("prompt", provider="codex-cli", env={}, process_chain=[])
 
-    assert result == "codex-cli:gpt-5.6-luna:prompt"
-    assert sleep_calls == [10, 10]
+    assert sleep_calls == []
+    assert flaky.attempts == 1
 
 
-def test_run_json_retries_selected_provider_twice_before_success(tmp_path, monkeypatch):
+def test_run_json_does_not_replay_unknown_provider_failure(tmp_path, monkeypatch):
     flaky = FlakyJsonProvider(name="codex-cli", failures_before_success=2, result={"provider": "codex-cli"})
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: flaky)
 
-    result = run_json(
-        "prompt",
-        env={"ARC_AGENT_HOST": "codex"},
-        process_chain=[],
-    )
-
-    assert result["provider"] == "codex-cli"
-    assert result[ARC_LLM_CALL_RECORD_FIELD]["attempt"] == 3
-    assert [item["status"] for item in result[ARC_LLM_CALL_RECORD_FIELD]["attempts"]] == [
-        "failed",
-        "failed",
-        "success",
-    ]
-    assert flaky.attempts == 3
-
-
-def test_run_json_auto_retries_only_selected_provider(monkeypatch):
-    codex = FlakyJsonProvider(name="codex-cli")
-    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: codex)
-
-    with pytest.raises(RuntimeError, match="LLM task failed after 3 attempt\\(s\\) across 1 provider\\(s\\)"):
+    with pytest.raises(LLMTaskError):
         run_json(
             "prompt",
             env={"ARC_AGENT_HOST": "codex"},
             process_chain=[],
         )
 
-    assert codex.attempts == 3
+    assert flaky.attempts == 1
 
 
-def test_run_json_explicit_provider_retries_without_fallback(tmp_path, monkeypatch):
+def test_run_json_auto_does_not_replay_selected_provider(monkeypatch):
     codex = FlakyJsonProvider(name="codex-cli")
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: codex)
 
-    with pytest.raises(RuntimeError, match="LLM task failed after 3 attempt\\(s\\) across 1 provider\\(s\\)"):
+    with pytest.raises(RuntimeError, match="LLM task failed after 1 attempt\\(s\\) across 1 provider\\(s\\)"):
+        run_json(
+            "prompt",
+            env={"ARC_AGENT_HOST": "codex"},
+            process_chain=[],
+        )
+
+    assert codex.attempts == 1
+
+
+def test_run_json_explicit_provider_does_not_replay_without_proof(tmp_path, monkeypatch):
+    codex = FlakyJsonProvider(name="codex-cli")
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: codex)
+
+    with pytest.raises(RuntimeError, match="LLM task failed after 1 attempt\\(s\\) across 1 provider\\(s\\)"):
         run_json(
             "prompt",
             provider="codex-cli",
@@ -1309,4 +1324,4 @@ def test_run_json_explicit_provider_retries_without_fallback(tmp_path, monkeypat
             process_chain=[],
         )
 
-    assert codex.attempts == 3
+    assert codex.attempts == 1

@@ -124,6 +124,22 @@ def parsed_source_lock(source_id: str, *, namespace: str = "light"):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def content_lock(namespace: str, key: str):
+    """Serialize one content-addressed cache fill across ARC processes."""
+
+    safe_namespace = re.sub(r"[^A-Za-z0-9_.-]+", "_", namespace).strip("._") or "cache"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    path = cache_root() / "locks" / safe_namespace / f"{digest}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def parsed_source_annotations_cache_path(source_id: str) -> Path:
     safe_name = paper_ids_safe_dir_name([source_id])
     return cache_root() / "source-annotations" / f"{safe_name}.json"

@@ -24,7 +24,13 @@ from arc_llm.evidence import (
     EVIDENCE_REQUESTS_FIELD,
 )
 from arc_llm.runner import LLMNeedsLLM, resolve_llm_config, run_json
-from arc_llm.providers.base import LLMSchemaError, LLMWorkerCancelled, LLMWorkerTimeout
+from arc_llm.providers.base import (
+    LLMAbortScope,
+    LLMSchemaError,
+    LLMWorkerCancelled,
+    LLMWorkerTimeout,
+    failure_disposition,
+)
 from arc_llm.schema_cache import schema_hash, sha256_text
 from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
 from arc_llm.structured_recovery import structured_metadata
@@ -173,7 +179,7 @@ def run_proposers_reviewer_batch(
                 except CancelledError:
                     result = _skipped_loop_result(paths, loop_id, "cancelled by fail_fast")
                 loop_results.append(result)
-                if batch.fail_fast and result["status"] == "failed":
+                if _result_is_batch_fatal(result) or (batch.fail_fast and result["status"] == "failed"):
                     stop_scheduling = True
             if stop_scheduling and not future_by_loop:
                 break
@@ -627,6 +633,12 @@ def _run_proposers(
                 )
             except Exception as exc:
                 if isinstance(exc, LLMWorkerCancelled):
+                    raise
+                disposition = failure_disposition(exc)
+                if disposition is not None and disposition.abort_scope in {
+                    LLMAbortScope.BATCH,
+                    LLMAbortScope.PROVIDER,
+                }:
                     raise
                 worker_failures.append(_worker_failure_record(proposer.id, "proposer", exc, round_number))
                 _emit_progress(
@@ -1922,7 +1934,21 @@ def _loop_failure(loop_id: str, paths, message: str, *, exc: BaseException | Non
     }
     if exc is not None:
         result["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        disposition = failure_disposition(exc)
+        if disposition is not None:
+            result["llm_failure"] = {
+                "category": disposition.category.value,
+                "abort_scope": disposition.abort_scope.value,
+                "submission_state": disposition.submission_state.value,
+                "retryable": disposition.retryable,
+                "retry_after_seconds": disposition.retry_after_seconds,
+            }
     return result
+
+
+def _result_is_batch_fatal(result: Mapping[str, Any]) -> bool:
+    failure = result.get("llm_failure")
+    return isinstance(failure, Mapping) and failure.get("abort_scope") in {"batch", "provider"}
 
 
 def _write_loop_failure_state(paths, *, run_id: str, result: dict[str, Any]) -> None:

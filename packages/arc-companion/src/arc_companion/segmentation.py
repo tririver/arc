@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pathlib import Path
+import re
 from typing import Any, Callable
 
 from .io import read_json, sha256_json, write_json
@@ -280,6 +281,7 @@ def segment_document(
             call_model=call_model,
             label_prefix=f"companion-segmentation-{window['window_id']}",
             refinement=False,
+            reuse_attempts=not force,
         )
         return sorted(set(model_cuts + deterministic_end))
 
@@ -346,6 +348,7 @@ def segment_document(
                 label_prefix=f"companion-segmentation-refine-{round_number}-{item['segment_id']}",
                 refinement=True,
                 refinement_round=round_number,
+                reuse_attempts=not force,
             )
             return item, result
 
@@ -422,9 +425,60 @@ def _call_for_cuts(
     label_prefix: str,
     refinement: bool,
     refinement_round: int | None = None,
+    reuse_attempts: bool = True,
 ) -> list[int]:
     last_error = "unknown validation failure"
-    for attempt in range(1, MAX_VALIDATION_ATTEMPTS + 1):
+    completed_attempts = 0
+    attempt_paths = attempts_dir.glob("attempt-*.json") if reuse_attempts else ()
+    for attempt_path in sorted(attempt_paths, key=_attempt_number):
+        record = _read_optional_json(attempt_path)
+        if not isinstance(record, dict):
+            continue
+        if (
+            record.get("schema_version") != SEGMENTATION_VERSION
+            or record.get("inventory_sha256") != inventory_hash
+            or record.get("window_sha256") != window_hash
+        ):
+            continue
+        attempt_number = _attempt_number(attempt_path)
+        if attempt_number < 1 or attempt_number > MAX_VALIDATION_ATTEMPTS:
+            continue
+        completed_attempts = max(completed_attempts, attempt_number)
+        response = record.get("response")
+        if record.get("accepted") is True and isinstance(response, dict):
+            try:
+                cuts = _validate_window_cuts(
+                    response.get("cut_after_ordinals"), window, len(inventory)
+                )
+                if refinement and not cuts:
+                    raise SegmentationError(
+                        f"refinement window {window['window_id']} must add at least one internal cut"
+                    )
+            except (SegmentationError, KeyError, TypeError, ValueError):
+                pass
+            else:
+                write_json(checkpoint_path, {
+                    "schema_version": SEGMENTATION_VERSION,
+                    "inventory_sha256": inventory_hash,
+                    "window_sha256": window_hash,
+                    "cuts": cuts,
+                })
+                return cuts
+        last_error = str(record.get("error") or last_error)
+
+    if completed_attempts >= MAX_VALIDATION_ATTEMPTS:
+        raise SegmentationError(
+            f"window {window['window_id']} exhausted its lifetime semantic cut "
+            f"validation budget of {MAX_VALIDATION_ATTEMPTS} attempts: {last_error}",
+            context=_window_failure_context(
+                window,
+                attempt=completed_attempts,
+                refinement=refinement,
+                refinement_round=refinement_round,
+            ),
+        )
+
+    for attempt in range(completed_attempts + 1, MAX_VALIDATION_ATTEMPTS + 1):
         prompt = segmentation_prompt(
             window, total_blocks=len(inventory), refinement=refinement
         )
@@ -489,6 +543,11 @@ def _call_for_cuts(
             refinement_round=refinement_round,
         ),
     )
+
+
+def _attempt_number(path: Path) -> int:
+    match = re.fullmatch(r"attempt-(\d+)\.json", path.name)
+    return int(match.group(1)) if match else 0
 
 
 def _validate_window_cuts(

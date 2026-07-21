@@ -14,6 +14,7 @@ from arc_paper.ids import extract_paper_ids, normalize_paper_id
 
 from . import paper
 from .cache import DomainPaths, now_iso, update_status, write_json
+from .llm_safety import raise_if_llm_fatal
 from .text import deterministic_sample, normalize_authors, paper_key, token_overlap_score
 
 
@@ -393,6 +394,7 @@ def _llm_audit_candidates(
         method = "llm_relaxed" if _domain_llm_recovered(audit) or _schema_error(audit, FOUNDATION_CANDIDATE_AUDIT_SCHEMA) else "llm"
         return _repair_candidate_audit(audit, method=method)
     except Exception as exc:
+        raise_if_llm_fatal(exc)
         audit = _default_candidate_audit()
         audit["warnings"].append(f"llm_candidate_audit_failed:{exc}")
         audit["audit_method"] = "llm_failed"
@@ -857,6 +859,7 @@ def _llm_select_foundation(
             min_citation_count=min_citation_count,
         )
     except Exception as exc:
+        raise_if_llm_fatal(exc)
         selection = _deterministic_selection(
             candidates,
             intent=intent,

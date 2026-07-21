@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Mapping, Sequence
 
 from ...host import select_llm_provider
-from arc_llm.providers.select import select_provider as select_prompt_provider
+from arc_llm.providers.registry import get_provider_spec
 from .claude_cli import ClaudeCliProvider
 from .codex_cli import CodexCliProvider
 from .manual import ManualProvider
@@ -26,6 +26,12 @@ def select_summary_provider(
     if name == "manual":
         return ManualProvider()
     try:
-        return PromptProviderSummaryAdapter(select_prompt_provider(name, env=env, process_chain=process_chain), env=env)
+        get_provider_spec(name)
+        return PromptProviderSummaryAdapter(
+            None,
+            provider_name=name,
+            env=env,
+            process_chain=process_chain,
+        )
     except ValueError as exc:
         raise ValueError(f"Unknown summary provider: {name}") from exc

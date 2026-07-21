@@ -58,9 +58,9 @@ returned `next.cli_command`. Watch all launched jobs to a terminal result. If
 the host cannot run jobs concurrently, fall back to sequential
 watching/running without changing the artifact contract.
 
-Domain LLM calls wait indefinitely by default. A quiet job is not timed out;
-continue watching unless it reaches a terminal state or receives an explicit
-timeout or cancellation. Optional bounds may be supplied through an owning
+Domain LLM calls use a one-hour monotonic deadline by default. A quiet job is
+not failed before that deadline; continue watching unless it reaches a terminal
+state or receives an explicit timeout or cancellation. Other bounds may be supplied through an owning
 CLI's `--timeout-seconds` option where available or an applicable
 `ARC_*_TIMEOUT_SECONDS` environment variable.
 

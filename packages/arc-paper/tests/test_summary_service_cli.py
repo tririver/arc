@@ -1,4 +1,10 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+import time
+
+import pytest
+from arc_llm.providers.base import LLMWorkerError
 
 from arc_paper import cli, service
 
@@ -108,6 +114,47 @@ class ModelRecordingSummaryProvider(FakeSummaryProvider):
 
 class ManualSummaryProvider:
     name = "manual"
+
+
+def test_summary_generation_is_single_flight_across_callers(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    monkeypatch.setattr(service, "_inspire", FakeInspire())
+    monkeypatch.setattr(service, "_ar5iv", FakeAr5iv())
+    provider = ModelRecordingSummaryProvider()
+    call_lock = Lock()
+    original_generate = provider.generate_summary
+
+    def slow_generate(*args, **kwargs):
+        with call_lock:
+            time.sleep(0.05)
+            return original_generate(*args, **kwargs)
+
+    provider.generate_summary = slow_generate
+    monkeypatch.setattr(service, "select_summary_provider", lambda _provider: provider)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _: service.generate_llm_summary(
+                    "0911.3380", provider="codex-cli", model="test-model"
+                ),
+                range(2),
+            )
+        )
+
+    assert all(result["ok"] for result in results)
+    assert provider.models == ["test-model"]
+
+
+def test_summary_generation_propagates_batch_fatal_config(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "resolve_llm_config",
+        lambda **kwargs: (_ for _ in ()).throw(LLMWorkerError("bad schema", abort_batch=True)),
+    )
+
+    with pytest.raises(LLMWorkerError, match="bad schema"):
+        service.generate_llm_summary("0911.3380", provider="codex-cli")
 
 
 def test_get_llm_summary_returns_needs_llm_when_provider_is_manual(monkeypatch, tmp_path):

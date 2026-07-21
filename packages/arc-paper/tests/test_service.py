@@ -1,5 +1,6 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import arc_paper.parse.source as parse_source_module
 from arc_paper import reference_inference, service
@@ -217,6 +218,39 @@ def test_llm_infer_main_references_rejects_unverified_candidates(monkeypatch, tm
 
     assert result["ok"] is False
     assert result["error"]["code"] == "reference_inference_unverified"
+
+
+def test_llm_reference_inference_is_single_flight(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    calls = []
+
+    def infer(query_text, **kwargs):
+        calls.append(query_text)
+        time.sleep(0.05)
+        return {
+            "paper_ids": ["arXiv:0911.3380"],
+            "provider": "codex-cli",
+            "model": "test-model",
+            "focus_scope": "one_domain",
+            "warnings": [],
+            "verified_references": [],
+            "rejected_candidates": [],
+            "raw_llm_response": {},
+        }
+
+    monkeypatch.setattr(service, "infer_main_references", infer)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _: service.llm_infer_main_references(
+                    "Find the canonical paper without an explicit identifier.", provider="codex-cli"
+                ),
+                range(2),
+            )
+        )
+
+    assert all(result["ok"] for result in results)
+    assert len(calls) == 1
 
 
 class FakeInspire:

@@ -378,10 +378,9 @@ Runtime capability options:
 ```
 
 `--timeout-seconds` is one monotonic deadline for the complete worker call,
-including retries, resume attempts, and schema formatting. When the option and
-all applicable timeout environment variables are unset, ARC does not impose a
-worker-call deadline. Cancellation and process cleanup remain active while a
-call is otherwise unlimited.
+including recovery and schema formatting. When the option and all applicable
+timeout environment variables are unset, ARC uses 3600 seconds. Nested calls
+share the original deadline and never receive a fresh hour.
 
 Provider timeout environment variables:
 
@@ -393,7 +392,7 @@ ARC_LLM_TIMEOUT_SECONDS              General fallback for every provider
 ```
 
 An explicit CLI or worker timeout takes precedence, followed by the
-provider-specific variable and then `ARC_LLM_TIMEOUT_SECONDS`.
+provider-specific variable, `ARC_LLM_TIMEOUT_SECONDS`, and finally 3600 seconds.
 
 Kimi runtime environment variables:
 
@@ -401,6 +400,7 @@ Kimi runtime environment variables:
 ARC_KIMI_BIN                         Kimi executable; default: kimi
 ARC_KIMI_WORK_DIR                    Working directory for new sessions; default: current directory
 ARC_KIMI_TIMEOUT_SECONDS             Call deadline; falls back to ARC_LLM_TIMEOUT_SECONDS
+ARC_KIMI_ALLOW_INTERNAL_RETRIES      Explicitly accept unsafe provider-internal retries
 ARC_LLM_KIMI_LOW_MODEL               Low-tier model alias
 ARC_LLM_KIMI_MEDIUM_MODEL            Medium-tier model alias
 ARC_LLM_KIMI_HIGH_MODEL              High-tier model alias
@@ -410,6 +410,18 @@ ARC_LLM_KIMI_MAX_MODEL               Max-tier model alias
 ARC starts the Kimi subprocess with `KIMI_CODE_NO_AUTO_UPDATE=1`,
 `KIMI_DISABLE_TELEMETRY=1`, and `KIMI_DISABLE_CRON=1`. It preserves the user's
 existing `KIMI_CODE_HOME` and login state.
+
+Before starting Kimi, ARC requires either a supported per-process retry
+override or `[loop_control] max_retries_per_step = 1` in the effective Kimi
+configuration. Missing, unreadable, or larger values fail before an agent
+session starts. `ARC_KIMI_ALLOW_INTERNAL_RETRIES=1` is an explicit cost-risk
+escape hatch and is always reported by doctor and call diagnostics.
+
+ARC_HOME-wide provider concurrency is capped at 24 real model calls. Local
+worker counts may lower but never multiply this cap. Quota and authentication
+failures open a persistent provider circuit; rate limits cool down for at least
+15 minutes and then admit one half-open probe. Inspect or reset these states
+with `arc-llm circuit status` and `arc-llm circuit reset`.
 
 `--allow-mcp` is an explicit advanced opt-in for standalone LLM tasks using
 caller-configured servers. ARC workflow workers must leave it disabled and use

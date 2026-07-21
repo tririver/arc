@@ -12,13 +12,19 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, validate_codex_strict_schema
+from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.paths import llm_tmp_root, schema_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text, write_schema_cache_file
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
-from .base import LLMSchemaError, LLMWorkerError
+from .base import (
+    LLMFailureCategory,
+    LLMSubmissionState,
+    LLMSchemaError,
+    LLMWorkerError,
+)
 from .lifecycle import resolve_worker_call_timeout_seconds, run_process_group
 
 
@@ -31,19 +37,11 @@ def _run_codex(cmd, prompt, *, env, timeout_seconds, deadline, cancel_check):
     effective_deadline = deadline if deadline is not None else (
         time.monotonic() + timeout if timeout is not None else None
     )
-    if effective_deadline is not None or cancel_check is not None:
-        return run_process_group(
-            cmd, input_text=prompt, env=env,
-            deadline=effective_deadline,
-            cancel_check=cancel_check,
-        )
-    try:
-        return subprocess.run(
-            cmd, input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=dict(env), timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise LLMWorkerError(f"codex exec timed out after {exc.timeout} seconds") from exc
+    return run_process_group(
+        cmd, input_text=prompt, env=env,
+        deadline=effective_deadline,
+        cancel_check=cancel_check,
+    )
 
 
 class CodexCliProvider:
@@ -113,7 +111,7 @@ class CodexCliProvider:
                 deadline=deadline, cancel_check=cancel_check,
             )
             if result.returncode != 0:
-                raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
+                raise _codex_failure(result.stderr or result.stdout or "codex exec failed")
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
             if stateful and not resume_id and not native_session_id:
                 raise LLMWorkerError("stateful Codex call did not report thread/session id")
@@ -124,6 +122,7 @@ class CodexCliProvider:
                 native_session_id=native_session_id or (session.native_session_id if session else None),
                 raw_events=raw_events,
                 raw_output=result.stdout,
+                raw_model_output=json.dumps(payload, ensure_ascii=False, default=str),
                 prompt_sent_sha256=sha256_text(effective_prompt),
                 structured_output=structured_output,
             )
@@ -161,7 +160,7 @@ class CodexCliProvider:
                 deadline=deadline, cancel_check=cancel_check,
             )
             if result.returncode != 0:
-                raise LLMWorkerError(result.stderr or result.stdout or "codex exec failed")
+                raise _codex_failure(result.stderr or result.stdout or "codex exec failed")
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
             if stateful and not session.native_session_id and not native_session_id:
                 raise LLMWorkerError("stateful Codex call did not report thread/session id")
@@ -175,8 +174,33 @@ class CodexCliProvider:
                 native_session_id=native_session_id or (session.native_session_id if session else None),
                 raw_events=raw_events,
                 raw_output=result.stdout,
+                raw_model_output=value,
                 prompt_sent_sha256=sha256_text(prompt),
             )
+
+
+def _codex_failure(message: str) -> LLMWorkerError:
+    disposition = classify_provider_diagnostic(
+        message,
+        submission_state=LLMSubmissionState.SUBMITTED,
+    )
+    if disposition is not None:
+        return LLMWorkerError(message, **disposition_error_kwargs(disposition))
+    return LLMWorkerError(
+        message,
+        retryable=False,
+        category=LLMFailureCategory.PROVIDER_INTERNAL,
+        submission_state=LLMSubmissionState.SUBMITTED,
+    )
+
+
+def _submitted_output_error(message: str) -> LLMWorkerError:
+    return LLMWorkerError(
+        message,
+        retryable=False,
+        category=LLMFailureCategory.OUTPUT_INVALID,
+        submission_state=LLMSubmissionState.SUBMITTED,
+    )
 
 
 def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
@@ -393,7 +417,7 @@ def _read_json_payload(
                 )
     if not isinstance(payload, dict):
         if output_recovery != "warn":
-            raise LLMWorkerError("Codex JSON output was not an object")
+            raise _submitted_output_error("Codex JSON output was not an object")
         return {}, structured_metadata(
             severity="major",
             warnings=["Codex JSON output was not an object; using local recovery."],
@@ -407,7 +431,7 @@ def _read_json_payload(
 def _extract_first_json_object(text: str) -> str:
     start = text.find("{")
     if start < 0:
-        raise LLMWorkerError("Codex JSON output did not contain an object")
+        raise _submitted_output_error("Codex JSON output did not contain an object")
     depth = 0
     in_string = False
     escape = False
@@ -429,7 +453,7 @@ def _extract_first_json_object(text: str) -> str:
             depth -= 1
             if depth == 0:
                 return text[start : index + 1]
-    raise LLMWorkerError("Codex JSON output contained an unterminated object")
+    raise _submitted_output_error("Codex JSON output contained an unterminated object")
 
 
 def _int_or_none(value: Any) -> int | None:

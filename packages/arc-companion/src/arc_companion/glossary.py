@@ -194,7 +194,7 @@ def _consolidate_candidates(
             protected_names=protected_names,
             entry_limit=entry_limit,
             output_limit=entry_limit,
-            cache_path=None,
+            cache_path=checkpoint_dir / "glossary-consolidation" / "direct.json",
             artifact_dir=checkpoint_dir / "llm" / "glossary" / "consolidation",
             call_label="companion-glossary-consolidation",
             stage="final",
@@ -240,6 +240,14 @@ def _consolidate_candidates(
             protected_names=protected_names,
             entry_limit=entry_limit,
         )
+        maximum_following_count = sum(
+            min(entry_limit, max(1, len(batch) // 2)) for batch in batches
+        )
+        if maximum_following_count >= len(current):
+            raise RuntimeError(
+                "glossary consolidation cannot reduce this input within the prompt "
+                "transport limits; refusing to spend calls on a no-progress level"
+            )
 
         def merge_node(node: int, batch: list[dict[str, Any]]) -> tuple[int, dict[str, Any]]:
             output_limit = min(entry_limit, max(1, len(batch) // 2))

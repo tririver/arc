@@ -4,7 +4,6 @@ import json
 import os
 import queue
 import re
-import signal
 import subprocess
 import threading
 import time
@@ -13,13 +12,26 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.retryable_output import ProviderOutputClass, classify_provider_output_text
+from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.schema_cache import canonical_json, sha256_text
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
-from .base import LLMWorkerCancelled, LLMWorkerError, LLMWorkerTimeout
-from .lifecycle import resolve_worker_call_timeout_seconds
+from .base import (
+    LLMFailureCategory,
+    LLMSubmissionState,
+    LLMWorkerCancelled,
+    LLMWorkerError,
+    LLMWorkerTimeout,
+)
+from .kimi_safety import resolve_kimi_retry_safety
+from .lifecycle import (
+    resolve_worker_call_timeout_seconds,
+    start_process_group_watchdog,
+    stop_process_group_watchdog,
+    terminate_process_group,
+)
 
 
 EXPERIMENTAL_WARNING = (
@@ -208,6 +220,7 @@ class KimiCodeCliProvider:
                 native_session_id=native_session_id,
                 raw_events=tuple(client.events),
                 raw_output=text,
+                raw_model_output=text,
                 prompt_sent_sha256=sha256_text(prompt),
             )
         except (_AcpTimeout, LLMWorkerCancelled) as exc:
@@ -235,6 +248,7 @@ class _AcpProcess:
         self.env = env
         self.artifact_dir = artifact_dir
         self.process: subprocess.Popen[str] | None = None
+        self.watchdog: subprocess.Popen[object] | None = None
         self.stdout_queue: queue.Queue[str | None] = queue.Queue()
         self.stderr_lines: list[str] = []
         self.stdout_lines: list[str] = []
@@ -250,9 +264,14 @@ class _AcpProcess:
         self._cancel_check = cancel_check
         self._threads: list[threading.Thread] = []
         self._stopped = False
+        self._fatal_error: LLMWorkerError | None = None
+        self._fatal_lock = threading.Lock()
 
     def start(self) -> None:
-        command = [self.env.get("ARC_KIMI_BIN", "kimi"), "acp"]
+        retry_safety = resolve_kimi_retry_safety(self.env)
+        command = list(retry_safety.command)
+        if retry_safety.warning:
+            warnings.warn(retry_safety.warning, RuntimeWarning, stacklevel=2)
         child_env = dict(self.env)
         child_env.update(
             {
@@ -282,6 +301,7 @@ class _AcpProcess:
                 f"Kimi Code binary not found: {command[0]}. Install @moonshot-ai/kimi-code >=0.28.0.",
                 retryable=False,
             ) from exc
+        self.watchdog = start_process_group_watchdog(self.process, grace_seconds=0.35)
         assert self.process.stdout is not None
         assert self.process.stderr is not None
         stdout_thread = threading.Thread(target=self._read_stdout, name="arc-kimi-stdout", daemon=True)
@@ -303,12 +323,27 @@ class _AcpProcess:
         assert self.process is not None and self.process.stderr is not None
         for line in self.process.stderr:
             self.stderr_lines.append(line)
+            disposition = classify_provider_diagnostic(
+                line,
+                submission_state=LLMSubmissionState.UNKNOWN,
+            )
+            if disposition is not None and disposition.abort_scope.value == "provider":
+                with self._fatal_lock:
+                    if self._fatal_error is None:
+                        self._fatal_error = LLMWorkerError(
+                            f"Kimi provider reported {disposition.category.value}",
+                            **disposition_error_kwargs(disposition),
+                        )
 
     def request(self, method: str, params: dict[str, Any]) -> Any:
         request_id = self._next_id
         self._next_id += 1
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         while True:
+            with self._fatal_lock:
+                fatal_error = self._fatal_error
+            if fatal_error is not None:
+                raise fatal_error
             if self._cancel_check is not None and self._cancel_check():
                 raise LLMWorkerCancelled("Kimi ACP call was cancelled")
             remaining = None if self._deadline is None else self._deadline - time.monotonic()
@@ -316,18 +351,10 @@ class _AcpProcess:
                 raise _AcpTimeout()
             try:
                 line = self.stdout_queue.get(
-                    timeout=(
-                        0.1
-                        if remaining is None and self._cancel_check is not None
-                        else None
-                        if remaining is None
-                        else min(remaining, 0.1 if self._cancel_check is not None else remaining)
-                    )
+                    timeout=0.1 if remaining is None else min(remaining, 0.1)
                 )
-            except queue.Empty as exc:
-                if self._cancel_check is not None:
-                    continue
-                raise _AcpTimeout() from exc
+            except queue.Empty:
+                continue
             if line is None:
                 return_code = self.process.poll() if self.process is not None else None
                 diagnostic = "".join(self.stderr_lines).strip()
@@ -456,15 +483,12 @@ class _AcpProcess:
         try:
             process.wait(timeout=0.35)
         except subprocess.TimeoutExpired:
-            _signal_process_group(process, force=False)
-            try:
-                process.wait(timeout=0.35)
-            except subprocess.TimeoutExpired:
-                _signal_process_group(process, force=True)
-                try:
-                    process.wait(timeout=0.35)
-                except subprocess.TimeoutExpired:
-                    pass
+            pass
+        # Cleanup must also inspect the process group after the ACP leader has
+        # exited; helpers otherwise survive a successful or cancelled call.
+        terminate_process_group(process, grace_seconds=0.35)
+        stop_process_group_watchdog(self.watchdog)
+        self.watchdog = None
         self._stopped = True
 
     def _write_artifacts(self) -> None:
@@ -481,21 +505,6 @@ class _AcpProcess:
         (self.artifact_dir / "raw_stderr.txt").write_text(
             "".join(self.stderr_lines), encoding="utf-8", errors="replace"
         )
-
-
-def _signal_process_group(process: subprocess.Popen[str], *, force: bool) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            process.kill() if force else process.terminate()
-        else:
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            process.kill() if force else process.terminate()
-        except OSError:
-            pass
 
 
 def _validate_initialize(result: Any) -> None:
@@ -583,21 +592,25 @@ def _worker_error(
     *,
     retryable: bool,
     abort_batch: bool = False,
+    submission_state: LLMSubmissionState = LLMSubmissionState.UNKNOWN,
 ) -> LLMWorkerError:
-    try:
-        return LLMWorkerError(
-            message,
-            retryable=retryable,
-            abort_batch=abort_batch,
-        )
-    except TypeError:
-        try:
-            error = LLMWorkerError(message, retryable=retryable)
-        except TypeError:
-            error = LLMWorkerError(message)
-        error.retryable = retryable  # type: ignore[attr-defined]
-        error.abort_batch = abort_batch  # type: ignore[attr-defined]
-        return error
+    disposition = classify_provider_diagnostic(
+        message,
+        submission_state=submission_state,
+    )
+    if disposition is not None:
+        return LLMWorkerError(message, **disposition_error_kwargs(disposition))
+    return LLMWorkerError(
+        message,
+        retryable=False,
+        abort_batch=abort_batch,
+        category=(
+            LLMFailureCategory.PROVIDER_INTERNAL
+            if retryable or abort_batch
+            else LLMFailureCategory.OUTPUT_INVALID
+        ),
+        submission_state=submission_state,
+    )
 
 
 def _timeout_seconds(env: Mapping[str, str]) -> float | None:
@@ -649,7 +662,11 @@ def _parse_json_response(
                 strategy="natural_language_fallback",
                 provider_error_type=type(direct_error).__name__,
             )
-        raise _worker_error(f"Kimi output was not JSON: {direct_error}", retryable=True) from direct_error
+        raise _worker_error(
+            f"Kimi output was not JSON: {direct_error}",
+            retryable=False,
+            submission_state=LLMSubmissionState.SUBMITTED,
+        ) from direct_error
     if not isinstance(value, dict):
         if output_recovery == "warn":
             return {}, structured_metadata(
@@ -659,7 +676,11 @@ def _parse_json_response(
                 strategy="natural_language_fallback",
                 provider_error_type=type(value).__name__,
             )
-        raise _worker_error("Kimi JSON output was not an object", retryable=True)
+        raise _worker_error(
+            "Kimi JSON output was not an object",
+            retryable=False,
+            submission_state=LLMSubmissionState.SUBMITTED,
+        )
     return value, None
 
 

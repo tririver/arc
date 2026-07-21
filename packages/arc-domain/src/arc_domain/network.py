@@ -11,6 +11,7 @@ from arc_paper.ids import arxiv_path_id, normalize_paper_id
 
 from . import paper
 from .cache import DomainPaths, now_iso, read_json, update_status, write_json
+from .llm_safety import raise_if_llm_fatal
 from .text import citation_per_year, log_score, paper_key, token_overlap_score
 
 
@@ -287,6 +288,7 @@ def _rank_by_intent(
             ranking[ARC_LLM_CALL_RECORD_FIELD] = result[ARC_LLM_CALL_RECORD_FIELD]
         return ranking
     except Exception as exc:
+        raise_if_llm_fatal(exc)
         ranked = [
             item["paper_id"]
             for item in shortlist

@@ -91,6 +91,62 @@ def test_glossary_is_consolidated_ordered_and_resumable(tmp_path: Path) -> None:
     assert len(calls) == count
 
 
+def test_direct_glossary_consolidation_cache_survives_missing_final_envelope(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        calls.append(call_label)
+        return {"entries": [{
+            "source_term": "Feynman diagram",
+            "target_term": "Feynman 图",
+            "brief_explanation": "图形表示",
+            "protected_names": ["Feynman"],
+            "first_block_id": "b1",
+        }]}
+
+    first = generate_glossary(
+        _document(), language="zh-CN", protected_names=["Feynman"],
+        checkpoint_dir=tmp_path, workers=1, force=False, call_model=call_model,
+    )
+    assert (tmp_path / "glossary-consolidation" / "direct.json").is_file()
+    (tmp_path / "glossary.json").unlink()
+    calls.clear()
+
+    assert generate_glossary(
+        _document(), language="zh-CN", protected_names=["Feynman"],
+        checkpoint_dir=tmp_path, workers=1, force=False, call_model=call_model,
+    ) == first
+    assert calls == []
+
+
+def test_glossary_refuses_no_progress_hierarchy_before_model_calls(tmp_path: Path) -> None:
+    calls: list[str] = []
+    huge = "x" * 25_000
+    candidates = [{"entries": [{
+        "source_term": f"term-{index}",
+        "target_term": f"target-{index}",
+        "brief_explanation": huge,
+        "first_block_id": "b1",
+    }]} for index in range(2)]
+
+    with pytest.raises(RuntimeError, match="refusing to spend calls"):
+        glossary_module._consolidate_candidates(
+            candidates,
+            blocks=_document()["blocks"],
+            language="zh-CN",
+            protected_names=[],
+            entry_limit=1,
+            checkpoint_dir=tmp_path,
+            workers=2,
+            force=False,
+            call_model=lambda *args: calls.append("llm") or {"entries": []},
+        )
+
+    assert calls == []
+
+
 def test_glossary_hierarchically_consolidates_155_windows_with_bounded_nodes(
     tmp_path: Path,
 ) -> None:

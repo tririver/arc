@@ -1170,7 +1170,7 @@ def test_arc_runtime_and_job_docs_cover_unified_context_and_lifecycle() -> None:
     assert "migration status" in skill
     assert "detected host" in skill
     assert "provider" in skill
-    assert "no wall-clock timeout" in jobs
+    assert "3600-second monotonic deadline" in jobs
     assert "1800-second" not in jobs
     assert "worker_call_timeout_seconds" in jobs
     assert "--progress-jsonl" in jobs
@@ -1197,7 +1197,7 @@ def test_domain_and_ideas_docs_route_by_semantic_fields_and_frozen_recency() -> 
     assert "status is `completed` or `degraded`" in ideas
     assert "rank only usable loops" in ideas
     for text in (skill, domain, ideas):
-        assert "wait indefinitely by default" in text
+        assert "one-hour monotonic deadline by default" in text
         assert "--timeout-seconds" in text
         assert "ARC_*_TIMEOUT_SECONDS" in text
     assert "cancellation" in skill

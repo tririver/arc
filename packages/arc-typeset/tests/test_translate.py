@@ -224,6 +224,9 @@ def test_translate_quality_scope_marks_prefix_limited_review(tmp_path: Path) -> 
         "draft_chars_checked": 30000,
         "full_document_checked": False,
     }
+    output = Path(result["data"]["output_markdown_path"]).read_text(encoding="utf-8")
+    assert output.startswith("reviewed\n")
+    assert output.endswith("A" * 1000 + "\n")
 
 
 def test_discover_batch_translation_candidates_requires_matching_md_pdf_and_skips_locale_outputs(tmp_path: Path) -> None:

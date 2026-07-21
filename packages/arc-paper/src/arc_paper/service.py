@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ from arc_llm.runner import resolve_llm_config
 from .cache import (
     CachePaths,
     cache_root,
+    content_lock,
     now_iso,
     parsed_source_annotations_cache_path,
     parsed_source_cache_path,
@@ -125,7 +127,8 @@ def llm_infer_main_references(
 ) -> dict[str, Any]:
     query_text = (text or "").strip()
     cache_path = text_query_cache_path("main-references", query_text)
-    cached = read_json(cache_path) if not refresh else None
+    existing_cached = read_json(cache_path)
+    cached = existing_cached if not refresh else None
 
     explicit_ids = _extract_paper_ids(query_text)
     if explicit_ids:
@@ -153,32 +156,52 @@ def llm_infer_main_references(
             cache_path=str(cache_path),
             cached_at=cached.get("created_at"),
         )
-    try:
-        result = infer_main_references(
-            query_text,
-            provider=provider,
-            model=model,
-            model_tier=model_tier,
-            refresh=refresh,
-            metadata_lookup=_inspire.get_metadata,
-        )
-    except ReferenceInferenceError as exc:
-        return err(exc.code, exc.message)
-    except ProviderError as exc:
-        return err(exc.code, exc.message)
-    except Exception as exc:
-        return err("reference_inference_failed", str(exc))
-    meta = {
-        "provider": result.get("provider"),
-        "model": result.get("model"),
-        "llm_used": True,
-        "focus_scope": result.get("focus_scope"),
-        "warnings": result.get("warnings", []),
-        "verified_references": result.get("verified_references", []),
-        "rejected_candidates": result.get("rejected_candidates", []),
-        "raw_llm_response": result.get("raw_llm_response"),
-    }
-    _write_reference_query_cache(cache_path, query_text=query_text, paper_ids=result["paper_ids"], meta=meta)
+    initial_cached = existing_cached
+    # The public reference cache is query-addressed and provider-agnostic, so
+    # its single-flight lock must use the same identity to avoid competing
+    # providers writing the same cache path.
+    lock_key = hashlib.sha256(query_text.encode("utf-8")).hexdigest()
+    with content_lock("main-references", lock_key):
+        cached = read_json(cache_path)
+        if isinstance(cached, dict) and isinstance(cached.get("paper_ids"), list) and (
+            not refresh or cached != initial_cached
+        ):
+            meta = dict(cached.get("meta") or {})
+            return ok(
+                cached["paper_ids"],
+                **meta,
+                cache="hit",
+                cache_path=str(cache_path),
+                cached_at=cached.get("created_at"),
+            )
+        try:
+            result = infer_main_references(
+                query_text,
+                provider=provider,
+                model=model,
+                model_tier=model_tier,
+                refresh=refresh,
+                metadata_lookup=_inspire.get_metadata,
+            )
+        except ReferenceInferenceError as exc:
+            return err(exc.code, exc.message)
+        except ProviderError as exc:
+            return err(exc.code, exc.message)
+        except Exception as exc:
+            if _abort_batch_exception(exc):
+                raise
+            return err("reference_inference_failed", str(exc))
+        meta = {
+            "provider": result.get("provider"),
+            "model": result.get("model"),
+            "llm_used": True,
+            "focus_scope": result.get("focus_scope"),
+            "warnings": result.get("warnings", []),
+            "verified_references": result.get("verified_references", []),
+            "rejected_candidates": result.get("rejected_candidates", []),
+            "raw_llm_response": result.get("raw_llm_response"),
+        }
+        _write_reference_query_cache(cache_path, query_text=query_text, paper_ids=result["paper_ids"], meta=meta)
     return ok(
         result["paper_ids"],
         **meta,
@@ -1519,6 +1542,8 @@ def _get_or_generate_summary_one(
         try:
             config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
         except Exception as exc:
+            if _abort_batch_exception(exc):
+                raise
             return err("summary_generation_failed", str(exc))
         status = _summary_status_for_generation_or_error(
             paper_id,
@@ -1556,6 +1581,8 @@ def _generate_summary_one(
     try:
         config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
     except Exception as exc:
+        if _abort_batch_exception(exc):
+            raise
         return err("summary_generation_failed", str(exc))
     status = _summary_status_for_generation_or_error(
         paper_id,
@@ -1617,15 +1644,53 @@ def _generate_from_status(
         selected = select_summary_provider(config.provider)
         if selected.name == "manual":
             return status
-        summary = selected.generate_summary(
-            status["llm_task"],
-            model=config.model,
-            model_tier=model_tier,
-            progress_callback=progress_callback,
-        )
         summary_paper_id = str(status.get("paper_id") or paper_id)
-        path = store_summary(summary_paper_id, summary)
+        task = status["llm_task"]
+        input_pack = task.get("input_pack") or {}
+        source_hash = str(input_pack.get("source_hash") or "")
+        refresh = bool(task.get("refresh"))
+        initial_cached = read_summary(
+            summary_paper_id,
+            source_hash=source_hash,
+            provider=config.provider,
+            model=config.model,
+        )
+        lock_key = json.dumps(
+            {
+                "paper_id": summary_paper_id,
+                "source_hash": source_hash,
+                "prompt_version": task.get("prompt_version"),
+                "provider": config.provider,
+                "model": config.model,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with content_lock("paper-summaries", lock_key):
+            cached = read_summary(
+                summary_paper_id,
+                source_hash=source_hash,
+                provider=config.provider,
+                model=config.model,
+            )
+            if cached is not None and (not refresh or cached != initial_cached):
+                cached_path = CachePaths.for_paper(summary_paper_id).summary_path(
+                    str(task.get("prompt_version") or "paper-summary-v1"),
+                    source_hash,
+                    provider=config.provider,
+                    model=config.model,
+                )
+                return ok(cached, provider="local-cache", cache="hit", summary_path=str(cached_path))
+            summary = selected.generate_summary(
+                task,
+                model=config.model,
+                model_tier=model_tier,
+                progress_callback=progress_callback,
+            )
+            path = store_summary(summary_paper_id, summary)
     except Exception as exc:
+        if _abort_batch_exception(exc):
+            raise
         return err("summary_generation_failed", str(exc))
     return ok(summary, provider=selected.name, cache="write", summary_path=str(path))
 
@@ -1691,6 +1756,27 @@ def _map(ids: str | Iterable[str] | None, func: Callable[[str], dict[str, Any]])
         if paper_id not in out:
             out[paper_id] = func(paper_id)
     return out
+
+
+def _abort_batch_exception(exc: BaseException) -> bool:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if bool(getattr(current, "abort_batch", False)):
+            return True
+        scope = getattr(current, "abort_scope", None)
+        scope_text = str(getattr(scope, "value", scope) or "").lower()
+        if scope_text in {"batch", "provider"}:
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None and current.__context__ is not current.__cause__:
+            pending.append(current.__context__)
+    return False
 
 
 def _call(func: Callable[[], Any], provider: str) -> dict[str, Any]:

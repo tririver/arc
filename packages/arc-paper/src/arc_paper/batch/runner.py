@@ -4,7 +4,7 @@ import json
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
-from threading import get_ident
+from threading import Event, Thread, get_ident
 from typing import Any
 
 from arc_llm.runner import resolve_llm_config
@@ -36,13 +36,18 @@ def run_batch(
 ) -> dict[str, Any]:
     resolve_llm_config(provider=provider, model=model, model_tier=model_tier)
     db = db or BatchDB.default()
-    limit = max_items or 1_000_000
+    if max_items is not None and max_items < 0:
+        raise ValueError("max_items must be non-negative")
+    limit = 1_000_000 if max_items is None else max_items
+    if limit == 0:
+        return {"batch": name, "counts": db.status_counts(name)}
     workers = max(1, concurrency)
     submitted = 0
     worker_id = _worker_id()
+    abort_error: BaseException | None = None
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {}
-        while True:
+        while abort_error is None:
             while len(futures) < workers and submitted < limit:
                 claim_limit = min(workers - len(futures), limit - submitted)
                 items = db.claim_ready_items(name, limit=claim_limit, worker_id=worker_id)
@@ -59,7 +64,19 @@ def run_batch(
             done, _pending = wait(futures, return_when=FIRST_COMPLETED)
             for future in done:
                 futures.pop(future)
-                future.result()
+                try:
+                    future.result()
+                except BaseException as exc:
+                    if _abort_batch_exception(exc):
+                        abort_error = exc
+                        break
+                    raise
+        if abort_error is not None:
+            for future, item in list(futures.items()):
+                if future.cancel() and item.lease_token:
+                    db.mark_status(item.batch_name, item.paper_id, "ready", lease_token=item.lease_token)
+    if abort_error is not None:
+        raise abort_error
     return {"batch": name, "counts": db.status_counts(name)}
 
 
@@ -101,27 +118,110 @@ def _prefetch_one(item: BatchItem, db: BatchDB) -> None:
 
 
 def _run_one(item: BatchItem, db: BatchDB, *, provider: str, model: str | None, model_tier: str | None) -> None:
-    result = service.generate_llm_summary(item.paper_id, provider=provider, model=model, model_tier=model_tier)
-    if result.get("ok"):
-        summary_path = result.get("meta", {}).get("summary_path") or result.get("summary_path")
+    if not item.lease_token:
+        raise RuntimeError(f"Claimed batch item has no lease token: {item.paper_id}")
+    heartbeat = _LeaseHeartbeat(db, item)
+    with heartbeat:
+        try:
+            result = service.generate_llm_summary(item.paper_id, provider=provider, model=model, model_tier=model_tier)
+        except BaseException as exc:
+            db.mark_status(
+                item.batch_name,
+                item.paper_id,
+                "failed",
+                lease_token=item.lease_token,
+                provider=provider,
+                model=model,
+                last_error=str(exc),
+            )
+            raise
+    if heartbeat.failed:
         db.mark_status(
             item.batch_name,
             item.paper_id,
+            "failed",
+            lease_token=item.lease_token,
+            last_error="Batch lease heartbeat failed",
+        )
+        raise RuntimeError(f"Lost batch lease while generating summary for {item.paper_id}")
+    if result.get("ok"):
+        summary_path = result.get("meta", {}).get("summary_path") or result.get("summary_path")
+        committed = db.mark_status(
+            item.batch_name,
+            item.paper_id,
             "done",
+            lease_token=item.lease_token,
             provider=provider,
             model=model,
             summary_path=summary_path,
         )
     else:
-        db.mark_status(
+        committed = db.mark_status(
             item.batch_name,
             item.paper_id,
             "failed",
+            lease_token=item.lease_token,
             provider=provider,
             model=model,
             last_error=json.dumps(result.get("error", result), ensure_ascii=False),
         )
+    if not committed:
+        raise RuntimeError(f"Lost batch lease before committing summary status for {item.paper_id}")
 
 
 def _worker_id() -> str:
     return f"pid:{os.getpid()}:thread:{get_ident()}"
+
+
+class _LeaseHeartbeat:
+    def __init__(self, db: BatchDB, item: BatchItem, *, interval_seconds: float = 60.0):
+        self.db = db
+        self.item = item
+        self.interval_seconds = interval_seconds
+        self.failed = False
+        self._stop = Event()
+        self._thread: Thread | None = None
+
+    def __enter__(self):
+        self._thread = Thread(target=self._run, name="arc-paper-lease-heartbeat", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                alive = self.db.heartbeat(
+                    self.item.batch_name,
+                    self.item.paper_id,
+                    lease_token=str(self.item.lease_token),
+                )
+            except Exception:
+                alive = False
+            if not alive:
+                self.failed = True
+                return
+
+
+def _abort_batch_exception(exc: BaseException) -> bool:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if bool(getattr(current, "abort_batch", False)):
+            return True
+        scope = getattr(current, "abort_scope", None)
+        if str(getattr(scope, "value", scope) or "").lower() in {"batch", "provider"}:
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None and current.__context__ is not current.__cause__:
+            pending.append(current.__context__)
+    return False

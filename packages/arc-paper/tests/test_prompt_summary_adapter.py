@@ -1,3 +1,4 @@
+from arc_paper.summary.providers import prompt as prompt_module
 from arc_paper.summary.providers.prompt import PromptProviderSummaryAdapter
 from arc_paper.summary.schema import load_summary_schema
 
@@ -48,3 +49,36 @@ def test_kimi_prompt_adapter_uses_default_model_schema_and_valid_provenance():
     assert summary["provenance"]["method"] == "kimi-code-cli"
     assert summary["provenance"]["model"] == "default_model"
     assert summary["provenance"]["source_hash"] == "a" * 64
+
+
+def test_production_kimi_summary_routes_through_arc_llm_runner(monkeypatch):
+    calls = []
+
+    def fake_run_json(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return RecoveredKimiPromptProvider().generate_json(
+            prompt,
+            schema=kwargs["schema"],
+            model=kwargs["model"],
+        )
+
+    monkeypatch.setattr(prompt_module, "run_json", fake_run_json)
+    adapter = PromptProviderSummaryAdapter(
+        None,
+        provider_name="kimi-code-cli",
+        env={"ARC_HOME": "/tmp/arc-test"},
+        process_chain=[],
+    )
+    task = {
+        "prompt_version": "paper-summary-v1",
+        "system_prompt": "Summarize the paper.",
+        "user_prompt": "Return JSON only.",
+        "input_pack": {"paper_id": "arXiv:0911.3380", "source_hash": "a" * 64},
+        "output_schema": load_summary_schema(),
+    }
+
+    adapter.generate_summary(task)
+
+    assert calls
+    assert all(call["provider"] == "kimi-code-cli" for call in calls)
+    assert all(call["session_policy"] == "stateless" for call in calls)

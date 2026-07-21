@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from arc_llm.providers import kimi_code_cli as kimi_module
-from arc_llm.providers.base import LLMWorkerError, LLMWorkerTimeout
+from arc_llm.providers.base import LLMFailureCategory, LLMWorkerError, LLMWorkerTimeout
 from arc_llm.providers.kimi_code_cli import EXPERIMENTAL_WARNING, KimiCodeCliProvider
 from arc_llm.runner import run_text, run_text_result
 from arc_llm.schema_cache import canonical_json, sha256_text
@@ -25,8 +25,8 @@ def reset_experimental_warning(monkeypatch):
     monkeypatch.setattr(kimi_module, "_WARNING_EMITTED", False)
 
 
-def test_kimi_timeout_is_unlimited_when_timeout_environment_is_unset():
-    assert kimi_module._timeout_seconds({}) is None
+def test_kimi_timeout_defaults_to_one_hour_when_environment_is_unset():
+    assert kimi_module._timeout_seconds({}) == 3600
 
 
 def fake_env(tmp_path: Path, *, scenario: str = "happy", output: str = "hello") -> dict[str, str]:
@@ -34,6 +34,8 @@ def fake_env(tmp_path: Path, *, scenario: str = "happy", output: str = "hello") 
     env.update(
         {
             "ARC_KIMI_BIN": str(FAKE_KIMI),
+            "ARC_HOME": str(tmp_path / "arc-home"),
+            "ARC_LLM_CACHE": str(tmp_path / "arc-home" / "cache" / "arc-llm"),
             "ARC_KIMI_WORK_DIR": str(tmp_path),
             "ARC_KIMI_TIMEOUT_SECONDS": "5",
             "FAKE_KIMI_RECORD": str(tmp_path / "fake-kimi.jsonl"),
@@ -192,7 +194,7 @@ def test_large_prompt_only_travels_in_acp_stdin_not_process_argv(tmp_path):
     assert KimiCodeCliProvider(env=env).generate_text(prompt) == "hello"
 
     boot = next(item for item in records(env) if item["kind"] == "boot")
-    assert boot["argv"] == [str(FAKE_KIMI), "acp"]
+    assert boot["argv"] == [str(FAKE_KIMI), "--max-retries-per-step", "1", "acp"]
     assert all(prompt not in arg for arg in boot["argv"])
     prompt_request = next(request for request in client_requests(env) if request["method"] == "session/prompt")
     assert prompt_request["params"]["prompt"] == [{"type": "text", "text": prompt}]
@@ -296,7 +298,7 @@ def test_json_strict_mode_rejects_plain_text(tmp_path):
             output_recovery="strict",
         )
 
-    assert caught.value.retryable is True
+    assert caught.value.retryable is False
 
 
 @pytest.mark.parametrize("output_recovery", ["strict", "warn"])
@@ -380,7 +382,7 @@ def test_reverse_filesystem_requests_receive_json_rpc_errors(tmp_path):
         ("invalid_session", "protocol error", False, False),
         ("invalid_json", "invalid JSON", False, False),
         ("old_version", "requires >=0.28.0", False, False),
-        ("transport_eof", "exited before replying", True, False),
+        ("transport_eof", "exited before replying", False, False),
         ("transport_usage_limit", "usage limit", False, True),
         ("rpc_usage_limit", "usage limit", False, True),
         ("rpc_quota_exhausted", "quota-exhausted", False, True),
@@ -435,6 +437,19 @@ def test_kimi_diagnostic_retryability_distinguishes_quota_from_throttling(
     )
 
 
+def test_stderr_rate_limit_aborts_hung_acp_immediately(tmp_path):
+    env = fake_env(tmp_path, scenario="stderr_rate_limit_hang")
+    started = time.monotonic()
+    with pytest.raises(LLMWorkerError, match="rate_limit") as caught:
+        KimiCodeCliProvider(env=env).generate_text_result(
+            "prompt",
+            timeout_seconds=10,
+        )
+    assert time.monotonic() - started < 3
+    assert caught.value.category == LLMFailureCategory.RATE_LIMIT
+    assert caught.value.retryable is False
+
+
 def test_missing_binary_is_non_retryable(tmp_path):
     env = fake_env(tmp_path)
     env["ARC_KIMI_BIN"] = str(tmp_path / "does-not-exist" / "kimi")
@@ -466,7 +481,7 @@ def test_timeout_sends_cancel_and_kills_process_group(tmp_path):
     with pytest.raises(LLMWorkerTimeout, match="timed out") as caught:
         KimiCodeCliProvider(env=env).generate_text("long prompt")
 
-    assert caught.value.retryable is True
+    assert caught.value.retryable is False
     seen = records(env)
     assert any(
         item.get("kind") == "client_message" and item.get("message", {}).get("method") == "session/cancel"

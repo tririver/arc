@@ -12,6 +12,7 @@ from arc_llm import run_json
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA, strip_arc_llm_call_records
 
 from .cache import DomainPaths, now_iso, read_json, update_status, write_json, write_text
+from .llm_safety import raise_if_llm_fatal
 
 
 SUMMARY_ABSTRACT_CHAR_LIMIT = 1600
@@ -301,6 +302,7 @@ def summarize_domain(
             output_recovery="warn",
         )
     except Exception as exc:
+        raise_if_llm_fatal(exc)
         warning = {
             "code": "domain_summary_llm_failed",
             "message": f"LLM domain summary failed; proceeding without domain summary: {type(exc).__name__}: {exc}",

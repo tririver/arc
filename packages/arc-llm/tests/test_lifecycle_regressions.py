@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -12,8 +14,18 @@ from arc_llm import runner as core_runner
 from arc_llm.evidence import EVIDENCE_REQUESTS_FIELD, allow_evidence_requests, evidence_requests_schema
 from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, validate_codex_strict_schema
 from arc_llm.proposers_reviewer.runner import _batch_status, run_proposers_reviewer_batch
-from arc_llm.providers.lifecycle import resolve_worker_call_timeout_seconds, run_process_group
-from arc_llm.providers.base import LLMSchemaError, LLMWorkerCancelled, LLMWorkerError, LLMWorkerTimeout
+from arc_llm.providers.lifecycle import (
+    resolve_worker_call_timeout_seconds,
+    run_process_group,
+    terminate_process_group,
+)
+from arc_llm.providers.base import (
+    LLMSchemaError,
+    LLMSubmissionState,
+    LLMWorkerCancelled,
+    LLMWorkerError,
+    LLMWorkerTimeout,
+)
 
 from .test_proposers_reviewer_runner import FakeJsonRunner, _context_from_prompt, base_config
 
@@ -49,8 +61,8 @@ def test_recursive_codex_validator_rejects_optional_nested_property() -> None:
         validate_codex_strict_schema(schema)
 
 
-def test_worker_timeout_precedence_and_unlimited_default() -> None:
-    assert resolve_worker_call_timeout_seconds(None, env={}, provider="codex-cli") is None
+def test_worker_timeout_precedence_and_one_hour_default() -> None:
+    assert resolve_worker_call_timeout_seconds(None, env={}, provider="codex-cli") == 3600
     assert resolve_worker_call_timeout_seconds(None, env={"ARC_LLM_TIMEOUT_SECONDS": "22"}, provider="codex-cli") == 22
     assert resolve_worker_call_timeout_seconds(
         None,
@@ -113,7 +125,7 @@ def test_process_group_cancellation_remains_active_without_deadline() -> None:
     assert time.monotonic() - started < 2
 
 
-def test_runner_passes_no_deadline_when_timeout_is_unset(monkeypatch) -> None:
+def test_runner_passes_one_hour_deadline_when_timeout_is_unset(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Provider:
@@ -123,9 +135,69 @@ def test_runner_passes_no_deadline_when_timeout_is_unset(monkeypatch) -> None:
             return core_runner.LLMProviderResponse(value="ok")
 
     monkeypatch.setattr(core_runner, "select_provider", lambda *_args, **_kwargs: Provider())
+    monkeypatch.setattr(core_runner.time, "monotonic", lambda: 100.0)
 
     assert core_runner.run_text("prompt", provider="codex-cli", env={}, process_chain=[]) == "ok"
-    assert captured == {"deadline": None, "cancel_check": None}
+    assert captured == {"deadline": 3700.0, "cancel_check": None}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
+def test_terminate_process_group_kills_descendant_after_leader_exits(tmp_path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    script = (
+        "import pathlib,subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid)); "
+    )
+    leader = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
+    leader.wait(timeout=2)
+    child_pid = int(child_pid_path.read_text())
+
+    terminate_process_group(leader, grace_seconds=0.1)
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and _pid_is_running(child_pid):
+        time.sleep(0.01)
+    assert not _pid_is_running(child_pid)
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        stat = open(f"/proc/{pid}/stat", encoding="utf-8").read()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].strip().split()[0] != "Z"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent-death watchdog")
+def test_provider_watchdog_reaps_group_after_caller_sigkill(tmp_path) -> None:
+    provider_pid_path = tmp_path / "provider.pid"
+    provider_script = (
+        "import os,pathlib,signal,time; "
+        f"pathlib.Path({str(provider_pid_path)!r}).write_text(str(os.getpid())); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    caller_script = (
+        "import os,sys; "
+        "from arc_llm.providers.lifecycle import run_process_group; "
+        f"run_process_group([sys.executable,'-c',{provider_script!r}],"
+        "input_text='',env=os.environ,deadline=None)"
+    )
+    caller = subprocess.Popen([sys.executable, "-c", caller_script])
+    deadline = time.monotonic() + 3
+    while not provider_pid_path.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    provider_pid = int(provider_pid_path.read_text())
+
+    os.kill(caller.pid, signal.SIGKILL)
+    caller.wait(timeout=2)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and _pid_is_running(provider_pid):
+        time.sleep(0.02)
+    assert not _pid_is_running(provider_pid)
 
 
 def test_retry_loop_uses_one_total_monotonic_deadline(monkeypatch) -> None:
@@ -137,13 +209,20 @@ def test_retry_loop_uses_one_total_monotonic_deadline(monkeypatch) -> None:
         def generate_json(self, prompt, *, schema=None, model=None):
             self.attempts += 1
             clock["now"] += 6
-            raise LLMWorkerError("transient")
+            raise LLMWorkerError(
+                "transient",
+                retryable=True,
+                submission_state=LLMSubmissionState.NOT_SUBMITTED,
+            )
 
     provider = Provider()
     monkeypatch.setattr(core_runner, "select_provider", lambda *_args, **_kwargs: provider)
     monkeypatch.setattr(core_runner.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr("arc_llm.providers.lifecycle.time.monotonic", lambda: clock["now"])
     monkeypatch.setattr(core_runner.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+    # Production defaults to one provider submission. Exercise the deadline
+    # invariant with an explicitly enabled retry loop.
+    monkeypatch.setattr(core_runner, "MAX_ATTEMPTS_PER_PROVIDER", 3)
 
     with pytest.raises(LLMWorkerTimeout, match="timed out"):
         core_runner.run_json(

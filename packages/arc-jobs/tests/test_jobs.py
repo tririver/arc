@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -45,6 +48,45 @@ def _install_fake_cli(tmp_path: Path, monkeypatch, *, body: str) -> Path:
     command.chmod(0o755)
     monkeypatch.setattr("arc_jobs.jobs.runtime_script_dirs", lambda: (scripts,))
     return command
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent-death watchdog")
+def test_command_watchdog_reaps_group_after_worker_sigkill(tmp_path):
+    command_pid_path = tmp_path / "command.pid"
+    command_script = (
+        "import os,pathlib,signal,time; "
+        f"pathlib.Path({str(command_pid_path)!r}).write_text(str(os.getpid())); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    worker_script = (
+        "import subprocess,sys,time; "
+        "from arc_jobs.worker import _start_process_watchdog; "
+        f"p=subprocess.Popen([sys.executable,'-c',{command_script!r}],start_new_session=True); "
+        "_start_process_watchdog(p); time.sleep(60)"
+    )
+    child_env = dict(os.environ)
+    child_env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    worker_process = subprocess.Popen([sys.executable, "-c", worker_script], env=child_env)
+    deadline = time.monotonic() + 3
+    while not command_pid_path.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    command_pid = int(command_pid_path.read_text())
+
+    os.kill(worker_process.pid, signal.SIGKILL)
+    worker_process.wait(timeout=2)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and _test_pid_running(command_pid):
+        time.sleep(0.02)
+    assert not _test_pid_running(command_pid)
+
+
+def _test_pid_running(pid: int) -> bool:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return stat_text.rsplit(")", 1)[1].strip().split()[0] != "Z"
 
 
 def test_thread_job_compatibility_and_protocol_neutral_schema(tmp_path, monkeypatch):
@@ -599,6 +641,24 @@ def test_environment_snapshot_preserves_explicit_provider_reasoning_effort(monke
     assert persisted["ARC_CLAUDE_EFFORT"] == "high"
     assert restored["ARC_CODEX_REASONING_EFFORT"] == "medium"
     assert restored["ARC_CLAUDE_EFFORT"] == "high"
+
+
+def test_environment_snapshot_preserves_nonsecret_llm_concurrency_limits(monkeypatch):
+    expected = {
+        "ARC_LLM_MAX_CONCURRENCY": "24",
+        "ARC_CODEX_MAX_CONCURRENCY": "8",
+        "ARC_CLAUDE_MAX_CONCURRENCY": "6",
+        "ARC_KIMI_MAX_CONCURRENCY": "4",
+        "ARC_KIMI_ALLOW_INTERNAL_RETRIES": "1",
+    }
+    for key, value in expected.items():
+        monkeypatch.setenv(key, value)
+
+    persisted = snapshot_environment()
+    restored = restored_environment(persisted, base={"PATH": os.environ["PATH"]})
+
+    assert {key: persisted[key] for key in expected} == expected
+    assert {key: restored[key] for key in expected} == expected
 
 
 @pytest.mark.parametrize("env_key", _TIER_MODEL_ENV_KEYS)

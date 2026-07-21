@@ -14,6 +14,30 @@ from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionRef
 
 
+@pytest.fixture(autouse=True)
+def adapt_provider_process_group_to_legacy_subprocess_mock(monkeypatch):
+    """Keep provider command-shape tests focused on their existing run mock.
+
+    Process-group behavior is exercised with real subprocesses in
+    ``test_lifecycle_regressions``; these tests inspect provider arguments and
+    output parsing by replacing ``subprocess.run``.
+    """
+
+    def adapter(command, *, input_text, env, **_kwargs):
+        return subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+            timeout=None,
+        )
+
+    monkeypatch.setattr(codex_module, "run_process_group", adapter)
+    monkeypatch.setattr(claude_module, "run_process_group", adapter)
+
+
 def test_codex_generate_json_writes_prompt_to_stdin_and_reads_output(monkeypatch):
     captured = {}
 

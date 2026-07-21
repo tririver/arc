@@ -133,7 +133,10 @@ def test_doctor_provider_and_config_include_kimi_risk_metadata(tmp_path, monkeyp
     assert provider["provider_side_persistence"] is True
     assert any(item["category"] == "mcp" for item in provider["risks"])
     assert "do-not-report-this-value" not in repr(provider)
+    assert provider["kimi_retry_safety"]["safe"] is False
+    assert "do-not-report-this-value" not in repr(provider["kimi_retry_safety"])
     assert "kimi_code_cli.experimental" in config["warnings"]
+    assert config["kimi_retry_safety"]["safe"] is False
 
 
 def test_doctor_json_is_accepted_after_each_doctor_subcommand(monkeypatch, capsys):
@@ -147,14 +150,33 @@ def test_doctor_json_is_accepted_after_each_doctor_subcommand(monkeypatch, capsy
     assert parser.parse_args(["doctor", "config", "--json"]).json is True
 
 
+def test_circuit_status_and_reset_cli(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ARC_HOME", str(tmp_path))
+    from arc_llm.providers.base import LLMWorkerError
+    from arc_llm.safety import LLMSafetyController
+
+    LLMSafetyController().report_failure(
+        "codex-cli",
+        LLMWorkerError("quota exhausted", category="quota", abort_scope="provider"),
+    )
+
+    assert cli.main(["circuit", "status", "--provider", "codex-cli", "--json"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["circuits"][0]["category"] == "quota"
+
+    assert cli.main(["circuit", "reset", "--provider", "codex-cli", "--json"]) == 0
+    reset = json.loads(capsys.readouterr().out)
+    assert reset["reset_count"] == 1
+
+
 @pytest.mark.parametrize("command", ["run-text", "run-json", "proposers-reviewer-loop"])
-def test_timeout_help_documents_unlimited_default(command, capsys):
+def test_timeout_help_documents_one_hour_default(command, capsys):
     with pytest.raises(SystemExit) as caught:
         cli._build_parser().parse_args([command, "--help"])
 
     assert caught.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "default is unlimited" in help_text
+    assert "default is 3600 seconds" in help_text
 
 
 def test_runtime_env_merges_cli_llm_options(monkeypatch):

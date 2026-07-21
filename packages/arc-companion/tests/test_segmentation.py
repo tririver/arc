@@ -188,6 +188,17 @@ def test_portable_cut_schema_leaves_duplicate_rejection_to_companion_validation(
     assert all(json.loads(path.read_text(encoding="utf-8"))["accepted"] is False for path in attempts)
     assert not (tmp_path / "segmentation.json").exists()
 
+    calls.clear()
+    with pytest.raises(SegmentationError, match="exhausted its lifetime"):
+        segment_document(
+            _document(["prose"] * 3),
+            checkpoint_dir=tmp_path,
+            workers=1,
+            force=False,
+            call_model=model,
+        )
+    assert calls == []
+
 
 def test_provider_failure_is_not_multiplied_by_semantic_validation_retries(
     tmp_path: Path,
@@ -693,8 +704,10 @@ def test_corrupt_window_cache_is_recomputed_without_losing_valid_windows(tmp_pat
 
     rebuilt = segment_document(document, checkpoint_dir=tmp_path, workers=2, force=False, call_model=model)
 
-    assert len(calls) == 1
-    assert "w-0001" in calls[0]
+    # The accepted response is durable before the derived window cache. A
+    # missing/corrupt derived cache must replay validation without another
+    # paid model call.
+    assert calls == []
     validate_exact_coverage(rebuilt, document["blocks"])
 
 

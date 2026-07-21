@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from typing import Any, Callable
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_llm.runner import resolve_llm_config, run_json
 
 from .ids import arxiv_path_id, doi_value, extract_paper_ids, inspire_recid, normalize_paper_id
+from .summary.checkpoint import run_json_checkpointed
 
 
 MetadataLookup = Callable[..., dict[str, Any]]
@@ -76,12 +78,25 @@ def infer_main_references(
 
     env = _internet_enabled_env()
     config = resolve_llm_config(provider=provider, model=model, model_tier=model_tier, env=env)
-    payload = run_json(
-        _build_prompt(request),
+    prompt = _build_prompt(request)
+    payload = run_json_checkpointed(
+        paper_id=f"query:{hashlib.sha256(request.encode('utf-8')).hexdigest()}",
+        call_kind="main-reference-inference",
+        identity={"request_sha256": hashlib.sha256(request.encode("utf-8")).hexdigest(), "provider": config.provider},
+        prompt=prompt,
         schema=REFERENCE_INFERENCE_SCHEMA,
-        provider=config.provider,
         model=config.model,
-        env=env,
+        run_json=lambda prompt, schema, model: run_json(
+            prompt,
+            schema=schema,
+            provider=config.provider,
+            model=model,
+            env=env,
+        ),
+        # arc_llm.run_json already enforces the provider schema; verification
+        # below owns candidate-level acceptance and its stable error codes.
+        validate=lambda payload: None,
+        use_cache=not refresh,
     )
     verified = _verify_payload(payload, metadata_lookup=metadata_lookup, refresh=refresh)
     if not verified["paper_ids"]:

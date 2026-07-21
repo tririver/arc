@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record, strip_arc_llm_call_records
+from .call_checkpoint import checkpoint_path, prepare_call, record_failure, record_response, record_validated
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
 from .model import reasoning_effort_for_model_tier, resolve_model_with_warnings
@@ -18,12 +19,13 @@ from .providers.lifecycle import check_lifecycle, remaining_seconds, resolve_wor
 from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
+from .safety import LLMSafetyController
 from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
 from .structured_recovery import recover_json_output, structured_metadata
 from .usage import LLMProviderResponse, LLMUsage
 
 
-MAX_ATTEMPTS_PER_PROVIDER = 3
+MAX_ATTEMPTS_PER_PROVIDER = 1
 RETRY_INTERVAL_SECONDS = 10
 LOW_CONTENT_TOKEN_THRESHOLD = 10
 
@@ -458,25 +460,65 @@ def _generate_json(
     if session_policy == "stateful" and not hasattr(selected, "generate_json_result"):
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
     provider_schema = to_provider_json_schema(schema)
+    prepared_checkpoint = None
 
-    def call_provider(session: LLMSessionRef | None) -> LLMProviderResponse[dict[str, Any]]:
-        if hasattr(selected, "generate_json_result"):
-            kwargs = {
-                "schema": provider_schema,
-                "model": model,
-                "session": session,
-                "session_policy": session_policy,
-                "schema_cache_dir": _schema_cache_dir(artifact_dir),
-                "artifact_dir": artifact_dir,
-            }
-            if _accepts_keyword(selected.generate_json_result, "output_recovery"):
-                kwargs["output_recovery"] = output_recovery
-            if _accepts_keyword(selected.generate_json_result, "deadline"):
-                kwargs["deadline"] = deadline
-            if _accepts_keyword(selected.generate_json_result, "cancel_check"):
-                kwargs["cancel_check"] = cancel_check
-            return selected.generate_json_result(prompt, **kwargs)
-        return LLMProviderResponse(selected.generate_json(prompt, schema=provider_schema, model=model))
+    def call_provider(
+        session: LLMSessionRef | None, session_turn: int | None = None
+    ) -> LLMProviderResponse[dict[str, Any]]:
+        nonlocal prepared_checkpoint
+        if artifact_dir is not None and call_label:
+            path, identity = checkpoint_path(
+                artifact_dir,
+                prompt=prompt,
+                schema=provider_schema,
+                provider=provider_used,
+                model=model,
+                call_label=call_label,
+                session_policy=session_policy,
+                session_key=session.key if session is not None else None,
+                session_turn=session_turn,
+                runtime_fingerprint=runtime_fp,
+            )
+            prepared_checkpoint = prepare_call(
+                path, identity=identity, deadline=deadline, cancel_check=cancel_check
+            )
+            if prepared_checkpoint.replay_response is not None:
+                return prepared_checkpoint.replay_response
+        def invoke() -> LLMProviderResponse[dict[str, Any]]:
+            if hasattr(selected, "generate_json_result"):
+                kwargs = {
+                    "schema": provider_schema,
+                    "model": model,
+                    "session": session,
+                    "session_policy": session_policy,
+                    "schema_cache_dir": _schema_cache_dir(artifact_dir),
+                    "artifact_dir": artifact_dir,
+                }
+                if _accepts_keyword(selected.generate_json_result, "output_recovery"):
+                    kwargs["output_recovery"] = output_recovery
+                if _accepts_keyword(selected.generate_json_result, "deadline"):
+                    kwargs["deadline"] = deadline
+                if _accepts_keyword(selected.generate_json_result, "cancel_check"):
+                    kwargs["cancel_check"] = cancel_check
+                return selected.generate_json_result(prompt, **kwargs)
+            return LLMProviderResponse(selected.generate_json(prompt, schema=provider_schema, model=model))
+
+        try:
+            response = _controlled_provider_call(
+                provider_used,
+                env=env,
+                deadline=deadline,
+                cancel_check=cancel_check,
+                call_label=call_label,
+                invoke=invoke,
+            )
+        except BaseException as exc:
+            if prepared_checkpoint is not None:
+                record_failure(prepared_checkpoint, exc)
+            raise
+        if prepared_checkpoint is not None:
+            record_response(prepared_checkpoint, response)
+        return response
 
     if session_policy == "stateful":
         assert session_manager is not None
@@ -488,8 +530,8 @@ def _generate_json(
             runtime_fingerprint=runtime_fp,
             name=session_name,
             metadata=session_metadata,
-        ) as (session, _turn_count):
-            response = call_provider(session)
+        ) as (session, turn_count):
+            response = call_provider(session, turn_count)
             result = response.value
             prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
             native_session_id = response.native_session_id
@@ -542,6 +584,8 @@ def _generate_json(
                     model_tier=model_tier,
                     env=env,
                     process_chain=process_chain,
+                    artifact_dir=artifact_dir,
+                    call_label=call_label,
                     deadline=deadline,
                     cancel_check=cancel_check,
                 )
@@ -566,11 +610,15 @@ def _generate_json(
             model_tier=model_tier,
             env=env,
             process_chain=process_chain,
+            artifact_dir=artifact_dir,
+            call_label=call_label,
             deadline=deadline,
             cancel_check=cancel_check,
         )
         native_session_id = response.native_session_id
         prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
+    if prepared_checkpoint is not None:
+        record_validated(prepared_checkpoint)
     return LLMCallOutcome(
         value=result,
         usage=response.usage,
@@ -616,20 +664,61 @@ def _generate_text(
     if session_policy == "stateful" and not hasattr(selected, "generate_text_result"):
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
 
-    def call_provider(session: LLMSessionRef | None) -> LLMProviderResponse[str]:
-        if hasattr(selected, "generate_text_result"):
-            kwargs = {
-                "model": model,
-                "session": session,
-                "session_policy": session_policy,
-                "artifact_dir": artifact_dir,
-            }
-            if _accepts_keyword(selected.generate_text_result, "deadline"):
-                kwargs["deadline"] = deadline
-            if _accepts_keyword(selected.generate_text_result, "cancel_check"):
-                kwargs["cancel_check"] = cancel_check
-            return selected.generate_text_result(prompt, **kwargs)
-        return LLMProviderResponse(selected.generate_text(prompt, model=model))
+    prepared_checkpoint = None
+
+    def call_provider(
+        session: LLMSessionRef | None, session_turn: int | None = None
+    ) -> LLMProviderResponse[str]:
+        nonlocal prepared_checkpoint
+        if artifact_dir is not None and call_label:
+            path, identity = checkpoint_path(
+                artifact_dir,
+                prompt=prompt,
+                schema=None,
+                provider=provider_used,
+                model=model,
+                call_label=call_label,
+                session_policy=session_policy,
+                session_key=session.key if session is not None else None,
+                session_turn=session_turn,
+                runtime_fingerprint=runtime_fp,
+            )
+            prepared_checkpoint = prepare_call(
+                path, identity=identity, deadline=deadline, cancel_check=cancel_check
+            )
+            if prepared_checkpoint.replay_response is not None:
+                return prepared_checkpoint.replay_response
+        def invoke() -> LLMProviderResponse[str]:
+            if hasattr(selected, "generate_text_result"):
+                kwargs = {
+                    "model": model,
+                    "session": session,
+                    "session_policy": session_policy,
+                    "artifact_dir": artifact_dir,
+                }
+                if _accepts_keyword(selected.generate_text_result, "deadline"):
+                    kwargs["deadline"] = deadline
+                if _accepts_keyword(selected.generate_text_result, "cancel_check"):
+                    kwargs["cancel_check"] = cancel_check
+                return selected.generate_text_result(prompt, **kwargs)
+            return LLMProviderResponse(selected.generate_text(prompt, model=model))
+
+        try:
+            response = _controlled_provider_call(
+                provider_used,
+                env=env,
+                deadline=deadline,
+                cancel_check=cancel_check,
+                call_label=call_label,
+                invoke=invoke,
+            )
+        except BaseException as exc:
+            if prepared_checkpoint is not None:
+                record_failure(prepared_checkpoint, exc)
+            raise
+        if prepared_checkpoint is not None:
+            record_response(prepared_checkpoint, response)
+        return response
 
     if session_policy == "stateful":
         assert session_manager is not None
@@ -641,8 +730,8 @@ def _generate_text(
             runtime_fingerprint=runtime_fp,
             name=session_name,
             metadata=session_metadata,
-        ) as (session, _turn_count):
-            response = call_provider(session)
+        ) as (session, turn_count):
+            response = call_provider(session, turn_count)
             prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
             session_warnings: list[str] = []
             if response.native_session_id:
@@ -678,6 +767,10 @@ def _generate_text(
         session = None
         response = call_provider(None)
         prompt_sha = response.prompt_sent_sha256 or sha256_text(prompt)
+    if not str(response.value or "").strip():
+        raise LLMOutputValidationError("LLM text output was empty")
+    if prepared_checkpoint is not None:
+        record_validated(prepared_checkpoint)
     return LLMCallOutcome(
         value=response.value,
         usage=response.usage,
@@ -707,6 +800,33 @@ def _runtime_fp(
         env=env,
         process_chain=process_chain,
     )
+
+
+def _controlled_provider_call(
+    provider: str,
+    *,
+    env: Mapping[str, str] | None,
+    deadline: float | None,
+    cancel_check: Callable[[], bool] | None,
+    call_label: str | None,
+    invoke: Callable[[], LLMProviderResponse[Any]],
+) -> LLMProviderResponse[Any]:
+    if provider == "manual":
+        return invoke()
+    safety_env = dict(os.environ)
+    if env is not None:
+        safety_env.update(env)
+    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+    controller = LLMSafetyController(env=safety_env)
+    with controller.acquire_call(
+        provider,
+        timeout_seconds=remaining,
+        cancel_check=cancel_check,
+        call_label=call_label,
+    ) as permit:
+        response = invoke()
+        permit.report_success()
+        return response
 
 
 def _schema_cache_dir(artifact_dir: Path | None) -> Path | None:
@@ -775,6 +895,8 @@ def _recover_or_validate_json_output(
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
+    artifact_dir: Path | None = None,
+    call_label: str | None = None,
     deadline: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -819,6 +941,8 @@ def _recover_or_validate_json_output(
             model_tier=model_tier,
             env=env,
             process_chain=process_chain,
+            artifact_dir=artifact_dir,
+            call_label=call_label,
             deadline=deadline,
             cancel_check=cancel_check,
         )
@@ -847,6 +971,8 @@ def _recover_or_validate_json_output(
                 model_tier=model_tier,
                 env=env,
                 process_chain=process_chain,
+                artifact_dir=artifact_dir,
+                call_label=call_label,
                 deadline=deadline,
                 cancel_check=cancel_check,
             )
@@ -879,6 +1005,8 @@ def _recover_warn_schema_output(
     model_tier: str | None,
     env: Mapping[str, str] | None,
     process_chain: Sequence[str] | None,
+    artifact_dir: Path | None,
+    call_label: str | None,
     deadline: float | None,
     cancel_check: Callable[[], bool] | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -909,6 +1037,12 @@ def _recover_warn_schema_output(
                 check_lifecycle(deadline, cancel_check)
                 formatter_kwargs["timeout_seconds"] = remaining_seconds(deadline)
             formatter_kwargs["cancel_check"] = cancel_check
+            # A formatter is the final paid recovery step. It must never invoke
+            # another formatter or cause the original worker to be replayed.
+            formatter_kwargs["schema_formatter_enabled"] = False
+            if artifact_dir is not None and call_label:
+                formatter_kwargs["artifact_dir"] = artifact_dir
+                formatter_kwargs["call_label"] = f"{call_label}/schema_formatter"
             return run_json(format_prompt, **formatter_kwargs)
 
         formatted = format_to_schema_or_retry(
@@ -922,17 +1056,19 @@ def _recover_warn_schema_output(
             env=env,
             process_chain=list(process_chain) if process_chain is not None else None,
         )
+    except (LLMWorkerCancelled, LLMWorkerTimeout, LLMSchemaError):
+        raise
     except Exception as exc:
-        raise LLMRetryableProviderOutputError(
-            f"JSON output failed schema validation: schema formatter failed; retry original worker: {exc}"
+        raise LLMOutputValidationError(
+            f"JSON output failed schema validation: schema formatter failed: {exc}"
         ) from exc
     if formatted.action == "retry":
         reason = getattr(formatted, "reason", "")
-        raise LLMRetryableProviderOutputError(
-            f"JSON output failed schema validation: schema formatter requested retry: {reason}"
+        raise LLMOutputValidationError(
+            f"JSON output failed schema validation: schema formatter could not repair output: {reason}"
         )
     if not isinstance(formatted.value, dict):
-        raise LLMRetryableProviderOutputError(
+        raise LLMOutputValidationError(
             "JSON output failed schema validation: schema formatter returned no formatted object"
         )
     return formatted.value, formatted.structured_output
@@ -953,12 +1089,12 @@ def _schema_recovery_source_text(
     provider_metadata: Any,
 ) -> str:
     metadata = provider_metadata if isinstance(provider_metadata, Mapping) else {}
+    raw_model_output = str(response.raw_model_output or "")
+    if raw_model_output.strip():
+        return raw_model_output
     raw_output = response.raw_output or ""
     if metadata.get("provider_error_type") == "error_max_structured_output_retries":
         return _model_text_from_raw_output(raw_output)
-    raw_excerpt = metadata.get("raw_text_excerpt")
-    if isinstance(raw_excerpt, str) and raw_excerpt.strip():
-        return raw_excerpt
     model_text = _model_text_from_raw_output(raw_output)
     if model_text.strip():
         return model_text
@@ -966,6 +1102,9 @@ def _schema_recovery_source_text(
         return result
     if isinstance(result, dict):
         return json.dumps(strip_arc_llm_call_records(result), ensure_ascii=False, sort_keys=True, default=str)
+    raw_excerpt = metadata.get("raw_text_excerpt")
+    if isinstance(raw_excerpt, str) and raw_excerpt.strip():
+        return raw_excerpt
     return str(result or "")
 
 
@@ -1002,8 +1141,7 @@ def _content_token_count(source: str) -> int:
     if isinstance(parsed, Mapping):
         parsed = strip_arc_llm_call_records(dict(parsed))
         text = json.dumps(parsed, ensure_ascii=False, sort_keys=True, default=str)
-    tokens = re.findall(r"[A-Za-z0-9]+", text)
-    return len(tokens)
+    return sum(1 for character in text if character.isalnum())
 
 
 def _recovered_natural_language_metadata(result: Any, response: LLMProviderResponse[Any]) -> dict[str, Any]:

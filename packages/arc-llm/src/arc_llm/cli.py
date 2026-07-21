@@ -16,8 +16,10 @@ from .proposers_reviewer.template_materializer import materialize_batch
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
 from .proposers_reviewer_bench.runner import run_proposers_reviewer_bench
 from .providers.registry import provider_diagnostic
+from .providers.kimi_safety import kimi_retry_safety_diagnostic
 from .runner import LLMNeedsLLM, resolve_llm_config, run_json, run_text
 from .schema_formatter import format_to_schema
+from .safety import LLMSafetyController
 from .sessions import LLMSessionManager
 
 
@@ -136,7 +138,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=float,
         default=None,
-        help="Positive total deadline per worker call; default is unlimited unless an ARC timeout environment variable is set.",
+        help="Positive total deadline per worker call; default is 3600 seconds unless an ARC timeout environment variable is set.",
     )
 
     bench_parser = sub.add_parser("proposers-reviewer-bench")
@@ -149,6 +151,15 @@ def _build_parser() -> argparse.ArgumentParser:
     for doctor_command in ("host", "provider", "config"):
         doctor_parser = doctor_sub.add_parser(doctor_command)
         doctor_parser.add_argument("--json", action="store_true")
+    circuit = sub.add_parser("circuit", help="Inspect or reset shared provider safety circuits")
+    circuit_sub = circuit.add_subparsers(dest="circuit_command", required=True)
+    circuit_status = circuit_sub.add_parser("status")
+    circuit_status.add_argument("--provider", default=None)
+    circuit_status.add_argument("--json", action="store_true")
+    circuit_reset = circuit_sub.add_parser("reset")
+    circuit_reset.add_argument("--provider", default=None)
+    circuit_reset.add_argument("--endpoint", default=None)
+    circuit_reset.add_argument("--json", action="store_true")
     cache_audit = sub.add_parser("cache-audit")
     cache_audit.add_argument("run_root")
     materialize = sub.add_parser("materialize-proposers-reviewer")
@@ -158,22 +169,48 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "doctor":
+        safety = LLMSafetyController().status()
         if args.doctor_command == "host":
-            return detect_host().__dict__
+            return {**detect_host().__dict__, "llm_safety": safety}
         if args.doctor_command == "provider":
             selected = select_llm_provider()
-            return {
+            result = {
                 **provider_diagnostic(selected.provider),
                 "host": selected.host.host,
                 "signals": selected.signals,
+                "llm_safety": safety,
             }
+            if selected.provider == "kimi-code-cli":
+                result["kimi_retry_safety"] = kimi_retry_safety_diagnostic()
+            return result
         config = resolve_llm_config()
-        return {
+        result = {
             **provider_diagnostic(config.provider),
             "model": config.model,
             "host": config.host.host,
             "signals": config.signals,
             "warnings": list(config.warnings),
+            "llm_safety": safety,
+        }
+        if config.provider == "kimi-code-cli":
+            result["kimi_retry_safety"] = kimi_retry_safety_diagnostic()
+        return result
+    if args.command == "circuit":
+        controller = LLMSafetyController()
+        if args.circuit_command == "status":
+            status = controller.status()
+            if args.provider:
+                status["circuits"] = [
+                    item for item in status["circuits"] if item.get("provider") == args.provider
+                ]
+            return {"ok": True, "status": "completed", **status}
+        reset_count = controller.reset_circuit(args.provider, endpoint=args.endpoint)
+        return {
+            "ok": True,
+            "status": "completed",
+            "provider": args.provider,
+            "endpoint": args.endpoint,
+            "reset_count": reset_count,
         }
     if args.command == "run-json":
         session_manager = _session_manager(args)
@@ -368,7 +405,7 @@ def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
         "--timeout-seconds",
         type=float,
         default=None,
-        help="Positive monotonic total call deadline; default is unlimited unless an ARC timeout environment variable is set.",
+        help="Positive monotonic total call deadline; default is 3600 seconds unless an ARC timeout environment variable is set.",
     )
     parser.add_argument("--codex-sandbox", default=None)
     parser.add_argument("--codex-profile", default=None)

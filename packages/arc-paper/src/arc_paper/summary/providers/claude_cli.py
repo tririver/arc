@@ -7,6 +7,7 @@ from arc_llm.runner import run_json
 
 from ..model import DEFAULT_SUMMARY_MODEL_TIER, resolve_summary_model
 from ..schema import load_summary_schema, validate_summary
+from ..checkpoint import current_provider_checkpoint
 from .pipeline import apply_provider_provenance, generate_summary_with_section_pipeline
 
 
@@ -54,6 +55,7 @@ class ClaudeCliProvider:
         output_schema = schema or load_summary_schema()
         if self._test_prompt_provider is not None:
             return self._test_prompt_provider.generate_json(prompt, schema=output_schema, model=model)
+        artifact_dir, call_label = current_provider_checkpoint()
         return run_json(
             prompt,
             schema=output_schema,
@@ -62,5 +64,6 @@ class ClaudeCliProvider:
             model_tier=model_tier,
             env=self.env,
             session_policy="stateless",
-            call_label="arc-paper/summary",
+            artifact_dir=artifact_dir,
+            call_label=call_label or "arc-paper/summary",
         )
