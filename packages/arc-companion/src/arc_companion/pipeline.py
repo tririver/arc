@@ -1625,11 +1625,17 @@ def resume_companion(
 
     from arc_llm.sessions import LLMSessionManager
     manager = LLMSessionManager(checkpoint_dir / "sessions")
+    native_resume_contexts: list[dict[str, Any]] = []
     if action == "resume-native":
         native_resume_keys: list[str] = []
-        for _path, ledger in supervised_ledgers:
+        for ledger_path, ledger in supervised_ledgers:
             context = dict(ledger["needs_supervision"].get("recovery_context") or {})
             session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+            if not context.get("idempotency_key"):
+                return err(
+                    "native_resume_idempotency_key_missing",
+                    f"The supervised call for {session_key} has no logical call key",
+                )
             if not context.get("resumable") or not (
                 context.get("native_session_id") or manager.has_native_session(session_key)
             ):
@@ -1637,13 +1643,27 @@ def resume_companion(
                     "native_session_not_resumable",
                     f"The supervised call for {session_key} has no resumable native session",
                 )
-            idempotency_key = str(context.get("idempotency_key") or "")
-            if not idempotency_key:
-                return err(
-                    "native_resume_idempotency_key_missing",
-                    f"The supervised call for {session_key} has no logical call key",
+            try:
+                validated = _validate_native_resume_context(
+                    checkpoint_dir=checkpoint_dir,
+                    ledger_path=ledger_path,
+                    ledger=ledger,
+                    session_manager=manager,
                 )
-            native_resume_keys.append(idempotency_key)
+            except ValueError as exc:
+                return err(
+                    "native_resume_context_invalid",
+                    str(exc),
+                )
+            native_resume_contexts.append(validated)
+            native_resume_keys.append(validated["idempotency_key"])
+        for validated in native_resume_contexts:
+            native_id = validated.get("native_session_id_to_restore")
+            if native_id:
+                try:
+                    _restore_native_session_id(manager, validated, str(native_id))
+                except ValueError as exc:
+                    return err("native_resume_context_invalid", str(exc))
     resumed: list[dict[str, Any]] = []
     for path, ledger in supervised_ledgers:
         supervision = dict(ledger["needs_supervision"])
@@ -1677,6 +1697,130 @@ def resume_companion(
     return build_companion(options)
 
 
+def _validate_native_resume_context(
+    *,
+    checkpoint_dir: Path,
+    ledger_path: Path,
+    ledger: dict[str, Any],
+    session_manager: Any,
+) -> dict[str, Any]:
+    supervision = dict(ledger.get("needs_supervision") or {})
+    context = dict(supervision.get("recovery_context") or {})
+    session_key = f"{ledger.get('chapter_id')}:{ledger.get('lane')}"
+    ref = session_manager.get_existing(session_key)
+    if ref is None:
+        raise ValueError(f"No saved logical session exists for {session_key}")
+    try:
+        ledger_generation = int(ledger.get("generation"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"The supervised ledger for {session_key} has no valid generation") from exc
+    if ref.generation != ledger_generation:
+        raise ValueError(f"The supervised ledger generation does not match session {session_key}")
+    context_session_key = context.get("session_key")
+    if context_session_key is not None and str(context_session_key) != session_key:
+        raise ValueError(f"The recovery context belongs to a different session than {session_key}")
+    context_generation = context.get("generation")
+    if context_generation is not None and int(context_generation) != ledger_generation:
+        raise ValueError(f"The recovery context generation does not match session {session_key}")
+    for field, expected in (
+        ("provider", ref.provider),
+        ("model", ref.model),
+        ("runtime_fingerprint", ref.runtime_fingerprint),
+    ):
+        if field in context and context[field] != expected:
+            raise ValueError(f"The recovery context {field} does not match session {session_key}")
+    idempotency_key = str(context.get("idempotency_key") or "")
+    if not idempotency_key:
+        raise ValueError(f"The supervised call for {session_key} has no logical call key")
+    if not (
+        idempotency_key.startswith(f"{session_key}:")
+        and idempotency_key.endswith(f":generation-{ledger_generation}")
+    ):
+        raise ValueError(f"The logical call key does not match session {session_key} generation")
+    if not context.get("resumable"):
+        raise ValueError(f"The supervised call for {session_key} is not resumable")
+    context_native_id = str(context.get("native_session_id") or "")
+    if ref.native_session_id:
+        if context_native_id and context_native_id != ref.native_session_id:
+            raise ValueError(f"The recovery native session id conflicts with session {session_key}")
+        return {
+            "session_key": session_key,
+            "idempotency_key": idempotency_key,
+            "provider": ref.provider,
+            "model": ref.model,
+            "runtime_fingerprint": ref.runtime_fingerprint,
+            "generation": ref.generation,
+            "native_session_id_to_restore": None,
+        }
+    if str(context_session_key or "") != session_key or context_generation is None:
+        raise ValueError(f"The recovery context for {session_key} lacks exact session identity")
+    checkpoint_value = str(context.get("checkpoint_path") or "")
+    if not checkpoint_value:
+        raise ValueError(f"The recovery context for {session_key} has no checkpoint path")
+    checkpoint_path = Path(checkpoint_value).expanduser().resolve(strict=False)
+    checkpoint_root = checkpoint_dir.resolve(strict=False)
+    try:
+        checkpoint_path.relative_to(checkpoint_root)
+    except ValueError as exc:
+        raise ValueError(f"The recovery checkpoint for {session_key} is outside the build") from exc
+    expected_name = f"idempotency-{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()}.json"
+    if checkpoint_path.name != expected_name or checkpoint_path.parent.name != "call-checkpoints":
+        raise ValueError(f"The recovery checkpoint does not match the logical call for {session_key}")
+    artifact_dir = checkpoint_path.parent.parent
+    from arc_llm import read_recovery_context
+    fresh = read_recovery_context(
+        artifact_dir,
+        idempotency_key=idempotency_key,
+        session_manager=session_manager,
+        session_key=session_key,
+    )
+    if fresh.checkpoint_path is None or fresh.checkpoint_path.resolve(strict=False) != checkpoint_path:
+        raise ValueError(f"The recovery checkpoint for {session_key} is missing or changed")
+    if fresh.session_key != session_key or fresh.generation != ledger_generation:
+        raise ValueError(f"The recovered call identity does not match session {session_key}")
+    if (
+        fresh.provider != ref.provider
+        or fresh.model != ref.model
+        or fresh.runtime_fingerprint != ref.runtime_fingerprint
+    ):
+        raise ValueError(f"The recovered provider/model runtime does not match session {session_key}")
+    if context.get("checkpoint_state") != fresh.checkpoint_state:
+        raise ValueError(f"The recovery checkpoint state changed for session {session_key}")
+    if context.get("submission_state") != fresh.submission_state:
+        raise ValueError(f"The recovery submission state changed for session {session_key}")
+    if not fresh.resumable or not fresh.native_session_id:
+        raise ValueError(f"The supervised call for {session_key} has no resumable native session")
+    if not context_native_id or context_native_id != fresh.native_session_id:
+        raise ValueError(f"The recovery native session id changed for session {session_key}")
+    return {
+        "session_key": session_key,
+        "idempotency_key": idempotency_key,
+        "provider": ref.provider,
+        "model": ref.model,
+        "runtime_fingerprint": ref.runtime_fingerprint,
+        "generation": ref.generation,
+        "native_session_id_to_restore": fresh.native_session_id,
+        "ledger_path": str(ledger_path),
+    }
+
+
+def _restore_native_session_id(session_manager: Any, validated: dict[str, Any], native_id: str) -> None:
+    session_key = str(validated["session_key"])
+    with session_manager.lock(session_key):
+        ref = session_manager.get_existing(session_key)
+        if ref is None or (
+            ref.provider != validated["provider"]
+            or ref.model != validated["model"]
+            or ref.runtime_fingerprint != validated["runtime_fingerprint"]
+            or ref.generation != validated["generation"]
+        ):
+            raise ValueError(f"Session {session_key} changed while restoring native recovery state")
+        if ref.native_session_id and ref.native_session_id != native_id:
+            raise ValueError(f"Session {session_key} already has a different native session id")
+        if not ref.native_session_id:
+            session_manager.update_native_session_id(session_key, native_id)
+
+
 def _recovery_context_json(context: Any) -> dict[str, Any]:
     return {
         "idempotency_key": context.idempotency_key,
@@ -1689,6 +1833,9 @@ def _recovery_context_json(context: Any) -> dict[str, Any]:
         "latest_progress": context.latest_progress,
         "session_key": context.session_key,
         "generation": context.generation,
+        "provider": context.provider,
+        "model": context.model,
+        "runtime_fingerprint": context.runtime_fingerprint,
     }
 
 

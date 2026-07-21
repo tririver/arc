@@ -61,3 +61,6 @@ def test_recovery_context_combines_checkpoint_progress_and_generation(tmp_path):
     assert context.native_session_id == "native-progress"
     assert context.resumable is True
     assert context.generation == 1
+    assert context.provider == "codex-cli"
+    assert context.model == "m"
+    assert context.runtime_fingerprint == "fp"

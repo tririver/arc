@@ -5,11 +5,16 @@ from types import SimpleNamespace
 
 import json
 
+import pytest
+
 import arc_companion.pipeline as pipeline
 from arc_companion.ledger import initialize_lane_ledger, mark_needs_supervision
 from arc_companion.pipeline import BuildOptions, build_companion
 from arc_companion.source import SourceBundle
 from arc_companion.io import sha256_json
+from arc_llm.call_checkpoint import checkpoint_path, prepare_call
+from arc_llm.progress_journal import ProgressJournal
+from arc_llm.recovery_context import read_recovery_context
 from arc_llm.sessions import LLMSessionManager
 
 
@@ -454,6 +459,133 @@ def test_resume_native_passes_one_shot_call_authorization_to_build(
     assert result["ok"] is True
     assert captured["options"].supervised_native_resume_keys == (logical_key,)
     assert json.loads(ledger_path.read_text())["needs_supervision"] is None
+    assert manager.get_existing("ch-0001:translation").native_session_id == "native-1"
+
+
+def _missing_store_native_resume_fixture(tmp_path: Path) -> dict[str, object]:
+    project = tmp_path / "run"
+    checkpoint = project / "checkpoint"
+    session_key = "ch-0008:guide"
+    logical_key = "ch-0008:guide:companion-guide-ch-0008:generation-1"
+    artifact_dir = checkpoint / "chapters" / "ch-0008" / "llm"
+    manager = LLMSessionManager(checkpoint / "sessions")
+    manager.get_or_create(
+        key=session_key,
+        provider="codex-cli",
+        model="m",
+        runtime_fingerprint="runtime",
+    )
+    call_path, identity = checkpoint_path(
+        artifact_dir,
+        prompt="guide prompt",
+        schema={"type": "object"},
+        provider="codex-cli",
+        model="m",
+        call_label="companion-guide-ch-0008",
+        session_policy="stateful",
+        session_key=session_key,
+        session_turn=0,
+        runtime_fingerprint="runtime",
+        idempotency_key=logical_key,
+        generation=1,
+    )
+    prepared = prepare_call(call_path, identity=identity)
+    ProgressJournal(
+        artifact_dir=artifact_dir,
+        call_label="companion-guide-ch-0008",
+        provider="codex-cli",
+        callback=None,
+    )({
+        "event": "provider_progress",
+        "native_session_id": "native-progress",
+        "resumable": True,
+    })
+    prepared.release_lock()
+    recovery = read_recovery_context(
+        artifact_dir,
+        idempotency_key=logical_key,
+        session_manager=manager,
+        session_key=session_key,
+    )
+    ledger_path = checkpoint / "chapters" / "ch-0008" / "guide-ledger.json"
+    initialize_lane_ledger(
+        ledger_path,
+        chapter_id="ch-0008",
+        lane="guide",
+        segment_ids=["ch-0008:guide"],
+    )
+    mark_needs_supervision(
+        ledger_path,
+        segment_id="ch-0008:guide",
+        reason="interrupted after provider established a session",
+        recovery_context=pipeline._recovery_context_json(recovery),
+    )
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "state.json").write_text(json.dumps({
+        "status": "needs_supervision",
+        "checkpoint_dir": str(checkpoint),
+        "recovery_options": {"paper_id": "local:book", "workers": 1},
+    }))
+    return {
+        "project": project,
+        "checkpoint": checkpoint,
+        "ledger_path": ledger_path,
+        "manager": manager,
+        "session_key": session_key,
+        "logical_key": logical_key,
+    }
+
+
+def test_resume_native_restores_valid_progress_session_missing_from_store(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    fixture = _missing_store_native_resume_fixture(tmp_path)
+    captured = {}
+
+    def resumed_build(options):
+        captured["options"] = options
+        return {"ok": True, "status": "complete"}
+
+    monkeypatch.setattr(pipeline, "build_companion", resumed_build)
+
+    result = pipeline.resume_companion(fixture["project"], action="resume-native")
+
+    assert result["ok"] is True
+    manager = LLMSessionManager(fixture["checkpoint"] / "sessions")
+    assert manager.get_existing(fixture["session_key"]).native_session_id == "native-progress"
+    assert captured["options"].supervised_native_resume_keys == (fixture["logical_key"],)
+    assert json.loads(fixture["ledger_path"].read_text())["needs_supervision"] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("session_key", "ch-0007:guide"),
+        ("generation", 2),
+        ("provider", "claude-cli"),
+        ("model", "other-model"),
+        ("native_session_id", "tampered-native"),
+    ],
+)
+def test_resume_native_missing_store_id_rejects_mismatched_recovery_context(
+    tmp_path: Path, monkeypatch, field: str, value: object,
+) -> None:
+    fixture = _missing_store_native_resume_fixture(tmp_path)
+    ledger = json.loads(fixture["ledger_path"].read_text())
+    ledger["needs_supervision"]["recovery_context"][field] = value
+    fixture["ledger_path"].write_text(json.dumps(ledger))
+    monkeypatch.setattr(
+        pipeline,
+        "build_companion",
+        lambda _options: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+
+    result = pipeline.resume_companion(fixture["project"], action="resume-native")
+
+    assert result["error"]["code"] == "native_resume_context_invalid"
+    manager = LLMSessionManager(fixture["checkpoint"] / "sessions")
+    assert manager.get_existing(fixture["session_key"]).native_session_id is None
+    assert json.loads(fixture["ledger_path"].read_text())["needs_supervision"] is not None
 
 
 def test_resume_native_rejects_supervision_without_logical_call_key(

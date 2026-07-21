@@ -21,6 +21,9 @@ class LLMRecoveryContext:
     latest_progress: dict[str, Any] | None
     session_key: str | None
     generation: int | None
+    provider: str | None
+    model: str | None
+    runtime_fingerprint: str | None
 
 
 def read_recovery_context(
@@ -45,11 +48,17 @@ def read_recovery_context(
     if not native_id and latest:
         native_id = latest.get("native_session_id")
     generation = None
+    provider = str(latest.get("provider")) if latest and latest.get("provider") else None
+    model = None
+    runtime_fp = None
     if session_manager is not None and session_key:
         ref = session_manager.get_existing(session_key)
         if ref is not None:
             generation = ref.generation
             native_id = native_id or ref.native_session_id
+            provider = provider or ref.provider
+            model = ref.model
+            runtime_fp = ref.runtime_fingerprint
     resumable = bool(
         (checkpoint and checkpoint.get("resumable"))
         or (latest and latest.get("resumable"))
@@ -66,6 +75,9 @@ def read_recovery_context(
         latest_progress=latest,
         session_key=session_key,
         generation=generation,
+        provider=provider,
+        model=model,
+        runtime_fingerprint=runtime_fp,
     )
 
 
