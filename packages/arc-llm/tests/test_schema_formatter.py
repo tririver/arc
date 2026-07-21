@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
+from arc_llm.progress_prompt import RUNTIME_PROGRESS_CONTRACT_MARKER
 from arc_llm.schema_formatter import SchemaFormatError, format_to_schema, format_to_schema_or_retry
 
 
@@ -53,13 +54,15 @@ def test_schema_formatter_preserves_explicit_numbers() -> None:
     assert result.value["review_payload"]["marks"] == {"total_score": 92, "novelty": 13}
     assert result.structured_output["recovery_strategy"] == "schema_formatter"
     assert calls
+    assert calls[0]["prompt"].count(RUNTIME_PROGRESS_CONTRACT_MARKER) == 1
+    assert "Never put progress messages in the final answer" in calls[0]["prompt"]
 
 
-def test_schema_formatter_forwards_finite_timeout_and_cancellation() -> None:
+def test_schema_formatter_forwards_idle_timeout_and_cancellation() -> None:
     captured = {}
 
-    def fake_runner(prompt: str, *, timeout_seconds=None, cancel_check=None, **_kwargs):
-        captured["timeout_seconds"] = timeout_seconds
+    def fake_runner(prompt: str, *, idle_timeout_seconds=None, cancel_check=None, **_kwargs):
+        captured["idle_timeout_seconds"] = idle_timeout_seconds
         captured["cancel_check"] = cancel_check
         return {
             "schema_version": "arc.llm.review_envelope.v1",
@@ -71,12 +74,12 @@ def test_schema_formatter_forwards_finite_timeout_and_cancellation() -> None:
         raw_text="Final review. Total 92/100. Novelty 13/15.",
         schema=_review_schema(),
         json_runner=fake_runner,
-        timeout_seconds=7.5,
+        idle_timeout_seconds=7.5,
         cancel_check=cancel_check,
     )
 
     assert result.value["review_payload"]["marks"]["total_score"] == 92
-    assert captured == {"timeout_seconds": 7.5, "cancel_check": cancel_check}
+    assert captured == {"idle_timeout_seconds": 7.5, "cancel_check": cancel_check}
 
 
 def test_schema_formatter_rejects_numbers_not_present_in_source() -> None:

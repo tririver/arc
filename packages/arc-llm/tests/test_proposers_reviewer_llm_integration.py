@@ -75,7 +75,9 @@ def _true_llm_targeted_addition_config(tmp_path: Path) -> dict[str, Any]:
         "run_id": "true_llm_targeted_additions",
         "run_dir": str(tmp_path / "llm-runs"),
         "max_concurrent_loops": 1,
-        "worker_call_timeout_seconds": float(os.environ.get("ARC_LLM_TEST_TIMEOUT_SECONDS", "1800")),
+        "worker_idle_timeout_seconds": float(
+            os.environ.get("ARC_LLM_TEST_IDLE_TIMEOUT_SECONDS", "1800")
+        ),
         "defaults": defaults,
         "loops": [
             {

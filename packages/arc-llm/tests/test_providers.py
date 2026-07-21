@@ -23,8 +23,8 @@ def adapt_provider_process_group_to_legacy_subprocess_mock(monkeypatch):
     output parsing by replacing ``subprocess.run``.
     """
 
-    def adapter(command, *, input_text, env, **_kwargs):
-        return subprocess.run(
+    def adapter(command, *, input_text, env, stdout_line_callback=None, **_kwargs):
+        result = subprocess.run(
             command,
             input=input_text,
             text=True,
@@ -33,9 +33,29 @@ def adapt_provider_process_group_to_legacy_subprocess_mock(monkeypatch):
             env=dict(env),
             timeout=None,
         )
+        if command and command[0] == "claude" and "stream-json" in command and result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                payload = {"type": "result", "result": result.stdout}
+            else:
+                if isinstance(payload, dict) and payload.get("type") != "result":
+                    if "result" in payload or "structured_output" in payload:
+                        payload = {**payload, "type": "result"}
+                    else:
+                        payload = {"type": "result", "structured_output": payload}
+            result = subprocess.CompletedProcess(
+                result.args, result.returncode, json.dumps(payload), result.stderr
+            )
+        if stdout_line_callback is not None:
+            for line in result.stdout.splitlines(keepends=True):
+                stdout_line_callback(line)
+        return result
 
-    monkeypatch.setattr(codex_module, "run_process_group", adapter)
-    monkeypatch.setattr(claude_module, "run_process_group", adapter)
+    monkeypatch.setattr(codex_module, "run_streaming_process_group", adapter)
+    monkeypatch.setattr(claude_module, "run_streaming_process_group", adapter)
+    monkeypatch.setattr(codex_module, "_require_codex_json_stream_support", lambda _env: None)
+    monkeypatch.setattr(claude_module, "_require_stream_json_support", lambda _env: None)
 
 
 def test_codex_generate_json_writes_prompt_to_stdin_and_reads_output(monkeypatch):
@@ -393,7 +413,7 @@ def test_codex_passes_provider_env_to_subprocess(monkeypatch):
     assert captured["timeout"] is None
 
 
-def test_codex_timeout_uses_provider_specific_env(monkeypatch):
+def test_codex_idle_timeout_uses_provider_specific_env(monkeypatch):
     captured = {}
 
     def fake_run_process_group(cmd, **kwargs):
@@ -403,13 +423,12 @@ def test_codex_timeout_uses_provider_specific_env(monkeypatch):
             handle.write("plain text")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(codex_module.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(codex_module, "run_process_group", fake_run_process_group)
+    monkeypatch.setattr(codex_module, "run_streaming_process_group", fake_run_process_group)
 
-    assert CodexCliProvider(env={"ARC_LLM_TIMEOUT_SECONDS": "30", "ARC_CODEX_TIMEOUT_SECONDS": "12.5"}).generate_text(
+    assert CodexCliProvider(env={"ARC_LLM_IDLE_TIMEOUT_SECONDS": "30", "ARC_CODEX_IDLE_TIMEOUT_SECONDS": "12.5"}).generate_text(
         "prompt"
     ) == "plain text"
-    assert captured["deadline"] == 112.5
+    assert captured["activity"].idle_timeout_seconds == 12.5
 
 
 def test_codex_options_can_be_overridden_by_env(monkeypatch):
@@ -945,7 +964,7 @@ def test_claude_stateful_text_uses_json_output_and_records_usage(monkeypatch):
     assert response.native_session_id == "00000000-0000-4000-8000-000000000001"
     assert response.usage.cache_read_input_tokens == 8
     assert "--output-format" in captured["cmd"]
-    assert captured["cmd"][captured["cmd"].index("--output-format") + 1] == "json"
+    assert captured["cmd"][captured["cmd"].index("--output-format") + 1] == "stream-json"
 
 
 def test_claude_text_result_writes_raw_artifacts(monkeypatch, tmp_path):
@@ -1053,18 +1072,19 @@ def test_claude_passes_provider_env_to_subprocess(monkeypatch):
     assert captured["timeout"] is None
 
 
-def test_claude_timeout_uses_generic_env(monkeypatch):
+def test_claude_idle_timeout_uses_generic_env(monkeypatch):
     captured = {}
 
     def fake_run_process_group(cmd, **kwargs):
         captured.update(kwargs)
-        return subprocess.CompletedProcess(cmd, 0, stdout="plain text", stderr="")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout='{"type":"result","result":"plain text"}\n', stderr=""
+        )
 
-    monkeypatch.setattr(claude_module.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(claude_module, "run_process_group", fake_run_process_group)
+    monkeypatch.setattr(claude_module, "run_streaming_process_group", fake_run_process_group)
 
-    assert ClaudeCliProvider(env={"ARC_LLM_TIMEOUT_SECONDS": "30"}).generate_text("prompt") == "plain text"
-    assert captured["deadline"] == 130.0
+    assert ClaudeCliProvider(env={"ARC_LLM_IDLE_TIMEOUT_SECONDS": "30"}).generate_text("prompt") == "plain text"
+    assert captured["activity"].idle_timeout_seconds == 30
 
 
 def test_claude_options_can_be_overridden_by_env(monkeypatch):

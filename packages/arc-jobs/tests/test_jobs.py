@@ -434,6 +434,134 @@ def test_cli_watch_progress_jsonl_emits_terminal_error_and_fails(
     assert records[-1]["error"]["code"] == "job_failed"
 
 
+def test_cli_watch_until_review_returns_without_cancelling_job(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path))
+    review_written = Event()
+    request_second_review = Event()
+    second_review_written = Event()
+    release = Event()
+    manager = JobManager(worker_mode="thread")
+
+    def runner(progress, cancel):
+        progress(
+            {
+                "schema_version": "arc.llm.progress.v1",
+                "event": "review_due",
+                "review_sequence": 2,
+                "substantive": True,
+                "summary": "Derived the bounded intermediate result.",
+                "artifact_paths": ["steps/derived.json"],
+            }
+        )
+        review_written.set()
+        assert request_second_review.wait(timeout=2)
+        progress(
+            {
+                "schema_version": "arc.llm.progress.v1",
+                "event": "review_due",
+                "review_sequence": 1,
+                "substantive": False,
+            }
+        )
+        second_review_written.set()
+        assert release.wait(timeout=2)
+        return {"ok": True}
+
+    job_id = manager.start(job_type="test", payload={}, runner=runner)
+    assert review_written.wait(timeout=2)
+
+    assert cli.main(
+        [
+            "watch",
+            job_id,
+            "--interval",
+            "0.01",
+            "--until-review",
+            "--after-review-sequence",
+            "0",
+            "--json",
+        ]
+    ) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "running"
+    assert response["watch_status"] == "review_due"
+    assert response["review_sequence"] == 1
+    review_events = [event for event in response["events"] if event["event"] == "review_due"]
+    assert review_events[-1]["provider_review_sequence"] == 2
+    assert response["last_substantive_excerpt"] == "Derived the bounded intermediate result."
+    assert manager.status(job_id)["cancel_requested"] is False
+
+    request_second_review.set()
+    assert second_review_written.wait(timeout=2)
+    assert cli.main(
+        [
+            "watch",
+            job_id,
+            "--interval",
+            "0.01",
+            "--until-review",
+            "--after-review-sequence",
+            "1",
+            "--json",
+        ]
+    ) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["review_sequence"] == 2
+    assert response["provider_review_sequence"] == 1
+    assert manager.status(job_id)["cancel_requested"] is False
+
+    release.set()
+    assert manager.wait(job_id, timeout=2)
+
+
+def test_concurrent_provider_review_sequences_become_monotonic_job_cursors(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path))
+    manager = JobManager(worker_mode="thread")
+    provider_sequences = [7, 1, 4, 1, 12, 2, 3, 1]
+
+    def runner(progress, cancel):
+        with ThreadPoolExecutor(max_workers=len(provider_sequences)) as executor:
+            futures = [
+                executor.submit(
+                    progress,
+                    {
+                        "schema_version": "arc.llm.progress.v1",
+                        "event": "review_due",
+                        "review_sequence": sequence,
+                        "substantive": False,
+                    },
+                )
+                for sequence in provider_sequences
+            ]
+            for future in futures:
+                future.result()
+        return {"ok": True}
+
+    job_id = manager.start(job_type="test", payload={}, runner=runner)
+    assert manager.wait(job_id, timeout=2)
+    status = manager.status(job_id)
+    events = [event for event in status["events"] if event["event"] == "review_due"]
+
+    assert status["review_sequence"] == len(provider_sequences)
+    assert [event["review_sequence"] for event in events] == list(
+        range(1, len(provider_sequences) + 1)
+    )
+    assert sorted(event["provider_review_sequence"] for event in events) == sorted(
+        provider_sequences
+    )
+
+
+def test_watch_after_review_sequence_requires_until_review(monkeypatch, capsys):
+    assert cli.main(["watch", "job", "--after-review-sequence", "1", "--json"]) == 1
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "invalid_request"
+    assert "requires --until-review" in response["error"]["message"]
+
+
 def test_cache_env_uses_protocol_neutral_name(tmp_path, monkeypatch):
     from arc_jobs.jobs import cache_root
 
@@ -618,7 +746,7 @@ def test_tail_events_uses_bounded_binary_tail(tmp_path, monkeypatch):
 def test_environment_snapshot_excludes_secrets_and_persists_host(tmp_path, monkeypatch):
     monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("ARC_AGENT_HOST", "kimi-code")
-    monkeypatch.setenv("ARC_LLM_TIMEOUT_SECONDS", "41")
+    monkeypatch.setenv("ARC_LLM_IDLE_TIMEOUT_SECONDS", "41")
     monkeypatch.setenv("OPENAI_API_KEY", "not-persisted")
     _install_fake_cli(tmp_path, monkeypatch, body="printf '%s' '{\"ok\":true}'")
     manager = JobManager(worker_mode="process")
@@ -626,8 +754,39 @@ def test_environment_snapshot_excludes_secrets_and_persists_host(tmp_path, monke
     job_id = manager.submit(["arc-paper", "--json"])
     persisted = read_json(JobPaths.for_job(job_id).job)["environment"]
     assert persisted["ARC_AGENT_HOST"] == "kimi-code"
-    assert persisted["ARC_LLM_TIMEOUT_SECONDS"] == "41"
+    assert persisted["ARC_LLM_IDLE_TIMEOUT_SECONDS"] == "41"
+    assert "ARC_LLM_TIMEOUT_SECONDS" not in persisted
     assert "OPENAI_API_KEY" not in persisted
+
+
+@pytest.mark.parametrize(
+    "env_key",
+    [
+        "ARC_LLM_TIMEOUT_SECONDS",
+        "ARC_CODEX_TIMEOUT_SECONDS",
+        "ARC_CLAUDE_TIMEOUT_SECONDS",
+        "ARC_KIMI_TIMEOUT_SECONDS",
+    ],
+)
+def test_submit_rejects_removed_total_timeout_from_caller_environment(
+    tmp_path, monkeypatch, env_key
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(env_key, "60")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+
+    with pytest.raises(ValueError, match="total-timeout.*removed.*IDLE_TIMEOUT_SECONDS"):
+        manager.submit(["arc-paper", "--json"])
+
+    assert not list((tmp_path / "cache").glob("jobs/*/job.json"))
+
+
+def test_environment_override_and_persisted_snapshot_reject_removed_total_timeout():
+    with pytest.raises(ValueError, match="ARC_CODEX_IDLE_TIMEOUT_SECONDS"):
+        snapshot_environment(overrides={"ARC_CODEX_TIMEOUT_SECONDS": "60"})
+    with pytest.raises(ValueError, match="ARC_KIMI_IDLE_TIMEOUT_SECONDS"):
+        restored_environment({"ARC_KIMI_TIMEOUT_SECONDS": "60"}, base={})
 
 
 def test_environment_snapshot_preserves_explicit_provider_reasoning_effort(monkeypatch):
@@ -693,7 +852,7 @@ def test_detached_kimi_context_matches_foreground_runtime(tmp_path, monkeypatch)
         "ARC_KIMI_BIN": "/opt/kimi/bin/kimi",
         "ARC_KIMI_WORK_DIR": str(tmp_path / "work"),
         "KIMI_CODE_HOME": str(tmp_path / "kimi-home"),
-        "ARC_KIMI_TIMEOUT_SECONDS": "73",
+        "ARC_KIMI_IDLE_TIMEOUT_SECONDS": "73",
         "ARC_LLM_KIMI_LOW_MODEL": "kimi-low",
         "ARC_LLM_KIMI_MEDIUM_MODEL": "kimi-medium",
         "ARC_LLM_KIMI_HIGH_MODEL": "kimi-high",
@@ -757,9 +916,10 @@ def test_worker_forwards_progress_sidechannel(tmp_path, monkeypatch):
         tmp_path,
         monkeypatch,
         body=(
-            "printf '%s\\n' '{\"schema_version\":\"arc.llm.proposers_reviewer.progress.v1\","
-            "\"event\":\"worker_finished\",\"phase\":\"proposers\",\"round_number\":2,"
-            "\"role\":\"proposer\",\"completed_workers\":1,\"failed_workers\":1}' "
+            "printf '%s\\n' '{\"schema_version\":\"arc.llm.progress.v1\","
+            "\"event\":\"provider_progress\",\"phase\":\"proposers\",\"round_number\":2,"
+            "\"role\":\"proposer\",\"completed_workers\":1,\"failed_workers\":1,"
+            "\"substantive\":true,\"summary\":\"checked the first derivation\"}' "
             "> \"$ARC_JOB_PROGRESS_FILE\"; "
             "printf '%s' '{\"ok\":true,\"status\":\"degraded\"}'"
         ),
@@ -772,7 +932,39 @@ def test_worker_forwards_progress_sidechannel(tmp_path, monkeypatch):
     assert status["status"] == "degraded"
     assert status["round_number"] == 2 and status["failed_workers"] == 1
     assert status["role"] == "proposer"
-    assert any(event["event"] == "worker_finished" for event in status["events"])
+    assert status["last_substantive_excerpt"] == "checked the first derivation"
+    assert status["last_activity_at"] == status["last_substantive_at"]
+    assert any(event["event"] == "provider_progress" for event in status["events"])
+
+
+def test_non_substantive_progress_does_not_replace_last_excerpt(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    manager = JobManager(worker_mode="thread")
+
+    def runner(progress, cancel):
+        progress(
+            {
+                "schema_version": "arc.llm.progress.v1",
+                "event": "provider_progress",
+                "substantive": True,
+                "summary": "Completed a source-backed calculation.",
+            }
+        )
+        progress(
+            {
+                "schema_version": "arc.llm.progress.v1",
+                "event": "provider_progress",
+                "substantive": False,
+                "summary": "still alive",
+            }
+        )
+        return {"ok": True}
+
+    job_id = manager.start(job_type="test", payload={}, runner=runner)
+    assert manager.wait(job_id, timeout=2)
+    assert manager.status(job_id)["last_substantive_excerpt"] == (
+        "Completed a source-backed calculation."
+    )
 
 
 def test_live_status_projects_actual_proposer_phase_and_round(tmp_path, monkeypatch):

@@ -365,7 +365,7 @@ Exact-model options:
 Runtime capability options:
 
 ```text
---timeout-seconds <positive-seconds>
+--idle-timeout-seconds <positive-seconds>
 --allow-internet
 --allow-mcp
 --mcp-mode arc-only
@@ -377,29 +377,50 @@ Runtime capability options:
 --claude-effort low
 ```
 
-`--timeout-seconds` is one monotonic deadline for the complete worker call,
-including recovery and schema formatting. When the option and all applicable
-timeout environment variables are unset, ARC uses 3600 seconds. Nested calls
-share the original deadline and never receive a fresh hour.
+`--idle-timeout-seconds` limits only continuous time without substantive
+provider activity. ARC defaults to 1800 seconds and imposes no absolute total
+runtime limit. New visible assistant content, a changed tool state, or a
+confirmed artifact write resets the idle timer. Handshakes, hidden reasoning,
+stderr noise, empty/repeated content, and `still alive` heartbeats do not.
 
-Provider timeout environment variables:
+Provider idle-timeout environment variables:
 
 ```text
-ARC_CODEX_TIMEOUT_SECONDS            Codex call deadline
-ARC_CLAUDE_TIMEOUT_SECONDS           Claude call deadline
-ARC_KIMI_TIMEOUT_SECONDS             Kimi call deadline
-ARC_LLM_TIMEOUT_SECONDS              General fallback for every provider
+ARC_CODEX_IDLE_TIMEOUT_SECONDS       Codex idle timeout
+ARC_CLAUDE_IDLE_TIMEOUT_SECONDS      Claude idle timeout
+ARC_KIMI_IDLE_TIMEOUT_SECONDS        Kimi idle timeout
+ARC_LLM_IDLE_TIMEOUT_SECONDS         General fallback for every provider
 ```
 
-An explicit CLI or worker timeout takes precedence, followed by the
-provider-specific variable, `ARC_LLM_TIMEOUT_SECONDS`, and finally 3600 seconds.
+An explicit CLI or worker idle timeout takes precedence, followed by the
+provider-specific variable, `ARC_LLM_IDLE_TIMEOUT_SECONDS`, and finally 1800
+seconds. Removed `--timeout-seconds`, `worker_call_timeout_seconds`, and
+`ARC_LLM/CODEX/CLAUDE/KIMI_TIMEOUT_SECONDS` settings fail before a model call
+with a migration message instead of silently retaining total-deadline behavior.
+ARC also validates non-numeric and non-positive idle-timeout values before
+creating a call checkpoint or acquiring a provider concurrency slot. These are
+typed `not_submitted` configuration failures, so they cannot quarantine a
+checkpoint or be mistaken for a paid request.
+
+Every public ARC-LLM entry point adds the versioned runtime progress
+contract once. Long, multi-stage workers must report concrete completed work,
+evidence or results, reusable artifact paths, the next step, and blockers while
+they work. They must not emit private chain-of-thought, secrets, full tool
+arguments, repeated plans, or content-free `still alive` messages. Progress is
+sent out of band as `arc.llm.progress.v1`, so it never contaminates structured
+JSON. Short single-stage calls need not manufacture progress.
+
+ARC persists the progress journal and available session/checkpoint context.
+After idle timeout or explicit cancellation, the owning workflow may resume
+from verified artifacts or a native provider session rather than repeating
+completed work. Idle timeout never automatically starts a second paid call.
 
 Kimi runtime environment variables:
 
 ```text
 ARC_KIMI_BIN                         Kimi executable; default: kimi
 ARC_KIMI_WORK_DIR                    Working directory for new sessions; default: current directory
-ARC_KIMI_TIMEOUT_SECONDS             Call deadline; falls back to ARC_LLM_TIMEOUT_SECONDS
+ARC_KIMI_IDLE_TIMEOUT_SECONDS        Idle timeout; falls back to ARC_LLM_IDLE_TIMEOUT_SECONDS
 ARC_KIMI_ALLOW_INTERNAL_RETRIES      Explicitly accept unsafe provider-internal retries
 ARC_LLM_KIMI_LOW_MODEL               Low-tier model alias
 ARC_LLM_KIMI_MEDIUM_MODEL            Medium-tier model alias

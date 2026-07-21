@@ -9,8 +9,14 @@ from pathlib import Path
 import pytest
 
 from arc_llm.providers import kimi_code_cli as kimi_module
-from arc_llm.providers.base import LLMFailureCategory, LLMWorkerError, LLMWorkerTimeout
+from arc_llm.providers.base import (
+    LLMConfigurationError,
+    LLMFailureCategory,
+    LLMWorkerError,
+    LLMWorkerTimeout,
+)
 from arc_llm.providers.kimi_code_cli import EXPERIMENTAL_WARNING, KimiCodeCliProvider
+from arc_llm.providers.activity import resolve_idle_timeout_seconds
 from arc_llm.runner import run_text, run_text_result
 from arc_llm.schema_cache import canonical_json, sha256_text
 from arc_llm.sessions import LLMSessionManager, LLMSessionRef
@@ -25,25 +31,42 @@ def reset_experimental_warning(monkeypatch):
     monkeypatch.setattr(kimi_module, "_WARNING_EMITTED", False)
 
 
-def test_kimi_timeout_defaults_to_one_hour_when_environment_is_unset():
-    assert kimi_module._timeout_seconds({}) == 3600
+def test_kimi_idle_timeout_defaults_to_half_hour_when_environment_is_unset():
+    assert resolve_idle_timeout_seconds(None, env={}, provider="kimi-code-cli") == 1800
 
 
 def fake_env(tmp_path: Path, *, scenario: str = "happy", output: str = "hello") -> dict[str, str]:
     env = dict(os.environ)
+    for key in (
+        "ARC_LLM_TIMEOUT_SECONDS",
+        "ARC_CODEX_TIMEOUT_SECONDS",
+        "ARC_CLAUDE_TIMEOUT_SECONDS",
+        "ARC_KIMI_TIMEOUT_SECONDS",
+    ):
+        env.pop(key, None)
     env.update(
         {
             "ARC_KIMI_BIN": str(FAKE_KIMI),
             "ARC_HOME": str(tmp_path / "arc-home"),
             "ARC_LLM_CACHE": str(tmp_path / "arc-home" / "cache" / "arc-llm"),
             "ARC_KIMI_WORK_DIR": str(tmp_path),
-            "ARC_KIMI_TIMEOUT_SECONDS": "5",
+            "ARC_KIMI_IDLE_TIMEOUT_SECONDS": "5",
             "FAKE_KIMI_RECORD": str(tmp_path / "fake-kimi.jsonl"),
             "FAKE_KIMI_SCENARIO": scenario,
             "FAKE_KIMI_OUTPUT": output,
         }
     )
     return env
+
+
+def test_removed_kimi_total_timeout_env_fails_before_model_call(tmp_path):
+    env = fake_env(tmp_path)
+    env["ARC_KIMI_TIMEOUT_SECONDS"] = "42"
+
+    with pytest.raises(LLMConfigurationError, match="total-timeout.*removed.*ARC_KIMI_IDLE_TIMEOUT_SECONDS"):
+        run_text("must not be submitted", provider="kimi-code-cli", env=env)
+
+    assert records(env) == []
 
 
 def records(env: dict[str, str]) -> list[dict]:
@@ -443,7 +466,7 @@ def test_stderr_rate_limit_aborts_hung_acp_immediately(tmp_path):
     with pytest.raises(LLMWorkerError, match="rate_limit") as caught:
         KimiCodeCliProvider(env=env).generate_text_result(
             "prompt",
-            timeout_seconds=10,
+            idle_timeout_seconds=10,
         )
     assert time.monotonic() - started < 3
     assert caught.value.category == LLMFailureCategory.RATE_LIMIT
@@ -474,11 +497,11 @@ def test_experimental_warning_is_emitted_once_before_execution(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group assertion")
-def test_timeout_sends_cancel_and_kills_process_group(tmp_path):
+def test_idle_timeout_sends_cancel_and_kills_process_group(tmp_path):
     env = fake_env(tmp_path, scenario="timeout")
-    env["ARC_KIMI_TIMEOUT_SECONDS"] = "0.25"
+    env["ARC_KIMI_IDLE_TIMEOUT_SECONDS"] = "0.25"
 
-    with pytest.raises(LLMWorkerTimeout, match="timed out") as caught:
+    with pytest.raises(LLMWorkerTimeout, match="no meaningful output") as caught:
         KimiCodeCliProvider(env=env).generate_text("long prompt")
 
     assert caught.value.retryable is False

@@ -15,10 +15,10 @@ from arc_llm.evidence import EVIDENCE_REQUESTS_FIELD, allow_evidence_requests, e
 from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, validate_codex_strict_schema
 from arc_llm.proposers_reviewer.runner import _batch_status, run_proposers_reviewer_batch
 from arc_llm.providers.lifecycle import (
-    resolve_worker_call_timeout_seconds,
-    run_process_group,
+    run_streaming_process_group,
     terminate_process_group,
 )
+from arc_llm.providers.activity import ActivityTracker
 from arc_llm.providers.base import (
     LLMSchemaError,
     LLMSubmissionState,
@@ -61,41 +61,28 @@ def test_recursive_codex_validator_rejects_optional_nested_property() -> None:
         validate_codex_strict_schema(schema)
 
 
-def test_worker_timeout_precedence_and_one_hour_default() -> None:
-    assert resolve_worker_call_timeout_seconds(None, env={}, provider="codex-cli") == 3600
-    assert resolve_worker_call_timeout_seconds(None, env={"ARC_LLM_TIMEOUT_SECONDS": "22"}, provider="codex-cli") == 22
-    assert resolve_worker_call_timeout_seconds(
-        None,
-        env={"ARC_LLM_TIMEOUT_SECONDS": "22", "ARC_CODEX_TIMEOUT_SECONDS": "11"},
-        provider="codex-cli",
-    ) == 11
-    assert resolve_worker_call_timeout_seconds(
-        7,
-        env={"ARC_CODEX_TIMEOUT_SECONDS": "11"},
-        provider="codex-cli",
-    ) == 7
-
-
-def test_process_group_deadline_covers_blocked_stdin_delivery() -> None:
+def test_streaming_process_idle_timeout_covers_blocked_stdin_delivery() -> None:
     started = time.monotonic()
-    with pytest.raises(LLMWorkerTimeout, match="timed out"):
-        run_process_group(
+    with pytest.raises(LLMWorkerTimeout, match="no meaningful output"):
+        run_streaming_process_group(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             input_text="x" * (10 * 1024 * 1024),
             env=os.environ,
-            deadline=time.monotonic() + 0.2,
+            activity=ActivityTracker(provider="test", idle_timeout_seconds=0.2),
+            stdout_line_callback=lambda _line: None,
             poll_interval_seconds=0.02,
             terminate_grace_seconds=0.2,
         )
     assert time.monotonic() - started < 2
 
 
-def test_process_group_allows_no_deadline() -> None:
-    result = run_process_group(
+def test_streaming_process_allows_long_total_runtime_with_activity() -> None:
+    result = run_streaming_process_group(
         [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
         input_text="unlimited",
         env=os.environ,
-        deadline=None,
+        activity=ActivityTracker(provider="test", idle_timeout_seconds=10),
+        stdout_line_callback=lambda _line: None,
         poll_interval_seconds=0.02,
     )
 
@@ -103,18 +90,19 @@ def test_process_group_allows_no_deadline() -> None:
     assert result.stdout.strip() == "unlimited"
 
 
-def test_process_group_cancellation_remains_active_without_deadline() -> None:
+def test_streaming_process_cancellation_remains_active() -> None:
     cancelled = threading.Event()
     timer = threading.Timer(0.1, cancelled.set)
     timer.start()
     started = time.monotonic()
     try:
         with pytest.raises(LLMWorkerCancelled, match="cancelled"):
-            run_process_group(
+            run_streaming_process_group(
                 [sys.executable, "-c", "import time; time.sleep(60)"],
                 input_text="",
                 env=os.environ,
-                deadline=None,
+                activity=ActivityTracker(provider="test", idle_timeout_seconds=10),
+                stdout_line_callback=lambda _line: None,
                 cancel_check=cancelled.is_set,
                 poll_interval_seconds=0.02,
                 terminate_grace_seconds=0.2,
@@ -123,22 +111,6 @@ def test_process_group_cancellation_remains_active_without_deadline() -> None:
         timer.cancel()
 
     assert time.monotonic() - started < 2
-
-
-def test_runner_passes_one_hour_deadline_when_timeout_is_unset(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-
-    class Provider:
-        def generate_text_result(self, prompt, *, deadline=None, cancel_check=None, **_kwargs):
-            captured["deadline"] = deadline
-            captured["cancel_check"] = cancel_check
-            return core_runner.LLMProviderResponse(value="ok")
-
-    monkeypatch.setattr(core_runner, "select_provider", lambda *_args, **_kwargs: Provider())
-    monkeypatch.setattr(core_runner.time, "monotonic", lambda: 100.0)
-
-    assert core_runner.run_text("prompt", provider="codex-cli", env={}, process_chain=[]) == "ok"
-    assert captured == {"deadline": 3700.0, "cancel_check": None}
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
@@ -181,9 +153,11 @@ def test_provider_watchdog_reaps_group_after_caller_sigkill(tmp_path) -> None:
     )
     caller_script = (
         "import os,sys; "
-        "from arc_llm.providers.lifecycle import run_process_group; "
-        f"run_process_group([sys.executable,'-c',{provider_script!r}],"
-        "input_text='',env=os.environ,deadline=None)"
+        "from arc_llm.providers.activity import ActivityTracker; "
+        "from arc_llm.providers.lifecycle import run_streaming_process_group; "
+        f"run_streaming_process_group([sys.executable,'-c',{provider_script!r}],"
+        "input_text='',env=os.environ,activity=ActivityTracker(provider='test'),"
+        "stdout_line_callback=lambda line:None)"
     )
     caller = subprocess.Popen([sys.executable, "-c", caller_script])
     deadline = time.monotonic() + 3
@@ -198,41 +172,6 @@ def test_provider_watchdog_reaps_group_after_caller_sigkill(tmp_path) -> None:
     while time.monotonic() < deadline and _pid_is_running(provider_pid):
         time.sleep(0.02)
     assert not _pid_is_running(provider_pid)
-
-
-def test_retry_loop_uses_one_total_monotonic_deadline(monkeypatch) -> None:
-    clock = {"now": 100.0}
-
-    class Provider:
-        attempts = 0
-
-        def generate_json(self, prompt, *, schema=None, model=None):
-            self.attempts += 1
-            clock["now"] += 6
-            raise LLMWorkerError(
-                "transient",
-                retryable=True,
-                submission_state=LLMSubmissionState.NOT_SUBMITTED,
-            )
-
-    provider = Provider()
-    monkeypatch.setattr(core_runner, "select_provider", lambda *_args, **_kwargs: provider)
-    monkeypatch.setattr(core_runner.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr("arc_llm.providers.lifecycle.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr(core_runner.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
-    # Production defaults to one provider submission. Exercise the deadline
-    # invariant with an explicitly enabled retry loop.
-    monkeypatch.setattr(core_runner, "MAX_ATTEMPTS_PER_PROVIDER", 3)
-
-    with pytest.raises(LLMWorkerTimeout, match="timed out"):
-        core_runner.run_json(
-            "prompt",
-            provider="codex-cli",
-            env={},
-            process_chain=[],
-            timeout_seconds=10,
-        )
-    assert provider.attempts == 1
 
 
 def test_auto_manual_fails_before_provider_attempts(monkeypatch) -> None:
@@ -295,13 +234,13 @@ def test_auto_manual_batch_returns_needs_llm_before_creating_run(tmp_path) -> No
     assert not (tmp_path / "ideas/run_001").exists()
 
 
-def test_batch_timeout_passes_none_for_env_resolution_and_honors_worker_override(tmp_path) -> None:
+def test_batch_idle_timeout_passes_none_for_env_resolution_and_honors_worker_override(tmp_path) -> None:
     def execute(config):
         seen: dict[str, float | None] = {}
 
-        def runner(prompt, *, timeout_seconds, **kwargs):
+        def runner(prompt, *, idle_timeout_seconds, **kwargs):
             context = _context_from_prompt(prompt)
-            seen[context["worker_id"]] = timeout_seconds
+            seen[context["worker_id"]] = idle_timeout_seconds
             if context["worker_id"].startswith("reviewer"):
                 return {
                     "schema_version": "arc.llm.review_envelope.v1",
@@ -325,8 +264,8 @@ def test_batch_timeout_passes_none_for_env_resolution_and_honors_worker_override
     }
 
     explicit = base_config(tmp_path / "explicit", max_rounds=1)
-    explicit["worker_call_timeout_seconds"] = 12
-    explicit["loops"][0]["proposers"][0]["worker_call_timeout_seconds"] = 4
+    explicit["worker_idle_timeout_seconds"] = 12
+    explicit["loops"][0]["proposers"][0]["worker_idle_timeout_seconds"] = 4
     assert execute(explicit) == {
         "proposer_001": 4,
         "proposer_002": 12,

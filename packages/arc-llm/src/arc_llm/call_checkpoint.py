@@ -198,6 +198,11 @@ def record_failure(prepared: PreparedCall, exc: BaseException) -> None:
                         "state": "failed",
                         "submission_state": "submitted",
                         "failure_category": disposition.category.value,
+                        "resumable": disposition.category
+                        in {LLMFailureCategory.TIMEOUT, LLMFailureCategory.CANCELLED},
+                        "progress_journal": str(
+                            prepared.path.parent.parent / "progress.jsonl"
+                        ),
                         "updated_at": time.time(),
                     }
                 )

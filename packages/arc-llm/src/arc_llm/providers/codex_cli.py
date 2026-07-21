@@ -7,7 +7,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,23 +24,64 @@ from .base import (
     LLMSchemaError,
     LLMWorkerError,
 )
-from .lifecycle import resolve_worker_call_timeout_seconds, run_process_group
+from .activity import ActivityTracker, resolve_idle_timeout_seconds
+from .lifecycle import run_streaming_process_group
 
 
 _RESUME_SCHEMA_SUPPORT_CACHE: dict[tuple[str, str | None], bool] = {}
 _RESUME_SCHEMA_SUPPORT_LOCK = threading.Lock()
+_JSON_STREAM_SUPPORT_CACHE: dict[tuple[str, str | None], bool] = {}
+_JSON_STREAM_SUPPORT_LOCK = threading.Lock()
 
 
-def _run_codex(cmd, prompt, *, env, timeout_seconds, deadline, cancel_check):
-    timeout = resolve_worker_call_timeout_seconds(timeout_seconds, env=env, provider="codex-cli")
-    effective_deadline = deadline if deadline is not None else (
-        time.monotonic() + timeout if timeout is not None else None
+def _run_codex(cmd, prompt, *, env, idle_timeout_seconds, cancel_check, progress_callback):
+    _require_codex_json_stream_support(env)
+    activity = ActivityTracker(
+        provider="codex-cli",
+        idle_timeout_seconds=resolve_idle_timeout_seconds(
+            idle_timeout_seconds, env=env, provider="codex-cli"
+        ),
+        progress_callback=progress_callback,
     )
-    return run_process_group(
-        cmd, input_text=prompt, env=env,
-        deadline=effective_deadline,
-        cancel_check=cancel_check,
+
+    def on_line(line: str) -> None:
+        _record_codex_activity(line, activity)
+
+    return run_streaming_process_group(
+        cmd, input_text=prompt, env=env, activity=activity,
+        stdout_line_callback=on_line, cancel_check=cancel_check,
     )
+
+
+def _require_codex_json_stream_support(env: Mapping[str, str]) -> None:
+    override = env.get("ARC_CODEX_JSON_STREAM_SUPPORT")
+    if override is not None:
+        supported = _env_bool(env, "ARC_CODEX_JSON_STREAM_SUPPORT", False)
+    else:
+        key = (env.get("ARC_CODEX_BIN", "codex"), env.get("PATH"))
+        with _JSON_STREAM_SUPPORT_LOCK:
+            cached = _JSON_STREAM_SUPPORT_CACHE.get(key)
+        if cached is None:
+            try:
+                result = subprocess.run(
+                    [key[0], "exec", "--help"], text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, env=dict(env), timeout=5,
+                )
+                supported = result.returncode == 0 and "--json" in (result.stdout + result.stderr)
+            except (OSError, subprocess.SubprocessError):
+                supported = False
+            with _JSON_STREAM_SUPPORT_LOCK:
+                _JSON_STREAM_SUPPORT_CACHE[key] = supported
+        else:
+            supported = cached
+    if not supported:
+        raise LLMWorkerError(
+            "Installed Codex CLI does not advertise --json streaming; upgrade Codex before "
+            "starting a paid ARC call",
+            retryable=False,
+            category=LLMFailureCategory.INVALID_REQUEST,
+            submission_state=LLMSubmissionState.NOT_SUBMITTED,
+        )
 
 
 class CodexCliProvider:
@@ -70,9 +110,9 @@ class CodexCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
-        timeout_seconds: float | None = None,
-        deadline: float | None = None,
         cancel_check=None,
+        idle_timeout_seconds: float | None = None,
+        progress_callback=None,
     ) -> LLMProviderResponse[dict[str, Any]]:
         provider_schema = to_provider_json_schema(schema)
         try:
@@ -103,16 +143,16 @@ class CodexCliProvider:
                 output_path=output_path,
                 schema_path=schema_path if use_schema else None,
                 model=model,
-                json_events=stateful,
+                json_events=True,
             )
 
             result = _run_codex(
-                cmd, effective_prompt, env=self.env, timeout_seconds=timeout_seconds,
-                deadline=deadline, cancel_check=cancel_check,
+                cmd, effective_prompt, env=self.env, idle_timeout_seconds=idle_timeout_seconds,
+                cancel_check=cancel_check, progress_callback=progress_callback,
             )
             if result.returncode != 0:
                 raise _codex_failure(result.stderr or result.stdout or "codex exec failed")
-            native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
+            native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout)
             if stateful and not resume_id and not native_session_id:
                 raise LLMWorkerError("stateful Codex call did not report thread/session id")
             payload, structured_output = _read_json_payload(output_path, result.stdout, output_recovery=output_recovery)
@@ -138,9 +178,9 @@ class CodexCliProvider:
         session: LLMSessionRef | None = None,
         session_policy: str = "stateless",
         artifact_dir: Path | None = None,
-        timeout_seconds: float | None = None,
-        deadline: float | None = None,
         cancel_check=None,
+        idle_timeout_seconds: float | None = None,
+        progress_callback=None,
     ) -> LLMProviderResponse[str]:
         stateful = session_policy == "stateful" and session is not None
         with _temporary_directory(self.env) as tmp:
@@ -152,16 +192,16 @@ class CodexCliProvider:
                 output_path=output_path,
                 schema_path=None,
                 model=model,
-                json_events=stateful,
+                json_events=True,
             )
 
             result = _run_codex(
-                cmd, prompt, env=self.env, timeout_seconds=timeout_seconds,
-                deadline=deadline, cancel_check=cancel_check,
+                cmd, prompt, env=self.env, idle_timeout_seconds=idle_timeout_seconds,
+                cancel_check=cancel_check, progress_callback=progress_callback,
             )
             if result.returncode != 0:
                 raise _codex_failure(result.stderr or result.stdout or "codex exec failed")
-            native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout) if stateful else (None, LLMUsage(), ())
+            native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout)
             if stateful and not session.native_session_id and not native_session_id:
                 raise LLMWorkerError("stateful Codex call did not report thread/session id")
             try:
@@ -380,6 +420,43 @@ def _parse_codex_json_events(stdout: str) -> tuple[str | None, LLMUsage, tuple[d
     return thread_id, usage, tuple(events)
 
 
+def _record_codex_activity(line: str, activity: ActivityTracker) -> None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict):
+        return
+    event_type = str(event.get("type") or "")
+    if event_type == "thread.started":
+        native_session_id = event.get("thread_id") or event.get("session_id")
+        if native_session_id:
+            activity.record_metadata(
+                "session",
+                text="provider session established",
+                detail={"native_session_id": str(native_session_id), "resumable": True},
+            )
+        return
+    item = event.get("item")
+    if not isinstance(item, dict):
+        item = {}
+    item_type = str(item.get("type") or "")
+    if item_type in {"reasoning", "analysis"} or "reasoning" in event_type:
+        return
+    if item_type in {"agent_message", "assistant_message", "message"}:
+        text = item.get("text") or item.get("content")
+        if isinstance(text, str):
+            activity.record("assistant", text=text)
+        return
+    if item_type in {"command_execution", "tool_call", "mcp_tool_call", "web_search"}:
+        status = item.get("status") or event_type
+        activity.record_tool_state(
+            tool_type=item_type,
+            status=str(status),
+            tool_id=str(item.get("id") or item.get("call_id") or "anonymous"),
+        )
+
+
 def _read_json_payload(
     output_path: Path,
     stdout: str,
@@ -542,8 +619,8 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
 
 
 def _timeout_seconds(env: Mapping[str, str], provider_key: str) -> float | None:
-    key = provider_key if env.get(provider_key) not in {None, ""} else "ARC_LLM_TIMEOUT_SECONDS"
-    value = env.get(key)
+    key = provider_key
+    value = env.get(provider_key)
     if value is None or not value.strip():
         return None
     try:

@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
-import time
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,17 +18,26 @@ from arc_llm.structured_recovery import parse_json_object_relaxed, structured_me
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
 from .base import LLMFailureCategory, LLMSubmissionState, LLMWorkerError
-from .lifecycle import resolve_worker_call_timeout_seconds, run_process_group
+from .activity import ActivityTracker, resolve_idle_timeout_seconds
+from .lifecycle import run_streaming_process_group
 
 
-def _run_claude(cmd, prompt, *, env, timeout_seconds, deadline, cancel_check):
-    timeout = resolve_worker_call_timeout_seconds(timeout_seconds, env=env, provider="claude-cli")
-    effective_deadline = deadline if deadline is not None else (
-        time.monotonic() + timeout if timeout is not None else None
+_STREAM_JSON_SUPPORT_CACHE: dict[tuple[str, str | None], bool] = {}
+_STREAM_JSON_SUPPORT_LOCK = threading.Lock()
+
+
+def _run_claude(cmd, prompt, *, env, idle_timeout_seconds, cancel_check, progress_callback):
+    _require_stream_json_support(env)
+    activity = ActivityTracker(
+        provider="claude-cli",
+        idle_timeout_seconds=resolve_idle_timeout_seconds(
+            idle_timeout_seconds, env=env, provider="claude-cli"
+        ),
+        progress_callback=progress_callback,
     )
-    return run_process_group(
-        cmd, input_text=prompt, env=env,
-        deadline=effective_deadline,
+    return run_streaming_process_group(
+        cmd, input_text=prompt, env=env, activity=activity,
+        stdout_line_callback=lambda line: _record_claude_activity(line, activity),
         cancel_check=cancel_check,
     )
 
@@ -59,9 +68,9 @@ class ClaudeCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
-        timeout_seconds: float | None = None,
-        deadline: float | None = None,
         cancel_check=None,
+        idle_timeout_seconds: float | None = None,
+        progress_callback=None,
     ) -> LLMProviderResponse[dict[str, Any]]:
         schema = schema or {"type": "object"}
         stateful = session_policy == "stateful" and session is not None
@@ -69,7 +78,8 @@ class ClaudeCliProvider:
         cmd = [
             *_base_cmd(self.env, stateful=stateful),
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
         ]
         effective_prompt = prompt
         if mode == "provider":
@@ -87,14 +97,15 @@ class ClaudeCliProvider:
             cmd.extend(["--model", model])
 
         result = _run_claude(
-            cmd, effective_prompt, env=self.env, timeout_seconds=timeout_seconds,
-            deadline=deadline, cancel_check=cancel_check,
+            cmd, effective_prompt, env=self.env, idle_timeout_seconds=idle_timeout_seconds,
+            cancel_check=cancel_check, progress_callback=progress_callback,
         )
         _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
             raise _claude_failure(result.stderr or result.stdout or "claude -p failed")
+        terminal_output = _claude_terminal_json(result.stdout)
         value, usage, returned_session_id, structured_output = _extract_claude_metadata(
-            result.stdout,
+            terminal_output,
             output_recovery=output_recovery,
         )
         return LLMProviderResponse(
@@ -102,7 +113,7 @@ class ClaudeCliProvider:
             usage=usage,
             native_session_id=returned_session_id or native_id,
             raw_output=result.stdout,
-            raw_model_output=_claude_model_text(result.stdout),
+            raw_model_output=_claude_model_text(terminal_output),
             prompt_sent_sha256=sha256_text(effective_prompt),
             structured_output=structured_output,
         )
@@ -118,15 +129,14 @@ class ClaudeCliProvider:
         session: LLMSessionRef | None = None,
         session_policy: str = "stateless",
         artifact_dir: Path | None = None,
-        timeout_seconds: float | None = None,
-        deadline: float | None = None,
         cancel_check=None,
+        idle_timeout_seconds: float | None = None,
+        progress_callback=None,
     ) -> LLMProviderResponse[str]:
         stateful = session_policy == "stateful" and session is not None
         cmd = _base_cmd(self.env, stateful=stateful)
-        json_output = stateful or _env_bool(self.env, "ARC_CLAUDE_TEXT_OUTPUT_FORMAT_JSON", False)
-        if json_output:
-            cmd.extend(["--output-format", "json"])
+        json_output = True
+        cmd.extend(["--output-format", "stream-json", "--verbose"])
         native_id = session.native_session_id if stateful else None
         if stateful:
             if native_id:
@@ -138,14 +148,16 @@ class ClaudeCliProvider:
             cmd.extend(["--model", model])
 
         result = _run_claude(
-            cmd, prompt, env=self.env, timeout_seconds=timeout_seconds,
-            deadline=deadline, cancel_check=cancel_check,
+            cmd, prompt, env=self.env, idle_timeout_seconds=idle_timeout_seconds,
+            cancel_check=cancel_check, progress_callback=progress_callback,
         )
         _write_raw_artifacts(artifact_dir, stdout=result.stdout, stderr=result.stderr)
         if result.returncode != 0:
             raise _claude_failure(result.stderr or result.stdout or "claude -p failed")
         if json_output:
-            value, usage, returned_session_id = _extract_claude_text_metadata(result.stdout)
+            value, usage, returned_session_id = _extract_claude_text_metadata(
+                _claude_terminal_json(result.stdout)
+            )
             return LLMProviderResponse(
                 value,
                 usage=usage,
@@ -174,6 +186,101 @@ def _claude_failure(message: str) -> LLMWorkerError:
         category=LLMFailureCategory.PROVIDER_INTERNAL,
         submission_state=LLMSubmissionState.SUBMITTED,
     )
+
+
+def _require_stream_json_support(env: Mapping[str, str]) -> None:
+    override = env.get("ARC_CLAUDE_STREAM_JSON_SUPPORT")
+    if override is not None:
+        supported = _env_bool(env, "ARC_CLAUDE_STREAM_JSON_SUPPORT", False)
+    else:
+        key = (env.get("ARC_CLAUDE_BIN", "claude"), env.get("PATH"))
+        with _STREAM_JSON_SUPPORT_LOCK:
+            cached = _STREAM_JSON_SUPPORT_CACHE.get(key)
+        if cached is None:
+            try:
+                result = subprocess.run(
+                    [key[0], "-p", "--help"], text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, env=dict(env), timeout=5,
+                )
+                supported = result.returncode == 0 and "stream-json" in (result.stdout + result.stderr)
+            except (OSError, subprocess.SubprocessError):
+                supported = False
+            with _STREAM_JSON_SUPPORT_LOCK:
+                _STREAM_JSON_SUPPORT_CACHE[key] = supported
+        else:
+            supported = cached
+    if not supported:
+        raise LLMWorkerError(
+            "Installed Claude CLI does not advertise stream-json; upgrade Claude Code before "
+            "starting a paid ARC call",
+            retryable=False,
+            category=LLMFailureCategory.INVALID_REQUEST,
+            submission_state=LLMSubmissionState.NOT_SUBMITTED,
+        )
+
+
+def _record_claude_activity(line: str, activity: ActivityTracker) -> None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict):
+        return
+    event_type = str(event.get("type") or "")
+    if event_type == "system":
+        native_session_id = event.get("session_id") or event.get("sessionId")
+        if native_session_id:
+            activity.record_metadata(
+                "session",
+                text="provider session established",
+                detail={"native_session_id": str(native_session_id), "resumable": True},
+            )
+        return
+    if event_type == "assistant":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    activity.record("assistant", text=block["text"])
+                elif block.get("type") == "tool_use":
+                    activity.record_tool_state(
+                        tool_type="claude_tool",
+                        status="running",
+                        tool_id=str(block.get("id") or "anonymous"),
+                    )
+        return
+    if event_type == "stream_event":
+        inner = event.get("event")
+        if not isinstance(inner, dict):
+            return
+        inner_type = str(inner.get("type") or "")
+        # Text deltas are fragments, not classifiable progress messages.  The
+        # completed assistant event above records their aggregated content.
+        if inner_type == "content_block_start":
+            block = inner.get("content_block")
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                activity.record_tool_state(
+                    tool_type="claude_tool",
+                    status="running",
+                    tool_id=str(block.get("id") or inner.get("index") or "anonymous"),
+                )
+
+
+def _claude_terminal_json(stdout: str) -> str:
+    terminal: dict[str, Any] | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            terminal = event
+    if terminal is None:
+        raise _submitted_output_error("Claude stream-json output contained no terminal result event")
+    return json.dumps(terminal, ensure_ascii=False)
 
 
 def _submitted_output_error(message: str) -> LLMWorkerError:
@@ -537,17 +644,3 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
-
-
-def _timeout_seconds(env: Mapping[str, str], provider_key: str) -> float | None:
-    key = provider_key if env.get(provider_key) not in {None, ""} else "ARC_LLM_TIMEOUT_SECONDS"
-    value = env.get(key)
-    if value is None or not value.strip():
-        return None
-    try:
-        timeout = float(value)
-    except ValueError as exc:
-        raise LLMWorkerError(f"{key} must be a positive number") from exc
-    if timeout <= 0:
-        raise LLMWorkerError(f"{key} must be a positive number")
-    return timeout

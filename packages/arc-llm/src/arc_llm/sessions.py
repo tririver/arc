@@ -367,11 +367,11 @@ def _provider_runtime_values(provider: str, env: Mapping[str, str]) -> dict[str,
     search_path = env.get("PATH", os.defpath)
     resolved_binary = shutil.which(binary, path=search_path)
     work_dir = Path(env.get("ARC_KIMI_WORK_DIR") or os.getcwd()).expanduser().resolve(strict=False)
-    provider_timeout = env.get("ARC_KIMI_TIMEOUT_SECONDS")
-    effective_timeout = (
-        provider_timeout
-        if provider_timeout is not None and provider_timeout.strip()
-        else env.get("ARC_LLM_TIMEOUT_SECONDS")
+    provider_idle_timeout = env.get("ARC_KIMI_IDLE_TIMEOUT_SECONDS")
+    effective_idle_timeout = (
+        provider_idle_timeout
+        if provider_idle_timeout is not None and provider_idle_timeout.strip()
+        else env.get("ARC_LLM_IDLE_TIMEOUT_SECONDS")
     )
     return {
         "binary": binary,
@@ -382,7 +382,7 @@ def _provider_runtime_values(provider: str, env: Mapping[str, str]) -> dict[str,
             tier: env.get(f"ARC_LLM_KIMI_{tier.upper()}_MODEL")
             for tier in ("low", "medium", "high", "max")
         },
-        "timeout_seconds": effective_timeout,
+        "idle_timeout_seconds": effective_idle_timeout,
     }
 
 

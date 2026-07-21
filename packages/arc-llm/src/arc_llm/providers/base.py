@@ -89,7 +89,7 @@ class LLMWorkerError(RuntimeError):
 
 
 class LLMWorkerTimeout(LLMWorkerError):
-    """The total worker-call deadline expired."""
+    """The provider produced no meaningful activity before its idle deadline."""
 
     def __init__(self, message: str, **kwargs: Any) -> None:
         kwargs.setdefault("category", LLMFailureCategory.TIMEOUT)
@@ -103,6 +103,19 @@ class LLMWorkerCancelled(LLMWorkerError):
     def __init__(self, message: str, **kwargs: Any) -> None:
         kwargs.setdefault("category", LLMFailureCategory.CANCELLED)
         super().__init__(message, **kwargs)
+
+
+class LLMConfigurationError(LLMWorkerError):
+    """Local LLM configuration is invalid before provider submission."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            retryable=False,
+            category=LLMFailureCategory.INVALID_REQUEST,
+            abort_scope=LLMAbortScope.BATCH,
+            submission_state=LLMSubmissionState.NOT_SUBMITTED,
+        )
 
 
 class LLMSchemaError(LLMWorkerError):

@@ -57,6 +57,8 @@ def main(argv: list[str] | None = None) -> int:
                 interval=args.interval,
                 json_output=args.json,
                 progress_jsonl=args.progress_jsonl,
+                until_review=args.until_review,
+                after_review_sequence=args.after_review_sequence,
             )
     except ValueError as exc:
         response = {
@@ -106,6 +108,18 @@ def _parser() -> argparse.ArgumentParser:
     watch.add_argument("--interval", type=float, default=5.0)
     watch.add_argument("--json", action="store_true")
     watch.add_argument("--progress-jsonl", action="store_true")
+    watch.add_argument(
+        "--until-review",
+        action="store_true",
+        help="Return successfully after the next review_due event without cancelling the job",
+    )
+    watch.add_argument(
+        "--after-review-sequence",
+        type=int,
+        default=0,
+        metavar="N",
+        help="With --until-review, wait for a review sequence greater than N",
+    )
     return parser
 
 
@@ -116,7 +130,13 @@ def _watch(
     interval: float,
     json_output: bool,
     progress_jsonl: bool,
+    until_review: bool,
+    after_review_sequence: int,
 ) -> int:
+    if after_review_sequence < 0:
+        raise ValueError("--after-review-sequence must be non-negative")
+    if after_review_sequence and not until_review:
+        raise ValueError("--after-review-sequence requires --until-review")
     seen_event_keys: set[tuple[Any, Any, Any]] = set()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -142,6 +162,15 @@ def _watch(
                 if progress_jsonl:
                     return _emit_jsonl(response, failure=response.get("ok") is not True)
                 return _emit(response, json_output=json_output, failure=response.get("ok") is not True)
+            if until_review and _review_sequence(status) > after_review_sequence:
+                response = {
+                    **status,
+                    "watch_status": "review_due",
+                    "after_review_sequence": after_review_sequence,
+                }
+                if progress_jsonl:
+                    return _emit_jsonl(response)
+                return _emit(response, json_output=json_output)
             time.sleep(max(0.1, interval))
     except KeyboardInterrupt:
         manager.cancel(job_id)
@@ -152,6 +181,11 @@ def _watch(
         return _emit(response, json_output=json_output, failure=True)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def _review_sequence(status: dict[str, Any]) -> int:
+    value = status.get("review_sequence")
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _emit_jsonl(data: Any, *, failure: bool = False) -> int:

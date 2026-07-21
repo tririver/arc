@@ -996,7 +996,7 @@ def test_readme_and_llm_manual_document_experimental_kimi_provider() -> None:
         assert "ARC_AGENT_HOST=kimi-code" in text
         assert "ARC_KIMI_BIN" in text
         assert "ARC_KIMI_WORK_DIR" in text
-        assert "ARC_KIMI_TIMEOUT_SECONDS" in text
+        assert "ARC_KIMI_IDLE_TIMEOUT_SECONDS" in text
         assert "ARC_LLM_KIMI_LOW_MODEL" in text
         assert "provider-side" in text
         assert "not a sandbox" in compact
@@ -1170,10 +1170,14 @@ def test_arc_runtime_and_job_docs_cover_unified_context_and_lifecycle() -> None:
     assert "migration status" in skill
     assert "detected host" in skill
     assert "provider" in skill
-    assert "3600-second monotonic deadline" in jobs
-    assert "1800-second" not in jobs
-    assert "worker_call_timeout_seconds" in jobs
+    assert "1800 seconds" in jobs
+    assert "no absolute runtime deadline" in jobs
+    assert "worker_idle_timeout_seconds" in jobs
     assert "--progress-jsonl" in jobs
+    assert "--until-review" in jobs
+    assert "last substantive excerpt" in jobs
+    assert "provider_review_sequence" in jobs
+    assert "returned `review_sequence`" in jobs
     assert "`degraded`" in jobs
     assert "full provider process group" in jobs
     assert "tokens, API keys" in jobs
@@ -1197,9 +1201,18 @@ def test_domain_and_ideas_docs_route_by_semantic_fields_and_frozen_recency() -> 
     assert "status is `completed` or `degraded`" in ideas
     assert "rank only usable loops" in ideas
     for text in (skill, domain, ideas):
-        assert "one-hour monotonic deadline by default" in text
-        assert "--timeout-seconds" in text
-        assert "ARC_*_TIMEOUT_SECONDS" in text
+        assert "no absolute runtime limit" in text
+        assert "--idle-timeout-seconds" in text
+        assert "ARC_*_IDLE_TIMEOUT_SECONDS" in text
+        assert "30-minute" in text or "30 minutes" in text
+    for text in (skill, domain):
+        assert "--until-review --after-review-sequence 0 --json" in text
+    assert "streams progress JSONL to" in ideas
+    assert "stderr" in ideas
+    assert "SIGINT" in ideas and "SIGTERM" in ideas
+    for text in (skill, domain, ideas):
+        assert "review_sequence" in text
+        assert "terminal result" in text
     assert "cancellation" in skill
     assert "cancellation" in domain
     assert "cancellation" in ideas

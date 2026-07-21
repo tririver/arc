@@ -15,7 +15,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock, get_ident
+from threading import Lock, RLock, get_ident
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
@@ -67,9 +67,15 @@ RESERVED_STATUS_PAYLOAD_KEYS = frozenset(
         "errors",
         "meta",
         "environment",
+        "review_sequence",
+        "last_activity_at",
+        "last_substantive_excerpt",
+        "last_substantive_at",
+        "artifact_paths",
     }
 )
 _JOB_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+_STATUS_UPDATE_LOCK = RLock()
 
 
 class JobCancelled(RuntimeError):
@@ -188,6 +194,11 @@ class JobManager:
             "status": "queued",
             "phase": "queued",
             "progress": {},
+            "review_sequence": 0,
+            "last_activity_at": None,
+            "last_substantive_excerpt": None,
+            "last_substantive_at": None,
+            "artifact_paths": [],
             "payload": payload_dict,
             "cancel_requested": False,
             "started_at": now,
@@ -554,15 +565,15 @@ _SNAPSHOT_ENV_KEYS = frozenset(
         "ARC_JOBS_DIR",
         "ARC_LLM_TMP_DIR",
         "ARC_LLM_SCHEMA_CACHE_DIR",
-        "ARC_LLM_TIMEOUT_SECONDS",
+        "ARC_LLM_IDLE_TIMEOUT_SECONDS",
         "ARC_LLM_MAX_CONCURRENCY",
-        "ARC_CODEX_TIMEOUT_SECONDS",
+        "ARC_CODEX_IDLE_TIMEOUT_SECONDS",
         "ARC_CODEX_MAX_CONCURRENCY",
         "ARC_CODEX_REASONING_EFFORT",
-        "ARC_CLAUDE_TIMEOUT_SECONDS",
+        "ARC_CLAUDE_IDLE_TIMEOUT_SECONDS",
         "ARC_CLAUDE_MAX_CONCURRENCY",
         "ARC_CLAUDE_EFFORT",
-        "ARC_KIMI_TIMEOUT_SECONDS",
+        "ARC_KIMI_IDLE_TIMEOUT_SECONDS",
         "ARC_KIMI_MAX_CONCURRENCY",
         "ARC_KIMI_ALLOW_INTERNAL_RETRIES",
         "ARC_KIMI_WORK_DIR",
@@ -588,6 +599,31 @@ _PROCESS_ENV_KEYS = frozenset(
     {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "SYSTEMROOT", "COMSPEC", "PATHEXT"}
 )
 _SECRET_MARKERS = ("TOKEN", "API_KEY", "APIKEY", "PASSWORD", "SECRET", "CREDENTIAL")
+_REMOVED_LLM_TIMEOUT_ENV_KEYS = frozenset(
+    {
+        "ARC_LLM_TIMEOUT_SECONDS",
+        "ARC_CODEX_TIMEOUT_SECONDS",
+        "ARC_CLAUDE_TIMEOUT_SECONDS",
+        "ARC_KIMI_TIMEOUT_SECONDS",
+    }
+)
+
+
+def _reject_removed_llm_timeout_environment(environment: Mapping[str, Any]) -> None:
+    present = [
+        key
+        for key in sorted(_REMOVED_LLM_TIMEOUT_ENV_KEYS)
+        if str(environment.get(key) or "").strip()
+    ]
+    if not present:
+        return
+    replacements = ", ".join(
+        key.replace("_TIMEOUT_SECONDS", "_IDLE_TIMEOUT_SECONDS") for key in present
+    )
+    raise ValueError(
+        "LLM total-timeout environment variables were removed; use idle timeout "
+        f"variables instead: {replacements}"
+    )
 
 
 def snapshot_environment(
@@ -597,6 +633,9 @@ def snapshot_environment(
 ) -> dict[str, str]:
     """Capture only portable, non-secret ARC context for a detached job."""
     source = os.environ if env is None else env
+    _reject_removed_llm_timeout_environment(source)
+    override_values = dict(overrides or {})
+    _reject_removed_llm_timeout_environment(override_values)
     result = {
         key: str(source[key])
         for key in _SNAPSHOT_ENV_KEYS
@@ -611,7 +650,9 @@ def snapshot_environment(
                 result["ARC_AGENT_HOST"] = host
         except (ImportError, RuntimeError):
             pass
-    for key, value in dict(overrides or {}).items():
+    for key, value in override_values.items():
+        if key in _REMOVED_LLM_TIMEOUT_ENV_KEYS and isinstance(value, str) and not value:
+            continue
         if any(marker in key.upper() for marker in _SECRET_MARKERS):
             raise ValueError(f"job environment must not contain secrets: {key}")
         if key not in _SNAPSHOT_ENV_KEYS:
@@ -642,6 +683,7 @@ def restored_environment(
         return result
     if not isinstance(snapshot, Mapping):
         raise ValueError("persisted job environment must be an object")
+    _reject_removed_llm_timeout_environment(snapshot)
     for key, value in snapshot.items():
         if key not in _SNAPSHOT_ENV_KEYS or not isinstance(value, str):
             raise ValueError(f"persisted job environment is invalid: {key}")
@@ -830,46 +872,84 @@ def record_progress(job_id: str, event: Mapping[str, Any]) -> None:
     normalized_event = dict(event)
     normalized_event.pop("schema_version", None)
     normalized_event.pop("updated_at", None)
-    timestamped = append_event(job_id, normalized_event, paths=paths)
-    event_name = str(timestamped.get("event") or "")
-    progress = _progress_from_event(timestamped)
-    updates: dict[str, Any] = {"phase": event_name or None, "progress": progress}
-    status_fields = {
-        "round",
-        "round_number",
-        "phase",
-        "run_id",
-        "loop_id",
-        "worker_id",
-        "role",
-        "worker_status",
-        "active_workers",
-        "completed_workers",
-        "failed_workers",
-        "evidence_round_number",
-        "evidence_status",
-        "request_count",
-        "sections_completed",
-        "sections_total",
-        "current",
-        "title",
-        "section_id",
-        "warning",
-        "warnings",
-        "failure_count",
-    }
-    for key, value in timestamped.items():
-        if key in status_fields:
-            updates[key] = value
-    update_status(
-        job_id,
-        paths=paths,
-        **{key: value for key, value in updates.items() if value is not None},
-    )
-    write_json(
-        paths.heartbeat,
-        {"job_id": job_id, "pid": os.getpid(), "heartbeat_at": timestamped["at"], "phase": event_name},
-    )
+    provider_review_sequence = normalized_event.pop("review_sequence", None)
+    if provider_review_sequence is not None:
+        normalized_event["provider_review_sequence"] = provider_review_sequence
+    with _STATUS_UPDATE_LOCK:
+        event_name = str(normalized_event.get("event") or "")
+        if event_name == "review_due":
+            current = read_json(paths.status, {})
+            current_cursor = current.get("review_sequence", 0) if isinstance(current, dict) else 0
+            if not isinstance(current_cursor, int) or isinstance(current_cursor, bool):
+                current_cursor = 0
+            normalized_event["review_sequence"] = max(0, current_cursor) + 1
+        timestamped = append_event(job_id, normalized_event, paths=paths)
+        progress = _progress_from_event(timestamped)
+        updates: dict[str, Any] = {"phase": event_name or None, "progress": progress}
+        status_fields = {
+            "round",
+            "round_number",
+            "phase",
+            "run_id",
+            "loop_id",
+            "worker_id",
+            "role",
+            "worker_status",
+            "active_workers",
+            "completed_workers",
+            "failed_workers",
+            "evidence_round_number",
+            "evidence_status",
+            "request_count",
+            "sections_completed",
+            "sections_total",
+            "current",
+            "title",
+            "section_id",
+            "warning",
+            "warnings",
+            "failure_count",
+            "review_sequence",
+            "provider_review_sequence",
+            "last_activity_at",
+            "artifact_paths",
+        }
+        for key, value in timestamped.items():
+            if key in status_fields:
+                updates[key] = value
+        excerpt = _substantive_progress_excerpt(timestamped)
+        if timestamped.get("substantive") is True:
+            updates["last_activity_at"] = timestamped["at"]
+        if excerpt is not None:
+            updates["last_substantive_excerpt"] = excerpt
+            updates["last_substantive_at"] = timestamped["at"]
+        update_status(
+            job_id,
+            paths=paths,
+            **{key: value for key, value in updates.items() if value is not None},
+        )
+        write_json(
+            paths.heartbeat,
+            {
+                "job_id": job_id,
+                "pid": os.getpid(),
+                "heartbeat_at": timestamped["at"],
+                "phase": event_name,
+            },
+        )
+
+
+def _substantive_progress_excerpt(event: Mapping[str, Any]) -> str | None:
+    """Return a bounded user-visible progress excerpt, never a heartbeat."""
+    if event.get("substantive") is not True:
+        return None
+    for key in ("summary", "excerpt", "message"):
+        value = event.get(key)
+        if isinstance(value, str):
+            compact = " ".join(value.split())
+            if compact:
+                return compact[:2000]
+    return None
 
 
 def append_event(
@@ -962,14 +1042,15 @@ def is_cancel_requested(job_id: str) -> bool:
 
 
 def update_status(job_id: str, *, paths: JobPaths | None = None, **fields: Any) -> dict[str, Any]:
-    paths = paths or find_job_paths(job_id) or JobPaths.for_job(job_id)
-    status = read_json(paths.status)
-    if not isinstance(status, dict):
-        status = {"schema_version": "arc.job_status.v1", "job_id": job_id}
-    status.update({key: value for key, value in fields.items() if value is not None})
-    status["updated_at"] = now_iso()
-    write_json(paths.status, status)
-    return status
+    with _STATUS_UPDATE_LOCK:
+        paths = paths or find_job_paths(job_id) or JobPaths.for_job(job_id)
+        status = read_json(paths.status)
+        if not isinstance(status, dict):
+            status = {"schema_version": "arc.job_status.v1", "job_id": job_id}
+        status.update({key: value for key, value in fields.items() if value is not None})
+        status["updated_at"] = now_iso()
+        write_json(paths.status, status)
+        return status
 
 
 def tail_events(path: Path, *, limit: int) -> list[dict[str, Any]]:

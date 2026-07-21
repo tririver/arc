@@ -307,8 +307,8 @@ def test_runtime_fingerprint_includes_provider_config_env():
         {"ARC_KIMI_WORK_DIR": "/tmp/kimi-project"},
         {"KIMI_CODE_HOME": "/tmp/kimi-home"},
         {"ARC_LLM_KIMI_HIGH_MODEL": "kimi-high"},
-        {"ARC_KIMI_TIMEOUT_SECONDS": "42"},
-        {"ARC_LLM_TIMEOUT_SECONDS": "43"},
+        {"ARC_KIMI_IDLE_TIMEOUT_SECONDS": "42"},
+        {"ARC_LLM_IDLE_TIMEOUT_SECONDS": "43"},
     ],
 )
 def test_kimi_runtime_fingerprint_includes_runtime_inputs(changed_env):
@@ -323,35 +323,47 @@ def test_kimi_runtime_fingerprint_includes_runtime_inputs(changed_env):
     assert changed != base
 
 
-def test_kimi_runtime_fingerprint_uses_provider_timeout_before_generic_fallback():
+def test_kimi_runtime_fingerprint_uses_provider_idle_timeout_before_generic_fallback():
     first = runtime_fingerprint(
         provider="kimi-code-cli",
         model="default_model",
         model_tier=None,
-        env={"ARC_KIMI_TIMEOUT_SECONDS": "42", "ARC_LLM_TIMEOUT_SECONDS": "10"},
+        env={
+            "ARC_KIMI_IDLE_TIMEOUT_SECONDS": "42",
+            "ARC_LLM_IDLE_TIMEOUT_SECONDS": "10",
+        },
     )
     second = runtime_fingerprint(
         provider="kimi-code-cli",
         model="default_model",
         model_tier=None,
-        env={"ARC_KIMI_TIMEOUT_SECONDS": "42", "ARC_LLM_TIMEOUT_SECONDS": "20"},
+        env={
+            "ARC_KIMI_IDLE_TIMEOUT_SECONDS": "42",
+            "ARC_LLM_IDLE_TIMEOUT_SECONDS": "20",
+        },
     )
 
     assert first == second
 
 
-def test_kimi_runtime_fingerprint_empty_provider_timeout_uses_generic_fallback():
+def test_kimi_runtime_fingerprint_empty_provider_idle_timeout_uses_generic_fallback():
     first = runtime_fingerprint(
         provider="kimi-code-cli",
         model="default_model",
         model_tier=None,
-        env={"ARC_KIMI_TIMEOUT_SECONDS": "", "ARC_LLM_TIMEOUT_SECONDS": "10"},
+        env={
+            "ARC_KIMI_IDLE_TIMEOUT_SECONDS": "",
+            "ARC_LLM_IDLE_TIMEOUT_SECONDS": "10",
+        },
     )
     second = runtime_fingerprint(
         provider="kimi-code-cli",
         model="default_model",
         model_tier=None,
-        env={"ARC_KIMI_TIMEOUT_SECONDS": "", "ARC_LLM_TIMEOUT_SECONDS": "20"},
+        env={
+            "ARC_KIMI_IDLE_TIMEOUT_SECONDS": "",
+            "ARC_LLM_IDLE_TIMEOUT_SECONDS": "20",
+        },
     )
 
     assert first != second

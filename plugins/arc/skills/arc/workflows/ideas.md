@@ -61,11 +61,19 @@ python3 <skill-dir>/workflows/scripts/ideas_runner.py \
   --json
 ```
 
-LLM calls use a one-hour monotonic deadline by default. Override it through
-the owning batch configuration, a CLI's
-`--timeout-seconds` option where exposed, or an applicable
-`ARC_*_TIMEOUT_SECONDS` environment variable. `SIGINT`, `SIGTERM`, and
-background job cancellation remain available throughout the deadline.
+LLM calls have no absolute runtime limit and stop after 30 minutes with no
+substantive provider output. The foreground runner streams progress JSONL to
+stderr. Keep its terminal session active and inspect the latest excerpt and
+artifacts at each 30-minute `review_due`. Concrete results, new evidence,
+reusable artifacts, or meaningful narrowing mean continue waiting in the same
+session. Repetitive, erroneous, or off-task output means send `SIGINT` or
+`SIGTERM`; never interrupt merely because a run is long. A terminal result
+ends the foreground review loop normally. When an external
+controller launches the runner with an ARC job side channel, use the job-level
+`review_sequence` cursor loop documented in `manuals/arc-jobs.md` instead.
+Override the idle bound through `worker_idle_timeout_seconds`,
+`--idle-timeout-seconds`, or an applicable `ARC_*_IDLE_TIMEOUT_SECONDS`
+variable. `SIGINT`, `SIGTERM`, and background cancellation remain available.
 
 Step 2: Print any returned `WARNING:` messages. For loop concurrency, see
 `manuals/arc-llm.md`.

@@ -170,13 +170,14 @@ def test_circuit_status_and_reset_cli(tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("command", ["run-text", "run-json", "proposers-reviewer-loop"])
-def test_timeout_help_documents_one_hour_default(command, capsys):
+def test_timeout_help_documents_idle_semantics(command, capsys):
     with pytest.raises(SystemExit) as caught:
         cli._build_parser().parse_args([command, "--help"])
 
     assert caught.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "default is 3600 seconds" in help_text
+    assert "without substantive provider progress" in help_text
+    assert "total" not in help_text.lower()
 
 
 def test_runtime_env_merges_cli_llm_options(monkeypatch):
@@ -354,7 +355,7 @@ def test_schema_format_cli_passes_schema_and_model_tier(monkeypatch):
             "medium",
             "--role-hint",
             "reviewer",
-            "--timeout-seconds",
+            "--idle-timeout-seconds",
             "12.5",
         ]
     )
@@ -366,15 +367,15 @@ def test_schema_format_cli_passes_schema_and_model_tier(monkeypatch):
     assert captured["schema"] == {"type": "object"}
     assert captured["model_tier"] == "medium"
     assert captured["role_hint"] == "reviewer"
-    assert captured["timeout_seconds"] == 12.5
+    assert captured["idle_timeout_seconds"] == 12.5
     assert captured["cancel_check"] is cli._job_cancel_check
 
 
-def test_schema_format_cli_finite_timeout_and_cancellation_reach_json_runner(monkeypatch):
+def test_schema_format_cli_idle_timeout_and_cancellation_reach_json_runner(monkeypatch):
     captured = {}
 
-    def fake_run_json(prompt, *, timeout_seconds=None, cancel_check=None, **_kwargs):
-        captured["timeout_seconds"] = timeout_seconds
+    def fake_run_json(prompt, *, idle_timeout_seconds=None, cancel_check=None, **_kwargs):
+        captured["idle_timeout_seconds"] = idle_timeout_seconds
         captured["cancel_check"] = cancel_check
         if cancel_check is not None and cancel_check():
             raise LLMWorkerCancelled("cancelled by test")
@@ -392,7 +393,7 @@ def test_schema_format_cli_finite_timeout_and_cancellation_reach_json_runner(mon
             "-",
             "--schema",
             "schema.json",
-            "--timeout-seconds",
+            "--idle-timeout-seconds",
             "0.25",
         ]
     )
@@ -400,7 +401,14 @@ def test_schema_format_cli_finite_timeout_and_cancellation_reach_json_runner(mon
     with pytest.raises(LLMWorkerCancelled, match="cancelled by test"):
         cli._dispatch(args)
 
-    assert captured == {"timeout_seconds": 0.25, "cancel_check": cancel_check}
+    assert captured == {"idle_timeout_seconds": 0.25, "cancel_check": cancel_check}
+
+
+def test_removed_total_timeout_cli_flag_fails_before_dispatch():
+    with pytest.raises(SystemExit):
+        cli._build_parser().parse_args(
+            ["run-text", "--prompt-text", "hello", "--timeout-seconds", "12"]
+        )
 
 
 def test_claude_session_persistence_flags_are_consistent():

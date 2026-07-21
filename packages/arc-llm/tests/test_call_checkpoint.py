@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import json
 import time
 
 import pytest
@@ -16,7 +17,12 @@ from arc_llm.call_checkpoint import (
     record_validated,
 )
 from arc_llm.usage import LLMProviderResponse, LLMUsage
-from arc_llm.providers.base import LLMSubmissionState, LLMWorkerError
+from arc_llm.providers.base import (
+    LLMSubmissionState,
+    LLMWorkerCancelled,
+    LLMWorkerError,
+    LLMWorkerTimeout,
+)
 from arc_llm import runner
 from arc_llm.runner import run_json
 
@@ -178,3 +184,25 @@ def test_known_submitted_failure_is_terminal_and_never_replayed(tmp_path: Path) 
     )
     with pytest.raises(LLMCallRetryExhausted, match="known terminal failure"):
         prepare_call(path, identity=identity, now=10_000)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        LLMWorkerTimeout("idle", submission_state=LLMSubmissionState.SUBMITTED),
+        LLMWorkerCancelled("cancelled", submission_state=LLMSubmissionState.SUBMITTED),
+    ],
+)
+def test_interrupted_submitted_call_records_recovery_metadata(
+    tmp_path: Path, failure: LLMWorkerError
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    path, identity = _identity(artifact_dir)
+    prepared = prepare_call(path, identity=identity, now=100)
+
+    record_failure(prepared, failure)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["state"] == "failed"
+    assert payload["resumable"] is True
+    assert payload["progress_journal"] == str(artifact_dir / "progress.jsonl")

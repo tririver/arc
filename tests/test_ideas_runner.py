@@ -1107,6 +1107,26 @@ def test_ideas_cli_prints_warnings(tmp_path: Path, capsys: Any) -> None:
     assert "no_info_idea_001" in captured.out
 
 
+def test_foreground_progress_streams_to_stderr_without_job_sidechannel(
+    monkeypatch: Any, capsys: Any
+) -> None:
+    runner = _load_runner_module()
+    monkeypatch.delenv("ARC_JOB_PROGRESS_FILE", raising=False)
+
+    callback = runner._foreground_progress_callback()
+    assert callback is not None
+    callback({"schema_version": "arc.llm.progress.v1", "event": "review_due"})
+
+    assert json.loads(capsys.readouterr().err)["event"] == "review_due"
+
+
+def test_foreground_progress_defers_to_job_sidechannel(monkeypatch: Any, tmp_path: Path) -> None:
+    runner = _load_runner_module()
+    monkeypatch.setenv("ARC_JOB_PROGRESS_FILE", str(tmp_path / "progress.jsonl"))
+
+    assert runner._foreground_progress_callback() is None
+
+
 def test_ideas_result_includes_round_score_table_from_loop_transcripts(tmp_path: Path) -> None:
     runner = _load_runner_module()
     project_dir = tmp_path / "project"

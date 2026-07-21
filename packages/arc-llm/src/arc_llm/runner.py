@@ -14,8 +14,16 @@ from .call_checkpoint import checkpoint_path, prepare_call, record_failure, reco
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
 from .model import reasoning_effort_for_model_tier, resolve_model_with_warnings
-from .providers.base import LLMSchemaError, LLMWorkerCancelled, LLMWorkerError, LLMWorkerTimeout
-from .providers.lifecycle import check_lifecycle, remaining_seconds, resolve_worker_call_timeout_seconds
+from .providers.activity import resolve_idle_timeout_seconds
+from .providers.base import (
+    LLMConfigurationError,
+    LLMSchemaError,
+    LLMWorkerCancelled,
+    LLMWorkerError,
+    LLMWorkerTimeout,
+)
+from .progress_journal import ProgressJournal
+from .progress_prompt import ensure_runtime_progress_contract
 from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
@@ -156,7 +164,8 @@ def run_json(
     artifact_dir: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
-    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     if session_policy not in {"stateless", "stateful"}:
@@ -165,6 +174,8 @@ def run_json(
         raise ValueError("output_recovery must be strict or warn")
     if session_policy == "stateful" and (session_manager is None or not session_key):
         raise ValueError("stateful run_json requires session_manager and session_key")
+    prompt = ensure_runtime_progress_contract(prompt)
+    static_prefix = ensure_runtime_progress_contract(static_prefix or "")
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -182,9 +193,10 @@ def run_json(
         env=env,
         process_chain=process_chain,
         max_attempts=MAX_ATTEMPTS_PER_PROVIDER,
-        timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        progress_callback=progress_callback,
         cancel_check=cancel_check,
-        call=lambda selected, config, deadline: _generate_json(
+        call=lambda selected, config, effective_idle_timeout_seconds: _generate_json(
             selected,
             prompt,
             schema=schema,
@@ -205,7 +217,8 @@ def run_json(
             artifact_dir=Path(artifact_dir) if artifact_dir else None,
             call_label=call_label,
             static_prefix=static_prefix,
-            deadline=deadline,
+            idle_timeout_seconds=effective_idle_timeout_seconds,
+            progress_callback=progress_callback,
             cancel_check=cancel_check,
         ),
     )
@@ -227,7 +240,8 @@ def run_text(
     artifact_dir: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
-    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> str:
     return run_text_result(
@@ -245,7 +259,8 @@ def run_text(
         artifact_dir=artifact_dir,
         call_label=call_label,
         static_prefix=static_prefix,
-        timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        progress_callback=progress_callback,
         cancel_check=cancel_check,
     ).value
 
@@ -266,13 +281,16 @@ def run_text_result(
     artifact_dir: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
-    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> LLMCallOutcome:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
     if session_policy == "stateful" and (session_manager is None or not session_key):
         raise ValueError("stateful run_text requires session_manager and session_key")
+    prompt = ensure_runtime_progress_contract(prompt)
+    static_prefix = ensure_runtime_progress_contract(static_prefix or "")
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -291,9 +309,10 @@ def run_text_result(
         process_chain=process_chain,
         max_attempts=1 if session_policy == "stateful" else MAX_ATTEMPTS_PER_PROVIDER,
         return_outcome=True,
-        timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        progress_callback=progress_callback,
         cancel_check=cancel_check,
-        call=lambda selected, config, deadline: _generate_text(
+        call=lambda selected, config, effective_idle_timeout_seconds: _generate_text(
             selected,
             prompt,
             model=config.model,
@@ -309,7 +328,8 @@ def run_text_result(
             artifact_dir=Path(artifact_dir) if artifact_dir else None,
             call_label=call_label,
             static_prefix=static_prefix,
-            deadline=deadline,
+            idle_timeout_seconds=effective_idle_timeout_seconds,
+            progress_callback=progress_callback,
             cancel_check=cancel_check,
         ),
     )
@@ -331,25 +351,30 @@ def _run_with_retries(
     process_chain: Sequence[str] | None,
     max_attempts: int = MAX_ATTEMPTS_PER_PROVIDER,
     return_outcome: bool = False,
-    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    call: Callable[[Any, LLMConfig, float | None], Any],
+    call: Callable[[Any, LLMConfig, float], Any],
 ) -> Any:
+    del progress_callback
     failures: list[LLMAttemptFailure] = []
     attempt_records: list[dict[str, Any]] = []
-    timeout = resolve_worker_call_timeout_seconds(
-        timeout_seconds,
-        env=env,
-        provider=configs[0].provider if configs else None,
-    )
-    deadline = time.monotonic() + timeout if timeout is not None else None
     for fallback_index, config in enumerate(configs):
+        _check_cancel(cancel_check)
         provider_env = _env_with_tier_reasoning_default(env, config.provider, model_tier_requested)
+        try:
+            effective_idle_timeout_seconds = resolve_idle_timeout_seconds(
+                idle_timeout_seconds,
+                env=provider_env,
+                provider=config.provider,
+            )
+        except (TypeError, ValueError) as exc:
+            raise LLMConfigurationError(str(exc)) from exc
         selected = select_provider(config.provider, env=provider_env, process_chain=process_chain)
         for attempt in range(1, max_attempts + 1):
             try:
-                check_lifecycle(deadline, cancel_check)
-                result = call(selected, config, deadline)
+                _check_cancel(cancel_check)
+                result = call(selected, config, effective_idle_timeout_seconds)
                 value = result.value if isinstance(result, LLMCallOutcome) else result
                 attempt_record = _attempt_record(
                     config,
@@ -392,11 +417,14 @@ def _run_with_retries(
                 ):
                     raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts)) from exc
                 if _has_remaining_attempt(configs, fallback_index=fallback_index, attempt=attempt, max_attempts=max_attempts):
-                    delay = min(RETRY_INTERVAL_SECONDS, remaining_seconds(deadline))
-                    if delay <= 0:
-                        check_lifecycle(deadline, cancel_check)
-                    time.sleep(delay)
+                    time.sleep(RETRY_INTERVAL_SECONDS)
+                    _check_cancel(cancel_check)
     raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts))
+
+
+def _check_cancel(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise LLMWorkerCancelled("LLM worker call was cancelled")
 
 
 def _env_with_tier_reasoning_default(
@@ -447,7 +475,8 @@ def _generate_json(
     artifact_dir: Path | None,
     call_label: str | None,
     static_prefix: str | None,
-    deadline: float | None,
+    idle_timeout_seconds: float | None,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
     cancel_check: Callable[[], bool] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
@@ -461,6 +490,12 @@ def _generate_json(
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
     provider_schema = to_provider_json_schema(schema)
     prepared_checkpoint = None
+    progress = _progress_journal(
+        artifact_dir=artifact_dir,
+        call_label=call_label,
+        provider=provider_used,
+        callback=progress_callback,
+    )
 
     def call_provider(
         session: LLMSessionRef | None, session_turn: int | None = None
@@ -479,9 +514,7 @@ def _generate_json(
                 session_turn=session_turn,
                 runtime_fingerprint=runtime_fp,
             )
-            prepared_checkpoint = prepare_call(
-                path, identity=identity, deadline=deadline, cancel_check=cancel_check
-            )
+            prepared_checkpoint = prepare_call(path, identity=identity, cancel_check=cancel_check)
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
         def invoke() -> LLMProviderResponse[dict[str, Any]]:
@@ -496,8 +529,10 @@ def _generate_json(
                 }
                 if _accepts_keyword(selected.generate_json_result, "output_recovery"):
                     kwargs["output_recovery"] = output_recovery
-                if _accepts_keyword(selected.generate_json_result, "deadline"):
-                    kwargs["deadline"] = deadline
+                if _accepts_keyword(selected.generate_json_result, "idle_timeout_seconds"):
+                    kwargs["idle_timeout_seconds"] = idle_timeout_seconds
+                if _accepts_keyword(selected.generate_json_result, "progress_callback"):
+                    kwargs["progress_callback"] = progress
                 if _accepts_keyword(selected.generate_json_result, "cancel_check"):
                     kwargs["cancel_check"] = cancel_check
                 return selected.generate_json_result(prompt, **kwargs)
@@ -507,7 +542,6 @@ def _generate_json(
             response = _controlled_provider_call(
                 provider_used,
                 env=env,
-                deadline=deadline,
                 cancel_check=cancel_check,
                 call_label=call_label,
                 invoke=invoke,
@@ -518,6 +552,7 @@ def _generate_json(
             raise
         if prepared_checkpoint is not None:
             record_response(prepared_checkpoint, response)
+        progress({"event": "call_finished", "substantive": False, "resumable": False})
         return response
 
     if session_policy == "stateful":
@@ -586,7 +621,8 @@ def _generate_json(
                     process_chain=process_chain,
                     artifact_dir=artifact_dir,
                     call_label=call_label,
-                    deadline=deadline,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    progress_callback=progress,
                     cancel_check=cancel_check,
                 )
             except Exception:
@@ -612,7 +648,8 @@ def _generate_json(
             process_chain=process_chain,
             artifact_dir=artifact_dir,
             call_label=call_label,
-            deadline=deadline,
+            idle_timeout_seconds=idle_timeout_seconds,
+            progress_callback=progress,
             cancel_check=cancel_check,
         )
         native_session_id = response.native_session_id
@@ -651,7 +688,8 @@ def _generate_text(
     artifact_dir: Path | None,
     call_label: str | None,
     static_prefix: str | None,
-    deadline: float | None,
+    idle_timeout_seconds: float | None,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
     cancel_check: Callable[[], bool] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
@@ -665,6 +703,12 @@ def _generate_text(
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
 
     prepared_checkpoint = None
+    progress = _progress_journal(
+        artifact_dir=artifact_dir,
+        call_label=call_label,
+        provider=provider_used,
+        callback=progress_callback,
+    )
 
     def call_provider(
         session: LLMSessionRef | None, session_turn: int | None = None
@@ -683,9 +727,7 @@ def _generate_text(
                 session_turn=session_turn,
                 runtime_fingerprint=runtime_fp,
             )
-            prepared_checkpoint = prepare_call(
-                path, identity=identity, deadline=deadline, cancel_check=cancel_check
-            )
+            prepared_checkpoint = prepare_call(path, identity=identity, cancel_check=cancel_check)
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
         def invoke() -> LLMProviderResponse[str]:
@@ -696,8 +738,10 @@ def _generate_text(
                     "session_policy": session_policy,
                     "artifact_dir": artifact_dir,
                 }
-                if _accepts_keyword(selected.generate_text_result, "deadline"):
-                    kwargs["deadline"] = deadline
+                if _accepts_keyword(selected.generate_text_result, "idle_timeout_seconds"):
+                    kwargs["idle_timeout_seconds"] = idle_timeout_seconds
+                if _accepts_keyword(selected.generate_text_result, "progress_callback"):
+                    kwargs["progress_callback"] = progress
                 if _accepts_keyword(selected.generate_text_result, "cancel_check"):
                     kwargs["cancel_check"] = cancel_check
                 return selected.generate_text_result(prompt, **kwargs)
@@ -707,7 +751,6 @@ def _generate_text(
             response = _controlled_provider_call(
                 provider_used,
                 env=env,
-                deadline=deadline,
                 cancel_check=cancel_check,
                 call_label=call_label,
                 invoke=invoke,
@@ -718,6 +761,7 @@ def _generate_text(
             raise
         if prepared_checkpoint is not None:
             record_response(prepared_checkpoint, response)
+        progress({"event": "call_finished", "substantive": False, "resumable": False})
         return response
 
     if session_policy == "stateful":
@@ -802,11 +846,27 @@ def _runtime_fp(
     )
 
 
+def _progress_journal(
+    *,
+    artifact_dir: Path | None,
+    call_label: str | None,
+    provider: str,
+    callback: Callable[[dict[str, Any]], None] | None,
+) -> ProgressJournal:
+    if isinstance(callback, ProgressJournal):
+        return callback
+    return ProgressJournal(
+        artifact_dir=artifact_dir,
+        call_label=call_label,
+        provider=provider,
+        callback=callback,
+    )
+
+
 def _controlled_provider_call(
     provider: str,
     *,
     env: Mapping[str, str] | None,
-    deadline: float | None,
     cancel_check: Callable[[], bool] | None,
     call_label: str | None,
     invoke: Callable[[], LLMProviderResponse[Any]],
@@ -816,11 +876,10 @@ def _controlled_provider_call(
     safety_env = dict(os.environ)
     if env is not None:
         safety_env.update(env)
-    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
     controller = LLMSafetyController(env=safety_env)
     with controller.acquire_call(
         provider,
-        timeout_seconds=remaining,
+        timeout_seconds=None,
         cancel_check=cancel_check,
         call_label=call_label,
     ) as permit:
@@ -897,7 +956,8 @@ def _recover_or_validate_json_output(
     process_chain: Sequence[str] | None = None,
     artifact_dir: Path | None = None,
     call_label: str | None = None,
-    deadline: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     structured_output = response.structured_output
@@ -943,7 +1003,8 @@ def _recover_or_validate_json_output(
             process_chain=process_chain,
             artifact_dir=artifact_dir,
             call_label=call_label,
-            deadline=deadline,
+            idle_timeout_seconds=idle_timeout_seconds,
+            progress_callback=progress_callback,
             cancel_check=cancel_check,
         )
         if schema is not None:
@@ -973,7 +1034,8 @@ def _recover_or_validate_json_output(
                 process_chain=process_chain,
                 artifact_dir=artifact_dir,
                 call_label=call_label,
-                deadline=deadline,
+                idle_timeout_seconds=idle_timeout_seconds,
+                progress_callback=progress_callback,
                 cancel_check=cancel_check,
             )
             _validate_json_output(result, schema)
@@ -1007,7 +1069,8 @@ def _recover_warn_schema_output(
     process_chain: Sequence[str] | None,
     artifact_dir: Path | None,
     call_label: str | None,
-    deadline: float | None,
+    idle_timeout_seconds: float | None,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
     cancel_check: Callable[[], bool] | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     source = _schema_recovery_source_text(result, response=response, provider_metadata=provider_metadata)
@@ -1033,10 +1096,9 @@ def _recover_warn_schema_output(
         raise LLMOutputValidationError("JSON output failed schema validation and schema formatter is disabled")
     try:
         def formatter_runner(format_prompt: str, **formatter_kwargs: Any) -> dict[str, Any]:
-            if deadline is not None:
-                check_lifecycle(deadline, cancel_check)
-                formatter_kwargs["timeout_seconds"] = remaining_seconds(deadline)
             formatter_kwargs["cancel_check"] = cancel_check
+            formatter_kwargs["idle_timeout_seconds"] = idle_timeout_seconds
+            formatter_kwargs["progress_callback"] = progress_callback
             # A formatter is the final paid recovery step. It must never invoke
             # another formatter or cause the original worker to be replayed.
             formatter_kwargs["schema_formatter_enabled"] = False

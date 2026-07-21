@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
+from arc_llm.progress_prompt import ensure_runtime_progress_contract
 from arc_llm.runner import run_json
 
 from .config import (
@@ -252,7 +253,7 @@ def _improver_prompt(
         "loop_artifacts": loop_paths,
     }
     inline_context = _inline_artifact_context(bench=bench, current_result=current_result)
-    return (
+    return ensure_runtime_progress_contract(
         "You are improving prompts for an ARC proposers-reviewer benchmark.\n"
         "Read the artifact files from disk when details are needed. Do not ask for histories to be pasted inline.\n"
         "Worker outputs may include a top-level `suggested_improvement` object. Do not directly follow every "

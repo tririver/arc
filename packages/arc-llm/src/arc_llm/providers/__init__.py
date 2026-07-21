@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-from .base import LLMWorkerError
+from .base import LLMConfigurationError, LLMWorkerError
 
 
 _LAZY_EXPORTS = {
@@ -36,6 +36,7 @@ __all__ = [
     "ClaudeCliProvider",
     "CodexCliProvider",
     "KimiCodeCliProvider",
+    "LLMConfigurationError",
     "LLMWorkerError",
     "ManualProvider",
     "PROVIDER_SPECS",

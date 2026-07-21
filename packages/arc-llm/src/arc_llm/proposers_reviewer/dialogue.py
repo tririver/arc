@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from arc_llm.call_record import strip_arc_llm_call_records
+from arc_llm.progress_prompt import ensure_runtime_progress_contract, runtime_progress_contract
 
 from .config import LoopConfig, WorkerConfig
 from .context_pack import split_caller_context
@@ -58,6 +59,8 @@ def render_initial_worker_prompt(
         "",
         "## Output Contract",
         "Return exactly one JSON object matching the provided schema. Do not wrap it in Markdown. If unsure about a field, still include the field with your best useful value. For arrays, return [] when no items are available. For booleans, return true or false. For nullable fields, use null when appropriate. Do not return explanatory prose outside the JSON object.",
+        "",
+        runtime_progress_contract(),
     ]
     if worker.evidence_enabled:
         static_parts.append(
@@ -107,7 +110,7 @@ def render_proposer_delta_prompt(
     }
     if worker.evidence_enabled:
         delta["evidence_responses"] = _evidence_responses(correspondence, worker_id=worker.id)
-    prompt = "\n".join(
+    prompt = ensure_runtime_progress_contract("\n".join(
         [
             "## ARC-LLM Worker Delta Turn v2",
             "You are continuing the same proposer session. Use the remembered static task context, worker instructions, and current delta context.",
@@ -121,7 +124,7 @@ def render_proposer_delta_prompt(
             "",
             "Return the revised proposer JSON object for this round. If you cannot complete the derivation or proposal, still return every required JSON field and put the partial work or difficulty inside the appropriate field rather than prose outside JSON.",
         ]
-    ) + "\n"
+    ) + "\n")
     context = {"turn_kind": "delta", **strip_arc_llm_call_records(delta)}
     return prompt, context
 
@@ -147,7 +150,7 @@ def render_reviewer_delta_prompt(
             correspondence or [], worker_id=worker.id
         )
     outputs = strip_arc_llm_call_records(current_proposer_outputs)
-    prompt = "\n".join(
+    prompt = ensure_runtime_progress_contract("\n".join(
         [
             "## ARC-LLM Reviewer Delta Turn v2",
             "You are continuing the same reviewer session. Use the remembered static task context and worker instructions.",
@@ -163,7 +166,7 @@ def render_reviewer_delta_prompt(
             "",
             "Return exactly one arc.llm.review_envelope.v1 JSON object for this round. If you cannot complete a full review, still return a valid review envelope with a non-accepting status, explanatory analysis/controller.message, and proposer_messages for every active proposer id.",
         ]
-    ) + "\n"
+    ) + "\n")
     context = {"turn_kind": "delta", **delta, "current_proposer_outputs": outputs}
     return prompt, context
 

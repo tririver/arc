@@ -5,58 +5,32 @@ import signal
 import subprocess
 import sys
 import time
+import queue
+import threading
 from collections.abc import Callable, Mapping, Sequence
 
-from .base import LLMFailureCategory, LLMSubmissionState, LLMWorkerCancelled, LLMWorkerError, LLMWorkerTimeout
+from .base import LLMFailureCategory, LLMSubmissionState, LLMWorkerCancelled, LLMWorkerError
+from .activity import ActivityTracker
 
-
-_PROVIDER_TIMEOUT_KEYS = {
-    "codex-cli": "ARC_CODEX_TIMEOUT_SECONDS",
-    "claude-cli": "ARC_CLAUDE_TIMEOUT_SECONDS",
-    "kimi-code-cli": "ARC_KIMI_TIMEOUT_SECONDS",
-}
-
-DEFAULT_WORKER_CALL_TIMEOUT_SECONDS = 60 * 60
-
-
-def resolve_worker_call_timeout_seconds(
-    explicit: float | int | None, *, env: Mapping[str, str] | None, provider: str | None = None
-) -> float:
-    if explicit is not None:
-        return _positive_timeout(explicit, "worker_call_timeout_seconds")
-    material = os.environ if env is None else env
-    provider_key = _PROVIDER_TIMEOUT_KEYS.get(provider or "")
-    if provider_key and material.get(provider_key) not in {None, ""}:
-        return _positive_timeout(material[provider_key], provider_key)
-    if material.get("ARC_LLM_TIMEOUT_SECONDS") not in {None, ""}:
-        return _positive_timeout(material["ARC_LLM_TIMEOUT_SECONDS"], "ARC_LLM_TIMEOUT_SECONDS")
-    return float(DEFAULT_WORKER_CALL_TIMEOUT_SECONDS)
-
-
-def remaining_seconds(deadline: float | None) -> float:
-    return float("inf") if deadline is None else max(0.0, deadline - time.monotonic())
-
-
-def check_lifecycle(deadline: float | None, cancel_check: Callable[[], bool] | None) -> None:
-    if cancel_check is not None and cancel_check():
-        raise LLMWorkerCancelled("LLM worker call was cancelled")
-    if deadline is not None and remaining_seconds(deadline) <= 0:
-        raise LLMWorkerTimeout("LLM worker call timed out")
-
-
-def run_process_group(
-    command: Sequence[str], *, input_text: str, env: Mapping[str, str], deadline: float | None,
-    cancel_check: Callable[[], bool] | None = None, poll_interval_seconds: float = 0.1,
+def run_streaming_process_group(
+    command: Sequence[str],
+    *,
+    input_text: str,
+    env: Mapping[str, str],
+    activity: ActivityTracker,
+    stdout_line_callback: Callable[[str], None],
+    cancel_check: Callable[[], bool] | None = None,
+    poll_interval_seconds: float = 0.1,
     terminate_grace_seconds: float = 0.5,
 ) -> subprocess.CompletedProcess[str]:
-    check_lifecycle(deadline, cancel_check)
+    """Run a JSONL-style provider while enforcing activity-based timeout."""
     kwargs: dict[str, object] = {"start_new_session": True}
     if os.name == "nt":
         kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
     try:
         process = subprocess.Popen(
             list(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=dict(env), **kwargs,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, env=dict(env), **kwargs,
         )
     except FileNotFoundError as exc:
         raise LLMWorkerError(
@@ -64,35 +38,70 @@ def run_process_group(
             category=LLMFailureCategory.INVALID_REQUEST,
             submission_state=LLMSubmissionState.NOT_SUBMITTED,
         ) from exc
+
     watchdog = start_process_group_watchdog(process, grace_seconds=terminate_grace_seconds)
-    pending_input: str | None = input_text
+    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def read_stream(name: str, stream: object) -> None:
+        try:
+            for line in stream:  # type: ignore[union-attr]
+                output_queue.put((name, line))
+        finally:
+            output_queue.put((name, None))
+
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    readers = [
+        threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    def write_input() -> None:
+        try:
+            process.stdin.write(input_text)
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    writer = threading.Thread(target=write_input, name="arc-provider-stdin", daemon=True)
     try:
-        while True:
-            try:
-                check_lifecycle(deadline, cancel_check)
-            except (LLMWorkerCancelled, LLMWorkerTimeout):
-                terminate_process_group(process, grace_seconds=terminate_grace_seconds)
-                raise
-            try:
-                stdout, stderr = process.communicate(
-                    input=pending_input,
-                    timeout=min(poll_interval_seconds, remaining_seconds(deadline)),
+        activity.submitted()
+        writer.start()
+        closed: set[str] = set()
+        while process.poll() is None or len(closed) < 2:
+            if cancel_check is not None and cancel_check():
+                raise LLMWorkerCancelled(
+                    "LLM worker call was cancelled",
+                    submission_state=LLMSubmissionState.SUBMITTED,
                 )
-            except subprocess.TimeoutExpired:
-                # Popen retains partially written stdin and captured output;
-                # subsequent communicate calls continue both operations.
-                pending_input = None
+            activity.check()
+            try:
+                source, line = output_queue.get(timeout=poll_interval_seconds)
+            except queue.Empty:
                 continue
-            # A provider executable can exit after spawning helpers which keep
-            # running in the provider's process group.  Reap those helpers
-            # before releasing the call slot or reporting completion.
-            terminate_process_group(process, grace_seconds=terminate_grace_seconds)
-            return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+            if line is None:
+                closed.add(source)
+                continue
+            if source == "stdout":
+                stdout_parts.append(line)
+                stdout_line_callback(line)
+            else:
+                # Diagnostics are captured but never count as meaningful work.
+                stderr_parts.append(line)
+        terminate_process_group(process, grace_seconds=terminate_grace_seconds)
+        return subprocess.CompletedProcess(
+            list(command), process.returncode, "".join(stdout_parts), "".join(stderr_parts)
+        )
     except BaseException:
         terminate_process_group(process, grace_seconds=terminate_grace_seconds)
         raise
     finally:
         stop_process_group_watchdog(watchdog)
+        for reader in readers:
+            reader.join(timeout=0.2)
+        writer.join(timeout=0.2)
 
 
 def start_process_group_watchdog(
@@ -146,7 +155,6 @@ def stop_process_group_watchdog(watchdog: subprocess.Popen[object] | None) -> No
         except OSError:
             pass
 
-
 def terminate_process_group(process: subprocess.Popen[object], *, grace_seconds: float = 0.5) -> None:
     # Do not use ``process.poll()`` as an early return on POSIX.  The group
     # leader may have exited while descendants (including a paid provider
@@ -198,21 +206,3 @@ def _signal_group(process: subprocess.Popen[object], *, force: bool) -> None:
             process.kill() if force else process.terminate()
         except OSError:
             pass
-
-
-def _positive_timeout(value: object, name: str) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise LLMWorkerError(
-            f"{name} must be a positive number", retryable=False,
-            category=LLMFailureCategory.INVALID_REQUEST,
-            submission_state=LLMSubmissionState.NOT_SUBMITTED,
-        ) from exc
-    if result <= 0:
-        raise LLMWorkerError(
-            f"{name} must be a positive number", retryable=False,
-            category=LLMFailureCategory.INVALID_REQUEST,
-            submission_state=LLMSubmissionState.NOT_SUBMITTED,
-        )
-    return result

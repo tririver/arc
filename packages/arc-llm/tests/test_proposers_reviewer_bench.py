@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from arc_llm.progress_prompt import RUNTIME_PROGRESS_CONTRACT_MARKER
 from arc_llm.proposers_reviewer.config import ConfigError
 from arc_llm.proposers_reviewer_bench.config import (
     apply_improvement_edits,
@@ -325,6 +326,7 @@ def test_bench_runner_accepts_significant_prompt_improvement(tmp_path):
     assert "Do not propose prompt-template edits that require domain-specific objects" in improver.calls[0]
     assert "belongs in reviewer-to-proposer feedback inside a run" in improver.calls[0]
     assert "Use scalar-exchange search terms before proposing." in improver.calls[0]
+    assert improver.calls[0].count(RUNTIME_PROGRESS_CONTRACT_MARKER) == 1
     candidate_payload = batch_runner.calls[1]
     assert "Before proposing, run a novelty scouting pass." in candidate_payload["loops"][0]["proposers"][0]["prompt"][
         "template"

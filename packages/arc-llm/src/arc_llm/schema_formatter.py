@@ -11,6 +11,7 @@ from jsonschema import validate as validate_json_schema
 from jsonschema.exceptions import SchemaError as JsonSchemaError
 
 from arc_llm.call_record import strip_arc_llm_call_records
+from arc_llm.progress_prompt import ensure_runtime_progress_contract
 from arc_llm.structured_recovery import structured_metadata
 
 
@@ -62,7 +63,8 @@ def format_to_schema(
     model: str | None = None,
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
-    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> SchemaFormatResult:
     source = str(raw_text or "").strip()
@@ -80,7 +82,8 @@ def format_to_schema(
         "validate_schema": True,
         "output_recovery": "warn",
         "role_hint": "schema_formatter",
-        "timeout_seconds": timeout_seconds,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "progress_callback": progress_callback,
         "cancel_check": cancel_check,
     }.items():
         if _accepts_keyword(json_runner, key):
@@ -118,7 +121,8 @@ def format_to_schema_or_retry(
     model_tier: str | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: list[str] | None = None,
-    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> SchemaFormatDecision:
     source = str(raw_text or "").strip()
@@ -137,7 +141,8 @@ def format_to_schema_or_retry(
         "output_recovery": "strict",
         "role_hint": "schema_formatter",
         "process_chain": process_chain,
-        "timeout_seconds": timeout_seconds,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "progress_callback": progress_callback,
         "cancel_check": cancel_check,
     }.items():
         if _accepts_keyword(json_runner, key):
@@ -189,7 +194,7 @@ def format_to_schema_or_retry(
 
 
 def _formatter_prompt(raw_text: str, *, schema: Mapping[str, Any], role_hint: str | None) -> str:
-    return (
+    return ensure_runtime_progress_contract(
         "## Schema Formatter\n"
         "Reformat source text into exactly one JSON object matching the schema.\n"
         "Do not add new scientific claims, scores, evidence, or judgments.\n"
@@ -208,7 +213,7 @@ def _formatter_prompt(raw_text: str, *, schema: Mapping[str, Any], role_hint: st
 
 
 def _formatter_decision_prompt(raw_text: str, *, schema: Mapping[str, Any], role_hint: str | None) -> str:
-    return (
+    return ensure_runtime_progress_contract(
         "## Schema Formatter\n"
         "Decide whether source text contains enough information to reformat into the target schema.\n"
         "Return exactly one JSON object matching the formatter decision schema.\n"

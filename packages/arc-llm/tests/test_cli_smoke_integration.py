@@ -49,7 +49,7 @@ def test_stateful_run_json_cli_smoke(provider, binary, tmp_path):
         f"smoke/{provider}",
         "--schema",
         str(schema_path),
-        "--timeout-seconds",
+        "--idle-timeout-seconds",
         "180",
     ]
 
@@ -102,7 +102,7 @@ def test_codex_evidence_schema_strict_structured_output_smoke(tmp_path):
             "--prompt-text",
             "Return ok=true and arc_evidence_requests as an empty array.",
             "--json",
-            "--timeout-seconds",
+            "--idle-timeout-seconds",
             "180",
         ],
         text=True,

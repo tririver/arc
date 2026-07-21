@@ -10,7 +10,16 @@ Commands are passed as an argument vector and are never evaluated by a shell.
 ```bash
 arc-jobs submit --json -- arc-paper get-title 0911.3380 --json
 arc-jobs watch JOB_ID --json
+arc-jobs watch JOB_ID --until-review --after-review-sequence 0 --json
 ```
+
+LLM progress events are persisted while a command runs. `status` exposes the
+latest substantive excerpt and job-level review sequence. Start long-running
+jobs with `--after-review-sequence 0`; after meaningful progress, pass the
+returned `review_sequence` as the next cursor and watch again. `watch
+--until-review` returns successfully at the next 30-minute review checkpoint
+without cancelling the job. Use `cancel` when activity is repetitive, stalled,
+or off task; a terminal result returns normally and ends the watch loop.
 
 Successful submit, status, cancel, and list operations return `ok: true`.
 Failed/cancelled job status and result commands use a nonzero process exit code

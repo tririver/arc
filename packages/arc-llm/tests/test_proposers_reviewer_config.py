@@ -60,7 +60,7 @@ def test_valid_config_parses_and_merges_defaults():
     assert config.run_id == "idea-test"
     assert config.max_concurrent_loops == 2
     assert config.artifact_options.save_prompts is True
-    assert config.worker_call_timeout_seconds is None
+    assert config.worker_idle_timeout_seconds is None
     assert config.session.policy == "stateful"
     assert config.session.history_mode == "delta"
     assert config.session.max_concurrent_same_prefix == 12
@@ -89,17 +89,29 @@ def test_valid_config_parses_and_merges_defaults():
     assert reviewer.runtime["claude_effort"] == "high"
 
 
-def test_timeout_config_preserves_unspecified_and_parses_batch_and_worker_overrides():
+def test_idle_timeout_config_preserves_unspecified_and_parses_batch_and_worker_overrides():
     payload = minimal_config()
-    assert load_batch_config(payload).worker_call_timeout_seconds is None
+    assert load_batch_config(payload).worker_idle_timeout_seconds is None
 
-    payload["worker_call_timeout_seconds"] = 12
-    payload["loops"][0]["proposers"][0]["worker_call_timeout_seconds"] = 4
+    payload["worker_idle_timeout_seconds"] = 12
+    payload["loops"][0]["proposers"][0]["worker_idle_timeout_seconds"] = 4
     config = load_batch_config(payload)
 
-    assert config.worker_call_timeout_seconds == 12
-    assert config.loops[0].proposers[0].worker_call_timeout_seconds == 4
-    assert config.loops[0].reviewers[0].worker_call_timeout_seconds is None
+    assert config.worker_idle_timeout_seconds == 12
+    assert config.loops[0].proposers[0].worker_idle_timeout_seconds == 4
+    assert config.loops[0].reviewers[0].worker_idle_timeout_seconds is None
+
+
+@pytest.mark.parametrize("location", ["batch", "worker"])
+def test_removed_total_timeout_config_fails_fast_with_migration_hint(location):
+    payload = minimal_config()
+    if location == "batch":
+        payload["worker_call_timeout_seconds"] = 12
+    else:
+        payload["loops"][0]["proposers"][0]["worker_call_timeout_seconds"] = 4
+
+    with pytest.raises(ConfigError, match="removed; use worker_idle_timeout_seconds"):
+        load_batch_config(payload)
 
 
 def test_session_options_parse_and_loop_overrides_parent():

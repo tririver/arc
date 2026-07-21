@@ -11,7 +11,13 @@ from arc_llm.call_record import (
     allow_arc_llm_call_record,
 )
 from arc_llm.json_schema import to_provider_json_schema
-from arc_llm.providers.base import LLMWorkerError
+from arc_llm.providers.base import (
+    LLMConfigurationError,
+    LLMFailureCategory,
+    LLMSubmissionState,
+    LLMWorkerError,
+)
+from arc_llm.progress_prompt import ensure_runtime_progress_contract
 from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionManager
 from arc_llm.structured_recovery import structured_metadata
@@ -415,6 +421,26 @@ class FakeTextResultProvider:
         )
 
 
+class IdleTimeoutCapturingProvider:
+    name = "codex-cli"
+
+    def __init__(self):
+        self.idle_timeouts = []
+
+    def generate_text_result(
+        self,
+        prompt,
+        *,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        artifact_dir=None,
+        idle_timeout_seconds=None,
+    ):
+        self.idle_timeouts.append(idle_timeout_seconds)
+        return LLMProviderResponse("ok")
+
+
 class PromptHashResultProvider:
     name = "codex-cli"
 
@@ -654,7 +680,7 @@ def test_run_json_uses_selected_provider_and_model(tmp_path, monkeypatch):
         process_chain=[],
     )
 
-    assert result["prompt"] == "prompt"
+    assert result["prompt"] == ensure_runtime_progress_contract("prompt")
     assert result["schema"] == {"type": "object", "additionalProperties": False}
     assert result["model"] == "fast"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["provider_used"] == "codex-cli"
@@ -1052,8 +1078,9 @@ def test_run_json_stateful_records_static_prefix(tmp_path, monkeypatch):
     line = (tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8").splitlines()[0]
     call = json.loads(line)
 
-    assert result[ARC_LLM_CALL_RECORD_FIELD]["static_prefix_sha256"] == sha256_text("stable prefix")
-    assert call["static_prefix_sha256"] == sha256_text("stable prefix")
+    effective_prefix = ensure_runtime_progress_contract("stable prefix")
+    assert result[ARC_LLM_CALL_RECORD_FIELD]["static_prefix_sha256"] == sha256_text(effective_prefix)
+    assert call["static_prefix_sha256"] == sha256_text(effective_prefix)
 
 
 def test_run_json_records_provider_prompt_hash_when_prompt_is_rewritten(tmp_path, monkeypatch):
@@ -1073,7 +1100,7 @@ def test_run_json_records_provider_prompt_hash_when_prompt_is_rewritten(tmp_path
         call_label="round_001/proposer_001",
     )
 
-    expected = sha256_text("prompt\nprovider contract")
+    expected = sha256_text(f"{ensure_runtime_progress_contract('prompt')}\nprovider contract")
     call = json.loads((tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8"))
 
     assert result[ARC_LLM_CALL_RECORD_FIELD]["prompt_sha256"] == expected
@@ -1124,9 +1151,11 @@ def test_run_text_result_returns_usage_and_records_stateful_call(tmp_path, monke
 
     call = json.loads((tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8"))
 
-    assert outcome.value == "m:prompt"
+    assert outcome.value == f"m:{ensure_runtime_progress_contract('prompt')}"
     assert outcome.usage.cached_input_ratio == 0.75
-    assert outcome.static_prefix_sha256 == sha256_text("stable text")
+    assert outcome.static_prefix_sha256 == sha256_text(
+        ensure_runtime_progress_contract("stable text")
+    )
     assert call["usage"]["cached_input_ratio"] == 0.75
 
 
@@ -1254,7 +1283,70 @@ def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):
 
     result = run_text("prompt", env={"ARC_AGENT_HOST": "codex"}, process_chain=[])
 
-    assert result == "gpt-5.6-luna:prompt"
+    assert result == f"gpt-5.6-luna:{ensure_runtime_progress_contract('prompt')}"
+
+
+@pytest.mark.parametrize(
+    ("explicit", "env", "expected"),
+    [
+        (7, {"ARC_CODEX_IDLE_TIMEOUT_SECONDS": "11", "ARC_LLM_IDLE_TIMEOUT_SECONDS": "22"}, 7),
+        (None, {"ARC_CODEX_IDLE_TIMEOUT_SECONDS": "11", "ARC_LLM_IDLE_TIMEOUT_SECONDS": "22"}, 11),
+        (None, {"ARC_LLM_IDLE_TIMEOUT_SECONDS": "22"}, 22),
+        (None, {}, 1800),
+    ],
+)
+def test_runner_resolves_idle_timeout_before_passing_it_to_provider(
+    monkeypatch, explicit, env, expected
+):
+    provider = IdleTimeoutCapturingProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    assert run_text(
+        "prompt",
+        provider="codex-cli",
+        env=env,
+        process_chain=[],
+        idle_timeout_seconds=explicit,
+    ) == "ok"
+    assert provider.idle_timeouts == [expected]
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"ARC_LLM_IDLE_TIMEOUT_SECONDS": "not-a-number"},
+        {"ARC_LLM_IDLE_TIMEOUT_SECONDS": "nan"},
+        {"ARC_LLM_IDLE_TIMEOUT_SECONDS": "inf"},
+        {"ARC_CODEX_IDLE_TIMEOUT_SECONDS": "not-a-number"},
+        {"ARC_LLM_TIMEOUT_SECONDS": "60"},
+        {"ARC_CODEX_TIMEOUT_SECONDS": "60"},
+    ],
+)
+def test_invalid_idle_timeout_fails_not_submitted_without_provider_or_checkpoint(
+    tmp_path, monkeypatch, env
+):
+    selected = []
+    monkeypatch.setattr(
+        runner,
+        "select_provider",
+        lambda provider_name, **kwargs: selected.append(provider_name),
+    )
+    artifact_dir = tmp_path / "artifacts"
+
+    with pytest.raises(LLMConfigurationError) as caught:
+        run_text(
+            "prompt",
+            provider="codex-cli",
+            env=env,
+            process_chain=[],
+            artifact_dir=artifact_dir,
+            call_label="worker",
+        )
+
+    assert caught.value.category == LLMFailureCategory.INVALID_REQUEST
+    assert caught.value.submission_state == LLMSubmissionState.NOT_SUBMITTED
+    assert selected == []
+    assert not artifact_dir.exists()
 
 
 def test_run_text_does_not_replay_unknown_provider_failure(tmp_path, monkeypatch):

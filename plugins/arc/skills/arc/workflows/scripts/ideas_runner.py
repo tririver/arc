@@ -967,8 +967,10 @@ def _progress_sidechannel_callback(
         with lock:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
+                os.chmod(path, 0o600)
                 handle.write(payload)
                 handle.flush()
+                os.fsync(handle.fileno())
 
     return append_progress
 
@@ -984,6 +986,21 @@ def _combined_progress_callback(
     def emit(event: dict[str, Any]) -> None:
         for callback in callbacks:
             callback(dict(event))
+
+    return emit
+
+
+def _foreground_progress_callback() -> Callable[[dict[str, Any]], None] | None:
+    """Stream progress to stderr when no owning arc-jobs side channel exists."""
+    if str(os.environ.get("ARC_JOB_PROGRESS_FILE", "")).strip():
+        return None
+
+    def emit(event: dict[str, Any]) -> None:
+        print(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str),
+            file=sys.stderr,
+            flush=True,
+        )
 
     return emit
 
@@ -1014,6 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run_ideas(
             _read_config_file(args.config),
             dry_run=args.dry_run,
+            progress_callback=_foreground_progress_callback(),
             cancel_check=cancel_event.is_set,
         )
     finally:

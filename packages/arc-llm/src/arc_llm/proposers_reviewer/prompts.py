@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from arc_llm.call_record import strip_arc_llm_call_records
+from arc_llm.progress_prompt import ensure_runtime_progress_contract
 
 from .config import LoopConfig, WorkerConfig
 
@@ -63,7 +64,7 @@ def render_prompt(worker: WorkerConfig, context: dict[str, Any]) -> str:
         )
     if worker.runtime.get("append_context", True):
         sections.extend(["## ARC Worker Context", json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)])
-    return "\n".join(sections).rstrip() + "\n"
+    return ensure_runtime_progress_contract("\n".join(sections).rstrip() + "\n")
 
 
 def _replace_known_placeholders(template: str, context: dict[str, Any]) -> str:

@@ -265,7 +265,11 @@ def _validated_progress_event(value: Any) -> dict[str, Any]:
     if not isinstance(event, str) or not event or len(event) > 128:
         raise ValueError("ARC job progress event requires a short event name")
     schema_version = value.get("schema_version")
-    if schema_version not in {None, "arc.llm.proposers_reviewer.progress.v1"}:
+    if schema_version not in {
+        None,
+        "arc.llm.progress.v1",
+        "arc.llm.proposers_reviewer.progress.v1",
+    }:
         raise ValueError("ARC job progress event has an unsupported schema_version")
     forbidden = {"job_id", "status", "environment", "argv", "command"}
     if forbidden & value.keys():

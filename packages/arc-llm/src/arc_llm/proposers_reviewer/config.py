@@ -43,7 +43,7 @@ class WorkerConfig:
     model_tier: str | None
     runtime: dict[str, Any]
     evidence_enabled: bool
-    worker_call_timeout_seconds: float | None
+    worker_idle_timeout_seconds: float | None
 
 
 @dataclass(frozen=True)
@@ -116,7 +116,7 @@ class BatchConfig:
     evidence: EvidenceOptions
     session: SessionOptions
     loops: list[LoopConfig]
-    worker_call_timeout_seconds: float | None
+    worker_idle_timeout_seconds: float | None
 
 
 def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
@@ -129,10 +129,13 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
     run_dir = Path(_required_text(data, "run_dir")).expanduser()
     max_concurrent_loops = _positive_int(data.get("max_concurrent_loops", 1), "max_concurrent_loops")
     fail_fast = _bool(data.get("fail_fast", False), "fail_fast")
-    raw_batch_timeout = data.get("worker_call_timeout_seconds")
-    worker_call_timeout_seconds = (
-        _positive_float(raw_batch_timeout, "worker_call_timeout_seconds")
-        if raw_batch_timeout is not None
+    if "worker_call_timeout_seconds" in data:
+        raise ConfigError(
+            "worker_call_timeout_seconds was removed; use worker_idle_timeout_seconds"
+        )
+    worker_idle_timeout_seconds = (
+        _positive_float(data.get("worker_idle_timeout_seconds"), "worker_idle_timeout_seconds")
+        if data.get("worker_idle_timeout_seconds") is not None
         else None
     )
     artifact_options = _parse_artifact_options(data.get("artifact_options", {}))
@@ -181,7 +184,7 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
         evidence=evidence,
         session=batch_session,
         loops=loops,
-        worker_call_timeout_seconds=worker_call_timeout_seconds,
+        worker_idle_timeout_seconds=worker_idle_timeout_seconds,
     )
 
 
@@ -391,6 +394,11 @@ def _parse_worker(
         model = str(model)
     _validate_exact_model_provider(model, provider, f"{field_name}.{worker_id}")
     model_tier = _model_tier(worker_data.get("model_tier", default_model_tier), f"{field_name}.{worker_id}.model_tier")
+    if "worker_call_timeout_seconds" in worker_data:
+        raise ConfigError(
+            f"{field_name}.{worker_id}.worker_call_timeout_seconds was removed; "
+            "use worker_idle_timeout_seconds"
+        )
     return WorkerConfig(
         id=worker_id,
         prompt=prompt,
@@ -400,12 +408,12 @@ def _parse_worker(
         model_tier=model_tier,
         runtime=runtime,
         evidence_enabled=evidence_enabled,
-        worker_call_timeout_seconds=(
+        worker_idle_timeout_seconds=(
             _positive_float(
-                worker_data.get("worker_call_timeout_seconds"),
-                f"{field_name}.{worker_id}.worker_call_timeout_seconds",
+                worker_data.get("worker_idle_timeout_seconds"),
+                f"{field_name}.{worker_id}.worker_idle_timeout_seconds",
             )
-            if worker_data.get("worker_call_timeout_seconds") is not None
+            if worker_data.get("worker_idle_timeout_seconds") is not None
             else None
         ),
     )

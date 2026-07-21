@@ -413,6 +413,7 @@ def _run_loop_rounds(
                 cache_guard=loop.session.cache_guard,
                 cache_warnings_path=paths.run_root / "cache_warnings.jsonl",
                 cancel_check=cancel_check,
+                progress_callback=progress_callback,
             )
         except Exception as exc:
             worker_failures.append(_worker_failure_record(reviewer.id, "reviewer", exc, round_number))
@@ -611,10 +612,11 @@ def _run_proposers(
                 output_recovery=batch.output_recovery,
                 validate_schema=True,
                 cancel_check=cancel_check,
-                timeout_seconds=(
-                    proposer.worker_call_timeout_seconds
-                    if proposer.worker_call_timeout_seconds is not None
-                    else batch.worker_call_timeout_seconds
+                progress_callback=progress_callback,
+                idle_timeout_seconds=(
+                    proposer.worker_idle_timeout_seconds
+                    if proposer.worker_idle_timeout_seconds is not None
+                    else batch.worker_idle_timeout_seconds
                 ),
             ): proposer
             for proposer in loop.proposers
@@ -703,6 +705,7 @@ def _call_reviewer(
     cache_guard: CacheGuardOptions,
     cache_warnings_path: Path,
     cancel_check: CancelCheck | None,
+    progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
     first_call = _call_json_runner_with_prompt_options(
         json_runner,
@@ -725,10 +728,11 @@ def _call_reviewer(
         output_recovery=batch.output_recovery,
         validate_schema=True,
         cancel_check=cancel_check,
-        timeout_seconds=(
-            worker.worker_call_timeout_seconds
-            if worker.worker_call_timeout_seconds is not None
-            else batch.worker_call_timeout_seconds
+        progress_callback=progress_callback,
+        idle_timeout_seconds=(
+            worker.worker_idle_timeout_seconds
+            if worker.worker_idle_timeout_seconds is not None
+            else batch.worker_idle_timeout_seconds
         ),
     )
     review_output = first_call.output
@@ -949,7 +953,8 @@ def _call_json_runner_with_prompt_options(
     output_recovery: OutputRecoveryOptions,
     validate_schema: bool = True,
     cancel_check: CancelCheck | None = None,
-    timeout_seconds: float | None = None,
+    progress_callback: ProgressCallback | None = None,
+    idle_timeout_seconds: float | None = None,
 ) -> WorkerCallResult:
     selected: WorkerPromptOption | None = None
 
@@ -982,7 +987,8 @@ def _call_json_runner_with_prompt_options(
             output_recovery=output_recovery,
             validate_schema=validate_schema,
             cancel_check=cancel_check,
-            timeout_seconds=timeout_seconds,
+            progress_callback=progress_callback,
+            idle_timeout_seconds=idle_timeout_seconds,
         )
         return WorkerCallResult(
             output=output,
@@ -1033,7 +1039,8 @@ def _call_json_runner(
     output_recovery: OutputRecoveryOptions,
     validate_schema: bool = True,
     cancel_check: CancelCheck | None = None,
-    timeout_seconds: float | None = None,
+    progress_callback: ProgressCallback | None = None,
+    idle_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     env = worker_env(worker, base_env=base_env)
     effective_session_policy = session_policy
@@ -1062,7 +1069,8 @@ def _call_json_runner(
                 "output_recovery": _output_recovery_mode(output_recovery),
                 "schema_formatter_enabled": output_recovery.schema_formatter_enabled,
                 "role_hint": _role_hint(worker),
-                "timeout_seconds": timeout_seconds,
+                "idle_timeout_seconds": idle_timeout_seconds,
+                "progress_callback": progress_callback,
                 "cancel_check": cancel_check,
             }
             for key, value in optional.items():
@@ -1121,7 +1129,8 @@ def _call_json_runner(
             output_recovery=_output_recovery_mode(output_recovery),
             schema_formatter_enabled=output_recovery.schema_formatter_enabled,
             role_hint=_role_hint(worker),
-            timeout_seconds=timeout_seconds,
+            idle_timeout_seconds=idle_timeout_seconds,
+            progress_callback=progress_callback,
             cancel_check=cancel_check,
         )
         _maybe_record_cache_warning(

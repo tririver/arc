@@ -53,16 +53,24 @@ If there is more than one distinct domain, submit all domain-build
 background jobs before watching any of them. This allows independent domains to
 build concurrently while preserving per-job result inspection.
 
-Step 3: For every background job, follow `manuals/arc-jobs.md` using the
-returned `next.cli_command`. Watch all launched jobs to a terminal result. If
-the host cannot run jobs concurrently, fall back to sequential
-watching/running without changing the artifact contract.
+Step 3: For every background job, take its job ID from the submit response and
+follow the review-cursor loop in `manuals/arc-jobs.md`; do not use a default
+terminal-only watch while an LLM job is active. Watch all launched jobs to a
+terminal result. If the host cannot run jobs concurrently, fall back to
+sequential watching/running without changing the artifact contract.
 
-Domain LLM calls use a one-hour monotonic deadline by default. A quiet job is
-not failed before that deadline; continue watching unless it reaches a terminal
-state or receives an explicit timeout or cancellation. Other bounds may be supplied through an owning
-CLI's `--timeout-seconds` option where available or an applicable
-`ARC_*_TIMEOUT_SECONDS` environment variable.
+Domain LLM calls have no absolute runtime limit and stop after 30 minutes with
+no substantive provider output. For each long-running job, begin with
+`arc-jobs watch <job-id> --until-review --after-review-sequence 0 --json`.
+At each 30-minute `review_due`, inspect the latest excerpt and artifacts.
+Concrete results, new evidence, reusable artifacts, or meaningful narrowing
+mean continue: pass the returned `review_sequence` as the next
+`--after-review-sequence` cursor and watch again. Repetitive, erroneous, or
+off-task output means run `arc-jobs cancel <job-id> --json`. A terminal result
+returns normally and ends the loop; never cancel merely because a run is long.
+Override the idle bound only through `--idle-timeout-seconds` or an applicable
+`ARC_*_IDLE_TIMEOUT_SECONDS` environment variable. Explicit cancellation
+remains available throughout.
 
 Step 4: Inspect each returned JSON body. Do not treat command exit code alone
 as success. Continue only when every domain job result is successful. If any

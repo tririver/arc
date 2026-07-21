@@ -53,12 +53,17 @@ explicitly asks to review or confirm steps. Example: `use arc to download
 papers that cited 0911.3380 since 2024 and create a full summary of these
 papers` is direct ARC tool orchestration, not a managed workflow mode prompt.
 
-ARC LLM calls use a one-hour monotonic deadline by default. The deadline covers
-the complete logical call, including recovery and schema formatting; nested
-steps do not receive a fresh hour. Override it with `--timeout-seconds` where
-the owning CLI exposes that option, or an applicable
-`ARC_*_TIMEOUT_SECONDS` environment variable. Explicit cancellation remains
-available for foreground and background work.
+ARC LLM calls have no absolute runtime limit. They stop after 30 minutes with
+no substantive provider output, using `--idle-timeout-seconds` or an applicable
+`ARC_*_IDLE_TIMEOUT_SECONDS` variable when an override is needed. For a
+long-running job, start with
+`arc-jobs watch <job-id> --until-review --after-review-sequence 0 --json`.
+At each review, continue by running the same command with the returned job-level
+`review_sequence` as the new cursor when the agent reports concrete results,
+evidence, artifacts, or a meaningfully narrowed problem. Cancel repetitive
+heartbeats, repeated errors, off-task work, or activity with no reusable result.
+A terminal result returns normally and ends the loop; do not cancel merely
+because the call is long. Explicit cancellation remains available throughout.
 
 ## Required References
 

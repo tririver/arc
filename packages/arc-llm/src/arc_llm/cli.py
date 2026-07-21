@@ -135,10 +135,10 @@ def _build_parser() -> argparse.ArgumentParser:
     loop_parser.add_argument("--session-scope-id", default=None)
     loop_parser.add_argument("--max-concurrent-same-prefix", type=int, default=None)
     loop_parser.add_argument(
-        "--timeout-seconds",
+        "--idle-timeout-seconds",
         type=float,
         default=None,
-        help="Positive total deadline per worker call; default is 3600 seconds unless an ARC timeout environment variable is set.",
+        help="Cancel a worker after this many seconds without substantive provider progress.",
     )
 
     bench_parser = sub.add_parser("proposers-reviewer-bench")
@@ -227,7 +227,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             session_name=args.session_name,
             call_label=args.call_label,
             artifact_dir=args.session_root,
-            timeout_seconds=args.timeout_seconds,
+            idle_timeout_seconds=args.idle_timeout_seconds,
+            progress_callback=_job_progress_callback(),
             cancel_check=_job_cancel_check,
         )
     if args.command == "run-text":
@@ -244,7 +245,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
             session_name=args.session_name,
             call_label=args.call_label,
             artifact_dir=args.session_root,
-            timeout_seconds=args.timeout_seconds,
+            idle_timeout_seconds=args.idle_timeout_seconds,
+            progress_callback=_job_progress_callback(),
             cancel_check=_job_cancel_check,
         )
     if args.command == "schema-format":
@@ -257,14 +259,15 @@ def _dispatch(args: argparse.Namespace) -> Any:
             model=args.model,
             model_tier=args.model_tier,
             env=_runtime_env(args),
-            timeout_seconds=args.timeout_seconds,
+            idle_timeout_seconds=args.idle_timeout_seconds,
+            progress_callback=_job_progress_callback(),
             cancel_check=_job_cancel_check,
         ).value
     if args.command == "proposers-reviewer-loop":
         config = _read_json_file(args.config)
         _apply_loop_session_overrides(config, args)
-        if args.timeout_seconds is not None:
-            config["worker_call_timeout_seconds"] = args.timeout_seconds
+        if args.idle_timeout_seconds is not None:
+            config["worker_idle_timeout_seconds"] = args.idle_timeout_seconds
         return run_proposers_reviewer_batch(
             config,
             dry_run=args.dry_run,
@@ -372,8 +375,10 @@ def _job_progress_callback():
         with _PROGRESS_FILE_LOCK:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
+                os.chmod(path, 0o600)
                 handle.write(encoded)
                 handle.flush()
+                os.fsync(handle.fileno())
 
     return append
 
@@ -402,10 +407,10 @@ def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--timeout-seconds",
+        "--idle-timeout-seconds",
         type=float,
         default=None,
-        help="Positive monotonic total call deadline; default is 3600 seconds unless an ARC timeout environment variable is set.",
+        help="Cancel after this many seconds without substantive provider progress.",
     )
     parser.add_argument("--codex-sandbox", default=None)
     parser.add_argument("--codex-profile", default=None)

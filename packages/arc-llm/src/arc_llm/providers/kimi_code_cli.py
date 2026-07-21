@@ -6,7 +6,6 @@ import queue
 import re
 import subprocess
 import threading
-import time
 import warnings
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,8 +25,8 @@ from .base import (
     LLMWorkerTimeout,
 )
 from .kimi_safety import resolve_kimi_retry_safety
+from .activity import ActivityTracker, resolve_idle_timeout_seconds
 from .lifecycle import (
-    resolve_worker_call_timeout_seconds,
     start_process_group_watchdog,
     stop_process_group_watchdog,
     terminate_process_group,
@@ -77,9 +76,9 @@ class KimiCodeCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
-        timeout_seconds: float | None = None,
-        deadline: float | None = None,
         cancel_check=None,
+        idle_timeout_seconds: float | None = None,
+        progress_callback=None,
     ) -> LLMProviderResponse[dict[str, Any]]:
         del schema_cache_dir
         effective_prompt = _with_json_schema_contract(prompt, schema or {"type": "object"})
@@ -89,9 +88,9 @@ class KimiCodeCliProvider:
             session=session,
             session_policy=session_policy,
             artifact_dir=artifact_dir,
-            timeout_seconds=timeout_seconds,
-            deadline=deadline,
             cancel_check=cancel_check,
+            idle_timeout_seconds=idle_timeout_seconds,
+            progress_callback=progress_callback,
         )
         value, recovery = _parse_json_response(response.value, output_recovery=output_recovery)
         return LLMProviderResponse(
@@ -115,9 +114,9 @@ class KimiCodeCliProvider:
         session: LLMSessionRef | None = None,
         session_policy: str = "stateless",
         artifact_dir: Path | None = None,
-        timeout_seconds: float | None = None,
-        deadline: float | None = None,
         cancel_check=None,
+        idle_timeout_seconds: float | None = None,
+        progress_callback=None,
     ) -> LLMProviderResponse[str]:
         return self._generate(
             prompt,
@@ -125,9 +124,9 @@ class KimiCodeCliProvider:
             session=session,
             session_policy=session_policy,
             artifact_dir=artifact_dir,
-            timeout_seconds=timeout_seconds,
-            deadline=deadline,
             cancel_check=cancel_check,
+            idle_timeout_seconds=idle_timeout_seconds,
+            progress_callback=progress_callback,
         )
 
     def _generate(
@@ -138,23 +137,25 @@ class KimiCodeCliProvider:
         session: LLMSessionRef | None,
         session_policy: str,
         artifact_dir: Path | None,
-        timeout_seconds: float | None,
-        deadline: float | None,
         cancel_check,
+        idle_timeout_seconds: float | None,
+        progress_callback,
     ) -> LLMProviderResponse[str]:
         _warn_experimental_once()
         stateful = session_policy == "stateful" and session is not None
         resume_id = session.native_session_id if stateful else None
         work_dir = _work_dir(self.env)
-        timeout = resolve_worker_call_timeout_seconds(timeout_seconds, env=self.env, provider=self.name)
-        effective_deadline = deadline if deadline is not None else (
-            time.monotonic() + timeout if timeout is not None else None
-        )
         client = _AcpProcess(
             self.env,
             artifact_dir=artifact_dir,
-            deadline=effective_deadline,
             cancel_check=cancel_check,
+            activity=ActivityTracker(
+                provider=self.name,
+                idle_timeout_seconds=resolve_idle_timeout_seconds(
+                    idle_timeout_seconds, env=self.env, provider=self.name
+                ),
+                progress_callback=progress_callback,
+            ),
         )
         native_session_id: str | None = None
         try:
@@ -193,10 +194,17 @@ class KimiCodeCliProvider:
                     {"sessionId": native_session_id, "configId": "model", "value": model},
                 )
             client.current_session_id = native_session_id
+            client.activity.submitted()
+            client.activity.record_metadata(
+                "session",
+                text="provider session established",
+                detail={"native_session_id": native_session_id, "resumable": True},
+            )
             result = client.request(
                 "session/prompt",
                 {"sessionId": native_session_id, "prompt": [{"type": "text", "text": prompt}]},
             )
+            client.flush_assistant_progress()
             if isinstance(result, dict) and result.get("stopReason") in {"cancelled", "refusal"}:
                 raise _worker_error(
                     f"Kimi ACP prompt stopped with {result.get('stopReason')}",
@@ -223,17 +231,11 @@ class KimiCodeCliProvider:
                 raw_model_output=text,
                 prompt_sent_sha256=sha256_text(prompt),
             )
-        except (_AcpTimeout, LLMWorkerCancelled) as exc:
+        except (LLMWorkerTimeout, LLMWorkerCancelled) as exc:
             client.cancel_and_stop(native_session_id)
-            if isinstance(exc, LLMWorkerCancelled):
-                raise
-            raise LLMWorkerTimeout("kimi acp timed out") from exc
+            raise
         finally:
             client.close()
-
-
-class _AcpTimeout(TimeoutError):
-    pass
 
 
 class _AcpProcess:
@@ -242,8 +244,8 @@ class _AcpProcess:
         env: Mapping[str, str],
         *,
         artifact_dir: Path | None,
-        deadline: float | None = None,
         cancel_check=None,
+        activity: ActivityTracker,
     ) -> None:
         self.env = env
         self.artifact_dir = artifact_dir
@@ -254,13 +256,11 @@ class _AcpProcess:
         self.stdout_lines: list[str] = []
         self.events: list[dict[str, Any]] = []
         self.message_chunks: list[str] = []
+        self._pending_progress_text = ""
         self.current_session_id: str | None = None
         self._next_id = 1
         self._write_lock = threading.Lock()
-        fallback_timeout = _timeout_seconds(env)
-        self._deadline = deadline if deadline is not None else (
-            time.monotonic() + fallback_timeout if fallback_timeout is not None else None
-        )
+        self.activity = activity
         self._cancel_check = cancel_check
         self._threads: list[threading.Thread] = []
         self._stopped = False
@@ -345,14 +345,13 @@ class _AcpProcess:
             if fatal_error is not None:
                 raise fatal_error
             if self._cancel_check is not None and self._cancel_check():
-                raise LLMWorkerCancelled("Kimi ACP call was cancelled")
-            remaining = None if self._deadline is None else self._deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                raise _AcpTimeout()
-            try:
-                line = self.stdout_queue.get(
-                    timeout=0.1 if remaining is None else min(remaining, 0.1)
+                raise LLMWorkerCancelled(
+                    "Kimi ACP call was cancelled",
+                    submission_state=LLMSubmissionState.SUBMITTED,
                 )
+            self.activity.check()
+            try:
+                line = self.stdout_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             if line is None:
@@ -393,11 +392,50 @@ class _AcpProcess:
         if self.current_session_id and params.get("sessionId") != self.current_session_id:
             return
         update = params.get("update")
-        if not isinstance(update, dict) or update.get("sessionUpdate") != "agent_message_chunk":
+        if not isinstance(update, dict):
             return
+        update_type = str(update.get("sessionUpdate") or "")
         content = update.get("content")
-        if isinstance(content, dict) and content.get("type") == "text" and isinstance(content.get("text"), str):
-            self.message_chunks.append(content["text"])
+        if update_type == "agent_message_chunk":
+            if isinstance(content, dict) and content.get("type") == "text" and isinstance(content.get("text"), str):
+                self.message_chunks.append(content["text"])
+                self._capture_assistant_chunk(content["text"])
+            return
+        if update_type in {"plan", "plan_update", "current_mode_update"}:
+            self.activity.record_metadata(
+                "provider_status",
+                text="non-substantive provider status update",
+                detail={"update_type": update_type},
+            )
+            return
+        if update_type in {"tool_call", "tool_call_update"}:
+            self.activity.record_tool_state(
+                tool_type="kimi_tool",
+                status=_kimi_tool_status(update),
+                tool_id=_kimi_tool_id(update),
+            )
+
+    def _capture_assistant_chunk(self, chunk: str) -> None:
+        self._pending_progress_text += chunk
+        while "\n" in self._pending_progress_text:
+            complete, self._pending_progress_text = self._pending_progress_text.split("\n", 1)
+            self.activity.record("assistant", text=complete)
+        if self._pending_progress_text.rstrip().endswith((".", "?", "!", "。", "？", "！")):
+            complete = self._pending_progress_text
+            self._pending_progress_text = ""
+            self.activity.record("assistant", text=complete)
+        elif len(self._pending_progress_text) >= 4096:
+            boundary = self._pending_progress_text.rfind(" ", 0, 4096)
+            boundary = boundary if boundary > 0 else 4096
+            complete = self._pending_progress_text[:boundary]
+            self._pending_progress_text = self._pending_progress_text[boundary:]
+            self.activity.record("assistant", text=complete)
+
+    def flush_assistant_progress(self) -> None:
+        if self._pending_progress_text:
+            complete = self._pending_progress_text
+            self._pending_progress_text = ""
+            self.activity.record("assistant", text=complete)
 
     def _handle_reverse_request(self, event: dict[str, Any]) -> None:
         method = str(event.get("method") or "")
@@ -613,8 +651,26 @@ def _worker_error(
     )
 
 
-def _timeout_seconds(env: Mapping[str, str]) -> float | None:
-    return resolve_worker_call_timeout_seconds(None, env=env, provider="kimi-code-cli")
+def _kimi_tool_status(update: Mapping[str, Any]) -> str:
+    for source in (update, update.get("content")):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("status", "state"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return "running" if update.get("sessionUpdate") == "tool_call" else "updated"
+
+
+def _kimi_tool_id(update: Mapping[str, Any]) -> str:
+    for source in (update, update.get("content")):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("toolCallId", "tool_call_id", "callId", "id"):
+            value = source.get(key)
+            if isinstance(value, (str, int)):
+                return str(value)
+    return "anonymous"
 
 
 def _work_dir(env: Mapping[str, str]) -> Path:
