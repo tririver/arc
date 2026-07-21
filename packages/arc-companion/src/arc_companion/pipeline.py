@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import unicodedata
 import uuid
 from typing import Any, Callable
 
@@ -27,6 +28,7 @@ from .evidence import (
     validate_annotation_citations,
     validate_cited_ids,
     validate_evidence_record,
+    validate_registry,
 )
 from .evidence_requests import (
     EVIDENCE_RESOLUTION_VERSION,
@@ -90,10 +92,16 @@ TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION = (
 )
 TRANSLATION_TOKEN_REPAIR_VERSION = "arc.companion.translation-token-repair.v3"
 ANNOTATION_TIER = "high"
+ANNOTATION_PROMPT_MAX_BYTES = 60 * 1024
+ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
+ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
 REVIEW_TIER = "medium"
 REVIEW_VERSION = "arc.companion.review.v3"
 ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v5"
 SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
+SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
+REVIEW_PROMPT_MAX_BYTES = 60 * 1024
+REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
@@ -1029,9 +1037,11 @@ def _generate_annotations(
         paper_context = _full_paper_context(
             bundle.document, segment, blocks_by_id=by_id, options=options
         )
+        first_draft = (first_drafts or {}).get(str(segment["segment_id"]))
+        evidence_resolution = (resolution_by_segment or {}).get(str(segment["segment_id"]))
         value = _llm_call(
             llm,
-            annotation_prompt(
+            _bounded_annotation_prompt(
                 segment,
                 selected,
                 language=options.annotation_language,
@@ -1041,8 +1051,8 @@ def _generate_annotations(
                 protected_names=protected_names,
                 paper_context=paper_context,
                 domain_context=domain_context,
-                first_draft=(first_drafts or {}).get(str(segment["segment_id"])),
-                evidence_resolution=(resolution_by_segment or {}).get(str(segment["segment_id"])),
+                first_draft=first_draft,
+                evidence_resolution=evidence_resolution,
             ),
             ANNOTATION_SCHEMA,
             options=options,
@@ -1433,6 +1443,36 @@ def _merge_evidence_records(
     return output
 
 
+def _deduplicate_evidence_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep first provenance and union request support across exact duplicates."""
+    output: list[dict[str, Any]] = []
+    index: dict[str, int] = {}
+    for record in records:
+        evidence_id = str(record.get("evidence_id") or "")
+        if not evidence_id or evidence_id not in index:
+            if evidence_id:
+                index[evidence_id] = len(output)
+            output.append(record)
+            continue
+        position = index[evidence_id]
+        first = output[position]
+        validate_registry((first, record))
+        supported_request_keys = list(dict.fromkeys(
+            key
+            for item in (first, record)
+            for key in item.get("supported_request_keys") or []
+            if isinstance(key, str) and key
+        ))
+        if supported_request_keys or "supported_request_keys" in first:
+            output[position] = {
+                **first,
+                "supported_request_keys": supported_request_keys,
+            }
+    return output
+
+
 def _known_evidence_ids(values: Any, records: list[dict[str, Any]]) -> list[str]:
     valid = {str(item.get("evidence_id") or "") for item in records}
     return [str(value) for value in values if str(value) in valid]
@@ -1608,13 +1648,42 @@ def _translation_coverage_attempt_path(checkpoint_dir: Path, segment_id: str) ->
     )
 
 
+TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION = (
+    "arc.companion.translation-coverage-attempt.v2"
+)
+
+
 def _matching_translation_coverage_attempt(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
 ) -> dict[str, Any] | None:
     path = _translation_coverage_attempt_path(checkpoint_dir, segment_id)
-    value = read_json(path) if path.is_file() else None
+    value = _read_checkpoint_json(path)
     if (
         isinstance(value, dict)
+        and value.get("schema_version") == TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION
+        and value.get("prompt_version") == TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION
+        and value.get("response_schema_version")
+        == TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
+        and value.get("segment_id") == segment_id
+        and value.get("input_sha256") == input_sha256
+    ):
+        return value
+    return None
+
+
+def _matching_legacy_translation_coverage_attempt(
+    checkpoint_dir: Path, segment_id: str, input_sha256: str,
+) -> dict[str, Any] | None:
+    """Return the v1 marker whose response could not be persisted for replay."""
+    value = _read_checkpoint_json(
+        _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+    )
+    if (
+        isinstance(value, dict)
+        and value.get("schema_version") == "arc.companion.translation-coverage-attempt.v1"
+        and value.get("prompt_version") == TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION
+        and value.get("response_schema_version")
+        == TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
     ):
@@ -2172,9 +2241,32 @@ def _generate_translations(
         attempt = _matching_translation_coverage_attempt(
             checkpoint_dir, segment_id, input_hashes[segment_id]
         )
+        legacy_coverage_attempt = _matching_legacy_translation_coverage_attempt(
+            checkpoint_dir, segment_id, input_hashes[segment_id]
+        )
+        raw_coverage_attempt = _read_checkpoint_json(
+            _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+        )
+        if (
+            _translation_coverage_attempt_path(checkpoint_dir, segment_id).is_file()
+            and raw_coverage_attempt is None
+        ):
+            raise RuntimeError(
+                f"translation coverage repair marker is unreadable for {segment_id}"
+            )
+        if (
+            raw_coverage_attempt is not None
+            and attempt is None
+            and legacy_coverage_attempt is None
+            and raw_coverage_attempt.get("input_sha256") == input_hashes[segment_id]
+        ):
+            raise RuntimeError(
+                f"translation coverage repair marker has unknown identity for {segment_id}"
+            )
         candidate_provenance: dict[str, Any] | None = None
         translation: dict[str, Any] | None = None
         restored_name_ids: list[str] = []
+        canonicalized_token_ids: list[str] = []
         if (
             isinstance(draft, dict)
             and draft.get("schema_version") == "arc.companion.translation-primary-draft.v1"
@@ -2187,6 +2279,11 @@ def _generate_translations(
                 draft_translation, restored_name_ids = (
                     _restore_translation_protected_names(
                         segment, draft_translation, by_id, protected_names
+                    )
+                )
+                draft_translation, canonicalized_token_ids = (
+                    _canonicalize_translation_opaque_candidates(
+                        draft_translation, by_id
                     )
                 )
                 _validate_translation(segment, draft_translation, by_id, protected_names)
@@ -2269,6 +2366,12 @@ def _generate_translations(
         restored_name_ids = list(dict.fromkeys([
             *restored_name_ids, *newly_restored_ids,
         ]))
+        translation, newly_canonicalized_ids = (
+            _canonicalize_translation_opaque_candidates(translation, by_id)
+        )
+        canonicalized_token_ids = list(dict.fromkeys([
+            *canonicalized_token_ids, *newly_canonicalized_ids,
+        ]))
         repair_provenance: list[dict[str, Any]] = []
         if restored_name_ids:
             repair_provenance.append({
@@ -2277,6 +2380,15 @@ def _generate_translations(
                 "normalizer_version": TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION,
                 "repaired_block_ids": restored_name_ids,
             })
+        if canonicalized_token_ids:
+            repair_provenance.append({
+                "kind": "opaque-token-canonicalization",
+                "attempt": 0,
+                "normalizer_version": TRANSLATION_OPAQUE_TOKEN_CANONICALIZER_VERSION,
+                "repaired_block_ids": canonicalized_token_ids,
+            })
+        coverage_response: dict[str, Any] | None = None
+        coverage_marker_base: dict[str, Any] | None = None
         try:
             _validate_translation(segment, translation, by_id, protected_names)
         except TranslationCoverageError:
@@ -2284,49 +2396,104 @@ def _generate_translations(
                 segment, translation, by_id
             )
             if missing_blocks:
-                if attempt is not None:
-                    raise RuntimeError(
-                        f"translation coverage repair attempt already consumed for {segment_id}"
-                    )
                 repair_contexts = [
                     _translation_coverage_repair_context(block) for block in missing_blocks
                 ]
                 attempt_path = _translation_coverage_attempt_path(checkpoint_dir, segment_id)
-                write_json(attempt_path, {
-                    "schema_version": "arc.companion.translation-coverage-attempt.v1",
+                missing_block_ids = [block_id(block) for block in missing_blocks]
+                coverage_marker_base = {
+                    "schema_version": TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION,
                     "segment_id": segment_id,
                     "input_sha256": input_hashes[segment_id],
-                    "status": "started",
-                    "started_at": datetime.now(timezone.utc).isoformat(),
                     "prompt_version": TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
                     "response_schema_version": TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
                     "model_tier": TRANSLATION_COVERAGE_REPAIR_TIER,
-                    "missing_block_ids": [block_id(block) for block in missing_blocks],
-                })
-                value = _llm_call(
-                    llm,
-                    translation_coverage_repair_prompt(
-                        segment,
-                        repair_contexts,
-                        language=options.annotation_language,
-                        glossary=glossary,
-                        protected_names=protected_names,
-                        paper_context={
-                            **paper_context,
-                            "access": {"allow_mcp": False, "allow_internet": False},
-                        },
-                        repair_model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
-                    ),
-                    TRANSLATION_COVERAGE_REPAIR_SCHEMA,
-                    options=options,
-                    artifact_dir=artifact_dir / "coverage-repair-1",
-                    call_label=f"companion-translation-{segment_id}-coverage-repair-1",
-                    model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
-                    allow_internet=False,
-                    force_offline=True,
-                )
+                    "missing_block_ids": missing_block_ids,
+                }
+                if isinstance(legacy_coverage_attempt, dict):
+                    coverage_marker_base["superseded_attempt"] = {
+                        "schema_version": str(
+                            legacy_coverage_attempt.get("schema_version") or ""
+                        ),
+                        "status": str(legacy_coverage_attempt.get("status") or ""),
+                        "started_at": str(
+                            legacy_coverage_attempt.get("started_at") or ""
+                        ),
+                        "sha256": sha256_json(legacy_coverage_attempt),
+                    }
+                if attempt is not None:
+                    if list(attempt.get("missing_block_ids") or []) != missing_block_ids:
+                        raise RuntimeError(
+                            f"translation coverage repair marker changed missing blocks for {segment_id}"
+                        )
+                    status = str(attempt.get("status") or "")
+                    if status in {"response_received", "validated"}:
+                        raw_response = attempt.get("raw_response")
+                        if not isinstance(raw_response, dict):
+                            raise RuntimeError(
+                                "translation coverage repair marker lacks its auditable "
+                                f"response for {segment_id}"
+                            )
+                        coverage_response = raw_response
+                    elif status == "started":
+                        raise RuntimeError(
+                            f"translation coverage repair attempt already started for {segment_id}; "
+                            "refusing another model call"
+                        )
+                    else:
+                        raise RuntimeError(
+                            "translation coverage repair marker has invalid status "
+                            f"{status!r} for {segment_id}"
+                        )
+                if coverage_response is None:
+                    started_at = datetime.now(timezone.utc).isoformat()
+                    write_json(attempt_path, {
+                        **coverage_marker_base,
+                        "status": "started",
+                        "started_at": started_at,
+                    })
+                    try:
+                        coverage_response = _llm_call(
+                            llm,
+                            translation_coverage_repair_prompt(
+                                segment,
+                                repair_contexts,
+                                language=options.annotation_language,
+                                glossary=glossary,
+                                protected_names=protected_names,
+                                paper_context={
+                                    **paper_context,
+                                    "access": {"allow_mcp": False, "allow_internet": False},
+                                },
+                                repair_model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
+                            ),
+                            TRANSLATION_COVERAGE_REPAIR_SCHEMA,
+                            options=options,
+                            artifact_dir=artifact_dir / "coverage-repair-1",
+                            call_label=f"companion-translation-{segment_id}-coverage-repair-1",
+                            model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
+                            allow_internet=False,
+                            force_offline=True,
+                        )
+                    except CompanionLLMCircuitOpen:
+                        # The shared limiter rejected this queued call before it
+                        # entered any provider.  Do not consume its one lifetime
+                        # repair attempt merely because another worker opened
+                        # the build-wide circuit.
+                        if isinstance(legacy_coverage_attempt, dict):
+                            write_json(attempt_path, legacy_coverage_attempt)
+                        else:
+                            attempt_path.unlink(missing_ok=True)
+                        raise
+                    write_json(attempt_path, {
+                        **coverage_marker_base,
+                        "status": "response_received",
+                        "started_at": started_at,
+                        "response_received_at": datetime.now(timezone.utc).isoformat(),
+                        "raw_response": coverage_response,
+                    })
                 translation = _apply_translation_coverage_repairs(
-                    normalized, segment, missing_blocks, value, by_id
+                    normalized, segment, missing_blocks, coverage_response, by_id
                 )
                 repair_provenance.append({
                     "kind": "coverage",
@@ -2395,6 +2562,22 @@ def _generate_translations(
                 _citation_delimiter_normalization_provenance(normalized_citation_ids)
             )
         _validate_translation(segment, translation, by_id, protected_names)
+        if coverage_response is not None and coverage_marker_base is not None:
+            prior_marker = _matching_translation_coverage_attempt(
+                checkpoint_dir, segment_id, input_hashes[segment_id]
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            write_json(_translation_coverage_attempt_path(checkpoint_dir, segment_id), {
+                **coverage_marker_base,
+                "status": "validated",
+                "started_at": str((prior_marker or {}).get("started_at") or now),
+                "response_received_at": str(
+                    (prior_marker or {}).get("response_received_at") or now
+                ),
+                "validated_at": now,
+                "validated_translation_sha256": sha256_json(translation),
+                "raw_response": coverage_response,
+            })
         return segment_id, translation, {
             "candidate": candidate_provenance or {},
             "repairs": repair_provenance,
@@ -2483,9 +2666,27 @@ def _review(
         ]
     }
     findings: list[dict[str, Any]] = []
-    hierarchical = len(json.dumps(payload, ensure_ascii=False)) > options.review_context_chars
+    direct_payload = {**payload, "glossary": glossary, "protected_names": protected_names}
+    direct_prompt = review_prompt(
+        direct_payload,
+        language=options.annotation_language,
+        findings=findings,
+    )
+    # ``review_context_chars`` remains a user-controlled soft threshold for
+    # choosing hierarchical review.  Actual calls use a small viability floor
+    # and can never exceed the provider-independent 60 KiB hard ceiling.
+    review_prompt_limit = _review_prompt_byte_limit(options)
+    hierarchy_threshold = min(
+        REVIEW_PROMPT_MAX_BYTES,
+        max(1, int(options.review_context_chars)),
+    )
+    hierarchical = _utf8_size(direct_prompt) > hierarchy_threshold
     if hierarchical:
-        chunks = _review_chunks(payload["segments"], options.review_context_chars // 2)
+        chunks = _review_chunks(
+            payload["segments"],
+            language=options.annotation_language,
+            max_prompt_bytes=review_prompt_limit,
+        )
         recovered_reviews = (
             {} if options.force else _load_recovered_section_reviews(checkpoint_dir, chunks)
         )
@@ -2493,6 +2694,11 @@ def _review(
         def inspect(index: int, chunk: list[dict[str, Any]]) -> dict[str, Any]:
             prompt = section_review_prompt(
                 {"segments": chunk}, language=options.annotation_language
+            )
+            _require_review_prompt_within_limit(
+                prompt,
+                label=f"section review {index}",
+                max_prompt_bytes=review_prompt_limit,
             )
             input_sha256 = sha256_json({
                 "prompt": prompt,
@@ -2506,7 +2712,9 @@ def _review(
                     isinstance(checkpoint, dict)
                     and checkpoint.get("schema_version") == SECTION_REVIEW_CHECKPOINT_VERSION
                     and checkpoint.get("input_sha256") == input_sha256
-                    and isinstance(checkpoint.get("review"), dict)
+                    and _section_review_validation_error(
+                        checkpoint.get("review"), chunk
+                    ) is None
                 ):
                     return checkpoint["review"]
             value = recovered_reviews.get(index)
@@ -2520,6 +2728,9 @@ def _review(
                     call_label=f"companion-section-review-{index}",
                     model_tier=REVIEW_TIER,
                 )
+            validation_error = _section_review_validation_error(value, chunk)
+            if validation_error is not None:
+                raise RuntimeError(f"section review {index} {validation_error}")
             write_json(path, {
                 "schema_version": SECTION_REVIEW_CHECKPOINT_VERSION,
                 "section_index": index,
@@ -2541,25 +2752,13 @@ def _review(
         review_coverage: set[str] = set()
         for index in sorted(ordered):
             value = ordered[index]
+            validation_error = _section_review_validation_error(value, chunks[index])
+            if validation_error is not None:
+                raise RuntimeError(f"section review {index} {validation_error}")
             chunk_ids = {str(item["segment"]["segment_id"]) for item in chunks[index]}
-            reviewed_segments = [item for item in value.get("reviewed_segments") or [] if isinstance(item, dict)]
+            reviewed_segments = list(value["reviewed_segments"])
             reviewed_ids = {str(item.get("segment_id") or "") for item in reviewed_segments}
-            if (
-                reviewed_ids != chunk_ids
-                or len(reviewed_segments) != len(chunk_ids)
-                or any(
-                    not isinstance(item.get("translation"), dict)
-                    or not isinstance(item.get("annotation"), dict)
-                    for item in reviewed_segments
-                )
-            ):
-                raise RuntimeError(f"section review {index} did not cover every segment")
-            chunk_findings = [item for item in value.get("findings") or [] if isinstance(item, dict)]
-            invalid_finding_ids = {
-                str(item.get("segment_id") or "") for item in chunk_findings
-            } - chunk_ids
-            if invalid_finding_ids:
-                raise RuntimeError(f"section review {index} returned findings for unknown segments")
+            chunk_findings = list(value["findings"])
             review_coverage.update(reviewed_ids)
             findings.extend(chunk_findings)
             section_reviews.append({
@@ -2575,53 +2774,28 @@ def _review(
             missing = sorted(all_segment_ids - review_coverage)
             raise RuntimeError(f"hierarchical review did not cover every segment: {missing}")
 
-    final_payload = {**payload, "glossary": glossary, "protected_names": protected_names}
+    final_payload = direct_payload
+    final_prompt = direct_prompt
     if hierarchical:
-        final_context_budget = max(40_000, options.review_context_chars)
-        source_anchors = _review_source_anchors(
+        final_payload, final_prompt = _bounded_hierarchical_review_prompt(
+            section_reviews,
             segments,
             blocks_by_id=by_id,
             document=document,
-            total_chars=min(24_000, max(8_000, final_context_budget // 6)),
+            segment_payloads=payload["segments"],
+            glossary=glossary,
+            protected_names=protected_names,
+            language=options.annotation_language,
+            max_prompt_bytes=review_prompt_limit,
         )
-        context_evidence_anchors = _review_context_evidence_anchors(
-            payload["segments"],
-            total_chars=min(24_000, max(8_000, final_context_budget // 6)),
-        )
-        bounded_glossary = _bounded_glossary_projection(
-            glossary, total_chars=min(20_000, max(8_000, final_context_budget // 7))
-        )
-        projection_budget = max(
-            10_000,
-            final_context_budget
-            - len(json.dumps(source_anchors, ensure_ascii=False))
-            - len(json.dumps(context_evidence_anchors, ensure_ascii=False))
-            - len(json.dumps(bounded_glossary, ensure_ascii=False))
-            - 10_000,
-        )
-        final_payload = {
-            "section_reviews": _bounded_section_review_projection(
-                section_reviews, total_chars=projection_budget
-            ),
-            "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
-            "source_anchors": source_anchors,
-            "context_evidence_anchors": context_evidence_anchors,
-            "glossary": bounded_glossary,
-            "protected_names": protected_names,
-            "instruction": (
-                "Consolidate section findings into non-conflicting translation and/or annotation patches. "
-                "Use the bounded source anchor for every segment as a direct source-awareness check; "
-                "section reviews contain bounded findings and proposed corrections from the complete "
-                "source-aware local review."
-            ),
-        }
+    _require_review_prompt_within_limit(
+        final_prompt,
+        label="final review",
+        max_prompt_bytes=review_prompt_limit,
+    )
     review = _llm_call(
         llm,
-        review_prompt(
-            final_payload,
-            language=options.annotation_language,
-            findings=None if hierarchical else findings,
-        ),
+        final_prompt,
         REVIEW_SCHEMA,
         options=options,
         artifact_dir=checkpoint_dir / "llm" / "final-review",
@@ -3950,8 +4124,89 @@ def _opaque_inline_token(run: dict[str, Any]) -> str:
 
 _OPAQUE_INLINE_PATTERN = re.compile(r"\[\[ARC_INLINE:[^\]\s]+:[0-9a-f]{64}\]\]")
 _OPAQUE_INLINE_CANDIDATE_PATTERN = re.compile(
-    r"\[\s*\[ARC_INLINE:[^\]\r\n]{0,512}\]\s*\]"
+    r"\[(?:[ \t\u200b]*\[)?ARC_INLINE:[^\]\r\n]{0,512}\](?:[ \t\u200b]*\])?"
 )
+_OPAQUE_INLINE_CANONICALIZABLE_PATTERN = re.compile(
+    r"\[(?:[ \t\u200b]*\[)?ARC_INLINE:"
+    r"(?P<token_id>[A-Za-z0-9_.-]+):(?P<digest>[0-9a-f]{12,64})"
+    r"\](?:[ \t\u200b]*\])?"
+)
+TRANSLATION_OPAQUE_TOKEN_CANONICALIZER_VERSION = (
+    "arc.companion.translation-opaque-token-canonicalizer.v1"
+)
+
+
+def _candidate_digest_matches(expected_digest: str, candidate_digest: str) -> bool:
+    """Require the source digest or its identity-bearing twelve-character prefix."""
+    return (
+        expected_digest == candidate_digest
+        or (
+            len(candidate_digest) >= 12
+            and expected_digest.startswith(candidate_digest[:12])
+        )
+    )
+
+
+def _canonicalize_translation_opaque_candidates(
+    translation: dict[str, Any],
+    blocks_by_id: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Restore bounded marker mutations without moving or regenerating prose."""
+    raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
+    if not isinstance(raw_blocks, list):
+        return translation, []
+    changed_ids: list[str] = []
+    repaired_blocks: list[Any] = []
+    for item in raw_blocks:
+        if not isinstance(item, dict):
+            repaired_blocks.append(item)
+            continue
+        item_id = str(item.get("block_id") or "")
+        source_block = blocks_by_id.get(item_id)
+        text = str(item.get("text") or "")
+        if source_block is None:
+            repaired_blocks.append(item)
+            continue
+        expected_tokens = _opaque_inline_tokens(source_block)
+        if _OPAQUE_INLINE_PATTERN.findall(text) == expected_tokens:
+            repaired_blocks.append(item)
+            continue
+        candidates = list(_OPAQUE_INLINE_CANONICALIZABLE_PATTERN.finditer(text))
+        if len(candidates) != len(expected_tokens):
+            repaired_blocks.append(item)
+            continue
+        identities_match = True
+        for candidate, expected in zip(candidates, expected_tokens):
+            payload = expected.removeprefix("[[ARC_INLINE:").removesuffix("]]")
+            expected_token_id, expected_digest = payload.rsplit(":", 1)
+            candidate_digest = str(candidate.group("digest") or "")
+            if (
+                candidate.group("token_id") != expected_token_id
+                or not _candidate_digest_matches(expected_digest, candidate_digest)
+            ):
+                identities_match = False
+                break
+        if not identities_match:
+            repaired_blocks.append(item)
+            continue
+        pieces: list[str] = []
+        cursor = 0
+        for candidate, expected in zip(candidates, expected_tokens):
+            pieces.extend([text[cursor:candidate.start()], expected])
+            cursor = candidate.end()
+        pieces.append(text[cursor:])
+        repaired_text = "".join(pieces)
+        if _translation_natural_residue(repaired_text) != _translation_natural_residue(text):
+            raise RuntimeError(
+                "opaque-token canonicalization changed prior natural language"
+            )
+        if _OPAQUE_INLINE_PATTERN.findall(repaired_text) != expected_tokens:
+            raise RuntimeError("opaque-token canonicalization did not restore source order")
+        changed_ids.append(item_id)
+        repaired_blocks.append({**item, "text": repaired_text})
+    if not changed_ids:
+        return translation, []
+    return {**translation, "blocks": repaired_blocks}, changed_ids
 
 
 def _opaque_inline_tokens(block: dict[str, Any]) -> list[str]:
@@ -3960,6 +4215,155 @@ def _opaque_inline_tokens(block: dict[str, Any]) -> list[str]:
 
 def _annotation_input_block(block: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
     return _project_annotation_input_block(block, document)
+
+
+def _bounded_annotation_prompt(
+    segment: dict[str, Any],
+    blocks: list[dict[str, Any]],
+    *,
+    language: str,
+    metadata: dict[str, Any],
+    evidence: dict[str, Any],
+    glossary: dict[str, Any],
+    protected_names: list[str],
+    paper_context: dict[str, Any],
+    domain_context: dict[str, Any] | None,
+    first_draft: dict[str, Any] | None,
+    evidence_resolution: dict[str, Any] | None,
+    max_bytes: int = ANNOTATION_PROMPT_MAX_BYTES,
+) -> str:
+    """Project optional context so every submitted annotation prompt is safely bounded."""
+    attempts = (
+        (ANNOTATION_GLOSSARY_MAX_BYTES, None),
+        (ANNOTATION_GLOSSARY_MAX_BYTES, 10_000),
+        (ANNOTATION_GLOSSARY_MAX_BYTES, 6_000),
+        (ANNOTATION_GLOSSARY_MAX_BYTES, 3_000),
+        (4_000, 3_000),
+        (2_000, 3_000),
+        (1_000, 3_000),
+    )
+    last_size = 0
+    for glossary_bytes, paper_context_chars in attempts:
+        projected_glossary = _annotation_glossary_projection(
+            glossary,
+            segment=segment,
+            blocks=blocks,
+            evidence=evidence,
+            first_draft=first_draft,
+            evidence_resolution=evidence_resolution,
+            max_bytes=glossary_bytes,
+        )
+        projected_paper_context = json.loads(json.dumps(paper_context, ensure_ascii=False))
+        if paper_context_chars is not None:
+            _shrink_paper_context(projected_paper_context, max_chars=paper_context_chars)
+        prompt = annotation_prompt(
+            segment,
+            blocks,
+            language=language,
+            metadata=metadata,
+            evidence=evidence,
+            glossary=projected_glossary,
+            protected_names=protected_names,
+            paper_context=projected_paper_context,
+            domain_context=domain_context,
+            first_draft=first_draft,
+            evidence_resolution=evidence_resolution,
+        )
+        last_size = len(prompt.encode("utf-8"))
+        if last_size < max_bytes:
+            return prompt
+    raise RuntimeError(
+        f"annotation prompt essential payload is {last_size} bytes and cannot be bounded "
+        f"below the {max_bytes}-byte transport limit without dropping source or evidence"
+    )
+
+
+def _annotation_glossary_projection(
+    glossary: dict[str, Any],
+    *,
+    segment: dict[str, Any],
+    blocks: list[dict[str, Any]],
+    evidence: dict[str, Any],
+    first_draft: dict[str, Any] | None,
+    evidence_resolution: dict[str, Any] | None,
+    max_bytes: int = ANNOTATION_GLOSSARY_MAX_BYTES,
+) -> dict[str, Any]:
+    """Keep complete glossary entries relevant to the exact annotation input."""
+    entries = [
+        dict(item) for item in (glossary.get("entries") or [])
+        if isinstance(item, dict)
+    ] if isinstance(glossary, dict) else []
+    segment_ids = {str(value) for value in segment.get("block_ids") or []}
+    source_text = _normalized_glossary_match_text({
+        "title": segment.get("title"),
+        "blocks": blocks,
+    })
+    supporting_text = _normalized_glossary_match_text({
+        "evidence": evidence,
+        "first_draft": first_draft,
+        "evidence_resolution": evidence_resolution,
+    })
+
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for index, entry in enumerate(entries):
+        first_block_id = str(entry.get("first_block_id") or "")
+        terms = [
+            entry.get("source_term"), entry.get("target_term"),
+            *(entry.get("aliases") or []),
+        ]
+        normalized_terms = [
+            _normalized_glossary_match_text(value) for value in terms if str(value or "").strip()
+        ]
+        if first_block_id and first_block_id in segment_ids:
+            priority = 0
+        elif any(_glossary_term_in_text(term, source_text) for term in normalized_terms):
+            priority = 1
+        elif any(_glossary_term_in_text(term, supporting_text) for term in normalized_terms):
+            priority = 2
+        else:
+            continue
+        candidates.append((priority, index, entry))
+
+    source_sha256 = sha256_json(glossary) if isinstance(glossary, dict) else sha256_json({})
+
+    def projection(selected: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
+        ordered = [entry for _, entry in sorted(selected, key=lambda item: item[0])]
+        return {
+            "schema_version": ANNOTATION_GLOSSARY_PROJECTION_VERSION,
+            "source_glossary_schema_version": (
+                glossary.get("schema_version") if isinstance(glossary, dict) else None
+            ),
+            "source_glossary_sha256": source_sha256,
+            "entries": ordered,
+            "source_entry_count": len(entries),
+            "selected_entry_count": len(ordered),
+            "omitted_entry_count": len(entries) - len(ordered),
+        }
+
+    selected: list[tuple[int, dict[str, Any]]] = []
+    for _, index, entry in sorted(candidates):
+        proposed = [*selected, (index, entry)]
+        if len(json.dumps(projection(proposed), ensure_ascii=False).encode("utf-8")) <= max_bytes:
+            selected = proposed
+    return projection(selected)
+
+
+def _normalized_glossary_match_text(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    separated = "".join(
+        " " if unicodedata.category(char)[0] in {"P", "Z"} else char
+        for char in normalized
+    )
+    return re.sub(r"\s+", " ", separated).strip()
+
+
+def _glossary_term_in_text(term: str, text: str) -> bool:
+    if not term:
+        return False
+    if re.fullmatch(r"[a-z0-9 ]+", term):
+        return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) is not None
+    return term in text
 
 
 def _full_paper_context(
@@ -4396,7 +4800,9 @@ def _evidence_for_segment(
     )
     source_tokens = _terms(source_text)
     citation_targets = _segment_citation_targets(segment, blocks_by_id, evidence)
-    related_papers = list(evidence.get("related_papers") or [])
+    related_papers = _deduplicate_evidence_records(
+        list(evidence.get("related_papers") or [])
+    )
     idf = _related_paper_idf(related_papers)
     required_ids = set(
         (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
@@ -4468,8 +4874,9 @@ def _evidence_for_segment(
                     compact["source_descriptor"] = descriptor
                 validate_evidence_record(compact)
             selected.append(compact)
+    selected_ids = {str(item.get("evidence_id") or "") for item in selected}
     context_papers = [
-        paper for paper in evidence.get("related_papers") or []
+        paper for paper in related_papers
         if paper.get("relation") == "context"
     ]
     if context_papers:
@@ -4478,6 +4885,9 @@ def _evidence_for_segment(
             max(1, CONTEXT_SEGMENT_CHARS_TOTAL // len(context_papers)),
         )
         for paper in context_papers:
+            evidence_id = str(paper.get("evidence_id") or "")
+            if evidence_id in selected_ids:
+                continue
             compact = {key: paper.get(key) for key in (
                 "evidence_id", "relation", "paper_id", "title", "authors", "year",
                 "evidence_level", "abstract", "context_role", "context_index",
@@ -4529,11 +4939,11 @@ def _evidence_for_segment(
             )
             validate_evidence_record(compact)
             selected.append(compact)
+            selected_ids.add(evidence_id)
     required_ids = set(
         (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
     )
-    selected_ids = {str(item.get("evidence_id") or "") for item in selected}
-    for paper in evidence.get("related_papers") or []:
+    for paper in related_papers:
         evidence_id = str(paper.get("evidence_id") or "")
         if evidence_id in required_ids and evidence_id not in selected_ids:
             selected.append(paper)
@@ -4807,11 +5217,63 @@ def _normalized_doi(value: Any) -> str:
     return re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", text).rstrip(".,;)")
 
 
+def _section_review_validation_error(
+    review: Any,
+    chunk: list[dict[str, Any]],
+) -> str | None:
+    """Return why a section review is unsafe to reuse or persist, if anything."""
+    expected_ids = [
+        str((item.get("segment") or {}).get("segment_id") or "")
+        for item in chunk
+    ]
+    if (
+        not expected_ids
+        or any(not value for value in expected_ids)
+        or len(expected_ids) != len(set(expected_ids))
+    ):
+        return "has invalid expected segment coverage"
+    if not isinstance(review, dict):
+        return "is malformed"
+    reviewed_segments = review.get("reviewed_segments")
+    if not isinstance(reviewed_segments, list):
+        return "is missing reviewed segment coverage"
+    reviewed_ids: list[str] = []
+    for item in reviewed_segments:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("segment_id"), str)
+            or not item["segment_id"]
+            or not isinstance(item.get("translation"), dict)
+            or not isinstance(item.get("annotation"), dict)
+        ):
+            return "contains a malformed reviewed segment"
+        reviewed_ids.append(item["segment_id"])
+    if len(reviewed_ids) != len(set(reviewed_ids)):
+        return "contains duplicate reviewed segments"
+    if len(reviewed_ids) != len(expected_ids) or set(reviewed_ids) != set(expected_ids):
+        return "did not cover every segment"
+    findings = review.get("findings")
+    if not isinstance(findings, list) or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("segment_id"), str)
+        or not item["segment_id"]
+        or not isinstance(item.get("issue"), str)
+        for item in findings
+    ):
+        return "contains malformed findings"
+    invalid_finding_ids = {
+        str(item.get("segment_id") or "") for item in findings
+    } - set(expected_ids)
+    if invalid_finding_ids:
+        return "returned findings for unknown segments"
+    return None
+
+
 def _load_recovered_section_reviews(
     checkpoint_dir: Path,
     chunks: list[list[dict[str, Any]]],
 ) -> dict[int, dict[str, Any]]:
-    """Import a controller-recovered failed-final payload within this fingerprint."""
+    """Import only recovered sections whose exact segment set survives rechunking."""
     path = checkpoint_dir / "section-reviews.recovered-from-failed-final.v1.json"
     if not path.is_file():
         return {}
@@ -4825,36 +5287,58 @@ def _load_recovered_section_reviews(
     expected_all = {str(item["segment"]["segment_id"]) for chunk in chunks for item in chunk}
     if set(str(value) for value in recovered.get("reviewed_segment_ids") or []) != expected_all:
         raise RuntimeError("recovered section reviews do not match current segment coverage")
-    imported: dict[int, dict[str, Any]] = {}
+    recovered_by_ids: dict[frozenset[str], dict[str, Any]] = {}
+    recovered_indices: set[int] = set()
+    covered_ids: set[str] = set()
     for item in recovered["section_reviews"]:
         if not isinstance(item, dict):
             raise RuntimeError("recovered section review is malformed")
         index = int(item.get("section_index", -1))
-        if index < 0 or index >= len(chunks) or index in imported:
+        if index < 0 or index in recovered_indices:
             raise RuntimeError("recovered section review has an invalid section index")
-        expected_ids = {
-            str(value["segment"]["segment_id"]) for value in chunks[index]
+        recovered_indices.add(index)
+        declared_id_values = [
+            str(value) for value in item.get("reviewed_segment_ids") or []
+        ]
+        declared_ids = set(declared_id_values)
+        review = {
+            "findings": item.get("findings"),
+            "reviewed_segments": item.get("reviewed_segments"),
         }
-        reviewed_segments = item.get("reviewed_segments")
-        reviewed_ids = {
-            str(value.get("segment_id") or "")
-            for value in reviewed_segments or []
-            if isinstance(value, dict)
-        }
+        validation_error = _section_review_validation_error(
+            review,
+            [
+                {"segment": {"segment_id": segment_id}}
+                for segment_id in declared_id_values
+            ],
+        )
         if (
-            not isinstance(reviewed_segments, list)
-            or reviewed_ids != expected_ids
-            or set(str(value) for value in item.get("reviewed_segment_ids") or [])
-            != expected_ids
-            or not isinstance(item.get("findings"), list)
+            not declared_ids
+            or len(declared_id_values) != len(declared_ids)
+            or validation_error is not None
         ):
             raise RuntimeError(f"recovered section review {index} does not match its chunk")
-        imported[index] = {
-            "findings": item["findings"],
-            "reviewed_segments": reviewed_segments,
-        }
-    if set(imported) != set(range(len(chunks))):
+        frozen_ids = frozenset(declared_ids)
+        if frozen_ids in recovered_by_ids:
+            raise RuntimeError("recovered section reviews have duplicate chunks")
+        overlap = covered_ids.intersection(declared_ids)
+        if overlap:
+            raise RuntimeError(
+                "recovered section reviews have overlapping segment coverage: "
+                f"{sorted(overlap)}"
+            )
+        covered_ids.update(declared_ids)
+        recovered_by_ids[frozen_ids] = review
+    if covered_ids != expected_all:
         raise RuntimeError("recovered section reviews do not cover every section")
+
+    imported: dict[int, dict[str, Any]] = {}
+    for index, chunk in enumerate(chunks):
+        expected_ids = frozenset(
+            str(value["segment"]["segment_id"]) for value in chunk
+        )
+        if value := recovered_by_ids.get(expected_ids):
+            imported[index] = value
     return imported
 
 
@@ -4902,6 +5386,106 @@ def _section_review_patch_proposals(
         ):
             proposals.append(proposal)
     return proposals
+
+
+def _utf8_size(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def _review_prompt_byte_limit(options: BuildOptions) -> int:
+    """Combine the user soft budget with ARC's hard transport ceiling."""
+    return min(
+        REVIEW_PROMPT_MAX_BYTES,
+        max(REVIEW_PROMPT_MIN_SOFT_BYTES, int(options.review_context_chars)),
+    )
+
+
+def _require_review_prompt_within_limit(
+    prompt: str,
+    *,
+    label: str,
+    max_prompt_bytes: int,
+) -> None:
+    size = _utf8_size(prompt)
+    if size > max_prompt_bytes:
+        raise RuntimeError(
+            f"{label} requires a {size}-byte prompt, exceeding the strict "
+            f"{max_prompt_bytes}-byte limit"
+        )
+
+
+def _bounded_hierarchical_review_prompt(
+    section_reviews: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    *,
+    blocks_by_id: dict[str, dict[str, Any]],
+    document: dict[str, Any],
+    segment_payloads: list[dict[str, Any]],
+    glossary: dict[str, Any],
+    protected_names: list[str],
+    language: str,
+    max_prompt_bytes: int,
+) -> tuple[dict[str, Any], str]:
+    """Render successively smaller complete projections and verify actual bytes."""
+    instruction = (
+        "Consolidate section findings into non-conflicting translation and/or annotation patches. "
+        "Use the bounded source anchor for every segment as a direct source-awareness check; "
+        "section reviews contain bounded findings and proposed corrections from the complete "
+        "source-aware local review."
+    )
+    # Optional material shrinks monotonically.  The final attempt still keeps
+    # every section/segment identity, a source digest, and a source excerpt; if
+    # that essential audit projection does not fit, fail before calling a model.
+    attempts = (
+        (0.24, 0.18, 0.12, 0.28, True, 160),
+        (0.16, 0.10, 0.08, 0.18, True, 96),
+        (0.10, 0.05, 0.04, 0.10, True, 64),
+        (0.06, 0.00, 0.00, 0.00, False, 32),
+    )
+    last_prompt = ""
+    last_payload: dict[str, Any] = {}
+    for source_ratio, context_ratio, glossary_ratio, section_ratio, include_context, minimum_excerpt in attempts:
+        source_anchors = _review_source_anchors(
+            segments,
+            blocks_by_id=blocks_by_id,
+            document=document,
+            total_chars=int(max_prompt_bytes * source_ratio),
+            minimum_excerpt_chars=minimum_excerpt,
+        )
+        context_evidence_anchors = (
+            _review_context_evidence_anchors(
+                segment_payloads,
+                total_chars=int(max_prompt_bytes * context_ratio),
+            )
+            if include_context
+            else []
+        )
+        bounded_glossary = _bounded_glossary_projection(
+            glossary,
+            total_chars=int(max_prompt_bytes * glossary_ratio),
+        )
+        projected_sections = _bounded_section_review_projection(
+            section_reviews,
+            total_chars=int(max_prompt_bytes * section_ratio),
+        )
+        last_payload = {
+            "section_reviews": projected_sections,
+            "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
+            "source_anchors": source_anchors,
+            "context_evidence_anchors": context_evidence_anchors,
+            "glossary": bounded_glossary,
+            "protected_names": protected_names,
+            "instruction": instruction,
+        }
+        last_prompt = review_prompt(last_payload, language=language, findings=None)
+        if _utf8_size(last_prompt) <= max_prompt_bytes:
+            return last_payload, last_prompt
+    _require_review_prompt_within_limit(
+        last_prompt,
+        label="hierarchical final review essential projection",
+        max_prompt_bytes=max_prompt_bytes,
+    )
+    raise AssertionError("unreachable")
 
 
 def _bounded_section_review_projection(
@@ -4978,19 +5562,36 @@ def _review_context_evidence(
     ]
 
 
-def _review_chunks(items: list[dict[str, Any]], target_chars: int) -> list[list[dict[str, Any]]]:
+def _review_chunks(
+    items: list[dict[str, Any]],
+    *,
+    language: str,
+    max_prompt_bytes: int = SECTION_REVIEW_PROMPT_MAX_BYTES,
+) -> list[list[dict[str, Any]]]:
+    """Pack complete segments by the final rendered prompt's UTF-8 byte size."""
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
-    size = 0
     for item in items:
-        item_size = len(json.dumps(item, ensure_ascii=False))
-        if current and size + item_size > max(10_000, target_chars):
+        candidate = [*current, item]
+        candidate_prompt = section_review_prompt(
+            {"segments": candidate}, language=language,
+        )
+        if len(candidate_prompt.encode("utf-8")) <= max_prompt_bytes:
+            current = candidate
+            continue
+        if current:
             chunks.append(current)
-            boundary = current[-1]
-            current = [boundary]
-            size = len(json.dumps(boundary, ensure_ascii=False))
-        current.append(item)
-        size += item_size
+        single_prompt = section_review_prompt(
+            {"segments": [item]}, language=language,
+        )
+        single_size = len(single_prompt.encode("utf-8"))
+        if single_size > max_prompt_bytes:
+            segment_id = str((item.get("segment") or {}).get("segment_id") or "")
+            raise RuntimeError(
+                f"section review segment {segment_id or '<unknown>'} requires a "
+                f"{single_size}-byte prompt, exceeding the strict {max_prompt_bytes}-byte limit"
+            )
+        current = [item]
     if current:
         chunks.append(current)
     return chunks
@@ -5002,9 +5603,16 @@ def _review_source_anchors(
     blocks_by_id: dict[str, dict[str, Any]],
     document: dict[str, Any],
     total_chars: int,
+    minimum_excerpt_chars: int = 160,
 ) -> list[dict[str, Any]]:
     """Give the hierarchical final reviewer bounded source context for every segment."""
-    per_segment = max(160, min(1_200, total_chars // max(1, len(segments))))
+    per_segment = max(
+        1,
+        min(
+            1_200,
+            max(minimum_excerpt_chars, total_chars // max(1, len(segments))),
+        ),
+    )
     anchors: list[dict[str, Any]] = []
     for segment in segments:
         projection = [
@@ -5019,7 +5627,7 @@ def _review_source_anchors(
             excerpt = serialized
         anchors.append({
             "segment_id": str(segment.get("segment_id") or ""),
-            "title": str(segment.get("title") or ""),
+            "title": str(segment.get("title") or "")[:160],
             "start_block_id": str(segment.get("start_block_id") or ""),
             "end_block_id": str(segment.get("end_block_id") or ""),
             "source_sha256": sha256_json(projection),

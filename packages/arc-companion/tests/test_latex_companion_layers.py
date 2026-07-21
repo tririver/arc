@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import unicodedata
 
 import pytest
 
@@ -724,21 +725,26 @@ def test_equation_renderer_canonicalizes_embedded_tag_or_adds_cached_number(tmp_
     assert embedded_only.count(r"\tag{raw}") == 1
 
 
-def test_renderer_drops_unsupported_c0_controls(tmp_path: Path) -> None:
+def test_renderer_drops_unsupported_unicode_controls(tmp_path: Path) -> None:
     document = {
-        "blocks": [{"block_id": "p", "kind": "prose", "text": "a\x03b\x0fc"}],
+        "blocks": [{"block_id": "p", "kind": "prose", "text": "a\x03b\x0fc\x7fd\x85e"}],
         "integrity": {"status": "complete"},
     }
     tex, _ = render_companion_tex(
         document,
         [{"segment_id": "s", "block_ids": ["p"]}],
-        {"s": {"commentary": "x\x03y\x0fz"}},
+        {"s": {"commentary": "x\x03y\x0fz\\[\\partial\x7f\\phi\\]"}},
         output_dir=tmp_path,
         language="en",
     )
 
-    assert "abc" in tex and "xyz" in tex
-    assert "\x03" not in tex and "\x0f" not in tex
+    assert "abcde" in tex and "xyz" in tex
+    assert r"\[\partial\phi\]" in tex
+    assert not any(
+        unicodedata.category(char) == "Cc"
+        for char in tex
+        if char not in "\n\r\t"
+    )
 
 
 def test_fidelity_validation_audits_translation_boundaries_and_forbidden_content(tmp_path: Path) -> None:
@@ -951,12 +957,15 @@ def test_16_bit_alpha_png_is_detected_for_xelatex_flattening(tmp_path: Path) -> 
 
 
 def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() -> None:
-    glyphs = "δνθσζτ αεϵβφπη ∼≪≫≲∝≡≈∑⟨⟩∙ Ḣ ℒℋ 𝐻𝐤𝜃𝒪𝑚𝜎𝑝𝛿𝑡𝑁𝐿𝐼𝜈𝜁𝑉𝑅𝒞𝑓𝑎𝑙𝑘𝑖𝑏𝑃 ₀₁₂₃ᵢ′\u200b"
+    glyphs = "δνθσζτ αεϵβφπη ∼≪≫≲∝≡≈∑∫ℓ⟨⟩∙ Ḣ ℒℋℏ 𝐻𝐤𝜃𝒪𝑚𝜎𝑝𝛿𝑡𝑁𝐿𝐼𝜈𝜁𝑉𝑅𝒞𝑓𝑎𝑙𝑘𝑖𝑏𝑃 ⁿ₀₁₂₃ᵢ′\u200b"
     rendered = escape_tex(glyphs)
 
     for glyph in glyphs.replace(" ", "").replace("\u200b", ""):
         assert glyph not in rendered
     assert r"\delta" in rendered
+    assert r"\int" in rendered
+    assert r"\ell" in rendered
+    assert r"{}^{n}" in rendered
     assert r"\mathcal{O}" in rendered
     assert r"\mathbf{k}" in rendered
     assert escape_tex("ℏ") == r"\(\hbar\)"
@@ -978,9 +987,12 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
 
 
 @pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")
-def test_planck_constant_unicode_glyph_compiles_as_a_math_atom(tmp_path: Path) -> None:
-    rendered = escape_tex("Planck constant ℏ")
-    assert rendered == r"Planck constant \(\hbar\)"
+def test_common_unicode_math_glyphs_compile_as_math_atoms(tmp_path: Path) -> None:
+    rendered = escape_tex("Planck constant ℏ; integral ∫; length ℓ; power 10ⁿ")
+    assert r"\(\hbar\)" in rendered
+    assert r"\(\int\)" in rendered
+    assert r"\(\ell\)" in rendered
+    assert r"\({}^{n}\)" in rendered
 
     tex_path = tmp_path / "planck-constant.tex"
     tex_path.write_text(

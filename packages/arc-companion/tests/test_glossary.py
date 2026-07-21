@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import arc_companion.glossary as glossary_module
 from arc_companion.glossary import (
     GLOSSARY_VERSION,
     _validate_protected_names,
@@ -20,6 +21,38 @@ def _document() -> dict:
             {"block_id": "b2", "type": "text", "text": "A Feynman diagram represents a perturbative term."},
         ]
     }
+
+
+def _many_window_document(count: int = 155) -> dict:
+    return {
+        "blocks": [
+            {
+                "block_id": f"b{index:04d}",
+                "type": "text",
+                "section_id": f"section-{index:04d}",
+                "text": f"Specialized concepts for window {index}.",
+            }
+            for index in range(1, count + 1)
+        ]
+    }
+
+
+def _window_entries(index: int) -> list[dict]:
+    return [
+        {
+            "source_term": f"specialized concept {index:04d}-{offset}",
+            "target_term": f"专业概念 {index:04d}-{offset}",
+            "brief_explanation": "领域读者仍需辨析的专门定义",
+            "aliases": [],
+            "protected_names": [],
+            "first_block_id": f"b{index:04d}",
+        }
+        for offset in range(3)
+    ]
+
+
+def _prompt_candidates(prompt: str) -> list[dict]:
+    return json.loads(prompt.split("CANDIDATES:\n", maxsplit=1)[1])
 
 
 def test_glossary_is_consolidated_ordered_and_resumable(tmp_path: Path) -> None:
@@ -56,6 +89,195 @@ def test_glossary_is_consolidated_ordered_and_resumable(tmp_path: Path) -> None:
         checkpoint_dir=tmp_path, workers=12, force=False, call_model=call_model,
     ) == first
     assert len(calls) == count
+
+
+def test_glossary_hierarchically_consolidates_155_windows_with_bounded_nodes(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, int, int]] = []
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        if call_label.startswith("companion-glossary-window-"):
+            index = int(call_label.rsplit("-", maxsplit=1)[1])
+            return {"entries": _window_entries(index)}
+        candidates = _prompt_candidates(prompt)
+        entries = [entry for candidate in candidates for entry in candidate["entries"]]
+        calls.append((call_label, len(entries), len(prompt.encode("utf-8"))))
+        return {"entries": entries}
+
+    result = generate_glossary(
+        _many_window_document(), language="zh-CN", protected_names=[],
+        checkpoint_dir=tmp_path, workers=12, force=False, call_model=call_model,
+    )
+
+    assert {label for label, _, _ in calls} == {
+        "companion-glossary-consolidation-l0001-n0001",
+        "companion-glossary-consolidation-l0001-n0002",
+        "companion-glossary-consolidation-l0001-n0003",
+        "companion-glossary-consolidation-l0001-n0004",
+        "companion-glossary-consolidation-l0001-n0005",
+        "companion-glossary-consolidation-l0002-n0001",
+        "companion-glossary-consolidation-l0002-n0002",
+        "companion-glossary-consolidation-l0002-n0003",
+    }
+    assert all(count <= 100 for _, count, _ in calls)
+    assert all(
+        prompt_bytes < glossary_module.CONSOLIDATION_PROMPT_MAX_BYTES
+        for _, _, prompt_bytes in calls
+    )
+    assert "companion-glossary-consolidation" not in {label for label, _, _ in calls}
+    assert 100 < len(result["entries"]) <= result["entry_limit"] == 200
+    block_ids = [entry["first_block_id"] for entry in result["entries"]]
+    assert block_ids == sorted(block_ids)
+    assert block_ids[0] == "b0001"
+    assert (
+        tmp_path / "glossary-consolidation" / "level-0001" / "0001.json"
+    ).is_file()
+    assert (
+        tmp_path / "glossary-consolidation" / "level-0002" / "0001.json"
+    ).is_file()
+
+
+def test_glossary_batches_long_cjk_entries_by_complete_prompt_utf8_bytes(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        if call_label.startswith("companion-glossary-window-"):
+            index = int(call_label.rsplit("-", maxsplit=1)[1])
+            entries = _window_entries(index)
+            for entry in entries:
+                entry["brief_explanation"] = "量子场论中的专门定义" * 500
+            return {"entries": entries}
+        prompt_bytes = len(prompt.encode("utf-8"))
+        calls.append((call_label, prompt_bytes))
+        candidates = _prompt_candidates(prompt)
+        return {"entries": [
+            entry for candidate in candidates for entry in candidate["entries"]
+        ]}
+
+    result = generate_glossary(
+        _many_window_document(70), language="zh-CN", protected_names=[],
+        checkpoint_dir=tmp_path, workers=12, force=False, call_model=call_model,
+    )
+
+    level_one = [label for label, _ in calls if "-l0001-" in label]
+    assert len(level_one) > 1
+    assert all(
+        prompt_bytes < glossary_module.CONSOLIDATION_PROMPT_MAX_BYTES
+        for _, prompt_bytes in calls
+    )
+    assert max(prompt_bytes for _, prompt_bytes in calls) > 30_000
+    assert 0 < len(result["entries"]) <= result["entry_limit"]
+
+
+def test_glossary_rejects_single_essential_entry_above_prompt_hard_cap(
+    tmp_path: Path,
+) -> None:
+    consolidation_calls: list[str] = []
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        if call_label.startswith("companion-glossary-window-"):
+            index = int(call_label.rsplit("-", maxsplit=1)[1])
+            if index == 1:
+                entry = _window_entries(index)[0]
+                entry["brief_explanation"] = "不可删减的必要内容" * 4_000
+                return {"entries": [entry]}
+            return {"entries": _window_entries(index)}
+        consolidation_calls.append(call_label)
+        return {"entries": []}
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"essential content exceeds the strict 61440-byte prompt limit",
+    ):
+        generate_glossary(
+            _many_window_document(70), language="zh-CN", protected_names=[],
+            checkpoint_dir=tmp_path, workers=12, force=False, call_model=call_model,
+        )
+
+    assert consolidation_calls == []
+    consolidation_dir = tmp_path / "glossary-consolidation"
+    assert not consolidation_dir.exists() or not list(consolidation_dir.rglob("*.json"))
+
+
+def test_glossary_resumes_only_missing_hierarchical_consolidation_node(
+    tmp_path: Path,
+) -> None:
+    first_calls: list[str] = []
+
+    def interrupted_model(prompt, schema, artifact_dir, call_label):
+        first_calls.append(call_label)
+        if call_label.startswith("companion-glossary-window-"):
+            index = int(call_label.rsplit("-", maxsplit=1)[1])
+            return {"entries": _window_entries(index)}
+        if call_label == "companion-glossary-consolidation-l0002-n0003":
+            raise RuntimeError("interrupted hierarchical consolidation")
+        candidates = _prompt_candidates(prompt)
+        return {"entries": [
+            entry for candidate in candidates for entry in candidate["entries"]
+        ]}
+
+    with pytest.raises(RuntimeError, match="interrupted hierarchical consolidation"):
+        generate_glossary(
+            _many_window_document(), language="zh-CN", protected_names=[],
+            checkpoint_dir=tmp_path, workers=12, force=False,
+            call_model=interrupted_model,
+        )
+
+    assert "companion-glossary-consolidation-l0001-n0001" in first_calls
+    assert "companion-glossary-consolidation-l0001-n0002" in first_calls
+    resume_calls: list[str] = []
+
+    def resumed_model(prompt, schema, artifact_dir, call_label):
+        resume_calls.append(call_label)
+        candidates = _prompt_candidates(prompt)
+        return {"entries": [
+            entry for candidate in candidates for entry in candidate["entries"]
+        ]}
+
+    result = generate_glossary(
+        _many_window_document(), language="zh-CN", protected_names=[],
+        checkpoint_dir=tmp_path, workers=12, force=False, call_model=resumed_model,
+    )
+
+    assert resume_calls == ["companion-glossary-consolidation-l0002-n0003"]
+    assert 100 < len(result["entries"]) <= result["entry_limit"]
+
+
+def test_parallel_glossary_consolidation_fails_closed_without_caching_empty_node(
+    tmp_path: Path,
+) -> None:
+    failed_label = "companion-glossary-consolidation-l0001-n0002"
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        if call_label.startswith("companion-glossary-window-"):
+            index = int(call_label.rsplit("-", maxsplit=1)[1])
+            return {"entries": _window_entries(index)}
+        if call_label == failed_label:
+            return {"entries": []}
+        candidates = _prompt_candidates(prompt)
+        return {"entries": [
+            entry for candidate in candidates for entry in candidate["entries"]
+        ]}
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"node .*n0002 returned no usable entries.*non-empty input",
+    ):
+        generate_glossary(
+            _many_window_document(), language="zh-CN", protected_names=[],
+            checkpoint_dir=tmp_path, workers=12, force=False,
+            call_model=call_model,
+        )
+
+    level_dir = tmp_path / "glossary-consolidation" / "level-0001"
+    assert not (level_dir / "0002.json").exists()
+    assert any(
+        path.name != "0002.json"
+        for path in level_dir.glob("*.json")
+    )
 
 
 def test_glossary_restores_translated_personal_name_and_keeps_strict_validation(tmp_path: Path) -> None:
@@ -159,7 +381,7 @@ def test_glossary_protected_name_repair_uses_complete_lexical_boundaries(tmp_pat
 
 def test_glossary_version_invalidates_pre_repair_final_cache(tmp_path: Path) -> None:
     stale = {
-        "schema_version": "arc.companion.glossary.v3",
+        "schema_version": "arc.companion.glossary.v5",
         "source_sha256": "irrelevant",
         "entries": [],
     }
@@ -250,7 +472,7 @@ def test_glossary_page_count_boundaries_and_absolute_limit(page_count, expected)
 
 
 @pytest.mark.parametrize("page_count,expected", [(50, 50), (51, 100), (100, 100), (101, 200), (None, 200)])
-def test_glossary_deterministically_caps_entries(tmp_path: Path, page_count, expected) -> None:
+def test_glossary_deterministically_enforces_entry_cap(tmp_path: Path, page_count, expected) -> None:
     entries = [{
         "source_term": f"specialized concept {index}",
         "target_term": f"专业概念 {index}",
@@ -270,7 +492,7 @@ def test_glossary_deterministically_caps_entries(tmp_path: Path, page_count, exp
         workers=2, force=False, call_model=call_model, page_count=page_count,
     )
 
-    assert len(result["entries"]) == expected
+    assert 0 < len(result["entries"]) <= expected
     assert result["entry_limit"] == expected
 
 

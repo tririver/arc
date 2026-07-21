@@ -80,8 +80,16 @@ calls total rather than 24 calls per lane. Both calls receive the frozen
 full-paper glossary and the same current source unit. Long documents use
 medium-tier section reviews followed by a medium-tier consolidation review,
 with complete unit coverage and a bounded source anchor for every unit in the
-consolidation payload. Review
-patches may change translations and commentaries only.
+consolidation payload. Annotation, section-review, and final-review calls are
+checked against their rendered UTF-8 size and may not exceed 60 KiB. The review
+context setting remains a softer, potentially smaller hierarchy threshold; a
+32 KiB viability floor applies to actual review calls when a deliberately tiny
+soft setting is used to force tests or diagnostics into the hierarchical path.
+Review patches may change translations and commentaries only.
+
+Large glossary candidate sets use a bounded hierarchical merge instead of one
+global prompt. Every merge node has its own content-addressed checkpoint, so a
+resume calls only missing nodes before producing the frozen paper glossary.
 
 Every new primary medium-tier translation prompt ends with an explicit controller
 checklist for exact block coverage/order, byte-exact opaque-token coverage/order,
@@ -453,6 +461,12 @@ artifacts for diagnosis but never publishes a successful deliverable.
   submitted units before reporting their aggregated failures, so later
   successes remain checkpointed and a new build schedules only missing or stale
   units.
+- Translation coverage repair records the raw model response before validation
+  in a v2 attempt marker, allowing deterministic replay without another model
+  call. A legacy v1 `started` marker receives exactly one migration call into
+  v2; a v2 marker left at `started` fails closed permanently. Provider quota,
+  authentication, or empty-response failures open the build-wide circuit, so
+  queued legacy upgrades and other lanes do not create additional sessions.
 - If a traceback suggests that one early unit cancelled unrelated work, compare
   the traceback with checkpoint coverage and reproduce the scheduling behavior
   in a minimal package test. Fix controller-owned cancellation in

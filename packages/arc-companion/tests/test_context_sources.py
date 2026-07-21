@@ -147,6 +147,26 @@ def test_context_selection_is_relevant_bounded_and_kept_out_of_chronology() -> N
         validate_annotation_citations(bad, selected)
 
 
+def test_required_context_evidence_is_selected_once() -> None:
+    record = load_context_evidence(["isbn:one"], parsed_getter=_parsed_getter)[0]
+    record["supported_request_keys"] = ["seg:request-1"]
+    segment = {"segment_id": "seg", "block_ids": ["b"]}
+
+    selected = _evidence_for_segment(
+        segment,
+        {"b": {"block_id": "b", "text": "canonical field momentum"}},
+        {
+            "related_papers": [record],
+            "required_evidence_ids_by_segment": {
+                "seg": [record["evidence_id"]],
+            },
+        },
+    )["papers"]
+
+    assert [item["evidence_id"] for item in selected] == [record["evidence_id"]]
+    assert selected[0]["supported_request_keys"] == ["seg:request-1"]
+
+
 def test_context_index_keeps_late_relevant_blocks_until_segment_selection() -> None:
     def getter(paper_id: str, *, include_document: bool) -> dict:
         blocks = [

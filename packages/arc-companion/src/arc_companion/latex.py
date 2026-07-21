@@ -89,6 +89,7 @@ _UNICODE_MATH_SYMBOLS = {
     "Φ": r"\Phi", "Ψ": r"\Psi", "Ω": r"\Omega",
     "∼": r"\sim", "≪": r"\ll", "≫": r"\gg",
     "≲": r"\lesssim", "∝": r"\propto", "≡": r"\equiv", "≈": r"\approx", "∑": r"\sum",
+    "∫": r"\int", "ℓ": r"\ell",
     "⟨": r"\langle", "⟩": r"\rangle", "∙": r"\mathbin{\cdot}", "Ḣ": r"\dot{H}",
     "ℒ": r"\mathcal{L}", "ℋ": r"\mathcal{H}", "ℏ": r"\hbar",
 }
@@ -96,6 +97,7 @@ _UNICODE_MATH_SYMBOLS = {
 _UNICODE_MATH_MODIFIERS = {
     "⁰": "{}^{0}", "¹": "{}^{1}", "²": "{}^{2}", "³": "{}^{3}", "⁴": "{}^{4}",
     "⁵": "{}^{5}", "⁶": "{}^{6}", "⁷": "{}^{7}", "⁸": "{}^{8}", "⁹": "{}^{9}",
+    "ⁿ": "{}^{n}",
     "⁺": "{}^{+}", "⁻": "{}^{-}", "⁼": "{}^{=}", "⁽": "{}^{(}", "⁾": "{}^{)}",
     "†": r"\dagger", "‡": r"\ddagger",
 }
@@ -615,8 +617,12 @@ def _disambiguate_math_row_starts(tex: str) -> str:
 
 
 def _remove_disallowed_c0(value: str) -> str:
-    """Drop C0 controls that XeLaTeX cannot accept, preserving layout whitespace."""
-    return "".join(char for char in value if ord(char) >= 32 or char in "\n\r\t")
+    """Drop Unicode control characters XeLaTeX cannot accept, preserving layout whitespace."""
+    return "".join(
+        char
+        for char in value
+        if char in "\n\r\t" or unicodedata.category(char) != "Cc"
+    )
 
 
 def _render_figure(

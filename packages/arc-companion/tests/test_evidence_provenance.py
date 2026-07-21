@@ -4,6 +4,10 @@ from copy import deepcopy
 
 import pytest
 
+from arc_companion.pipeline import (
+    _deduplicate_evidence_records,
+    _enforce_request_claim_bindings,
+)
 from arc_companion.evidence import (
     EvidenceProvenanceError,
     arc_cache_descriptor,
@@ -12,6 +16,7 @@ from arc_companion.evidence import (
     validate_annotation_citations,
     validate_cited_ids,
     validate_evidence_record,
+    validate_registry,
     web_evidence_record,
 )
 
@@ -78,6 +83,89 @@ def test_arc_cache_descriptor_preserves_existing_id_and_detects_tampering() -> N
     changed["blocks"][0]["text"] = "Unrecorded replacement."
     with pytest.raises(EvidenceProvenanceError, match="source-piece hash mismatch"):
         validate_evidence_record(changed)
+
+
+def test_registry_stably_deduplicates_identical_provenance() -> None:
+    first = _arc_record()
+    duplicate = deepcopy(first)
+    duplicate["supported_request_keys"] = ["seg-1:request-1"]
+
+    registry = validate_registry([first, duplicate])
+
+    assert list(registry) == ["prior-001"]
+    assert registry["prior-001"] is first
+
+
+def test_pipeline_dedup_unions_request_support_and_keeps_second_round_claim() -> None:
+    first = _arc_record()
+    duplicate_one = {
+        **deepcopy(first),
+        "supported_request_keys": ["seg-1:request-1"],
+    }
+    duplicate_two = {
+        **deepcopy(first),
+        "supported_request_keys": ["seg-1:request-2", "seg-1:request-1"],
+    }
+
+    records = _deduplicate_evidence_records([first, duplicate_one, duplicate_two])
+
+    assert len(records) == 1
+    assert records[0]["supported_request_keys"] == [
+        "seg-1:request-1",
+        "seg-1:request-2",
+    ]
+    preserved = dict(records[0])
+    preserved.pop("supported_request_keys")
+    assert preserved == first
+
+    annotation = {
+        "prior_work": [{
+            "text": "A supported second-round claim.",
+            "request_key": "seg-1:request-2",
+            "evidence_ids": ["prior-001"],
+            "source_locators": [{
+                "evidence_id": "prior-001",
+                "locator": "b-1",
+            }],
+        }],
+        "later_work": [],
+        "context_claims": [],
+        "evidence_ids": ["prior-001"],
+    }
+    _enforce_request_claim_bindings(
+        annotation,
+        [{"request_key": "seg-1:request-2", "relation": "prior"}],
+        supported={"seg-1:request-2"},
+        evidence_ids_by_request={"seg-1:request-2": {"prior-001"}},
+        first_draft=None,
+        records=records,
+    )
+
+    assert len(annotation["prior_work"]) == 1
+    assert annotation["evidence_ids"] == ["prior-001"]
+
+
+def test_registry_rejects_duplicate_id_with_conflicting_content() -> None:
+    first = _arc_record()
+    conflicting = _arc_record()
+    conflicting["blocks"][0]["text"] = "A different recorded result."
+    conflicting["blocks"][0]["sha256"] = text_sha256(
+        conflicting["blocks"][0]["text"]
+    )
+    conflicting["source_descriptor"] = arc_cache_descriptor(
+        paper_id=conflicting["paper_id"],
+        title=conflicting["title"],
+        authors=conflicting["authors"],
+        year=conflicting["year"],
+        evidence_level="full_text",
+        content=conflicting["blocks"],
+        document_hash="d" * 64,
+    )
+
+    with pytest.raises(EvidenceProvenanceError, match="conflicting duplicate evidence ID"):
+        validate_registry([first, conflicting])
+    with pytest.raises(EvidenceProvenanceError, match="conflicting duplicate evidence ID"):
+        _deduplicate_evidence_records([first, conflicting])
 
 
 def test_web_evidence_gets_stable_controller_id_and_auditable_descriptor() -> None:

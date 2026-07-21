@@ -1697,6 +1697,70 @@ def test_slot_repair_strips_a_bounded_mutated_marker_candidate() -> None:
     assert "broken token value" not in result["blocks"][0]["text"]
 
 
+@pytest.mark.parametrize(
+    "wrapper", ["single", "zero-width", "truncated-hash", "middle-truncated-hash"]
+)
+def test_controller_canonicalizes_identity_preserving_marker_mutations(
+    wrapper: str,
+) -> None:
+    block = {
+        "block_id": "canonical", "type": "text", "text": "A x B.",
+        "inline_runs": [
+            _inline_run("text", "A ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", " B.", 3),
+        ],
+    }
+    expected = pipeline_module._opaque_inline_tokens(block)[0]
+    if wrapper == "single":
+        candidate = expected[1:-1]
+    elif wrapper == "zero-width":
+        candidate = "[\u200b" + expected[1:]
+    elif wrapper == "truncated-hash":
+        candidate = expected[:-6] + "]]"
+    else:
+        prefix, digest = expected[:-2].rsplit(":", 1)
+        candidate = f"{prefix}:{digest[:12]}{digest[-24:]}]]"
+    translation = {
+        "blocks": [{"block_id": "canonical", "text": f"甲{candidate}乙。"}]
+    }
+    repaired, changed = pipeline_module._canonicalize_translation_opaque_candidates(
+        translation, {"canonical": block},
+    )
+    assert changed == ["canonical"]
+    assert repaired["blocks"][0]["text"] == f"甲{expected}乙。"
+    assert pipeline_module._translation_natural_residue(
+        repaired["blocks"][0]["text"]
+    ) == "甲乙。"
+
+
+@pytest.mark.parametrize("mutation", ["token-id", "short-hash", "non-hex"])
+def test_controller_rejects_ambiguous_marker_candidates(mutation: str) -> None:
+    block = {
+        "block_id": "canonical", "type": "text", "text": "A x B.",
+        "inline_runs": [
+            _inline_run("text", "A ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", " B.", 3),
+        ],
+    }
+    expected = pipeline_module._opaque_inline_tokens(block)[0]
+    if mutation == "token-id":
+        candidate = expected.replace("b.token-0002", "b.token-9999")
+    elif mutation == "short-hash":
+        candidate = expected.rsplit(":", 1)[0] + ":deadbeef]]"
+    else:
+        candidate = expected.rsplit(":", 1)[0] + ":not-a-digest]]"
+    translation = {
+        "blocks": [{"block_id": "canonical", "text": f"甲{candidate}乙。"}]
+    }
+    repaired, changed = pipeline_module._canonicalize_translation_opaque_candidates(
+        translation, {"canonical": block},
+    )
+    assert changed == []
+    assert repaired == translation
+
+
 def test_protected_name_validation_ignores_opaque_runs_but_checks_text_runs() -> None:
     opaque_name = _inline_run("link", "Maldacena", 2)
     opaque_name["href"] = "https://example.test/maldacena"
@@ -2211,7 +2275,7 @@ def test_coverage_draft_resumes_repair_after_interruption_before_attempt(
     assert result["seg-0063"]["blocks"][0]["text"] == "补齐译文。"
 
 
-def test_started_coverage_attempt_is_lifetime_bounded_and_never_checkpoints_failure(
+def test_invalid_coverage_response_is_checkpointed_and_replayed_without_model(
     tmp_path: Path,
 ) -> None:
     block = {"block_id": "body", "type": "text", "text": "Ada reports the result."}
@@ -2250,6 +2314,17 @@ def test_started_coverage_attempt_is_lifetime_bounded_and_never_checkpoints_fail
     ]
     assert list((checkpoint_dir / "translation-coverage-attempts").glob("*.json"))
     assert not list((checkpoint_dir / "translations").glob("*.json"))
+    marker_path = pipeline_module._translation_coverage_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["schema_version"] == (
+        pipeline_module.TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION
+    )
+    assert marker["status"] == "response_received"
+    assert marker["raw_response"]["repairs"][0]["slots"][0]["slot_id"] == (
+        "body.invalid-slot"
+    )
 
     def forbidden_llm(prompt: str, **kwargs):
         raise AssertionError("consumed coverage repair must not invoke any model")
@@ -2261,7 +2336,221 @@ def test_started_coverage_attempt_is_lifetime_bounded_and_never_checkpoints_fail
             bundle=bundle, glossary={"entries": []}, protected_names=["Ada"],
             checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
         )
-    assert "attempt already consumed" in str(exc_info.value)
+    assert "changed slot coverage" in str(exc_info.value)
+
+
+def test_legacy_started_coverage_attempt_gets_one_v2_upgrade(tmp_path: Path) -> None:
+    block = {"block_id": "body", "type": "text", "text": "Missing source."}
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-legacy-coverage", "block_ids": ["body"]}
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1)
+    checkpoint_dir = tmp_path / "checkpoints"
+    draft_path = pipeline_module._seed_translation_coverage_draft(
+        segment, options=options, bundle=bundle, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir,
+    )
+    draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    attempt_path = pipeline_module._translation_coverage_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    attempt_path.parent.mkdir(parents=True, exist_ok=True)
+    attempt_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-coverage-attempt.v1",
+        "segment_id": segment["segment_id"],
+        "input_sha256": draft["input_sha256"],
+        "status": "started",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "prompt_version": pipeline_module.TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
+        "response_schema_version": (
+            pipeline_module.TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
+        ),
+        "model_tier": pipeline_module.TRANSLATION_COVERAGE_REPAIR_TIER,
+        "missing_block_ids": ["body"],
+    }), encoding="utf-8")
+    calls: list[str] = []
+
+    def repair_llm(prompt: str, **kwargs):
+        calls.append(str(kwargs["call_label"]))
+        return {"repairs": [{"block_id": "body", "slots": [{
+            "slot_id": pipeline_module._translation_coverage_slot_ids(block)[0],
+            "text": "补齐译文。",
+        }]}]}
+
+    result = _generate_translations(
+        [segment], options=options, bundle=bundle, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir, llm=repair_llm,
+    )
+    assert result[segment["segment_id"]]["blocks"][0]["text"] == "补齐译文。"
+    assert calls == [f"companion-translation-{segment['segment_id']}-coverage-repair-1"]
+    upgraded = json.loads(attempt_path.read_text(encoding="utf-8"))
+    assert upgraded["status"] == "validated"
+    assert upgraded["superseded_attempt"]["schema_version"].endswith(".v1")
+
+
+def test_concurrent_legacy_coverage_upgrades_stop_at_build_circuit(
+    tmp_path: Path,
+) -> None:
+    blocks = [
+        {"block_id": f"body-{index}", "type": "text", "text": f"Missing source {index}."}
+        for index in range(6)
+    ]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segments = [
+        {"segment_id": f"seg-legacy-{index}", "block_ids": [f"body-{index}"]}
+        for index in range(6)
+    ]
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=2)
+    checkpoint_dir = tmp_path / "checkpoints"
+    marker_paths: list[Path] = []
+    for segment in segments:
+        draft_path = pipeline_module._seed_translation_coverage_draft(
+            segment,
+            options=options,
+            bundle=bundle,
+            glossary={"entries": []},
+            protected_names=[],
+            checkpoint_dir=checkpoint_dir,
+        )
+        draft = json.loads(draft_path.read_text(encoding="utf-8"))
+        marker_path = pipeline_module._translation_coverage_attempt_path(
+            checkpoint_dir, segment["segment_id"],
+        )
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "schema_version": "arc.companion.translation-coverage-attempt.v1",
+            "segment_id": segment["segment_id"],
+            "input_sha256": draft["input_sha256"],
+            "status": "started",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "prompt_version": pipeline_module.TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
+            "response_schema_version": (
+                pipeline_module.TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
+            ),
+            "model_tier": pipeline_module.TRANSLATION_COVERAGE_REPAIR_TIER,
+            "missing_block_ids": list(segment["block_ids"]),
+        }), encoding="utf-8")
+        marker_paths.append(marker_path)
+
+    class FatalProviderError(RuntimeError):
+        abort_batch = True
+
+    initial_budget = threading.Barrier(2)
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    def fatal_provider(prompt: str, **kwargs):
+        with calls_lock:
+            calls.append(str(kwargs["call_label"]))
+        initial_budget.wait(timeout=5)
+        try:
+            raise FatalProviderError("usage quota exhausted")
+        except FatalProviderError as exc:
+            raise RuntimeError("wrapped provider failure") from exc
+
+    limited_llm = pipeline_module._limit_llm_concurrency(fatal_provider, 2)
+    with pytest.raises(CompanionLaneError) as exc_info:
+        _generate_translations(
+            segments,
+            options=options,
+            bundle=bundle,
+            glossary={"entries": []},
+            protected_names=[],
+            checkpoint_dir=checkpoint_dir,
+            llm=limited_llm,
+        )
+
+    assert len(calls) == 2
+    assert all(label.endswith("coverage-repair-1") for label in calls)
+    failures = [failure for _, failure in exc_info.value.failures]
+    assert sum(isinstance(failure, CompanionLLMCircuitOpen) for failure in failures) == 4
+    markers = [json.loads(path.read_text(encoding="utf-8")) for path in marker_paths]
+    assert sum(marker["schema_version"].endswith(".v2") for marker in markers) == 2
+    assert sum(marker["schema_version"].endswith(".v1") for marker in markers) == 4
+    assert all(
+        marker["status"] == "started"
+        and marker["superseded_attempt"]["schema_version"].endswith(".v1")
+        for marker in markers if marker["schema_version"].endswith(".v2")
+    )
+
+    def forbidden_provider(prompt: str, **kwargs):
+        raise AssertionError("an actually submitted coverage upgrade must remain consumed")
+
+    submitted_segments = [
+        segment for segment, marker in zip(segments, markers)
+        if marker["schema_version"].endswith(".v2")
+    ]
+    with pytest.raises(CompanionLaneError, match="already started"):
+        _generate_translations(
+            submitted_segments,
+            options=options,
+            bundle=bundle,
+            glossary={"entries": []},
+            protected_names=[],
+            checkpoint_dir=checkpoint_dir,
+            llm=forbidden_provider,
+        )
+    assert [json.loads(path.read_text(encoding="utf-8")) for path in marker_paths] == markers
+
+
+def test_current_started_coverage_attempt_fails_closed(tmp_path: Path) -> None:
+    block = {"block_id": "body", "type": "text", "text": "Missing source."}
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [], "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="arXiv:1234.5678", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    segment = {"segment_id": "seg-current-coverage", "block_ids": ["body"]}
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path, workers=1)
+    checkpoint_dir = tmp_path / "checkpoints"
+    draft_path = pipeline_module._seed_translation_coverage_draft(
+        segment, options=options, bundle=bundle, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir,
+    )
+    draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    attempt_path = pipeline_module._translation_coverage_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    attempt_path.parent.mkdir(parents=True, exist_ok=True)
+    attempt_path.write_text(json.dumps({
+        "schema_version": pipeline_module.TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION,
+        "segment_id": segment["segment_id"],
+        "input_sha256": draft["input_sha256"],
+        "status": "started",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "prompt_version": pipeline_module.TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
+        "response_schema_version": (
+            pipeline_module.TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
+        ),
+        "model_tier": pipeline_module.TRANSLATION_COVERAGE_REPAIR_TIER,
+        "missing_block_ids": ["body"],
+    }), encoding="utf-8")
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("current started coverage attempt must not call the model")
+
+    with pytest.raises(CompanionLaneError, match="already started"):
+        _generate_translations(
+            [segment], options=options, bundle=bundle, glossary={"entries": []},
+            protected_names=[], checkpoint_dir=checkpoint_dir, llm=forbidden_llm,
+        )
 
 
 def test_controller_seeded_empty_draft_enters_repair_only(tmp_path: Path) -> None:
@@ -3241,6 +3530,444 @@ def test_legacy_string_annotation_checkpoint_is_rerun_and_upgraded(tmp_path: Pat
     assert upgraded["schema_version"] == pipeline_module.ANNOTATION_CHECKPOINT_VERSION
 
 
+def test_annotation_prompt_projects_relevant_glossary_and_stays_below_transport_limit() -> None:
+    segment = {
+        "segment_id": "seg-0001", "block_ids": ["b1"], "title": "Gauge symmetry",
+        "start_block_id": "b1", "end_block_id": "b1",
+    }
+    blocks = [{
+        "block_id": "b1", "type": "text",
+        "text": "Gauge symmetry constrains the vacuum while SOURCE-SENTINEL remains exact.",
+    }]
+    relevant_entries = [
+        {
+            "source_term": "gauge symmetry", "target_term": "规范对称性",
+            "aliases": [], "brief_explanation": "relevant gauge entry",
+            "first_block_id": "b1", "protected_names": [],
+        },
+        {
+            "source_term": "vacuum", "target_term": "真空",
+            "aliases": [], "brief_explanation": "relevant vacuum entry",
+            "first_block_id": "elsewhere", "protected_names": [],
+        },
+    ]
+    glossary = {
+        "schema_version": "arc.companion.glossary.test",
+        "entries": [
+            *relevant_entries,
+            *[
+                {
+                    "source_term": f"unrelated-term-{index}",
+                    "target_term": f"无关术语{index}", "aliases": [],
+                    "brief_explanation": "x" * 500,
+                    "first_block_id": f"other-{index}", "protected_names": [],
+                }
+                for index in range(100)
+            ],
+        ],
+    }
+    paper_context = {
+        "schema_version": "paper-context", "paper_id": "paper", "abstract": "a" * 4_000,
+        "current_segment": {"segment_id": "seg-0001"},
+        "section_navigation": [
+            {"block_id": f"h{index}", "title": f"Heading {index}", "anchor": "n" * 500}
+            for index in range(100)
+        ],
+        "neighboring_source_anchors": [], "access": {"allow_internet": False},
+    }
+    evidence = {
+        "schema_version": "evidence", "papers": [{"evidence_id": "EVIDENCE-SENTINEL"}],
+        "citation_targets": [], "reference_catalog": [], "citer_catalog": [],
+    }
+    first_draft = {"commentary": "FIRST-DRAFT-SENTINEL 真空"}
+    resolution = {"requests": [{"needed_claim": "RESOLUTION-SENTINEL"}]}
+
+    prompt = pipeline_module._bounded_annotation_prompt(
+        segment, blocks, language="zh-CN", metadata={}, evidence=evidence,
+        glossary=glossary, protected_names=[], paper_context=paper_context,
+        domain_context=None, first_draft=first_draft, evidence_resolution=resolution,
+    )
+
+    assert len(prompt.encode("utf-8")) < pipeline_module.ANNOTATION_PROMPT_MAX_BYTES
+    assert "SOURCE-SENTINEL" in prompt
+    assert "EVIDENCE-SENTINEL" in prompt
+    assert "FIRST-DRAFT-SENTINEL" in prompt
+    assert "RESOLUTION-SENTINEL" in prompt
+    assert "relevant gauge entry" in prompt
+    assert "relevant vacuum entry" in prompt
+    assert "unrelated-term-99" not in prompt
+
+
+def test_annotation_prompt_fails_closed_when_required_source_exceeds_transport_limit() -> None:
+    segment = {"segment_id": "seg-large", "block_ids": ["b-large"], "title": "Large"}
+    blocks = [{"block_id": "b-large", "type": "text", "text": "x" * 70_000}]
+    paper_context = {
+        "section_navigation": [], "neighboring_source_anchors": [], "abstract": "",
+        "current_segment": {"segment_id": "seg-large"},
+    }
+
+    with pytest.raises(RuntimeError, match="cannot be bounded"):
+        pipeline_module._bounded_annotation_prompt(
+            segment, blocks, language="zh-CN", metadata={},
+            evidence={"papers": []}, glossary={"entries": []}, protected_names=[],
+            paper_context=paper_context, domain_context=None, first_draft=None,
+            evidence_resolution=None,
+        )
+
+
+def test_annotation_transport_projection_does_not_invalidate_semantic_checkpoint(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    fake = FakeLLM()
+    fake.annotation_barrier = threading.Barrier(1)
+    segment = {
+        "segment_id": "seg-0001", "block_ids": ["b1", "b2"],
+        "start_block_id": "b1", "end_block_id": "b2",
+    }
+    kwargs = dict(
+        options=BuildOptions(bundle.paper_id, tmp_path, workers=1), bundle=bundle,
+        evidence={"related_papers": []}, domain_context=None,
+        glossary={"entries": [{
+            "source_term": "source", "target_term": "源", "aliases": [],
+            "brief_explanation": "term", "first_block_id": "b1", "protected_names": [],
+        }]},
+        protected_names=[], checkpoint_dir=tmp_path / "projection-cache", llm=fake,
+    )
+
+    first = pipeline_module._generate_annotations([segment], **kwargs)
+    annotation_calls = len([
+        call for call in fake.calls
+        if str(call["call_label"]).startswith("companion-annotation-")
+    ])
+    monkeypatch.setattr(
+        pipeline_module, "_bounded_annotation_prompt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cache was not reused")),
+    )
+
+    second = pipeline_module._generate_annotations([segment], **kwargs)
+
+    assert second == first
+    assert len([
+        call for call in fake.calls
+        if str(call["call_label"]).startswith("companion-annotation-")
+    ]) == annotation_calls
+
+
+def test_section_review_chunks_use_rendered_utf8_bytes_and_preserve_order() -> None:
+    items = [
+        {
+            "segment": {"segment_id": f"seg-{index:04d}"},
+            "source_blocks": [{"block_id": f"b{index}", "text": "源" * 200}],
+            "translation": {"blocks": [{"block_id": f"b{index}", "text": "译" * 200}]},
+            "annotation": {"commentary": "注" * 100},
+            "context_evidence": [],
+        }
+        for index in range(4)
+    ]
+    exact_pair_bytes = len(pipeline_module.section_review_prompt(
+        {"segments": items[:2]}, language="zh-CN",
+    ).encode("utf-8"))
+
+    strict_chunks = pipeline_module._review_chunks(
+        items, language="zh-CN", max_prompt_bytes=exact_pair_bytes,
+    )
+    paired_chunks = pipeline_module._review_chunks(
+        items, language="zh-CN", max_prompt_bytes=exact_pair_bytes + 1,
+    )
+
+    assert [len(chunk) for chunk in strict_chunks] == [2, 2]
+    assert [len(chunk) for chunk in paired_chunks] == [2, 2]
+    assert [item for chunk in paired_chunks for item in chunk] == items
+    assert all(
+        len(pipeline_module.section_review_prompt(
+            {"segments": chunk}, language="zh-CN",
+        ).encode("utf-8")) < exact_pair_bytes + 1
+        for chunk in paired_chunks
+    )
+
+
+def test_section_review_chunks_fail_closed_when_one_segment_exceeds_limit() -> None:
+    item = {
+        "segment": {"segment_id": "seg-large"},
+        "source_blocks": [{"block_id": "b-large", "text": "源" * 1_000}],
+        "translation": {"blocks": []}, "annotation": {}, "context_evidence": [],
+    }
+    single_size = len(pipeline_module.section_review_prompt(
+        {"segments": [item]}, language="zh-CN",
+    ).encode("utf-8"))
+
+    with pytest.raises(RuntimeError, match=r"seg-large.*exceeding"):
+        pipeline_module._review_chunks(
+            [item], language="zh-CN", max_prompt_bytes=single_size - 1,
+        )
+
+
+def _minimal_section_review_inputs() -> tuple[
+    list[dict[str, object]],
+    dict[str, dict[str, object]],
+    dict[str, dict[str, object]],
+    dict[str, object],
+]:
+    blocks = [
+        {"block_id": f"b{index}", "type": "text", "text": f"source {index}"}
+        for index in range(2)
+    ]
+    segments = [
+        {"segment_id": f"seg-{index}", "block_ids": [f"b{index}"], "title": "Body"}
+        for index in range(2)
+    ]
+    translations = {
+        str(segment["segment_id"]): {
+            "blocks": [{"block_id": segment["block_ids"][0], "text": "译文"}]
+        }
+        for segment in segments
+    }
+    annotations = {
+        str(segment["segment_id"]): {
+            "commentary": "伴读", "explanation": "解释", "prior_work": [],
+            "later_work": [], "evidence_ids": [], "key_points": [],
+            "source_notes": [], "evidence_requests": [],
+        }
+        for segment in segments
+    }
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+    }
+    return segments, translations, annotations, document
+
+
+@pytest.mark.parametrize("invalid_mode", ["missing", "duplicate"])
+def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
+    invalid_mode: str,
+    tmp_path: Path,
+) -> None:
+    segments, translations, annotations, document = _minimal_section_review_inputs()
+    section_calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        if label.startswith("companion-section-review-"):
+            section_calls.append(label)
+            portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+            return {
+                "findings": [],
+                "reviewed_segments": [{
+                    "segment_id": item["segment"]["segment_id"],
+                    "translation": item["translation"],
+                    "annotation": item["annotation"],
+                } for item in portion["segments"]],
+            }
+        return {"patches": [], "issues": []}
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    kwargs = dict(
+        document=document, glossary={"entries": []}, protected_names=[],
+        evidence={"related_papers": []},
+        options=BuildOptions(
+            paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
+            review_context_chars=1,
+        ),
+        llm=llm, checkpoint_dir=checkpoint_dir,
+    )
+    _review(segments, translations, annotations, **kwargs)
+    assert len(section_calls) == 1
+
+    _review(segments, translations, annotations, **kwargs)
+    assert len(section_calls) == 1
+
+    checkpoint_path = checkpoint_dir / "section-reviews" / "0000.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    reviewed_segments = checkpoint["review"]["reviewed_segments"]
+    if invalid_mode == "missing":
+        checkpoint["review"]["reviewed_segments"] = reviewed_segments[:1]
+    else:
+        checkpoint["review"]["reviewed_segments"] = [
+            reviewed_segments[0], reviewed_segments[0],
+        ]
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    _review(segments, translations, annotations, **kwargs)
+
+    assert len(section_calls) == 2
+    repaired = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert {
+        item["segment_id"] for item in repaired["review"]["reviewed_segments"]
+    } == {"seg-0", "seg-1"}
+
+
+def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
+    segments, translations, annotations, document = _minimal_section_review_inputs()
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        if label.startswith("companion-section-review-"):
+            portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+            item = portion["segments"][0]
+            return {
+                "findings": [],
+                "reviewed_segments": [{
+                    "segment_id": item["segment"]["segment_id"],
+                    "translation": item["translation"],
+                    "annotation": item["annotation"],
+                }],
+            }
+        raise AssertionError("final review must not run after incomplete section coverage")
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    with pytest.raises(RuntimeError, match="did not cover every segment"):
+        _review(
+            segments, translations, annotations,
+            document=document, glossary={"entries": []}, protected_names=[],
+            evidence={"related_papers": []},
+            options=BuildOptions(
+                paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
+                review_context_chars=1,
+            ),
+            llm=llm, checkpoint_dir=checkpoint_dir,
+        )
+
+    assert not (checkpoint_dir / "section-reviews" / "0000.json").exists()
+
+
+def test_direct_review_between_soft_default_and_hard_limit_becomes_hierarchical(
+    tmp_path: Path,
+) -> None:
+    blocks = [
+        {"block_id": f"b-{index}", "type": "text", "text": "源" * 8_000}
+        for index in range(2)
+    ]
+    document = {
+        "front_matter": {}, "blocks": blocks, "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+    }
+    segments = [
+        {"segment_id": f"seg-{index}", "block_ids": [f"b-{index}"]}
+        for index in range(2)
+    ]
+    translations = {
+        f"seg-{index}": {"blocks": [{
+            "block_id": f"b-{index}", "text": "译" * 3_000,
+        }]}
+        for index in range(2)
+    }
+    annotations = {
+        f"seg-{index}": {
+            "commentary": "注" * 1_000, "explanation": "", "prior_work": [],
+            "later_work": [], "evidence_ids": [], "key_points": [],
+            "source_notes": [], "evidence_requests": [],
+        }
+        for index in range(2)
+    }
+    calls: list[tuple[str, int]] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        calls.append((label, len(prompt.encode("utf-8"))))
+        assert len(prompt.encode("utf-8")) <= pipeline_module.REVIEW_PROMPT_MAX_BYTES
+        if label.startswith("companion-section-review-"):
+            portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+            return {
+                "findings": [],
+                "reviewed_segments": [{
+                    "segment_id": item["segment"]["segment_id"],
+                    "translation": item["translation"],
+                    "annotation": item["annotation"],
+                } for item in portion["segments"]],
+            }
+        return {"patches": [], "issues": []}
+
+    _, _, audit = _review(
+        segments,
+        translations,
+        annotations,
+        document=document,
+        glossary={"entries": []},
+        protected_names=[],
+        evidence={"related_papers": []},
+        options=BuildOptions("arXiv:1234.5678", tmp_path),
+        llm=llm,
+        checkpoint_dir=tmp_path / "checkpoints",
+    )
+
+    assert audit["hierarchical"] is True
+    assert any(label.startswith("companion-section-review-") for label, _ in calls)
+    assert calls[-1][0] == "companion-final-review"
+
+
+def test_hierarchical_final_review_fails_closed_when_essential_projection_is_too_large(
+    tmp_path: Path,
+) -> None:
+    segment = {"segment_id": "seg-essential", "block_ids": ["b-essential"]}
+    block = {"block_id": "b-essential", "type": "text", "text": "source"}
+
+    with pytest.raises(RuntimeError, match="essential projection.*exceeding"):
+        pipeline_module._bounded_hierarchical_review_prompt(
+            [{
+                "section_index": 0,
+                "reviewed_segment_ids": ["seg-essential"],
+                "findings": [],
+                "patch_proposals": [],
+            }],
+            [segment],
+            blocks_by_id={"b-essential": block},
+            document={"blocks": [block]},
+            segment_payloads=[{
+                "segment": segment, "source_blocks": [block],
+                "translation": {"blocks": []}, "annotation": {},
+                "context_evidence": [],
+            }],
+            glossary={"entries": []},
+            protected_names=["N" * pipeline_module.REVIEW_PROMPT_MAX_BYTES],
+            language="zh-CN",
+            max_prompt_bytes=pipeline_module.REVIEW_PROMPT_MAX_BYTES,
+        )
+
+
+def test_recovered_section_reviews_reject_overlapping_old_chunk_topology(
+    tmp_path: Path,
+) -> None:
+    def chunk_item(segment_id: str) -> dict[str, object]:
+        return {"segment": {"segment_id": segment_id}}
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "section-reviews.recovered-from-failed-final.v1.json").write_text(
+        json.dumps({
+            "schema_version": "arc.companion.recovered-section-reviews.v1",
+            "reviewed_segment_ids": ["seg-a", "seg-b", "seg-c"],
+            "section_reviews": [
+                {
+                    "section_index": 0,
+                    "reviewed_segment_ids": ["seg-a", "seg-b"],
+                    "findings": [],
+                    "reviewed_segments": [
+                        {"segment_id": value, "translation": {}, "annotation": {}}
+                        for value in ("seg-a", "seg-b")
+                    ],
+                },
+                {
+                    "section_index": 1,
+                    "reviewed_segment_ids": ["seg-b", "seg-c"],
+                    "findings": [],
+                    "reviewed_segments": [
+                        {"segment_id": value, "translation": {}, "annotation": {}}
+                        for value in ("seg-b", "seg-c")
+                    ],
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    new_chunks = [
+        [chunk_item("seg-a")], [chunk_item("seg-b")], [chunk_item("seg-c")],
+    ]
+
+    with pytest.raises(RuntimeError, match="overlapping segment coverage"):
+        pipeline_module._load_recovered_section_reviews(checkpoint_dir, new_chunks)
+
+
 def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
     tmp_path: Path,
 ) -> None:
@@ -3277,6 +4004,7 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
         label = str(kwargs["call_label"])
         if label.startswith("companion-section-review-"):
             section_calls.append(label)
+            assert len(prompt.encode("utf-8")) <= 32 * 1024
             assert "Display equations" in prompt
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
             return {
@@ -3291,7 +4019,7 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
                 } for item in portion["segments"]],
             }
         assert label == "companion-final-review"
-        final_prompt_lengths.append(len(prompt))
+        final_prompt_lengths.append(len(prompt.encode("utf-8")))
         assert '"reviewed_segments"' not in prompt
         assert '"patch_proposals"' in prompt
         assert "PRIOR SECTION FINDINGS" not in prompt
@@ -3317,7 +4045,7 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
     assert reviewed_translations == translations
     assert reviewed_annotations["seg-0000"]["commentary"] == "审校后的伴读"
     assert audit["reviewed_segment_ids"] == [item["segment_id"] for item in segments]
-    assert final_prompt_lengths[0] < 40_000
+    assert final_prompt_lengths[0] <= 32 * 1024
     first_section_call_count = len(section_calls)
     assert first_section_call_count > 1
     assert len(list((tmp_path / "checkpoints" / "section-reviews").glob("*.json"))) == (

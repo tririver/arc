@@ -11,8 +11,11 @@ from .segmentation import build_block_inventory, build_segmentation_windows
 from .source import block_id
 
 
-GLOSSARY_VERSION = "arc.companion.glossary.v4"
+GLOSSARY_VERSION = "arc.companion.glossary.v6"
 ABSOLUTE_GLOSSARY_LIMIT = 200
+CONSOLIDATION_MAX_ENTRIES = 100
+CONSOLIDATION_PROMPT_MAX_BYTES = 60 * 1024
+CONSOLIDATION_PROMPT_TARGET_BYTES = 48 * 1024
 
 
 def glossary_entry_limit(page_count: int | None) -> int:
@@ -47,6 +50,9 @@ def generate_glossary(
         "names": protected_names,
         "page_count": page_count,
         "entry_limit": glossary_entry_limit(page_count),
+        "consolidation_max_entries": CONSOLIDATION_MAX_ENTRIES,
+        "consolidation_prompt_max_bytes": CONSOLIDATION_PROMPT_MAX_BYTES,
+        "consolidation_prompt_target_bytes": CONSOLIDATION_PROMPT_TARGET_BYTES,
     })
     final_path = checkpoint_dir / "glossary.json"
     if final_path.is_file() and not force:
@@ -67,11 +73,39 @@ def generate_glossary(
         start = int(window["start_ordinal"]) - 1
         end = int(window["end_ordinal"])
         selected = canonical_records[start:end]
-        input_hash = sha256_json({"blocks": selected, "language": language, "names": protected_names})
+        input_hash = sha256_json({
+            "glossary_version": GLOSSARY_VERSION,
+            "blocks": selected,
+            "language": language,
+            "names": protected_names,
+            "entry_limit": entry_limit,
+        })
         if path.is_file() and not force:
             cached = _optional_json(path)
-            if cached.get("input_sha256") == input_hash and isinstance(cached.get("result"), dict):
-                return index, cached["result"]
+            cached_result = cached.get("result")
+            cached_hash = cached.get("input_sha256")
+            legacy_hash = sha256_json({
+                "blocks": selected,
+                "language": language,
+                "names": protected_names,
+            })
+            reusable_legacy = (
+                entry_limit == ABSOLUTE_GLOSSARY_LIMIT
+                and cached_hash == legacy_hash
+            )
+            if (
+                cached_hash == input_hash or reusable_legacy
+            ) and isinstance(cached_result, dict):
+                # v4 window prompts used the same extraction contract but did
+                # not bind the page-scaled limit into their cache key. Only
+                # migrate them at the unchanged absolute limit; lower limits
+                # must regenerate rather than silently reuse an overlong list.
+                if reusable_legacy:
+                    write_json(path, {
+                        "input_sha256": input_hash,
+                        "result": cached_result,
+                    })
+                return index, cached_result
         result = call_model(
             glossary_prompt(
                 selected,
@@ -95,16 +129,16 @@ def generate_glossary(
             candidates[index] = value
 
     ordered = [candidates[index] for index in sorted(candidates)]
-    consolidated = call_model(
-        glossary_consolidation_prompt(
-            ordered,
-            language=language,
-            protected_names=protected_names,
-            entry_limit=entry_limit,
-        ),
-        GLOSSARY_SCHEMA,
-        checkpoint_dir / "llm" / "glossary" / "consolidation",
-        "companion-glossary-consolidation",
+    consolidated = _consolidate_candidates(
+        ordered,
+        blocks=blocks,
+        language=language,
+        protected_names=protected_names,
+        entry_limit=entry_limit,
+        checkpoint_dir=checkpoint_dir,
+        workers=workers,
+        force=force,
+        call_model=call_model,
     )
     entries = _normalize_entries(consolidated.get("entries") or [], blocks)
     entries = _deduplicate(entries)
@@ -121,6 +155,386 @@ def generate_glossary(
     }
     write_json(final_path, output)
     return output
+
+
+def _consolidate_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    blocks: list[dict[str, Any]],
+    language: str,
+    protected_names: list[str],
+    entry_limit: int,
+    checkpoint_dir: Path,
+    workers: int,
+    force: bool,
+    call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Merge window glossaries without constructing one unbounded model prompt."""
+    entries = [
+        entry
+        for candidate in candidates
+        for entry in candidate.get("entries") or []
+        if isinstance(entry, dict)
+    ]
+    _validate_consolidation_entry_transport(
+        entries,
+        language=language,
+        protected_names=protected_names,
+    )
+    if _consolidation_candidates_fit(
+        candidates,
+        language=language,
+        protected_names=protected_names,
+        output_limit=entry_limit,
+    ):
+        return _consolidate_node(
+            candidates,
+            blocks=blocks,
+            language=language,
+            protected_names=protected_names,
+            entry_limit=entry_limit,
+            output_limit=entry_limit,
+            cache_path=None,
+            artifact_dir=checkpoint_dir / "llm" / "glossary" / "consolidation",
+            call_label="companion-glossary-consolidation",
+            stage="final",
+            force=force,
+            call_model=call_model,
+        )
+
+    level = 1
+    current = entries
+    while True:
+        if len(current) <= entry_limit:
+            return {"entries": current}
+        if _consolidation_input_fits(
+            current,
+            language=language,
+            protected_names=protected_names,
+            output_limit=entry_limit,
+        ):
+            return _consolidate_node(
+                [{"entries": current}],
+                blocks=blocks,
+                language=language,
+                protected_names=protected_names,
+                entry_limit=entry_limit,
+                output_limit=entry_limit,
+                cache_path=(
+                    checkpoint_dir / "glossary-consolidation"
+                    / f"level-{level:04d}" / "0001.json"
+                ),
+                artifact_dir=(
+                    checkpoint_dir / "llm" / "glossary" / "consolidation"
+                    / f"level-{level:04d}" / "node-0001"
+                ),
+                call_label=f"companion-glossary-consolidation-l{level:04d}-n0001",
+                stage="final",
+                force=force,
+                call_model=call_model,
+            )
+
+        batches = _consolidation_batches(
+            current,
+            language=language,
+            protected_names=protected_names,
+            entry_limit=entry_limit,
+        )
+
+        def merge_node(node: int, batch: list[dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+            output_limit = min(entry_limit, max(1, len(batch) // 2))
+            return node, _consolidate_node(
+                [{"entries": batch}],
+                blocks=blocks,
+                language=language,
+                protected_names=protected_names,
+                entry_limit=entry_limit,
+                output_limit=output_limit,
+                cache_path=(
+                    checkpoint_dir / "glossary-consolidation"
+                    / f"level-{level:04d}" / f"{node:04d}.json"
+                ),
+                artifact_dir=(
+                    checkpoint_dir / "llm" / "glossary" / "consolidation"
+                    / f"level-{level:04d}" / f"node-{node:04d}"
+                ),
+                call_label=(
+                    f"companion-glossary-consolidation-l{level:04d}-n{node:04d}"
+                ),
+                stage="intermediate",
+                force=force,
+                call_model=call_model,
+            )
+
+        merged: dict[int, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(max(1, workers), len(batches))) as executor:
+            futures = {
+                executor.submit(merge_node, node, batch): node
+                for node, batch in enumerate(batches, 1)
+            }
+            for future in as_completed(futures):
+                node, value = future.result()
+                merged[node] = value
+        following = [
+            entry
+            for node in sorted(merged)
+            for entry in merged[node].get("entries") or []
+        ]
+        if following and len(following) >= len(current):
+            raise RuntimeError("hierarchical glossary consolidation did not reduce its input")
+        current = following
+        level += 1
+
+
+def _consolidate_node(
+    candidates: list[dict[str, Any]],
+    *,
+    blocks: list[dict[str, Any]],
+    language: str,
+    protected_names: list[str],
+    entry_limit: int,
+    output_limit: int,
+    cache_path: Path | None,
+    artifact_dir: Path,
+    call_label: str,
+    stage: str,
+    force: bool,
+    call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+) -> dict[str, Any]:
+    input_entry_count = sum(
+        1
+        for candidate in candidates
+        for entry in candidate.get("entries") or []
+        if isinstance(entry, dict)
+    )
+    cache_key = sha256_json({
+        "glossary_version": GLOSSARY_VERSION,
+        "stage": stage,
+        "candidates": candidates,
+        "language": language,
+        "protected_names": protected_names,
+        "entry_limit": entry_limit,
+        "output_limit": output_limit,
+        "max_entries": CONSOLIDATION_MAX_ENTRIES,
+        "prompt_max_bytes": CONSOLIDATION_PROMPT_MAX_BYTES,
+        "prompt_target_bytes": CONSOLIDATION_PROMPT_TARGET_BYTES,
+    })
+    if cache_path is not None and cache_path.is_file() and not force:
+        cached = _optional_json(cache_path)
+        cached_result = cached.get("result")
+        if cached.get("input_sha256") == cache_key and isinstance(cached_result, dict):
+            raw_entries = cached_result.get("entries")
+            if isinstance(raw_entries, list) and all(
+                isinstance(entry, dict) for entry in raw_entries
+            ):
+                try:
+                    normalized = _normalize_entries(raw_entries, blocks)
+                    normalized = _deduplicate(normalized)[:output_limit]
+                    _restore_protected_names(normalized, protected_names)
+                    _validate_protected_names(normalized, protected_names)
+                except (KeyError, TypeError, ValueError, RuntimeError):
+                    pass
+                else:
+                    if input_entry_count == 0 or normalized:
+                        return {"entries": normalized}
+
+    prompt = glossary_consolidation_prompt(
+        candidates,
+        language=language,
+        protected_names=protected_names,
+        entry_limit=output_limit,
+    )
+    prompt_bytes = len(prompt.encode("utf-8"))
+    if prompt_bytes >= CONSOLIDATION_PROMPT_MAX_BYTES:
+        raise RuntimeError(
+            f"glossary consolidation node {call_label} requires a {prompt_bytes}-byte "
+            f"prompt, exceeding the strict {CONSOLIDATION_PROMPT_MAX_BYTES}-byte limit"
+        )
+    result = call_model(
+        prompt,
+        GLOSSARY_SCHEMA,
+        artifact_dir,
+        call_label,
+    )
+    entries = _normalize_entries(result.get("entries") or [], blocks)
+    entries = _deduplicate(entries)[:output_limit]
+    _restore_protected_names(entries, protected_names)
+    _validate_protected_names(entries, protected_names)
+    if input_entry_count > 0 and not entries:
+        raise RuntimeError(
+            f"glossary consolidation node {call_label} returned no usable entries "
+            f"for {input_entry_count} non-empty input entries"
+        )
+    value = {"entries": entries}
+    if cache_path is not None:
+        write_json(cache_path, {"input_sha256": cache_key, "result": value})
+    return value
+
+
+def _consolidation_input_fits(
+    entries: list[dict[str, Any]],
+    *,
+    language: str,
+    protected_names: list[str],
+    output_limit: int,
+) -> bool:
+    return (
+        len(entries) <= CONSOLIDATION_MAX_ENTRIES
+        and _consolidation_prompt_bytes(
+            [{"entries": entries}],
+            language=language,
+            protected_names=protected_names,
+            output_limit=output_limit,
+        ) < CONSOLIDATION_PROMPT_TARGET_BYTES
+    )
+
+
+def _consolidation_candidates_fit(
+    candidates: list[dict[str, Any]],
+    *,
+    language: str,
+    protected_names: list[str],
+    output_limit: int,
+) -> bool:
+    entry_count = sum(
+        1
+        for candidate in candidates
+        for entry in candidate.get("entries") or []
+        if isinstance(entry, dict)
+    )
+    return (
+        entry_count <= CONSOLIDATION_MAX_ENTRIES
+        and _consolidation_prompt_bytes(
+            candidates,
+            language=language,
+            protected_names=protected_names,
+            output_limit=output_limit,
+        ) < CONSOLIDATION_PROMPT_TARGET_BYTES
+    )
+
+
+def _consolidation_prompt_bytes(
+    candidates: list[dict[str, Any]],
+    *,
+    language: str,
+    protected_names: list[str],
+    output_limit: int,
+) -> int:
+    prompt = glossary_consolidation_prompt(
+        candidates,
+        language=language,
+        protected_names=protected_names,
+        entry_limit=output_limit,
+    )
+    return len(prompt.encode("utf-8"))
+
+
+def _consolidation_batches(
+    entries: list[dict[str, Any]],
+    *,
+    language: str,
+    protected_names: list[str],
+    entry_limit: int,
+) -> list[list[dict[str, Any]]]:
+    _validate_consolidation_entry_transport(
+        entries,
+        language=language,
+        protected_names=protected_names,
+    )
+
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for entry in entries:
+        proposed = [*current, entry]
+        proposed_output_limit = min(entry_limit, max(1, len(proposed) // 2))
+        if current and (
+            len(proposed) > CONSOLIDATION_MAX_ENTRIES
+            or _consolidation_prompt_bytes(
+                [{"entries": proposed}],
+                language=language,
+                protected_names=protected_names,
+                output_limit=proposed_output_limit,
+            ) >= CONSOLIDATION_PROMPT_TARGET_BYTES
+        ):
+            batches.append(current)
+            current = [entry]
+        else:
+            current = proposed
+    if current:
+        batches.append(current)
+
+    # Pair ordinary singleton nodes when the complete rendered prompt still
+    # fits the target. A byte-heavy singleton may remain alone; the hard cap is
+    # checked below and sibling nodes still provide count reduction.
+    index = 0
+    while len(batches) > 1 and index < len(batches):
+        if len(batches[index]) != 1:
+            index += 1
+            continue
+        if index + 1 < len(batches):
+            proposed = [*batches[index], batches[index + 1][0]]
+            if _consolidation_prompt_bytes(
+                [{"entries": proposed}],
+                language=language,
+                protected_names=protected_names,
+                output_limit=min(entry_limit, max(1, len(proposed) // 2)),
+            ) < CONSOLIDATION_PROMPT_TARGET_BYTES:
+                batches[index].append(batches[index + 1].pop(0))
+                if not batches[index + 1]:
+                    batches.pop(index + 1)
+            index += 1
+            continue
+        proposed = [batches[index - 1][-1], *batches[index]]
+        if _consolidation_prompt_bytes(
+            [{"entries": proposed}],
+            language=language,
+            protected_names=protected_names,
+            output_limit=min(entry_limit, max(1, len(proposed) // 2)),
+        ) < CONSOLIDATION_PROMPT_TARGET_BYTES:
+            batches[index].insert(0, batches[index - 1].pop())
+            if not batches[index - 1]:
+                batches.pop(index - 1)
+        index += 1
+    if any(len(batch) > CONSOLIDATION_MAX_ENTRIES for batch in batches):
+        raise RuntimeError(
+            "glossary consolidation batch exceeds the "
+            f"{CONSOLIDATION_MAX_ENTRIES}-entry limit"
+        )
+    if any(
+        _consolidation_prompt_bytes(
+            [{"entries": batch}],
+            language=language,
+            protected_names=protected_names,
+            output_limit=min(entry_limit, max(1, len(batch) // 2)),
+        ) >= CONSOLIDATION_PROMPT_MAX_BYTES
+        for batch in batches
+    ):
+        raise RuntimeError("glossary consolidation batch exceeds the strict prompt byte limit")
+    return batches
+
+
+def _validate_consolidation_entry_transport(
+    entries: list[dict[str, Any]],
+    *,
+    language: str,
+    protected_names: list[str],
+) -> None:
+    oversized = [
+        index
+        for index, entry in enumerate(entries, 1)
+        if _consolidation_prompt_bytes(
+            [{"entries": [entry]}],
+            language=language,
+            protected_names=protected_names,
+            output_limit=1,
+        ) >= CONSOLIDATION_PROMPT_MAX_BYTES
+    ]
+    if oversized:
+        raise RuntimeError(
+            "glossary consolidation contains an entry whose essential content exceeds "
+            f"the strict {CONSOLIDATION_PROMPT_MAX_BYTES}-byte prompt limit: "
+            f"entry {oversized[0]}"
+        )
 
 
 def _normalize_entries(entries: list[Any], blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:

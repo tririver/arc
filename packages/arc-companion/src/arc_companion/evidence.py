@@ -273,9 +273,28 @@ def validate_registry(records: Iterable[Any]) -> dict[str, dict[str, Any]]:
         record = validate_evidence_record(raw)
         evidence_id = str(record["evidence_id"])
         if evidence_id in registry:
-            raise EvidenceProvenanceError(f"duplicate evidence ID: {evidence_id}")
+            if (
+                _evidence_provenance_payload(registry[evidence_id])
+                == _evidence_provenance_payload(record)
+            ):
+                continue
+            raise EvidenceProvenanceError(f"conflicting duplicate evidence ID: {evidence_id}")
         registry[evidence_id] = record
     return registry
+
+
+def _evidence_provenance_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the immutable source/content fields that define an evidence ID."""
+    pieces = record.get("snippets")
+    if pieces is None:
+        pieces = record.get("blocks")
+    return {
+        "relation": record.get("relation"),
+        "paper_id": record.get("paper_id"),
+        "evidence_level": record.get("evidence_level"),
+        "content": pieces if pieces else str(record.get("abstract") or ""),
+        "source_descriptor": record.get("source_descriptor"),
+    }
 
 
 def validate_cited_ids(values: Any, records: Iterable[Any]) -> list[str]:
