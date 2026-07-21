@@ -36,7 +36,7 @@ def _bundle() -> SourceBundle:
     )
 
 
-def test_skip_translation_defaults_off_and_changes_build_fingerprint(tmp_path: Path) -> None:
+def test_skip_translation_defaults_off_without_changing_source_fingerprint(tmp_path: Path) -> None:
     bundle = _bundle()
     evidence = {"records": []}
     translated = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "translated")
@@ -48,7 +48,7 @@ def test_skip_translation_defaults_off_and_changes_build_fingerprint(tmp_path: P
 
     assert translated.skip_translation is False
     assert commentary_only.skip_translation is True
-    assert _fingerprint(bundle, translated, evidence=evidence) != _fingerprint(
+    assert _fingerprint(bundle, translated, evidence=evidence) == _fingerprint(
         bundle,
         commentary_only,
         evidence=evidence,
@@ -159,10 +159,12 @@ def test_commentary_only_fidelity_rejects_translation_layer_mutations(
 def test_legacy_pipeline_skip_translation_keeps_commentary_and_pdf(tmp_path: Path) -> None:
     bundle = _bundle()
     labels: list[str] = []
+    prompts: list[str] = []
 
-    def llm(_prompt: str, **kwargs):
+    def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
         labels.append(label)
+        prompts.append(prompt)
         if "translation" in label:
             raise AssertionError(f"translation call was submitted: {label}")
         if label.startswith("companion-segmentation-"):
@@ -191,6 +193,7 @@ def test_legacy_pipeline_skip_translation_keeps_commentary_and_pdf(tmp_path: Pat
         annotation_language="en",
         workers=2,
         skip_translation=True,
+        regenerate_lanes=("glossary",),
     )
     result = build_companion(
         options,
@@ -203,10 +206,21 @@ def test_legacy_pipeline_skip_translation_keeps_commentary_and_pdf(tmp_path: Pat
     assert result["ok"], result
     checkpoint = Path(result["data"]["checkpoint_dir"])
     assert not any("translation" in label for label in labels)
+    assert not any("glossary" in label for label in labels)
+    assert all("GLOSSARY:\n" not in prompt for prompt in prompts)
     assert any(label.startswith("companion-annotation-") for label in labels)
     assert any(label.startswith("companion-commentary-review-") for label in labels)
     assert not list(checkpoint.rglob("translations*"))
     assert not (checkpoint / "llm" / "translation").exists()
+    reuse_plan = json.loads((checkpoint / "reuse-plan.json").read_text())
+    glossary_entry = next(item for item in reuse_plan["entries"] if item["lane"] == "glossary")
+    translation_entry = next(item for item in reuse_plan["entries"] if item["lane"] == "translation")
+    assert glossary_entry["status"] == "skipped"
+    assert glossary_entry["reason"] == "glossary_disabled_for_same_language_source"
+    assert glossary_entry["estimated_provider_calls"] == 0
+    assert translation_entry["status"] == "skipped"
+    reader_final = json.loads((checkpoint / "reader-final.json").read_text())
+    assert reader_final["final_overrides"]["glossary"] == {}
     assert Path(result["data"]["output_pdf"]).is_file()
     tex = Path(result["data"]["output_tex"]).read_text(encoding="utf-8")
     manifest = json.loads(
@@ -387,9 +401,9 @@ def test_hierarchical_commentary_review_uses_relevant_glossary_and_checkpoints(
     _review(llm=review, **kwargs)
 
     assert len(prompts) == 2
-    assert "RELEVANT" in prompts[0]
-    assert "UNRELATED-" not in prompts[0]
-    assert "RELEVANT" not in prompts[1]
+    assert all("GLOSSARY" not in prompt for prompt in prompts)
+    assert all("RELEVANT" not in prompt for prompt in prompts)
+    assert all("UNRELATED-" not in prompt for prompt in prompts)
     checkpoints = sorted((tmp_path / "checkpoint" / "commentary-reviews").glob("*.json"))
     assert len(checkpoints) == 2
     assert all(json.loads(path.read_text())["input_sha256"] for path in checkpoints)

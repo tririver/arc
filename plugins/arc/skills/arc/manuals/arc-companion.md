@@ -3,15 +3,15 @@
 `arc-companion` builds a source-faithful reading companion for a paper, lecture
 note, or book. It consumes a rich source plus its paired PDF through
 `arc-paper`, runs chapter-scoped stateful generation through `arc-llm`, and
-renders and validates the PDF deterministically. The core workflow is CLI-only
-and portable across supported agent hosts.
+renders and validates both a PDF and a static-web reader deterministically. The
+core workflow is CLI-only and portable across supported agent hosts.
 
 Chapter workers use `arc-paper-worker` by default for deterministic access to
 the shared paper cache and run overlay. They do not inherit the user's MCP,
 skills, plugins, rules, or extra CLIs unless the run explicitly enables the
-high-risk `inherit_host_tools` option. Imported external files must pass
-through `arc-paper-worker parse` before the companion may cite them as ARC
-evidence.
+high-risk `inherit_host_tools` option. When internet access is enabled, the
+commentary agent may use host search and `arc-paper-worker` directly in its
+generation turn.
 
 ## Phase 1: Source and Structure
 
@@ -58,15 +58,19 @@ Useful flags:
 - `--refresh`: refresh remote inputs; mutually exclusive with `--recache`.
 - `--idle-timeout-seconds <seconds>`: override provider inactivity timeout.
 - `--regenerate-commentary`: keep reusable translations and rebuild commentary.
+- `--no-internet`: disable host search; commentary may cite only prompt-supplied
+  sources or local ARC cache records that have usable URLs.
 - `--skip-translation`: omit translation only after the workflow agent has
   confirmed from beginning, middle, and end body samples that the source and
-  target have the same base language.
+  target have the same base language. This also disables bilingual glossary
+  generation, reuse, migration, projection, prompt context, and output; a
+  source Index remains source-only content.
 - `--stop-after-first-chapter`: schedule only the first substantive chapter.
 - `--domain-id` or `--domain-manifest`: reuse one explicitly named domain;
   companion does not discover or build one.
 
 `workers` is one global LLM-call concurrency budget shared by chapter
-preparation, translation, commentary, evidence, and review. Changing it does
+preparation, translation, commentary, and review. Changing it does
 not invalidate content checkpoints.
 
 The CLI deliberately performs no automatic language detection. The agent
@@ -84,8 +88,17 @@ Inspect and validate without changing generation state:
 
 ```bash
 arc-companion status --project-dir <dir> --json
+arc-companion render-web --project-dir <dir> --json
 arc-companion validate --project-dir <dir> --json
 ```
+
+Status includes `current_phase`, `wait_reason`, build-lock owner PID/start
+identity, active/queued/draining call counts, `last_progress_at`, and persisted
+per-phase elapsed time. A stale lock-file payload is diagnostic only; the
+reported `active` field comes from the OS lock.
+
+`render-web` manually rebuilds the static reader from durable checkpoints; it
+does not repeat generation calls. `validate` checks both the PDF and web bundle.
 
 ### Step 2: Resume a supervised call
 
@@ -121,6 +134,11 @@ The watch returns for inspection; it does not pause or cancel the build.
 
 ### Step 1: Build the global glossary
 
+Skip this step completely with `--skip-translation`. Do not inspect, migrate,
+project, or expose a bilingual glossary. Record an explicit glossary
+regeneration request as a zero-call `skipped` lane in the reuse plan, while
+leaving any existing cache files untouched for a future translated build.
+
 If a real Index exists, preserve its complete hierarchy: every main entry,
 subentry, page or range, `see`, and `see also`. There is no entry cap. Add
 standard target-language terms and short explanations in bounded batches
@@ -131,13 +149,16 @@ Without an Index, use the concise terminology policy: at most 50 entries for
 documents through 50 pages, 100 through 100 pages, and 200 for longer documents
 or unknown page counts. Personal names remain in Latin script.
 
-### Step 2: Project terms to chapters
+### Step 2: Project terms to segments
 
-A deterministic scanner uses only the chapter's source blocks plus Index page
-intersection. It does not scan evidence or generated prose. A matching subentry
-retains its parent. `chapter-glossary.json` stores every match. Prompts always
-carry a compact source-to-target map; detailed explanations are block-local.
-Mappings over 60 KiB are split into stateful setup turns without dropping terms.
+A deterministic scanner uses only the current segment's original source blocks.
+It does not scan sources or generated prose. Matching uses NFKC, case folding,
+and Latin-letter/digit word boundaries. Source aliases are supported, and a
+matching Index subentry retains its parent lineage. The translation and
+commentary lanes receive the same ordered projection from the whole-document
+glossary: canonical source and target terms plus only necessary aliases,
+explanations, and protected names. These are the only two glossary levels; no
+intermediate projection artifact or preparatory call is created.
 
 ### Step 3: Prepare guides and segments
 
@@ -149,8 +170,8 @@ motivation, contents, section logic, document position, prerequisites, and
 supplementary reading.
 
 Supplementary sources are deduplicated against the bibliography by DOI, arXiv
-ID, and normalized title. Only controller-verified additions may appear, under
-an explicit supplementary-reading label.
+ID, and normalized title. Only additions whose primary page was actually read
+may appear, under an explicit supplementary-reading label.
 
 ## Phase 4: Stateful Chapter Lanes
 
@@ -161,18 +182,21 @@ and commentary uses an independent high-tier session. The lanes may run in
 parallel, while each advances strictly by segment order. With
 `--skip-translation`, the translation lane is disabled completely: no
 translation session, provider call, ledger, checkpoint, review overlay, or
-migrated translation artifact is created. Guide, segmentation, glossary,
-commentary, evidence resolution, and companion review are unchanged.
+migrated translation artifact is created. Guide, segmentation, commentary, and
+companion review continue normally; bilingual glossary data is absent from
+commentary and review prompts and from output.
 Review uses its commentary-only contract and rejects any proposed translation
 patch. Legacy migration records a receipt saying that prior translations were
 not migrated. Both chaptered builds and the legacy non-chaptered path support
 this mode. Omitting the flag preserves the normal two-lane behavior.
 
-The generation bootstrap carries fixed rules, guide, structure, chapter
-glossary, and first source segment. Delta turns carry only the current segment,
-block terms and evidence, cursor, source hash, and short instruction. Models do
-not read project files. The static prefix is an audit hash, not a substitute for
-the explicit bootstrap.
+The generation bootstrap carries fixed rules, a compact chapter descriptor,
+guide, static whole-document navigation, capability instructions, and the first
+source segment. Delta turns carry only the current segment, its glossary
+projection when translation is enabled, neighboring source anchors, bounded
+sources already available for that segment, cursor, source hash, and a short
+instruction. Models do not read project files. The static prefix is an audit
+hash, not a substitute for the explicit bootstrap.
 
 Every turn has a stable idempotency key. A repeated accepted turn replays its
 recorded response without another provider call. The lane ledger records logical
@@ -181,23 +205,42 @@ native ID, usage, and validation receipt.
 
 ### Step 2: Validate before advancement
 
-Each segment moves through `pending`, `submitted`, `schema_valid`,
+Each paid call moves through `prepared/not_submitted`, `submitted`,
+`response_received`, and `accepted`; segment validation moves through `pending`, `schema_valid`,
 `invariant_valid`, and `accepted`. ARC performs local JSON repair first, then
 may send one aggregated correction turn in the same session. Validation covers
 source order, block coverage, opaque tokens, language, protected names, and
-registered evidence. Acceptance atomically updates the ledger and submits the
+direct-citation structure. Acceptance atomically updates the ledger and submits the
 next block without placing the invoking agent in the critical path.
 
-Commentary may request a bounded evidence round for its current segment. Only
-controller-captured, auditable sources support external claims. Unsupported
-claims are omitted, and evidence work cannot move behind the accepted cursor.
+At the same accepted boundary, ARC atomically publishes a refreshed reader
+snapshot and hashed static bundle. Readers either see the previous complete
+bundle or the new complete bundle, never a partially written update. A failed
+web refresh does not discard the last valid bundle; run `render-web` to refresh
+it manually after the underlying issue is fixed.
+
+An internet-enabled commentary agent searches, reads, writes, and cites sources
+within one generation turn. It should prefer papers, publishers, and official
+primary pages, and must not use search-results pages or snippet-only aggregators
+as final URLs. `commentary_sources` supports facts in explanation/commentary;
+each `prior_work` or `later_work` item carries its own `sources`. Every source
+requires a title, an HTTP(S) URL, and a reader-understandable locator, with at
+most three distinct sources per claim. ARC validates structure and duplicate
+sources only; it does not register claims or perform a second generation pass.
+In `--no-internet` mode, unsupported external claims must be omitted.
+
+Within one native chapter session, the commentary prompt asks the model to use
+the existing conversation and prioritize information not already explained.
+Delta turns do not resend old commentary. ARC does not create or persist
+commentary summaries, covered points, or similarity checks. A rollover or
+restart carries only hash-based continuity, so modest repetition is acceptable.
 
 ### Step 3: Roll over safely
 
 At an accepted boundary, start a new generation when a session reaches 70% of
 its known context window; use a conservative 128k-token estimate if unknown.
-Send fixed context and a bounded continuity capsule, not the accepted source
-prefix. If an earlier accepted block changes, retain the unchanged prefix,
+Send fixed context and a hash-based continuity capsule, not accepted source or
+commentary prose. If an earlier accepted block changes, retain the unchanged prefix,
 invalidate the suffix, and rotate generation.
 
 ## Phase 5: Interactive Review and Rendering
@@ -206,7 +249,8 @@ invalidate the suffix, and rotate generation.
 
 With `--stop-after-first-chapter`, ARC must not schedule chapter two. It returns
 `first_chapter_ready` only after the first substantive chapter's guide,
-all enabled lanes, evidence, review, typesetting, and PDF validation complete.
+all enabled lanes, review, PDF typesetting, static-web publication, and
+validation complete.
 Rerun without the flag after approval. The accepted first chapter is frozen and
 cannot be silently rewritten by final consistency review. Its freeze record
 includes the translation mode and uses a null translation hash in skip mode.
@@ -221,19 +265,46 @@ followed by commentary, with no translation layer. Styling, not visible
 controller labels, identifies layers: reader text must not contain `译文`,
 `伴读`, or `本段解释`; use `解释` when needed.
 
+When translation is enabled, place the PDF glossary after references and before
+the document end. In the single static `index.html`, place it once as the final
+`#glossary` section and add its link after chapter navigation. Lazy-mount a
+large glossary when its link is used or it approaches the viewport; hash
+navigation and restored reading position must still work.
+
+Mark matched source terms, source aliases, and target terms in original,
+translation, and commentary text with low-saturation blue-gray text. Hover or
+keyboard focus shows the canonical `source ↔ target` pair as a plain-text,
+accessible tooltip. Do not split math, URLs, citation/link text, or KaTeX DOM.
+
 Source, guides, translations, commentary, and glossary use sans-serif text.
 CJK fallbacks are Noto Sans CJK SC, Source Han Sans SC/CN, then
 FandolHei-Regular. Mathematics and formula `\\text{}` remain LaTeX serif.
 Invisible manifest or TeX markers validate hierarchy.
 
+Direct citations render with the source title linked to its URL and the locator
+visible to the reader. The source manifest preserves each segment's citation
+objects unchanged, including claim association.
+
+The static reader is a self-contained directory rooted at `reader/index.html`.
+It uses only manifest-declared local JavaScript, CSS, KaTeX, font, and media
+files; viewing it must not fetch CDN or other network resources. Its snapshot
+and data script are content-addressed, and publishing the HTML entry point is
+the final atomic step.
+
 `arc-companion validate` checks exact coverage, glossary completeness, guide
 placement, formulas, figures, tables, links, names, accepted ledgers, searchable
 text, fonts, clipping, and overlap. In skip mode it also rejects translation IDs
-in the manifest and translation markers in TeX. Deliver only the validated full
-PDF.
+in the manifest and translation markers in TeX. It additionally validates web
+manifest containment and hashes, offline asset closure, snapshot coverage, and
+HTML source/translation/commentary ordering. Deliver the validated full PDF and
+static reader; normal non-JSON build output continues to print the PDF path.
 
 Create a reproducibility package only when explicitly requested:
 
 ```bash
 arc-companion package --project-dir <dir> --json
 ```
+
+The package contains the PDF/TeX validation set and every web-manifest file,
+including the HTML entry point, snapshot, JavaScript, CSS, local KaTeX/fonts,
+and copied media. Packaging rejects escaping paths or hash mismatches.

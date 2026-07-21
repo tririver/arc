@@ -14,18 +14,19 @@
     section_logic: "章节逻辑", book_position: "全文位置", prerequisites: "预备知识",
     explanation: "解释", prior_work: "此前工作", later_work: "后续工作",
     waiting: "尚在生成，刷新页面后将显示已通过校验的内容。", translationPending: "译文生成中",
-    companionPending: "伴读生成中", glossary: "全文词汇表", status: "生成状态"
+    companionPending: "伴读生成中", glossary: "全文术语表", status: "生成状态", sourceAppendix: "原文附录"
   } : {
     contents: "Contents", guide: "Chapter guide", motivation: "Motivation", main_content: "Main content",
     section_logic: "Section logic", book_position: "Position", prerequisites: "Prerequisites",
     explanation: "Explanation", prior_work: "Prior work", later_work: "Later work",
     waiting: "Generation is in progress. Refresh to show newly accepted material.", translationPending: "Translation pending",
-    companionPending: "Companion pending", glossary: "Glossary", status: "Build status"
+    companionPending: "Companion pending", glossary: "Glossary", status: "Build status", sourceAppendix: "Source appendix"
   };
   const chapterNodes = new Map();
   const chapterData = new Map((snapshot.chapters || []).map(chapter => [chapter.chapter_id, chapter]));
   const readingPositionKey = `arc-reader-anchor:${safeId(snapshot.paper_id || snapshot.title || "reader")}`;
   let readingObserver = null;
+  let glossaryNode = null;
 
   restoreSidebar();
   toggle.addEventListener("click", () => setSidebar(!app.classList.contains("sidebar-collapsed")));
@@ -68,6 +69,21 @@
       if (!(chapter.segments || []).length) item.append(element("div", labels.waiting, "pending"));
       list.append(item);
     });
+    if (glossaryEnabled()) {
+      const item = document.createElement("li");
+      const link = element("a", labels.glossary);
+      link.href = "#glossary";
+      link.dataset.glossary = "true";
+      link.addEventListener("click", event => {
+        event.preventDefault();
+        mountGlossary();
+        rememberAnchor("glossary");
+        requestAnimationFrame(() => document.getElementById("glossary")?.scrollIntoView({behavior: "smooth", block: "start"}));
+        if (window.matchMedia("(max-width: 760px)").matches) setSidebar(false);
+      });
+      item.append(link);
+      list.append(item);
+    }
   }
 
   function renderMain() {
@@ -82,11 +98,10 @@
     status.append(element("span", `${(coverage.annotation_segment_ids || []).length}/${(coverage.segment_ids || []).length} companion`, "status-pill"));
     header.append(status);
     main.append(header);
-    renderGlossary();
     const chapters = snapshot.chapters || [];
     if (!chapters.length) {
       main.append(element("div", labels.waiting, "empty-reader"));
-      return;
+      if (!(snapshot.appendices || []).length && !glossaryEnabled()) return;
     }
     chapters.forEach((chapter, index) => {
       const holder = document.createElement("section");
@@ -99,23 +114,62 @@
       main.append(holder);
       if (index < 2) mountChapter(chapter.chapter_id);
     });
+    (snapshot.appendices || []).forEach(appendix => main.append(renderAppendix(appendix)));
+    prepareGlossary();
     lazyMountChapters();
   }
 
-  function renderGlossary() {
-    if (!(snapshot.glossary || []).length) return;
-    const details = document.createElement("details");
-    details.className = "glossary";
-    details.append(element("summary", labels.glossary));
+  function glossaryEnabled() {
+    return snapshot.translation_mode === "enabled" && (snapshot.glossary || []).length > 0;
+  }
+
+  function prepareGlossary() {
+    if (!glossaryEnabled()) return;
+    glossaryNode = document.createElement("section");
+    glossaryNode.id = "glossary";
+    glossaryNode.className = "glossary glossary-placeholder";
+    glossaryNode.append(element("h2", labels.glossary));
+    main.append(glossaryNode);
+    if (String(location.hash || "") === "#glossary") mountGlossary();
+    if (!("IntersectionObserver" in window)) { mountGlossary(); return; }
+    const observer = new IntersectionObserver(entries => {
+      if (!entries.some(entry => entry.isIntersecting)) return;
+      mountGlossary();
+      observer.disconnect();
+    }, {rootMargin: "1000px 0px"});
+    observer.observe(glossaryNode);
+  }
+
+  function mountGlossary() {
+    if (!glossaryNode || glossaryNode.dataset.mounted) return;
+    glossaryNode.dataset.mounted = "true";
+    glossaryNode.classList.remove("glossary-placeholder");
+    const heading = element("h2", labels.glossary);
     const list = document.createElement("dl");
     list.className = "glossary-list";
     snapshot.glossary.forEach(entry => {
-      list.append(element("dt", entry.source || ""));
-      list.append(element("dd", entry.target || "", "glossary-target"));
+      const source = document.createElement("dt");
+      source.append(termElement(entry.source || "", entry));
+      const target = document.createElement("dd");
+      target.className = "glossary-target";
+      target.append(termElement(entry.target || "", entry));
+      list.append(source, target);
       list.append(element("dd", entry.explanation || "", "glossary-explanation"));
     });
-    details.append(list);
-    main.append(details);
+    glossaryNode.replaceChildren(heading, list);
+    observeReadingTargets(glossaryNode);
+  }
+
+  function renderAppendix(appendix) {
+    const section = document.createElement("section");
+    section.className = "source-appendix";
+    section.id = `appendix-${safeId(appendix.appendix_id || "source")}`;
+    section.append(element("h2", appendix.title || labels.sourceAppendix));
+    const source = layer("source-layer");
+    (appendix.source || []).forEach(block => source.append(renderSourceBlock(block)));
+    section.append(source);
+    typeset(section);
+    return section;
   }
 
   function lazyMountChapters() {
@@ -277,10 +331,26 @@
           if (!href.startsWith("#")) { link.target = "_blank"; link.rel = "noopener noreferrer"; }
           parent.append(link);
         }
+      } else if (run.type === "term") {
+        parent.append(termElement(run.text || "", run));
       } else {
         parent.append(document.createTextNode(String(run.text || "")));
       }
     });
+  }
+
+  function termElement(text, entry) {
+    const source = String(entry.source || "");
+    const target = String(entry.target || "");
+    if (!source || !target || source.normalize("NFKC").toLocaleLowerCase() === target.normalize("NFKC").toLocaleLowerCase()) {
+      return document.createTextNode(String(text || ""));
+    }
+    const node = element("span", text, "glossary-term");
+    const description = `${source} ↔ ${target}`;
+    node.tabIndex = 0;
+    node.dataset.tooltip = description;
+    node.setAttribute("aria-label", description);
+    return node;
   }
 
   function appendSources(parent, sources) {
@@ -335,6 +405,7 @@
       const chapter = current.target.classList.contains("chapter") ? current.target : current.target.closest(".chapter");
       const chapterId = chapter?.dataset.chapter || "";
       sidebar.querySelectorAll("a[data-chapter]").forEach(link => link.classList.toggle("is-current", link.dataset.chapter === chapterId));
+      sidebar.querySelectorAll("a[data-glossary]").forEach(link => link.classList.toggle("is-current", current.target.id === "glossary"));
       rememberAnchor(current.target.id);
     }, {rootMargin: "-15% 0px -70%"});
     chapterNodes.forEach(node => observeReadingTargets(node));
@@ -362,8 +433,9 @@
       if (chapterAnchor(item.chapter_id) === anchor) return true;
       return (item.segments || []).some(segment => segmentAnchor(segment.segment_id) === anchor);
     });
-    if (!chapter) return;
-    mountChapter(chapter.chapter_id);
+    if (anchor === "glossary" && glossaryEnabled()) mountGlossary();
+    else if (chapter) mountChapter(chapter.chapter_id);
+    else if (!document.getElementById(anchor)) return;
     requestAnimationFrame(() => requestAnimationFrame(() => {
       document.getElementById(anchor)?.scrollIntoView({behavior: "auto", block: "start"});
     }));

@@ -13,9 +13,9 @@ separately installed adapter exposes the same services through optional MCP:
   proposers-reviewer workflows.
 - `arc-typeset`: deterministic typesetting utilities, including Markdown to PDF
   conversion through Pandoc and XeLaTeX.
-- `arc-companion`: builds a source-faithful, chapter-aware
-  original/translation/commentary PDF for papers, lecture notes, and books from
-  a paired rich source and PDF.
+- `arc-companion`: builds source-faithful, chapter-aware PDF and static-web
+  original/translation/commentary readers for papers, lecture notes, and books
+  from a paired rich source and PDF.
 - `arc-jobs`: protocol-neutral persistent background execution for ARC CLIs.
 - `arc-mcp` (optional): exposes ARC services to MCP clients; it delegates
   background work to `arc-jobs`.
@@ -28,9 +28,10 @@ Use ARC when you want to:
 
 - Look up reliable paper metadata, references, citers, sections, or equations.
 - Summarize a paper from cached ar5iv/INSPIRE data.
-- Generate a Chinese-by-default companion-reading PDF with chapter guides, a
-  unified glossary, and an original/translation/commentary sequence while
-  retaining source equations, figures, tables, links, and bibliography.
+- Generate Chinese-by-default companion-reading PDF and static-web readers with
+  chapter guides, a unified glossary, and an original/translation/commentary
+  sequence while retaining source equations, figures, tables, links, and
+  bibliography.
 - Build a research-domain overview from a seed paper.
 - Generate ideas using domain context and reviewer scoring.
 - Plan and execute a careful symbolic or numerical research calculation with
@@ -270,7 +271,8 @@ the same folder and `<name>.zh_CN.pdf` is missing:
 arc-typeset batch-translate <project-dir> --json
 ```
 
-Build or resume a companion-reading PDF for a paper, lecture note, or book. A
+Build or resume companion-reading PDF and static-web readers for a paper,
+lecture note, or book. A
 formal build pairs a rich Markdown/TeX/HTML source with its PDF: the rich source
 provides faithful content and the PDF is authoritative for hierarchy, printed
 pages, and chapter-boundary reconciliation. If `--annotation-language` is
@@ -278,6 +280,7 @@ omitted, ARC prints a language-switch notice and continues in Chinese:
 
 ```bash
 arc-companion build arXiv:0911.3380 --project-dir ./0911.3380-companion --json
+arc-companion render-web --project-dir ./0911.3380-companion --json
 arc-companion validate --project-dir ./0911.3380-companion --json
 ```
 
@@ -301,22 +304,42 @@ chapter and segment coverage. Chapters may prepare concurrently under one
 global `workers` budget. Within each chapter, semantic segmentation and a
 stateful guide prepare independent, source-ordered translation and commentary
 sessions. A bootstrap turn carries fixed chapter context; later turns carry
-only the current segment, cursor, source hash, terms, and evidence. Stable
+only the current segment, cursor, source hash, terms, and bounded sources. Stable
 idempotency keys and accepted-block ledgers make routine resume automatic
 without repeating accepted provider calls.
 
-With `--skip-translation`, ARC runs the guide, segmentation, glossary,
-commentary, evidence, review, typesetting, and validation stages without
-creating a translation session, call, ledger, checkpoint, overlay, artifact, or
-PDF layer. The default remains the two-lane translation-and-commentary build.
+During generation, each accepted segment atomically refreshes the static reader
+snapshot and its hashed HTML/JavaScript asset bundle. The last complete bundle
+remains readable if a later refresh fails. `arc-companion render-web` rebuilds
+the reader manually from durable project checkpoints without repeating LLM
+work. The reader has no server dependency and vendors KaTeX, fonts, style,
+script, and media assets locally, so opening the completed HTML does not require
+network access.
 
-A real Index becomes the complete global glossary, including nested entries,
+A translated reader places its glossary once at the end of the same
+`index.html`, reachable from the sidebar and `#glossary`; large Index-based
+glossaries mount only when opened or approached. Matching source terms,
+aliases, and translations in original, translation, and commentary text use a
+subtle blue-gray accessible tooltip. Math and links remain untouched. The PDF
+likewise places a translated glossary after the references.
+
+With `--skip-translation`, ARC runs guide, segmentation, commentary, review,
+rendering, and validation without creating or reusing any translation or
+glossary session, call, ledger, checkpoint, projection, prompt context,
+artifact, or reader layer. Existing glossary cache files remain available for
+a later translated build but are invisible to the current output. A source
+book's own Index remains source content rather than a bilingual glossary. The
+default remains the two-lane translation-and-commentary build.
+
+A real Index becomes the complete global glossary when translation is enabled,
+including nested entries,
 page ranges, `see`, and `see also`; it is never truncated. Documents without an
-Index use the page-scaled 50/100/200 terminology limits. Each chapter receives
-only its deterministic source-term projection, while commentary evidence is
-resolved by the controller through CLI package services and must retain
-captured provenance. Companion workers do not depend on MCP or file-reading
-tools.
+Index use the page-scaled 50/100/200 terminology limits. Each segment receives
+only its deterministic source-term projection. Commentary agents may search,
+inspect, and directly cite external sources in the same generation turn; ARC
+validates the returned title, HTTP(S) URL, and reader-understandable locator
+without a separate evidence-controller rewrite pass. Companion workers do not
+depend on MCP or project-file reading.
 
 Timeout, cancellation, unknown submission state, provider failure, and native
 session loss return `needs_supervision` instead of automatically repeating a
@@ -331,7 +354,8 @@ arc-companion resume --project-dir ./0911.3380-companion \
 
 `--stop-after-first-chapter` schedules no later chapter and returns
 `first_chapter_ready` only after the first substantive chapter passes guide,
-both lanes, evidence, review, typesetting, and PDF validation. Long background
+all enabled lanes, review, PDF rendering, static-web publication, and
+validation. Long background
 builds emit a build-level `review_due` at the next safe boundary after each 30
 minutes of cumulative runtime; `arc-jobs watch <job-id> --until-review --json`
 returns for inspection without pausing the job.
@@ -339,9 +363,11 @@ returns for inspection without pausing the job.
 Each chapter guide appears once after its title. Every segment renders original,
 translation, then commentary without visible controller layer labels. Text uses
 sans-serif fonts while mathematics remains LaTeX serif. Personal names remain
-in Latin script. The default deliverable is the validated full-document PDF; a
-reproducibility ZIP is generated only by an explicit `arc-companion package`
-request.
+in Latin script. The deliverables are the validated full-document PDF and its
+static-web reader; ordinary non-JSON CLI output still prints the PDF path first.
+`arc-companion validate` verifies both forms, while a reproducibility ZIP that
+contains both plus every manifest-declared local web asset is generated only by
+an explicit `arc-companion package` request.
 
 Run slow conversion through `arc-jobs` when the caller should not block. The
 optional MCP adapter exposes the same `md2pdf`, `translate`, and
@@ -858,9 +884,9 @@ Package boundaries:
   single-paper work and `arc-llm` for LLM work.
 - `packages/arc-companion` owns paired-source/PDF chapter orchestration,
   Index-aware glossary projection, ordered stateful translation and commentary
-  lanes, evidence selection, supervised resume, review checkpoints,
-  deterministic LaTeX rendering, and PDF validation. It consumes document and
-  asset caches from `arc-paper` and LLM calls from `arc-llm`.
+  lanes, bounded source selection, supervised resume, review checkpoints,
+  deterministic LaTeX/PDF and static-web rendering, and validation. It consumes
+  document and asset caches from `arc-paper` and LLM calls from `arc-llm`.
 - `packages/arc-jobs` owns protocol-neutral persistent CLI execution, status,
   cancellation, output capture, and ETA. It has no core package dependency.
 - `packages/arc-mcp` stays a thin MCP adapter over package service functions

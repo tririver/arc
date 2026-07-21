@@ -194,15 +194,14 @@ class KimiCodeCliProvider:
                     {"sessionId": native_session_id, "configId": "model", "value": model},
                 )
             client.current_session_id = native_session_id
-            client.activity.submitted()
-            client.activity.record_metadata(
-                "session",
-                text="provider session established",
-                detail={"native_session_id": native_session_id, "resumable": True},
-            )
             result = client.request(
                 "session/prompt",
                 {"sessionId": native_session_id, "prompt": [{"type": "text", "text": prompt}]},
+                submission_barrier=True,
+                submission_metadata={
+                    "native_session_id": native_session_id,
+                    "resumable": True,
+                },
             )
             client.flush_assistant_progress()
             if isinstance(result, dict) and result.get("stopReason") in {"cancelled", "refusal"}:
@@ -335,10 +334,24 @@ class _AcpProcess:
                             **disposition_error_kwargs(disposition),
                         )
 
-    def request(self, method: str, params: dict[str, Any]) -> Any:
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        submission_barrier: bool = False,
+        submission_metadata: dict[str, Any] | None = None,
+    ) -> Any:
         request_id = self._next_id
         self._next_id += 1
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        if submission_barrier:
+            self.activity.submitted()
+            self.activity.record_metadata(
+                "session",
+                text="provider session established",
+                detail=submission_metadata,
+            )
         while True:
             with self._fatal_lock:
                 fatal_error = self._fatal_error
@@ -347,7 +360,11 @@ class _AcpProcess:
             if self._cancel_check is not None and self._cancel_check():
                 raise LLMWorkerCancelled(
                     "Kimi ACP call was cancelled",
-                    submission_state=LLMSubmissionState.SUBMITTED,
+                    submission_state=(
+                        LLMSubmissionState.SUBMITTED
+                        if self.activity.is_submitted
+                        else LLMSubmissionState.NOT_SUBMITTED
+                    ),
                 )
             self.activity.check()
             try:

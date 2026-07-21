@@ -9,6 +9,7 @@
   --companion: #fff8e8;
   --source: #f8fafc;
   --accent: #315d82;
+  --term: #36586b;
   --sidebar-width: 18rem;
 }
 
@@ -81,13 +82,47 @@ button { font: inherit; }
 .build-status { display: flex; flex-wrap: wrap; gap: .55rem 1rem; margin-top: 1rem; color: var(--muted); font-size: .86rem; }
 .status-pill { padding: .1rem .55rem; border: 1px solid #ccd6df; border-radius: 999px; background: white; }
 
-.glossary { max-width: 70rem; margin: 0 auto 2.8rem; border: 1px solid var(--line); border-radius: .65rem; background: var(--paper); }
-.glossary summary { cursor: pointer; padding: .8rem 1rem; font-weight: 650; }
-.glossary-list { display: grid; grid-template-columns: minmax(8rem, .8fr) minmax(8rem, .8fr) minmax(12rem, 1.5fr); margin: 0; padding: 0 1rem 1rem; }
+.glossary { max-width: 86rem; min-height: 12rem; margin: 6rem auto 0; padding-top: 1.5rem; border-top: 1px solid var(--line); scroll-margin-top: 1rem; }
+.glossary > h2 { margin: 0 0 1.3rem; font-size: clamp(1.5rem, 3vw, 2.15rem); }
+.glossary-placeholder { color: var(--muted); }
+.glossary-list { display: grid; grid-template-columns: minmax(8rem, .8fr) minmax(8rem, .8fr) minmax(12rem, 1.5fr); margin: 0; padding: 0; border: 1px solid var(--line); border-radius: .65rem; background: var(--paper); overflow: hidden; }
 .glossary-list > * { margin: 0; padding: .45rem .55rem; border-top: 1px solid #edf0f3; }
 .glossary-list dt { font-weight: 650; }
 .glossary-target { color: #3f5262; }
 .glossary-explanation { color: var(--muted); }
+.glossary-term { position: relative; color: var(--term); cursor: help; }
+.glossary-term:focus-visible { outline: 2px solid #8daaba; outline-offset: 2px; border-radius: .12rem; }
+.glossary-term::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 50;
+  left: 50%;
+  bottom: calc(100% + .4rem);
+  width: max-content;
+  max-width: min(26rem, 80vw);
+  padding: .38rem .55rem;
+  border: 1px solid #b9c7d0;
+  border-radius: .35rem;
+  color: #1f303a;
+  background: #f8fbfd;
+  box-shadow: 0 3px 12px rgba(25, 42, 52, .14);
+  font-size: .78rem;
+  font-weight: 400;
+  line-height: 1.35;
+  white-space: normal;
+  transform: translate(-50%, .2rem);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity .12s ease, transform .12s ease;
+}
+.glossary-term:hover::after, .glossary-term:focus::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(-50%, 0);
+}
+.source-appendix { max-width: 86rem; margin: 6rem auto 0; scroll-margin-top: 1rem; }
+.source-appendix > h2 { margin: 0 0 1.3rem; font-size: clamp(1.5rem, 3vw, 2.15rem); }
 
 .chapter { max-width: 86rem; margin: 0 auto 4rem; scroll-margin-top: 1rem; }
 .chapter > h2 { margin: 0 0 1.3rem; font-size: clamp(1.5rem, 3vw, 2.15rem); line-height: 1.25; }

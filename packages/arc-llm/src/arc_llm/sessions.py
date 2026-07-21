@@ -305,6 +305,7 @@ class LLMSessionManager:
                         name=name,
                         metadata=metadata,
                     )
+                    ref = self._mark_generation_started_locked(ref)
             yield ref, self.turn_count(key, generation=ref.generation)
 
     def _receipt_path(self, idempotency_key: str) -> Path:
@@ -325,7 +326,20 @@ class LLMSessionManager:
             if existing.provider != provider or existing.model != model:
                 raise ValueError(f"session provider/model changed for {key}")
             if existing.runtime_fingerprint != runtime_fingerprint:
-                raise ValueError(f"session runtime fingerprint changed for {key}")
+                if not self._can_rebind_rotated_runtime(existing):
+                    raise ValueError(f"session runtime fingerprint changed for {key}")
+                existing = LLMSessionRef(
+                    key=existing.key,
+                    provider=existing.provider,
+                    model=existing.model,
+                    runtime_fingerprint=runtime_fingerprint,
+                    native_session_id=None,
+                    name=existing.name,
+                    metadata=dict(existing.metadata),
+                    generation=existing.generation,
+                )
+                self._sessions[key] = existing
+                self._write_sessions()
             return existing
         ref = LLMSessionRef(
             key=key,
@@ -338,6 +352,35 @@ class LLMSessionManager:
         self._sessions[key] = ref
         self._write_sessions()
         return ref
+
+    def _can_rebind_rotated_runtime(self, ref: LLMSessionRef) -> bool:
+        """Return whether an unused rotated generation can adopt a new runtime."""
+
+        return (
+            ref.generation > 1
+            and ref.native_session_id is None
+            and ref.metadata.get("arc_runtime_started_generation") != ref.generation
+            and self.turn_count(ref.key, generation=ref.generation) == 0
+        )
+
+    def _mark_generation_started_locked(self, ref: LLMSessionRef) -> LLMSessionRef:
+        if ref.metadata.get("arc_runtime_started_generation") == ref.generation:
+            return ref
+        metadata = dict(ref.metadata)
+        metadata["arc_runtime_started_generation"] = ref.generation
+        updated = LLMSessionRef(
+            key=ref.key,
+            provider=ref.provider,
+            model=ref.model,
+            runtime_fingerprint=ref.runtime_fingerprint,
+            native_session_id=ref.native_session_id,
+            name=ref.name,
+            metadata=metadata,
+            generation=ref.generation,
+        )
+        self._sessions[ref.key] = updated
+        self._write_sessions()
+        return updated
 
     def _require_ref(self, key: str) -> LLMSessionRef:
         ref = self._sessions.get(key)

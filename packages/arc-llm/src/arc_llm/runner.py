@@ -21,6 +21,7 @@ from .call_checkpoint import (
     prepare_call,
     record_failure,
     record_response,
+    record_submitted,
     record_validated,
 )
 from .host import HostDetection, select_llm_provider
@@ -119,7 +120,11 @@ def _configure_paper_worker_session(
     access = env.get("ARC_PAPER_CLI_ACCESS", "none")
     if access == "full" and env.get("ARC_PAPER_WORKER_SESSION_DIR"):
         return
-    location = artifact_dir or (session_manager.root if session_manager is not None else None)
+    # A stateful session can span calls whose artifact directories differ (for
+    # example, one directory per segment or round).  Keep its paper-worker
+    # overlay rooted with the session manager so controller paths and the
+    # runtime fingerprint remain stable for every turn in that session.
+    location = session_manager.root if session_manager is not None else artifact_dir
     if location is None:
         from .paths import llm_tmp_root
 
@@ -978,12 +983,23 @@ def _generate_json(
         call_label=call_label,
         provider=provider_used,
         callback=progress_callback,
+        identity={
+            "idempotency_key": idempotency_key,
+            "session_key": session_key,
+            "provider": provider_used,
+            "model": model,
+            "runtime_fingerprint": runtime_fp,
+        },
     )
 
     def call_provider(
         session: LLMSessionRef | None, session_turn: int | None = None
     ) -> LLMProviderResponse[dict[str, Any]]:
         nonlocal prepared_checkpoint
+        progress.update_identity(
+            session_key=session.key if session is not None else None,
+            generation=session.generation if session is not None else None,
+        )
         if artifact_dir is not None and (call_label or idempotency_key):
             path, identity = checkpoint_path(
                 artifact_dir,
@@ -1010,6 +1026,7 @@ def _generate_json(
             )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
+            progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
             if supervised_native_resume and (session is None or not session.native_session_id):
                 prepared_checkpoint.release_lock()
                 raise LLMTaskError(
@@ -1243,12 +1260,23 @@ def _generate_text(
         call_label=call_label,
         provider=provider_used,
         callback=progress_callback,
+        identity={
+            "idempotency_key": idempotency_key,
+            "session_key": session_key,
+            "provider": provider_used,
+            "model": model,
+            "runtime_fingerprint": runtime_fp,
+        },
     )
 
     def call_provider(
         session: LLMSessionRef | None, session_turn: int | None = None
     ) -> LLMProviderResponse[str]:
         nonlocal prepared_checkpoint
+        progress.update_identity(
+            session_key=session.key if session is not None else None,
+            generation=session.generation if session is not None else None,
+        )
         if artifact_dir is not None and (call_label or idempotency_key):
             path, identity = checkpoint_path(
                 artifact_dir,
@@ -1275,6 +1303,7 @@ def _generate_text(
             )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
+            progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
             if supervised_native_resume and (session is None or not session.native_session_id):
                 prepared_checkpoint.release_lock()
                 raise LLMTaskError(
@@ -1456,6 +1485,7 @@ def _progress_journal(
     call_label: str | None,
     provider: str,
     callback: Callable[[dict[str, Any]], None] | None,
+    identity: Mapping[str, Any] | None = None,
 ) -> ProgressJournal:
     if isinstance(callback, ProgressJournal):
         return callback
@@ -1464,6 +1494,7 @@ def _progress_journal(
         call_label=call_label,
         provider=provider,
         callback=callback,
+        identity=identity,
     )
 
 

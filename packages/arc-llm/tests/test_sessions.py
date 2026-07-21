@@ -133,6 +133,76 @@ def test_session_manager_rejects_runtime_mismatch(tmp_path):
         manager.get_or_create(key="k", provider="codex-cli", model="m1", runtime_fingerprint="fp-2")
 
 
+def test_rotated_unused_generation_can_rebind_runtime_fingerprint(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-1")
+    manager.update_native_session_id("k", "native-1")
+    rotated = manager.rotate("k", reason="restart generation")
+
+    rebound = manager.get_or_create(
+        key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-2"
+    )
+
+    assert rotated.generation == 2
+    assert rebound.generation == 2
+    assert rebound.native_session_id is None
+    assert rebound.runtime_fingerprint == "fp-2"
+    assert LLMSessionManager(manager.root).get_existing("k") == rebound
+
+
+def test_rotated_generation_with_a_turn_rejects_runtime_rebind(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-1")
+    rotated = manager.rotate("k", reason="restart generation")
+    manager.record_turn(
+        "k",
+        call_label="turn",
+        prompt_sha256="prompt",
+        static_prefix_sha256=None,
+        schema_sha256=None,
+        usage={},
+        provider_used="codex-cli",
+        model_used="m",
+        native_session_id=None,
+        generation=rotated.generation,
+    )
+
+    with pytest.raises(ValueError, match="runtime fingerprint changed"):
+        manager.get_or_create(
+            key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-2"
+        )
+
+
+def test_rotated_generation_with_native_session_rejects_runtime_rebind(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-1")
+    manager.rotate("k", reason="restart generation")
+    manager.update_native_session_id("k", "native-2")
+
+    with pytest.raises(ValueError, match="runtime fingerprint changed"):
+        manager.get_or_create(
+            key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-2"
+        )
+
+
+def test_started_rotated_generation_rejects_runtime_rebind_without_native_id_or_turn(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-1")
+    manager.rotate("k", reason="restart generation")
+
+    with manager.locked_turn(
+        key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-2"
+    ) as (started, turn_count):
+        assert started.metadata["arc_runtime_started_generation"] == 2
+        assert started.native_session_id is None
+        assert turn_count == 0
+
+    with pytest.raises(ValueError, match="runtime fingerprint changed"):
+        manager.get_or_create(
+            key="k", provider="codex-cli", model="m", runtime_fingerprint="fp-3"
+        )
+
+
 def test_session_manager_reloads_state_written_by_other_manager(tmp_path):
     root = tmp_path / "sessions"
     first = LLMSessionManager(root)

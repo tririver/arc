@@ -254,6 +254,8 @@ def test_renderer_orders_layers_and_repeats_only_unnumbered_equations(tmp_path: 
     assert tex.count("Unique table cell") == 1
     assert "随后是公式" in tex
     assert "术语表" in tex and "equation" in tex and "方程" in tex
+    assert tex.index("这解释了结果") < tex.index(r"\clearpage") < tex.index("术语表")
+    assert tex.index("术语表") < tex.index(r"\end{document}")
     assert "本版说明" not in tex
     assert "ArcSourceBackground" not in tex
     assert r"\newenvironment{arcsource}{\par\begingroup}{\par\endgroup}" in tex
@@ -263,6 +265,90 @@ def test_renderer_orders_layers_and_repeats_only_unnumbered_equations(tmp_path: 
     assert r"\newtcolorbox{arccompanion}[1][]{arccompanionsurface,#1}" in tex
     assert r"\newtcolorbox{arcchapterguide}[1][]{arccompanionsurface,#1}" in tex
     assert validate_tex_fidelity(tex, document, manifest) == []
+
+
+def test_glossary_is_back_matter_after_references(tmp_path: Path) -> None:
+    document = {
+        "front_matter": {},
+        "blocks": [
+            {"block_id": "body", "kind": "prose", "text": "SOURCE BODY"},
+            {"block_id": "ref", "kind": "bibliography", "text": "REFERENCE TEXT"},
+        ],
+        "bibliography": [{"id": "ref", "label": "[1]", "text": "REFERENCE TEXT"}],
+        "equations": [], "figures": [], "tables": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    tex, _ = render_companion_tex(
+        document,
+        [{
+            "segment_id": "body", "block_ids": ["body"],
+            "start_block_id": "body", "end_block_id": "body",
+        }],
+        {"body": {"explanation": "COMPANION NOTE"}},
+        translations={"body": {"blocks": [
+            {"block_id": "body", "translate": True, "text": "TRANSLATED BODY"},
+        ]}},
+        glossary={"entries": [{
+            "source_term": "SOURCE TERM", "target_term": "TARGET TERM",
+            "brief_explanation": "GLOSSARY NOTE",
+        }]},
+        output_dir=tmp_path,
+        language="en",
+    )
+
+    assert (
+        tex.index("SOURCE BODY")
+        < tex.index("REFERENCE TEXT")
+        < tex.index(r"\clearpage")
+        < tex.index("GLOSSARY NOTE")
+        < tex.index(r"\end{document}")
+    )
+
+
+def test_same_language_render_ignores_passed_glossary_and_preserves_source_index(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "front_matter": {},
+        "blocks": [
+            {"block_id": "body", "kind": "prose", "text": "SOURCE BODY"},
+            {
+                "block_id": "index-heading", "kind": "heading", "level": 1,
+                "title": "Index", "text": "Index", "source_role": "index",
+            },
+            {
+                "block_id": "index-entry", "kind": "prose",
+                "text": "Gauge field, 42", "source_role": "index",
+            },
+        ],
+        "bibliography": [], "equations": [], "figures": [], "tables": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    tex, manifest = render_companion_tex(
+        document,
+        [{
+            "segment_id": "body", "block_ids": ["body"],
+            "start_block_id": "body", "end_block_id": "body",
+        }],
+        {"body": {"explanation": "COMPANION NOTE"}},
+        translations=None,
+        glossary={"entries": [{
+            "source_term": "STALE SOURCE TERM", "target_term": "STALE TARGET TERM",
+            "brief_explanation": "STALE GLOSSARY NOTE",
+        }]},
+        output_dir=tmp_path,
+        language="en",
+        augmentation_scope="substantive",
+    )
+
+    assert manifest["companion_layers"]["translation_mode"] is False
+    assert "STALE SOURCE TERM" not in tex
+    assert "STALE TARGET TERM" not in tex
+    assert "STALE GLOSSARY NOTE" not in tex
+    assert r"\section*{Glossary}" not in tex
+    assert tex.count(r"\section*{Index}") == 1
+    assert tex.count("Gauge field, 42") == 1
+    assert tex.index("SOURCE BODY") < tex.index(r"\section*{Index}") < tex.index("Gauge field, 42")
 
 
 def test_reader_layers_remove_html_wrappers_and_internal_evidence_labels(tmp_path: Path) -> None:

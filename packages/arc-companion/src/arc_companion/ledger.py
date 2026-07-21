@@ -9,8 +9,15 @@ import uuid
 from typing import Any, Mapping
 
 
-LANE_LEDGER_VERSION = "arc.companion.chapter-lane-ledger.v1"
-BLOCK_STATES = ("pending", "submitted", "schema_valid", "invariant_valid", "accepted")
+LANE_LEDGER_VERSION = "arc.companion.chapter-lane-ledger.v2"
+BLOCK_STATES = (
+    "prepared",
+    "submitted",
+    "response_received",
+    "schema_valid",
+    "invariant_valid",
+    "accepted",
+)
 
 
 class LaneLedgerError(RuntimeError):
@@ -29,6 +36,9 @@ def initialize_lane_ledger(
         raise LaneLedgerError("segment ids must be non-empty and unique")
     if path.is_file():
         ledger = _read(path)
+        if ledger.get("schema_version") == "arc.companion.chapter-lane-ledger.v1":
+            ledger = _upgrade_v1(ledger)
+            _write(path, ledger)
         _validate_identity(ledger, chapter_id=chapter_id, lane=lane, segment_ids=segment_ids)
         return ledger
     ledger = {
@@ -38,7 +48,12 @@ def initialize_lane_ledger(
         "generation": generation,
         "needs_supervision": None,
         "blocks": [
-            {"segment_id": value, "state": "pending", "generation": generation}
+            {
+                "segment_id": value,
+                "state": "prepared",
+                "submission_state": "not_submitted",
+                "generation": generation,
+            }
             for value in segment_ids
         ],
         "accepted_chain_sha256": _hash(""),
@@ -63,7 +78,7 @@ def advance_block(
     ledger = _read(path)
     index = _block_index(ledger, segment_id)
     block = dict(ledger["blocks"][index])
-    current = str(block.get("state") or "pending")
+    current = str(block.get("state") or "prepared")
     if BLOCK_STATES.index(state) < BLOCK_STATES.index(current):
         raise LaneLedgerError(f"cannot move {segment_id} backward from {current} to {state}")
     if BLOCK_STATES.index(state) > BLOCK_STATES.index(current) + 1:
@@ -71,6 +86,10 @@ def advance_block(
     if index and str(ledger["blocks"][index - 1].get("state")) != "accepted":
         raise LaneLedgerError(f"cannot advance {segment_id} before its predecessor is accepted")
     block["state"] = state
+    if state == "prepared":
+        block["submission_state"] = "not_submitted"
+    elif state in {"submitted", "response_received", "schema_valid", "invariant_valid", "accepted"}:
+        block["submission_state"] = "submitted"
     if receipt is not None:
         block["logical_receipt"] = dict(receipt)
     if input_sha256 is not None:
@@ -100,7 +119,13 @@ def mark_needs_supervision(
     path: Path, *, segment_id: str, reason: str, recovery_context: Mapping[str, Any]
 ) -> dict[str, Any]:
     ledger = _read(path)
-    _block_index(ledger, segment_id)
+    index = _block_index(ledger, segment_id)
+    block = dict(ledger["blocks"][index])
+    submission_state = str(recovery_context.get("submission_state") or "unknown")
+    if block.get("state") == "prepared" and submission_state in {"unknown", "submitted"}:
+        block["state"] = "submitted"
+        block["submission_state"] = submission_state
+        ledger["blocks"][index] = block
     ledger["needs_supervision"] = {
         "segment_id": segment_id,
         "reason": reason,
@@ -131,7 +156,12 @@ def invalidate_suffix(path: Path, *, from_segment_id: str, generation: int) -> d
         raise LaneLedgerError("only an accepted prefix may be preserved")
     suffix = []
     for item in ledger["blocks"][index:]:
-        suffix.append({"segment_id": item["segment_id"], "state": "pending", "generation": generation})
+        suffix.append({
+            "segment_id": item["segment_id"],
+            "state": "prepared",
+            "submission_state": "not_submitted",
+            "generation": generation,
+        })
     ledger["blocks"] = prefix + suffix
     ledger["generation"] = generation
     ledger["needs_supervision"] = None
@@ -152,10 +182,93 @@ def next_pending(ledger: Mapping[str, Any]) -> str | None:
     return None
 
 
+def accept_reused_block(
+    path: Path,
+    *,
+    segment_id: str,
+    input_sha256: str,
+    output_sha256: str,
+    artifact_id: str,
+    validation_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Accept a validated object-store hit without claiming provider submission."""
+
+    ledger = _read(path)
+    index = _block_index(ledger, segment_id)
+    block = dict(ledger["blocks"][index])
+    if block.get("state") != "prepared" or block.get("submission_state") != "not_submitted":
+        raise LaneLedgerError(f"cannot reuse artifact for non-prepared block {segment_id}")
+    if index and str(ledger["blocks"][index - 1].get("state")) != "accepted":
+        raise LaneLedgerError(f"cannot reuse {segment_id} before its predecessor is accepted")
+    predecessor = str(ledger.get("accepted_chain_sha256") or _hash(""))
+    block.update({
+        "state": "accepted",
+        "submission_state": "not_submitted",
+        "input_sha256": input_sha256,
+        "output_sha256": output_sha256,
+        "logical_receipt": {
+            "kind": "accepted_artifact_reuse",
+            "artifact_id": artifact_id,
+            "provider_calls": 0,
+        },
+        "validation_receipt": dict(validation_receipt),
+        "predecessor_accepted_chain_sha256": predecessor,
+    })
+    block["accepted_chain_sha256"] = _hash(json.dumps({
+        "predecessor": predecessor,
+        "segment_id": segment_id,
+        "input_sha256": input_sha256,
+        "output_sha256": output_sha256,
+        "generation": block.get("generation"),
+    }, sort_keys=True, separators=(",", ":")))
+    ledger["blocks"][index] = block
+    ledger["accepted_chain_sha256"] = block["accepted_chain_sha256"]
+    ledger["updated_at"] = time.time()
+    _write(path, ledger)
+    return ledger
+
+
+def mark_submitted(path: Path, *, segment_id: str) -> dict[str, Any]:
+    """Advance only when the provider confirms crossing its submission barrier."""
+
+    ledger = _read(path)
+    block = ledger["blocks"][_block_index(ledger, segment_id)]
+    if block.get("state") == "prepared":
+        return advance_block(path, segment_id=segment_id, state="submitted")
+    return ledger
+
+
+def mark_response_received(path: Path, *, segment_id: str) -> dict[str, Any]:
+    """Record the first durable provider response for a logical lane item."""
+
+    ledger = _read(path)
+    block = ledger["blocks"][_block_index(ledger, segment_id)]
+    if block.get("state") == "submitted":
+        return advance_block(path, segment_id=segment_id, state="response_received")
+    return ledger
+
+
 def _validate_identity(ledger: Mapping[str, Any], *, chapter_id: str, lane: str, segment_ids: list[str]) -> None:
     actual = [str(item.get("segment_id") or "") for item in ledger.get("blocks") or []]
     if ledger.get("schema_version") != LANE_LEDGER_VERSION or ledger.get("chapter_id") != chapter_id or ledger.get("lane") != lane or actual != segment_ids:
         raise LaneLedgerError("lane ledger identity changed")
+
+
+def _upgrade_v1(ledger: Mapping[str, Any]) -> dict[str, Any]:
+    upgraded = dict(ledger)
+    blocks = []
+    for raw in upgraded.get("blocks") or []:
+        block = dict(raw)
+        state = str(block.get("state") or "pending")
+        if state == "pending":
+            block["state"] = "prepared"
+            block["submission_state"] = "not_submitted"
+        else:
+            block["submission_state"] = "submitted"
+        blocks.append(block)
+    upgraded["blocks"] = blocks
+    upgraded["schema_version"] = LANE_LEDGER_VERSION
+    return upgraded
 
 
 def _block_index(ledger: Mapping[str, Any], segment_id: str) -> int:

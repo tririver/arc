@@ -37,3 +37,20 @@ def test_progress_journal_persists_session_and_recovery_context(tmp_path) -> Non
     assert events[1]["native_session_id"] == "session-1"
     assert events[1]["resumable"] is True
     assert json.loads((tmp_path / "latest_progress.json").read_text()) == events[1]
+
+
+def test_submitted_event_crosses_checkpoint_barrier_before_persist(tmp_path) -> None:
+    calls = []
+    journal = ProgressJournal(
+        artifact_dir=tmp_path,
+        call_label="worker-1",
+        provider="codex-cli",
+        callback=None,
+        submission_callback=lambda: calls.append("submitted"),
+    )
+
+    journal({"event": "submitted", "substantive": False})
+
+    assert calls == ["submitted"]
+    event = json.loads((tmp_path / "latest_progress.json").read_text())
+    assert event["event"] == "submitted"

@@ -147,24 +147,18 @@ def test_context_selection_is_relevant_bounded_and_kept_out_of_chronology() -> N
         validate_annotation_citations(bad, selected)
 
 
-def test_required_context_evidence_is_selected_once() -> None:
+def test_context_evidence_is_selected_once_without_request_protocol_fields() -> None:
     record = load_context_evidence(["isbn:one"], parsed_getter=_parsed_getter)[0]
-    record["supported_request_keys"] = ["seg:request-1"]
     segment = {"segment_id": "seg", "block_ids": ["b"]}
 
     selected = _evidence_for_segment(
         segment,
         {"b": {"block_id": "b", "text": "canonical field momentum"}},
-        {
-            "related_papers": [record],
-            "required_evidence_ids_by_segment": {
-                "seg": [record["evidence_id"]],
-            },
-        },
+        {"related_papers": [record]},
     )["papers"]
 
     assert [item["evidence_id"] for item in selected] == [record["evidence_id"]]
-    assert selected[0]["supported_request_keys"] == ["seg:request-1"]
+    assert "supported_request_keys" not in selected[0]
 
 
 def test_context_index_keeps_late_relevant_blocks_until_segment_selection() -> None:
@@ -235,7 +229,7 @@ def test_prompt_limits_context_to_explanation() -> None:
         protected_names=[],
         paper_context={},
     )
-    assert "relation is context" in prompt
-    assert "must never be presented as prior work" in prompt
-    assert "Never put an evidence ID, hash, or controller label in reader-facing prose" in prompt
-    assert "Record its evidence_id only in the structured evidence_ids field" in prompt
+    assert "BOUNDED SOURCES" in prompt
+    assert "direct HTTP(S) URL" in prompt
+    assert "never expose hashes, internal IDs, or controller labels" in prompt
+    assert "same turn" in prompt

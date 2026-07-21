@@ -7,11 +7,14 @@ import subprocess
 import sys
 
 from arc_companion.content import (
+    CONTENT_RECEIPT_VERSION,
+    READER_CONTENT_VERSION,
     ContentBundleError,
     load_reader_content,
     store_reader_content,
 )
-from arc_companion.io import read_json, write_json
+from arc_companion.io import read_json, sha256_file, write_json
+from arc_companion.pipeline import validate_project
 from arc_companion.render import render_content
 from arc_companion.run_lock import ProjectBuildLock
 
@@ -87,6 +90,36 @@ def test_reviewed_content_is_immutable_and_tampering_is_rejected(tmp_path: Path)
         assert "hash" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("tampered content was accepted")
+
+
+def test_reviewed_content_uses_current_schema_and_receipt_versions(tmp_path: Path) -> None:
+    project, digest = _project(tmp_path)
+    value = read_json(
+        project / ".arc-companion" / "objects" / "reader-content" / f"{digest}.json"
+    )
+
+    assert value["schema_version"] == READER_CONTENT_VERSION
+    assert value["validation_receipt"]["schema_version"] == CONTENT_RECEIPT_VERSION
+    assert value["validation_receipt"]["validator_version"] == CONTENT_RECEIPT_VERSION
+
+
+def test_store_refreshes_matching_legacy_content_envelope(tmp_path: Path) -> None:
+    project, digest = _project(tmp_path)
+    path = project / ".arc-companion" / "objects" / "reader-content" / f"{digest}.json"
+    legacy = read_json(path)
+    legacy["schema_version"] = "arc.companion.reader-content.v1"
+    legacy["validation_receipt"]["schema_version"] = (
+        "arc.companion.reader-content-validation.v1"
+    )
+    legacy["validation_receipt"]["validator_version"] = (
+        "arc.companion.reader-content-validation.v1"
+    )
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    stored = store_reader_content(project, content=legacy["content"])
+
+    assert stored["schema_version"] == READER_CONTENT_VERSION
+    assert stored["validation_receipt"]["schema_version"] == CONTENT_RECEIPT_VERSION
 
 
 def test_validation_receipt_checks_are_bound_to_bundle_identity(tmp_path: Path) -> None:
@@ -212,3 +245,66 @@ def test_cli_import_does_not_load_pipeline_or_llm_runtime() -> None:
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_validate_uses_published_last_good_while_active_run_failed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import arc_companion.pipeline as pipeline_module
+    import arc_companion.web as web_module
+
+    project, digest = _project(tmp_path)
+    revision = project / ".arc-companion" / "renders" / "pdf" / "last-good"
+    revision.mkdir(parents=True)
+    paths = {
+        "output_tex": revision / "paper.tex",
+        "output_pdf": revision / "paper.pdf",
+        "source_manifest_path": revision / "source-manifest.json",
+        "validation_path": revision / "validation.json",
+    }
+    paths["output_tex"].write_text("fixture tex", encoding="utf-8")
+    paths["output_pdf"].write_bytes(b"%PDF fixture")
+    write_json(paths["source_manifest_path"], {"assets": []})
+    write_json(paths["validation_path"], {"ok": True})
+    published_pdf = {
+        key: str(path) for key, path in paths.items()
+    }
+    published_pdf.update({
+        key.replace("path", "sha256") if key.endswith("_path") else f"{key}_sha256": sha256_file(path)
+        for key, path in paths.items()
+    })
+    # Correct the two output keys whose hash names append rather than replace.
+    published_pdf["output_tex_sha256"] = sha256_file(paths["output_tex"])
+    published_pdf["output_pdf_sha256"] = sha256_file(paths["output_pdf"])
+    state = read_json(project / "state.json")
+    state.update({
+        "schema_version": "arc.companion.state.v3",
+        "status": "failed",
+        "checkpoint_dir": str(project / "new-active-checkpoint"),
+        "published": {
+            "content_sha256": digest,
+            "pdf": published_pdf,
+            "web": {"output_html": str(project / "reader" / "index.html")},
+        },
+    })
+    for key in (*paths, "output_tex_sha256", "output_pdf_sha256",
+                "source_manifest_sha256", "validation_sha256", "output_html"):
+        state.pop(key, None)
+    write_json(project / "state.json", state)
+    monkeypatch.setattr(pipeline_module, "validate_tex_fidelity", lambda *args: [])
+    observed: dict = {}
+
+    def validate_web(_root: Path, *, state: dict) -> dict:
+        observed.update(state)
+        return {"ok": True}
+
+    monkeypatch.setattr(web_module, "validate_reader_project", validate_web)
+
+    result = validate_project(
+        project, pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["output_pdf"] == str(paths["output_pdf"])
+    assert observed["output_pdf"] == str(paths["output_pdf"])
+    assert observed["output_html"].endswith("reader/index.html")

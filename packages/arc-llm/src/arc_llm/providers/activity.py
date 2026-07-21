@@ -136,6 +136,10 @@ class ActivityTracker:
         self._next_review_at = now + self.review_interval_seconds
         self._emit("submitted", activity_type="provider_submission")
 
+    @property
+    def is_submitted(self) -> bool:
+        return self._submitted_at is not None
+
     def record(
         self,
         activity_type: str,

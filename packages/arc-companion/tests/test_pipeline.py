@@ -12,7 +12,6 @@ import pytest
 from arc_companion import pipeline as pipeline_module
 from arc_companion.cli import _emit
 from arc_companion.evidence import arc_cache_descriptor, text_sha256, validate_evidence_record
-from arc_companion.evidence_requests import EvidenceResolution
 from arc_companion.pipeline import (
     BuildOptions,
     CompanionLLMCircuitOpen,
@@ -35,11 +34,11 @@ from arc_companion.pipeline import (
     _validate_translation,
     _protected_names,
     _repair_reviewed_translation_checkpoint,
-    _repair_unique_supplied_source_locators,
     _segment_checkpoint_name,
     _state,
     build_companion,
     validate_and_expand_segments,
+    validate_project,
 )
 from arc_companion.prompts import ANNOTATION_SCHEMA
 from arc_companion.source import SourceBundle
@@ -3438,11 +3437,24 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert "审校后的解释" in tex
     assert "解释 0002" in tex
     assert Path(data["output_pdf"]).is_file()
+    assert data["web_render_version"] == "arc.companion.web-render.v2"
+    assert Path(data["output_html"]).is_file()
+    assert Path(data["reader_snapshot_path"]).is_file()
+    assert Path(data["web_manifest_path"]).is_file()
+    reader_snapshot = json.loads(Path(data["reader_snapshot_path"]).read_text())
+    assert reader_snapshot["language"] == "zh-CN"
+    validation = validate_project(
+        tmp_path / "run", pdf_validator=lambda path: {"bytes": path.stat().st_size}
+    )
+    assert validation["ok"]
+    assert validation["data"]["web"]["ok"] is True
     saved_evidence = list((Path(data["checkpoint_dir"]) / "segment-evidence").glob("*.json"))
     assert len(saved_evidence) == 2
     assert all("evidence" in json.loads(path.read_text(encoding="utf-8")) for path in saved_evidence)
 
     call_count = len(fake.calls)
+    # A missing web commit is repaired from reader-final.json without model work.
+    Path(data["output_html"]).unlink()
     resumed = build_companion(
         BuildOptions(
             paper_id=bundle.paper_id,
@@ -3458,6 +3470,7 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     )
     assert resumed["ok"] and resumed["meta"]["resumed"] is True
     assert len(fake.calls) == call_count
+    assert Path(resumed["data"]["output_html"]).is_file()
 
     state_path = tmp_path / "run" / "state.json"
     stale_preview_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -3481,19 +3494,9 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert len(fake.calls) == call_count
 
 
-def test_build_passes_explicit_domain_and_seed_ids_to_default_evidence_controller(
-    monkeypatch, tmp_path: Path,
-) -> None:
+def test_build_does_not_construct_an_evidence_controller(monkeypatch, tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
-    captured: dict[str, tuple[str, ...]] = {}
-
-    class CapturingController:
-        def __init__(self, *, domain_paper_ids=(), seed_paper_ids=()):
-            captured["domain"] = tuple(domain_paper_ids)
-            captured["seed"] = tuple(seed_paper_ids)
-
-    monkeypatch.setattr(pipeline_module, "EvidenceRequestController", CapturingController)
     monkeypatch.setattr(pipeline_module, "load_domain_context", lambda **_kwargs: {
         "schema_version": "arc.companion.domain-context.v1",
         "paper_ids": ["arXiv:1111.1111", "arXiv:2222.2222"],
@@ -3512,10 +3515,7 @@ def test_build_passes_explicit_domain_and_seed_ids_to_default_evidence_controlle
     )
 
     assert result["ok"], result
-    assert captured == {
-        "domain": ("arXiv:1111.1111", "arXiv:2222.2222"),
-        "seed": (bundle.paper_id,),
-    }
+    assert not hasattr(pipeline_module, "EvidenceRequestController")
 
 
 def test_legacy_string_annotation_checkpoint_is_rerun_and_upgraded(tmp_path: Path) -> None:
@@ -3558,6 +3558,71 @@ def test_legacy_string_annotation_checkpoint_is_rerun_and_upgraded(tmp_path: Pat
     assert second["seg-0001"]["prior_work"] == []
     assert calls_after == calls_before + 1
     assert upgraded["schema_version"] == pipeline_module.ANNOTATION_CHECKPOINT_VERSION
+
+
+@pytest.mark.parametrize(
+    ("returned_url", "accepted", "cache_only"),
+    [
+        ("https://cache.example/paper", True, False),
+        ("https://cache.example/descriptor", True, True),
+        ("https://fabricated.example/paper", False, False),
+    ],
+)
+def test_offline_annotation_accepts_only_bounded_cache_urls(
+    tmp_path: Path, monkeypatch, returned_url: str, accepted: bool, cache_only: bool,
+) -> None:
+    bundle = _bundle(tmp_path)
+    segment = {
+        "segment_id": "seg-offline", "block_ids": ["b1", "b2"],
+        "start_block_id": "b1", "end_block_id": "b2",
+    }
+    monkeypatch.setattr(
+        pipeline_module, "_evidence_for_segment",
+        lambda *args, **kwargs: {
+            "schema_version": "arc.companion.segment-evidence.v3",
+            "bounded_sources": [] if cache_only else [{
+                "title": "Cached paper",
+                "url": "https://cache.example/paper",
+                "locator": "Abstract",
+            }],
+            "papers": ([{
+                "source_descriptor": {
+                    "provider": "arc-paper",
+                    "canonical_locator": "https://cache.example/descriptor",
+                },
+            }] if cache_only else []),
+        },
+    )
+
+    calls: list[str] = []
+
+    def llm(_prompt: str, **_kwargs):
+        calls.append(returned_url)
+        return {
+            "explanation": "Cached fact.", "commentary": "",
+            "commentary_sources": [{
+                "title": "Cached paper", "url": returned_url, "locator": "Abstract",
+            }],
+            "prior_work": [], "later_work": [],
+        }
+
+    call = lambda: pipeline_module._generate_annotations(
+        [segment],
+        options=BuildOptions(
+            bundle.paper_id, tmp_path / returned_url.split("//", 1)[-1],
+            workers=1, allow_internet=False,
+        ),
+        bundle=bundle, evidence={"related_papers": []}, domain_context=None,
+        glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=tmp_path / ("accepted" if accepted else "rejected"), llm=llm,
+    )
+    if accepted:
+        assert call()["seg-offline"]["commentary_sources"][0]["url"] == returned_url
+        assert call()["seg-offline"]["commentary_sources"][0]["url"] == returned_url
+        assert calls == [returned_url]
+    else:
+        with pytest.raises(CompanionLaneError, match="not supplied by the prompt or ARC cache"):
+            call()
 
 
 def test_annotation_prompt_projects_relevant_glossary_and_stays_below_transport_limit() -> None:
@@ -3609,20 +3674,15 @@ def test_annotation_prompt_projects_relevant_glossary_and_stays_below_transport_
         "schema_version": "evidence", "papers": [{"evidence_id": "EVIDENCE-SENTINEL"}],
         "citation_targets": [], "reference_catalog": [], "citer_catalog": [],
     }
-    first_draft = {"commentary": "FIRST-DRAFT-SENTINEL 真空"}
-    resolution = {"requests": [{"needed_claim": "RESOLUTION-SENTINEL"}]}
-
     prompt = pipeline_module._bounded_annotation_prompt(
         segment, blocks, language="zh-CN", metadata={}, evidence=evidence,
         glossary=glossary, protected_names=[], paper_context=paper_context,
-        domain_context=None, first_draft=first_draft, evidence_resolution=resolution,
+        domain_context=None,
     )
 
     assert len(prompt.encode("utf-8")) < pipeline_module.ANNOTATION_PROMPT_MAX_BYTES
     assert "SOURCE-SENTINEL" in prompt
     assert "EVIDENCE-SENTINEL" in prompt
-    assert "FIRST-DRAFT-SENTINEL" in prompt
-    assert "RESOLUTION-SENTINEL" in prompt
     assert "relevant gauge entry" in prompt
     assert "relevant vacuum entry" in prompt
     assert "unrelated-term-99" not in prompt
@@ -3640,8 +3700,7 @@ def test_annotation_prompt_fails_closed_when_required_source_exceeds_transport_l
         pipeline_module._bounded_annotation_prompt(
             segment, blocks, language="zh-CN", metadata={},
             evidence={"papers": []}, glossary={"entries": []}, protected_names=[],
-            paper_context=paper_context, domain_context=None, first_draft=None,
-            evidence_resolution=None,
+            paper_context=paper_context, domain_context=None,
         )
 
 
@@ -3756,8 +3815,7 @@ def _minimal_section_review_inputs() -> tuple[
     annotations = {
         str(segment["segment_id"]): {
             "commentary": "伴读", "explanation": "解释", "prior_work": [],
-            "later_work": [], "evidence_ids": [], "key_points": [],
-            "source_notes": [], "evidence_requests": [],
+            "later_work": [], "commentary_sources": [],
         }
         for segment in segments
     }
@@ -3783,11 +3841,10 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
             return {
                 "findings": [],
-                "reviewed_segments": [{
-                    "segment_id": item["segment"]["segment_id"],
-                    "translation": item["translation"],
-                    "annotation": item["annotation"],
-                } for item in portion["segments"]],
+                "reviewed_segment_ids": [
+                    item["segment"]["segment_id"] for item in portion["segments"]
+                ],
+                "patches": [],
             }
         return {"patches": [], "issues": []}
 
@@ -3809,11 +3866,11 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
 
     checkpoint_path = checkpoint_dir / "section-reviews" / "0000.json"
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    reviewed_segments = checkpoint["review"]["reviewed_segments"]
+    reviewed_segments = checkpoint["review"]["reviewed_segment_ids"]
     if invalid_mode == "missing":
-        checkpoint["review"]["reviewed_segments"] = reviewed_segments[:1]
+        checkpoint["review"]["reviewed_segment_ids"] = reviewed_segments[:1]
     else:
-        checkpoint["review"]["reviewed_segments"] = [
+        checkpoint["review"]["reviewed_segment_ids"] = [
             reviewed_segments[0], reviewed_segments[0],
         ]
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
@@ -3822,9 +3879,7 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
 
     assert len(section_calls) == 2
     repaired = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    assert {
-        item["segment_id"] for item in repaired["review"]["reviewed_segments"]
-    } == {"seg-0", "seg-1"}
+    assert set(repaired["review"]["reviewed_segment_ids"]) == {"seg-0", "seg-1"}
 
 
 def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
@@ -3837,11 +3892,8 @@ def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
             item = portion["segments"][0]
             return {
                 "findings": [],
-                "reviewed_segments": [{
-                    "segment_id": item["segment"]["segment_id"],
-                    "translation": item["translation"],
-                    "annotation": item["annotation"],
-                }],
+                "reviewed_segment_ids": [item["segment"]["segment_id"]],
+                "patches": [],
             }
         raise AssertionError("final review must not run after incomplete section coverage")
 
@@ -4130,7 +4182,7 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
 
 
 
-def test_first_round_preview_is_published_before_evidence_resolution_and_review(tmp_path: Path) -> None:
+def test_first_round_preview_is_published_before_review_without_evidence_rerun(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
     fake.annotation_barrier = threading.Barrier(1)
@@ -4144,21 +4196,14 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
             assert (project / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
             assert (project / "first-round-preview-source-manifest.json").is_file()
             assert (project / "first-round-preview-validation.json").is_file()
-        value = fake(prompt, **kwargs)
-        if label == "companion-annotation-seg-0001":
-            value = {**value, "evidence_requests": [{
-                "relation": "context",
-                "needed_claim": "context claim",
-                "queries": ["context query"],
-                "candidate_paper_ids": [],
-                "candidate_urls": [],
-                "reason": "verify context before review",
-            }]}
-        return value
+        return fake(prompt, **kwargs)
 
     def compiler(tex_path: Path, pdf_path: Path) -> None:
-        assert tex_path.parent == project
-        assert pdf_path.parent == project
+        if "first_round_preview" in tex_path.name:
+            assert tex_path.parent == project
+        else:
+            assert tex_path.parent.parent.parent == project / ".arc-companion" / "renders"
+        assert pdf_path.parent == tex_path.parent
         assert not tex_path.name.startswith(".")
         assert not pdf_path.name.startswith(".")
         assert tex_path.stem == pdf_path.stem
@@ -4171,20 +4216,6 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
             assert "companion-annotation-seg-0002" not in labels
         pdf_path.write_bytes(b"%PDF-1.7 fixture")
 
-    class Controller:
-        def resolve(self, requests, *, existing_records=()):
-            assert list(requests)
-            assert (project / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
-            state = json.loads((project / "state.json").read_text(encoding="utf-8"))
-            assert state["status"] == "preview_ready"
-            assert state["preview_pdf_sha256"]
-            return EvidenceResolution(
-                records=(),
-                evidence_ids_by_segment={},
-                supported_request_keys=(),
-                audit={"requests": [], "lanes": {}, "accepted": [], "rejected": []},
-            )
-
     result = build_companion(
         BuildOptions(
             paper_id=bundle.paper_id,
@@ -4196,11 +4227,11 @@ def test_first_round_preview_is_published_before_evidence_resolution_and_review(
         llm=llm,
         compiler=compiler,
         pdf_validator=lambda path: {"bytes": path.stat().st_size},
-        evidence_controller=Controller(),
     )
 
     assert result["ok"], result
     assert len(compiler_calls) == 2
+    assert not any("evidence-rerun" in str(call["call_label"]) for call in fake.calls)
     assert "解释 0001" in compiler_calls[0][1]
     assert "解释 0002" not in compiler_calls[0][1]
     assert r"\tag{7}" in compiler_calls[0][1]
@@ -4337,10 +4368,6 @@ def test_stop_after_first_chapter_returns_before_remaining_work_and_resumes(tmp_
         validation_calls.append(path)
         return {"bytes": path.stat().st_size}
 
-    class UnexpectedEvidenceController:
-        def resolve(self, *_args, **_kwargs):
-            raise AssertionError("preview gate must stop before evidence resolution")
-
     gated = build_companion(
         BuildOptions(
             paper_id=bundle.paper_id,
@@ -4353,7 +4380,6 @@ def test_stop_after_first_chapter_returns_before_remaining_work_and_resumes(tmp_
         llm=fake,
         compiler=compiler,
         pdf_validator=pdf_validator,
-        evidence_controller=UnexpectedEvidenceController(),
     )
 
     assert gated["ok"], gated
@@ -4512,7 +4538,7 @@ def test_segment_ranges_must_cover_blocks_once_in_order() -> None:
         raise AssertionError("invalid segmentation was accepted")
 
 
-def test_fingerprint_covers_metadata_evidence_prompts_and_checkpoint_names(tmp_path: Path) -> None:
+def test_source_fingerprint_excludes_lane_metadata_and_evidence(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run")
     evidence = _evidence(bundle)
@@ -4525,12 +4551,12 @@ def test_fingerprint_covers_metadata_evidence_prompts_and_checkpoint_names(tmp_p
         references=bundle.references,
         citers=bundle.citers,
     )
-    assert _fingerprint(changed_metadata, options, evidence=evidence) != first
-    assert _fingerprint(bundle, options, evidence={**evidence, "citers": []}) != first
+    assert _fingerprint(changed_metadata, options, evidence=evidence) == first
+    assert _fingerprint(bundle, options, evidence={**evidence, "citers": []}) == first
     assert _segment_checkpoint_name("a/b") != _segment_checkpoint_name("a b")
 
 
-def test_fingerprint_invalidates_when_glossary_tier_changes(tmp_path: Path, monkeypatch) -> None:
+def test_source_fingerprint_excludes_glossary_tier(tmp_path: Path, monkeypatch) -> None:
     bundle = _bundle(tmp_path)
     options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run")
     evidence = _evidence(bundle)
@@ -4538,10 +4564,10 @@ def test_fingerprint_invalidates_when_glossary_tier_changes(tmp_path: Path, monk
 
     monkeypatch.setattr(pipeline_module, "GLOSSARY_TIER", "high")
 
-    assert _fingerprint(bundle, options, evidence=evidence) != medium
+    assert _fingerprint(bundle, options, evidence=evidence) == medium
 
 
-def test_fingerprint_invalidates_when_review_tier_changes(tmp_path: Path, monkeypatch) -> None:
+def test_source_fingerprint_excludes_review_tier(tmp_path: Path, monkeypatch) -> None:
     bundle = _bundle(tmp_path)
     options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run")
     evidence = _evidence(bundle)
@@ -4549,7 +4575,7 @@ def test_fingerprint_invalidates_when_review_tier_changes(tmp_path: Path, monkey
 
     monkeypatch.setattr(pipeline_module, "REVIEW_TIER", "high")
 
-    assert _fingerprint(bundle, options, evidence=evidence) != baseline
+    assert _fingerprint(bundle, options, evidence=evidence) == baseline
 
 
 def test_fingerprint_reuses_content_checkpoints_when_total_workers_change(tmp_path: Path) -> None:
@@ -4666,7 +4692,30 @@ def test_shared_llm_limiter_does_not_inject_cancel_check_into_simple_fake() -> N
     assert calls == ["plain"]
 
 
-def test_shared_llm_limiter_does_not_trip_on_ordinary_unit_failure() -> None:
+def test_shared_llm_limiter_propagates_external_cancel_and_stops_queued_work() -> None:
+    requested = threading.Event()
+    active_started = threading.Event()
+
+    def model(prompt: str, *, cancel_check=None) -> dict[str, str]:
+        active_started.set()
+        assert cancel_check is not None
+        while not cancel_check():
+            threading.Event().wait(0.001)
+        raise RuntimeError(f"cancelled {prompt}")
+
+    limited = _limit_llm_concurrency(model, 1, cancel_check=requested.is_set)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        active = executor.submit(limited, "active")
+        assert active_started.wait(timeout=5)
+        queued = executor.submit(limited, "queued")
+        requested.set()
+        with pytest.raises(RuntimeError, match="cancelled active"):
+            active.result(timeout=5)
+        with pytest.raises(CompanionLLMCircuitOpen):
+            queued.result(timeout=5)
+
+
+def test_shared_llm_limiter_stops_successors_after_any_call_failure() -> None:
     calls: list[str] = []
 
     def model(prompt: str) -> dict[str, str]:
@@ -4678,8 +4727,9 @@ def test_shared_llm_limiter_does_not_trip_on_ordinary_unit_failure() -> None:
     limited = _limit_llm_concurrency(model, 1)
     with pytest.raises(RuntimeError, match="ordinary validation failure"):
         limited("bad-unit")
-    assert limited("independent-unit") == {"prompt": "independent-unit"}
-    assert calls == ["bad-unit", "independent-unit"]
+    with pytest.raises(CompanionLLMCircuitOpen):
+        limited("independent-unit")
+    assert calls == ["bad-unit"]
 
 
 def test_legacy_worker_fingerprint_checkpoint_is_exactly_migrated(tmp_path: Path) -> None:
@@ -4854,7 +4904,7 @@ def test_explicit_host_tool_inheritance_preserves_host_configuration(monkeypatch
     assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/research-mcp.json"
 
 
-def test_fingerprint_covers_runtime_access_options(tmp_path: Path) -> None:
+def test_source_fingerprint_excludes_runtime_access_options(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     evidence = _evidence(bundle)
     enabled = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run")
@@ -4863,7 +4913,7 @@ def test_fingerprint_covers_runtime_access_options(tmp_path: Path) -> None:
         project_dir=tmp_path / "run",
         allow_internet=False,
     )
-    assert _fingerprint(bundle, enabled, evidence=evidence) != _fingerprint(
+    assert _fingerprint(bundle, enabled, evidence=evidence) == _fingerprint(
         bundle, local_only, evidence=evidence
     )
     inherited = BuildOptions(
@@ -4871,23 +4921,23 @@ def test_fingerprint_covers_runtime_access_options(tmp_path: Path) -> None:
         project_dir=tmp_path / "run",
         inherit_host_tools=True,
     )
-    assert _fingerprint(bundle, enabled, evidence=evidence) != _fingerprint(
+    assert _fingerprint(bundle, enabled, evidence=evidence) == _fingerprint(
         bundle, inherited, evidence=evidence
     )
 
 
-def test_fingerprint_covers_context_selection_version_and_budgets(tmp_path: Path, monkeypatch) -> None:
+def test_source_fingerprint_excludes_context_recipe(tmp_path: Path, monkeypatch) -> None:
     bundle = _bundle(tmp_path)
     options = BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "run")
     evidence = _evidence(bundle)
     original = _fingerprint(bundle, options, evidence=evidence)
 
     monkeypatch.setattr(pipeline_module, "CONTEXT_SEGMENT_CHARS_PER_SOURCE", 2_999)
-    assert _fingerprint(bundle, options, evidence=evidence) != original
+    assert _fingerprint(bundle, options, evidence=evidence) == original
 
     monkeypatch.setattr(pipeline_module, "CONTEXT_SEGMENT_CHARS_PER_SOURCE", 3_000)
     monkeypatch.setattr(pipeline_module, "CONTEXT_SELECTION_VERSION", "changed")
-    assert _fingerprint(bundle, options, evidence=evidence) != original
+    assert _fingerprint(bundle, options, evidence=evidence) == original
 
 
 def test_evidence_keeps_optional_source_diagnostics(tmp_path: Path) -> None:
@@ -5026,7 +5076,7 @@ def test_full_paper_context_is_bounded_navigable_and_excludes_raw_html(tmp_path:
     context = _full_paper_context(document, segment, blocks_by_id=by_id, max_chars=4_000)
     serialized = json.dumps(context, ensure_ascii=False)
 
-    assert context["schema_version"] == "arc.companion.full-paper-context.v1"
+    assert context["schema_version"] == "arc.companion.full-paper-context.v2"
     assert any(item["title"] == "Distant physics" for item in context["section_navigation"])
     assert "late-time transfer context" in serialized
     assert "DO_NOT_EXPOSE_RAW_HTML" not in serialized
@@ -5279,6 +5329,7 @@ def test_selected_candidate_can_be_bound_in_production_claim_schema() -> None:
     record = {
         "evidence_id": "prior-direct", "relation": "prior",
         "paper_id": "arXiv:0001.0009", "title": "Spectator conversion bispectrum",
+        "url": "https://arxiv.org/abs/0001.0009",
         "authors": [], "year": 2000, "citation_count": 1,
         "evidence_level": "full_text", "abstract": "",
         "blocks": [{"block_id": "S2", "text": text, "sha256": text_sha256(text)}],
@@ -5292,70 +5343,19 @@ def test_selected_candidate_can_be_bound_in_production_claim_schema() -> None:
     chosen = selected["papers"][0]
     annotation = {
         "explanation": "Explanation", "commentary": "Commentary",
+        "commentary_sources": [],
         "prior_work": [{
             "text": "The prior paper studies this conversion.",
-            "evidence_ids": [chosen["evidence_id"]],
-            "source_locators": [{
-                "evidence_id": chosen["evidence_id"],
+            "sources": [{
+                "title": chosen["title"],
+                "url": chosen["url"],
                 "locator": chosen["snippets"][0]["block_id"],
             }],
-            "request_key": None,
         }],
-        "later_work": [], "context_claims": [], "evidence_ids": [chosen["evidence_id"]],
-        "key_points": [], "source_notes": [], "evidence_requests": [],
+        "later_work": [],
     }
 
     jsonschema.validate(annotation, ANNOTATION_SCHEMA)
-
-
-def test_unique_supplied_locator_repairs_reader_facing_section_label() -> None:
-    record = {
-        "evidence_id": "context-one",
-        "snippets": [{"block_id": "sec_0042", "text": "Recorded passage."}],
-    }
-    annotation = {
-        "prior_work": [], "later_work": [],
-        "context_claims": [{
-            "text": "The reference gives another presentation.",
-            "evidence_ids": ["context-one"],
-            "source_locators": [{
-                "evidence_id": "context-one",
-                "locator": "Chapter 2: Reader-facing heading",
-            }],
-            "request_key": None,
-        }],
-    }
-
-    _repair_unique_supplied_source_locators(annotation, [record])
-
-    assert annotation["context_claims"][0]["source_locators"] == [{
-        "evidence_id": "context-one", "locator": "sec_0042",
-    }]
-
-
-def test_locator_repair_never_guesses_among_multiple_supplied_pieces() -> None:
-    record = {
-        "evidence_id": "context-many",
-        "snippets": [
-            {"block_id": "sec_0042", "text": "First passage."},
-            {"block_id": "sec_0043", "text": "Second passage."},
-        ],
-    }
-    annotation = {
-        "prior_work": [], "later_work": [],
-        "context_claims": [{
-            "text": "The reference gives another presentation.",
-            "evidence_ids": ["context-many"],
-            "source_locators": [{
-                "evidence_id": "context-many", "locator": "Chapter 2",
-            }],
-            "request_key": None,
-        }],
-    }
-
-    _repair_unique_supplied_source_locators(annotation, [record])
-
-    assert annotation["context_claims"][0]["source_locators"][0]["locator"] == "Chapter 2"
 
 
 def test_whole_paper_soft_reuse_can_leave_empty_but_exact_citation_is_exempt() -> None:
@@ -5548,7 +5548,11 @@ def test_generation_failure_drains_both_lanes_and_retry_only_runs_missing_segmen
         json.loads(path.read_text(encoding="utf-8"))["segment_id"]
         for path in (checkpoint / "translations").glob("*.json")
     }
-    assert completed_annotations == {"seg-0002"}
+    # A terminal failure now opens the shared generation circuit immediately.
+    # No queued successor may start merely to produce a reusable checkpoint.
+    assert completed_annotations == set()
+    # The non-translatable second segment is a deterministic empty artifact and
+    # does not cross the provider circuit.
     assert completed_translations == {"seg-0002"}
 
     retry_generation_calls: list[str] = []
@@ -5584,6 +5588,7 @@ def test_generation_failure_drains_both_lanes_and_retry_only_runs_missing_segmen
     assert second["ok"], second
     assert sorted(retry_generation_calls) == [
         "companion-annotation-seg-0001",
+        "companion-annotation-seg-0002",
         "companion-translation-seg-0001",
     ]
 
@@ -5686,6 +5691,92 @@ def test_complete_resume_requires_matching_output_hashes(tmp_path: Path) -> None
     assert compile_count == 4
 
 
+def test_pdf_failure_preserves_reviewed_content_before_typesetting(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    bundle = _bundle(tmp_path)
+    project = tmp_path / "pdf-failure"
+    publish_pdf = pipeline_module._publish_pdf_artifact
+    publish_calls = 0
+
+    def fail_final_pdf(*args, **kwargs):
+        nonlocal publish_calls
+        publish_calls += 1
+        if publish_calls == 2:
+            raise RuntimeError("final PDF failed")
+        preview = publish_pdf(*args, **kwargs)
+        state = json.loads((project / "state.json").read_text())
+        stale = Path(state["checkpoint_dir"]) / "reader-final.json"
+        stale.write_text('{"schema_version":"stale"}', encoding="utf-8")
+        return preview
+
+    monkeypatch.setattr(pipeline_module, "_publish_pdf_artifact", fail_final_pdf)
+
+    result = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=FakeLLM(),
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert not result["ok"]
+    assert publish_calls == 2
+    checkpoint = Path(result["meta"]["state"]["checkpoint_dir"])
+    assert (checkpoint / "reader-final.json").is_file()
+    state = result["meta"]["state"]
+    digest = state["published"]["content_sha256"]
+    content_path = project / ".arc-companion" / "objects" / "reader-content" / f"{digest}.json"
+    assert content_path.is_file()
+    assert json.loads(content_path.read_text())["content_sha256"] == digest
+
+
+def test_final_pdf_partial_replace_failure_preserves_published_revision(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    bundle = _bundle(tmp_path)
+    project = tmp_path / "immutable-final-pdf"
+    options = BuildOptions(paper_id=bundle.paper_id, project_dir=project)
+    build_kwargs = {
+        "source_loader": lambda *args, **kwargs: bundle,
+        "compiler": lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        "pdf_validator": lambda path: {"bytes": path.stat().st_size},
+    }
+    first = build_companion(options, llm=FakeLLM(), **build_kwargs)
+    assert first["ok"] is True
+    old_state = json.loads((project / "state.json").read_text())
+    old_pdf = Path(old_state["published"]["pdf"]["output_pdf"])
+    old_bytes = old_pdf.read_bytes()
+
+    real_replace = pipeline_module._publish_artifact_replace
+    final_replacements = 0
+
+    def fail_second_final_replace(source: Path, target: Path) -> None:
+        nonlocal final_replacements
+        if ".arc-companion/renders/pdf/" in target.as_posix():
+            final_replacements += 1
+            if final_replacements == 2:
+                raise OSError("injected final publish failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(
+        pipeline_module, "_publish_artifact_replace", fail_second_final_replace,
+    )
+    rerender_state = dict(old_state)
+    rerender_state["final_render_version"] = "stale-render-recipe"
+    (project / "state.json").write_text(json.dumps(rerender_state), encoding="utf-8")
+    failed = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project),
+        llm=FakeLLM(), **build_kwargs,
+    )
+
+    assert failed["ok"] is False
+    assert final_replacements == 2
+    failed_state = json.loads((project / "state.json").read_text())
+    assert failed_state["published"]["pdf"] == old_state["published"]["pdf"]
+    assert old_pdf.read_bytes() == old_bytes
+
+
 def test_non_failed_state_clears_stale_error(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     _state(path, status="failed", error="old failure")
@@ -5693,6 +5784,7 @@ def test_non_failed_state_clears_stale_error(tmp_path: Path) -> None:
     state = _state(path, status="segmenting")
 
     assert state["status"] == "segmenting"
+    assert state["schema_version"] == "arc.companion.state.v3"
     assert "error" not in state
 
 
@@ -5712,6 +5804,14 @@ def test_state_change_of_fingerprint_clears_bound_artifacts(tmp_path: Path) -> N
         source_manifest_path="/run/old-manifest.json",
         validation_path="/run/old-validation.json",
         final_render_version="old-render-version",
+        output_html="/run/reader/index.html",
+        output_html_sha256="old-html-hash",
+        reader_snapshot_path="/run/reader/snapshot.json",
+        reader_snapshot_sha256="old-snapshot-hash",
+        web_manifest_path="/run/reader/manifest.json",
+        web_manifest_sha256="old-web-manifest-hash",
+        web_render_version="old-web-version",
+        web={"ok": True, "snapshot_revision": "old"},
     )
 
     state = _state(
@@ -5732,6 +5832,12 @@ def test_state_change_of_fingerprint_clears_bound_artifacts(tmp_path: Path) -> N
     assert not any(key.startswith("source_manifest_") for key in state)
     assert not any(key.startswith("validation_") for key in state)
     assert "final_render_version" not in state
+    assert "reader_snapshot_path" not in state
+    assert "reader_snapshot_sha256" not in state
+    assert "web_manifest_path" not in state
+    assert "web_manifest_sha256" not in state
+    assert "web_render_version" not in state
+    assert "web" not in state
 
 
 def test_failure_before_fingerprint_clears_prior_fingerprint_state(tmp_path: Path) -> None:

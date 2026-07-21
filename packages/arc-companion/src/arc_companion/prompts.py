@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "arc.companion.prompts.v14"
-SCHEMA_VERSION = "arc.companion.schemas.v11"
+PROMPT_VERSION = "arc.companion.prompts.v15"
+SCHEMA_VERSION = "arc.companion.schemas.v12"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v5"
 TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v4"
 TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION = (
@@ -140,35 +140,42 @@ TRANSLATION_COVERAGE_REPAIR_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+SOURCE_CITATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["title", "url", "locator"],
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "url": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^https?://",
+        },
+        "locator": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Reader-understandable location such as Section 3, p. 12, or Abstract.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+SOURCE_CITATIONS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "maxItems": 3,
+    "items": SOURCE_CITATION_SCHEMA,
+}
+
+CLAIM_SOURCE_CITATIONS_SCHEMA: dict[str, Any] = {
+    **SOURCE_CITATIONS_SCHEMA,
+    "minItems": 1,
+}
+
 RELATED_WORK_CLAIM_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["text", "evidence_ids", "source_locators", "request_key"],
+    "required": ["text", "sources"],
     "properties": {
         "text": {"type": "string", "minLength": 1},
-        "evidence_ids": {
-            "type": "array", "minItems": 1, "items": {"type": "string"},
-        },
-        "source_locators": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "required": ["evidence_id", "locator"],
-                "properties": {
-                    "evidence_id": {"type": "string", "minLength": 1},
-                    "locator": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": (
-                            "Exact machine locator copied verbatim from the supplied evidence "
-                            "snippet; never a title, section heading, page description, or paraphrase."
-                        ),
-                    },
-                },
-                "additionalProperties": False,
-            },
-        },
-        "request_key": {"type": ["string", "null"]},
+        "sources": CLAIM_SOURCE_CITATIONS_SCHEMA,
     },
     "additionalProperties": False,
 }
@@ -183,51 +190,54 @@ ANNOTATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
         "explanation",
+        "commentary",
+        "commentary_sources",
         "prior_work",
         "later_work",
-        "context_claims",
-        "commentary",
-        "evidence_ids",
-        "key_points",
-        "source_notes",
-        "evidence_requests",
     ],
     "properties": {
         "explanation": {"type": "string"},
         "commentary": {"type": "string"},
+        "commentary_sources": SOURCE_CITATIONS_SCHEMA,
         "prior_work": RELATED_WORK_SCHEMA,
         "later_work": RELATED_WORK_SCHEMA,
-        "context_claims": {
+    },
+    "additionalProperties": False,
+}
+
+REVIEW_PATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "segment_id",
+        "translation_blocks",
+        "commentary",
+        "explanation",
+        "commentary_sources",
+        "prior_work",
+        "later_work",
+        "reason",
+    ],
+    "properties": {
+        "segment_id": {"type": "string"},
+        "translation_blocks": {
+            **TRANSLATION_SCHEMA["properties"]["blocks"],
+            "type": ["array", "null"],
+        },
+        "commentary": {"type": ["string", "null"]},
+        "explanation": {"type": ["string", "null"]},
+        "commentary_sources": {
+            **SOURCE_CITATIONS_SCHEMA,
+            "type": ["array", "null"],
+        },
+        "prior_work": {
             **RELATED_WORK_SCHEMA,
-            "description": (
-                "Audited context claims used in explanation/commentary; empty unless context evidence is used."
-            ),
+            "type": ["array", "null"],
         },
-        "evidence_ids": {
-            "type": "array", "maxItems": 6, "items": {"type": "string"},
+        "later_work": {
+            **RELATED_WORK_SCHEMA,
+            "type": ["array", "null"],
         },
-        "key_points": {"type": "array", "items": {"type": "string"}},
-        "source_notes": {"type": "array", "items": {"type": "string"}},
-        "evidence_requests": {
-            "type": "array",
-            "maxItems": 2,
-            "items": {
-                "type": "object",
-                "required": [
-                    "relation", "needed_claim", "queries", "candidate_paper_ids",
-                    "candidate_urls", "reason",
-                ],
-                "properties": {
-                    "relation": {"type": "string", "enum": ["prior", "later", "context"]},
-                    "needed_claim": {"type": "string", "minLength": 1},
-                    "queries": {"type": "array", "items": {"type": "string"}},
-                    "candidate_paper_ids": {"type": "array", "items": {"type": "string"}},
-                    "candidate_urls": {"type": "array", "items": {"type": "string"}},
-                    "reason": {"type": "string", "minLength": 1},
-                },
-                "additionalProperties": False,
-            },
-        },
+        "reason": {"type": "string"},
     },
     "additionalProperties": False,
 }
@@ -238,42 +248,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
     "properties": {
         "patches": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "required": [
-                    "segment_id",
-                    "translation_blocks",
-                    "commentary",
-                    "explanation",
-                    "prior_work",
-                    "later_work",
-                    "evidence_ids",
-                    "reason",
-                ],
-                "properties": {
-                    "segment_id": {"type": "string"},
-                    "translation_blocks": {
-                        **TRANSLATION_SCHEMA["properties"]["blocks"],
-                        "type": ["array", "null"],
-                    },
-                    "commentary": {"type": ["string", "null"]},
-                    "explanation": {"type": ["string", "null"]},
-                    "prior_work": {
-                        "type": ["array", "null"],
-                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
-                    },
-                    "later_work": {
-                        "type": ["array", "null"],
-                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
-                    },
-                    "evidence_ids": {
-                        "type": ["array", "null"],
-                        "items": {"type": "string"},
-                    },
-                    "reason": {"type": "string"},
-                },
-                "additionalProperties": False,
-            },
+            "items": REVIEW_PATCH_SCHEMA,
         },
         "issues": {"type": "array", "items": {"type": "string"}},
     },
@@ -290,22 +265,23 @@ COMMENTARY_REVIEW_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "required": [
                     "segment_id", "commentary", "explanation", "prior_work",
-                    "later_work", "evidence_ids", "reason",
+                    "later_work", "commentary_sources", "reason",
                 ],
                 "properties": {
                     "segment_id": {"type": "string"},
                     "commentary": {"type": ["string", "null"]},
                     "explanation": {"type": ["string", "null"]},
-                    "prior_work": {
+                    "commentary_sources": {
+                        **SOURCE_CITATIONS_SCHEMA,
                         "type": ["array", "null"],
-                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
+                    },
+                    "prior_work": {
+                        **RELATED_WORK_SCHEMA,
+                        "type": ["array", "null"],
                     },
                     "later_work": {
+                        **RELATED_WORK_SCHEMA,
                         "type": ["array", "null"],
-                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
-                    },
-                    "evidence_ids": {
-                        "type": ["array", "null"], "items": {"type": "string"},
                     },
                     "reason": {"type": "string"},
                 },
@@ -319,8 +295,12 @@ COMMENTARY_REVIEW_SCHEMA: dict[str, Any] = {
 
 SECTION_REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["findings", "reviewed_segments"],
+    "required": ["reviewed_segment_ids", "findings", "patches"],
     "properties": {
+        "reviewed_segment_ids": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
         "findings": {
             "type": "array",
             "items": {
@@ -333,18 +313,9 @@ SECTION_REVIEW_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
-        "reviewed_segments": {
+        "patches": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["segment_id", "translation", "annotation"],
-                "properties": {
-                    "segment_id": {"type": "string"},
-                    "translation": TRANSLATION_SCHEMA,
-                    "annotation": ANNOTATION_SCHEMA,
-                },
-                "additionalProperties": False,
-            },
+            "items": REVIEW_PATCH_SCHEMA,
         },
     },
     "additionalProperties": False,
@@ -519,8 +490,16 @@ def annotation_prompt(
     first_draft: dict[str, Any] | None = None,
     evidence_resolution: dict[str, Any] | None = None,
 ) -> str:
+    glossary_context = (
+        f"GLOSSARY:\n{json.dumps(glossary, ensure_ascii=False)}\n\n"
+        if glossary
+        else ""
+    )
     return (
         "Write rigorous, reader-useful companion commentary for this contiguous theoretical-physics segment. "
+        "Use the companion discussion already present in this native session to judge what has been explained; "
+        "prefer new value for the current segment and avoid unnecessary repetition. Do not output a summary, "
+        "covered-points list, or any other memory of earlier commentary. "
         "Explanation is optional: if the passage is already evident to the intended reader and none of the "
         "criteria below adds material value, return empty strings for explanation and commentary instead of "
         "paraphrasing, summarizing, praising, or manufacturing a teaching note. A commentary that merely "
@@ -537,17 +516,17 @@ def annotation_prompt(
         "when it is substantive rather than a loose analogy; (6) add a directly relevant historical story or "
         "interesting fact only when a reliable, verifiable source supports it and the attribution is not folklore; "
         "(7) proactively consider a current understanding or development, but include it only after identifying a "
-        "registered, verifiable source, stating what specifically changed, and explaining exactly how it materially "
-        "changes this passage's interpretation; it must have registered, verifiable evidence. This is the only acceptable basis for a materially useful current "
+        "directly inspected, verifiable source, stating what specifically changed, and explaining exactly how it materially "
+        "changes this passage's interpretation. This is the only acceptable basis for a materially useful current "
         "understanding or development remark. Do not use vague recent-progress remarks. Do not chase novelty, treat a "
         "routine reformulation as progress, or rely on model memory for an update. Do not force all directions into "
         "every segment and do not repeat the "
-        "source. Return optional explanation and commentary strings, a bounded account of relevant prior work, "
-        "and a bounded account of relevant later work. The prior_work and later_work fields are strictly optional. "
-        "Return each non-empty field as at most three claim "
-        "objects, each with text, the evidence_ids used for that exact claim, source_locators pairing every "
-        "evidence_id with an exact supplied block/snippet locator (or 'abstract'), and request_key (null for "
-        "an initially supported claim). The top-level evidence_ids must equal the union of claim evidence_ids. "
+        "source. Return optional explanation and commentary strings, sources for external facts used in either "
+        "string, and bounded accounts of relevant prior and later work. The prior_work and later_work fields are "
+        "strictly optional. commentary_sources contains the sources supporting external facts in explanation or "
+        "commentary. Each prior_work or later_work item contains its claim text and its own sources. Use at most "
+        "three sources per claim. Every source must contain its exact title, a direct HTTP(S) URL, and a "
+        "reader-understandable locator such as Section 3, p. 12, or Abstract. Do not repeat a source within one claim. "
         "Include a claim only when it directly illuminates a concrete claim in this exact segment. Never fill "
         "either field merely because it exists in the schema, and never use a famous, highly cited, or field-"
         "defining paper as a generic fallback. A same-relation paper is not generic support for another claim. "
@@ -555,54 +534,28 @@ def annotation_prompt(
         "exact bibliography citation targets as the strongest prior-work relevance signal; citation count is only "
         "a weak secondary prior. Prefer a more directly relevant paper even when it is outside the supplied domain "
         "or less cited. Do not fill a quota. Explain motivation, assumptions, "
-        "derivation logic, notation, and conceptual connections. Do not rewrite or correct the source. "
-        "Never put an evidence ID, hash, or controller label in reader-facing prose; refer to a source by its "
-        "exact title and its supplied chapter, section, or other reader-facing location. Write for a reader who "
-        "has only the rendered companion PDF: never say 'context evidence', 'supplied context', 'bounded "
-        "evidence', 'evidence ID', or otherwise refer to controller inputs. If no reader-facing location is "
-        "available, cite the exact title alone and do not expose an opaque block locator. Use an ordinary "
-        "reader citation such as '(Source: Exact Title, Chapter/Section)' (localized to the output language). "
+        "derivation logic, notation, and conceptual connections. Do not rewrite or correct the source. Write for "
+        "a reader who has only the rendered companion PDF; never expose hashes, internal IDs, or controller labels. "
         "Use the glossary consistently and preserve every personal name in Latin spelling. "
-        "When needed, use the bounded full-paper navigation context and internet search to inspect the full paper "
-        "or verify terminology and related-work context. The worker has no ARC CLI, shell, or MCP access; request "
-        "additional ARC evidence through evidence_requests so the controller can resolve it through services. Treat external material as "
-        "supporting context, never as permission to alter the immutable source passage. Do not make a prior- or "
-        "later-work claim from an external result unless it is also present in BOUNDED LITERATURE EVIDENCE with "
-        "a registered evidence_id and source_descriptor. If research identifies a potentially useful new "
-        "source that is not registered, keep the dependent related-work claim out of prior_work/later_work and "
-        "return a precise evidence_requests item instead (at most two). On the evidence rerun, a claim depending "
-        "on a resolved request must carry that request_key and bind one of that request's newly registered evidence "
-        "IDs and its exact locator; otherwise omit that claim and preserve unrelated claims. A request must state the claim, relation, "
-        "queries, candidate paper IDs or discovery URLs, and reason. Web snippets are discovery hints only. "
-        "Evidence whose relation is context is an explicitly selected local reference: use it only to support "
-        "the explanation or conceptual connections in the combined commentary. It must never be presented as "
-        "prior work, later work, chronology, or historical priority. Record its evidence_id only in the "
-        "structured evidence_ids field when it materially supports such explanatory context. For every context "
-        "evidence_id you record, cite that source's exact supplied title in explanation or commentary and add its "
-        "supplied section/location when available; do not print the identifier itself. This reader-facing "
-        "title/section citation is separate from source_locators: every source_locators.locator value must be "
-        "copied verbatim from that evidence record's supplied snippet locator (the snippet's locator or block_id, "
-        "or 'abstract' when no snippet exists). Never put a book title, section title, chapter label, page label, "
-        "or a rewritten locator in source_locators.locator. "
+        "In this same turn, use host internet search and arc-paper-worker when useful to search, read, verify, and "
+        "cite external material. Prefer papers, publisher pages, and official primary pages. A search-results page, "
+        "an aggregator that exposes only a snippet, or a URL you did not inspect is not an acceptable final source. "
+        "Treat external material as supporting context, never as permission to alter the immutable source passage. "
+        "If internet access is disabled, cite only sources already supplied in this prompt or available in the local "
+        "ARC cache with a usable HTTP(S) URL; omit any external claim that cannot be supported that way. "
         "When EXPLICIT DOMAIN CONTEXT is present, use it as preferred navigation and a relevance signal, not as "
-        "a closed corpus. A domain match never forbids or short-circuits ARC, INSPIRE, references/citers, or web "
-        "research, and a more directly relevant paper outside the domain may be preferred. The reference and "
-        "citer catalogs are discovery context, not evidence that may be cited without a registered descriptor. "
-        "For a resolved context request, include an audited context_claims object binding the exact factual "
-        "statement used in explanation/commentary to the request_key, evidence ID, and exact locator. "
+        "a closed corpus. A more directly relevant source outside the domain may be preferred. Catalog entries and "
+        "search snippets are discovery context only; inspect the final cited page itself. "
         f"Write in {language}; state uncertainty explicitly. Protected names: "
         f"{json.dumps(protected_names, ensure_ascii=False)}.\n\n"
         f"PAPER METADATA:\n{json.dumps(metadata, ensure_ascii=False)}\n\n"
         f"FULL-PAPER NAVIGATION CONTEXT:\n{json.dumps(paper_context, ensure_ascii=False)}\n\n"
         f"EXPLICIT DOMAIN CONTEXT:\n{json.dumps(domain_context, ensure_ascii=False)}\n\n"
-        f"GLOSSARY:\n{json.dumps(glossary, ensure_ascii=False)}\n\n"
+        + glossary_context
+        +
         f"SEGMENT:\n{json.dumps(segment, ensure_ascii=False)}\n\n"
         f"SOURCE BLOCKS:\n{json.dumps(blocks, ensure_ascii=False)}\n\n"
-        f"BOUNDED LITERATURE EVIDENCE:\n{json.dumps(evidence, ensure_ascii=False)}\n\n"
-        f"FIRST-ROUND DRAFT (present only for the controller evidence rerun):\n"
-        f"{json.dumps(first_draft, ensure_ascii=False)}\n\n"
-        f"CONTROLLER EVIDENCE RESOLUTION (present only for the controller evidence rerun):\n"
-        f"{json.dumps(evidence_resolution, ensure_ascii=False)}"
+        f"BOUNDED SOURCES:\n{json.dumps(evidence, ensure_ascii=False)}"
     )
 
 
@@ -618,27 +571,24 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "with a different logical viewpoint or organization, deeper non-conventional incompatibilities, non-evident "
         "intermediate derivations, substantive connections to other concepts/courses/disciplines, reliable relevant "
         "historical stories or interesting facts, and materially useful current understanding or developments backed "
-        "by registered, verifiable evidence that identifies what changed and how it changes this passage. Do not "
+        "by directly cited, verifiable sources that identify what changed and how it changes this passage. Do not "
         "chase novelty or relabel a routine reformulation as progress. "
         "A difference that is only convention, notation, normalization, or an "
         "equivalent formulation is not an inconsistency. "
         "An empty explanation/commentary is valid when the passage needs no reader aid. "
         "Every patch field is required by the output schema: use null for each translation or companion field that "
         "must remain unchanged. Use an empty string when intentionally clearing explanation/commentary, and an "
-        "empty array only when intentionally clearing prior_work or later_work. "
+        "empty array only when intentionally clearing commentary_sources, prior_work, or later_work. "
         "Prior and later work are optional; never add a generic or quota-filling related-work patch. "
         "Return full replacement translation blocks for a translation correction. Never alter equations, equation numbers, figures, "
-        "tables, citations, references, identifiers, or evidence IDs. Never create a new prior/later claim or bind "
-        "an existing relation-level evidence ID to a new fact; review may only correct wording or remove an already "
-        "claim-bound item. Translation coverage applies only to "
+        "tables, citations, references, or identifiers. A reviewer may retain, remove, or correct an existing direct "
+        "citation, but must not invent or add a source that it did not search and inspect during generation; review "
+        "does not perform new source research. Translation coverage applies only to "
         "translatable natural-language blocks supplied in translation blocks. Display equations, figures, "
         "tables, bibliography, and other controller-owned or source-only blocks are intentionally absent and "
         "must not be invented as translation blocks. An empty patches list is valid. "
-        "For each segment, verify context-supported explanatory claims against that segment's bounded "
-        "context_evidence and source_descriptor; context evidence never establishes chronology or priority. "
-        "Any source mention retained in reader-facing prose must be intelligible from the rendered PDF alone: "
-        "use the exact source title plus its supplied chapter/section/location, never an evidence ID, opaque "
-        "block locator, controller label, or phrases such as 'context evidence' or 'supplied context'. "
+        "Verify externally supported claims against the direct sources already attached to that segment. Any source "
+        "retained must keep its exact title, HTTP(S) URL, and reader-understandable locator. "
         f"All replacements must be in {language}.\n\nCOMPANION:\n"
         f"{json.dumps(payload, ensure_ascii=False)}{extra}"
     )
@@ -652,10 +602,9 @@ def commentary_review_prompt(payload: dict[str, Any], *, language: str) -> str:
         "or patch any translation. Source blocks and the frozen glossary are immutable. Return one "
         "patch only for a segment needing a commentary correction. Every patch field is required: "
         "use null for unchanged fields, an empty string to clear commentary/explanation, and an empty "
-        "array only to clear prior_work or later_work. Remove paraphrase and generic teaching filler. "
-        "Review may correct or remove an existing claim but must not create a related-work fact or a "
-        "new evidence binding. An empty patches list is valid. Reader-facing source mentions must use "
-        "the supplied title and locator, never controller labels or evidence IDs. "
+        "array only to clear commentary_sources, prior_work, or later_work. Remove paraphrase and generic teaching "
+        "filler. Review may retain, remove, or correct an existing citation but must not add a source it did not "
+        "search and inspect during generation; review performs no new source research. An empty patches list is valid. "
         f"All replacements must be in {language}.\n\nCOMPANION:\n"
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
@@ -664,25 +613,21 @@ def commentary_review_prompt(payload: dict[str, Any], *, language: str) -> str:
 def section_review_prompt(payload: dict[str, Any], *, language: str) -> str:
     return (
         "Review this portion of a source/translation/companion theoretical-physics paper. Identify concrete "
-        "technical, translation, coverage, terminology, protected-name, and evidence-grounding issues. "
-        "Verify explanatory claims against each segment's actual bounded context_evidence and "
-        "source_descriptor; do not use context evidence for chronology or priority. "
-        "Reader-facing source mentions must stand alone in the rendered PDF: use the exact source title plus its "
-        "supplied chapter/section/location, and never expose evidence IDs, opaque block locators, controller "
-        "labels, or phrases such as 'context evidence' or 'supplied context'. "
+        "technical, translation, coverage, terminology, protected-name, and source-grounding issues. Verify external "
+        "claims against the direct sources attached to each segment. A reviewer may retain, remove, or correct an "
+        "existing citation, but must not invent or add a source and performs no new source research. "
         "An empty explanation/commentary is valid when the passage needs no reader aid; never add filler solely "
         "for completeness. Retain or propose explanation only when it materially clarifies motivation (especially "
         "at section or chapter openings), a genuinely different reference presentation, a deeper non-conventional "
         "source incompatibility, non-evident intermediate mathematics, a substantive connection to another "
         "concept/course/discipline, a reliable relevant historical story or interesting fact, or a current development "
-        "backed by registered, verifiable evidence that states what changed and how it changes this passage. Remove "
+        "backed by directly cited, verifiable sources that state what changed and how it changes this passage. Remove "
         "same-meaning paraphrase and generic teaching filler. Do not chase novelty or relabel a routine "
         "reformulation as progress. Treat notation, convention, normalization, and "
         "equivalent formulations as differences rather than inconsistencies. "
-        "Do not propose changes to source blocks or the frozen glossary. Do not add any prior/later fact or new "
-        "claim-evidence binding during review. Return reviewed_segments containing "
-        "exactly every input segment_id plus complete reviewed translation and annotation values (unchanged when correct) "
-        "so the controller can verify section coverage and project only concrete differences to the final reviewer. "
+        "Do not propose changes to source blocks or the frozen glossary. Return reviewed_segment_ids containing "
+        "exactly every input segment_id, plus only sparse findings and patches for concrete problems. Never echo "
+        "complete unchanged translations or annotations. Every patch field is required; use null for unchanged fields. "
         "Translation coverage applies only to translatable natural-language blocks already represented in the "
         "input translation. Display equations, figures, tables, bibliography, and other controller-owned or "
         "source-only blocks are intentionally absent; never report their absence as missing translation and never "

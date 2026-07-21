@@ -326,7 +326,14 @@ def render_companion_tex(
     guide = "" if chapters else _render_reading_guide(
         language=language, include_translation=bool(translations)
     )
-    glossary_tex = _render_glossary(glossary, language=language)
+    # A glossary is a bilingual companion artifact.  Treat the absence of the
+    # translation layer as authoritative even if a stale caller accidentally
+    # passes glossary data from an earlier translated run.
+    glossary_tex = _render_glossary(
+        glossary if translation_mode else None,
+        language=language,
+    )
+    glossary_back_matter = f"\n\\clearpage\n{glossary_tex}" if glossary_tex else ""
     annotation_sources_by_segment = {
         str(segment_id): source_manifest
         for segment_id, annotation in annotations.items()
@@ -341,8 +348,8 @@ def render_companion_tex(
         )
         + front_body
         + guide
-        + glossary_tex
         + "\n".join(body)
+        + glossary_back_matter
         + "\n\\end{document}\n"
     )
     tex = _remove_disallowed_c0(tex)

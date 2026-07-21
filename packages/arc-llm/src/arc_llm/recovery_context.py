@@ -42,7 +42,16 @@ def read_recovery_context(
     progress_path = root / "progress.jsonl"
     if checkpoint and checkpoint.get("progress_journal"):
         progress_path = Path(str(checkpoint["progress_journal"]))
-    latest = _last_json_object(progress_path)
+    session_ref = session_manager.get_existing(session_key) if session_manager and session_key else None
+    expected = {
+        "idempotency_key": idempotency_key,
+        "session_key": session_key,
+        "generation": session_ref.generation if session_ref is not None else None,
+        "provider": session_ref.provider if session_ref is not None else None,
+        "model": session_ref.model if session_ref is not None else None,
+        "runtime_fingerprint": session_ref.runtime_fingerprint if session_ref is not None else None,
+    }
+    latest = _last_matching_json_object(progress_path, expected=expected)
     response = checkpoint.get("response") if isinstance(checkpoint, dict) else None
     native_id = response.get("native_session_id") if isinstance(response, dict) else None
     if not native_id and latest:
@@ -52,7 +61,7 @@ def read_recovery_context(
     model = None
     runtime_fp = None
     if session_manager is not None and session_key:
-        ref = session_manager.get_existing(session_key)
+        ref = session_ref
         if ref is not None:
             generation = ref.generation
             native_id = native_id or ref.native_session_id
@@ -91,7 +100,9 @@ def _read_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _last_json_object(path: Path) -> dict[str, Any] | None:
+def _last_matching_json_object(
+    path: Path, *, expected: dict[str, Any]
+) -> dict[str, Any] | None:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -101,6 +112,9 @@ def _last_json_object(path: Path) -> dict[str, Any] | None:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
+        if isinstance(value, dict) and all(
+            expected_value is None or value.get(key) == expected_value
+            for key, expected_value in expected.items()
+        ):
             return value
     return None

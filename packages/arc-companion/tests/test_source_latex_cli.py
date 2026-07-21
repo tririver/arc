@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+import types
 
 import pytest
 
 from arc_companion import cli
+import arc_companion
 from arc_companion.latex import (
     LatexError,
     _render_html_fragment,
@@ -436,6 +439,62 @@ def test_cli_json_wraps_dispatch_exception(monkeypatch, capsys) -> None:
     }
 
 
+def test_cli_render_web_publishes_reader(tmp_path: Path, monkeypatch, capsys) -> None:
+    module = types.ModuleType("arc_companion.render")
+    captured: dict[str, Path] = {}
+
+    def render_content(project_dir: Path, *, format: str) -> dict:
+        captured["project_dir"] = project_dir
+        captured["format"] = format
+        return {"ok": True, "data": {
+            "mode": "render_only",
+            "output_html": str(project_dir / "reader" / "index.html"),
+            "provider_calls": 0,
+        }, "errors": [], "meta": {}}
+
+    module.render_content = render_content  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "arc_companion.render", module)
+
+    assert cli.main(["render-web", "--project-dir", str(tmp_path)]) == 0
+    assert captured["project_dir"] == tmp_path
+    assert captured["format"] == "web"
+    assert capsys.readouterr().out.strip() == str(tmp_path / "reader" / "index.html")
+
+
+def test_non_json_build_prefers_pdf_over_web_output(capsys) -> None:
+    cli._emit(
+        {
+            "ok": True,
+            "data": {"output_pdf": "/project/paper.pdf", "output_html": "/project/reader/index.html"},
+            "meta": {},
+        },
+        json_output=False,
+    )
+    assert capsys.readouterr().out.strip() == "/project/paper.pdf"
+
+
+def test_public_web_contract_delegates_lazily(tmp_path: Path, monkeypatch) -> None:
+    module = types.ModuleType("arc_companion.web")
+    module.build_reader_snapshot = lambda project_dir, **kwargs: {  # type: ignore[attr-defined]
+        "project_dir": project_dir, **kwargs
+    }
+    module.publish_reader = lambda project_dir, **kwargs: {  # type: ignore[attr-defined]
+        "project_dir": project_dir, **kwargs
+    }
+    module.validate_reader_project = lambda project_dir, **kwargs: {  # type: ignore[attr-defined]
+        "project_dir": project_dir, **kwargs
+    }
+    monkeypatch.setitem(sys.modules, "arc_companion.web", module)
+
+    assert arc_companion.build_reader_snapshot(tmp_path, state={"status": "complete"}) == {
+        "project_dir": tmp_path, "state": {"status": "complete"}, "final_overrides": None,
+    }
+    assert arc_companion.publish_reader(tmp_path, snapshot={"chapters": []})["snapshot"] == {
+        "chapters": []
+    }
+    assert arc_companion.validate_reader_project(tmp_path)["project_dir"] == tmp_path
+
+
 def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
     captured = {}
     legacy = tmp_path / "legacy"
@@ -522,7 +581,13 @@ def test_companion_docs_describe_chaptered_stateful_cli_contract() -> None:
     assert "PDF is authoritative" in workflow_text
     assert "CLI-only" in manual_text
     assert "There is no entry cap" in manual_text
-    assert "chapter-glossary.json" in manual_text
+    assert "whole-document glossary" in manual_text
+    assert "Project terms to segments" in manual_text
+    assert "chapter-glossary.json" not in manual_text
+    assert "glossary setup turns" not in manual_text
+    assert "searches, reads, writes, and cites sources within one generation turn" in manual_text
+    assert "`--no-internet`" in manual_text
+    assert "title linked to its URL and the locator visible" in manual_text
     assert "`first_chapter_ready`" in manual_text
     assert "`needs_supervision`" in manual_text
     assert "`--stop-after-first-chapter`" in manual_text
@@ -773,10 +838,18 @@ def test_html_renderer_preserves_inline_structure_without_front_or_reference_dup
         "end_block_id": "bib1",
         "block_ids": ["title", "p1", "bib1"],
     }]
+    annotation = {
+        "commentary": "note",
+        "commentary_sources": [{
+            "title": "Companion source",
+            "url": "https://example.test/source_a?view=full&lang=en",
+            "locator": "Section 2 / p. 4",
+        }],
+    }
     tex, manifest = render_companion_tex(
         document,
         segments,
-        {"all": {"commentary": "note"}},
+        {"all": annotation},
         output_dir=tmp_path,
         language="en",
     )
@@ -786,6 +859,14 @@ def test_html_renderer_preserves_inline_structure_without_front_or_reference_dup
     assert r"\(x_i\)" in tex
     assert r"\hyperref[bib1]{[1]}" in tex
     assert r"\href{https://example.test/a\_b?x=1\&y=2}{site}" in tex
+    assert (
+        r"\href{https://example.test/source\_a?view=full\&lang=en}{Companion source}"
+        in tex
+    )
+    assert "Section 2 / p. 4" in tex
+    assert manifest["companion_layers"]["annotation_sources_by_segment"] == {
+        "all": {"commentary_sources": annotation["commentary_sources"]}
+    }
     assert validate_tex_fidelity(tex, document, manifest) == []
 
 

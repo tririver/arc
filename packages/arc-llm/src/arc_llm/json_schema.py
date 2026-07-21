@@ -59,6 +59,8 @@ def _validate_codex_node(node: Any, *, path: str, errors: list[str]) -> None:
         return
     if not isinstance(node, dict):
         return
+    if "oneOf" in node:
+        errors.append(f"{path}.oneOf is not supported; use anyOf or a type union")
     if _is_object_schema(node):
         properties = node.get("properties", {})
         if not isinstance(properties, dict):

@@ -116,7 +116,7 @@ def test_cli_domain_options_are_mutually_exclusive() -> None:
         cli.main(["build", "arXiv:1", "--domain-id", "one", "--domain-manifest", "manifest.json"])
 
 
-def test_domain_context_is_in_annotation_prompt_and_fingerprint(tmp_path: Path) -> None:
+def test_domain_context_is_in_annotation_prompt_but_not_source_fingerprint(tmp_path: Path) -> None:
     context = load_domain_context(domain_manifest=_write_manifest(tmp_path))
     prompt = annotation_prompt(
         {"segment_id": "s"}, [], language="zh-CN", metadata={}, evidence={}, glossary={},
@@ -136,6 +136,6 @@ def test_domain_context_is_in_annotation_prompt_and_fingerprint(tmp_path: Path) 
     )
     options = BuildOptions(paper_id="arXiv:1", project_dir=tmp_path / "run")
     evidence = {"related_papers": []}
-    assert _fingerprint(bundle, options, evidence=evidence) != _fingerprint(
+    assert _fingerprint(bundle, options, evidence=evidence) == _fingerprint(
         bundle, options, evidence=evidence, domain_context=context
     )

@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from arc_companion.chapter_glossary import generate_index_glossary, project_chapter_glossary
+from arc_companion.chapter_glossary import generate_index_glossary, project_segment_glossary
 from arc_companion.chapter_guide import generate_chapter_guide
 from arc_companion.chapter_scheduler import run_chapter_pipeline
 from arc_companion.chapters import ChapterStructureError, build_chapters
@@ -45,50 +45,152 @@ def test_authoritative_chapter_gap_is_rejected() -> None:
         ]})
 
 
-def test_chapter_glossary_uses_source_and_index_overlap_and_keeps_parent() -> None:
-    chapter = {"chapter_id": "ch-0001", "block_ids": ["b1", "b2"], "page_start": 10, "page_end": 20}
+def test_segment_glossary_projects_only_terms_in_source_and_keeps_lineage() -> None:
     glossary = {"entries": [
         {"entry_id": "parent", "source": "field", "target": "场"},
         {"entry_id": "child", "parent_id": "parent", "source": "Ward identity", "target": "沃德恒等式"},
         {"entry_id": "outside", "source": "fermion", "target": "费米子"},
     ]}
-    index = [{"term": "Ward identity", "page_ranges": [{"start": 12, "end": 12}]}]
-    result = project_chapter_glossary(chapter, _document(), glossary, index_entries=index)
-    assert [item["entry_id"] for item in result["entries"]] == ["parent", "child"]
+    result = project_segment_glossary([{"text": "The Ward identity is useful."}], glossary)
+    assert [item["entry_id"] for item in result["entries"]] == ["child"]
+    assert result["entries"][0]["lineage"] == [
+        {"entry_id": "parent", "source": "field", "target": "场"}
+    ]
 
 
-def test_chapter_glossary_keeps_every_ancestor_in_global_order() -> None:
-    chapter = {"chapter_id": "ch-0001", "block_ids": ["b1", "b2"]}
+def test_segment_glossary_keeps_every_ancestor_as_ordered_lineage() -> None:
     glossary = {"entries": [
         {"entry_id": "grand", "source": "symmetry", "target": "对称性"},
         {"entry_id": "parent", "parent_id": "grand", "source": "current", "target": "流"},
         {"entry_id": "child", "parent_id": "parent", "source": "gauge field", "target": "规范场"},
         {"entry_id": "outside", "source": "fermion", "target": "费米子"},
     ]}
-    result = project_chapter_glossary(chapter, _document(), glossary)
-    assert [item["entry_id"] for item in result["entries"]] == ["grand", "parent", "child"]
+    result = project_segment_glossary([{"text": "A gauge field."}], glossary)
+    assert [item["entry_id"] for item in result["entries"]] == ["child"]
+    assert [item["entry_id"] for item in result["entries"][0]["lineage"]] == ["grand", "parent"]
 
 
-def test_chapter_glossary_assigns_stable_ids_to_non_index_terms() -> None:
-    result = project_chapter_glossary(
-        {"chapter_id": "ch-0001", "block_ids": ["b1", "b2"]},
-        _document(), {"entries": [{"source": "gauge field", "target": "规范场"}]},
+def test_segment_glossary_assigns_stable_ids_to_non_index_terms() -> None:
+    result = project_segment_glossary(
+        [{"text": "A gauge field."}],
+        {"entries": [{"source": "gauge field", "target": "规范场"}]},
     )
     assert result["entries"][0]["entry_id"] == "term-0001"
+
+
+def test_segment_glossary_normalizes_aliases_nfkc_case_and_boundaries() -> None:
+    glossary = {"entries": [
+        {"source_term": "Gauge Field", "target_term": "规范场", "source_aliases": ["ＧＦ"]},
+        {"term": "fermion", "translation": "费米子"},
+    ]}
+    result = project_segment_glossary([{"text": "A gf, not fermionic matter."}], glossary)
+    assert [item["source"] for item in result["entries"]] == ["Gauge Field"]
+    assert result["entries"][0]["aliases"] == ["ＧＦ"]
+
+
+def test_segment_glossary_uses_unicode_latin_and_decimal_boundaries() -> None:
+    glossary = {"entries": [
+        {"source": "résumé", "target": "简历"},
+        {"source": "phase 2", "target": "第二阶段"},
+    ]}
+    plural = project_segment_glossary(
+        [{"text": "Several résumés and phase 2٢ variants."}], glossary,
+    )
+    assert plural["entries"] == []
+    exact = project_segment_glossary(
+        [{"text": "The RÉSUMÉ ends; PHASE ２ begins."}], glossary,
+    )
+    assert [item["source"] for item in exact["entries"]] == ["résumé", "phase 2"]
+
+
+def test_segment_glossary_preserves_empty_target_and_global_order() -> None:
+    glossary = {"entries": [
+        {"source": "second", "target": ""},
+        {"source": "first", "target": "一"},
+    ]}
+    result = project_segment_glossary([{"text": "first and second"}], glossary)
+    assert [item["entry_id"] for item in result["entries"]] == ["term-0001", "term-0002"]
+    assert result["entries"][0]["target"] == ""
+    assert result["counts"] == {"source_entries": 2, "matched_entries": 2}
 
 
 def test_lane_ledger_orders_states_and_preserves_accepted_prefix(tmp_path) -> None:
     path = tmp_path / "ledger.json"
     ledger = initialize_lane_ledger(path, chapter_id="ch-0001", lane="translation", segment_ids=["s1", "s2"])
     assert next_pending(ledger) == "s1"
-    for state in ("submitted", "schema_valid", "invariant_valid", "accepted"):
+    assert ledger["blocks"][0]["state"] == "prepared"
+    assert ledger["blocks"][0]["submission_state"] == "not_submitted"
+    for state in ("submitted", "response_received", "schema_valid", "invariant_valid", "accepted"):
         ledger = advance_block(path, segment_id="s1", state=state, input_sha256="i", output_sha256="o")
     assert next_pending(ledger) == "s2"
     ledger = mark_needs_supervision(path, segment_id="s2", reason="timeout", recovery_context={"submission_state": "unknown"})
     assert next_pending(ledger) is None
     ledger = invalidate_suffix(path, from_segment_id="s2", generation=2)
     assert ledger["blocks"][0]["state"] == "accepted"
-    assert ledger["blocks"][1] == {"segment_id": "s2", "state": "pending", "generation": 2}
+    assert ledger["blocks"][1] == {
+        "segment_id": "s2", "state": "prepared",
+        "submission_state": "not_submitted", "generation": 2,
+    }
+
+
+def test_lane_ledger_v1_upgrade_preserves_uncertain_submission(tmp_path) -> None:
+    path = tmp_path / "ledger.json"
+    path.write_text(json.dumps({
+        "schema_version": "arc.companion.chapter-lane-ledger.v1",
+        "chapter_id": "ch-0001",
+        "lane": "translation",
+        "generation": 1,
+        "needs_supervision": None,
+        "blocks": [
+            {"segment_id": "s1", "state": "pending", "generation": 1},
+            {"segment_id": "s2", "state": "submitted", "generation": 1},
+        ],
+        "accepted_chain_sha256": "chain",
+    }), encoding="utf-8")
+
+    ledger = initialize_lane_ledger(
+        path,
+        chapter_id="ch-0001",
+        lane="translation",
+        segment_ids=["s1", "s2"],
+    )
+
+    assert ledger["schema_version"].endswith(".v2")
+    assert ledger["blocks"][0]["state"] == "prepared"
+    assert ledger["blocks"][0]["submission_state"] == "not_submitted"
+    assert ledger["blocks"][1]["state"] == "submitted"
+    assert ledger["blocks"][1]["submission_state"] == "submitted"
+
+
+def test_scheduler_failure_event_cancels_other_active_lane() -> None:
+    stopped = threading.Event()
+    both_active = threading.Barrier(2)
+    companion_cancelled = threading.Event()
+
+    def translation(_prepared, _segment):
+        both_active.wait(timeout=5)
+        raise ValueError("ordinary local lane failure")
+
+    def companion(_prepared, _segment):
+        both_active.wait(timeout=5)
+        while not stopped.is_set():
+            time.sleep(0.001)
+        companion_cancelled.set()
+        raise RuntimeError("peer cancellation observed")
+
+    with pytest.raises(ValueError, match="ordinary local lane failure"):
+        run_chapter_pipeline(
+            [{"chapter_id": "ch-0001"}],
+            workers=2,
+            prepare_guide=lambda _chapter: {},
+            prepare_segments=lambda _chapter: [{"segment_id": "s1"}],
+            run_translation=translation,
+            run_companion=companion,
+            stop_event=stopped,
+            cancel_check=stopped.is_set,
+        )
+
+    assert companion_cancelled.is_set()
 
 
 def test_build_review_is_emitted_only_at_a_safe_boundary(tmp_path) -> None:
@@ -260,3 +362,5 @@ def test_chapter_guide_excludes_original_bibliography_by_all_normalized_identiti
     assert "by-arxiv" not in captured[0]
     assert "by-title" not in captured[0]
     assert '"evidence_id": "new"' in captured[0]
+    assert "book_position field describes location within the supplied source document" in captured[0]
+    assert "never describe or predict pagination in the generated companion document" in captured[0]

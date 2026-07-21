@@ -10,9 +10,10 @@ from typing import Any, Mapping
 from .io import read_json, sha256_json, write_json
 
 
-READER_CONTENT_VERSION = "arc.companion.reader-content.v1"
-CONTENT_RECEIPT_VERSION = "arc.companion.reader-content-validation.v1"
+READER_CONTENT_VERSION = "arc.companion.reader-content.v2"
+CONTENT_RECEIPT_VERSION = "arc.companion.reader-content-validation.v2"
 CONTENT_OBJECT_KIND = "reader-content"
+_LEGACY_READER_CONTENT_VERSIONS = {"arc.companion.reader-content.v1"}
 
 
 class ContentBundleError(RuntimeError):
@@ -63,10 +64,33 @@ def store_reader_content(
     }
     path = content_object_path(root, content_sha256)
     if path.is_file():
-        existing = load_reader_content(root, content_sha256)
-        if existing["content"] != value:
-            raise ContentBundleError("content-addressed reader object has conflicting bytes")
-        return {**existing, "path": path}
+        try:
+            existing = load_reader_content(root, content_sha256)
+        except ContentBundleError:
+            try:
+                stale = read_json(path)
+            except (OSError, ValueError) as exc:
+                raise ContentBundleError(
+                    "content-addressed reader object is unreadable"
+                ) from exc
+            if (
+                not isinstance(stale, dict)
+                or stale.get("schema_version") not in _LEGACY_READER_CONTENT_VERSIONS
+                or stale.get("content") != value
+                or stale.get("content_sha256") != content_sha256
+                or sha256_json(stale.get("content")) != content_sha256
+            ):
+                raise ContentBundleError(
+                    "content-addressed reader object has conflicting bytes"
+                )
+            # The object path is payload-addressed, so a valid legacy envelope
+            # must be refreshed in place before the v2 loader can accept it.
+            write_json(path, envelope)
+        else:
+            if existing["content"] != value:
+                raise ContentBundleError("content-addressed reader object has conflicting bytes")
+            return {**existing, "path": path}
+        return {**load_reader_content(root, content_sha256), "path": path}
     write_json(path, envelope)
     return {**load_reader_content(root, content_sha256), "path": path}
 

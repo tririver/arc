@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 from typing import Any
+import unicodedata
 from urllib.parse import urlparse
 
 from .io import canonical_json, read_json, sha256_file, sha256_json, write_json, write_text
@@ -18,18 +19,21 @@ from .reader_text import clean_reader_annotation, clean_reader_translation
 from .source import asset_path, block_id
 
 
-READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v1"
-READER_FINAL_VERSION = "arc.companion.reader-final.v1"
-WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v1"
-WEB_RENDER_VERSION = "arc.companion.web-render.v1"
-WEB_VALIDATION_VERSION = "arc.companion.web-validation.v1"
+READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v2"
+READER_FINAL_VERSION = "arc.companion.reader-final.v2"
+WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v2"
+WEB_RENDER_VERSION = "arc.companion.web-render.v2"
+WEB_VALIDATION_VERSION = "arc.companion.web-validation.v2"
 
 _STATE_VERSIONS = {
     "arc.companion.state.v1",
     "arc.companion.state.v2",
     "arc.companion.state.v3",
 }
-_LEDGER_VERSION = "arc.companion.chapter-lane-ledger.v1"
+_LEDGER_VERSIONS = {
+    "arc.companion.chapter-lane-ledger.v1",
+    "arc.companion.chapter-lane-ledger.v2",
+}
 _SEGMENTATION_PREFIX = "arc.companion.segmentation."
 _CHAPTERS_PREFIX = "arc.companion.chapters."
 _GUIDE_PREFIX = "arc.companion.chapter-guide."
@@ -85,7 +89,15 @@ def build_reader_snapshot(
     document_envelope = _document_envelope(checkpoint, overrides)
     document = _document(document_envelope, overrides)
     metadata = _metadata(document_envelope, document, overrides)
-    glossary = _glossary(checkpoint, overrides)
+    translation_mode = str(
+        overrides.get("translation_mode")
+        or current_state.get("translation_mode")
+        or "pending"
+    )
+    # Same-language mode is authoritative.  In particular, never revive a
+    # glossary left in an older checkpoint when rendering or resuming it.
+    glossary = {} if translation_mode == "skipped" else _glossary(checkpoint, overrides)
+    glossary_view = _glossary_view(glossary)
     chapters = _chapters(checkpoint, document, overrides)
     segments_by_chapter = _segments(checkpoint, chapters, overrides)
     guides = _guides(checkpoint, chapters, overrides)
@@ -96,6 +108,10 @@ def build_reader_snapshot(
         overrides=overrides,
         trusted_overrides=trusted_overrides,
     )
+    if translation_mode == "skipped":
+        translations = {}
+        for state_value in lane_states.values():
+            state_value.pop("translation", None)
     blocks_by_id = {
         block_id(item): dict(item)
         for item in document.get("blocks") or []
@@ -157,6 +173,18 @@ def build_reader_snapshot(
             }
         )
 
+    appendices = _source_only_appendices(
+        document,
+        overrides=overrides,
+        entities=entities,
+        translation_mode=translation_mode,
+    )
+    if translation_mode != "skipped" and translation_mode == "pending" and translated_ids:
+        translation_mode = "enabled"
+    if translation_mode == "enabled" and glossary_view:
+        _annotate_term_runs(rendered_chapters, glossary_view)
+        _annotate_term_runs(appendices, glossary_view)
+
     title = str(
         overrides.get("title")
         or metadata.get("title")
@@ -173,13 +201,10 @@ def build_reader_snapshot(
         "title": title,
         "authors": _author_names(metadata.get("authors") or []),
         "language": language,
-        "translation_mode": str(
-            overrides.get("translation_mode")
-            or current_state.get("translation_mode")
-            or ("enabled" if translated_ids else "pending")
-        ),
-        "glossary": _glossary_view(glossary),
+        "translation_mode": translation_mode,
+        "glossary": glossary_view,
         "chapters": rendered_chapters,
+        "appendices": appendices,
         "coverage": {
             "chapter_ids": [str(item.get("chapter_id") or "") for item in chapters],
             "segment_ids": ordered_segment_ids,
@@ -466,7 +491,53 @@ def _validate_reader_bundle(
     ]
     if segment_ids != list(coverage.get("segment_ids") or []):
         raise WebReaderError("reader chapter content differs from declared segment coverage")
+    _validate_snapshot_terms(snapshot)
     return snapshot, segment_ids
+
+
+def _validate_snapshot_terms(snapshot: Mapping[str, Any]) -> None:
+    glossary = snapshot.get("glossary")
+    if not isinstance(glossary, list):
+        raise WebReaderError("reader glossary must be an array")
+    mode = str(snapshot.get("translation_mode") or "")
+    entries: dict[str, Mapping[str, Any]] = {}
+    for item in glossary:
+        if not isinstance(item, Mapping):
+            raise WebReaderError("reader glossary contains an invalid entry")
+        entry_id = str(item.get("entry_id") or "")
+        if not entry_id or entry_id in entries:
+            raise WebReaderError("reader glossary entry identities are invalid")
+        entries[entry_id] = item
+    term_runs = list(_walk_term_runs(snapshot.get("chapters") or []))
+    term_runs.extend(_walk_term_runs(snapshot.get("appendices") or []))
+    if mode == "skipped":
+        if glossary:
+            raise WebReaderError("skipped reader must not expose a glossary")
+        if term_runs:
+            raise WebReaderError("skipped reader must not expose term runs")
+        return
+    for run in term_runs:
+        entry = entries.get(str(run.get("entry_id") or ""))
+        if entry is None:
+            raise WebReaderError("reader term run refers to an unknown glossary entry")
+        source = str(entry.get("source") or "")
+        target = str(entry.get("target") or "")
+        if (
+            not source or not target or _fold_term(source) == _fold_term(target)
+            or run.get("source") != source or run.get("target") != target
+        ):
+            raise WebReaderError("reader term run refers to a non-bilingual glossary entry")
+
+
+def _walk_term_runs(value: Any):
+    if isinstance(value, list):
+        for item in value:
+            yield from _walk_term_runs(item)
+    elif isinstance(value, Mapping):
+        if value.get("type") == "term":
+            yield value
+        for item in value.values():
+            yield from _walk_term_runs(item)
 
 
 def _discover_manifest_for_index(root: Path, index_path: Path) -> Path:
@@ -822,7 +893,7 @@ def _lane_values(
     ledgers: dict[tuple[str, str], dict[str, Any]] = {}
     for path in sorted((checkpoint / "chapters").glob("*/*-ledger.json")):
         value = _read_object(path, label="chapter lane ledger")
-        if value.get("schema_version") != _LEDGER_VERSION:
+        if value.get("schema_version") not in _LEDGER_VERSIONS:
             continue
         chapter_id = str(value.get("chapter_id") or "")
         lane = str(value.get("lane") or "")
@@ -1012,21 +1083,206 @@ def _guide_view(value: Mapping[str, Any] | None) -> list[dict[str, Any]]:
 
 def _glossary_view(value: Mapping[str, Any]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
-    for item in value.get("entries") or []:
+    used_ids: set[str] = set()
+    for ordinal, item in enumerate(value.get("entries") or [], 1):
         if not isinstance(item, Mapping):
             continue
         source = str(item.get("source_term") or item.get("source") or item.get("term") or "").strip()
         target = str(item.get("target_term") or item.get("target") or item.get("translation") or "").strip()
         if not source:
             continue
+        entry_id = str(item.get("entry_id") or f"term-{ordinal:04d}")
+        if entry_id in used_ids:
+            entry_id = f"term-{ordinal:04d}"
+        used_ids.add(entry_id)
         lineage = item.get("parent_path") or item.get("lineage") or []
+        aliases = item.get("source_aliases") or item.get("aliases") or []
         output.append({
+            "entry_id": entry_id,
             "source": source,
             "target": target,
+            "source_aliases": _unique_folded_strings(aliases, excluding=source),
             "explanation": str(item.get("explanation") or ""),
-            "lineage": [str(value) for value in lineage] if isinstance(lineage, list) else [],
+            "lineage": deepcopy(lineage) if isinstance(lineage, list) else [],
         })
     return output
+
+
+def _source_only_appendices(
+    document: Mapping[str, Any],
+    *,
+    overrides: Mapping[str, Any],
+    entities: Mapping[str, Mapping[str, dict[str, Any]]],
+    translation_mode: str,
+) -> list[dict[str, Any]]:
+    """Expose the source Index in same-language mode without lane placeholders."""
+    if translation_mode != "skipped":
+        return []
+    supplied = overrides.get("source_only_appendices")
+    if isinstance(supplied, Sequence) and not isinstance(supplied, (str, bytes)):
+        output: list[dict[str, Any]] = []
+        for ordinal, raw in enumerate(supplied, 1):
+            if not isinstance(raw, Mapping):
+                continue
+            blocks = raw.get("blocks") or raw.get("source") or []
+            output.append({
+                "appendix_id": str(raw.get("appendix_id") or f"source-appendix-{ordinal:04d}"),
+                "kind": str(raw.get("kind") or "source_only"),
+                "title": str(raw.get("title") or "Index"),
+                "source": [
+                    _source_block(item, entities=entities)
+                    for item in blocks if isinstance(item, Mapping)
+                ],
+            })
+        return output
+    blocks = [
+        item for item in document.get("blocks") or []
+        if isinstance(item, Mapping)
+        and str(item.get("source_role") or item.get("role") or "").casefold() == "index"
+    ]
+    if not blocks:
+        return []
+    title = next((
+        str(item.get("title") or item.get("text") or "").strip()
+        for item in blocks
+        if str(item.get("type") or item.get("kind") or "").casefold()
+        in {"heading", "section", "chapter"}
+    ), "") or "Index"
+    return [{
+        "appendix_id": "source-index",
+        "kind": "source_only_index",
+        "title": title,
+        "source": [_source_block(item, entities=entities) for item in blocks],
+    }]
+
+
+def _unique_folded_strings(values: Any, *, excluding: str = "") -> list[str]:
+    if not isinstance(values, list):
+        return []
+    excluded = _fold_term(excluding)
+    seen = {excluded} if excluded else set()
+    output: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        folded = _fold_term(text)
+        if text and folded and folded not in seen:
+            seen.add(folded)
+            output.append(text)
+    return output
+
+
+def _annotate_term_runs(value: Any, glossary: Sequence[Mapping[str, Any]]) -> None:
+    """Split ordinary text runs into deterministic, browser-safe term runs."""
+    if isinstance(value, list):
+        for item in value:
+            _annotate_term_runs(item, glossary)
+        return
+    if not isinstance(value, dict):
+        return
+    runs = value.get("runs")
+    if isinstance(runs, list):
+        annotated: list[dict[str, Any]] = []
+        for run in runs:
+            if isinstance(run, Mapping) and run.get("type") == "text":
+                annotated.extend(_term_runs(str(run.get("text") or ""), glossary))
+            else:
+                annotated.append(dict(run) if isinstance(run, Mapping) else run)
+        value["runs"] = annotated
+    for key, item in list(value.items()):
+        if key != "runs":
+            _annotate_term_runs(item, glossary)
+
+
+def _term_runs(text: str, glossary: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    folded, spans = _fold_with_spans(text)
+    if not folded:
+        return ([{"type": "text", "text": text}] if text else [])
+    candidates: list[tuple[int, int, int, int, Mapping[str, Any]]] = []
+    for ordinal, entry in enumerate(glossary):
+        source = str(entry.get("source") or "")
+        target = str(entry.get("target") or "")
+        if not source or not target or _fold_term(source) == _fold_term(target):
+            continue
+        terms = [(source, 0), *(
+            (str(alias), 1) for alias in entry.get("source_aliases") or []
+        ), (target, 0)]
+        for term, alias_rank in terms:
+            needle = _fold_term(term)
+            if not needle:
+                continue
+            start = 0
+            while (offset := folded.find(needle, start)) >= 0:
+                end = offset + len(needle)
+                before = folded[offset - 1] if offset else ""
+                after = folded[end] if end < len(folded) else ""
+                if (
+                    (not _is_latin_or_decimal(needle[0]) or not _is_latin_or_decimal(before))
+                    and (not _is_latin_or_decimal(needle[-1]) or not _is_latin_or_decimal(after))
+                ):
+                    original_start = spans[offset][0]
+                    original_end = spans[end - 1][1]
+                    candidates.append((
+                        original_start, original_end, ordinal, alias_rank, entry
+                    ))
+                start = offset + 1
+    # Resolve every overlap by longest match, glossary order, then canonical
+    # over alias.  Re-sort the non-overlapping winners for source-order output.
+    candidates.sort(key=lambda item: (-(item[1] - item[0]), item[2], item[3], item[0]))
+    selected: list[tuple[int, int, Mapping[str, Any]]] = []
+    for start, end, _ordinal, _alias_rank, entry in candidates:
+        if any(start < chosen_end and end > chosen_start for chosen_start, chosen_end, _ in selected):
+            continue
+        selected.append((start, end, entry))
+    selected.sort(key=lambda item: item[0])
+    if not selected:
+        return [{"type": "text", "text": text}] if text else []
+    output: list[dict[str, Any]] = []
+    cursor = 0
+    for start, end, entry in selected:
+        if start > cursor:
+            output.append({"type": "text", "text": text[cursor:start]})
+        output.append({
+            "type": "term",
+            "text": text[start:end],
+            "entry_id": str(entry.get("entry_id") or ""),
+            "source": str(entry.get("source") or ""),
+            "target": str(entry.get("target") or ""),
+        })
+        cursor = end
+    if cursor < len(text):
+        output.append({"type": "text", "text": text[cursor:]})
+    return output
+
+
+def _fold_with_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    # Per-codepoint spans retain exact source slices for full-width/casefold
+    # expansions (for example, ligatures).  NFKC is deterministic and mirrors
+    # segment-glossary matching for ordinary source text.
+    folded: list[str] = []
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        end = index + 1
+        while end < len(text) and unicodedata.combining(text[end]):
+            end += 1
+        normalized = unicodedata.normalize("NFKC", text[index:end]).casefold()
+        folded.extend(normalized)
+        spans.extend([(index, end)] * len(normalized))
+        index = end
+    return "".join(folded), spans
+
+
+def _fold_term(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _is_latin_or_decimal(value: str) -> bool:
+    if not value:
+        return False
+    return unicodedata.category(value) == "Nd" or (
+        unicodedata.category(value).startswith("L")
+        and "LATIN" in unicodedata.name(value, "")
+    )
 
 
 def _inline_runs(block: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1154,41 +1410,49 @@ def _publish_source_assets(
     }
     records: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, str]] = {}
-    for chapter in snapshot.get("chapters") or []:
-        for segment in chapter.get("segments") or []:
-            for source in segment.get("source") or []:
-                identifiers = list(source.pop("asset_ids", []) or [])
-                rendered = []
-                for identifier in identifiers:
-                    asset = assets.get(str(identifier))
-                    path = asset_path(asset or {}) if asset else None
-                    if path is None or not path.is_file() or path.suffix.casefold() not in _WEB_IMAGE_SUFFIXES:
-                        continue
-                    source_digest = sha256_file(path)
-                    expected = str(asset.get("sha256") or "")
-                    if expected and expected != source_digest:
-                        raise WebReaderError(f"source asset hash mismatch: {path}")
-                    cached = by_id.get(str(identifier))
-                    if cached is None:
-                        suffix = path.suffix.casefold()
-                        if suffix == ".svg":
-                            data = _safe_svg(path.read_text(encoding="utf-8", errors="replace")).encode("utf-8")
-                        else:
-                            data = path.read_bytes()
-                        digest = hashlib.sha256(data).hexdigest()
-                        destination = root / "reader" / "assets" / "source" / f"{digest}{suffix}"
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        _publish_fault_point(f"source-asset:{digest}{suffix}")
-                        _write_bytes(destination, data)
-                        cached = {
-                            "url": destination.relative_to(root / "reader").as_posix(),
-                            "sha256": sha256_file(destination),
-                        }
-                        by_id[str(identifier)] = cached
-                        records.append(_file_record(destination, root=root))
-                    rendered.append(dict(cached))
-                if rendered:
-                    source["assets"] = rendered
+    source_groups = [
+        segment.get("source") or []
+        for chapter in snapshot.get("chapters") or []
+        for segment in chapter.get("segments") or []
+    ]
+    source_groups.extend(
+        appendix.get("source") or []
+        for appendix in snapshot.get("appendices") or []
+    )
+    for group in source_groups:
+        for source in group:
+            identifiers = list(source.pop("asset_ids", []) or [])
+            rendered = []
+            for identifier in identifiers:
+                asset = assets.get(str(identifier))
+                path = asset_path(asset or {}) if asset else None
+                if path is None or not path.is_file() or path.suffix.casefold() not in _WEB_IMAGE_SUFFIXES:
+                    continue
+                source_digest = sha256_file(path)
+                expected = str(asset.get("sha256") or "")
+                if expected and expected != source_digest:
+                    raise WebReaderError(f"source asset hash mismatch: {path}")
+                cached = by_id.get(str(identifier))
+                if cached is None:
+                    suffix = path.suffix.casefold()
+                    if suffix == ".svg":
+                        data = _safe_svg(path.read_text(encoding="utf-8", errors="replace")).encode("utf-8")
+                    else:
+                        data = path.read_bytes()
+                    digest = hashlib.sha256(data).hexdigest()
+                    destination = root / "reader" / "assets" / "source" / f"{digest}{suffix}"
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    _publish_fault_point(f"source-asset:{digest}{suffix}")
+                    _write_bytes(destination, data)
+                    cached = {
+                        "url": destination.relative_to(root / "reader").as_posix(),
+                        "sha256": sha256_file(destination),
+                    }
+                    by_id[str(identifier)] = cached
+                    records.append(_file_record(destination, root=root))
+                rendered.append(dict(cached))
+            if rendered:
+                source["assets"] = rendered
     return sorted(records, key=lambda record: str(record["path"]))
 
 

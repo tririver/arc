@@ -42,17 +42,23 @@ class ProgressJournal:
         call_label: str | None,
         provider: str,
         callback: Callable[[dict[str, Any]], None] | None,
+        identity: Mapping[str, Any] | None = None,
+        submission_callback: Callable[[], None] | None = None,
     ) -> None:
         self.artifact_dir = artifact_dir
         self.call_label = call_label
         self.provider = provider
         self.callback = callback
+        self.identity = {key: value for key, value in dict(identity or {}).items() if value is not None}
+        self.submission_callback = submission_callback
         self._lock = threading.Lock()
         self._sequence = 0
         self._native_session_id: str | None = None
 
     def __call__(self, raw_event: Mapping[str, Any]) -> None:
         with self._lock:
+            if raw_event.get("event") == "submitted" and self.submission_callback is not None:
+                self.submission_callback()
             self._sequence += 1
             event = _normalize_event(
                 raw_event,
@@ -60,6 +66,7 @@ class ProgressJournal:
                 call_label=self.call_label,
                 provider=self.provider,
             )
+            event.update(self.identity)
             if event.get("native_session_id"):
                 self._native_session_id = str(event["native_session_id"])
             elif self._native_session_id:
@@ -69,6 +76,20 @@ class ProgressJournal:
                 self._persist(event)
             if self.callback is not None:
                 self.callback(dict(event))
+
+    def bind_submission_callback(self, callback: Callable[[], None]) -> None:
+        """Bind the checkpoint barrier before invoking the provider."""
+
+        with self._lock:
+            self.submission_callback = callback
+
+    def update_identity(self, **values: Any) -> None:
+        """Attach identity fields learned only after the session lock is held."""
+
+        with self._lock:
+            self.identity.update(
+                {key: value for key, value in values.items() if value is not None}
+            )
 
     def _persist(self, event: Mapping[str, Any]) -> None:
         assert self.artifact_dir is not None

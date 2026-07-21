@@ -21,7 +21,7 @@ from .providers.base import (
 )
 
 
-SCHEMA_VERSION = "arc.llm.call_checkpoint.v2"
+SCHEMA_VERSION = "arc.llm.call_checkpoint.v3"
 
 
 class LLMCallCheckpointError(LLMWorkerError):
@@ -138,7 +138,12 @@ def prepare_call(
     try:
         existing = _read(path)
         if existing is not None:
-            if existing.get("schema_version") != SCHEMA_VERSION or existing.get("identity") != identity:
+            if existing.get("identity") != identity:
+                raise LLMCallCheckpointError(f"LLM call checkpoint identity mismatch: {path}")
+            if existing.get("schema_version") == "arc.llm.call_checkpoint.v2":
+                existing = _upgrade_v2_checkpoint(existing)
+                _write(path, existing)
+            if existing.get("schema_version") != SCHEMA_VERSION:
                 raise LLMCallCheckpointError(f"LLM call checkpoint identity mismatch: {path}")
             state = existing.get("state")
             if state in {"response_received", "validated"}:
@@ -151,7 +156,16 @@ def prepare_call(
                     replay_response=response,
                     replayed=True,
                 )
-            if state in {"started", "resuming"}:
+            if state == "prepared" and existing.get("submission_state") == "not_submitted":
+                existing.update({"started_at": current_time, "updated_at": current_time})
+                _write(path, existing)
+                return PreparedCall(
+                    path=path,
+                    identity=identity,
+                    attempt=int(existing.get("attempt") or 1),
+                    _lock_handle=lock_handle,
+                )
+            if state in {"submitted", "resuming"}:
                 if supervised_native_resume:
                     if not native_session_available:
                         raise LLMCallCheckpointError(
@@ -193,8 +207,8 @@ def prepare_call(
             {
                 "schema_version": SCHEMA_VERSION,
                 "identity": identity,
-                "state": "started",
-                "submission_state": "unknown",
+                "state": "prepared",
+                "submission_state": "not_submitted",
                 "attempt": next_attempt,
                 "started_at": current_time,
                 "updated_at": current_time,
@@ -223,23 +237,67 @@ def record_response(prepared: PreparedCall, response: LLMProviderResponse[Any]) 
         prepared.release_lock()
 
 
+def record_submitted(prepared: PreparedCall) -> None:
+    """Cross the provider submission barrier while retaining call ownership."""
+
+    current = _require_current(prepared)
+    if current.get("state") in {"submitted", "response_received", "validated"}:
+        return
+    if current.get("state") not in {"prepared", "resuming"}:
+        raise LLMCallCheckpointError(
+            f"Cannot submit checkpoint from state {current.get('state')!r}: {prepared.path}"
+        )
+    current.update(
+        {
+            "state": "submitted",
+            "submission_state": "submitted",
+            "submitted_at": time.time(),
+            "updated_at": time.time(),
+        }
+    )
+    _write(prepared.path, current)
+
+
 def record_failure(prepared: PreparedCall, exc: BaseException) -> None:
     """Release ownership without charging a non-submitted failure as a paid attempt."""
     try:
         disposition = failure_disposition(exc)
-        if disposition is not None and disposition.submission_state == LLMSubmissionState.NOT_SUBMITTED:
+        if disposition is None:
             current = _require_current(prepared)
-            if current.get("state") == "started" and int(current.get("attempt") or 1) == prepared.attempt:
+            if current.get("state") == "prepared":
                 prepared.path.unlink(missing_ok=True)
-        elif disposition is not None and disposition.submission_state == LLMSubmissionState.SUBMITTED:
-            current = _require_current(prepared)
-            if current.get("state") in {"started", "resuming"}:
+            elif current.get("state") in {"submitted", "resuming"}:
                 current.update(
                     {
-                        "state": "failed",
-                        "submission_state": "submitted",
+                        "state": "submitted",
+                        "submission_state": "unknown",
+                        "failure_category": LLMFailureCategory.UNKNOWN.value,
+                        "updated_at": time.time(),
+                    }
+                )
+                _write(prepared.path, current)
+        if disposition is not None and disposition.submission_state == LLMSubmissionState.NOT_SUBMITTED:
+            current = _require_current(prepared)
+            if current.get("state") == "prepared" and int(current.get("attempt") or 1) == prepared.attempt:
+                prepared.path.unlink(missing_ok=True)
+        elif disposition is not None and disposition.submission_state in {
+            LLMSubmissionState.SUBMITTED,
+            LLMSubmissionState.UNKNOWN,
+        }:
+            current = _require_current(prepared)
+            if current.get("state") in {"prepared", "submitted", "resuming"}:
+                current.update(
+                    {
+                        "state": (
+                            "submitted"
+                            if disposition.submission_state == LLMSubmissionState.UNKNOWN
+                            else "failed"
+                        ),
+                        "submission_state": disposition.submission_state.value,
                         "failure_category": disposition.category.value,
-                        "resumable": disposition.category
+                        "resumable": disposition.submission_state
+                        in {LLMSubmissionState.SUBMITTED, LLMSubmissionState.UNKNOWN}
+                        and disposition.category
                         in {LLMFailureCategory.TIMEOUT, LLMFailureCategory.CANCELLED},
                         "progress_journal": str(
                             prepared.path.parent.parent / "progress.jsonl"
@@ -264,6 +322,17 @@ def _authorize_native_resume(checkpoint: dict[str, Any], *, current_time: float)
             "updated_at": current_time,
         }
     )
+
+
+def _upgrade_v2_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade the old eager-unknown boundary without making it replayable."""
+
+    upgraded = dict(checkpoint)
+    upgraded["schema_version"] = SCHEMA_VERSION
+    if upgraded.get("state") == "started":
+        upgraded["state"] = "submitted"
+        upgraded["submission_state"] = "unknown"
+    return upgraded
 
 
 def record_validated(prepared: PreparedCall) -> None:

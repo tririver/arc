@@ -16,6 +16,7 @@ from arc_llm.call_checkpoint import (
     prepare_call,
     record_failure,
     record_response,
+    record_submitted,
     record_validated,
 )
 from arc_llm.usage import LLMProviderResponse, LLMUsage
@@ -63,6 +64,7 @@ def test_uncertain_call_never_retries_without_supervision(tmp_path: Path) -> Non
     path, identity = _identity(tmp_path)
     first = prepare_call(path, identity=identity, now=100)
     assert first.attempt == 1
+    record_submitted(first)
     first.release_lock()  # simulate the owning process exiting without a response
     with pytest.raises(LLMCallRetryDeferred):
         prepare_call(path, identity=identity, now=3699)
@@ -168,6 +170,31 @@ def test_not_submitted_failure_does_not_consume_checkpoint_attempt(tmp_path: Pat
     retry.release_lock()
 
 
+def test_unknown_submission_failure_requires_supervision(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    record_failure(
+        prepared,
+        LLMWorkerError("provider boundary uncertain", submission_state=LLMSubmissionState.UNKNOWN),
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["state"] == "submitted"
+    assert payload["submission_state"] == "unknown"
+    with pytest.raises(LLMCallNeedsSupervision):
+        prepare_call(path, identity=identity, now=101)
+
+
+def test_untyped_failure_after_submission_requires_supervision(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    record_submitted(prepared)
+    record_failure(prepared, RuntimeError("unexpected provider wrapper crash"))
+
+    with pytest.raises(LLMCallNeedsSupervision):
+        prepare_call(path, identity=identity, now=101)
+
+
 def test_known_submitted_failure_is_terminal_and_never_replayed(tmp_path: Path) -> None:
     path, identity = _identity(tmp_path)
     prepared = prepare_call(path, identity=identity, now=100)
@@ -187,6 +214,7 @@ def test_known_submitted_failure_is_terminal_and_never_replayed(tmp_path: Path) 
 def test_uncertain_checkpoint_exposes_supervision_path_and_disposition(tmp_path: Path) -> None:
     path, identity = _identity(tmp_path)
     prepared = prepare_call(path, identity=identity, now=100)
+    record_submitted(prepared)
     prepared.release_lock()
 
     with pytest.raises(LLMCallNeedsSupervision) as caught:
@@ -194,6 +222,39 @@ def test_uncertain_checkpoint_exposes_supervision_path_and_disposition(tmp_path:
 
     assert caught.value.checkpoint_path == path
     assert caught.value.submission_state == LLMSubmissionState.UNKNOWN
+
+
+def test_prepared_not_submitted_checkpoint_is_safe_to_retry(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    first = prepare_call(path, identity=identity, now=100)
+    first.release_lock()
+
+    retry = prepare_call(path, identity=identity, now=101)
+
+    assert retry.attempt == 1
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["state"] == "prepared"
+    assert payload["submission_state"] == "not_submitted"
+    retry.release_lock()
+
+
+def test_v2_started_checkpoint_upgrades_without_replaying(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "schema_version": "arc.llm.call_checkpoint.v2",
+        "identity": identity,
+        "state": "started",
+        "submission_state": "unknown",
+        "attempt": 1,
+    }), encoding="utf-8")
+
+    with pytest.raises(LLMCallNeedsSupervision):
+        prepare_call(path, identity=identity, now=101)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "arc.llm.call_checkpoint.v3"
+    assert payload["state"] == "submitted"
 
 
 @pytest.mark.parametrize(

@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import re
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .io import sha256_json, write_json
 
-from .source import block_id
-
-
-CHAPTER_GLOSSARY_VERSION = "arc.companion.chapter-glossary.v1"
+SEGMENT_GLOSSARY_VERSION = "arc.companion.segment-glossary.v2"
 INDEX_GLOSSARY_VERSION = "arc.companion.index-glossary.v1"
 INDEX_BATCH_SIZE = 100
 
@@ -69,68 +65,86 @@ def generate_index_glossary(
     return output
 
 
-def project_chapter_glossary(
-    chapter: Mapping[str, Any],
-    document: Mapping[str, Any],
+def project_segment_glossary(
+    source_blocks: list[Mapping[str, Any]],
     glossary: Mapping[str, Any],
-    *,
-    index_entries: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Select terms using source blocks and index/page overlap only."""
-    wanted = {str(value) for value in chapter.get("block_ids") or []}
-    source = "\n".join(
-        _source_text(item)
-        for item in document.get("blocks") or []
-        if isinstance(item, Mapping) and block_id(item) in wanted
-    )
-    folded_source = _fold(source)
-    page_start = _int_or_none(chapter.get("page_start"))
-    page_end = _int_or_none(chapter.get("page_end"))
-    index_by_term = _index_lookup(index_entries or [])
+    """Project the paper glossary onto immutable source blocks for one segment.
+
+    Projection is deliberately lexical.  Generated text and evidence are not
+    inputs, so the same source segment always receives the same ordered terms.
+    """
+    source = _fold("\n".join(_source_text(item) for item in source_blocks))
+    entries = _normalized_entries(glossary)
+    by_id = {item["entry_id"]: item for item in entries}
+    selected: list[dict[str, Any]] = []
+    for entry in entries:
+        if not any(_contains_term(source, _fold(term)) for term in _entry_terms(entry)):
+            continue
+        projected = {
+            "entry_id": entry["entry_id"],
+            "source": entry["source"],
+            "target": entry["target"],
+        }
+        for key in ("aliases", "explanation", "protected_names"):
+            if entry.get(key):
+                projected[key] = entry[key]
+        lineage = _entry_lineage(entry, by_id)
+        if lineage:
+            projected["lineage"] = lineage
+        selected.append(projected)
+    return {
+        "schema_version": SEGMENT_GLOSSARY_VERSION,
+        "source_glossary_sha256": sha256_json(glossary),
+        "counts": {"source_entries": len(entries), "matched_entries": len(selected)},
+        "entries": selected,
+    }
+
+
+def _normalized_entries(glossary: Mapping[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    for ordinal, item in enumerate(
+    for ordinal, raw in enumerate(
         (item for item in glossary.get("entries") or [] if isinstance(item, Mapping)), 1
     ):
-        value = dict(item)
-        value.setdefault("entry_id", f"term-{ordinal:04d}")
-        entries.append(value)
-    selected: list[dict[str, Any]] = []
-    selected_ids: set[str] = set()
-    for entry in entries:
-        terms = _entry_terms(entry)
-        index_match = any(
-            _page_overlap(index_by_term.get(_fold(term), []), page_start, page_end) for term in terms
-        )
-        source_match = any(_contains_term(folded_source, _fold(term)) for term in terms if term.strip())
-        if source_match or index_match:
-            value = dict(entry)
-            selected.append(value)
-            selected_ids.add(str(value["entry_id"]))
-    # A matched subentry is not meaningful without its complete visible path.
-    by_id = {str(item.get("entry_id") or ""): dict(item) for item in entries}
-    pending = [str(item.get("parent_id")) for item in selected if item.get("parent_id")]
-    while pending:
-        parent_id = pending.pop()
-        if parent_id in selected_ids:
+        source = _primary_term(raw)
+        if not source:
             continue
+        aliases = _unique_strings(raw.get("aliases") or raw.get("source_aliases") or [])
+        aliases = [value for value in aliases if _fold(value) != _fold(source)]
+        entry: dict[str, Any] = {
+            "entry_id": str(raw.get("entry_id") or f"term-{ordinal:04d}"),
+            "source": source,
+            # Empty targets are meaningful and must not fall through to an alias.
+            "target": _target_term(raw),
+            "aliases": aliases,
+            "explanation": str(raw.get("explanation") or raw.get("brief_explanation") or "").strip(),
+            "protected_names": _unique_strings(raw.get("protected_names") or []),
+        }
+        if raw.get("parent_id"):
+            entry["parent_id"] = str(raw["parent_id"])
+        entries.append(entry)
+    return entries
+
+
+def _entry_lineage(
+    entry: Mapping[str, Any], by_id: Mapping[str, Mapping[str, Any]]
+) -> list[dict[str, str]]:
+    lineage: list[dict[str, str]] = []
+    seen: set[str] = set()
+    parent_id = str(entry.get("parent_id") or "")
+    while parent_id and parent_id not in seen:
+        seen.add(parent_id)
         parent = by_id.get(parent_id)
         if parent is None:
-            continue
-        selected_ids.add(parent_id)
-        if parent.get("parent_id"):
-            pending.append(str(parent["parent_id"]))
-    # Preserve global glossary order after adding ancestors.  This also keeps a
-    # grandparent before its parent and child without relying on entry ids.
-    selected = [dict(item) for item in entries if str(item.get("entry_id") or "") in selected_ids]
-    return {
-        "schema_version": CHAPTER_GLOSSARY_VERSION,
-        "chapter_id": str(chapter.get("chapter_id") or ""),
-        "entries": selected,
-        "compact_mapping": [
-            {"source": _primary_term(item), "target": str(item.get("target") or item.get("translation") or "")}
-            for item in selected
-        ],
-    }
+            break
+        lineage.append({
+            "entry_id": str(parent["entry_id"]),
+            "source": str(parent["source"]),
+            "target": str(parent["target"]),
+        })
+        parent_id = str(parent.get("parent_id") or "")
+    lineage.reverse()
+    return lineage
 
 
 def _entry_terms(entry: Mapping[str, Any]) -> list[str]:
@@ -140,7 +154,28 @@ def _entry_terms(entry: Mapping[str, Any]) -> list[str]:
 
 
 def _primary_term(entry: Mapping[str, Any]) -> str:
-    return str(entry.get("source") or entry.get("term") or entry.get("source_term") or "").strip()
+    return str(entry.get("source_term") or entry.get("source") or entry.get("term") or "").strip()
+
+
+def _target_term(entry: Mapping[str, Any]) -> str:
+    for key in ("target_term", "target", "translation"):
+        if key in entry and entry[key] is not None:
+            return str(entry[key]).strip()
+    return ""
+
+
+def _unique_strings(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        key = _fold(text)
+        if text and key not in seen:
+            seen.add(key)
+            output.append(text)
+    return output
 
 
 def _source_text(block: Mapping[str, Any]) -> str:
@@ -154,32 +189,30 @@ def _fold(value: str) -> str:
 def _contains_term(source: str, term: str) -> bool:
     if not term:
         return False
-    if re.fullmatch(r"[\w -]+", term):
-        return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", source) is not None
-    return term in source
+    # Only Latin-script letters and Unicode decimal digits participate in word
+    # boundaries.  CJK may remain adjacent, while e.g. ``résumé`` cannot match
+    # the plural ``résumés`` and an ASCII digit cannot match an adjacent Nd digit.
+    start = 0
+    while (offset := source.find(term, start)) >= 0:
+        before = source[offset - 1] if offset else ""
+        after_offset = offset + len(term)
+        after = source[after_offset] if after_offset < len(source) else ""
+        if (
+            (not _is_latin_or_decimal(term[0]) or not _is_latin_or_decimal(before))
+            and (not _is_latin_or_decimal(term[-1]) or not _is_latin_or_decimal(after))
+        ):
+            return True
+        start = offset + 1
+    return False
 
 
-def _index_lookup(entries: list[Mapping[str, Any]]) -> dict[str, list[tuple[int, int]]]:
-    output: dict[str, list[tuple[int, int]]] = {}
-    def visit(item: Mapping[str, Any]) -> None:
-        term = str(item.get("term") or item.get("label") or "").strip()
-        ranges = item.get("page_ranges") or item.get("pages") or []
-        normalized: list[tuple[int, int]] = []
-        for value in ranges if isinstance(ranges, list) else []:
-            if isinstance(value, int):
-                normalized.append((value, value))
-            elif isinstance(value, Mapping):
-                start, end = _int_or_none(value.get("start")), _int_or_none(value.get("end"))
-                if start is not None:
-                    normalized.append((start, end if end is not None else start))
-        if term:
-            output.setdefault(_fold(term), []).extend(normalized)
-        for child in item.get("children") or []:
-            if isinstance(child, Mapping):
-                visit(child)
-    for entry in entries:
-        visit(entry)
-    return output
+def _is_latin_or_decimal(value: str) -> bool:
+    if not value:
+        return False
+    return unicodedata.category(value) == "Nd" or (
+        unicodedata.category(value).startswith("L")
+        and "LATIN" in unicodedata.name(value, "")
+    )
 
 
 def _flatten_index(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -198,13 +231,3 @@ def _flatten_index(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     for entry in entries:
         visit(entry, None)
     return output
-
-
-def _page_overlap(ranges: list[tuple[int, int]], start: int | None, end: int | None) -> bool:
-    if start is None or end is None:
-        return False
-    return any(left <= end and right >= start for left, right in ranges)
-
-
-def _int_or_none(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None

@@ -8,7 +8,7 @@ from threading import BoundedSemaphore, Lock
 from typing import Any, Iterator, Mapping
 
 
-GLOSSARY_SETUP_MAX_BYTES = 60 * 1024
+STATEFUL_TURN_VERSION = "arc.companion.stateful-turn.v2"
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 ROLLOVER_FRACTION = 0.70
 
@@ -33,18 +33,15 @@ class LLMSubmissionLimiter:
 
 @dataclass
 class StatefulPromptStream:
-    """Construct auditable generation bootstraps and compact follow-up turns."""
+    """Construct one static bootstrap followed by segment-local delta turns."""
 
     chapter_id: str
     lane: str
     fixed_rules: Mapping[str, Any]
-    chapter: Mapping[str, Any]
-    guide: Mapping[str, Any]
-    compact_glossary: list[Mapping[str, Any]]
+    static_context: Mapping[str, Any]
     generation: int = 1
     continuity_capsule: Mapping[str, Any] | None = None
     _turns: int = 0
-    _setup_emitted: bool = False
 
     def request(
         self,
@@ -52,87 +49,33 @@ class StatefulPromptStream:
         *,
         cursor: str,
         source_sha256: str,
-        block_glossary: list[Mapping[str, Any]] | None = None,
-        evidence: Mapping[str, Any] | None = None,
-        preserve_delta_instructions: bool = False,
+        current_payload: Mapping[str, Any],
     ) -> str:
+        segment_payload = {"request": request, **dict(current_payload)}
         if self._turns == 0:
             payload = {
+                "schema_version": STATEFUL_TURN_VERSION,
                 "turn_kind": "generation_bootstrap",
                 "generation": self.generation,
                 "chapter_id": self.chapter_id,
                 "lane": self.lane,
                 "fixed_rules": dict(self.fixed_rules),
-                "chapter": dict(self.chapter),
-                "chapter_guide": dict(self.guide),
-                "chapter_glossary_mapping": [dict(item) for item in self.compact_glossary],
+                "static_context": dict(self.static_context),
                 "continuity_capsule": dict(self.continuity_capsule or {}),
                 "cursor": cursor,
                 "source_sha256": source_sha256,
-                "current_request": request,
+                "current_payload": segment_payload,
             }
         else:
-            delta_request = (
-                request if preserve_delta_instructions else compact_primary_request(request)
-            )
             payload = {
+                "schema_version": STATEFUL_TURN_VERSION,
                 "turn_kind": "delta",
-                "generation": self.generation,
-                "chapter_id": self.chapter_id,
-                "lane": self.lane,
                 "cursor": cursor,
                 "source_sha256": source_sha256,
-                "glossary_mapping": [dict(item) for item in self.compact_glossary],
-                "block_glossary": [dict(item) for item in (block_glossary or [])],
-                "evidence": dict(evidence or {}),
-                "current_request": delta_request,
+                "current_payload": segment_payload,
             }
         self._turns += 1
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-    def setup_turns(self) -> list[str]:
-        """Return lossless glossary setup chunks only when the mapping exceeds 60 KiB."""
-        if self._setup_emitted:
-            return []
-        self._setup_emitted = True
-        encoded = json.dumps(self.compact_glossary, ensure_ascii=False, separators=(",", ":"))
-        if len(encoded.encode("utf-8")) <= GLOSSARY_SETUP_MAX_BYTES:
-            return []
-        chunks: list[list[Mapping[str, Any]]] = []
-        current: list[Mapping[str, Any]] = []
-        for item in self.compact_glossary:
-            candidate = [*current, item]
-            size = len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            if current and size > GLOSSARY_SETUP_MAX_BYTES:
-                chunks.append(current)
-                current = [item]
-            else:
-                current = candidate
-        if current:
-            chunks.append(current)
-        turns = []
-        for index, chunk in enumerate(chunks, 1):
-            payload = {
-                "turn_kind": "generation_bootstrap" if index == 1 else "glossary_setup_delta",
-                "chapter_id": self.chapter_id,
-                "lane": self.lane,
-                "generation": self.generation,
-                "chunk": index,
-                "chunk_count": len(chunks),
-                "entries": [dict(item) for item in chunk],
-            }
-            if index == 1:
-                payload.update({
-                    "fixed_rules": dict(self.fixed_rules),
-                    "chapter": dict(self.chapter),
-                    "chapter_guide": dict(self.guide),
-                    "continuity_capsule": dict(self.continuity_capsule or {}),
-                })
-            turns.append(json.dumps(
-                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ))
-        self._turns = 1
-        return turns
 
 
 @dataclass
@@ -143,6 +86,8 @@ class ContextRolloverBudget:
     input_tokens: int = 0
     output_tokens: int = 0
     _has_known_input: bool = False
+    _max_known_footprint: int = 0
+    _unmeasured_tokens: int = 0
 
     @property
     def threshold(self) -> int:
@@ -159,16 +104,28 @@ class ContextRolloverBudget:
             # context-size observation and avoids double-counting history.
             self.input_tokens = max(self.input_tokens, max(0, known_input))
             self._has_known_input = True
+            turn_output = max(0, known_output) if isinstance(known_output, int) else 0
+            self._max_known_footprint = max(
+                self._max_known_footprint, max(0, known_input) + turn_output
+            )
+            # A later complete-input observation already contains earlier turns.
+            self._unmeasured_tokens = 0
         elif prompt_bytes:
             estimate = max(1, prompt_bytes // 4)
+            self.input_tokens += estimate
             if self._has_known_input:
-                self.input_tokens += estimate
-            else:
-                self.input_tokens += estimate
+                self._unmeasured_tokens += estimate
         if isinstance(known_output, int):
-            self.output_tokens += max(0, known_output)
+            if isinstance(known_input, int):
+                self.output_tokens = max(self.output_tokens, max(0, known_output))
+            else:
+                self.output_tokens += max(0, known_output)
+                if self._has_known_input:
+                    self._unmeasured_tokens += max(0, known_output)
 
     def rollover_due(self) -> bool:
+        if self._has_known_input:
+            return self._max_known_footprint + self._unmeasured_tokens >= self.threshold
         return self.input_tokens + self.output_tokens >= self.threshold
 
 
@@ -197,15 +154,6 @@ def continuity_capsule(
         "last_input_sha256": input_sha256,
         "last_output_sha256": output_sha256,
     }
-
-
-def compact_primary_request(prompt: str) -> str:
-    """Remove repeated fixed instructions while retaining the current source payload."""
-    markers = ("\n\nSEGMENT:\n", "\n\nSEGMENT ID:\n")
-    offsets = [prompt.find(marker) for marker in markers if prompt.find(marker) >= 0]
-    if not offsets:
-        return prompt
-    return prompt[min(offsets) + 2 :]
 
 
 def _configured_context_window() -> int:

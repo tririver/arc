@@ -23,6 +23,7 @@ def run_chapter_pipeline(
     run_companion: Callable[[PreparedChapter, Mapping[str, Any]], Any],
     stop_after_first_chapter: bool = False,
     stop_event: Event | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run chapters concurrently while each lane advances in source order.
 
@@ -38,6 +39,9 @@ def run_chapter_pipeline(
     first_failure: list[BaseException] = []
     failure_lock = Lock()
 
+    def is_stopped() -> bool:
+        return stopped.is_set() or bool(cancel_check is not None and cancel_check())
+
     def remember_failure(exc: BaseException) -> None:
         with failure_lock:
             if not first_failure:
@@ -45,10 +49,10 @@ def run_chapter_pipeline(
         stopped.set()
 
     def guarded(call: Callable[..., Any], *args: Any) -> Any:
-        if stopped.is_set():
+        if is_stopped():
             raise _ChapterPipelineStopped("chapter pipeline stopped before another call")
         with budget:
-            if stopped.is_set():
+            if is_stopped():
                 raise _ChapterPipelineStopped("chapter pipeline stopped before another call")
             try:
                 return call(*args)

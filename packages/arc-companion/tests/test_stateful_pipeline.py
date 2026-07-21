@@ -10,52 +10,60 @@ from arc_companion.chapter_guide import generate_chapter_guide
 from arc_companion.stateful_pipeline import (
     ContextRolloverBudget,
     CorrectionBudget,
-    GLOSSARY_SETUP_MAX_BYTES,
     LLMSubmissionLimiter,
+    STATEFUL_TURN_VERSION,
     StatefulPromptStream,
 )
 
 
-def _stream(mapping=None) -> StatefulPromptStream:
+def _stream() -> StatefulPromptStream:
     return StatefulPromptStream(
         chapter_id="ch-0001", lane="translation", generation=1,
-        fixed_rules={"immutable": True}, chapter={"title": "One"},
-        guide={"main_content": "Guide"}, compact_glossary=mapping or [],
+        fixed_rules={"immutable": True},
+        static_context={
+            "chapter": {"title": "One"},
+            "chapter_guide": {"main_content": "Guide"},
+            "navigation": [{"section": "One"}],
+        },
     )
 
 
 def test_generation_bootstrap_is_not_repeated_in_delta() -> None:
-    stream = _stream([{"source": "field", "target": "场"}])
-    first = json.loads(stream.request("first", cursor="s1", source_sha256="a"))
+    stream = _stream()
+    first = json.loads(stream.request(
+        "first", cursor="s1", source_sha256="a",
+        current_payload={"source_blocks": [{"text": "field"}], "segment_glossary": []},
+    ))
     second = json.loads(stream.request(
         "REPEATED FIXED RULES\n\nSEGMENT:\nsecond", cursor="s2", source_sha256="b",
-        block_glossary=[{"source": "fermion", "target": "费米子"}],
+        current_payload={
+            "source_blocks": [{"text": "fermion"}],
+            "segment_glossary": [{"source": "fermion", "target": "费米子"}],
+        },
     ))
+    assert first["schema_version"] == STATEFUL_TURN_VERSION
     assert first["turn_kind"] == "generation_bootstrap"
-    assert first["chapter_guide"] == {"main_content": "Guide"}
-    assert first["chapter_glossary_mapping"] == [{"source": "field", "target": "场"}]
+    assert first["static_context"]["chapter_guide"] == {"main_content": "Guide"}
     assert second["turn_kind"] == "delta"
     assert second["cursor"] == "s2"
-    assert "chapter_guide" not in second
-    assert "chapter_glossary_mapping" not in second
-    assert second["glossary_mapping"] == [{"source": "field", "target": "场"}]
-    assert second["current_request"] == "SEGMENT:\nsecond"
+    assert "static_context" not in second
+    assert "chapter_id" not in second
+    assert second["current_payload"]["source_blocks"] == [{"text": "fermion"}]
+    assert second["current_payload"]["request"].startswith("REPEATED FIXED RULES")
 
 
-def test_large_glossary_setup_is_lossless_and_only_emitted_once() -> None:
-    mapping = [{"source": f"term-{index}", "target": "译" * 200} for index in range(400)]
-    assert len(json.dumps(mapping, ensure_ascii=False).encode()) > GLOSSARY_SETUP_MAX_BYTES
-    stream = _stream(mapping)
-    turns = [json.loads(value) for value in stream.setup_turns()]
-    assert len(turns) > 1
-    assert turns[0]["turn_kind"] == "generation_bootstrap"
-    assert all(
-        len(json.dumps(turn["entries"], ensure_ascii=False, separators=(",", ":")).encode())
-        <= GLOSSARY_SETUP_MAX_BYTES for turn in turns
+def test_delta_size_does_not_grow_with_prior_payloads() -> None:
+    stream = _stream()
+    stream.request(
+        "first" + "x" * 50_000, cursor="s1", source_sha256="a",
+        current_payload={"source_blocks": [{"text": "large" + "x" * 50_000}]},
     )
-    assert [item for turn in turns for item in turn["entries"]] == mapping
-    assert stream.setup_turns() == []
-    assert json.loads(stream.request("block", cursor="s1", source_sha256="a"))["turn_kind"] == "delta"
+    delta = stream.request(
+        "second", cursor="s2", source_sha256="b",
+        current_payload={"source_blocks": [{"text": "small"}]},
+    )
+    assert len(delta) < 1_000
+    assert "large" not in delta
 
 
 def test_context_rollover_uses_seventy_percent_and_prompt_estimate() -> None:
@@ -64,6 +72,15 @@ def test_context_rollover_uses_seventy_percent_and_prompt_estimate() -> None:
     assert not budget.rollover_due()
     budget.record({}, prompt_bytes=4)
     assert budget.rollover_due()
+
+
+def test_context_rollover_does_not_sum_outputs_already_in_later_input() -> None:
+    budget = ContextRolloverBudget(context_window_tokens=200)
+    budget.record({"total_input_tokens": 60, "output_tokens": 20})
+    budget.record({"total_input_tokens": 90, "output_tokens": 10})
+    assert budget.input_tokens == 90
+    assert budget.output_tokens == 20
+    assert not budget.rollover_due()
 
 
 def test_correction_budget_allows_exactly_one_turn() -> None:

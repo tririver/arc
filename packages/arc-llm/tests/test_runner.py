@@ -1621,6 +1621,86 @@ def test_new_call_constructs_shared_paper_overlay_before_submission(tmp_path):
     assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "full"
 
 
+def test_stateful_calls_share_paper_overlay_across_artifact_directories(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeResultProvider())
+    manager = LLMSessionManager(tmp_path / "sessions")
+    env = {
+        "ARC_PAPER_CLI_ACCESS": "full",
+        "ARC_PAPER_CACHE": str(tmp_path / "global-paper-cache"),
+    }
+
+    for index in (1, 2):
+        result = run_json(
+            f"prompt {index}",
+            schema={"type": "object"},
+            model="fast",
+            provider="codex-cli",
+            env=env,
+            process_chain=[],
+            session_policy="stateful",
+            session_manager=manager,
+            session_key="chapter/companion",
+            call_label=f"segment-{index}",
+            artifact_dir=tmp_path / "artifacts" / f"segment-{index}",
+            idempotency_key=f"segment-{index}",
+        )
+
+        assert result["ok"] is True
+
+    calls = [
+        json.loads(line)
+        for line in (manager.root / "calls.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert manager.turn_count("chapter/companion") == 2
+    assert calls[0]["runtime_fingerprint"] == calls[1]["runtime_fingerprint"]
+    assert (manager.root / "paper-cache-overlay").is_dir()
+    assert not (tmp_path / "artifacts" / "segment-1" / "paper-cache-overlay").exists()
+    assert not (tmp_path / "artifacts" / "segment-2" / "paper-cache-overlay").exists()
+
+
+def test_stateful_rotated_unused_generation_rebinds_runtime_before_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeResultProvider())
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(
+        key="chapter/companion",
+        provider="codex-cli",
+        model="fast",
+        runtime_fingerprint="pre-fix-runtime",
+        metadata={
+            "arc_runtime_capabilities": {
+                "arc_paper_cli_access": "full",
+                "inherit_host_tools": False,
+            }
+        },
+    )
+    manager.rotate("chapter/companion", reason="restart generation")
+
+    result = run_json(
+        "prompt",
+        schema={"type": "object"},
+        model="fast",
+        provider="codex-cli",
+        env={
+            "ARC_PAPER_CLI_ACCESS": "full",
+            "ARC_PAPER_CACHE": str(tmp_path / "global-paper-cache"),
+        },
+        process_chain=[],
+        session_policy="stateful",
+        session_manager=manager,
+        session_key="chapter/companion",
+        artifact_dir=tmp_path / "artifacts" / "segment-2",
+        idempotency_key="segment-2",
+    )
+
+    rebound = manager.get_existing("chapter/companion")
+    assert result["ok"] is True
+    assert rebound is not None
+    assert rebound.generation == 2
+    assert rebound.runtime_fingerprint != "pre-fix-runtime"
+    assert rebound.native_session_id == "native-123"
+    assert manager.turn_count("chapter/companion", generation=2) == 1
+
+
 def test_new_call_without_artifact_or_session_root_uses_managed_tmp_overlay(tmp_path, monkeypatch):
     monkeypatch.setenv("ARC_LLM_TMP_DIR", str(tmp_path / "llm-tmp"))
     env, metadata = runner._runtime_compatibility_policy(

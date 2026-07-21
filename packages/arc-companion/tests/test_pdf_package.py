@@ -9,8 +9,8 @@ import zipfile
 import pytest
 
 from arc_companion import pdf as pdf_module
-from arc_companion.io import canonical_json, sha256_json
-from arc_companion.package import package_project
+from arc_companion.io import canonical_json, sha256_file, sha256_json
+from arc_companion.package import _WEB_STATE_KEYS, package_project
 from arc_companion.pdf import PDFError, compile_latex, validate_pdf
 from arc_companion.web import (
     READER_SNAPSHOT_VERSION,
@@ -297,7 +297,10 @@ def _add_web_reader(root: Path) -> dict[str, Path]:
     assets.mkdir(parents=True)
     snapshot = {
         "schema_version": READER_SNAPSHOT_VERSION,
+        "translation_mode": "enabled",
+        "glossary": [],
         "chapters": [],
+        "appendices": [],
         "coverage": {
             "chapter_ids": [], "segment_ids": [],
             "translation_segment_ids": [], "annotation_segment_ids": [],
@@ -522,3 +525,50 @@ def test_package_keeps_pdf_only_compatibility_for_legacy_state(tmp_path: Path) -
     result = package_project(tmp_path)
 
     assert result["ok"] is True
+
+
+def test_package_uses_published_last_good_while_active_run_failed(tmp_path: Path) -> None:
+    _complete_project(tmp_path)
+    _add_web_reader(tmp_path)
+    state_path = tmp_path / "state.json"
+    flat = json.loads(state_path.read_text(encoding="utf-8"))
+    pdf = Path(flat["output_pdf"])
+    tex = tmp_path / "deliverables" / "paper.tex"
+    source_manifest = tmp_path / "source-manifest.json"
+    validation = tmp_path / "validation.json"
+    published_pdf = {
+        "output_pdf": str(pdf),
+        "output_pdf_sha256": sha256_file(pdf),
+        "output_tex": str(tex),
+        "output_tex_sha256": sha256_file(tex),
+        "source_manifest_path": str(source_manifest),
+        "source_manifest_sha256": sha256_file(source_manifest),
+        "validation_path": str(validation),
+        "validation_sha256": sha256_file(validation),
+    }
+    web_keys = {
+        key: flat[key] for key in _WEB_STATE_KEYS
+    }
+    active = {
+        key: value for key, value in flat.items()
+        if key not in {
+            "output_pdf", "output_tex", "source_manifest_path", "validation_path",
+            *_WEB_STATE_KEYS,
+        }
+    }
+    active.update({
+        "schema_version": "arc.companion.state.v3",
+        "status": "failed",
+        "fingerprint": "new-active-fingerprint",
+        "checkpoint_dir": str(tmp_path / "missing-active-checkpoint"),
+        "published": {"content_sha256": "a" * 64, "pdf": published_pdf, "web": web_keys},
+    })
+    state_path.write_text(json.dumps(active), encoding="utf-8")
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is True
+    with zipfile.ZipFile(result["data"]["archive_path"]) as handle:
+        names = set(handle.namelist())
+    assert "deliverables/paper.pdf" in names
+    assert "reader/index.html" in names

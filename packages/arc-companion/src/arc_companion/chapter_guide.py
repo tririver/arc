@@ -8,7 +8,7 @@ from .io import sha256_json, write_json
 from .stateful_pipeline import StatefulSessionError
 
 
-CHAPTER_GUIDE_VERSION = "arc.companion.chapter-guide.v1"
+CHAPTER_GUIDE_VERSION = "arc.companion.chapter-guide.v2"
 CHAPTER_GUIDE_SOURCE_WINDOW_BYTES = 48 * 1024
 
 CHAPTER_GUIDE_SETUP_SCHEMA: dict[str, Any] = {
@@ -67,7 +67,9 @@ def generate_chapter_guide(
         f"Write a concise {language} guide for this chapter. Every field is optional in substance: use null "
         "when it would not help. Explain motivation, content, logical flow, position, and prerequisites only "
         "from the supplied source. Supplementary reading may cite only evidence_id values in verified_evidence; "
-        "do not repeat the source bibliography and do not invent references.\n"
+        "do not repeat the source bibliography and do not invent references. The book_position field describes "
+        "location within the supplied source document, including source chapter, section, or source-page range; "
+        "never describe or predict pagination in the generated companion document.\n"
     )
     windows = _source_windows(source) if stateful else [source]
     if len(windows) == 1:

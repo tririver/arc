@@ -11,30 +11,40 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import threading
 import unicodedata
 import uuid
+from urllib.parse import urlparse
 from typing import Any, Callable
 
 from bs4 import BeautifulSoup
-from arc_llm.evidence import EvidenceRequest, EvidenceResponse, resolve_evidence_round
-
 from .context_sources import load_context_evidence
+from .content import (
+    checkpoint_receipts,
+    reader_content_from_overrides,
+    store_reader_content,
+)
 from .chapters import build_chapters
-from .chapter_glossary import generate_index_glossary, project_chapter_glossary
-from .chapter_guide import generate_chapter_guide
+from .artifact_store import AcceptedArtifactStore, canonical_sha256
+from .chapter_glossary import generate_index_glossary, project_segment_glossary
+from .chapter_guide import CHAPTER_GUIDE_VERSION, generate_chapter_guide
 from .chapter_scheduler import run_chapter_pipeline
 from .ledger import (
+    accept_reused_block,
     advance_block,
     clear_needs_supervision,
     initialize_lane_ledger,
     invalidate_suffix,
     mark_needs_supervision,
+    mark_response_received,
+    mark_submitted,
 )
 from .progress import CompanionProgress
 from .migration import (
     MIGRATION_VERSION,
     NEVER_MIGRATED_ARTIFACTS,
+    import_accepted_checkpoint_objects,
     legacy_translation_candidates,
     migrate_legacy_cuts,
     migrate_legacy_glossary,
@@ -46,16 +56,8 @@ from .domain import load_domain_context
 from .evidence import (
     arc_cache_descriptor,
     text_sha256,
-    validate_annotation_citations,
-    validate_cited_ids,
     validate_evidence_record,
     validate_registry,
-)
-from .evidence_requests import (
-    EVIDENCE_RESOLUTION_VERSION,
-    EvidenceRequestController,
-    EvidenceResolution,
-    normalize_evidence_requests,
 )
 from .io import read_json, safe_name, sha256_file, sha256_json, write_json, write_text
 from .latex import LatexError, render_companion_tex, validate_tex_fidelity
@@ -91,6 +93,8 @@ from .projection import (
     translation_input_block as _project_translation_input_block,
 )
 from .reader_text import clean_reader_annotation, clean_reader_translation
+from .regeneration import normalize_regeneration_lanes
+from .reuse import REUSE_PLAN_VERSION, lane_recipe_sha256, lane_semantic_sha256
 from .results import err, ok
 from .run_lock import BuildInProgressError, ProjectBuildLock
 from .segmentation import (
@@ -112,7 +116,7 @@ from .stateful_pipeline import (
 )
 
 
-WORKFLOW_VERSION = "arc.companion.workflow.v11"
+WORKFLOW_VERSION = "arc.companion.workflow.v13"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -134,17 +138,18 @@ ANNOTATION_PROMPT_MAX_BYTES = 60 * 1024
 ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
 ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
 REVIEW_TIER = "medium"
-REVIEW_VERSION = "arc.companion.review.v5"
-ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v6"
-SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
-COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v1"
+REVIEW_VERSION = "arc.companion.review.v6"
+ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v7"
+SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v2"
+COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v2"
 SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
-FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
+FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v2"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
-FINAL_RENDER_VERSION = "arc.companion.final-render.v5"
+FINAL_RENDER_VERSION = "arc.companion.final-render.v10"
+READER_FINAL_CHECKPOINT_VERSION = "arc.companion.reader-final.v2"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
 CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
 CONTEXT_SEGMENT_CHARS_TOTAL = 12_000
@@ -260,6 +265,8 @@ class BuildOptions:
     stop_after_first_chapter: bool = False
     document_kind: str = "auto"
     idle_timeout_seconds: float | None = None
+    regenerate_lanes: tuple[str, ...] = ()
+    confirm_expensive_regeneration: bool = False
     regenerate_commentary: bool = False
     supervised_native_resume_keys: tuple[str, ...] = ()
     legacy_checkpoint: Path | None = None
@@ -277,6 +284,15 @@ class BuildOptions:
             raise ValueError("document_kind must be auto, article, or book")
         if self.idle_timeout_seconds is not None and self.idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be positive")
+        requested_regeneration = tuple(self.regenerate_lanes) + (
+            ("commentary",) if self.regenerate_commentary else ()
+        )
+        normalized_regeneration = normalize_regeneration_lanes(
+            requested_regeneration,
+            confirm_expensive_all=self.confirm_expensive_regeneration,
+        )
+        object.__setattr__(self, "regenerate_lanes", normalized_regeneration)
+        object.__setattr__(self, "regenerate_commentary", "commentary" in normalized_regeneration)
         normalized_context_ids = tuple(
             dict.fromkeys(str(value).strip() for value in self.context_paper_ids if str(value).strip())
         )
@@ -311,7 +327,6 @@ def build_companion(
     llm: Callable[..., dict[str, Any]] | None = None,
     compiler: Callable[[Path, Path], None] = compile_latex,
     pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf,
-    evidence_controller: EvidenceRequestController | None = None,
     result_llm: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Build or resume one companion under an exclusive project lock."""
@@ -327,15 +342,18 @@ def build_companion(
             retryable=True,
         )
     try:
-        return _build_companion_unlocked(
-            options,
-            source_loader=source_loader,
-            llm=llm,
-            compiler=compiler,
-            pdf_validator=pdf_validator,
-            evidence_controller=evidence_controller,
-            result_llm=result_llm,
-        )
+        from arc_llm.cancellation import install_signal_cancel_chain
+
+        with install_signal_cancel_chain() as cancel_check:
+            return _build_companion_unlocked(
+                options,
+                source_loader=source_loader,
+                llm=llm,
+                compiler=compiler,
+                pdf_validator=pdf_validator,
+                result_llm=result_llm,
+                cancel_check=cancel_check,
+            )
     finally:
         lock.release()
 
@@ -347,8 +365,8 @@ def _build_companion_unlocked(
     llm: Callable[..., dict[str, Any]] | None = None,
     compiler: Callable[[Path, Path], None] = compile_latex,
     pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf,
-    evidence_controller: EvidenceRequestController | None = None,
     result_llm: Callable[..., Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Build or resume one companion while keeping source and annotations separate."""
     chapter_result_llm = result_llm
@@ -358,7 +376,7 @@ def _build_companion_unlocked(
 
         llm = run_json
         chapter_result_llm = chapter_result_llm or run_json_result
-    llm = _limit_llm_concurrency(llm, options.workers)
+    llm = _limit_llm_concurrency(llm, options.workers, cancel_check=cancel_check)
     project_dir = options.project_dir.resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     state_path = project_dir / "state.json"
@@ -404,17 +422,95 @@ def _build_companion_unlocked(
             previous_state=previous_state,
         )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        previous_checkpoint = Path(str(previous_state.get("checkpoint_dir") or ""))
+        if (
+            not options.skip_translation
+            and previous_checkpoint.is_dir()
+            and previous_checkpoint != checkpoint_dir
+            and not options.force
+        ):
+            for filename in ("glossary.json", "index-glossary.json"):
+                source = previous_checkpoint / filename
+                target = checkpoint_dir / filename
+                if source.is_file() and not target.exists():
+                    # The owning generator revalidates its content hash before
+                    # reuse, so carrying the file across generation fingerprints
+                    # cannot make a stale glossary authoritative.
+                    shutil.copy2(source, target)
         if (
             not options.force
+            and not options.regenerate_lanes
             and previous_state.get("status") == "complete"
             and previous_state.get("fingerprint") == fingerprint
+            and previous_state.get("translation_mode") == (
+                "skipped" if options.skip_translation else "enabled"
+            )
+            and _read_optional_json(checkpoint_dir / "evidence.json") == evidence
+            and _read_optional_json(checkpoint_dir / "domain-context.json") == (domain_context or {})
             and _completion_outputs_match(previous_state)
             and (
                 isinstance(bundle.parsed.get("structure"), dict)
                 or _first_wave_preview_outputs_match(previous_state)
             )
         ):
+            plan_path = checkpoint_dir / "reuse-plan.json"
+            if plan_path.is_file():
+                plan = read_json(plan_path)
+                current_recipes = {
+                    lane: lane_recipe_sha256(
+                        lane,
+                        prompt=(
+                            REVIEW_VERSION if lane == "review"
+                            else CHAPTER_GUIDE_VERSION if lane == "guide"
+                            else PROMPT_VERSION
+                        ),
+                        model=options.model,
+                        tier={
+                            "segmentation": SEGMENTATION_TIER, "glossary": GLOSSARY_TIER,
+                            "guide": ANNOTATION_TIER, "translation": TRANSLATION_TIER,
+                            "commentary": ANNOTATION_TIER, "review": REVIEW_TIER,
+                        }[lane],
+                        access_recipe=(
+                            {
+                                "provider": options.provider,
+                                "allow_internet": options.allow_internet if lane == "commentary" else False,
+                                "inherit_host_tools": options.inherit_host_tools,
+                            }
+                            if lane in {"translation", "commentary"}
+                            else {"provider": options.provider, "allow_internet": False}
+                        ),
+                    )
+                    for lane in ("segmentation", "glossary", "guide", "translation", "commentary", "review")
+                }
+                stale_lanes = {
+                    lane for lane, recipe in current_recipes.items()
+                    if any(item.get("recipe_sha256") != recipe for item in AcceptedArtifactStore(project_dir).iter_kind(lane))
+                }
+                for entry in plan.get("entries") or []:
+                    if options.skip_translation and entry.get("lane") == "glossary":
+                        entry.update({
+                            "status": "skipped", "artifact_id": None,
+                            "reason": "glossary_disabled_for_same_language_source",
+                            "estimated_provider_calls": 0,
+                        })
+                        continue
+                    if entry.get("lane") in stale_lanes:
+                        entry.update({
+                            "status": "recipe_stale",
+                            "reason": "accepted artifact remains valid but its generation recipe changed",
+                            "estimated_provider_calls": 0,
+                        })
+                plan["estimated_provider_calls"] = 0
+                write_json(plan_path, plan)
             resumed_state = {**previous_state, "diagnostics": list(diagnostics)}
+            if not _web_outputs_match(resumed_state):
+                # The reviewed reader checkpoint is authoritative.  Rebuilding a
+                # missing web bundle must never cause completed model work to run.
+                published = _publish_reader_update(
+                    project_dir, state_path, threading.RLock(), strict=True,
+                )
+                if published is not None:
+                    resumed_state = {**resumed_state, **published}
             _state(state_path, **resumed_state)
             return ok(
                 resumed_state,
@@ -424,6 +520,18 @@ def _build_companion_unlocked(
             )
 
         write_json(checkpoint_dir / "document.json", bundle.parsed)
+        _state(
+            state_path,
+            status="active",
+            paper_id=bundle.paper_id,
+            fingerprint=fingerprint,
+            checkpoint_dir=str(checkpoint_dir),
+            translation_mode="skipped" if options.skip_translation else "enabled",
+            annotation_language=options.annotation_language,
+            notice=notice,
+            diagnostics=list(diagnostics),
+        )
+        reader_publish_lock = threading.RLock()
         write_json(checkpoint_dir / "evidence.json", evidence)
         if domain_context is not None:
             write_json(checkpoint_dir / "domain-context.json", domain_context)
@@ -434,6 +542,7 @@ def _build_companion_unlocked(
                 fingerprint=fingerprint, notice=notice, diagnostics=diagnostics,
                 llm=llm, compiler=compiler, pdf_validator=pdf_validator,
                 result_llm=chapter_result_llm,
+                cancel_check=cancel_check,
                 require_first_chapter_freeze=(
                     previous_state.get("status") == "first_chapter_ready"
                 ),
@@ -446,6 +555,7 @@ def _build_companion_unlocked(
             notice=notice,
             diagnostics=list(diagnostics),
         )
+        _write_legacy_reuse_plan(checkpoint_dir, options)
 
         initial_names = _protected_names(bundle)
 
@@ -476,12 +586,55 @@ def _build_companion_unlocked(
                 ),
             )
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            segmentation_future = executor.submit(segment)
-            glossary_future = executor.submit(glossary_task)
-            expanded = segmentation_future.result()
-            glossary = glossary_future.result()
+        # Segmentation is the structural preflight for every downstream lane.
+        # Finish it before glossary submission so an invalid cut response keeps
+        # its SegmentationError identity and cannot spend another provider call.
+        expanded = segment()
+        _state(
+            state_path, status="active", paper_id=bundle.paper_id,
+            fingerprint=fingerprint, checkpoint_dir=str(checkpoint_dir),
+            segment_count=len(expanded), notice=notice,
+        )
+        _publish_reader_update(
+            project_dir, state_path, reader_publish_lock,
+        )
+        glossary = {} if options.skip_translation else glossary_task()
         protected_names = _protected_names(bundle, glossary=glossary)
+
+        accepted_translations: dict[str, dict[str, Any]] = {}
+        accepted_annotations: dict[str, dict[str, Any]] = {}
+        accepted_reader_lock = threading.RLock()
+
+        def publish_accepted_reader(
+            lane: str, segment_id: str, value: dict[str, Any],
+        ) -> None:
+            with accepted_reader_lock:
+                target = (
+                    accepted_translations if lane == "translation"
+                    else accepted_annotations
+                )
+                target[str(segment_id)] = dict(value)
+                overrides = {
+                    "document": bundle.document,
+                    "chapters": [],
+                    "segments": expanded,
+                    "chapter_guides": {},
+                    "translations": (
+                        None if options.skip_translation
+                        else dict(accepted_translations)
+                    ),
+                    "annotations": dict(accepted_annotations),
+                    "glossary": glossary,
+                    "metadata": bundle.metadata,
+                    "language": options.annotation_language,
+                    "translation_mode": (
+                        "skipped" if options.skip_translation else "enabled"
+                    ),
+                }
+            _publish_reader_update(
+                project_dir, state_path, reader_publish_lock,
+                final_overrides=overrides,
+            )
 
         _state(
             state_path,
@@ -505,6 +658,7 @@ def _build_companion_unlocked(
             protected_names=protected_names,
             checkpoint_dir=checkpoint_dir,
             llm=llm,
+            accepted_callback=publish_accepted_reader,
         )
         translations = first_wave_results["translation"]
         raw_annotations = first_wave_results["annotation"]
@@ -574,6 +728,7 @@ def _build_companion_unlocked(
                 protected_names=protected_names,
                 checkpoint_dir=checkpoint_dir,
                 llm=llm,
+                accepted_callback=publish_accepted_reader,
             )
             translations = {**translations, **remaining_results["translation"]}
             raw_annotations = {**raw_annotations, **remaining_results["annotation"]}
@@ -582,23 +737,6 @@ def _build_companion_unlocked(
             "schema_version": "arc.companion.annotations-first-round.v1",
             "annotations": raw_annotations,
         })
-        raw_annotations, evidence = _resolve_and_rerun_evidence_requests(
-            expanded,
-            raw_annotations,
-            options=options,
-            bundle=bundle,
-            evidence=evidence,
-            domain_context=domain_context,
-            glossary=glossary,
-            protected_names=protected_names,
-            checkpoint_dir=checkpoint_dir,
-            llm=llm,
-            controller=evidence_controller or EvidenceRequestController(
-                domain_paper_ids=(domain_context or {}).get("paper_ids") or (),
-                seed_paper_ids=(bundle.paper_id,),
-            ),
-        )
-
         _state(state_path, status="reviewing", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
                segment_count=len(expanded))
         reviewed_path = checkpoint_dir / "annotations.reviewed.v5.json"
@@ -655,10 +793,8 @@ def _build_companion_unlocked(
                 annotations=reviewed,
             )
             reviewed = {
-                str(segment_id): clean_reader_annotation(
+                str(segment_id): _validate_direct_annotation_sources(
                     annotation,
-                    evidence_records=cached_reader_evidence.get(str(segment_id), []),
-                    language=options.annotation_language,
                 )
                 for segment_id, annotation in reviewed.items()
             }
@@ -703,6 +839,30 @@ def _build_companion_unlocked(
             write_json(reviewed_path, reviewed_payload)
             write_json(review_path, review)
 
+        final_reader_overrides = {
+            "status": "complete",
+            "document": bundle.document,
+            "chapters": [],
+            "segments": expanded,
+            "chapter_guides": {},
+            "translations": reviewed_translations,
+            "annotations": reviewed,
+            "glossary": glossary,
+            "metadata": bundle.metadata,
+            "language": options.annotation_language,
+            "translation_mode": "skipped" if options.skip_translation else "enabled",
+        }
+        content_object = _store_reviewed_content(
+            project_dir, checkpoint_dir=checkpoint_dir,
+            final_overrides=final_reader_overrides, evidence=evidence,
+        )
+        _write_reader_final_checkpoint(checkpoint_dir, final_reader_overrides)
+        _state(
+            state_path,
+            content_sha256=content_object["content_sha256"],
+            content_object_path=str(content_object["path"]),
+        )
+
         _state(state_path, status="typesetting", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
                segment_count=len(expanded))
         final_artifact = _publish_pdf_artifact(
@@ -726,6 +886,11 @@ def _build_companion_unlocked(
         pdf_path = Path(final_artifact["pdf_path"])
         manifest_path = Path(final_artifact["manifest_path"])
         validation_path = Path(final_artifact["validation_path"])
+        _publish_reader_update(
+            project_dir, state_path, reader_publish_lock,
+            final_overrides=final_reader_overrides,
+            strict=True,
+        )
 
         final_state = _state(
             state_path,
@@ -784,8 +949,11 @@ def _build_chaptered_companion(
     pdf_validator: Callable[[Path], dict[str, object]],
     result_llm: Callable[..., Any] | None = None,
     require_first_chapter_freeze: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Execute the chapter contract while retaining legacy runs for old caches."""
+    regeneration = set(options.regenerate_lanes)
+    artifact_store = AcceptedArtifactStore(options.project_dir.resolve())
     state_path = options.project_dir.resolve() / "state.json"
     document = bundle.document
     structure = bundle.parsed.get("structure") or {}
@@ -820,6 +988,91 @@ def _build_chaptered_companion(
         "prompt_hash": migration_prompt_hash,
         "validator_hash": migration_validator_hash,
     })
+    object_migration = import_accepted_checkpoint_objects(
+        options.project_dir.resolve(),
+        validators={
+            "guide": lambda value: isinstance(value, dict),
+            "translation": lambda value: isinstance(value, dict) and isinstance(value.get("blocks"), list),
+            "commentary": lambda value: isinstance(value, dict) and isinstance(value.get("commentary"), str),
+            "review": lambda value: isinstance(value, dict),
+        },
+        contract_versions={
+            "guide": CHAPTER_GUIDE_VERSION,
+            "translation": SCHEMA_VERSION,
+            "commentary": SCHEMA_VERSION,
+            "review": REVIEW_VERSION,
+        },
+    )
+    write_json(checkpoint_dir / "object-migration.json", object_migration)
+    initial_reuse_entries = []
+    for chapter in chapters_pack["chapters"]:
+        chapter_id = str(chapter["chapter_id"])
+        for lane in ("segmentation", "guide", "translation", "commentary"):
+            if lane == "translation" and options.skip_translation:
+                continue
+            selected = lane in regeneration
+            initial_reuse_entries.append({
+                "chapter_id": chapter_id, "segment_id": None, "lane": lane,
+                "status": "miss", "artifact_id": None,
+                "reason": (
+                    "explicitly selected for regeneration" if selected
+                    else "detailed object lookup follows deterministic segmentation"
+                ),
+                "estimated_provider_calls": 1,
+            })
+    initial_reuse_entries.insert(0, {
+        "chapter_id": "project", "segment_id": None, "lane": "glossary",
+        "status": "skipped" if options.skip_translation else "miss",
+        "artifact_id": None,
+        "reason": (
+            "glossary_disabled_for_same_language_source"
+            if options.skip_translation
+            else "explicitly selected for regeneration"
+            if "glossary" in regeneration
+            else "no validated project glossary object selected"
+        ),
+        "estimated_provider_calls": 0 if options.skip_translation else 1,
+    })
+    initial_reuse_entries.append({
+        "chapter_id": "project", "segment_id": None, "lane": "review",
+        "status": "miss", "artifact_id": None,
+        "reason": (
+            "explicitly selected for regeneration" if "review" in regeneration
+            else "review lookup waits for exact base artifact hashes"
+        ),
+        "estimated_provider_calls": 1,
+    })
+    write_json(checkpoint_dir / "reuse-plan.json", {
+        "schema_version": REUSE_PLAN_VERSION,
+        "entries": initial_reuse_entries,
+        "estimated_provider_calls": sum(item["estimated_provider_calls"] for item in initial_reuse_entries),
+    })
+    reuse_plan_header_lock = threading.Lock()
+
+    def mark_plan_lane(
+        lane: str, *, chapter_id: str | None, artifact: dict[str, Any] | None,
+        reason: str,
+    ) -> None:
+        with reuse_plan_header_lock:
+            path = checkpoint_dir / "reuse-plan.json"
+            plan = read_json(path)
+            for entry in plan.get("entries") or []:
+                if entry.get("lane") != lane:
+                    continue
+                if chapter_id is not None and entry.get("chapter_id") != chapter_id:
+                    continue
+                status = str((artifact or {}).get("reuse_status") or "miss")
+                entry.update({
+                    "status": status,
+                    "artifact_id": (artifact or {}).get("artifact_id"),
+                    "reason": reason,
+                    "estimated_provider_calls": 0 if artifact is not None else 1,
+                })
+            plan["estimated_provider_calls"] = sum(
+                int(item.get("estimated_provider_calls") or 0)
+                for item in plan.get("entries") or []
+            )
+            write_json(path, plan)
     cut_migration = {"reused": {}, "receipts": []}
     glossary_migration = {
         "accepted": False, "reason": "legacy_checkpoint_not_requested", "value": None,
@@ -833,12 +1086,19 @@ def _build_chaptered_companion(
             max_segment_blocks=SEGMENT_HARD_MAX_BLOCKS,
             max_segment_source_chars=SEGMENT_HARD_MAX_SOURCE_CHARS,
         )
-        glossary_migration = migrate_legacy_glossary(
-            legacy.get("glossary"), metadata=_legacy_metadata_view(legacy),
-            source_hash=migration_source_hash, language=options.annotation_language,
-            prompt_hash=migration_prompt_hash, validator_hash=migration_validator_hash,
-            index_entries=index_pack,
-        )
+        if options.skip_translation:
+            glossary_migration = {
+                "accepted": False,
+                "reason": "glossary_disabled_for_same_language_source",
+                "value": None,
+            }
+        else:
+            glossary_migration = migrate_legacy_glossary(
+                legacy.get("glossary"), metadata=_legacy_metadata_view(legacy),
+                source_hash=migration_source_hash, language=options.annotation_language,
+                prompt_hash=migration_prompt_hash, validator_hash=migration_validator_hash,
+                index_entries=index_pack,
+            )
         migration_report = {
             "schema_version": MIGRATION_VERSION,
             "source_checkpoint_sha256": sha256_json(legacy),
@@ -857,6 +1117,12 @@ def _build_chaptered_companion(
         write_json(checkpoint_dir / "legacy-migration.json", migration_report)
     progress = CompanionProgress()
     supervision_event = threading.Event()
+
+    def chapter_cancel_check() -> bool:
+        return supervision_event.is_set() or bool(
+            cancel_check is not None and cancel_check()
+        )
+
     session_manager = None
     submission_limiter = LLMSubmissionLimiter(options.workers)
     if result_llm is not None:
@@ -870,58 +1136,197 @@ def _build_chaptered_companion(
                              artifact_dir=artifact_dir, call_label=call_label,
                              model_tier=tier)
 
-    if glossary_migration.get("accepted"):
+    glossary_input_hash = ""
+    glossary_recipe_hash = ""
+    glossary_object = None
+    if options.skip_translation:
+        glossary: dict[str, Any] = {}
+    else:
+        glossary_input_hash = lane_semantic_sha256("glossary", {
+            "source": _generation_document(document),
+            "target_language": options.annotation_language,
+            "index": index_pack,
+            "protected_names": initial_names,
+        })
+        glossary_recipe_hash = lane_recipe_sha256(
+            "glossary", prompt=PROMPT_VERSION, model=options.model, tier=GLOSSARY_TIER,
+            access_recipe={"provider": options.provider, "allow_internet": False},
+        )
+        glossary_object = None if "glossary" in regeneration else artifact_store.find(
+            kind="glossary", semantic_input_sha256=glossary_input_hash,
+            recipe_sha256=glossary_recipe_hash, contract_version="arc.companion.glossary.v1",
+            predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
+            output_validator=lambda value: isinstance(value, dict) and isinstance(value.get("entries"), list),
+        )
+    if options.skip_translation:
+        pass
+    elif glossary_object is not None:
+        mark_plan_lane(
+            "glossary", chapter_id=None, artifact=glossary_object,
+            reason="accepted glossary remains valid under the current contract",
+        )
+        glossary = dict(glossary_object["output"])
+    elif glossary_migration.get("accepted"):
         glossary = dict(glossary_migration["value"])
     elif index_entries:
         glossary = generate_index_glossary(
             index_entries, language=options.annotation_language,
-            checkpoint_dir=checkpoint_dir, force=options.force,
+            checkpoint_dir=checkpoint_dir, force="glossary" in regeneration,
             call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
         )
     else:
         glossary = generate_glossary(
             _generation_document(document), language=options.annotation_language,
             protected_names=initial_names, checkpoint_dir=checkpoint_dir,
-            workers=options.workers, force=options.force, page_count=_page_count(bundle),
+            workers=options.workers, force="glossary" in regeneration, page_count=_page_count(bundle),
             call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
+        )
+    if (
+        not options.skip_translation
+        and glossary_object is None
+        and isinstance(glossary, dict)
+    ):
+        _store_validated_stateless_artifact(
+            artifact_store, kind="glossary",
+            semantic_input_sha256=glossary_input_hash,
+            recipe_sha256=glossary_recipe_hash,
+            contract_version="arc.companion.glossary.v1", output=glossary,
+            segment_id="project:glossary", checkpoint_dir=checkpoint_dir,
+            provider=options.provider, model=options.model,
         )
     protected_names = _protected_names(bundle, glossary=glossary)
     blocks_by_id = {block_id(item): item for item in document.get("blocks") or []}
-    chapter_glossaries: dict[str, dict[str, Any]] = {}
+    reader_publish_lock = threading.RLock()
+    reader_data_lock = threading.RLock()
+    reader_segments: dict[str, dict[str, Any]] = {}
+    reader_guides: dict[str, dict[str, Any]] = {}
+    reader_translations: dict[str, dict[str, Any]] = {}
+    reader_annotations: dict[str, dict[str, Any]] = {}
+    reader_chapter_order = {
+        str(item.get("chapter_id") or ""): index
+        for index, item in enumerate(chapters_pack["chapters"])
+    }
 
-    def chapter_glossary_for(chapter: dict[str, Any]) -> dict[str, Any]:
-        chapter_id = str(chapter["chapter_id"])
-        with migration_lock:
-            current = chapter_glossaries.get(chapter_id)
-            if current is None:
-                current = project_chapter_glossary(
-                    chapter, document, glossary, index_entries=index_entries,
-                )
-                chapter_glossaries[chapter_id] = current
-                write_json(
-                    checkpoint_dir / "chapters" / chapter_id / "chapter-glossary.json",
-                    current,
-                )
-            return current
+    def chapter_reader_overrides() -> dict[str, Any]:
+        with reader_data_lock:
+            ordered_segments = sorted(
+                reader_segments.values(),
+                key=lambda item: (
+                    reader_chapter_order.get(
+                        str(item.get("chapter_id") or ""), len(reader_chapter_order)
+                    ),
+                    str(item.get("segment_id") or ""),
+                ),
+            )
+            return {
+                "document": document,
+                "chapters": list(chapters_pack["chapters"]),
+                "segments": ordered_segments,
+                "chapter_guides": dict(reader_guides),
+                "translations": (
+                    None if options.skip_translation else dict(reader_translations)
+                ),
+                "annotations": dict(reader_annotations),
+                "glossary": glossary,
+                "metadata": bundle.metadata,
+                "language": options.annotation_language,
+                "translation_mode": (
+                    "skipped" if options.skip_translation else "enabled"
+                ),
+            }
+
+    def segment_glossary_for(segment: dict[str, Any]) -> dict[str, Any]:
+        if options.skip_translation:
+            return {}
+        return project_segment_glossary(
+            [blocks_by_id[value] for value in segment.get("block_ids") or [] if value in blocks_by_id],
+            glossary,
+        )
 
     def prepare_segments(chapter):
         chapter_id = str(chapter["chapter_id"])
-        current_chapter_glossary = chapter_glossary_for(chapter)
         chapter_document = {**_generation_document(document), "blocks": [
             blocks_by_id[value] for value in chapter["block_ids"] if value in blocks_by_id
         ]}
-        raw = segment_document(
-            chapter_document, checkpoint_dir=checkpoint_dir / "chapters" / chapter_id,
-            workers=options.workers, force=options.force,
-            call_model=lambda p, s, a, l: model(p, s, a, l, SEGMENTATION_TIER),
-            seed_cuts=(
-                list(cut_migration.get("reused", {}).get(chapter_id) or [])
-                if chapter_id in cut_migration.get("reused", {}) else None
-            ),
+        segmentation_input_hash = lane_semantic_sha256("segmentation", {
+            "source": chapter_document,
+            "chapter": chapter,
+            "limits": {
+                "max_blocks": SEGMENT_HARD_MAX_BLOCKS,
+                "max_source_chars": SEGMENT_HARD_MAX_SOURCE_CHARS,
+            },
+        })
+        segmentation_recipe_hash = lane_recipe_sha256(
+            "segmentation", prompt=PROMPT_VERSION, model=options.model,
+            tier=SEGMENTATION_TIER,
+            access_recipe={"provider": options.provider, "allow_internet": False},
         )
+        segmentation_object = None if "segmentation" in regeneration else artifact_store.find(
+            kind="segmentation", semantic_input_sha256=segmentation_input_hash,
+            recipe_sha256=segmentation_recipe_hash,
+            contract_version="arc.companion.segmentation.v1",
+            predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
+            output_validator=lambda value: isinstance(value, list) and bool(value),
+        )
+        if segmentation_object is not None:
+            mark_plan_lane(
+                "segmentation", chapter_id=chapter_id, artifact=segmentation_object,
+                reason="accepted segmentation remains valid under the current contract",
+            )
+            raw = [dict(item) for item in segmentation_object["output"]]
+        else:
+            raw = segment_document(
+                chapter_document, checkpoint_dir=checkpoint_dir / "chapters" / chapter_id,
+                workers=options.workers, force="segmentation" in regeneration,
+                call_model=lambda p, s, a, l: model(p, s, a, l, SEGMENTATION_TIER),
+                seed_cuts=(
+                    list(cut_migration.get("reused", {}).get(chapter_id) or [])
+                    if chapter_id in cut_migration.get("reused", {}) else None
+                ),
+            )
+            validate_exact_coverage(raw, chapter_document["blocks"])
+            _store_validated_stateless_artifact(
+                artifact_store, kind="segmentation",
+                semantic_input_sha256=segmentation_input_hash,
+                recipe_sha256=segmentation_recipe_hash,
+                contract_version="arc.companion.segmentation.v1", output=raw,
+                segment_id=f"{chapter_id}:segmentation", checkpoint_dir=checkpoint_dir,
+                provider=options.provider, model=options.model,
+            )
         segments = [{**item, "chapter_id": chapter_id,
                      "segment_id": f"{chapter_id}.seg-{index:04d}"}
                     for index, item in enumerate(raw, 1)]
+        for requested_lane, ledger_lane in (("translation", "translation"), ("commentary", "companion")):
+            if requested_lane not in regeneration or (requested_lane == "translation" and options.skip_translation):
+                continue
+            ledger_path = checkpoint_dir / "chapters" / chapter_id / f"{ledger_lane}-ledger.json"
+            if not ledger_path.is_file():
+                continue
+            ledger = initialize_lane_ledger(
+                ledger_path, chapter_id=chapter_id, lane=ledger_lane,
+                segment_ids=[str(item["segment_id"]) for item in segments],
+            )
+            generation = int(ledger.get("generation") or 1) + 1
+            invalidate_suffix(
+                ledger_path, from_segment_id=str(segments[0]["segment_id"]), generation=generation,
+            )
+            if session_manager is not None:
+                session_key = f"{chapter_id}:{ledger_lane}"
+                if session_manager.get_existing(session_key) is not None:
+                    session_manager.rotate(session_key, reason=f"explicit-{requested_lane}-regeneration")
+        with reader_data_lock:
+            reader_segments.update({str(item["segment_id"]): dict(item) for item in segments})
+            reader_segment_count = len(reader_segments)
+        with reader_publish_lock:
+            _state(
+                state_path, status="active", paper_id=bundle.paper_id,
+                fingerprint=fingerprint, checkpoint_dir=str(checkpoint_dir),
+                segment_count=reader_segment_count, notice=notice,
+            )
+            _publish_reader_update(
+                options.project_dir.resolve(), state_path, reader_publish_lock,
+                final_overrides=chapter_reader_overrides(),
+            )
         if legacy is not None and not options.skip_translation:
             translation_migration = migrate_legacy_translations(
                 legacy_translation_candidates(legacy),
@@ -929,9 +1334,9 @@ def _build_chaptered_companion(
                 blocks=[dict(item) for item in document.get("blocks") or []],
                 chapters=[chapter], segments=segments,
                 source_hash=migration_source_hash, language=options.annotation_language,
-                glossary=current_chapter_glossary, protected_names=protected_names,
+                glossary=glossary, protected_names=protected_names,
                 segment_input_hash=lambda item: _segment_input_hash(
-                    dict(item), blocks_by_id, glossary=current_chapter_glossary,
+                    dict(item), blocks_by_id, glossary=segment_glossary_for(dict(item)),
                 ),
             )
             migrated_ledger = translation_migration["ledgers"].get(chapter_id)
@@ -953,20 +1358,79 @@ def _build_chaptered_companion(
 
     def prepare_guide(chapter):
         chapter_id = str(chapter["chapter_id"])
-        chapter_glossary_for(chapter)
         guide_segment_id = f"{chapter_id}:guide"
         guide_ledger_path = checkpoint_dir / "chapters" / chapter_id / "guide-ledger.json"
+        guide_input_hash = lane_semantic_sha256("guide", {
+            "chapter_source": {
+                "chapter": chapter,
+                "blocks": [blocks_by_id[value] for value in chapter["block_ids"] if value in blocks_by_id],
+            },
+            "target_language": options.annotation_language,
+            "verified_evidence": evidence,
+        })
+        guide_recipe_hash = lane_recipe_sha256(
+            "guide", prompt=CHAPTER_GUIDE_VERSION, model=options.model,
+            tier=ANNOTATION_TIER,
+            access_recipe={"provider": options.provider, "allow_internet": False},
+        )
         guide_ledger = None
         if result_llm is not None:
             guide_ledger = initialize_lane_ledger(
                 guide_ledger_path, chapter_id=chapter_id, lane="guide",
                 segment_ids=[guide_segment_id],
             )
-            if guide_ledger["blocks"][0]["state"] == "pending":
-                guide_ledger = advance_block(
-                    guide_ledger_path, segment_id=guide_segment_id, state="submitted"
+            accepted_guide = guide_ledger["blocks"][0]
+            if (
+                accepted_guide["state"] == "accepted"
+                and accepted_guide.get("input_sha256") != guide_input_hash
+            ):
+                guide_ledger = invalidate_suffix(
+                    guide_ledger_path, from_segment_id=guide_segment_id,
+                    generation=int(guide_ledger.get("generation") or 1) + 1,
                 )
+            if "guide" in regeneration and guide_ledger["blocks"][0]["state"] == "accepted":
+                guide_generation = int(guide_ledger.get("generation") or 1) + 1
+                guide_ledger = invalidate_suffix(
+                    guide_ledger_path, from_segment_id=guide_segment_id,
+                    generation=guide_generation,
+                )
+                if session_manager is not None:
+                    session_key = f"{chapter_id}:guide"
+                    if session_manager.get_existing(session_key) is not None:
+                        session_manager.rotate(session_key, reason="explicit-guide-regeneration")
+            if guide_ledger["blocks"][0]["state"] == "prepared" and "guide" not in regeneration:
+                guide_object = artifact_store.find(
+                    kind="guide", semantic_input_sha256=guide_input_hash,
+                    recipe_sha256=guide_recipe_hash,
+                    contract_version=CHAPTER_GUIDE_VERSION,
+                    predecessor_accepted_chain_sha256=str(guide_ledger.get("accepted_chain_sha256") or ""),
+                    output_validator=lambda value: (
+                        isinstance(value, dict)
+                        and value.get("schema_version") == CHAPTER_GUIDE_VERSION
+                        and value.get("chapter_id") == chapter_id
+                    ),
+                )
+                if guide_object is not None:
+                    mark_plan_lane(
+                        "guide", chapter_id=chapter_id, artifact=guide_object,
+                        reason="accepted guide remains valid under the current contract",
+                    )
+                    guide = dict(guide_object["output"])
+                    accept_reused_block(
+                        guide_ledger_path, segment_id=guide_segment_id,
+                        input_sha256=guide_input_hash,
+                        output_sha256=str(guide_object["output_sha256"]),
+                        artifact_id=str(guide_object["artifact_id"]),
+                        validation_receipt={
+                            "local_validation": True, "object_store_revalidated": True,
+                            "reuse_status": guide_object["reuse_status"],
+                        },
+                    )
+                    with reader_data_lock:
+                        reader_guides[chapter_id] = dict(guide)
+                    return guide
         guide_receipt: dict[str, Any] = {}
+        guide_provider_receipt: dict[str, Any] = {}
         last_guide_call: dict[str, str] = {}
         def guide_model(prompt, schema, artifact_dir, call_label):
             if result_llm is None or session_manager is None:
@@ -993,7 +1457,15 @@ def _build_chaptered_companion(
                         supervised_native_resume=(
                             idempotency_key in options.supervised_native_resume_keys
                         ),
-                        progress_callback=lambda event: progress.provider_event(event),
+                        cancel_check=chapter_cancel_check,
+                        progress_callback=lambda event: (
+                            mark_submitted(
+                                guide_ledger_path, segment_id=guide_segment_id
+                            )
+                            if event.get("event") == "submitted"
+                            else None,
+                            progress.provider_event(event),
+                        )[-1],
                     )
             except BaseException as exc:
                 if _chapter_failure_requires_supervision(exc):
@@ -1010,13 +1482,25 @@ def _build_chaptered_companion(
                 raise
             guide_receipt.clear()
             guide_receipt.update(dict(outcome.logical_receipt or {}))
+            usage = getattr(outcome, "usage", {})
+            usage_json = usage.to_json() if hasattr(usage, "to_json") else usage
+            guide_provider_receipt.update({
+                "provider": str(getattr(outcome, "provider", None) or options.provider),
+                "model": str(getattr(outcome, "model", None) or options.model or "provider-default"),
+                "call_id": str(guide_receipt.get("idempotency_key") or guide_receipt.get("call_id") or call_label),
+                "usage": dict(usage_json) if isinstance(usage_json, dict) else {},
+            })
+            mark_submitted(guide_ledger_path, segment_id=guide_segment_id)
+            mark_response_received(
+                guide_ledger_path, segment_id=guide_segment_id
+            )
             return dict(outcome.value)
         try:
             guide = generate_chapter_guide(
                 chapter, [blocks_by_id[value] for value in chapter["block_ids"]],
                 language=options.annotation_language, evidence=evidence,
                 checkpoint_dir=checkpoint_dir / "chapters" / chapter_id,
-                force=options.force, call_model=guide_model,
+                force="guide" in regeneration, call_model=guide_model,
                 stateful=result_llm is not None,
             )
         except StatefulSessionError as exc:
@@ -1037,28 +1521,61 @@ def _build_chaptered_companion(
             if current != "accepted":
                 advance_block(guide_ledger_path, segment_id=guide_segment_id, state="schema_valid")
                 advance_block(guide_ledger_path, segment_id=guide_segment_id, state="invariant_valid")
-                advance_block(
+                accepted_guide_ledger = advance_block(
                     guide_ledger_path, segment_id=guide_segment_id, state="accepted",
-                    receipt=guide_receipt, input_sha256=sha256_json(chapter),
+                    receipt=guide_receipt, input_sha256=guide_input_hash,
                     output_sha256=sha256_json(guide),
                     validation_receipt={"local_validation": True},
                 )
+                accepted_guide_block = next(
+                    item for item in accepted_guide_ledger["blocks"]
+                    if item.get("segment_id") == guide_segment_id
+                )
+                if guide_provider_receipt and accepted_guide_block.get("logical_receipt"):
+                    artifact_store.put_accepted(
+                        kind="guide", semantic_input_sha256=guide_input_hash,
+                        recipe_sha256=guide_recipe_hash,
+                        contract_version=CHAPTER_GUIDE_VERSION, output=guide,
+                        ledger_block=accepted_guide_block,
+                        provider_receipt=guide_provider_receipt,
+                        provenance={"checkpoint_dir": str(checkpoint_dir), "chapter_id": chapter_id},
+                    )
+        with reader_data_lock:
+            reader_guides[chapter_id] = dict(guide)
         return guide
 
     ledger_paths: dict[tuple[str, str], Path] = {}
     logical_receipts: dict[str, dict[str, Any]] = {}
+    provider_receipts: dict[str, dict[str, Any]] = {}
+    reuse_plan_lock = reuse_plan_header_lock
+    lane_identity_lock = threading.Lock()
     prepared_reported: set[str] = set()
     prepared_report_lock = threading.Lock()
-    evidence_merge_lock = threading.Lock()
     stream_lock = threading.Lock()
     prompt_streams: dict[tuple[str, str, int], StatefulPromptStream] = {}
     rollover_budgets: dict[tuple[str, str, int], ContextRolloverBudget] = {}
     correction_budget = CorrectionBudget()
-    setup_schema = {
-        "type": "object", "additionalProperties": False,
-        "required": ["setup_received"],
-        "properties": {"setup_received": {"type": "integer", "minimum": 1}},
-    }
+
+    def record_segment_reuse(
+        *, chapter_id: str, segment_id: str, lane: str,
+        status: str, artifact_id: str | None, reason: str,
+    ) -> None:
+        with reuse_plan_lock:
+            plan_path = checkpoint_dir / "reuse-plan.json"
+            plan = read_json(plan_path)
+            entries = list(plan.get("entries") or [])
+            entries.append({
+                "chapter_id": chapter_id, "segment_id": segment_id,
+                "lane": "commentary" if lane == "companion" else lane,
+                "status": status, "artifact_id": artifact_id, "reason": reason,
+                "estimated_provider_calls": 0 if status in {"hit", "recipe_stale"} else 1,
+            })
+            plan["entries"] = entries
+            plan["estimated_provider_calls"] = sum(
+                int(item.get("estimated_provider_calls") or 0) for item in entries
+                if item.get("segment_id") is not None
+            )
+            write_json(plan_path, plan)
 
     def lane_stream(prepared, lane: str, generation: int) -> StatefulPromptStream:
         key = (str(prepared.chapter["chapter_id"]), lane, generation)
@@ -1076,14 +1593,34 @@ def _build_chaptered_companion(
                             "use the glossary mapping, preserve protected names and opaque tokens byte-for-byte."
                             if lane == "translation" else
                             "Write rigorous optional reader commentary that adds reasoning rather than paraphrase; "
-                            "bind every literature claim to supplied verified evidence and request missing evidence."
+                            "use this native session's chapter history to avoid unnecessary repetition; search and "
+                            "inspect sources in the same turn when useful, then return direct title/URL/locator citations."
                         ),
                         "target_language": options.annotation_language,
                     },
-                    chapter=prepared.chapter, guide=prepared.guide,
-                    compact_glossary=list(
-                        chapter_glossaries[key[0]].get("compact_mapping") or []
-                    ),
+                    static_context={
+                        "chapter": _compact_chapter_descriptor(prepared.chapter),
+                        "chapter_guide": prepared.guide,
+                        "lane_instructions": (
+                            translation_prompt(
+                                {}, [], language=options.annotation_language,
+                                glossary={}, protected_names=protected_names, paper_context={},
+                            )
+                            if lane == "translation" else
+                            annotation_prompt(
+                                {}, [], language=options.annotation_language,
+                                metadata=_annotation_metadata(bundle.metadata), evidence={},
+                                glossary={}, protected_names=protected_names, paper_context={},
+                                domain_context=domain_context,
+                            ).replace("\n\nGLOSSARY:\n{}\n\n", "\n\n")
+                        ),
+                        "paper": _static_paper_context(
+                            _full_paper_context(
+                                document, prepared.segments[0], blocks_by_id=blocks_by_id,
+                                options=options,
+                            )
+                        ),
+                    },
                 )
                 prompt_streams[key] = stream
                 rollover_budgets[key] = ContextRolloverBudget()
@@ -1118,77 +1655,144 @@ def _build_chaptered_companion(
             )
             if isinstance(ledger_block.get("translation"), dict):
                 migrated_translation = dict(ledger_block["translation"])
-        segment_glossary = _chapter_segment_glossary(
-            chapter_glossaries[chapter_id], segment, blocks_by_id,
+        segment_glossary = segment_glossary_for(segment)
+        object_lane = "commentary" if lane == "companion" else lane
+        identity_block = next(
+            item for item in ledger["blocks"] if item["segment_id"] == segment_id
         )
-        if newly_accepted:
-            advance_block(path, segment_id=segment_id, state="submitted")
+        predecessor_chain = str(
+            identity_block.get("predecessor_accepted_chain_sha256")
+            if block_state == "accepted"
+            else ledger.get("accepted_chain_sha256")
+            or ""
+        )
+        source_segment = {
+            "segment": _compact_segment_descriptor(segment),
+            "blocks": [
+                (_translation_input_block(blocks_by_id[value]) if lane == "translation"
+                 else _annotation_input_block(blocks_by_id[value], document))
+                for value in segment.get("block_ids") or [] if value in blocks_by_id
+            ],
+        }
+        if lane == "translation":
+            semantic_context = {
+                "source_segment": source_segment,
+                "target_language": options.annotation_language,
+                "glossary": segment_glossary,
+                "protected_names": _protected_names_for_blocks(
+                    protected_names,
+                    [blocks_by_id[value] for value in segment.get("block_ids") or [] if value in blocks_by_id],
+                ),
+                "guide": prepared.guide,
+                "static_context": _full_paper_context(
+                    document, segment, blocks_by_id=blocks_by_id, options=options,
+                ),
+                "predecessor_accepted_chain_sha256": predecessor_chain,
+            }
+        else:
+            selected_evidence = _evidence_for_segment(
+                segment, blocks_by_id, evidence, usage_state={"counts": {}, "topics": []},
+            )
+            semantic_context = {
+                "source_segment": source_segment,
+                "guide": prepared.guide,
+                "metadata": _annotation_metadata(bundle.metadata),
+                "selected_evidence": selected_evidence,
+                "selected_domain_context": domain_context,
+                "access_policy": _generation_runtime_policy(options),
+                "predecessor_accepted_chain_sha256": predecessor_chain,
+            }
+        input_hash = lane_semantic_sha256(object_lane, semantic_context)
+        semantic_invalidated = False
+        if block_state == "accepted":
+            accepted_block = next(
+                item for item in ledger["blocks"] if item["segment_id"] == segment_id
+            )
+            if (
+                accepted_block.get("input_sha256") != input_hash
+                and not (lane == "translation" and isinstance(accepted_block.get("translation"), dict))
+            ):
+                with lane_identity_lock:
+                    current_ledger = initialize_lane_ledger(
+                        path, chapter_id=chapter_id, lane=lane,
+                        segment_ids=[item["segment_id"] for item in prepared.segments],
+                    )
+                    current_block = next(
+                        item for item in current_ledger["blocks"]
+                        if item["segment_id"] == segment_id
+                    )
+                    if current_block.get("state") == "accepted":
+                        ledger = invalidate_suffix(
+                            path, from_segment_id=segment_id,
+                            generation=int(current_ledger.get("generation") or 1) + 1,
+                        )
+                        semantic_invalidated = True
+                        block_state = "prepared"
+                        block_generation = int(ledger.get("generation") or 1)
+                        newly_accepted = True
+                        predecessor_chain = str(ledger.get("accepted_chain_sha256") or "")
+        contract_version = SCHEMA_VERSION
+        recipe_hash = lane_recipe_sha256(
+            object_lane,
+            prompt=PROMPT_VERSION,
+            model=options.model,
+            tier=(TRANSLATION_TIER if lane == "translation" else ANNOTATION_TIER),
+            access_recipe={
+                "provider": options.provider,
+                "allow_internet": options.allow_internet if lane == "companion" else False,
+                "inherit_host_tools": options.inherit_host_tools,
+            },
+        )
+        reused_artifact = None
+        if newly_accepted and object_lane not in regeneration:
+            reused_artifact = artifact_store.find(
+                kind=object_lane,
+                semantic_input_sha256=input_hash,
+                recipe_sha256=recipe_hash,
+                contract_version=contract_version,
+                predecessor_accepted_chain_sha256=predecessor_chain,
+                output_validator=lambda output: _reusable_lane_output_valid(
+                    object_lane, segment, output,
+                    blocks_by_id=blocks_by_id, protected_names=protected_names,
+                ),
+            )
+            if reused_artifact is not None:
+                value = dict(reused_artifact["output"])
+                ledger = accept_reused_block(
+                    path,
+                    segment_id=segment_id,
+                    input_sha256=input_hash,
+                    output_sha256=str(reused_artifact["output_sha256"]),
+                    artifact_id=str(reused_artifact["artifact_id"]),
+                    validation_receipt={
+                        "local_validation": True,
+                        "object_store_revalidated": True,
+                        "reuse_status": reused_artifact["reuse_status"],
+                    },
+                )
+                newly_accepted = False
+                record_segment_reuse(
+                    chapter_id=chapter_id, segment_id=segment_id, lane=lane,
+                    status=str(reused_artifact["reuse_status"]),
+                    artifact_id=str(reused_artifact["artifact_id"]),
+                    reason=(
+                        "accepted artifact matches semantic input and recipe"
+                        if reused_artifact["reuse_status"] == "hit" else
+                        "accepted artifact remains valid but its generation recipe changed"
+                    ),
+                )
+        if reused_artifact is None and block_state != "accepted":
+            record_segment_reuse(
+                chapter_id=chapter_id, segment_id=segment_id, lane=lane,
+                status="miss", artifact_id=None,
+                reason=(
+                    "explicitly selected for regeneration" if object_lane in regeneration
+                    else "no accepted artifact matches semantic input and predecessor chain"
+                ),
+            )
         lane_llm = llm
         if result_llm is not None and session_manager is not None:
             stream = lane_stream(prepared, lane, block_generation)
-            setup_turns = stream.setup_turns()
-            for setup_index, setup_prompt in enumerate(setup_turns, 1):
-                setup_label = f"companion-{lane}-{chapter_id}-glossary-setup-{setup_index:04d}"
-                setup_idempotency_key = (
-                    f"{chapter_id}:{lane}:glossary-setup-{setup_index:04d}:"
-                    f"generation-{block_generation}"
-                )
-                setup_artifact_dir = (
-                    checkpoint_dir / "chapters" / chapter_id / "llm" / lane / "glossary-setup"
-                )
-                try:
-                    with submission_limiter.permit():
-                        setup_outcome = result_llm(
-                            setup_prompt, schema=setup_schema, provider=options.provider,
-                            model=options.model,
-                            model_tier=None if options.model else (
-                                TRANSLATION_TIER if lane == "translation" else ANNOTATION_TIER
-                            ),
-                            env=_llm_runtime_env(allow_internet=False, force_disable_internet=True),
-                            artifact_dir=setup_artifact_dir,
-                            call_label=setup_label, idle_timeout_seconds=options.idle_timeout_seconds,
-                            session_policy="stateful", session_manager=session_manager,
-                            session_key=f"{chapter_id}:{lane}",
-                            idempotency_key=setup_idempotency_key,
-                            progress_contract_scope="session", schema_formatter_enabled=False,
-                            supervised_native_resume=(
-                                setup_idempotency_key in options.supervised_native_resume_keys
-                            ),
-                            progress_callback=lambda event: progress.provider_event(event),
-                        )
-                except BaseException as exc:
-                    if _chapter_failure_requires_supervision(exc):
-                        from arc_llm import read_recovery_context
-                        recovery = read_recovery_context(
-                            setup_artifact_dir, idempotency_key=setup_idempotency_key,
-                            session_manager=session_manager, session_key=f"{chapter_id}:{lane}",
-                        )
-                        mark_needs_supervision(
-                            path, segment_id=segment_id, reason=str(exc),
-                            recovery_context=_recovery_context_json(recovery),
-                        )
-                        supervision_event.set()
-                    raise
-                if int(setup_outcome.value.get("setup_received") or 0) != setup_index:
-                    mark_needs_supervision(
-                        path, segment_id=segment_id,
-                        reason="stateful glossary setup acknowledgement changed its ordinal",
-                        recovery_context={
-                            "idempotency_key": setup_idempotency_key,
-                            "submission_state": "response_received",
-                            "session_key": f"{chapter_id}:{lane}",
-                            "generation": block_generation,
-                            "resumable": True,
-                        },
-                    )
-                    supervision_event.set()
-                    raise StatefulSessionError(
-                        "stateful glossary setup acknowledgement changed its ordinal"
-                    )
-                rollover_budgets[(chapter_id, lane, block_generation)].record(
-                    getattr(setup_outcome, "usage", {}),
-                    prompt_bytes=getattr(setup_outcome, "prompt_bytes", None),
-                )
             def lane_llm(prompt: str, **kwargs: Any) -> dict[str, Any]:
                 call_label = str(kwargs.get("call_label") or segment_id)
                 artifact_dir = Path(kwargs["artifact_dir"])
@@ -1198,18 +1802,42 @@ def _build_chaptered_companion(
                 idempotency_key = (
                     f"{chapter_id}:{lane}:{call_label}:generation-{block_generation}"
                 )
+                correction = "repair" in call_label.casefold() or "correction" in call_label.casefold()
+                paper_context = _full_paper_context(
+                    document, segment, blocks_by_id=blocks_by_id, options=options,
+                )
+                segment_evidence = _evidence_for_segment(
+                    segment, blocks_by_id, evidence, usage_state={"counts": {}, "topics": []},
+                )
+                current_payload = {
+                    "segment": _compact_segment_descriptor(segment),
+                    "source_blocks": [
+                        (_translation_input_block(blocks_by_id[value]) if lane == "translation"
+                         else _annotation_input_block(blocks_by_id[value], document))
+                        for value in segment.get("block_ids") or [] if value in blocks_by_id
+                    ],
+                    "neighbor_context": _dynamic_paper_context(paper_context),
+                    "bounded_sources": segment_evidence.get("bounded_sources") or [],
+                    "protected_names": _protected_names_for_blocks(
+                        protected_names,
+                        [
+                            blocks_by_id[value]
+                            for value in segment.get("block_ids") or []
+                            if value in blocks_by_id
+                        ],
+                    ),
+                }
+                current_payload["segment_glossary"] = segment_glossary
                 stateful_prompt = stream.request(
-                    prompt, cursor=segment_id,
+                    (prompt if correction else (
+                        "Translate the current segment payload under the generation rules."
+                        if lane == "translation" else
+                        "Research when useful and write the current segment annotation under the generation rules."
+                    )), cursor=segment_id,
                     source_sha256=_segment_input_hash(
-                        segment, blocks_by_id, glossary=chapter_glossaries[chapter_id]
+                        segment, blocks_by_id, glossary=segment_glossary
                     ),
-                    block_glossary=list(
-                        segment_glossary.get("entries") or []
-                    ),
-                    preserve_delta_instructions=(
-                        "repair" in call_label.casefold()
-                        or "correction" in call_label.casefold()
-                    ),
+                    current_payload=current_payload,
                 )
                 try:
                     with submission_limiter.permit():
@@ -1224,7 +1852,13 @@ def _build_chaptered_companion(
                             supervised_native_resume=(
                                 idempotency_key in options.supervised_native_resume_keys
                             ),
-                            progress_callback=lambda event: progress.provider_event(event),
+                            cancel_check=chapter_cancel_check,
+                            progress_callback=lambda event: (
+                                mark_submitted(path, segment_id=segment_id)
+                                if event.get("event") == "submitted"
+                                else None,
+                                progress.provider_event(event),
+                            )[-1],
                         )
                 except BaseException as exc:
                     if _chapter_failure_requires_supervision(exc):
@@ -1242,18 +1876,32 @@ def _build_chaptered_companion(
                 logical_receipts[call_label] = dict(outcome.logical_receipt or {})
                 if not logical_receipts[call_label]:
                     raise RuntimeError(f"stateful call {call_label} returned no logical receipt")
+                mark_submitted(path, segment_id=segment_id)
+                mark_response_received(path, segment_id=segment_id)
+                usage = getattr(outcome, "usage", {})
+                usage_json = usage.to_json() if hasattr(usage, "to_json") else usage
+                logical = logical_receipts[call_label]
+                provider_receipts[call_label] = {
+                    "provider": str(getattr(outcome, "provider", None) or options.provider),
+                    "model": str(getattr(outcome, "model", None) or options.model or "provider-default"),
+                    "call_id": str(logical.get("idempotency_key") or logical.get("call_id") or call_label),
+                    "usage": dict(usage_json) if isinstance(usage_json, dict) else {},
+                }
                 rollover_budgets[(chapter_id, lane, block_generation)].record(
                     getattr(outcome, "usage", {}),
                     prompt_bytes=getattr(outcome, "prompt_bytes", None),
                 )
                 return dict(outcome.value)
-        if migrated_translation is not None:
+        if reused_artifact is not None:
+            pass
+        elif migrated_translation is not None:
             value = migrated_translation
         elif lane == "translation":
             value = _generate_translations(
                 [segment], options=options, bundle=bundle,
                 glossary=segment_glossary, protected_names=protected_names,
                 checkpoint_dir=checkpoint_dir, llm=lane_llm,
+                force_generation="translation" in regeneration or semantic_invalidated,
             )[segment_id]
         else:
             value = _generate_annotations(
@@ -1262,23 +1910,14 @@ def _build_chaptered_companion(
                 # Only current-block explanations are repeated on delta turns; the
                 # complete source-to-target mapping lives in the generation bootstrap.
                 protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=lane_llm,
+                force_generation="commentary" in regeneration or semantic_invalidated,
             )[segment_id]
-            resolved, _segment_evidence = _resolve_and_rerun_evidence_requests(
-                [segment], {segment_id: value}, options=options, bundle=bundle,
-                evidence=evidence, domain_context=domain_context,
-                glossary=segment_glossary, protected_names=protected_names,
-                checkpoint_dir=checkpoint_dir / "chapters" / chapter_id / "evidence" / segment_id,
-                llm=lane_llm,
-                controller=EvidenceRequestController(
-                    domain_paper_ids=(domain_context or {}).get("paper_ids") or (),
-                    seed_paper_ids=(bundle.paper_id,),
-                ),
-            )
-            value = resolved[segment_id]
-            with evidence_merge_lock:
-                evidence.update(_segment_evidence)
-        input_hash = _segment_input_hash(segment, blocks_by_id,
-                                         glossary=chapter_glossaries[chapter_id])
+        if newly_accepted:
+            # A successfully returned stateless call is itself a definitive
+            # submission/response receipt; stateful calls normally crossed
+            # these barriers earlier through provider progress.
+            mark_submitted(path, segment_id=segment_id)
+            mark_response_received(path, segment_id=segment_id)
         accepted_ledger = None
         if newly_accepted:
             advance_block(path, segment_id=segment_id, state="schema_valid")
@@ -1290,6 +1929,29 @@ def _build_chaptered_companion(
                 ), input_sha256=input_hash, output_sha256=sha256_json(value),
                 validation_receipt={"local_validation": True, "correction_turns_max": 1},
             )
+            call_label = (
+                f"companion-{'translation' if lane == 'translation' else 'annotation'}-{segment_id}"
+            )
+            provider_receipt = provider_receipts.get(call_label)
+            accepted_block = next(
+                item for item in accepted_ledger.get("blocks") or []
+                if item.get("segment_id") == segment_id
+            )
+            if provider_receipt is not None and accepted_block.get("logical_receipt"):
+                artifact_store.put_accepted(
+                    kind=object_lane,
+                    semantic_input_sha256=input_hash,
+                    recipe_sha256=recipe_hash,
+                    contract_version=contract_version,
+                    output=value,
+                    ledger_block=accepted_block,
+                    provider_receipt=provider_receipt,
+                    provenance={
+                        "checkpoint_dir": str(checkpoint_dir),
+                        "chapter_id": chapter_id,
+                        "segment_id": segment_id,
+                    },
+                )
         if newly_accepted:
             progress.safe_boundary("block_accepted", chapter_id=chapter_id,
                                    segment_id=segment_id, lane=lane,
@@ -1318,9 +1980,8 @@ def _build_chaptered_companion(
                 with stream_lock:
                     prompt_streams[(chapter_id, lane, rotated.generation)] = StatefulPromptStream(
                         chapter_id=chapter_id, lane=lane, generation=rotated.generation,
-                        fixed_rules=dict(stream.fixed_rules), chapter=prepared.chapter,
-                        guide=prepared.guide,
-                        compact_glossary=list(stream.compact_glossary),
+                        fixed_rules=dict(stream.fixed_rules),
+                        static_context=dict(stream.static_context),
                         continuity_capsule=continuity_capsule(
                             accepted_chain_sha256=str(accepted_block.get("accepted_chain_sha256") or ""),
                             segment_id=segment_id, input_sha256=input_hash,
@@ -1328,6 +1989,13 @@ def _build_chaptered_companion(
                         ),
                     )
                     rollover_budgets[(chapter_id, lane, rotated.generation)] = ContextRolloverBudget()
+        with reader_data_lock:
+            target = reader_translations if lane == "translation" else reader_annotations
+            target[str(segment_id)] = dict(value)
+        _publish_reader_update(
+            options.project_dir.resolve(), state_path, reader_publish_lock,
+            final_overrides=chapter_reader_overrides(),
+        )
         return value
 
     try:
@@ -1341,6 +2009,7 @@ def _build_chaptered_companion(
             ),
             "run_companion": lambda prepared, segment: run_lane(prepared, segment, "companion"),
             "stop_event": supervision_event,
+            "cancel_check": chapter_cancel_check,
         }
         freeze_path = checkpoint_dir / "first-chapter-freeze.json"
         existing_freeze = _load_first_chapter_freeze(
@@ -1381,20 +2050,62 @@ def _build_chaptered_companion(
     }
     annotations = {key: value for chapter in chapter_results.values()
                    for key, value in chapter["companion"].items()}
-    annotations, evidence = _resolve_and_rerun_evidence_requests(
-        segments, annotations, options=options, bundle=bundle, evidence=evidence,
-        domain_context=domain_context, glossary=glossary,
-        protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=llm,
-        controller=EvidenceRequestController(
-            domain_paper_ids=(domain_context or {}).get("paper_ids") or (),
-            seed_paper_ids=(bundle.paper_id,),
+    review_input_hash = lane_semantic_sha256("review", {
+        "translation_artifacts": (
+            None if translations is None else {
+                key: sha256_json(value) for key, value in sorted(translations.items())
+            }
+        ),
+        "commentary_artifacts": {
+            key: sha256_json(value) for key, value in sorted(annotations.items())
+        },
+        "review_contract": {
+            "translation_mode": "skipped" if options.skip_translation else "enabled",
+            "segment_ids": [str(item["segment_id"]) for item in segments],
+        },
+    })
+    review_recipe_hash = lane_recipe_sha256(
+        "review", prompt=REVIEW_VERSION, model=options.model, tier=REVIEW_TIER,
+        access_recipe={"provider": options.provider, "allow_internet": False},
+    )
+    review_object = None if "review" in regeneration else artifact_store.find(
+        kind="review", semantic_input_sha256=review_input_hash,
+        recipe_sha256=review_recipe_hash, contract_version=REVIEW_VERSION,
+        predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
+        output_validator=lambda value: (
+            isinstance(value, dict)
+            and isinstance(value.get("annotations"), dict)
+            and isinstance(value.get("review"), dict)
         ),
     )
-    translations, annotations, chapter_review = _review(
-        segments, translations, annotations, document=document, glossary=glossary,
-        protected_names=protected_names, evidence=evidence, options=options,
-        llm=llm, checkpoint_dir=checkpoint_dir,
-    )
+    if review_object is not None:
+        mark_plan_lane(
+            "review", chapter_id=None, artifact=review_object,
+            reason="accepted review remains valid and remains bound to the same base artifacts",
+        )
+        review_output = dict(review_object["output"])
+        translations = review_output.get("translations")
+        annotations = dict(review_output["annotations"])
+        chapter_review = dict(review_output["review"])
+    else:
+        translations, annotations, chapter_review = _review(
+            segments, translations, annotations, document=document, glossary=glossary,
+            protected_names=protected_names, evidence=evidence, options=options,
+            llm=llm, checkpoint_dir=checkpoint_dir,
+        )
+        review_output = {
+            "translations": translations,
+            "annotations": annotations,
+            "review": chapter_review,
+        }
+        _store_validated_stateless_artifact(
+            artifact_store, kind="review",
+            semantic_input_sha256=review_input_hash,
+            recipe_sha256=review_recipe_hash,
+            contract_version=REVIEW_VERSION, output=review_output,
+            segment_id="project:review", checkpoint_dir=checkpoint_dir,
+            provider=options.provider, model=options.model,
+        )
     write_json(checkpoint_dir / "chapter-review.json", chapter_review)
     _write_review_overlays(
         checkpoint_dir, chapter_results, translations=translations, annotations=annotations,
@@ -1410,7 +2121,32 @@ def _build_chaptered_companion(
     render_document = (
         {**document, "blocks": [item for item in document.get("blocks") or []
                                 if block_id(item) not in index_block_ids]}
-        if index_entries else document
+        if index_entries and not options.skip_translation else document
+    )
+    final_reader_overrides = {
+        "status": (
+            "first_chapter_ready" if options.stop_after_first_chapter else "complete"
+        ),
+        "document": render_document,
+        "chapters": selected_chapters,
+        "segments": segments,
+        "chapter_guides": guides,
+        "translations": translations,
+        "annotations": annotations,
+        "glossary": glossary,
+        "metadata": bundle.metadata,
+        "language": options.annotation_language,
+        "translation_mode": "skipped" if options.skip_translation else "enabled",
+    }
+    content_object = _store_reviewed_content(
+        options.project_dir.resolve(), checkpoint_dir=checkpoint_dir,
+        final_overrides=final_reader_overrides, evidence=evidence,
+    )
+    _write_reader_final_checkpoint(checkpoint_dir, final_reader_overrides)
+    _state(
+        state_path,
+        content_sha256=content_object["content_sha256"],
+        content_object_path=str(content_object["path"]),
     )
     stem = f"{safe_name(bundle.paper_id)}_companion_{safe_name(options.annotation_language)}"
     artifact = _publish_pdf_artifact(
@@ -1452,6 +2188,11 @@ def _build_chaptered_companion(
         if freeze_path.is_file() and read_json(freeze_path) != freeze:
             raise RuntimeError("the confirmed first chapter freeze manifest changed")
         write_json(freeze_path, freeze)
+    _publish_reader_update(
+        options.project_dir.resolve(), state_path, reader_publish_lock,
+        final_overrides=final_reader_overrides,
+        strict=True,
+    )
     for chapter_id in chapter_results:
         progress.safe_boundary("chapter_complete", chapter_id=chapter_id,
                                artifact_paths=[artifact["pdf_path"]], substantive=True)
@@ -1474,46 +2215,18 @@ def _build_chaptered_companion(
             "meta": {"diagnostics": list(diagnostics), "notice": notice}}
 
 
-def _chapter_segment_glossary(
-    chapter_glossary: dict[str, Any],
-    segment: dict[str, Any],
-    blocks_by_id: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """Keep the complete compact mapping and only current-block explanations."""
-    source = "\n".join(
-        " ".join(
-            str(blocks_by_id[value].get(key) or "")
-            for key in ("title", "text", "tex", "markdown")
-        )
-        for value in segment.get("block_ids") or []
-        if value in blocks_by_id
-    ).casefold()
-    selected = []
-    for item in chapter_glossary.get("entries") or []:
-        terms = [
-            str(item.get("source") or item.get("term") or item.get("source_term") or ""),
-            *[
-                str(value)
-                for value in (item.get("aliases") or item.get("source_aliases") or [])
-            ],
-        ]
-        if any(term.strip() and term.casefold() in source for term in terms):
-            selected.append(dict(item))
-    return {
-        "schema_version": chapter_glossary.get("schema_version"),
-        "chapter_id": chapter_glossary.get("chapter_id"),
-        "entries": selected,
-        "compact_mapping": list(chapter_glossary.get("compact_mapping") or []),
-    }
-
-
 def _chapter_failure_requires_supervision(exc: BaseException) -> bool:
     if isinstance(exc, TimeoutError):
         return True
     try:
         from arc_llm import LLMWorkerError
+        from arc_llm.providers.base import LLMSubmissionState, failure_disposition
         if isinstance(exc, LLMWorkerError):
-            return True
+            disposition = failure_disposition(exc)
+            return bool(
+                disposition
+                and disposition.submission_state != LLMSubmissionState.NOT_SUBMITTED
+            )
     except ImportError:
         pass
     name = type(exc).__name__.casefold()
@@ -1563,11 +2276,16 @@ def validate_and_expand_segments(
     return expanded
 
 
+_BUILD_COMPANION_ENTRYPOINT = build_companion
+
+
 def read_status(project_dir: Path) -> dict[str, Any]:
     path = project_dir.resolve() / "state.json"
     if not path.is_file():
         return err("companion_state_not_found", f"No companion state found in {project_dir}")
-    return ok(read_json(path))
+    from .observability import enrich_status
+
+    return ok(enrich_status(project_dir, read_json(path)))
 
 
 def resume_companion(
@@ -1576,7 +2294,41 @@ def resume_companion(
     action: str,
     confirm_possible_duplicate_charge: bool = False,
 ) -> dict[str, Any]:
-    """Resolve supervised lane ledgers and continue the saved build."""
+    """Resolve supervision and continue while retaining the project lock."""
+
+    resolved = project_dir.resolve()
+    lock = ProjectBuildLock(resolved / ".arc-companion-build.lock")
+    try:
+        lock.acquire()
+    except BuildInProgressError as exc:
+        return err(
+            "build_in_progress",
+            str(exc),
+            project_dir=str(resolved),
+            retryable=True,
+        )
+    try:
+        from arc_llm.cancellation import install_signal_cancel_chain
+
+        with install_signal_cancel_chain() as cancel_check:
+            return _resume_companion_unlocked(
+                resolved,
+                action=action,
+                confirm_possible_duplicate_charge=confirm_possible_duplicate_charge,
+                cancel_check=cancel_check,
+            )
+    finally:
+        lock.release()
+
+
+def _resume_companion_unlocked(
+    project_dir: Path,
+    *,
+    action: str,
+    confirm_possible_duplicate_charge: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Mutate supervised state and continue under the caller's project lock."""
     if action not in {"resume-native", "restart-generation"}:
         raise ValueError("action must be resume-native or restart-generation")
     if action == "restart-generation" and not confirm_possible_duplicate_charge:
@@ -1607,16 +2359,36 @@ def resume_companion(
     checkpoint_dir = Path(str(state.get("checkpoint_dir") or ""))
     if not checkpoint_dir.is_dir():
         return err("companion_checkpoint_not_found", "The supervised checkpoint directory is missing")
-    ledger_paths = sorted((checkpoint_dir / "chapters").glob("*/**/*-ledger.json"))
+    from .resume_transaction import (
+        begin_transaction,
+        load_transaction,
+        mark_entry,
+        mark_transaction,
+    )
+
+    try:
+        transaction = load_transaction(project_dir)
+    except ValueError as exc:
+        return err("resume_transaction_invalid", str(exc))
+    if transaction and transaction.get("status") != "complete":
+        if transaction.get("action") != action:
+            return err(
+                "resume_transaction_action_mismatch",
+                "An incomplete resume transaction uses a different action",
+            )
+        ledger_paths = [Path(str(item["ledger_path"])) for item in transaction.get("entries") or []]
+    else:
+        transaction = None
+        ledger_paths = sorted((checkpoint_dir / "chapters").glob("*/**/*-ledger.json"))
     supervised_ledgers = []
     for path in ledger_paths:
         ledger = read_json(path)
-        if ledger.get("needs_supervision"):
+        if ledger.get("needs_supervision") or transaction is not None:
             supervised_ledgers.append((path, ledger))
     if not supervised_ledgers:
         return err("companion_supervision_context_missing", "No supervised chapter lane was found")
 
-    saved = state.get("recovery_options")
+    saved = transaction.get("recovery_options") if transaction else state.get("recovery_options")
     if not isinstance(saved, dict):
         return err(
             "companion_recovery_options_missing",
@@ -1625,10 +2397,14 @@ def resume_companion(
 
     from arc_llm.sessions import LLMSessionManager
     manager = LLMSessionManager(checkpoint_dir / "sessions")
-    native_resume_contexts: list[dict[str, Any]] = []
+    native_resume_contexts: list[dict[str, Any]] = list(
+        transaction.get("native_resume_contexts") or [] if transaction else []
+    )
+    native_resume_keys: list[str] = [
+        str(item["idempotency_key"]) for item in native_resume_contexts
+    ]
     if action == "resume-native":
-        native_resume_keys: list[str] = []
-        for ledger_path, ledger in supervised_ledgers:
+        for ledger_path, ledger in supervised_ledgers if transaction is None else []:
             context = dict(ledger["needs_supervision"].get("recovery_context") or {})
             session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
             if not context.get("idempotency_key"):
@@ -1657,36 +2433,82 @@ def resume_companion(
                 )
             native_resume_contexts.append(validated)
             native_resume_keys.append(validated["idempotency_key"])
-        for validated in native_resume_contexts:
+    if transaction is None:
+        entries = []
+        for path, ledger in supervised_ledgers:
+            supervision = dict(ledger.get("needs_supervision") or {})
+            generation = int(ledger.get("generation") or 1)
+            entries.append({
+                "ledger_path": str(path),
+                "session_key": f"{ledger['chapter_id']}:{ledger['lane']}",
+                "segment_id": str(supervision.get("segment_id") or ""),
+                "initial_generation": generation,
+                "target_generation": generation + (1 if action == "restart-generation" else 0),
+            })
+        try:
+            transaction = begin_transaction(
+                project_dir,
+                action=action,
+                recovery_options=saved,
+                entries=entries,
+                native_resume_contexts=native_resume_contexts,
+            )
+        except ValueError as exc:
+            return err("resume_transaction_invalid", str(exc))
+    resumed: list[dict[str, Any]] = []
+    for index, entry in enumerate(transaction.get("entries") or []):
+        path = Path(str(entry["ledger_path"]))
+        ledger = read_json(path)
+        segment_id = str(entry.get("segment_id") or "")
+        session_key = str(entry["session_key"])
+        if entry.get("status") == "applied":
+            resumed.append(dict(entry))
+            continue
+        if action == "resume-native":
+            validated = next(
+                item for item in native_resume_contexts if item["session_key"] == session_key
+            )
             native_id = validated.get("native_session_id_to_restore")
             if native_id:
                 try:
                     _restore_native_session_id(manager, validated, str(native_id))
                 except ValueError as exc:
                     return err("native_resume_context_invalid", str(exc))
-    resumed: list[dict[str, Any]] = []
-    for path, ledger in supervised_ledgers:
-        supervision = dict(ledger["needs_supervision"])
-        segment_id = str(supervision.get("segment_id") or "")
-        session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
-        context = dict(supervision.get("recovery_context") or {})
-        if action == "resume-native":
-            updated = clear_needs_supervision(path)
+            updated = (
+                clear_needs_supervision(path)
+                if ledger.get("needs_supervision")
+                else ledger
+            )
         else:
-            try:
-                rotated = manager.rotate(session_key, reason="supervised restart-generation")
-            except KeyError:
+            ref = manager.get_existing(session_key)
+            if ref is None:
                 return err(
                     "native_session_not_found",
                     f"No saved logical session exists for {session_key}",
                 )
-            updated = invalidate_suffix(
-                path, from_segment_id=segment_id, generation=rotated.generation,
+            initial_generation = int(entry["initial_generation"])
+            target_generation = int(entry["target_generation"])
+            if ref.generation == initial_generation:
+                ref = manager.rotate(session_key, reason="supervised restart-generation")
+            elif ref.generation != target_generation:
+                return err(
+                    "resume_transaction_generation_mismatch",
+                    f"Session {session_key} changed outside the resume transaction",
+                )
+            updated = (
+                invalidate_suffix(path, from_segment_id=segment_id, generation=target_generation)
+                if int(ledger.get("generation") or 0) != target_generation
+                or ledger.get("needs_supervision")
+                else ledger
             )
-        resumed.append({
+        receipt = {
             "ledger_path": str(path), "session_key": session_key,
             "segment_id": segment_id, "generation": updated["generation"],
-        })
+        }
+        mark_entry(project_dir, index, status="applied", **receipt)
+        resumed.append(receipt)
+
+    mark_transaction(project_dir, "continuation_ready")
 
     options = _options_from_recovery(project_dir.resolve(), saved)
     if action == "resume-native":
@@ -1694,7 +2516,24 @@ def resume_companion(
             options,
             supervised_native_resume_keys=tuple(native_resume_keys),
         )
-    return build_companion(options)
+    # Production continuation must not release and reacquire the project lock:
+    # that would expose partially coordinated session/ledger mutations. Tests
+    # may replace ``build_companion`` with a capture stub, which is safe to call
+    # because it does not acquire an OS lock.
+    if build_companion is not _BUILD_COMPANION_ENTRYPOINT:
+        result = build_companion(options)
+    else:
+        result = _build_companion_unlocked(
+            options,
+            source_loader=load_source_bundle,
+            llm=None,
+            compiler=compile_latex,
+            pdf_validator=validate_pdf,
+            result_llm=None,
+            cancel_check=cancel_check,
+        )
+    mark_transaction(project_dir, "complete")
+    return result
 
 
 def _validate_native_resume_context(
@@ -1857,6 +2696,8 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "stop_after_first_chapter": options.stop_after_first_chapter,
         "document_kind": options.document_kind,
         "idle_timeout_seconds": options.idle_timeout_seconds,
+        "regenerate_lanes": list(options.regenerate_lanes),
+        "confirm_expensive_regeneration": options.confirm_expensive_regeneration,
         "regenerate_commentary": options.regenerate_commentary,
         "legacy_checkpoint": (
             str(options.legacy_checkpoint) if options.legacy_checkpoint else None
@@ -1881,6 +2722,8 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
         document_kind=str(value.get("document_kind") or "auto"),
         idle_timeout_seconds=value.get("idle_timeout_seconds"),
+        regenerate_lanes=tuple(value.get("regenerate_lanes") or ()),
+        confirm_expensive_regeneration=bool(value.get("confirm_expensive_regeneration")),
         regenerate_commentary=bool(value.get("regenerate_commentary")),
         legacy_checkpoint=(
             Path(value["legacy_checkpoint"]) if value.get("legacy_checkpoint") else None
@@ -1998,6 +2841,7 @@ def _generate_first_round_lanes(
     protected_names: list[str],
     checkpoint_dir: Path,
     llm: Callable[..., dict[str, Any]],
+    accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Drain translation and annotation concurrently for one scheduled wave."""
     if not segments:
@@ -2015,6 +2859,7 @@ def _generate_first_round_lanes(
                 protected_names=protected_names,
                 checkpoint_dir=checkpoint_dir,
                 llm=llm,
+                accepted_callback=accepted_callback,
             ),
         }
         if not options.skip_translation:
@@ -2027,6 +2872,7 @@ def _generate_first_round_lanes(
                 protected_names=protected_names,
                 checkpoint_dir=checkpoint_dir,
                 llm=llm,
+                accepted_callback=accepted_callback,
             )
         lane_results: dict[str, dict[str, dict[str, Any]]] = {"translation": {}}
         lane_failures: dict[str, BaseException] = {}
@@ -2151,6 +2997,17 @@ def _publish_pdf_artifact(
     chapter_guides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Render, validate, and atomically publish one preview or final PDF artifact."""
+    # Final builds never overwrite a path referenced by the published state.
+    # A new revision directory makes every target immutable; the later state
+    # write is the sole publication commit. Preview paths remain stable because
+    # they are not last-good deliverables and existing CLI/tests expose them.
+    artifact_dir = output_dir
+    if manifest_name == "source-manifest.json":
+        artifact_dir = (
+            output_dir / ".arc-companion" / "renders" / "pdf"
+            / f"{safe_name(stem)}-{uuid.uuid4().hex[:12]}"
+        )
+        artifact_dir.mkdir(parents=True, exist_ok=False)
     evidence_by_segment = _reader_evidence_by_segment(
         segments,
         document=document,
@@ -2161,7 +3018,7 @@ def _publish_pdf_artifact(
         document,
         segments,
         annotations,
-        output_dir=output_dir,
+        output_dir=artifact_dir,
         language=language,
         metadata=metadata,
         translations=translations,
@@ -2175,15 +3032,15 @@ def _publish_pdf_artifact(
     if fidelity_errors:
         raise LatexError("source fidelity validation failed: " + "; ".join(fidelity_errors))
 
-    tex_path = output_dir / f"{stem}.tex"
-    pdf_path = output_dir / f"{stem}.pdf"
-    manifest_path = output_dir / manifest_name
-    validation_path = output_dir / validation_name
+    tex_path = artifact_dir / f"{stem}.tex"
+    pdf_path = artifact_dir / f"{stem}.pdf"
+    manifest_path = artifact_dir / manifest_name
+    validation_path = artifact_dir / validation_name
     staging_stem = f"arc-companion-building-{safe_name(stem)}-{uuid.uuid4().hex[:12]}"
-    building_tex = output_dir / f"{staging_stem}.tex"
-    building_pdf = output_dir / f"{staging_stem}.pdf"
-    building_manifest = output_dir / f"{staging_stem}-manifest.json"
-    building_validation = output_dir / f"{staging_stem}-validation.json"
+    building_tex = artifact_dir / f"{staging_stem}.tex"
+    building_pdf = artifact_dir / f"{staging_stem}.pdf"
+    building_manifest = artifact_dir / f"{staging_stem}-manifest.json"
+    building_validation = artifact_dir / f"{staging_stem}-validation.json"
     staging_paths = (building_tex, building_pdf, building_manifest, building_validation)
     try:
         write_text(building_tex, tex)
@@ -2194,10 +3051,10 @@ def _publish_pdf_artifact(
             building_validation,
             {"ok": True, "pdf": pdf_report, "fidelity_errors": []},
         )
-        os.replace(building_tex, tex_path)
-        os.replace(building_pdf, pdf_path)
-        os.replace(building_manifest, manifest_path)
-        os.replace(building_validation, validation_path)
+        _publish_artifact_replace(building_tex, tex_path)
+        _publish_artifact_replace(building_pdf, pdf_path)
+        _publish_artifact_replace(building_manifest, manifest_path)
+        _publish_artifact_replace(building_validation, validation_path)
     except BaseException:
         for path in staging_paths:
             path.unlink(missing_ok=True)
@@ -2214,6 +3071,11 @@ def _publish_pdf_artifact(
         "validation_sha256": _sha256_existing_file(validation_path),
         "pdf": pdf_report,
     }
+
+
+def _publish_artifact_replace(source: Path, target: Path) -> None:
+    """Fault-injection seam for publishing files inside a new immutable revision."""
+    os.replace(source, target)
 
 
 def _reader_evidence_by_segment(
@@ -2245,17 +3107,7 @@ def _reader_evidence_by_segment(
             record = dict(full)
             record["selected_snippets"] = list(compact.get("snippets") or [])
             records.append(record)
-        segment_id = str(segment.get("segment_id") or "")
-        present = {str(record.get("evidence_id") or "") for record in records}
-        cited = (
-            (annotations or {}).get(segment_id, {}).get("evidence_ids") or []
-        )
-        for evidence_id in cited:
-            full = full_by_id.get(str(evidence_id))
-            if full is not None and str(evidence_id) not in present:
-                records.append(dict(full))
-                present.add(str(evidence_id))
-        result[segment_id] = records
+        result[str(segment.get("segment_id") or "")] = records
     return result
 
 
@@ -2264,17 +3116,38 @@ def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[
     if not status.get("ok"):
         return status
     state = status["data"]
-    pdf = Path(str(state.get("output_pdf") or ""))
-    tex = Path(str(state.get("output_tex") or ""))
-    manifest_path = project_dir.resolve() / "source-manifest.json"
+    published_value = state.get("published") or {}
+    if not isinstance(published_value, dict):
+        return err("companion_validation_failed", "Published companion state is invalid")
+    published = dict(published_value)
+    pdf_value = published.get("pdf") or {}
+    web_value = published.get("web") or {}
+    if not isinstance(pdf_value, dict) or not isinstance(web_value, dict):
+        return err("companion_validation_failed", "Published companion outputs are invalid")
+    effective = {
+        **state,
+        **dict(pdf_value),
+        **dict(web_value),
+    }
+    pdf = Path(str(effective.get("output_pdf") or ""))
+    tex = Path(str(effective.get("output_tex") or ""))
+    manifest_path = Path(str(effective.get("source_manifest_path") or ""))
     if not tex.is_file() or not manifest_path.is_file():
         return err("companion_validation_failed", "TeX or source manifest is missing")
     try:
-        if not _completion_outputs_match(state):
+        if not _published_pdf_outputs_match(effective):
             raise RuntimeError("completed companion outputs do not match their recorded hashes")
-        checkpoint_dir = Path(str(state.get("checkpoint_dir") or ""))
-        checkpoint_document = read_json(checkpoint_dir / "document.json")
-        document = checkpoint_document.get("document") if isinstance(checkpoint_document, dict) else None
+        content_sha256 = str(published.get("content_sha256") or "")
+        if content_sha256:
+            from .content import load_reader_content
+
+            document = load_reader_content(
+                project_dir.resolve(), content_sha256,
+            )["content"]["document"]
+        else:
+            checkpoint_dir = Path(str(state.get("checkpoint_dir") or ""))
+            checkpoint_document = read_json(checkpoint_dir / "document.json")
+            document = checkpoint_document.get("document") if isinstance(checkpoint_document, dict) else None
         if not isinstance(document, dict):
             raise RuntimeError("checkpoint source document is missing")
         manifest = read_json(manifest_path)
@@ -2282,9 +3155,37 @@ def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[
         if fidelity_errors:
             raise RuntimeError("source fidelity validation failed: " + "; ".join(fidelity_errors))
         report = pdf_validator(pdf)
+        from .web import validate_reader_project
+        web_report = (
+            validate_reader_project(project_dir.resolve(), state=effective)
+            if effective.get("output_html") else None
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         return err("companion_validation_failed", str(exc))
-    return ok({"pdf": report, "manifest": manifest, "output_pdf": str(pdf)})
+    return ok({
+        "pdf": report,
+        "web": web_report,
+        "manifest": manifest,
+        "output_pdf": str(pdf),
+    })
+
+
+def _published_pdf_outputs_match(state: dict[str, Any]) -> bool:
+    """Validate a last-good PDF revision independently of the active run."""
+    for path_key, hash_key in (
+        ("output_tex", "output_tex_sha256"),
+        ("output_pdf", "output_pdf_sha256"),
+        ("source_manifest_path", "source_manifest_sha256"),
+        ("validation_path", "validation_sha256"),
+    ):
+        value = state.get(path_key)
+        expected = str(state.get(hash_key) or "")
+        if not value or not expected:
+            return False
+        path = Path(str(value))
+        if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
+            return False
+    return True
 
 
 def _generate_annotations(
@@ -2298,9 +3199,8 @@ def _generate_annotations(
     protected_names: list[str],
     checkpoint_dir: Path,
     llm: Callable[..., dict[str, Any]],
-    round_number: int = 1,
-    first_drafts: dict[str, dict[str, Any]] | None = None,
-    resolution_by_segment: dict[str, dict[str, Any]] | None = None,
+    accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+    force_generation: bool = False,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
     usage_state: dict[str, Any] = {"counts": {}, "topics": []}
@@ -2310,7 +3210,7 @@ def _generate_annotations(
         )
         for segment in segments
     }
-    annotation_dir = checkpoint_dir / ("annotations" if round_number == 1 else "annotations-evidence-rerun")
+    annotation_dir = checkpoint_dir / "annotations"
     segment_evidence_dir = checkpoint_dir / "segment-evidence"
     annotation_dir.mkdir(parents=True, exist_ok=True)
     segment_evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -2319,6 +3219,14 @@ def _generate_annotations(
     for segment in segments:
         path = annotation_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json"
         segment_evidence = segment_evidence_by_id[str(segment["segment_id"])]
+        segment_glossary = (
+            {}
+            if options.skip_translation
+            else project_segment_glossary(
+                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
+                glossary,
+            )
+        )
         write_json(
             segment_evidence_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json",
             {
@@ -2328,22 +3236,19 @@ def _generate_annotations(
                 "evidence": segment_evidence,
             },
         )
-        if path.is_file() and not options.force and not options.regenerate_commentary:
+        if path.is_file() and not force_generation and not options.regenerate_commentary:
             checkpoint = read_json(path)
             paper_context = _full_paper_context(
                 bundle.document, segment, blocks_by_id=by_id, options=options
             )
             expected_hash = _segment_input_hash(
-                segment, by_id, glossary=glossary,
+                segment, by_id, glossary=segment_glossary,
                 extra={
                     "evidence": segment_evidence,
                     "names": protected_names,
                     "paper_context": paper_context,
                     "runtime_access": _generation_runtime_policy(options),
                     "domain_context": domain_context,
-                    "round": round_number,
-                    "first_draft": (first_drafts or {}).get(str(segment["segment_id"])),
-                    "evidence_resolution": (resolution_by_segment or {}).get(str(segment["segment_id"])),
                 },
             )
             if (
@@ -2353,22 +3258,37 @@ def _generate_annotations(
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("annotation"), dict)
             ):
-                output[segment["segment_id"]] = clean_reader_annotation(
-                    checkpoint["annotation"],
-                    evidence_records=segment_evidence["papers"],
-                    language=options.annotation_language,
-                )
-                continue
+                try:
+                    cached_annotation = _validate_direct_annotation_sources(
+                        checkpoint["annotation"],
+                        allowed_urls=(
+                            None if options.allow_internet
+                            else _available_source_urls(segment_evidence)
+                        ),
+                    )
+                except RuntimeError:
+                    pass
+                else:
+                    output[segment["segment_id"]] = cached_annotation
+                    if accepted_callback is not None:
+                        accepted_callback("annotation", str(segment["segment_id"]), cached_annotation)
+                    continue
         pending.append(segment)
 
     def generate(segment: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         selected = [_annotation_input_block(by_id[value], bundle.document) for value in segment["block_ids"]]
+        segment_glossary = (
+            {}
+            if options.skip_translation
+            else project_segment_glossary(
+                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
+                glossary,
+            )
+        )
         segment_evidence = segment_evidence_by_id[str(segment["segment_id"])]
         paper_context = _full_paper_context(
             bundle.document, segment, blocks_by_id=by_id, options=options
         )
-        first_draft = (first_drafts or {}).get(str(segment["segment_id"]))
-        evidence_resolution = (resolution_by_segment or {}).get(str(segment["segment_id"]))
         value = _llm_call(
             llm,
             _bounded_annotation_prompt(
@@ -2376,77 +3296,29 @@ def _generate_annotations(
                 selected,
                 language=options.annotation_language,
                 metadata=_annotation_metadata(bundle.metadata),
-                evidence=segment_evidence,
-                glossary=glossary,
+                evidence={"sources": segment_evidence.get("bounded_sources") or []},
+                glossary=segment_glossary,
                 protected_names=protected_names,
                 paper_context=paper_context,
                 domain_context=domain_context,
-                first_draft=first_draft,
-                evidence_resolution=evidence_resolution,
             ),
             ANNOTATION_SCHEMA,
             options=options,
             artifact_dir=(
-                checkpoint_dir / "llm"
-                / ("annotations" if round_number == 1 else "annotations-evidence-rerun")
+                checkpoint_dir / "llm" / "annotations"
                 / _segment_checkpoint_name(segment["segment_id"])
             ),
-            call_label=(
-                f"companion-annotation-{segment['segment_id']}"
-                if round_number == 1
-                else f"companion-annotation-evidence-rerun-{segment['segment_id']}"
-            ),
+            call_label=f"companion-annotation-{segment['segment_id']}",
             model_tier=ANNOTATION_TIER,
             allow_internet=True,
         )
-        normalized = {
-            "commentary": str(value.get("commentary") or ""),
-            "explanation": str(value.get("explanation") or ""),
-            "prior_work": _normalize_related_work(
-                value.get("prior_work"),
-                known_evidence_ids=(
-                    None if round_number == 1
-                    else {str(item.get("evidence_id") or "") for item in segment_evidence["papers"]}
-                ),
+        normalized = _validate_direct_annotation_sources(
+            value,
+            allowed_urls=(
+                None if options.allow_internet
+                else _available_source_urls(segment_evidence)
             ),
-            "later_work": _normalize_related_work(
-                value.get("later_work"),
-                known_evidence_ids=(
-                    None if round_number == 1
-                    else {str(item.get("evidence_id") or "") for item in segment_evidence["papers"]}
-                ),
-            ),
-            "context_claims": _normalize_related_work(
-                value.get("context_claims") or [],
-                known_evidence_ids=(
-                    None if round_number == 1
-                    else {str(item.get("evidence_id") or "") for item in segment_evidence["papers"]}
-                ),
-            ),
-            "evidence_ids": _validated_evidence_ids(
-                (
-                    value.get("evidence_ids") or []
-                    if round_number == 1
-                    else _known_evidence_ids(value.get("evidence_ids") or [], segment_evidence["papers"])
-                ),
-                {"related_papers": segment_evidence["papers"]},
-            ),
-            "key_points": list(value.get("key_points") or []),
-            "source_notes": list(value.get("source_notes") or []),
-            "evidence_requests": (
-                normalize_evidence_requests(segment["segment_id"], value.get("evidence_requests") or [])
-                if round_number == 1 else []
-            ),
-        }
-        normalized = clean_reader_annotation(
-            normalized,
-            evidence_records=segment_evidence["papers"],
-            language=options.annotation_language,
         )
-        _repair_unique_supplied_source_locators(normalized, segment_evidence["papers"])
-        if round_number > 1:
-            _drop_unsupported_second_round_related_work(normalized, segment_evidence["papers"])
-        _validate_annotation_evidence(normalized, segment_evidence["papers"])
         return segment["segment_id"], normalized
 
     with ThreadPoolExecutor(max_workers=min(options.workers, max(1, len(pending)))) as executor:
@@ -2466,10 +3338,14 @@ def _generate_annotations(
                     annotation_dir / f"{_segment_checkpoint_name(segment_id)}.json",
                     {
                         "schema_version": ANNOTATION_CHECKPOINT_VERSION,
-                        "round": round_number,
                         "segment_id": segment_id,
                         "input_sha256": _segment_input_hash(
-                            segment, by_id, glossary=glossary,
+                            segment,
+                            by_id,
+                            glossary=project_segment_glossary(
+                                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
+                                glossary,
+                            ),
                             extra={
                                 "evidence": segment_evidence_by_id[str(segment_id)],
                                 "names": protected_names,
@@ -2478,305 +3354,190 @@ def _generate_annotations(
                                 ),
                                 "runtime_access": _generation_runtime_policy(options),
                                 "domain_context": domain_context,
-                                "round": round_number,
-                                "first_draft": (first_drafts or {}).get(str(segment_id)),
-                                "evidence_resolution": (resolution_by_segment or {}).get(str(segment_id)),
                             },
                         ),
                         "annotation": value,
                     },
                 )
+                if accepted_callback is not None:
+                    accepted_callback("annotation", str(segment_id), value)
         if failures:
             raise CompanionLaneError("annotation", failures)
     return {segment["segment_id"]: output[segment["segment_id"]] for segment in segments}
 
 
-def _resolve_and_rerun_evidence_requests(
-    segments: list[dict[str, Any]],
-    annotations: dict[str, dict[str, Any]],
-    *,
-    options: BuildOptions,
-    bundle: SourceBundle,
-    evidence: dict[str, Any],
-    domain_context: dict[str, Any] | None,
-    glossary: dict[str, Any],
-    protected_names: list[str],
-    checkpoint_dir: Path,
-    llm: Callable[..., dict[str, Any]],
-    controller: EvidenceRequestController,
-) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    requests = [
-        dict(request)
-        for segment in segments
-        for request in annotations[str(segment["segment_id"])].get("evidence_requests") or []
-    ]
-    if not requests:
-        write_json(checkpoint_dir / "evidence-resolution.v3.json", {
-            "schema_version": EVIDENCE_RESOLUTION_VERSION,
-            "requests": [],
-            "lanes": {},
-            "accepted": [],
-            "rejected": [],
-            "rerun_segments": [],
-        })
-        return annotations, evidence
-
-    controller_request = EvidenceRequest(
-        request_id="companion-related-work-round-1",
-        operation="companion.resolve-related-work",
-        arguments={
-            "requests": requests,
-            "existing_records": evidence.get("related_papers") or [],
-        },
-    )
-
-    def resolve_with_services(
-        material: tuple[EvidenceRequest, ...], *, round_number: int,
-    ) -> tuple[EvidenceResponse, ...]:
-        responses: list[EvidenceResponse] = []
-        for request in material:
-            if request.operation != "companion.resolve-related-work":
-                responses.append(EvidenceResponse(
-                    request.request_id,
-                    False,
-                    error=f"unsupported evidence operation: {request.operation}",
-                ))
-                continue
-            try:
-                resolved = controller.resolve(
-                    request.arguments.get("requests") or [],
-                    existing_records=request.arguments.get("existing_records") or [],
-                )
-            except Exception as exc:
-                responses.append(EvidenceResponse(
-                    request.request_id,
-                    False,
-                    error=f"{type(exc).__name__}: {exc}",
-                ))
-            else:
-                responses.append(EvidenceResponse(
-                    request.request_id,
-                    True,
-                    resolved,
-                    provenance={"controller": "arc-companion", "round": round_number},
-                ))
-        return tuple(responses)
-
-    controller_response = resolve_evidence_round(
-        (controller_request,), resolve_with_services, round_number=1,
-    )[0]
-    if not controller_response.ok:
-        raise RuntimeError(f"evidence controller failed: {controller_response.error}")
-    resolution = controller_response.data
-    if not isinstance(resolution, EvidenceResolution):
-        raise RuntimeError("evidence controller returned an invalid resolution")
-    supported = set(resolution.supported_request_keys)
-    evidence_ids_by_request: dict[str, set[str]] = {}
-    for accepted in resolution.audit.get("accepted") or []:
-        if not isinstance(accepted, dict):
-            continue
-        request_key = str(accepted.get("request_key") or "")
-        evidence_id = str(accepted.get("evidence_id") or "")
-        if request_key in supported and evidence_id:
-            evidence_ids_by_request.setdefault(request_key, set()).add(evidence_id)
-    for segment_id, ids in resolution.evidence_ids_by_segment.items():
-        segment_keys = [
-            str(item["request_key"]) for item in requests
-            if item["segment_id"] == segment_id and item["request_key"] in supported
-        ]
-        if len(segment_keys) == 1 and not evidence_ids_by_request.get(segment_keys[0]):
-            evidence_ids_by_request[segment_keys[0]] = set(ids)
-    audit = dict(resolution.audit)
-    audit["round"] = 1
-    audit["rerun_segments"] = sorted(resolution.evidence_ids_by_segment)
-    write_json(checkpoint_dir / "evidence-resolution.v3.json", audit)
-
-    merged_records = _merge_evidence_records(
-        evidence.get("related_papers") or [], resolution.records,
-    )
-    merged_evidence = {
-        **evidence,
-        "related_papers": merged_records,
-        "required_evidence_ids_by_segment": {
-            key: list(values) for key, values in resolution.evidence_ids_by_segment.items()
-        },
-    }
-    segment_by_id = {str(item["segment_id"]): item for item in segments}
-    rerun_ids = [value for value in segment_by_id if value in resolution.evidence_ids_by_segment]
-    resolution_by_segment = {
-        segment_id: {
-            "round": 2,
-            "registered_evidence_ids": list(resolution.evidence_ids_by_segment[segment_id]),
-            "evidence_ids_by_request": {
-                item["request_key"]: sorted(evidence_ids_by_request.get(item["request_key"], set()))
-                for item in requests
-                if item["segment_id"] == segment_id and item["request_key"] in supported
-            },
-            "requests": [item for item in requests if item["segment_id"] == segment_id],
-            "audit_path": str(checkpoint_dir / "evidence-resolution.v3.json"),
-        }
-        for segment_id in rerun_ids
-    }
-    first_round_annotations = annotations
-    if rerun_ids:
-        rerun = _generate_annotations(
-            [segment_by_id[value] for value in rerun_ids],
-            options=options,
-            bundle=bundle,
-            evidence=merged_evidence,
-            domain_context=domain_context,
-            glossary=glossary,
-            protected_names=protected_names,
-            checkpoint_dir=checkpoint_dir,
-            llm=llm,
-            round_number=2,
-            first_drafts={value: annotations[value] for value in rerun_ids},
-            resolution_by_segment=resolution_by_segment,
-        )
-        annotations = {**annotations, **rerun}
-
-    claim_bindings: dict[str, list[str]] = {}
-    claim_binding_records: dict[str, list[dict[str, Any]]] = {}
-    for segment_id, annotation in annotations.items():
-        segment_requests = [item for item in requests if item["segment_id"] == segment_id]
-        _enforce_request_claim_bindings(
-            annotation,
-            segment_requests,
-            supported=supported,
-            evidence_ids_by_request=evidence_ids_by_request,
-            first_draft=first_round_annotations.get(segment_id),
-            records=merged_records,
-        )
-        _clear_unresolved_requested_work(annotation, segment_requests, supported)
-        annotation["evidence_requests"] = []
-        claim_bindings[segment_id] = list(annotation.get("evidence_ids") or [])
-        claim_binding_records[segment_id] = [
-            {
-                "relation": relation,
-                "text": str(claim.get("text") or ""),
-                "request_key": claim.get("request_key"),
-                "evidence_ids": list(claim.get("evidence_ids") or []),
-                "source_locators": list(claim.get("source_locators") or []),
-            }
-            for field, relation in (
-                ("prior_work", "prior"), ("later_work", "later"),
-                ("context_claims", "context"),
-            )
-            for claim in annotation.get(field) or []
-            if isinstance(annotation.get(field), list) and isinstance(claim, dict)
-        ]
-    audit["round"] = 2
-    audit["final_claim_evidence_ids"] = claim_bindings
-    audit["final_claim_bindings"] = claim_binding_records
-    write_json(checkpoint_dir / "evidence-resolution.v3.json", audit)
-    return annotations, merged_evidence
-
-
-def _normalize_related_work(
+def _validate_direct_annotation_sources(
     value: Any,
     *,
-    known_evidence_ids: set[str] | None = None,
-) -> str | list[dict[str, Any]]:
-    """Preserve legacy strings while normalizing claim-level evidence bindings."""
-    if not isinstance(value, list):
-        raise RuntimeError("related work must use claim arrays in generated annotations")
-    if len(value) > 3:
-        raise RuntimeError("related work may contain at most three claims")
-    claims: list[dict[str, Any]] = []
-    for index, raw in enumerate(value, 1):
-        if not isinstance(raw, dict) or not str(raw.get("text") or "").strip():
-            raise RuntimeError(f"related-work claim {index} has no text")
-        evidence_ids = [
-            str(item) for item in raw.get("evidence_ids") or []
-            if isinstance(item, str)
-            and (known_evidence_ids is None or item in known_evidence_ids)
-        ]
-        locator_values = [
-            {"evidence_id": str(item.get("evidence_id") or ""),
-             "locator": str(item.get("locator") or "")}
-            for item in raw.get("source_locators") or []
-            if isinstance(item, dict)
-            and str(item.get("evidence_id") or "") in evidence_ids
-        ]
-        request_key = raw.get("request_key")
-        claims.append({
-            "text": str(raw["text"]),
-            "evidence_ids": list(dict.fromkeys(evidence_ids)),
-            "source_locators": locator_values,
-            "request_key": None if request_key is None else str(request_key),
-        })
-    return claims
+    allowed_urls: set[str] | None = None,
+) -> dict[str, Any]:
+    """Validate direct citations without interpreting or registering their claims."""
+    if not isinstance(value, dict):
+        raise RuntimeError("annotation must be an object")
+    expected = {
+        "explanation", "commentary", "commentary_sources", "prior_work", "later_work",
+    }
+    # Local development fakes and interrupted pre-v12 formatter responses can
+    # still carry controller-era empty bookkeeping fields.  Collapse only that
+    # lossless empty shape; never persist the removed fields.
+    if "commentary_sources" not in value:
+        legacy_only = set(value) - {"explanation", "commentary", "prior_work", "later_work"}
+        if all(value.get(key) in (None, [], "") for key in legacy_only):
+            value = {
+                "explanation": str(value.get("explanation") or ""),
+                "commentary": str(value.get("commentary") or ""),
+                "commentary_sources": [],
+                "prior_work": value.get("prior_work") or [],
+                "later_work": value.get("later_work") or [],
+            }
+    if set(value) != expected:
+        extra = sorted(set(value) - expected)
+        missing = sorted(expected - set(value))
+        raise RuntimeError(
+            f"annotation fields do not match the direct-source contract "
+            f"(missing={missing}, extra={extra})"
+        )
+
+    def sources(
+        values: Any, *, owner: str, require_one: bool = False,
+    ) -> list[dict[str, str]]:
+        if (
+            not isinstance(values, list)
+            or len(values) > 3
+            or (require_one and not values)
+        ):
+            raise RuntimeError(f"{owner} sources must be an array with at most three items")
+        output: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for index, raw in enumerate(values, 1):
+            if not isinstance(raw, dict) or set(raw) != {"title", "url", "locator"}:
+                raise RuntimeError(f"{owner} source {index} must contain title, url, and locator")
+            title = raw.get("title")
+            url = raw.get("url")
+            locator = raw.get("locator")
+            if not all(isinstance(item, str) and item.strip() for item in (title, url, locator)):
+                raise RuntimeError(f"{owner} source {index} has an empty required field")
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise RuntimeError(f"{owner} source {index} URL must use HTTP(S)")
+            duplicate_key = url.casefold()
+            if duplicate_key in seen:
+                raise RuntimeError(f"{owner} contains a duplicate source URL: {url}")
+            if allowed_urls is not None and url not in allowed_urls:
+                raise RuntimeError(
+                    f"offline annotation cited a source not supplied by the prompt or ARC cache: {url}"
+                )
+            seen.add(duplicate_key)
+            output.append(dict(raw))
+        return output
+
+    def claims(values: Any, *, owner: str) -> list[dict[str, Any]]:
+        if not isinstance(values, list) or len(values) > 3:
+            raise RuntimeError(f"{owner} must be an array with at most three claims")
+        output: list[dict[str, Any]] = []
+        for index, raw in enumerate(values, 1):
+            if not isinstance(raw, dict) or set(raw) != {"text", "sources"}:
+                raise RuntimeError(f"{owner} claim {index} must contain text and sources")
+            if not isinstance(raw.get("text"), str) or not raw["text"].strip():
+                raise RuntimeError(f"{owner} claim {index} has no text")
+            output.append({
+                "text": raw["text"],
+                "sources": sources(
+                    raw["sources"], owner=f"{owner} claim {index}", require_one=True
+                ),
+            })
+        return output
+
+    if not isinstance(value.get("explanation"), str) or not isinstance(value.get("commentary"), str):
+        raise RuntimeError("annotation explanation and commentary must be strings")
+    return {
+        "explanation": value["explanation"],
+        "commentary": value["commentary"],
+        "commentary_sources": sources(
+            value["commentary_sources"], owner="commentary"
+        ),
+        "prior_work": claims(value["prior_work"], owner="prior_work"),
+        "later_work": claims(value["later_work"], owner="later_work"),
+    }
 
 
-def _repair_unique_supplied_source_locators(
-    annotation: dict[str, Any], records: list[dict[str, Any]],
-) -> None:
-    """Correct an invented locator only when the registered choice is unique.
+def _available_source_urls(evidence: dict[str, Any]) -> set[str]:
+    """Return URLs already present in bounded prompt/cache material for offline mode."""
+    output: set[str] = set()
 
-    Models occasionally copy the reader-facing section title into the
-    structured provenance field. That value is not accepted as provenance.
-    If the cited evidence record contains exactly one supplied source piece,
-    the exact locator can instead be restored deterministically before strict
-    validation. Missing locators, unknown evidence IDs, and records with
-    multiple candidate locators remain errors.
-    """
-    allowed_by_id: dict[str, set[str]] = {}
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        evidence_id = str(record.get("evidence_id") or "")
-        pieces = record.get("snippets")
-        if pieces is None:
-            pieces = record.get("blocks")
-        locators = {
-            str(piece.get("locator") or piece.get("block_id") or "").strip()
-            for piece in pieces or []
-            if isinstance(piece, dict)
-        }
-        locators.discard("")
-        if not locators and str(record.get("abstract") or "").strip():
-            locators.add("abstract")
-        if evidence_id:
-            allowed_by_id[evidence_id] = locators
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key in (
+                "url", "landing_url", "source_url", "html_url", "pdf_url",
+                "canonical_locator",
+            ):
+                candidate = value.get(key)
+                if isinstance(candidate, str):
+                    parsed = urlparse(candidate)
+                    if parsed.scheme in {"http", "https"} and parsed.netloc:
+                        output.add(candidate)
+            descriptor = value.get("source_descriptor")
+            if isinstance(descriptor, dict):
+                visit(descriptor)
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
 
-    for field in ("prior_work", "later_work", "context_claims"):
-        claims = annotation.get(field)
-        if not isinstance(claims, list):
-            continue
-        for claim in claims:
+    visit(evidence)
+    return output
+
+
+def _reusable_lane_output_valid(
+    lane: str,
+    segment: dict[str, Any],
+    output: Any,
+    *,
+    blocks_by_id: dict[str, dict[str, Any]],
+    protected_names: list[str],
+) -> bool:
+    """Re-run current deterministic output invariants before object reuse."""
+
+    if not isinstance(output, dict):
+        return False
+    try:
+        if lane == "translation":
+            _validate_translation(segment, output, blocks_by_id, protected_names)
+            return True
+        if lane == "commentary":
+            required_lists = ("prior_work", "later_work", "commentary_sources")
+            if not isinstance(output.get("commentary"), str):
+                return False
+            if any(not isinstance(output.get(key), list) for key in required_lists):
+                return False
+            _validate_direct_annotation_sources(output, allowed_urls=None)
+            return True
+    except (RuntimeError, ValueError, TypeError):
+        return False
+    return False
+
+
+def _annotation_source_urls(annotation: dict[str, Any]) -> set[str]:
+    output: set[str] = set()
+    for source in annotation.get("commentary_sources") or []:
+        if isinstance(source, dict) and isinstance(source.get("url"), str):
+            output.add(source["url"])
+    for field in ("prior_work", "later_work"):
+        for claim in annotation.get(field) or []:
             if not isinstance(claim, dict):
                 continue
-            for binding in claim.get("source_locators") or []:
-                if not isinstance(binding, dict):
-                    continue
-                evidence_id = str(binding.get("evidence_id") or "")
-                supplied = allowed_by_id.get(evidence_id, set())
-                emitted = str(binding.get("locator") or "").strip()
-                if emitted and emitted not in supplied and len(supplied) == 1:
-                    binding["locator"] = next(iter(supplied))
-
-
-def _merge_evidence_records(
-    existing: list[dict[str, Any]], updates: tuple[dict[str, Any], ...],
-) -> list[dict[str, Any]]:
-    """Replace updated registry records in place and append genuinely new records."""
-    output = [dict(item) for item in existing]
-    index = {str(item.get("evidence_id") or ""): position for position, item in enumerate(output)}
-    for raw in updates:
-        item = dict(raw)
-        evidence_id = str(item.get("evidence_id") or "")
-        if evidence_id in index:
-            output[index[evidence_id]] = item
-        else:
-            index[evidence_id] = len(output)
-            output.append(item)
+            for source in claim.get("sources") or []:
+                if isinstance(source, dict) and isinstance(source.get("url"), str):
+                    output.add(source["url"])
     return output
 
 
 def _deduplicate_evidence_records(
     records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep first provenance and union request support across exact duplicates."""
+    """Keep the first auditable record for each evidence identity."""
     output: list[dict[str, Any]] = []
     index: dict[str, int] = {}
     for record in records:
@@ -2789,181 +3550,7 @@ def _deduplicate_evidence_records(
         position = index[evidence_id]
         first = output[position]
         validate_registry((first, record))
-        supported_request_keys = list(dict.fromkeys(
-            key
-            for item in (first, record)
-            for key in item.get("supported_request_keys") or []
-            if isinstance(key, str) and key
-        ))
-        if supported_request_keys or "supported_request_keys" in first:
-            output[position] = {
-                **first,
-                "supported_request_keys": supported_request_keys,
-            }
     return output
-
-
-def _known_evidence_ids(values: Any, records: list[dict[str, Any]]) -> list[str]:
-    valid = {str(item.get("evidence_id") or "") for item in records}
-    return [str(value) for value in values if str(value) in valid]
-
-
-def _drop_unsupported_second_round_related_work(
-    annotation: dict[str, Any], records: list[dict[str, Any]],
-) -> None:
-    relation_by_id = {str(item.get("evidence_id") or ""): str(item.get("relation") or "") for item in records}
-    used = list(annotation.get("evidence_ids") or [])
-    for field, relation in (
-        ("prior_work", "prior"), ("later_work", "later"),
-        ("context_claims", "context"),
-    ):
-        value = annotation.get(field)
-        if isinstance(value, list):
-            annotation[field] = [
-                claim for claim in value
-                if isinstance(claim, dict)
-                and claim.get("evidence_ids")
-                and all(
-                    relation_by_id.get(str(evidence_id)) == relation
-                    for evidence_id in claim.get("evidence_ids") or []
-                )
-            ]
-        elif not any(relation_by_id.get(evidence_id) == relation for evidence_id in used):
-            annotation[field] = []
-    if any(isinstance(annotation.get(field), list) for field in (
-        "prior_work", "later_work", "context_claims",
-    )):
-        _sync_claim_evidence_ids(annotation)
-        return
-    used_relations = {
-        relation for relation, field in (("prior", "prior_work"), ("later", "later_work"))
-        if str(annotation.get(field) or "").strip()
-    }
-    if str(annotation.get("explanation") or annotation.get("commentary") or "").strip():
-        used_relations.add("context")
-    annotation["evidence_ids"] = [
-        value for value in used if relation_by_id.get(value) in used_relations
-    ]
-
-
-def _clear_unresolved_requested_work(
-    annotation: dict[str, Any], requests: list[dict[str, Any]], supported: set[str],
-) -> None:
-    unresolved = {
-        str(item["request_key"]): str(item["relation"])
-        for item in requests if str(item["request_key"]) not in supported
-    }
-    for field, relation in (
-        ("prior_work", "prior"), ("later_work", "later"),
-        ("context_claims", "context"),
-    ):
-        value = annotation.get(field)
-        relation_keys = {key for key, item_relation in unresolved.items() if item_relation == relation}
-        if not relation_keys:
-            continue
-        if isinstance(value, list):
-            annotation[field] = [
-                claim for claim in value
-                if not isinstance(claim, dict)
-                or str(claim.get("request_key") or "") not in relation_keys
-            ]
-        else:
-            annotation[field] = []
-    _sync_claim_evidence_ids(annotation)
-
-
-def _enforce_request_claim_bindings(
-    annotation: dict[str, Any],
-    requests: list[dict[str, Any]],
-    *,
-    supported: set[str],
-    evidence_ids_by_request: dict[str, set[str]],
-    first_draft: dict[str, Any] | None,
-    records: list[dict[str, Any]],
-) -> None:
-    """Drop only request-bound claims that ignored their specifically resolved evidence."""
-    request_by_key = {str(item["request_key"]): item for item in requests}
-    supported_keys_by_id = {
-        str(item.get("evidence_id") or ""): {
-            str(key) for key in item.get("supported_request_keys") or []
-        }
-        for item in records
-    }
-    for field, relation in (
-        ("prior_work", "prior"), ("later_work", "later"),
-        ("context_claims", "context"),
-    ):
-        value = annotation.get(field)
-        resolved_keys = {
-            key for key, request in request_by_key.items()
-            if request["relation"] == relation and key in supported
-        }
-        if not resolved_keys:
-            continue
-        if not isinstance(value, list):
-            annotation[field] = []
-            continue
-        prior_bindings = {
-            _claim_binding_key(claim)
-            for claim in (first_draft or {}).get(field) or []
-            if isinstance(claim, dict)
-        } if isinstance((first_draft or {}).get(field), list) else set()
-        kept: list[dict[str, Any]] = []
-        for claim in value:
-            if not isinstance(claim, dict):
-                continue
-            request_key = str(claim.get("request_key") or "")
-            if request_key not in resolved_keys:
-                if _claim_binding_key(claim) in prior_bindings:
-                    kept.append(claim)
-                continue
-            expected = evidence_ids_by_request.get(request_key, set())
-            cited = {str(item) for item in claim.get("evidence_ids") or []}
-            located = {
-                str(item.get("evidence_id") or "")
-                for item in claim.get("source_locators") or [] if isinstance(item, dict)
-            }
-            bound = cited.intersection(expected).intersection(located)
-            if bound and any(request_key in supported_keys_by_id.get(item, set()) for item in bound):
-                kept.append(claim)
-        annotation[field] = kept
-    _sync_claim_evidence_ids(annotation)
-
-
-def _claim_binding_key(claim: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        str(claim.get("text") or "").strip(),
-        claim.get("request_key"),
-        tuple(str(item) for item in claim.get("evidence_ids") or []),
-        tuple(
-            (str(item.get("evidence_id") or ""), str(item.get("locator") or ""))
-            for item in claim.get("source_locators") or [] if isinstance(item, dict)
-        ),
-    )
-
-
-def _sync_claim_evidence_ids(annotation: dict[str, Any]) -> None:
-    claim_fields = [
-        annotation.get("prior_work"), annotation.get("later_work"),
-        annotation.get("context_claims"),
-    ]
-    if not any(isinstance(value, list) for value in claim_fields):
-        return
-    claim_ids = list(dict.fromkeys(
-        str(evidence_id)
-        for value in claim_fields if isinstance(value, list)
-        for claim in value if isinstance(claim, dict)
-        for evidence_id in claim.get("evidence_ids") or []
-    ))
-    if any(
-        not isinstance(value, list) and str(value or "").strip()
-        for value in claim_fields
-    ):
-        claim_ids.extend(
-            str(value) for value in annotation.get("evidence_ids") or []
-            if str(value) not in claim_ids
-        )
-    annotation["evidence_ids"] = claim_ids
 
 
 def _translation_draft_path(checkpoint_dir: Path, segment_id: str) -> Path:
@@ -3251,7 +3838,10 @@ def _seed_translation_coverage_draft(
     input_sha256 = _segment_input_hash(
         segment,
         by_id,
-        glossary=glossary,
+        glossary=project_segment_glossary(
+            [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
+            glossary,
+        ),
         extra={
             "names": protected_names,
             "paper_context": paper_context,
@@ -3505,6 +4095,8 @@ def _generate_translations(
     protected_names: list[str],
     checkpoint_dir: Path,
     llm: Callable[..., dict[str, Any]],
+    accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+    force_generation: bool = False,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
     translation_dir = checkpoint_dir / "translations"
@@ -3519,10 +4111,14 @@ def _generate_translations(
         paper_context = _full_paper_context(
             bundle.document, segment, blocks_by_id=by_id, options=options
         )
+        segment_glossary = project_segment_glossary(
+            [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
+            glossary,
+        )
         expected_hash = _segment_input_hash(
             segment,
             by_id,
-            glossary=glossary,
+            glossary=segment_glossary,
             extra={
                 "names": protected_names,
                 "paper_context": paper_context,
@@ -3530,7 +4126,7 @@ def _generate_translations(
             },
         )
         input_hashes[str(segment["segment_id"])] = expected_hash
-        if path.is_file() and not options.force:
+        if path.is_file() and not force_generation:
             checkpoint = _read_checkpoint_json(path)
             if (
                 isinstance(checkpoint, dict)
@@ -3551,6 +4147,10 @@ def _generate_translations(
                     path, segment, by_id, protected_names=protected_names,
                 )
                 output[segment["segment_id"]] = checkpoint["translation"]
+                if accepted_callback is not None:
+                    accepted_callback(
+                        "translation", str(segment["segment_id"]), checkpoint["translation"]
+                    )
                 continue
         pending.append(segment)
 
@@ -3559,6 +4159,7 @@ def _generate_translations(
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         segment_id = str(segment["segment_id"])
         selected = [by_id[value] for value in segment["block_ids"]]
+        segment_glossary = project_segment_glossary(selected, glossary)
         translatable = [_translation_input_block(block) for block in selected if _is_translatable(block)]
         paper_context = _full_paper_context(
             bundle.document, segment, blocks_by_id=by_id, options=options
@@ -3625,7 +4226,7 @@ def _generate_translations(
                 # Only coverage-invalid drafts have a bounded specialized resume path.
                 pass
             else:
-                if not options.force:
+                if not force_generation:
                     translation = draft_translation
             if translation is not None:
                 candidate_provenance = dict(draft.get("candidate_provenance") or {})
@@ -3664,7 +4265,7 @@ def _generate_translations(
                         segment,
                         translatable,
                         language=options.annotation_language,
-                        glossary=glossary,
+                        glossary=segment_glossary,
                         protected_names=protected_names,
                         paper_context=paper_context,
                     ),
@@ -3789,7 +4390,7 @@ def _generate_translations(
                                 segment,
                                 repair_contexts,
                                 language=options.annotation_language,
-                                glossary=glossary,
+                                glossary=segment_glossary,
                                 protected_names=protected_names,
                                 paper_context={
                                     **paper_context,
@@ -3934,7 +4535,10 @@ def _generate_translations(
                         "input_sha256": _segment_input_hash(
                             segment,
                             by_id,
-                            glossary=glossary,
+                            glossary=project_segment_glossary(
+                                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
+                                glossary,
+                            ),
                             extra={
                                 "names": protected_names,
                                 "paper_context": _full_paper_context(
@@ -3947,6 +4551,8 @@ def _generate_translations(
                         "translation": value,
                     },
                 )
+                if accepted_callback is not None:
+                    accepted_callback("translation", str(segment_id), value)
         if failures:
             raise CompanionLaneError("translation", failures)
     return {segment["segment_id"]: output[segment["segment_id"]] for segment in segments}
@@ -3965,6 +4571,9 @@ def _review(
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
 ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, dict[str, Any]], dict[str, Any]]:
+    force_review = bool(
+        {"translation", "commentary", "review"}.intersection(options.regenerate_lanes)
+    )
     if options.skip_translation:
         if translations not in (None, {}):
             raise RuntimeError("skip-translation review received translation content")
@@ -3972,7 +4581,7 @@ def _review(
             segments,
             annotations,
             document=document,
-            glossary=glossary,
+            glossary={},
             evidence=evidence,
             options=options,
             llm=llm,
@@ -4032,12 +4641,24 @@ def _review(
             max_prompt_bytes=review_prompt_limit,
         )
         recovered_reviews = (
-            {} if options.force else _load_recovered_section_reviews(checkpoint_dir, chunks)
+            {} if force_review else _load_recovered_section_reviews(checkpoint_dir, chunks)
         )
 
         def inspect(index: int, chunk: list[dict[str, Any]]) -> dict[str, Any]:
+            chunk_text = json.dumps(
+                [item.get("source_blocks") or [] for item in chunk], ensure_ascii=False
+            )
             prompt = section_review_prompt(
-                {"segments": chunk}, language=options.annotation_language
+                {
+                    "segments": chunk,
+                    "glossary": _commentary_review_glossary_projection(
+                        glossary, chunk, max_bytes=ANNOTATION_GLOSSARY_MAX_BYTES,
+                    ),
+                    "protected_names": [
+                        name for name in protected_names if name and name in chunk_text
+                    ],
+                },
+                language=options.annotation_language,
             )
             _require_review_prompt_within_limit(
                 prompt,
@@ -4050,7 +4671,7 @@ def _review(
                 "model_tier": REVIEW_TIER,
             })
             path = checkpoint_dir / "section-reviews" / f"{index:04d}.json"
-            if path.is_file() and not options.force:
+            if path.is_file() and not force_review:
                 checkpoint = read_json(path)
                 if (
                     isinstance(checkpoint, dict)
@@ -4072,6 +4693,17 @@ def _review(
                     call_label=f"companion-section-review-{index}",
                     model_tier=REVIEW_TIER,
                 )
+            if isinstance(value, dict) and "reviewed_segment_ids" not in value:
+                legacy_reviewed = value.get("reviewed_segments")
+                if isinstance(legacy_reviewed, list):
+                    value = {
+                        "reviewed_segment_ids": [
+                            str(item.get("segment_id") or "")
+                            for item in legacy_reviewed if isinstance(item, dict)
+                        ],
+                        "findings": list(value.get("findings") or []),
+                        "patches": [],
+                    }
             validation_error = _section_review_validation_error(value, chunk)
             if validation_error is not None:
                 raise RuntimeError(f"section review {index} {validation_error}")
@@ -4100,8 +4732,7 @@ def _review(
             if validation_error is not None:
                 raise RuntimeError(f"section review {index} {validation_error}")
             chunk_ids = {str(item["segment"]["segment_id"]) for item in chunks[index]}
-            reviewed_segments = list(value["reviewed_segments"])
-            reviewed_ids = {str(item.get("segment_id") or "") for item in reviewed_segments}
+            reviewed_ids = {str(item) for item in value["reviewed_segment_ids"]}
             chunk_findings = list(value["findings"])
             review_coverage.update(reviewed_ids)
             findings.extend(chunk_findings)
@@ -4110,7 +4741,7 @@ def _review(
                 "reviewed_segment_ids": sorted(reviewed_ids),
                 "findings": chunk_findings,
                 "patch_proposals": _section_review_patch_proposals(
-                    chunks[index], reviewed_segments, chunk_findings
+                    chunks[index], list(value["patches"]), chunk_findings
                 ),
             })
         all_segment_ids = {str(item["segment_id"]) for item in segments}
@@ -4169,39 +4800,27 @@ def _review(
                 citation_normalized.add(segment_id)
             _validate_translation(segment, replacement, by_id, protected_names)
             reviewed_translations[segment_id] = replacement
-        annotation_fields = ("commentary", "explanation", "prior_work", "later_work", "evidence_ids")
+        annotation_fields = (
+            "commentary", "explanation", "commentary_sources", "prior_work", "later_work",
+        )
         changed_annotation_fields = [field for field in annotation_fields if patch.get(field) is not None]
         if not changed_annotation_fields and not translation_changed:
             raise RuntimeError(f"review returned an empty patch: {segment_id}")
         for field in changed_annotation_fields:
-            if field == "evidence_ids":
-                segment = next(item for item in segments if item["segment_id"] == segment_id)
-                segment_evidence = _evidence_for_segment(segment, by_id, evidence)
-                reviewed[segment_id][field] = _validated_evidence_ids(
-                    patch[field], {"related_papers": segment_evidence["papers"]}
-                )
-            elif field in {"prior_work", "later_work"}:
-                reviewed[segment_id][field] = _normalize_related_work(patch[field])
-            else:
+            if field in {"commentary", "explanation"}:
                 text = str(patch[field])
                 reviewed[segment_id][field] = text
-        if any(field in changed_annotation_fields for field in ("prior_work", "later_work")):
-            _sync_claim_evidence_ids(reviewed[segment_id])
-        segment = next(item for item in segments if item["segment_id"] == segment_id)
-        _validate_annotation_evidence(
-            clean_reader_annotation(
-                reviewed[segment_id],
-                evidence_records=reader_evidence.get(segment_id, []),
-                language=options.annotation_language,
-            ),
-            _evidence_for_segment(segment, by_id, evidence)["papers"]
+            else:
+                reviewed[segment_id][field] = patch[field]
+        reviewed[segment_id] = _validate_direct_annotation_sources(
+            reviewed[segment_id],
+            allowed_urls=_annotation_source_urls(original_annotation),
         )
         reviewed[segment_id] = clean_reader_annotation(
             reviewed[segment_id],
             evidence_records=reader_evidence.get(segment_id, []),
             language=options.annotation_language,
         )
-        _assert_review_did_not_add_related_work(original_annotation, reviewed[segment_id])
         patched.add(segment_id)
     return reviewed_translations, reviewed, {
         "hierarchical": hierarchical,
@@ -4363,38 +4982,25 @@ def _review_commentary_only(
                     f"review returned out-of-group, invalid, or duplicate annotation patch: {segment_id}"
                 )
             original = dict(reviewed[segment_id])
-            fields = ("commentary", "explanation", "prior_work", "later_work", "evidence_ids")
+            fields = (
+                "commentary", "explanation", "commentary_sources", "prior_work", "later_work",
+            )
             changed = [field for field in fields if patch.get(field) is not None]
             if not changed:
                 raise RuntimeError(f"review returned an empty patch: {segment_id}")
             for field in changed:
-                if field == "evidence_ids":
-                    segment = next(item for item in segments if item["segment_id"] == segment_id)
-                    segment_evidence = _evidence_for_segment(segment, by_id, evidence)
-                    reviewed[segment_id][field] = _validated_evidence_ids(
-                        patch[field], {"related_papers": segment_evidence["papers"]}
-                    )
-                elif field in {"prior_work", "later_work"}:
-                    reviewed[segment_id][field] = _normalize_related_work(patch[field])
-                else:
+                if field in {"commentary", "explanation"}:
                     reviewed[segment_id][field] = str(patch[field])
-            if any(field in changed for field in ("prior_work", "later_work")):
-                _sync_claim_evidence_ids(reviewed[segment_id])
-            segment = next(item for item in segments if item["segment_id"] == segment_id)
-            _validate_annotation_evidence(
-                clean_reader_annotation(
-                    reviewed[segment_id],
-                    evidence_records=reader_evidence.get(segment_id, []),
-                    language=options.annotation_language,
-                ),
-                _evidence_for_segment(segment, by_id, evidence)["papers"],
+                else:
+                    reviewed[segment_id][field] = patch[field]
+            reviewed[segment_id] = _validate_direct_annotation_sources(
+                reviewed[segment_id], allowed_urls=_annotation_source_urls(original),
             )
             reviewed[segment_id] = clean_reader_annotation(
                 reviewed[segment_id],
                 evidence_records=reader_evidence.get(segment_id, []),
                 language=options.annotation_language,
             )
-            _assert_review_did_not_add_related_work(original, reviewed[segment_id])
             patched.add(segment_id)
     return reviewed, {
         "translation_mode": "skipped",
@@ -4571,11 +5177,11 @@ def _assert_review_did_not_add_related_work(
         new_value = after.get(field)
         if isinstance(new_value, list):
             old_bindings = {
-                _claim_binding_key(claim)
+                _related_work_claim_key(claim)
                 for claim in old_value or [] if isinstance(claim, dict)
             } if isinstance(old_value, list) else set()
             new_bindings = {
-                _claim_binding_key(claim)
+                _related_work_claim_key(claim)
                 for claim in new_value if isinstance(claim, dict)
             }
             if not new_bindings.issubset(old_bindings):
@@ -4584,6 +5190,21 @@ def _assert_review_did_not_add_related_work(
             raise RuntimeError("review added a related-work claim without prior claim evidence")
         elif isinstance(old_value, list) and str(new_value or "").strip():
             raise RuntimeError("review replaced claim bindings with unbound related-work text")
+
+
+def _related_work_claim_key(claim: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(claim.get("text") or "").strip(),
+        tuple(
+            (
+                str(item.get("title") or "").strip(),
+                str(item.get("url") or "").strip(),
+                str(item.get("locator") or "").strip(),
+            )
+            for item in claim.get("sources") or []
+            if isinstance(item, dict)
+        ),
+    )
 
 
 def _llm_call(
@@ -4620,19 +5241,24 @@ def _llm_call(
 
 def _limit_llm_concurrency(
     llm: Callable[..., dict[str, Any]], max_concurrent_calls: int,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> Callable[..., dict[str, Any]]:
     """Share one total call budget and stop queued work after an explicit batch abort."""
+    external_cancel_check = cancel_check
     permits = threading.BoundedSemaphore(max_concurrent_calls)
     tripped = threading.Event()
     state_lock = threading.Lock()
     abort_reason: BaseException | None = None
 
     def raise_if_tripped() -> None:
+        if external_cancel_check is not None and external_cancel_check():
+            tripped.set()
         if not tripped.is_set():
             return
         with state_lock:
             reason = abort_reason
-        message = "companion LLM circuit is open after a provider-wide fatal failure"
+        message = "companion LLM circuit is open after another call failed or cancellation was requested"
         if reason is not None and str(reason):
             message += f": {reason}"
         raise CompanionLLMCircuitOpen(message) from reason
@@ -4649,17 +5275,16 @@ def _limit_llm_concurrency(
                 def cancel_check() -> bool:
                     return tripped.is_set() or bool(
                         callable(parent_cancel_check) and parent_cancel_check()
-                    )
+                    ) or bool(external_cancel_check is not None and external_cancel_check())
 
                 call_kwargs = {**kwargs, "cancel_check": cancel_check}
             try:
                 return llm(*args, **call_kwargs)
             except BaseException as exc:
-                if _exception_requests_batch_abort(exc):
-                    with state_lock:
-                        if abort_reason is None:
-                            abort_reason = exc
-                    tripped.set()
+                with state_lock:
+                    if abort_reason is None:
+                        abort_reason = exc
+                tripped.set()
                 raise
 
     return limited
@@ -4675,25 +5300,6 @@ def _accepts_explicit_keyword(call: Callable[..., Any], name: str) -> bool:
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
     }
-
-
-def _exception_requests_batch_abort(exc: BaseException) -> bool:
-    """Inspect a wrapped exception chain for an explicit provider abort marker."""
-    pending: list[BaseException] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        identity = id(current)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if getattr(current, "abort_batch", None) is True:
-            return True
-        if isinstance(current.__cause__, BaseException):
-            pending.append(current.__cause__)
-        if isinstance(current.__context__, BaseException):
-            pending.append(current.__context__)
-    return False
 
 
 def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str, bool | str]:
@@ -4761,6 +5367,52 @@ def _legacy_migration_source_hash(bundle: SourceBundle) -> str:
     )
 
 
+def _store_validated_stateless_artifact(
+    store: AcceptedArtifactStore,
+    *,
+    kind: str,
+    semantic_input_sha256: str,
+    recipe_sha256: str,
+    contract_version: str,
+    output: Any,
+    segment_id: str,
+    checkpoint_dir: Path,
+    provider: str,
+    model: str | None,
+) -> dict[str, Any]:
+    """Persist locally validated stateless output with explicit unavailable usage."""
+
+    predecessor = hashlib.sha256(b"").hexdigest()
+    output_sha = sha256_json(output)
+    generation = 1
+    chain = hashlib.sha256(json.dumps({
+        "predecessor": predecessor, "segment_id": segment_id,
+        "input_sha256": semantic_input_sha256, "output_sha256": output_sha,
+        "generation": generation,
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    block = {
+        "segment_id": segment_id, "state": "accepted", "generation": generation,
+        "input_sha256": semantic_input_sha256, "output_sha256": output_sha,
+        "predecessor_accepted_chain_sha256": predecessor,
+        "accepted_chain_sha256": chain,
+        "logical_receipt": {
+            "kind": "validated_stateless_checkpoint", "checkpoint_state": "validated",
+        },
+        "validation_receipt": {"local_validation": True},
+    }
+    return store.put_accepted(
+        kind=kind, semantic_input_sha256=semantic_input_sha256,
+        recipe_sha256=recipe_sha256, contract_version=contract_version,
+        output=output, ledger_block=block,
+        provider_receipt={
+            "provider": provider, "model": model or "provider-default",
+            "call_id": f"stateless:{kind}:{segment_id}:{output_sha}",
+            "usage": {"availability": "not_exposed_by_stateless_host_adapter"},
+        },
+        provenance={"checkpoint_dir": str(checkpoint_dir), "segment_id": segment_id},
+    )
+
+
 def _legacy_metadata_view(legacy: dict[str, Any]) -> dict[str, Any]:
     metadata = (
         dict(legacy.get("metadata") or {})
@@ -4780,15 +5432,9 @@ def _fingerprint_payload(
     domain_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     integrity = bundle.document.get("integrity") or {}
-    legacy_migration_sha256 = None
-    if options.legacy_checkpoint is not None:
-        legacy_migration_sha256 = sha256_json(
-            read_legacy_checkpoint(options.legacy_checkpoint)
-        )
+    # This identity owns only stable source partition storage. Generation
+    # recipes, evidence, review, render, and runtime policy have lane-local keys.
     return {
-        "workflow_version": WORKFLOW_VERSION,
-        "prompt_version": PROMPT_VERSION,
-        "schema_version": SCHEMA_VERSION,
         "paper_id": bundle.paper_id,
         "document_hash": (
             integrity.get("document_hash")
@@ -4804,33 +5450,6 @@ def _fingerprint_payload(
             or bundle.parsed.get("asset_manifest_hash")
         ),
         "language": options.annotation_language,
-        "translation_mode": "skipped" if options.skip_translation else "enabled",
-        "provider": options.provider,
-        "model": options.model,
-        "model_tiers": {
-            "segmentation": SEGMENTATION_TIER,
-            "glossary": GLOSSARY_TIER,
-            "translation": TRANSLATION_TIER,
-            "annotation": ANNOTATION_TIER,
-            "review": REVIEW_TIER,
-        },
-        "runtime_access": {
-            "segmentation": {"allow_mcp": False, "allow_internet": False},
-            "glossary": {"allow_mcp": False, "allow_internet": False},
-            "translation": _generation_runtime_policy(options),
-            "annotation": _generation_runtime_policy(options),
-            "review": {"allow_mcp": False, "allow_internet": False},
-        },
-        "full_paper_context_version": FULL_PAPER_CONTEXT_VERSION,
-        "context_selection": {
-            "version": CONTEXT_SELECTION_VERSION,
-            "chars_per_source": CONTEXT_SEGMENT_CHARS_PER_SOURCE,
-            "chars_total": CONTEXT_SEGMENT_CHARS_TOTAL,
-        },
-        "metadata_hash": sha256_json(bundle.metadata),
-        "evidence_hash": sha256_json(evidence),
-        "domain_context_hash": sha256_json(domain_context) if domain_context is not None else None,
-        "legacy_migration_sha256": legacy_migration_sha256,
     }
 
 
@@ -4951,10 +5570,23 @@ def _segment_input_hash(
     glossary: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> str:
+    bound_glossary = glossary
+    if (
+        glossary is not None
+        and glossary.get("schema_version") != "arc.companion.segment-glossary.v2"
+    ):
+        bound_glossary = project_segment_glossary(
+            [
+                blocks_by_id[value]
+                for value in segment.get("block_ids") or []
+                if value in blocks_by_id
+            ],
+            glossary,
+        )
     return sha256_json({
         "segment": segment,
         "blocks": [blocks_by_id[value] for value in segment.get("block_ids") or []],
-        "glossary_hash": sha256_json(glossary) if glossary is not None else None,
+        "glossary_hash": sha256_json(bound_glossary) if bound_glossary is not None else None,
         "extra": extra,
     })
 
@@ -4980,6 +5612,28 @@ def _completion_outputs_match(state: dict[str, Any]) -> bool:
         if not value or not expected:
             return False
         path = Path(str(value))
+        if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
+            return False
+    return True
+
+
+def _web_outputs_match(state: dict[str, Any]) -> bool:
+    try:
+        from .web import WEB_RENDER_VERSION
+    except ImportError:
+        return False
+    if state.get("web_render_version") != WEB_RENDER_VERSION:
+        return False
+    for path_key, hash_key in (
+        ("output_html", "output_html_sha256"),
+        ("reader_snapshot_path", "reader_snapshot_sha256"),
+        ("web_manifest_path", "web_manifest_sha256"),
+    ):
+        path_value = state.get(path_key)
+        expected = str(state.get(hash_key) or "")
+        if not path_value or not expected:
+            return False
+        path = Path(str(path_value))
         if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
             return False
     return True
@@ -5956,8 +6610,6 @@ def _bounded_annotation_prompt(
     protected_names: list[str],
     paper_context: dict[str, Any],
     domain_context: dict[str, Any] | None,
-    first_draft: dict[str, Any] | None,
-    evidence_resolution: dict[str, Any] | None,
     max_bytes: int = ANNOTATION_PROMPT_MAX_BYTES,
 ) -> str:
     """Project optional context so every submitted annotation prompt is safely bounded."""
@@ -5972,14 +6624,15 @@ def _bounded_annotation_prompt(
     )
     last_size = 0
     for glossary_bytes, paper_context_chars in attempts:
-        projected_glossary = _annotation_glossary_projection(
-            glossary,
-            segment=segment,
-            blocks=blocks,
-            evidence=evidence,
-            first_draft=first_draft,
-            evidence_resolution=evidence_resolution,
-            max_bytes=glossary_bytes,
+        projected_glossary = (
+            {}
+            if not glossary
+            else _annotation_glossary_projection(
+                glossary,
+                segment=segment,
+                blocks=blocks,
+                max_bytes=glossary_bytes,
+            )
         )
         projected_paper_context = json.loads(json.dumps(paper_context, ensure_ascii=False))
         if paper_context_chars is not None:
@@ -5994,9 +6647,9 @@ def _bounded_annotation_prompt(
             protected_names=protected_names,
             paper_context=projected_paper_context,
             domain_context=domain_context,
-            first_draft=first_draft,
-            evidence_resolution=evidence_resolution,
         )
+        if not glossary:
+            prompt = prompt.replace("\n\nGLOSSARY:\n{}\n\n", "\n\n")
         last_size = len(prompt.encode("utf-8"))
         if last_size < max_bytes:
             return prompt
@@ -6011,70 +6664,19 @@ def _annotation_glossary_projection(
     *,
     segment: dict[str, Any],
     blocks: list[dict[str, Any]],
-    evidence: dict[str, Any],
-    first_draft: dict[str, Any] | None,
-    evidence_resolution: dict[str, Any] | None,
     max_bytes: int = ANNOTATION_GLOSSARY_MAX_BYTES,
 ) -> dict[str, Any]:
-    """Keep complete glossary entries relevant to the exact annotation input."""
-    entries = [
-        dict(item) for item in (glossary.get("entries") or [])
-        if isinstance(item, dict)
-    ] if isinstance(glossary, dict) else []
-    segment_ids = {str(value) for value in segment.get("block_ids") or []}
-    source_text = _normalized_glossary_match_text({
-        "title": segment.get("title"),
-        "blocks": blocks,
-    })
-    supporting_text = _normalized_glossary_match_text({
-        "evidence": evidence,
-        "first_draft": first_draft,
-        "evidence_resolution": evidence_resolution,
-    })
-
-    candidates: list[tuple[int, int, dict[str, Any]]] = []
-    for index, entry in enumerate(entries):
-        first_block_id = str(entry.get("first_block_id") or "")
-        terms = [
-            entry.get("source_term"), entry.get("target_term"),
-            *(entry.get("aliases") or []),
-        ]
-        normalized_terms = [
-            _normalized_glossary_match_text(value) for value in terms if str(value or "").strip()
-        ]
-        if first_block_id and first_block_id in segment_ids:
-            priority = 0
-        elif any(_glossary_term_in_text(term, source_text) for term in normalized_terms):
-            priority = 1
-        elif any(_glossary_term_in_text(term, supporting_text) for term in normalized_terms):
-            priority = 2
-        else:
-            continue
-        candidates.append((priority, index, entry))
-
-    source_sha256 = sha256_json(glossary) if isinstance(glossary, dict) else sha256_json({})
-
-    def projection(selected: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
-        ordered = [entry for _, entry in sorted(selected, key=lambda item: item[0])]
-        return {
-            "schema_version": ANNOTATION_GLOSSARY_PROJECTION_VERSION,
-            "source_glossary_schema_version": (
-                glossary.get("schema_version") if isinstance(glossary, dict) else None
-            ),
-            "source_glossary_sha256": source_sha256,
-            "entries": ordered,
-            "source_entry_count": len(entries),
-            "selected_entry_count": len(ordered),
-            "omitted_entry_count": len(entries) - len(ordered),
-        }
-
-    selected: list[tuple[int, dict[str, Any]]] = []
-    for _, index, entry in sorted(candidates):
-        proposed = [*selected, (index, entry)]
-        if len(json.dumps(projection(proposed), ensure_ascii=False).encode("utf-8")) <= max_bytes:
-            selected = proposed
-    return projection(selected)
-
+    """Return the already source-only segment projection unchanged."""
+    if (
+        isinstance(glossary, dict)
+        and glossary.get("schema_version") == "arc.companion.segment-glossary.v2"
+    ):
+        return json.loads(json.dumps(glossary, ensure_ascii=False))
+    # Compatibility for callers outside the chapter pipeline: project only
+    # immutable source blocks and never inspect evidence or generated text.
+    return project_segment_glossary(
+        [item for item in blocks if isinstance(item, dict)], glossary,
+    )
 
 def _normalized_glossary_match_text(value: Any) -> str:
     text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
@@ -6166,6 +6768,47 @@ def _full_paper_context(
     }
     _shrink_paper_context(context, max_chars=max_chars)
     return context
+
+
+def _static_paper_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Paper context sent once per native generation."""
+    return {
+        key: context.get(key)
+        for key in (
+            "schema_version", "paper_id", "abstract", "section_navigation",
+            "navigation_omitted_count", "access",
+        )
+        if key in context
+    }
+
+
+def _dynamic_paper_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Segment-local anchors refreshed on every stateful turn."""
+    return {
+        "current_segment": dict(context.get("current_segment") or {}),
+        "neighboring_source_anchors": list(context.get("neighboring_source_anchors") or []),
+    }
+
+
+def _compact_chapter_descriptor(chapter: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: chapter.get(key)
+        for key in (
+            "chapter_id", "title", "start_block_id", "end_block_id", "page_start", "page_end",
+        )
+        if key in chapter
+    }
+
+
+def _compact_segment_descriptor(segment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: segment.get(key)
+        for key in (
+            "segment_id", "chapter_id", "title", "start_block_id", "end_block_id",
+            "start_ordinal", "end_ordinal", "page_start", "page_end",
+        )
+        if key in segment
+    }
 
 
 def _bounded_projection(value: dict[str, Any], limit: int) -> dict[str, Any]:
@@ -6487,32 +7130,18 @@ def _minimal_missing_name_insertions(missing_names: list[str]) -> list[str]:
     ]
 
 
-def _validated_evidence_ids(values: Any, evidence: dict[str, Any]) -> list[str]:
-    records = list(evidence.get("related_papers") or [])
-    if records and all(isinstance(item.get("source_descriptor"), dict) for item in records):
-        return validate_cited_ids(values, records)
-    valid = {str(item.get("evidence_id") or "") for item in records}
-    ids = [str(value) for value in values]
-    unknown = sorted(set(ids) - valid)
-    if unknown:
-        raise RuntimeError(f"annotation cited unknown evidence IDs: {unknown}")
-    return list(dict.fromkeys(ids))
-
-
-def _validate_annotation_evidence(annotation: dict[str, Any], papers: list[dict[str, Any]]) -> None:
-    if papers and all(isinstance(item.get("source_descriptor"), dict) for item in papers):
-        validate_annotation_citations(annotation, papers)
-        return
-    relation_by_id = {str(item.get("evidence_id") or ""): item.get("relation") for item in papers}
-    used = set(str(value) for value in annotation.get("evidence_ids") or [])
-    if bool(annotation.get("prior_work")) and not any(
-        relation_by_id.get(value) == "prior" for value in used
-    ):
-        raise RuntimeError("prior-work commentary has no cited prior-work evidence")
-    if bool(annotation.get("later_work")) and not any(
-        relation_by_id.get(value) == "later" for value in used
-    ):
-        raise RuntimeError("later-work commentary has no cited later-work evidence")
+def _protected_names_for_blocks(
+    protected_names: list[str], blocks: list[dict[str, Any]],
+) -> list[str]:
+    """Project protected names from immutable source only."""
+    source = "\n".join(
+        " ".join(str(block.get(key) or "") for key in ("title", "text", "markdown", "tex"))
+        for block in blocks
+    )
+    return [
+        name for name in protected_names
+        if name and re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", source)
+    ]
 
 
 def _evidence_for_segment(
@@ -6532,36 +7161,29 @@ def _evidence_for_segment(
         list(evidence.get("related_papers") or [])
     )
     idf = _related_paper_idf(related_papers)
-    required_ids = set(
-        (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
-    )
     selected: list[dict[str, Any]] = []
-    for relation in ("prior", "later", "context"):
+    for relation in ("prior", "later"):
         candidates: list[tuple[int, int, float, int, int, dict[str, Any]]] = []
         for index, paper in enumerate(related_papers):
             if paper.get("relation") != relation:
                 continue
-            required = str(paper.get("evidence_id") or "") in required_ids
-            if relation == "context" and not required:
-                continue
             exact = relation == "prior" and _paper_matches_citation_targets(paper, citation_targets)
             local_relevance = _strongest_local_relevance(paper, source_tokens, idf)
-            if not (required or exact or local_relevance is not None):
+            if not (exact or local_relevance is not None):
                 continue
             relevance = (
-                (16 if required else 0)
-                + (12 if exact else 0)
+                (12 if exact else 0)
                 + (local_relevance or 0.0)
             )
             citation_prior = min(_citation_count_value(paper).bit_length(), 10)
-            candidates.append((-int(exact), -int(required), -relevance, -citation_prior, index, paper))
+            candidates.append((-int(exact), 0, -relevance, -citation_prior, index, paper))
         for _, _, _, _, _, paper in _select_related_candidates(
             candidates, usage_state=usage_state, limit=3,
         ):
             compact = {key: paper.get(key) for key in (
                 "evidence_id", "relation", "paper_id", "arxiv_id", "doi", "inspire_id",
                 "title", "authors", "year", "citation_count", "evidence_level", "abstract",
-                "supported_request_keys",
+                "url", "landing_url", "source_url", "html_url",
             )}
             remaining = 4_000
             snippets: list[dict[str, str]] = []
@@ -6619,6 +7241,7 @@ def _evidence_for_segment(
             compact = {key: paper.get(key) for key in (
                 "evidence_id", "relation", "paper_id", "title", "authors", "year",
                 "evidence_level", "abstract", "context_role", "context_index",
+                "url", "landing_url", "source_url", "html_url",
             )}
             ranked_blocks = sorted(
                 enumerate(paper.get("blocks") or []),
@@ -6668,14 +7291,26 @@ def _evidence_for_segment(
             validate_evidence_record(compact)
             selected.append(compact)
             selected_ids.add(evidence_id)
-    required_ids = set(
-        (evidence.get("required_evidence_ids_by_segment") or {}).get(str(segment.get("segment_id")), [])
-    )
-    for paper in related_papers:
-        evidence_id = str(paper.get("evidence_id") or "")
-        if evidence_id in required_ids and evidence_id not in selected_ids:
-            selected.append(paper)
-            selected_ids.add(evidence_id)
+    bounded_sources: list[dict[str, str]] = []
+    seen_source_urls: set[str] = set()
+    for paper in selected:
+        url = next((
+            str(paper.get(key) or "") for key in (
+                "url", "landing_url", "source_url", "html_url", "pdf_url",
+            )
+            if str(paper.get(key) or "").startswith(("http://", "https://"))
+        ), "")
+        title = str(paper.get("title") or "").strip()
+        if not title or not url or url.casefold() in seen_source_urls:
+            continue
+        snippets = [item for item in paper.get("snippets") or [] if isinstance(item, dict)]
+        locator = next((
+            str(item.get("section_title") or item.get("block_id") or "").strip()
+            for item in snippets
+            if str(item.get("section_title") or item.get("block_id") or "").strip()
+        ), "Abstract")
+        bounded_sources.append({"title": title, "url": url, "locator": locator})
+        seen_source_urls.add(url.casefold())
     return {
         "schema_version": "arc.companion.segment-evidence.v3",
         "citation_targets": citation_targets,
@@ -6686,6 +7321,7 @@ def _evidence_for_segment(
             evidence.get("citers") or [], source_tokens, citation_targets=[],
         ),
         "papers": selected,
+        "bounded_sources": bounded_sources,
     }
 
 
@@ -6962,20 +7598,11 @@ def _section_review_validation_error(
         return "has invalid expected segment coverage"
     if not isinstance(review, dict):
         return "is malformed"
-    reviewed_segments = review.get("reviewed_segments")
-    if not isinstance(reviewed_segments, list):
+    reviewed_ids = review.get("reviewed_segment_ids")
+    if not isinstance(reviewed_ids, list):
         return "is missing reviewed segment coverage"
-    reviewed_ids: list[str] = []
-    for item in reviewed_segments:
-        if (
-            not isinstance(item, dict)
-            or not isinstance(item.get("segment_id"), str)
-            or not item["segment_id"]
-            or not isinstance(item.get("translation"), dict)
-            or not isinstance(item.get("annotation"), dict)
-        ):
-            return "contains a malformed reviewed segment"
-        reviewed_ids.append(item["segment_id"])
+    if any(not isinstance(item, str) or not item for item in reviewed_ids):
+        return "contains a malformed reviewed segment id"
     if len(reviewed_ids) != len(set(reviewed_ids)):
         return "contains duplicate reviewed segments"
     if len(reviewed_ids) != len(expected_ids) or set(reviewed_ids) != set(expected_ids):
@@ -6994,6 +7621,16 @@ def _section_review_validation_error(
     } - set(expected_ids)
     if invalid_finding_ids:
         return "returned findings for unknown segments"
+    patches = review.get("patches")
+    if not isinstance(patches, list):
+        return "is missing sparse patches"
+    patch_ids = [
+        str(item.get("segment_id") or "") for item in patches if isinstance(item, dict)
+    ]
+    if len(patch_ids) != len(patches) or any(value not in expected_ids for value in patch_ids):
+        return "returned a malformed or out-of-chunk patch"
+    if len(patch_ids) != len(set(patch_ids)):
+        return "returned duplicate patches"
     return None
 
 
@@ -7030,8 +7667,9 @@ def _load_recovered_section_reviews(
         ]
         declared_ids = set(declared_id_values)
         review = {
+            "reviewed_segment_ids": declared_id_values,
             "findings": item.get("findings"),
-            "reviewed_segments": item.get("reviewed_segments"),
+            "patches": item.get("patches") or item.get("patch_proposals") or [],
         }
         validation_error = _section_review_validation_error(
             review,
@@ -7072,48 +7710,12 @@ def _load_recovered_section_reviews(
 
 def _section_review_patch_proposals(
     chunk: list[dict[str, Any]],
-    reviewed_segments: list[dict[str, Any]],
+    patches: list[dict[str, Any]],
     findings: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Project full section-review echoes into final-review-compatible deltas."""
-    original_by_id = {
-        str(item["segment"]["segment_id"]): item for item in chunk
-    }
-    proposals: list[dict[str, Any]] = []
-    patchable_annotation_fields = (
-        "commentary", "explanation", "prior_work", "later_work", "evidence_ids"
-    )
-    finding_ids = {str(item.get("segment_id") or "") for item in findings}
-    for reviewed in reviewed_segments:
-        segment_id = str(reviewed.get("segment_id") or "")
-        if segment_id not in finding_ids:
-            continue
-        original = original_by_id[segment_id]
-        proposal: dict[str, Any] = {
-            "segment_id": segment_id,
-            "translation_blocks": None,
-            "commentary": None,
-            "explanation": None,
-            "prior_work": None,
-            "later_work": None,
-            "evidence_ids": None,
-            "reason": "section reviewer proposed a correction",
-        }
-        if reviewed.get("translation") != original.get("translation"):
-            proposal["translation_blocks"] = list(
-                (reviewed.get("translation") or {}).get("blocks") or []
-            )
-        reviewed_annotation = reviewed.get("annotation") or {}
-        original_annotation = original.get("annotation") or {}
-        for field in patchable_annotation_fields:
-            if reviewed_annotation.get(field) != original_annotation.get(field):
-                proposal[field] = reviewed_annotation.get(field)
-        if any(
-            proposal[field] is not None
-            for field in ("translation_blocks", *patchable_annotation_fields)
-        ):
-            proposals.append(proposal)
-    return proposals
+    """Preserve already sparse, schema-validated section patches."""
+    valid_ids = {str(item["segment"]["segment_id"]) for item in chunk}
+    return [dict(item) for item in patches if str(item.get("segment_id") or "") in valid_ids]
 
 
 def _utf8_size(value: str) -> int:
@@ -7404,6 +8006,112 @@ def _review_context_evidence_anchors(
     return output
 
 
+def _write_reader_final_checkpoint(
+    checkpoint_dir: Path, final_overrides: dict[str, Any],
+) -> Path:
+    path = checkpoint_dir / "reader-final.json"
+    write_json(path, {
+        "schema_version": READER_FINAL_CHECKPOINT_VERSION,
+        "final_overrides": final_overrides,
+    })
+    return path
+
+
+def _write_legacy_reuse_plan(checkpoint_dir: Path, options: BuildOptions) -> Path:
+    """Write the legacy-path lane plan before its first provider submission."""
+
+    entries = []
+    for lane in ("segmentation", "glossary", "translation", "commentary", "review"):
+        skipped = options.skip_translation and lane in {"glossary", "translation"}
+        entries.append({
+            "chapter_id": "project", "segment_id": None, "lane": lane,
+            "status": "skipped" if skipped else "miss", "artifact_id": None,
+            "reason": (
+                "glossary_disabled_for_same_language_source"
+                if skipped and lane == "glossary"
+                else "translation_disabled_for_same_language_source" if skipped
+                else "explicitly selected for regeneration" if lane in options.regenerate_lanes
+                else "legacy pipeline cache lookup follows deterministic preparation"
+            ),
+            "estimated_provider_calls": 0 if skipped else 1,
+        })
+    path = checkpoint_dir / "reuse-plan.json"
+    write_json(path, {
+        "schema_version": REUSE_PLAN_VERSION,
+        "entries": entries,
+        "estimated_provider_calls": sum(item["estimated_provider_calls"] for item in entries),
+    })
+    return path
+
+
+def _store_reviewed_content(
+    project_dir: Path,
+    *,
+    checkpoint_dir: Path,
+    final_overrides: dict[str, Any],
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Commit the reviewed render input before any fallible renderer runs."""
+    segments = list(final_overrides.get("segments") or [])
+    annotations = dict(final_overrides.get("annotations") or {})
+    reader_evidence = _reader_evidence_by_segment(
+        segments,
+        document=dict(final_overrides.get("document") or {}),
+        evidence=evidence,
+        annotations=annotations,
+    )
+    chains, overlays = checkpoint_receipts(checkpoint_dir)
+    content = reader_content_from_overrides(
+        final_overrides,
+        reader_evidence_by_segment=reader_evidence,
+        accepted_ledger_chains=chains,
+        review_overlay_hashes=overlays,
+    )
+    review_receipts: dict[str, Any] = {}
+    for name in ("review.v5.json", "chapter-review.json", "annotations.reviewed.v5.json"):
+        path = checkpoint_dir / name
+        if path.is_file():
+            review_receipts[name] = {
+                "sha256": sha256_file(path),
+                "bytes": path.stat().st_size,
+            }
+    return store_reader_content(
+        project_dir,
+        content=content,
+        checkpoint_dir=checkpoint_dir,
+        review_receipts=review_receipts,
+    )
+
+
+def _publish_reader_update(
+    project_dir: Path,
+    state_path: Path,
+    lock: threading.RLock,
+    *,
+    final_overrides: dict[str, Any] | None = None,
+    strict: bool = False,
+) -> dict[str, Any] | None:
+    """Serialize reader publication and preserve the last atomic bundle on failure."""
+    try:
+        from .web import publish_reader
+    except ImportError:
+        if strict:
+            raise
+        return None
+    with lock:
+        try:
+            published = publish_reader(
+                project_dir,
+                state=_read_optional_json(state_path),
+                final_overrides=final_overrides,
+            )
+        except Exception:
+            if strict:
+                raise
+            return None
+        return _state(state_path, **dict(published))
+
+
 def _state(path: Path, **values: Any) -> dict[str, Any]:
     previous = _read_optional_json(path)
     incoming_fingerprint = values.get("fingerprint")
@@ -7429,11 +8137,51 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
         **previous,
         **{key: value for key, value in values.items() if value is not None},
     }
+    published = dict(previous.get("published") or {})
+    content_sha256 = values.get("content_sha256")
+    if content_sha256:
+        published["content_sha256"] = content_sha256
+        if values.get("content_object_path"):
+            published["content_object_path"] = values["content_object_path"]
+    if values.get("output_pdf") and values.get("output_pdf_sha256"):
+        published["pdf"] = {
+            key: state.get(key)
+            for key in (
+                "output_tex", "output_pdf", "output_tex_sha256", "output_pdf_sha256",
+                "source_manifest_path", "source_manifest_sha256", "validation_path",
+                "validation_sha256", "final_render_version",
+            )
+            if state.get(key) is not None
+        }
+        if published.get("content_sha256"):
+            published["pdf"]["content_sha256"] = published["content_sha256"]
+    if values.get("output_html") and values.get("output_html_sha256"):
+        published["web"] = {
+            key: state.get(key)
+            for key in (
+                "output_html", "output_html_sha256", "reader_snapshot_path",
+                "reader_snapshot_sha256", "web_manifest_path", "web_manifest_sha256",
+                "web_render_version",
+            )
+            if state.get(key) is not None
+        }
+        if published.get("content_sha256"):
+            published["web"]["content_sha256"] = published["content_sha256"]
+    if published:
+        state["published"] = published
+    state["active_run"] = {
+        key: value for key, value in state.items()
+        if key not in {"schema_version", "active_run", "published", "revisions"}
+        and not key.startswith("output_")
+    }
     if values.get("status") and values.get("status") not in {"failed", "needs_supervision"}:
         state.pop("error", None)
-    state["schema_version"] = "arc.companion.state.v1"
+    state["schema_version"] = "arc.companion.state.v3"
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json(path, state)
+    from .observability import append_state_event
+
+    append_state_event(path, state)
     return state
 
 
@@ -7442,8 +8190,15 @@ def _fingerprint_bound_state_key(key: str) -> bool:
         "fingerprint",
         "checkpoint_dir",
         "segment_count",
+        "annotation_language",
         "first_wave_preview_version",
         "final_render_version",
+        "web_render_version",
+        "reader_snapshot_path",
+        "reader_snapshot_sha256",
+        "web_manifest_path",
+        "web_manifest_sha256",
+        "web",
     } or key.startswith(
         ("preview_", "output_", "source_manifest_", "validation_")
     )

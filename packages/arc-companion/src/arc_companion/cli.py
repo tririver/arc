@@ -8,15 +8,14 @@ from typing import Any
 
 from .io import safe_name
 from .package import package_project
-from .pipeline import (
-    DEFAULT_LANGUAGE,
-    DEFAULT_WORKERS,
-    LANGUAGE_NOTICE,
-    BuildOptions,
-    build_companion,
-    read_status,
-    validate_project,
-)
+
+
+DEFAULT_LANGUAGE = "zh-CN"
+DEFAULT_WORKERS = 24
+LANGUAGE_NOTICE = "默认使用中文生成伴读；如需切换伴读语言，请直接指定目标语言。"
+# Test/controller injection seam without importing the generation pipeline for
+# render-only commands.
+build_companion = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -86,7 +85,16 @@ def main(argv: list[str] | None = None) -> int:
         default="auto",
     )
     build.add_argument("--idle-timeout-seconds", type=float, default=None)
-    build.add_argument("--regenerate-commentary", action="store_true")
+    build.add_argument(
+        "--regenerate", action="append", default=[],
+        choices=("segmentation", "glossary", "guide", "translation", "commentary", "review", "all"),
+        help="repeat to explicitly regenerate only selected content lanes",
+    )
+    build.add_argument("--confirm-expensive-regeneration", action="store_true")
+    build.add_argument(
+        "--regenerate-commentary", action="store_true",
+        help="deprecated alias for --regenerate commentary",
+    )
     build.add_argument(
         "--legacy-checkpoint",
         default=None,
@@ -117,6 +125,20 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("--project-dir", required=True)
     validate.add_argument("--json", action="store_true")
 
+    render_web = sub.add_parser(
+        "render-web", help="Render or refresh the self-contained web reader"
+    )
+    render_web.add_argument("--project-dir", required=True)
+    render_web.add_argument("--json", action="store_true")
+
+    render = sub.add_parser(
+        "render", help="Render immutable reviewed content without model calls"
+    )
+    render.add_argument("--project-dir", required=True)
+    render.add_argument("--format", choices=("pdf", "web", "all"), default="all")
+    render.add_argument("--content-sha", default=None)
+    render.add_argument("--json", action="store_true")
+
     package = sub.add_parser("package", help="Package a completed companion")
     package.add_argument("--project-dir", required=True)
     package.add_argument("--json", action="store_true")
@@ -134,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "build":
+        from .pipeline import BuildOptions, build_companion as pipeline_build_companion
+
         defaulted = args.annotation_language is None
         language = args.annotation_language or DEFAULT_LANGUAGE
         if defaulted:
@@ -150,6 +174,10 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             else Path.cwd() / "arc-tests" / "companion" / safe_name(args.paper_id)
         )
         try:
+            if args.force:
+                raise ValueError(
+                    "--force no longer regenerates companion content; use --regenerate LANE"
+                )
             options = BuildOptions(
                 paper_id=args.paper_id,
                 project_dir=project_dir,
@@ -170,6 +198,8 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 stop_after_first_chapter=args.stop_after_first_chapter,
                 document_kind=args.document_kind,
                 idle_timeout_seconds=args.idle_timeout_seconds,
+                regenerate_lanes=tuple(args.regenerate),
+                confirm_expensive_regeneration=args.confirm_expensive_regeneration,
                 regenerate_commentary=args.regenerate_commentary,
                 legacy_checkpoint=(
                     Path(args.legacy_checkpoint) if args.legacy_checkpoint else None
@@ -178,7 +208,8 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         except ValueError as exc:
             result = {"ok": False, "data": None, "error": {"code": "invalid_options", "message": str(exc)}, "errors": []}
         else:
-            result = build_companion(options)
+            runner = build_companion or pipeline_build_companion
+            result = runner(options)
     elif args.command == "resume":
         from .pipeline import resume_companion
 
@@ -188,9 +219,23 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             confirm_possible_duplicate_charge=args.confirm_possible_duplicate_charge,
         )
     elif args.command == "status":
+        from .pipeline import read_status
+
         result = read_status(Path(args.project_dir))
     elif args.command == "validate":
+        from .pipeline import validate_project
+
         result = validate_project(Path(args.project_dir))
+    elif args.command == "render-web":
+        from .render import render_content
+
+        result = render_content(Path(args.project_dir), format="web")
+    elif args.command == "render":
+        from .render import render_content
+
+        result = render_content(
+            Path(args.project_dir), format=args.format, content_sha256=args.content_sha,
+        )
     elif args.command == "package":
         result = package_project(Path(args.project_dir))
     else:
@@ -234,6 +279,7 @@ def _emit(result: dict[str, Any], *, json_output: bool) -> None:
         print(
             data.get("output_pdf")
             or data.get("preview_pdf")
+            or data.get("output_html")
             or data.get("archive_path")
             or data.get("status")
             or data

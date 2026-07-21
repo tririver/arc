@@ -20,23 +20,55 @@ def package_project(project_dir: Path) -> dict[str, object]:
     if not state_path.is_file():
         return err("companion_state_not_found", f"No companion state found in {root}")
     state = read_json(state_path)
-    if state.get("status") != "complete":
+    published_value = state.get("published") or {}
+    if not isinstance(published_value, dict):
+        return err("companion_package_failed", "Published companion state is invalid")
+    published = dict(published_value)
+    if not isinstance(published.get("pdf") or {}, dict) or not isinstance(
+        published.get("web") or {}, dict
+    ):
+        return err("companion_package_failed", "Published companion outputs are invalid")
+    published_pdf = dict(published.get("pdf") or {})
+    published_web = dict(published.get("web") or {})
+    effective = {**state, **published_pdf, **published_web}
+    if not published_pdf and state.get("status") != "complete":
         return err("companion_not_complete", "Only a validated, complete companion can be packaged")
     try:
-        pdf_path = _state_file(root, state, "output_pdf")
-        tex_path = _state_file(root, state, "output_tex")
-        checkpoint = state.get("checkpoint_dir")
-        if checkpoint:
+        strict_published = bool(published_pdf) or state.get("schema_version") == "arc.companion.state.v3"
+        if strict_published:
+            pdf_path = _state_hashed_file(
+                root, effective, "output_pdf", "output_pdf_sha256"
+            )
+            tex_path = _state_hashed_file(
+                root, effective, "output_tex", "output_tex_sha256"
+            )
+        else:
+            pdf_path = _state_file(root, effective, "output_pdf")
+            tex_path = _state_file(root, effective, "output_tex")
+        checkpoint = effective.get("checkpoint_dir")
+        if checkpoint and not published_pdf:
             checkpoint_path = _inside_project(root, Path(str(checkpoint)))
             if not checkpoint_path.is_dir():
                 raise ValueError("State checkpoint_dir is missing or is not a directory")
         source_manifest_path = (
-            _state_file(root, state, "source_manifest_path")
-            if state.get("source_manifest_path") else root / "source-manifest.json"
+            _state_hashed_file(
+                root, effective, "source_manifest_path", "source_manifest_sha256"
+            )
+            if strict_published
+            else (
+                _state_file(root, effective, "source_manifest_path")
+                if effective.get("source_manifest_path") else root / "source-manifest.json"
+            )
         )
         validation_path = (
-            _state_file(root, state, "validation_path")
-            if state.get("validation_path") else root / "validation.json"
+            _state_hashed_file(
+                root, effective, "validation_path", "validation_sha256"
+            )
+            if strict_published
+            else (
+                _state_file(root, effective, "validation_path")
+                if effective.get("validation_path") else root / "validation.json"
+            )
         )
         if not source_manifest_path.is_file() or not validation_path.is_file():
             raise ValueError("Source manifest or validation report is missing")
@@ -55,7 +87,7 @@ def package_project(project_dir: Path) -> dict[str, object]:
             if expected_hash and sha256_file(asset_path) != expected_hash:
                 raise ValueError(f"TeX asset hash mismatch: {asset_path}")
             files.append(asset_path)
-        files.extend(_web_files(root, state))
+        files.extend(_web_files(root, effective))
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         return err("companion_package_failed", str(exc))
 

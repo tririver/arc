@@ -230,10 +230,20 @@ def test_snapshot_discovers_only_hash_verified_accepted_lane_values(tmp_path: Pa
         "annotation_segment_ids": [segment_id],
     }
     first, second = snapshot["chapters"][0]["segments"]
-    assert first["translation"]["blocks"][0]["runs"][1] == {
+    assert next(
+        item for item in first["translation"]["blocks"][0]["runs"]
+        if item["type"] == "math"
+    ) == {
         "type": "math",
         "tex": "E=mc^2",
         "display": False,
+    }
+    assert first["source"][0]["runs"][0] == {
+        "type": "term",
+        "text": "Energy",
+        "entry_id": "term-0001",
+        "source": "energy",
+        "target": "能量",
     }
     assert first["companion"]["sections"][0]["sources"][0]["locator"] == "Section 1"
     assert second["translation"] is None and second["companion"] is None
@@ -252,6 +262,57 @@ def test_math_runs_trim_all_supported_delimiters() -> None:
 
     assert [item["tex"] for item in math] == ["a+b", "c+d", "e+f", "g+h"]
     assert [item["display"] for item in math] == [False, True, False, True]
+
+
+def test_term_runs_are_bilingual_normalized_bounded_and_deterministic() -> None:
+    import arc_companion.web as web
+
+    glossary = web._glossary_view({"entries": [
+        {
+            "entry_id": "short",
+            "source": "field",
+            "target": "场",
+            "aliases": ["FIELD"],
+        },
+        {
+            "entry_id": "long",
+            "source": "gauge field",
+            "target": "规范场",
+            "source_aliases": ["gauge-field"],
+        },
+        {"source": "résumé", "target": "简历"},
+        {"source": "same", "target": "ＳＡＭＥ"},
+        {"source": "empty", "target": ""},
+    ]})
+
+    runs = web._term_runs(
+        "ＧＡＵＧＥ ＦＩＥＬＤ / gauge-field / 规范场; re\u0301sume\u0301 but résumés field2.",
+        glossary,
+    )
+    terms = [item for item in runs if item["type"] == "term"]
+
+    assert [(item["text"], item["entry_id"]) for item in terms] == [
+        ("ＧＡＵＧＥ ＦＩＥＬＤ", "long"),
+        ("gauge-field", "long"),
+        ("规范场", "long"),
+        ("re\u0301sume\u0301", "term-0003"),
+    ]
+    assert all(item["entry_id"] not in {"short", "term-0004", "term-0005"} for item in terms)
+
+
+def test_term_annotation_leaves_math_and_links_opaque() -> None:
+    import arc_companion.web as web
+
+    value = {"runs": [
+        {"type": "text", "text": "energy"},
+        {"type": "math", "tex": r"\text{energy}", "display": False},
+        {"type": "link", "text": "energy", "href": "https://example.test"},
+    ]}
+    glossary = web._glossary_view({"entries": [{"source": "energy", "target": "能量"}]})
+
+    web._annotate_term_runs(value, glossary)
+
+    assert [item["type"] for item in value["runs"]] == ["term", "math", "link"]
 
 
 def test_pending_ledger_hides_an_existing_translation_checkpoint(tmp_path: Path) -> None:
@@ -325,6 +386,49 @@ def test_reader_final_checkpoint_overrides_live_state_and_supports_legacy_segmen
         "runs"
     ][0]["text"] == "Reviewed explanation."
     assert snapshot["chapters"][0]["segments"][0]["lane_status"]["companion"] == "accepted"
+
+
+def test_skipped_snapshot_hides_stale_glossary_terms_and_keeps_source_index(
+    tmp_path: Path,
+) -> None:
+    import arc_companion.web as web
+
+    project, checkpoint, _segment_id = _project(tmp_path)
+    envelope = read_json(checkpoint / "document.json")
+    envelope["document"]["blocks"].extend([
+        {
+            "block_id": "index-heading",
+            "type": "heading",
+            "title": "Index",
+            "text": "Index",
+            "source_role": "index",
+        },
+        {
+            "block_id": "index-entry",
+            "type": "paragraph",
+            "text": "Energy, 1",
+            "source_role": "index",
+        },
+    ])
+    write_json(checkpoint / "document.json", envelope)
+
+    snapshot = build_reader_snapshot(
+        project,
+        final_overrides={
+            "translation_mode": "skipped",
+            # A stale or accidentally supplied glossary must be ignored.
+            "glossary": {"entries": [{"source": "energy", "target": "能量"}]},
+            "translations": None,
+        },
+    )
+
+    assert snapshot["glossary"] == []
+    assert snapshot["coverage"]["translation_segment_ids"] == []
+    assert snapshot["appendices"][0]["kind"] == "source_only_index"
+    assert snapshot["appendices"][0]["source"][1]["runs"] == [
+        {"type": "text", "text": "Energy, 1"}
+    ]
+    assert not list(web._walk_term_runs(snapshot))
 
 
 def test_active_override_without_checkpoint_proof_is_preview_only(tmp_path: Path) -> None:
@@ -481,6 +585,11 @@ def test_web_assets_use_container_layout_lazy_mount_text_nodes_and_katex() -> No
     assert "window.katex.render" in javascript
     assert "localStorage" in javascript
     assert 'snapshot.translation_mode !== "skipped"' in javascript
+    assert 'link.href = "#glossary"' in javascript
+    assert "mountGlossary" in javascript
+    assert "data-tooltip" in css
+    assert "#36586b" in css
+    assert 'run.type === "term"' in javascript
     assert "KaTeX" in katex
 
 

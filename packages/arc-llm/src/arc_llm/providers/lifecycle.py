@@ -9,7 +9,13 @@ import queue
 import threading
 from collections.abc import Callable, Mapping, Sequence
 
-from .base import LLMFailureCategory, LLMSubmissionState, LLMWorkerCancelled, LLMWorkerError
+from .base import (
+    LLMFailureCategory,
+    LLMSubmissionState,
+    LLMWorkerCancelled,
+    LLMWorkerError,
+    LLMWorkerTimeout,
+)
 from .activity import ActivityTracker
 
 def run_streaming_process_group(
@@ -58,23 +64,40 @@ def run_streaming_process_group(
     ]
     for reader in readers:
         reader.start()
+    input_submitted = threading.Event()
     def write_input() -> None:
         try:
             process.stdin.write(input_text)
+            process.stdin.flush()
+            activity.submitted()
+            input_submitted.set()
             process.stdin.close()
         except (BrokenPipeError, OSError):
             pass
 
     writer = threading.Thread(target=write_input, name="arc-provider-stdin", daemon=True)
     try:
-        activity.submitted()
+        transport_started = time.monotonic()
         writer.start()
         closed: set[str] = set()
         while process.poll() is None or len(closed) < 2:
+            if (
+                not input_submitted.is_set()
+                and time.monotonic() - transport_started >= activity.idle_timeout_seconds
+            ):
+                raise LLMWorkerTimeout(
+                    f"{activity.provider} produced no meaningful output while delivering input for "
+                    f"{activity.idle_timeout_seconds:g} seconds",
+                    submission_state=LLMSubmissionState.NOT_SUBMITTED,
+                )
             if cancel_check is not None and cancel_check():
                 raise LLMWorkerCancelled(
                     "LLM worker call was cancelled",
-                    submission_state=LLMSubmissionState.SUBMITTED,
+                    submission_state=(
+                        LLMSubmissionState.SUBMITTED
+                        if input_submitted.is_set()
+                        else LLMSubmissionState.NOT_SUBMITTED
+                    ),
                 )
             activity.check()
             try:

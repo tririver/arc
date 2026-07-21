@@ -1,792 +1,113 @@
 from __future__ import annotations
 
-from pathlib import Path
-import os
-import threading
-import json
-
-import jsonschema
 import pytest
 
-from arc_companion.evidence import arc_cache_descriptor, text_sha256, web_evidence_record
-from arc_companion.evidence_requests import (
-    ArcPaperEvidenceAdapter,
-    EvidenceRequestController,
-    EvidenceResolution,
-    normalize_evidence_requests,
+from arc_companion.pipeline import (
+    BuildOptions,
+    _annotation_source_urls,
+    _generate_annotations,
+    _validate_direct_annotation_sources,
 )
-from arc_companion.pipeline import BuildOptions, _resolve_and_rerun_evidence_requests, _review
-from arc_companion.prompts import ANNOTATION_SCHEMA
 from arc_companion.source import SourceBundle
 
 
-def _request(relation: str = "prior") -> dict:
+def _source(url: str = "https://example.org/paper") -> dict[str, str]:
+    return {"title": "Primary paper", "url": url, "locator": "Section 3"}
+
+
+def _annotation() -> dict[str, object]:
     return {
-        "relation": relation,
-        "needed_claim": "A concrete historical claim.",
-        "queries": ["specific mechanism"],
-        "candidate_paper_ids": ["arXiv:1234.5678"],
-        "candidate_urls": ["https://example.test/discovery"],
-        "reason": "The source passage relies on this antecedent.",
+        "explanation": "Explanation.",
+        "commentary": "Commentary.",
+        "commentary_sources": [_source()],
+        "prior_work": [{"text": "Prior result.", "sources": [_source("https://example.org/prior")]}],
+        "later_work": [],
     }
 
 
-def _record(relation: str = "prior") -> dict:
-    text = "This verified passage supports the specific mechanism and concrete historical claim."
-    blocks = [{"block_id": "S1", "text": text, "sha256": text_sha256(text)}]
-    record = {
-        "evidence_id": "verified-paper",
-        "relation": relation,
-        "paper_id": "arXiv:1234.5678",
-        "title": "Verified paper",
-        "authors": [],
-        "year": 2020,
-        "evidence_level": "full_text",
-        "abstract": "",
-        "blocks": blocks,
+def test_direct_sources_are_preserved_without_registration() -> None:
+    value = _annotation()
+    assert _validate_direct_annotation_sources(value) == value
+    assert _annotation_source_urls(value) == {
+        "https://example.org/paper", "https://example.org/prior",
     }
-    record["source_descriptor"] = arc_cache_descriptor(
-        paper_id=record["paper_id"], title=record["title"], authors=[], year=2020,
-        evidence_level="full_text", content=blocks, document_hash="d" * 64,
-    )
-    return record
 
 
-def _unverified_discovery_abstract(relation: str = "prior") -> dict:
-    abstract = "A search-result abstract that was not independently fetched."
-    record = {
-        "evidence_id": "unverified-abstract",
-        "relation": relation,
-        "paper_id": "arXiv:1234.5678",
-        "title": "Discovery result",
-        "authors": [],
-        "year": 2020,
-        "evidence_level": "abstract_only",
-        "abstract": abstract,
-        "blocks": [],
-    }
-    record["source_descriptor"] = arc_cache_descriptor(
-        paper_id=record["paper_id"], title=record["title"], authors=[], year=2020,
-        evidence_level="abstract_only", content=abstract,
-    )
-    return record
-
-
-def test_annotation_schema_and_controller_enforce_two_strict_requests() -> None:
-    base = {
-        "explanation": "Explanation", "prior_work": [], "later_work": [], "context_claims": [],
-        "commentary": "Commentary", "evidence_ids": [], "key_points": [], "source_notes": [],
-    }
-    for count in (0, 1, 2):
-        jsonschema.validate({**base, "evidence_requests": [_request() for _ in range(count)]}, ANNOTATION_SCHEMA)
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({
-            **base, "prior_work": "legacy prose", "evidence_requests": [],
-        }, ANNOTATION_SCHEMA)
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({**base, "evidence_requests": [_request() for _ in range(3)]}, ANNOTATION_SCHEMA)
-    with pytest.raises(ValueError, match="at most two"):
-        normalize_evidence_requests("seg", [_request(), _request(), _request()])
-    invalid = _request()
-    invalid["relation"] = "remembered"
-    with pytest.raises(ValueError, match="requires relation"):
-        normalize_evidence_requests("seg", [invalid])
-    claim = {
-        "text": "Located claim", "evidence_ids": ["paper-1"],
-        "source_locators": [{"evidence_id": "paper-1", "locator": "S1"}],
-        "request_key": None,
-    }
-    jsonschema.validate({
-        **base, "prior_work": [claim], "evidence_ids": ["paper-1"],
-        "evidence_requests": [],
-    }, ANNOTATION_SCHEMA)
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({
-            **base, "prior_work": [claim] * 4, "evidence_ids": ["paper-1"],
-            "evidence_requests": [],
-        }, ANNOTATION_SCHEMA)
-
-
-def test_controller_runs_all_lanes_deduplicates_and_never_registers_web_snippet() -> None:
-    calls: list[str] = []
-    lock = threading.Lock()
-    normalized = normalize_evidence_requests("seg-1", [_request()])
-    web_record = web_evidence_record(
-        relation="prior", url="https://example.test/discovery", title="Snippet",
-        excerpt="Search result snippet.", retrieved_at="2026-07-19T12:00:00Z",
-    )
-
-    def lane(name, output):
-        def run(requests):
-            with lock:
-                calls.append(name)
-            assert requests == normalized
-            return output
-        return run
-
-    envelope = {"request_key": normalized[0]["request_key"], "record": _record()}
-    controller = EvidenceRequestController({
-        "arc": lane("arc", [envelope]),
-        "inspire": lane("inspire", [envelope]),
-        "web": lane("web", [{"request_key": normalized[0]["request_key"], "record": web_record}]),
-    })
-    result = controller.resolve(normalized)
-
-    assert sorted(calls) == ["arc", "inspire", "web"]
-    assert [item["evidence_id"] for item in result.records] == ["verified-paper"]
-    assert result.evidence_ids_by_segment == {"seg-1": ("verified-paper",)}
-    assert any(item.get("deduplicated") for item in result.audit["accepted"])
-    assert any(item["reason"] == "web_snippet_not_claim_evidence" for item in result.audit["rejected"])
-    assert all(result.audit["lanes"][name]["status"] == "complete" for name in ("arc", "inspire", "web"))
-
-
-def test_lane_failure_does_not_cancel_other_lanes() -> None:
-    normalized = normalize_evidence_requests("seg-1", [_request()])
-
-    def failed(_requests):
-        raise RuntimeError("offline")
-
-    envelope = {"request_key": normalized[0]["request_key"], "record": _record()}
-    result = EvidenceRequestController({
-        "arc": lambda requests: [envelope],
-        "inspire": failed,
-        "web": lambda requests: [],
-    }).resolve(normalized)
-
-    assert result.records
-    assert result.audit["lanes"]["inspire"]["status"] == "failed"
-    assert result.audit["lanes"]["arc"]["status"] == "complete"
-
-
-class _DiscoveryFixture:
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-        self.metadata = {
-            "arXiv:1111.1111": {
-                "paper_id": "arXiv:1111.1111", "arxiv_id": "1111.1111",
-                "title": "Broad domain survey", "abstract": "A broad mechanism survey.",
-                "authors": [], "year": 2011,
-            },
-            "arXiv:2222.2222": {
-                "paper_id": "arXiv:2222.2222", "arxiv_id": "2222.2222",
-                "doi": "10.1000/direct", "inspire_recid": "22",
-                "title": "Specific mechanism calculation",
-                "abstract": "A specific mechanism calculation proves the concrete historical claim.",
-                "authors": [], "year": 2022,
-            },
-            "doi:10.1000/direct": {
-                "paper_id": "arXiv:2222.2222", "arxiv_id": "2222.2222",
-                "doi": "10.1000/direct", "inspire_recid": "22",
-                "title": "Specific mechanism calculation",
-                "abstract": "A specific mechanism calculation proves the concrete historical claim.",
-                "authors": [], "year": 2022,
-            },
-            "inspire:22": {
-                "paper_id": "arXiv:2222.2222", "arxiv_id": "2222.2222",
-                "doi": "10.1000/direct", "inspire_recid": "22",
-                "title": "Specific mechanism calculation",
-                "abstract": "A specific mechanism calculation proves the concrete historical claim.",
-                "authors": [], "year": 2022,
-            },
-        }
-
-    def search_arc_full_text(self, paper_ids, query):
-        self.calls.append(("arc_search", tuple(paper_ids), query))
-        return [{
-            "paper_id": "arXiv:1111.1111", "title": "Broad domain survey",
-            "snippet": "broad mechanism",
-        }]
-
-    def get_parsed_source(self, paper_id):
-        self.calls.append(("parsed", paper_id))
-        metadata = self.metadata.get(paper_id)
-        if not metadata:
-            return None
-        return {
-            **metadata, "source_hash": "a" * 64,
-            "sections": [{
-                "section_id": "S1",
-                "text": metadata["abstract"],
-            }],
-        }
-
-    def get_metadata(self, paper_id):
-        self.calls.append(("metadata", paper_id))
-        return self.metadata.get(paper_id)
-
-    def get_references(self, paper_id):
-        self.calls.append(("references", paper_id))
-        return [{"paper_id": "doi:10.1000/direct", **self.metadata["doi:10.1000/direct"]}]
-
-    def get_citers(self, paper_id):
-        self.calls.append(("citers", paper_id))
-        return []
-
-    def search_inspire(self, query):
-        self.calls.append(("inspire_search", query))
-        return [{"paper_id": "doi:10.1000/direct", **self.metadata["doi:10.1000/direct"]}]
-
-    def search_web(self, query):
-        self.calls.append(("web_search", query))
-        return [{
-            "url": "https://inspirehep.net/literature/22",
-            "paper_id": "inspire:22",
-            "snippet": "specific mechanism calculation",
-        }]
-
-
-def test_default_lanes_consume_queries_and_expand_beyond_domain_without_short_circuit() -> None:
-    adapter = _DiscoveryFixture()
-    normalized = normalize_evidence_requests("seg-1", [_request()])
-    controller = EvidenceRequestController(
-        adapter=adapter,
-        domain_paper_ids=["arXiv:1111.1111"],
-        seed_paper_ids=["arXiv:9999.9999"],
-    )
-
-    result = controller.resolve(normalized)
-
-    assert ("arc_search", ("arXiv:1111.1111", "arXiv:1234.5678"), "specific mechanism") in adapter.calls
-    assert ("inspire_search", "specific mechanism") in adapter.calls
-    assert ("web_search", "specific mechanism") in adapter.calls
-    assert ("references", "arXiv:9999.9999") in adapter.calls
-    assert ("citers", "arXiv:9999.9999") in adapter.calls
-    # The more claim-specific paper discovered outside the domain is ranked
-    # ahead of the broad domain hit; domain membership is only a soft signal.
-    assert result.records[0]["paper_id"] == "arXiv:2222.2222"
-    assert {record["paper_id"] for record in result.records} == {"arXiv:2222.2222"}
-    assert any(
-        item["reason"] == "insufficient_direct_support"
-        for item in result.audit["rejected"]
-    )
-    assert all(result.audit["lanes"][name]["status"] == "complete" for name in ("arc", "inspire", "web"))
-
-
-def test_arxiv_doi_and_inspire_aliases_register_once_across_three_lanes() -> None:
-    adapter = _DiscoveryFixture()
-    request = _request()
-    request["candidate_paper_ids"] = ["arXiv:2222.2222"]
-    normalized = normalize_evidence_requests("seg-1", [request])
-
-    result = EvidenceRequestController(
-        adapter=adapter, seed_paper_ids=["arXiv:9999.9999"],
-    ).resolve(normalized)
-
-    matching = [record for record in result.records if record["paper_id"] == "arXiv:2222.2222"]
-    assert len(matching) == 1
-    assert matching[0]["evidence_level"] == "full_text"
-    accepted = [item for item in result.audit["accepted"] if "2222.2222" in item["identity"]]
-    assert {item["lane"] for item in accepted} == {"arc", "inspire", "web"}
-    assert len({item["evidence_id"] for item in accepted}) == 1
-
-
-def test_same_canonical_paper_keeps_prior_and_later_relation_bindings_separate() -> None:
-    prior, later = normalize_evidence_requests("seg-1", [_request("prior"), _request("later")])
-    prior_record = _record("prior")
-    later_record = _record("later")
-    later_record["evidence_id"] = "verified-paper-later"
-
-    result = EvidenceRequestController({
-        "arc": lambda requests: [
-            {"request_key": prior["request_key"], "record": prior_record,
-             "canonical_aliases": ["arXiv:1234.5678"]},
-            {"request_key": later["request_key"], "record": later_record,
-             "canonical_aliases": ["doi:10.1000/alias", "arXiv:1234.5678"]},
-        ],
-        "inspire": lambda requests: [],
-        "web": lambda requests: [],
-    }).resolve([prior, later])
-
-    assert len(result.records) == 2
-    assert result.evidence_ids_by_segment["seg-1"] == (
-        "verified-paper", "verified-paper-later",
-    )
-    assert {record["relation"] for record in result.records} == {"prior", "later"}
-
-
-def test_unmapped_web_snippet_is_discovery_only() -> None:
-    adapter = _DiscoveryFixture()
-    adapter.search_web = lambda query: [{
-        "url": "https://example.test/result", "snippet": "unsupported technical assertion",
-    }]
-    normalized = normalize_evidence_requests("seg-1", [_request()])
-    result = EvidenceRequestController(adapter=adapter).resolve(normalized)
-
-    assert all(record["source_descriptor"]["source_type"] != "web" for record in result.records)
-    assert any(
-        item["lane"] == "web" and item["reason"] == "discovery_only_not_claim_evidence"
-        for item in result.audit["rejected"]
-    )
-
-
-@pytest.mark.skipif(
-    os.environ.get("ARC_RUN_NET_TESTS") != "1",
-    reason="set ARC_RUN_NET_TESTS=1 for live INSPIRE/candidate-URL verification",
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"url": "https://example.org", "locator": "Abstract"},
+        {"title": "Paper", "locator": "Abstract"},
+        {"title": "Paper", "url": "https://example.org"},
+        {"title": "Paper", "url": "ftp://example.org", "locator": "Abstract"},
+        {"title": "Paper", "url": "not a url", "locator": "Abstract"},
+    ],
 )
-def test_live_inspire_and_annotation_candidate_url_contract() -> None:
-    from arc_paper import service
-
-    search = service.search_inspire("quasi-single field inflation", limit=3)
-    assert search["ok"] and search["data"]
-    request = {
-        "relation": "context",
-        "needed_claim": "Quasi-single field inflation couples massive isocurvature modes.",
-        "queries": ["massive isocurvature quasi-single field inflation"],
-        "candidate_paper_ids": [],
-        "candidate_urls": ["https://arxiv.org/abs/0911.3380"],
-        "reason": "Verify the paper-level context from a live scholarly record.",
-    }
-    result = EvidenceRequestController(adapter=ArcPaperEvidenceAdapter()).resolve(
-        normalize_evidence_requests("net-segment", [request])
-    )
-    assert result.audit["lanes"]["inspire"]["status"] == "complete"
-    assert result.audit["lanes"]["web"]["status"] == "unavailable"
+def test_direct_source_requires_title_http_url_and_locator(source: dict[str, str]) -> None:
+    value = _annotation()
+    value["commentary_sources"] = [source]
+    with pytest.raises(RuntimeError):
+        _validate_direct_annotation_sources(value)
 
 
-def _install_production_service_fixture(monkeypatch, *, section_text="Verified full text."):
-    from arc_paper import service
-
-    calls = []
-    metadata = {
-        "paper_id": "arXiv:1234.5678", "arxiv_id": "1234.5678",
-        "doi": "10.1000/same", "inspire_recid": "123",
-        "title": "Specific mechanism", "abstract": "Specific mechanism abstract.",
-        "authors": [], "year": 2012,
-    }
-
-    def search_full_text(ids, *, query, limit):
-        calls.append(("arc_search", tuple(ids), query))
-        return {"ok": True, "data": [{
-            "paper_id": "arXiv:1234.5678", "snippet": "specific mechanism",
-        }]}
-
-    def parsed(paper_id):
-        calls.append(("parsed", paper_id))
-        return {"ok": True, "data": {
-            **metadata, "source_hash": "f" * 64,
-            "sections": [{"section_id": "S1", "text": section_text}],
-        }}
-
-    def get_metadata(paper_id):
-        calls.append(("metadata", paper_id))
-        return {"ok": True, "data": metadata}
-
-    def references(paper_id, *, enrich):
-        calls.append(("references", paper_id))
-        return {"ok": True, "data": [{**metadata, "paper_id": "arXiv:1234.5678"}]}
-
-    def citers(paper_id, *, limit):
-        calls.append(("citers", paper_id))
-        return {"ok": True, "data": [{**metadata, "paper_id": "arXiv:1234.5678"}]}
-
-    def inspire(query, *, limit):
-        calls.append(("inspire_search", query))
-        return {"ok": True, "data": [{**metadata, "paper_id": "arXiv:1234.5678"}]}
-
-    monkeypatch.setattr(service, "search_full_text", search_full_text)
-    monkeypatch.setattr(service, "get_parsed_source", parsed)
-    monkeypatch.setattr(service, "get_metadata", get_metadata)
-    monkeypatch.setattr(service, "get_references", references)
-    monkeypatch.setattr(service, "get_citers", citers)
-    monkeypatch.setattr(service, "search_inspire", inspire)
-    return calls
-
-
-def test_production_adapter_runs_real_service_paths_and_shares_inflight_cache(monkeypatch) -> None:
-    calls = _install_production_service_fixture(monkeypatch)
-    web_calls = []
-
-    def web_search(query):
-        web_calls.append(query)
-        return [{"paper_id": "arXiv:1234.5678", "url": "https://example.test/paper"}]
-
-    requests = normalize_evidence_requests("seg-1", [_request("prior"), _request("later")])
-    result = EvidenceRequestController(
-        adapter=ArcPaperEvidenceAdapter(web_search=web_search),
-        domain_paper_ids=["arXiv:1234.5678"],
-        seed_paper_ids=["arXiv:9999.9999"],
-    ).resolve(requests)
-
-    assert web_calls == ["specific mechanism"]
-    assert calls.count(("inspire_search", "specific mechanism")) == 1
-    assert calls.count(("references", "arXiv:9999.9999")) == 1
-    assert calls.count(("citers", "arXiv:9999.9999")) == 1
-    assert calls.count(("parsed", "arXiv:1234.5678")) == 1
-    assert calls.count(("metadata", "arXiv:1234.5678")) == 1
-    assert result.audit["schema_version"] == "arc.companion.evidence-resolution.v3"
-    assert {record["relation"] for record in result.records} == {"prior", "later"}
-    assert all(record["evidence_level"] == "full_text" for record in result.records)
-
-
-def test_production_adapter_marks_missing_web_provider_unavailable(monkeypatch) -> None:
-    _install_production_service_fixture(monkeypatch)
-    result = EvidenceRequestController(
-        adapter=ArcPaperEvidenceAdapter(),
-        domain_paper_ids=["arXiv:1234.5678"],
-    ).resolve(normalize_evidence_requests("seg-1", [_request()]))
-
-    assert result.audit["lanes"]["arc"]["status"] == "complete"
-    assert result.audit["lanes"]["inspire"]["status"] == "complete"
-    assert result.audit["lanes"]["web"]["status"] == "unavailable"
-
-
-def test_missing_web_provider_still_verifies_annotation_agent_candidate_url(monkeypatch) -> None:
-    _install_production_service_fixture(monkeypatch, section_text=(
-        "The specific mechanism supports the concrete historical claim."
-    ))
-    request = _request()
-    request["candidate_urls"] = ["https://arxiv.org/abs/1204.5678"]
-    result = EvidenceRequestController(adapter=ArcPaperEvidenceAdapter()).resolve(
-        normalize_evidence_requests("seg-url", [request])
-    )
-
-    assert result.audit["lanes"]["web"]["status"] == "unavailable"
-    assert any(
-        item["lane"] == "web" and item["discovery_origin"] == "annotation_agent"
-        for item in result.audit["accepted"]
-    )
-
-
-def test_lane_and_global_budgets_are_fair_across_requests(monkeypatch) -> None:
-    import arc_companion.evidence_requests as module
-
-    first = normalize_evidence_requests("seg-a", [_request()])[0]
-    second = normalize_evidence_requests("seg-b", [_request()])[0]
-    monkeypatch.setattr(module, "_MAX_LANE_RESULTS", 2)
-    monkeypatch.setattr(module, "_MAX_TOTAL_CANDIDATES", 2)
-
-    def crowded(_requests):
-        for _ in range(20):
-            yield {"request_key": first["request_key"], "record": _record()}
-        yield {"request_key": second["request_key"], "record": _record()}
-
-    result = EvidenceRequestController({
-        "arc": crowded, "inspire": lambda requests: [], "web": lambda requests: [],
-    }).resolve([first, second])
-
-    assert set(result.supported_request_keys) == {
-        first["request_key"], second["request_key"],
-    }
-    assert all(result.audit["per_request"][key]["considered"] for key in result.supported_request_keys)
-
-
-def test_explicit_same_relation_candidate_without_direct_support_is_rejected() -> None:
-    request = normalize_evidence_requests("seg", [_request()])[0]
-    unrelated = _record()
-    unrelated["blocks"][0]["text"] = "A telescope catalog measures detector calibration noise."
-    unrelated["blocks"][0]["sha256"] = text_sha256(unrelated["blocks"][0]["text"])
-    unrelated["source_descriptor"] = arc_cache_descriptor(
-        paper_id=unrelated["paper_id"], title=unrelated["title"], authors=[], year=2020,
-        evidence_level="full_text", content=unrelated["blocks"], document_hash="d" * 64,
-    )
-    result = EvidenceRequestController({
-        "arc": lambda requests: [{"request_key": request["request_key"], "record": unrelated}],
-        "inspire": lambda requests: [], "web": lambda requests: [],
-    }).resolve([request])
-
-    assert result.records == ()
-    assert result.supported_request_keys == ()
-    assert result.audit["rejected"][0]["reason"] == "insufficient_direct_support"
-
-
-def test_audit_is_bounded_and_never_embeds_full_evidence(monkeypatch) -> None:
-    secret_tail = "UNIQUE_FULL_TEXT_TAIL_" + "x" * 2000
-    _install_production_service_fixture(monkeypatch, section_text="prefix " + secret_tail)
-    yielded = []
-
-    def web_search(query):
-        for index in range(1000):
-            yielded.append(index)
-            yield {"url": f"https://example.test/{index}", "snippet": "discovery snippet"}
-
-    result = EvidenceRequestController(
-        adapter=ArcPaperEvidenceAdapter(web_search=web_search),
-        domain_paper_ids=["arXiv:1234.5678"],
-    ).resolve(normalize_evidence_requests("seg-1", [_request()]))
-
-    assert len(yielded) == 24
-    assert len(result.audit["lanes"]["web"]["raw_results"]) == 25
-    serialized = json.dumps(result.audit)
-    assert secret_tail not in serialized
-    assert max(
-        len(item.get("excerpt", ""))
-        for lane in result.audit["lanes"].values()
-        for item in lane["raw_results"]
-    ) <= 240
-
-
-def test_discovery_abstract_is_rejected_when_metadata_verification_fails() -> None:
-    adapter = _DiscoveryFixture()
-    adapter.get_metadata = lambda paper_id: None
-    adapter.get_parsed_source = lambda paper_id: None
-    request = _request()
-    request["candidate_paper_ids"] = []
-    result = EvidenceRequestController(adapter=adapter).resolve(
-        normalize_evidence_requests("seg-1", [request])
-    )
-
-    assert result.records == ()
-    assert result.evidence_ids_by_segment == {}
-
-    normalized = normalize_evidence_requests("seg-2", [_request()])
-    envelope = {
-        "request_key": normalized[0]["request_key"],
-        "record": _unverified_discovery_abstract(),
-    }
-    direct = EvidenceRequestController({
-        "arc": lambda requests: [],
-        "inspire": lambda requests: [envelope],
-        "web": lambda requests: [],
-    }).resolve(normalized)
-    assert direct.records == ()
-    assert direct.audit["rejected"][0]["reason"] == "unverified_discovery_abstract"
-
-
-def test_resolution_reruns_only_segments_with_registered_evidence_once(monkeypatch, tmp_path: Path) -> None:
-    segments = [
-        {"segment_id": "s1", "block_ids": ["b1"]},
-        {"segment_id": "s2", "block_ids": ["b2"]},
-        {"segment_id": "s3", "block_ids": ["b3"]},
+def test_duplicate_source_and_more_than_three_are_rejected() -> None:
+    value = _annotation()
+    value["commentary_sources"] = [_source(), _source()]
+    with pytest.raises(RuntimeError, match="duplicate"):
+        _validate_direct_annotation_sources(value)
+    value["commentary_sources"] = [
+        _source(f"https://example.org/{index}") for index in range(4)
     ]
-    requests = normalize_evidence_requests("s2", [_request()])
-    unresolved = normalize_evidence_requests("s3", [_request("later")])
-    annotations = {
-        "s1": {"commentary": "one", "explanation": "one", "prior_work": [], "later_work": [], "evidence_ids": [], "key_points": [], "source_notes": [], "evidence_requests": []},
-        "s2": {"commentary": "two", "explanation": "two", "prior_work": [], "later_work": [], "evidence_ids": [], "key_points": [], "source_notes": [], "evidence_requests": requests},
-        "s3": {"commentary": "three", "explanation": "three", "prior_work": [], "later_work": [{
-            "text": "unverified", "evidence_ids": ["missing"],
-            "source_locators": [{"evidence_id": "missing", "locator": "abstract"}],
-            "request_key": unresolved[0]["request_key"],
-        }], "evidence_ids": ["missing"], "key_points": [], "source_notes": [], "evidence_requests": unresolved},
+    with pytest.raises(RuntimeError, match="at most three"):
+        _validate_direct_annotation_sources(value)
+
+
+def test_offline_mode_accepts_only_bounded_source_urls() -> None:
+    value = _annotation()
+    allowed = {"https://example.org/paper", "https://example.org/prior"}
+    assert _validate_direct_annotation_sources(value, allowed_urls=allowed) == value
+    value["later_work"] = [{"text": "Unsupported.", "sources": [_source("https://new.example/x")]}]
+    with pytest.raises(RuntimeError, match="offline annotation"):
+        _validate_direct_annotation_sources(value, allowed_urls=allowed)
+
+
+def test_removed_controller_fields_are_not_persisted_from_empty_legacy_shape() -> None:
+    legacy = {
+        "explanation": "", "commentary": "", "prior_work": [], "later_work": [],
+        "key_points": [], "source_notes": [], "evidence_ids": [],
+        "context_claims": [], "evidence_requests": [],
     }
-    record = _record()
-    record["supported_request_keys"] = [requests[0]["request_key"]]
-
-    class Controller:
-        def resolve(self, material, *, existing_records):
-            assert {item["segment_id"] for item in material} == {"s2", "s3"}
-            return EvidenceResolution(
-                records=(record,), evidence_ids_by_segment={"s2": ("verified-paper",)},
-                supported_request_keys=(requests[0]["request_key"],),
-                audit={"schema_version": "arc.companion.evidence-resolution.v3", "requests": material, "lanes": {}, "accepted": [{
-                    "request_key": requests[0]["request_key"], "evidence_id": "verified-paper",
-                }], "rejected": []},
-            )
-
-    calls = []
-
-    def rerun(selected, **kwargs):
-        calls.append(([item["segment_id"] for item in selected], kwargs["round_number"]))
-        return {"s2": {
-            "commentary": "revised", "explanation": "revised", "prior_work": [{
-                "text": "supported", "evidence_ids": ["verified-paper"],
-                "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
-                "request_key": requests[0]["request_key"],
-            }],
-            "later_work": [], "evidence_ids": ["verified-paper"], "key_points": [],
-            "source_notes": [], "evidence_requests": [],
-        }}
-
-    monkeypatch.setattr("arc_companion.pipeline._generate_annotations", rerun)
-    document = {"blocks": [{"block_id": f"b{i}", "type": "text", "text": str(i)} for i in range(1, 4)]}
-    bundle = SourceBundle("arXiv:1", {"paper_id": "arXiv:1"}, document, {}, [], [])
-    final, merged = _resolve_and_rerun_evidence_requests(
-        segments, annotations, options=BuildOptions("arXiv:1", tmp_path), bundle=bundle,
-        evidence={"related_papers": []}, domain_context=None, glossary={}, protected_names=[],
-        checkpoint_dir=tmp_path, llm=lambda *args, **kwargs: {}, controller=Controller(),
-    )
-
-    assert calls == [(["s2"], 2)]
-    assert final["s1"]["commentary"] == "one"
-    assert final["s2"]["prior_work"][0]["text"] == "supported"
-    assert final["s3"]["later_work"] == []
-    assert all(not item["evidence_requests"] for item in final.values())
-    assert [item["evidence_id"] for item in merged["related_papers"]] == ["verified-paper"]
-    audit = __import__("json").loads((tmp_path / "evidence-resolution.v3.json").read_text())
-    assert audit["rerun_segments"] == ["s2"]
-    assert audit["final_claim_evidence_ids"]["s2"] == ["verified-paper"]
-    assert audit["final_claim_bindings"]["s2"][0]["source_locators"] == [
-        {"evidence_id": "verified-paper", "locator": "S1"}
-    ]
-
-
-def test_rerun_ignoring_request_evidence_drops_only_that_claim(monkeypatch, tmp_path: Path) -> None:
-    segment = {"segment_id": "s1", "block_ids": ["b1"]}
-    request = normalize_evidence_requests("s1", [_request()])[0]
-    generic = _record()
-    generic["evidence_id"] = "generic-prior"
-    resolved = _record()
-    resolved["supported_request_keys"] = [request["request_key"]]
-    first_claim = {
-        "text": "Existing supported context.", "evidence_ids": ["generic-prior"],
-        "source_locators": [{"evidence_id": "generic-prior", "locator": "S1"}],
-        "request_key": None,
+    normalized = _validate_direct_annotation_sources(legacy)
+    assert set(normalized) == {
+        "explanation", "commentary", "commentary_sources", "prior_work", "later_work",
     }
-    annotations = {"s1": {
-        "commentary": "one", "explanation": "one", "prior_work": [first_claim],
-        "later_work": [], "evidence_ids": ["generic-prior"], "key_points": [],
-        "source_notes": [], "evidence_requests": [request],
-    }}
-
-    class Controller:
-        def resolve(self, material, *, existing_records):
-            return EvidenceResolution(
-                records=(resolved,), evidence_ids_by_segment={"s1": ("verified-paper",)},
-                supported_request_keys=(request["request_key"],),
-                audit={
-                    "schema_version": "arc.companion.evidence-resolution.v3",
-                    "requests": material, "lanes": {}, "rejected": [],
-                    "accepted": [{
-                        "request_key": request["request_key"],
-                        "evidence_id": "verified-paper",
-                    }],
-                },
-            )
-
-    def rerun(_selected, **_kwargs):
-        return {"s1": {
-            "commentary": "revised", "explanation": "revised",
-            "prior_work": [
-                first_claim,
-                {
-                    "text": "Requested but bound to unrelated same-relation evidence.",
-                    "evidence_ids": ["generic-prior"],
-                    "source_locators": [{"evidence_id": "generic-prior", "locator": "S1"}],
-                    "request_key": request["request_key"],
-                },
-            ],
-            "later_work": [], "evidence_ids": ["generic-prior"], "key_points": [],
-            "source_notes": [], "evidence_requests": [],
-        }}
-
-    monkeypatch.setattr("arc_companion.pipeline._generate_annotations", rerun)
-    document = {"blocks": [{"block_id": "b1", "type": "text", "text": "Verified"}]}
-    bundle = SourceBundle("arXiv:1", {"paper_id": "arXiv:1"}, document, {}, [], [])
-    final, _ = _resolve_and_rerun_evidence_requests(
-        [segment], annotations, options=BuildOptions("arXiv:1", tmp_path), bundle=bundle,
-        evidence={"related_papers": [generic]}, domain_context=None, glossary={},
-        protected_names=[], checkpoint_dir=tmp_path, llm=lambda *args, **kwargs: {},
-        controller=Controller(),
-    )
-
-    assert final["s1"]["prior_work"] == [first_claim]
-    assert final["s1"]["evidence_ids"] == ["generic-prior"]
 
 
-def test_context_request_rerun_consumes_bound_context_evidence(monkeypatch, tmp_path: Path) -> None:
-    segment = {"segment_id": "s1", "block_ids": ["b1"]}
-    request = normalize_evidence_requests("s1", [_request("context")])[0]
-    record = _record("context")
-    record["supported_request_keys"] = [request["request_key"]]
-    annotations = {"s1": {
-        "commentary": "draft", "explanation": "draft", "prior_work": [],
-        "later_work": [], "context_claims": [], "evidence_ids": [],
-        "key_points": [], "source_notes": [], "evidence_requests": [request],
-    }}
-
-    class Controller:
-        def resolve(self, material, *, existing_records):
-            return EvidenceResolution(
-                records=(record,), evidence_ids_by_segment={"s1": ("verified-paper",)},
-                supported_request_keys=(request["request_key"],),
-                audit={"requests": material, "lanes": {}, "rejected": [], "accepted": [{
-                    "request_key": request["request_key"], "evidence_id": "verified-paper",
-                }]},
-            )
-
-    monkeypatch.setattr("arc_companion.pipeline._generate_annotations", lambda selected, **kwargs: {
-        "s1": {
-            "commentary": "context used", "explanation": "context used",
-            "prior_work": [], "later_work": [], "context_claims": [{
-                "text": "The specific mechanism supports the historical claim.",
-                "evidence_ids": ["verified-paper"],
-                "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
-                "request_key": request["request_key"],
-            }],
-            "evidence_ids": ["verified-paper"], "key_points": [],
-            "source_notes": [], "evidence_requests": [],
-        },
-    })
+def test_annotation_accepts_a_new_direct_source_in_one_call(tmp_path) -> None:
+    document = {
+        "front_matter": {},
+        "blocks": [{"block_id": "b1", "type": "text", "text": "A physical claim."}],
+        "equations": [], "figures": [], "tables": [], "assets": [], "bibliography": [],
+    }
     bundle = SourceBundle(
-        "arXiv:1", {"paper_id": "arXiv:1"},
-        {"blocks": [{"block_id": "b1", "type": "text", "text": "source"}]},
-        {}, [], [],
+        paper_id="local:direct-source", parsed={"document": document}, document=document,
+        metadata={"title": "Source"}, references=[], citers=[],
     )
-    final, _ = _resolve_and_rerun_evidence_requests(
-        [segment], annotations, options=BuildOptions("arXiv:1", tmp_path), bundle=bundle,
-        evidence={"related_papers": []}, domain_context=None, glossary={},
-        protected_names=[], checkpoint_dir=tmp_path, llm=lambda *args, **kwargs: {},
-        controller=Controller(),
+    calls = []
+
+    def llm(_prompt: str, **kwargs):
+        calls.append(kwargs["call_label"])
+        return _annotation()
+
+    result = _generate_annotations(
+        [{"segment_id": "seg-1", "block_ids": ["b1"]}],
+        options=BuildOptions(
+            paper_id=bundle.paper_id, project_dir=tmp_path, workers=1, allow_internet=True,
+        ),
+        bundle=bundle, evidence={"related_papers": [], "references": [], "citers": []},
+        domain_context=None, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=tmp_path / "checkpoint", llm=llm,
     )
-
-    assert final["s1"]["context_claims"][0]["request_key"] == request["request_key"]
-    assert final["s1"]["evidence_ids"] == ["verified-paper"]
-
-
-def test_review_cannot_add_related_work_from_relation_level_id(tmp_path: Path) -> None:
-    record = _record()
-    segment = {"segment_id": "s1", "block_ids": ["b1"]}
-    annotations = {"s1": {
-        "commentary": "commentary", "explanation": "explanation",
-        "prior_work": [], "later_work": [], "evidence_ids": [],
-        "key_points": [], "source_notes": [], "evidence_requests": [],
-    }}
-
-    def reviewer(_prompt, **_kwargs):
-        return {"patches": [{
-            "segment_id": "s1", "translation_blocks": None,
-            "commentary": None, "explanation": None,
-            "prior_work": [{
-                "text": "Invented prior-work fact.", "evidence_ids": ["verified-paper"],
-                "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
-                "request_key": None,
-            }], "later_work": None,
-            "evidence_ids": ["verified-paper"], "reason": "invent",
-        }], "issues": []}
-
-    with pytest.raises(RuntimeError, match="review added a related-work claim"):
-        _review(
-            [segment], {"s1": {"blocks": [{"block_id": "b1", "text": "译文"}]}},
-            annotations,
-            document={"blocks": [{"block_id": "b1", "type": "text", "text": "Verified paper passage."}]},
-            glossary={"entries": []}, protected_names=[],
-            evidence={"related_papers": [record]},
-            options=BuildOptions("arXiv:1", tmp_path, review_context_chars=100_000),
-            llm=reviewer, checkpoint_dir=tmp_path,
-        )
-
-
-def test_review_cannot_rewrite_text_while_reusing_a_claim_binding(tmp_path: Path) -> None:
-    record = _record()
-    claim = {
-        "text": "Verified prior statement.", "evidence_ids": ["verified-paper"],
-        "source_locators": [{"evidence_id": "verified-paper", "locator": "S1"}],
-        "request_key": None,
-    }
-    annotations = {"s1": {
-        "commentary": "commentary", "explanation": "explanation",
-        "prior_work": [claim], "later_work": [], "evidence_ids": ["verified-paper"],
-        "key_points": [], "source_notes": [], "evidence_requests": [],
-    }}
-
-    def reviewer(_prompt, **_kwargs):
-        return {"patches": [{
-            "segment_id": "s1", "translation_blocks": None,
-            "commentary": None, "explanation": None,
-            "prior_work": [{**claim, "text": "A materially different claim."}],
-            "later_work": None, "evidence_ids": None, "reason": "rewrite",
-        }], "issues": []}
-
-    with pytest.raises(RuntimeError, match="review added a related-work claim"):
-        _review(
-            [{"segment_id": "s1", "block_ids": ["b1"]}],
-            {"s1": {"blocks": [{"block_id": "b1", "text": "译文"}]}},
-            annotations,
-            document={"blocks": [{
-                "block_id": "b1", "type": "text", "text": "Verified paper passage.",
-            }]},
-            glossary={"entries": []}, protected_names=[],
-            evidence={"related_papers": [record]},
-            options=BuildOptions("arXiv:1", tmp_path, review_context_chars=100_000),
-            llm=reviewer, checkpoint_dir=tmp_path,
-        )
+    assert calls == ["companion-annotation-seg-1"]
+    assert result["seg-1"] == _annotation()
+    assert not list((tmp_path / "checkpoint").glob("evidence-resolution*"))

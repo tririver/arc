@@ -61,6 +61,22 @@ def test_recursive_codex_validator_rejects_optional_nested_property() -> None:
         validate_codex_strict_schema(schema)
 
 
+def test_codex_validator_rejects_unsupported_one_of_before_provider_submission() -> None:
+    schema = {
+        "type": "object",
+        "required": ["value"],
+        "properties": {
+            "value": {
+                "oneOf": [{"type": "string"}, {"type": "null"}],
+            }
+        },
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(CodexSchemaError, match=r"properties\.value\.oneOf is not supported"):
+        validate_codex_strict_schema(schema)
+
+
 def test_streaming_process_idle_timeout_covers_blocked_stdin_delivery() -> None:
     started = time.monotonic()
     with pytest.raises(LLMWorkerTimeout, match="no meaningful output"):
