@@ -19,7 +19,7 @@ def run_chapter_pipeline(
     workers: int,
     prepare_guide: Callable[[Mapping[str, Any]], dict[str, Any]],
     prepare_segments: Callable[[Mapping[str, Any]], list[dict[str, Any]]],
-    run_translation: Callable[[PreparedChapter, Mapping[str, Any]], Any],
+    run_translation: Callable[[PreparedChapter, Mapping[str, Any]], Any] | None,
     run_companion: Callable[[PreparedChapter, Mapping[str, Any]], Any],
     stop_after_first_chapter: bool = False,
     stop_event: Event | None = None,
@@ -80,11 +80,11 @@ def run_chapter_pipeline(
 
     def run_chapter(chapter: dict[str, Any]) -> dict[str, Any]:
         prepared = prepare(chapter)
-        with ThreadPoolExecutor(max_workers=2) as phase:
-            futures = {
-                "translation": phase.submit(lane, prepared, run_translation),
-                "companion": phase.submit(lane, prepared, run_companion),
-            }
+        with ThreadPoolExecutor(max_workers=2 if run_translation is not None else 1) as phase:
+            futures = {}
+            if run_translation is not None:
+                futures["translation"] = phase.submit(lane, prepared, run_translation)
+            futures["companion"] = phase.submit(lane, prepared, run_companion)
             outputs: dict[str, Any] = {}
             for name, future in futures.items():
                 try:
@@ -93,7 +93,12 @@ def run_chapter_pipeline(
                     pass
             if first_failure:
                 raise first_failure[0]
-            return {"guide": prepared.guide, "segments": prepared.segments, **outputs}
+            return {
+                "guide": prepared.guide,
+                "segments": prepared.segments,
+                "translation": {},
+                **outputs,
+            }
 
     results: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=min(max(1, len(selected)), workers)) as executor:

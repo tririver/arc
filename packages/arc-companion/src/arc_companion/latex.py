@@ -322,7 +322,12 @@ def render_companion_tex(
     )
     glossary_tex = _render_glossary(glossary, language=language)
     tex = (
-        _preamble(title=title, authors=author_text, language=language)
+        _preamble(
+            title=title,
+            authors=author_text,
+            language=language,
+            include_translation=translation_mode,
+        )
         + front_body
         + guide
         + glossary_tex
@@ -421,7 +426,16 @@ def validate_tex_fidelity(tex: str, document: dict[str, Any], manifest: dict[str
     return errors
 
 
-def _preamble(*, title: Any, authors: str, language: str) -> str:
+def _preamble(
+    *, title: Any, authors: str, language: str, include_translation: bool = True,
+) -> str:
+    translation_definitions = rf"""
+\definecolor{{ArcTranslationBackground}}{{HTML}}{{F0F7F3}}
+\definecolor{{ArcTranslationRule}}{{HTML}}{{6E9B89}}
+\newtcolorbox{{arctranslation}}[1][]{{enhanced,breakable,sharp corners,boxrule=0pt,
+  leftrule=1.2pt,colback=ArcTranslationBackground,colframe=ArcTranslationRule,
+  left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=8pt,#1}}
+""" if include_translation else ""
     return rf"""\documentclass[11pt,a4paper]{{article}}
 \usepackage{{amsmath,amssymb,mathtools}}
 \usepackage{{graphicx,longtable,array,multirow,hyperref,xcolor,needspace}}
@@ -451,14 +465,10 @@ def _preamble(*, title: Any, authors: str, language: str) -> str:
 }}}}}}}}
 \usepackage[margin=25mm]{{geometry}}
 \hypersetup{{hidelinks}}
-\definecolor{{ArcTranslationBackground}}{{HTML}}{{F0F7F3}}
-\definecolor{{ArcTranslationRule}}{{HTML}}{{6E9B89}}
 \definecolor{{ArcCompanionBackground}}{{HTML}}{{FAF3E8}}
 \definecolor{{ArcCompanionRule}}{{HTML}}{{A8735D}}
 \newenvironment{{arcsource}}{{\par\begingroup}}{{\par\endgroup}}
-\newtcolorbox{{arctranslation}}[1][]{{enhanced,breakable,sharp corners,boxrule=0pt,
-  leftrule=1.2pt,colback=ArcTranslationBackground,colframe=ArcTranslationRule,
-  left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=8pt,#1}}
+{translation_definitions}
 \newtcolorbox{{arccompanion}}[1][]{{enhanced,breakable,sharp corners,boxrule=0pt,
   leftrule=1.2pt,colback=ArcCompanionBackground,colframe=ArcCompanionRule,
   left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=12pt,#1}}
@@ -1260,6 +1270,19 @@ def _validate_companion_layers(tex: str, audit: dict[str, Any]) -> list[str]:
             errors.append("translations do not cover every semantic segment exactly once")
         if provided_translations - known_ids:
             errors.append("translations contain unknown segment ids")
+    else:
+        if provided_translations:
+            errors.append("translation-disabled manifest contains provided translation segment ids")
+        if rendered_translations:
+            errors.append("translation-disabled manifest contains rendered translation segment ids")
+        if audit.get("translations"):
+            errors.append("translation-disabled manifest contains translation audit records")
+        if "ARC-TRANSLATION" in tex:
+            errors.append("translation-disabled TeX contains translation markers")
+        if re.search(
+            r"\\(?:begin|end|newtcolorbox)\s*\{\s*arctranslation\s*\}", tex
+        ):
+            errors.append("translation-disabled TeX contains the arctranslation environment")
 
     for segment_id in semantic_ids:
         companion_region = _layer_region(tex, "COMPANION", segment_id)

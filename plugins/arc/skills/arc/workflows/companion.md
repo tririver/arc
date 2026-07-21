@@ -20,7 +20,7 @@ with `zh-CN`:
 默认使用中文生成伴读；如需切换伴读语言，请直接指定目标语言。
 ```
 
-The language applies to translation and commentary. Keep source text in its
+The language applies to generated reader material. Keep source text in its
 original language. Default to `provider=auto` and `workers=24`. Reuse a domain
 only when the user explicitly supplies `--domain-id` or `--domain-manifest`.
 
@@ -37,6 +37,26 @@ kind. A paired-PDF cache without a PDF hash and reconciliation proof is stale
 and must be recached. Never silently substitute rich-source headings when PDF
 boundaries conflict or alignment is ambiguous.
 
+### Step 3: Decide whether translation is needed
+
+After parsing, the agent running this workflow must inspect substantive body
+text near the beginning, middle, and end of the rich source. Do not decide from
+the title, abstract alone, metadata, table of contents, Index, bibliography, or
+filename. The program does not detect the source language.
+
+Compare source and target by base language. Normalize tags case-insensitively,
+convert underscores to hyphens, and compare their primary language subtags:
+`EN_US`, `EN_UK`, and `en-GB` are `en`; simplified and traditional Chinese
+tags are both `zh`. Use the analogous primary-subtag rule for other languages.
+Only choose `translation_mode=skip` when all three samples clearly have the
+same base language as the target. Mixed-language or uncertain source text must
+use `translation_mode=translate`.
+
+Record `source_language`, `source_base_language`, `target_language`,
+`target_base_language`, `translation_mode`, and a short `translation_reason`
+in `<project-dir>/context.json`. The reason should identify the beginning,
+middle, and end sampling result without copying long source passages.
+
 ## Phase 2: Build by Chapter
 
 ### Step 1: Start or resume the build
@@ -50,6 +70,10 @@ arc-companion build <source-id> \
   --workers <workers> \
   --json
 ```
+
+When Phase 1 selected `translation_mode=skip`, add `--skip-translation` to the
+build command. Otherwise omit it. Never pass the flag merely because source
+metadata, a title, or a short excerpt appears to match the target language.
 
 Use `--recache` to rebuild cached parsing and PDF reconciliation, `--refresh`
 only when fresh remote data was requested, and never both. Useful controls are
@@ -96,9 +120,16 @@ chapter and segment IDs such as `ch-0001` and `ch-0001.seg-0001`.
 
 ### Step 4: Run ordered stateful lanes
 
-Start independent translation and commentary sessions for the chapter.
-Translation uses the medium tier; commentary uses the high tier. The two lanes
-may run concurrently, but each lane advances strictly in segment order.
+Normally, start independent translation and commentary sessions for the
+chapter. Translation uses the medium tier; commentary uses the high tier. The
+two lanes may run concurrently, but each lane advances strictly in segment
+order. With `--skip-translation`, do not start or resume a translation session;
+the commentary lane and all chapter preparation continue normally.
+
+In skip mode, review must use the commentary-only branch and reject any
+translation patch. Do not migrate an old translation; record that decision in
+the migration receipt. These requirements apply to both chaptered builds and
+the legacy non-chaptered path. Omitting the flag preserves the two-lane default.
 
 The bootstrap turn contains fixed rules, chapter guide, chapter structure,
 chapter glossary, and the first segment. Later turns contain only the current
@@ -158,19 +189,21 @@ arc-jobs watch <job-id> --until-review --json
 
 For interactive review, add `--stop-after-first-chapter`. Schedule only the
 first substantive chapter. Return `first_chapter_ready` only after its guide,
-both ordered lanes, evidence, chapter review, typesetting, and PDF validation
-finish. Do not start chapter two. After approval, rerun without the flag; the
-accepted first chapter remains frozen. Never present the first-chapter PDF as
-the completed document.
+all enabled ordered lanes, evidence, chapter review, typesetting, and PDF
+validation finish. Do not start chapter two. After approval, rerun without the
+flag; the accepted first chapter remains frozen. Never present the first-chapter
+PDF as the completed document.
 
 ## Phase 3: Render and Validate
 
 ### Step 1: Render the reader document
 
 Place one chapter guide immediately after each chapter title and before its
-first source segment. Render each segment as original, translation, then
-commentary. Distinguish layers by styling without visible `译文`, `伴读`, or
-controller labels; use `解释` where an explanation heading is needed.
+first source segment. Normally render each segment as original, translation,
+then commentary. With `--skip-translation`, render original followed by
+commentary and do not create a translation layer. Distinguish layers by styling
+without visible `译文`, `伴读`, or controller labels; use `解释` where an
+explanation heading is needed.
 
 Use sans-serif text for source, guide, translation, commentary, and glossary,
 with CJK fallbacks `Noto Sans CJK SC`, `Source Han Sans SC/CN`, then
@@ -185,9 +218,10 @@ arc-companion validate --project-dir <project-dir> --json
 
 Require exact chapter and segment coverage, one guide per chapter in the right
 position, faithful source objects and links, glossary completeness, accepted
-lane ledgers, protected names, searchable text, valid fonts, and no clipping or
-overlap. Use invisible manifest or TeX markers for hierarchy checks rather than
-reader-visible labels.
+enabled-lane ledgers, protected names, searchable text, valid fonts, and no
+clipping or overlap. In skip mode, require that the manifest contains no
+translation IDs and TeX contains no translation markers. Use invisible
+manifest or TeX markers for hierarchy checks rather than reader-visible labels.
 
 ### Step 3: Deliver
 

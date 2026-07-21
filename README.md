@@ -287,6 +287,15 @@ Use `--document-kind auto|article|book` to select the structure policy,
 translations. `--stop-after-first-chapter` provides the interactive validation
 boundary.
 
+For a managed companion workflow, the executing agent inspects substantive
+source body text near the beginning, middle, and end before building. It
+compares normalized base languages (`EN_US`, `EN_UK`, and `en-GB` are `en`;
+simplified and traditional Chinese are `zh`) and records the source judgment,
+target language, translation mode, and reason in `context.json`. If all samples
+clearly match the target base language, the agent passes `--skip-translation`;
+mixed or uncertain text keeps translation. The CLI itself does not perform
+language detection.
+
 ARC reconciles PDF structure with rich-source blocks and validates exact
 chapter and segment coverage. Chapters may prepare concurrently under one
 global `workers` budget. Within each chapter, semantic segmentation and a
@@ -295,6 +304,11 @@ sessions. A bootstrap turn carries fixed chapter context; later turns carry
 only the current segment, cursor, source hash, terms, and evidence. Stable
 idempotency keys and accepted-block ledgers make routine resume automatic
 without repeating accepted provider calls.
+
+With `--skip-translation`, ARC runs the guide, segmentation, glossary,
+commentary, evidence, review, typesetting, and validation stages without
+creating a translation session, call, ledger, checkpoint, overlay, artifact, or
+PDF layer. The default remains the two-lane translation-and-commentary build.
 
 A real Index becomes the complete global glossary, including nested entries,
 page ranges, `see`, and `see also`; it is never truncated. Documents without an

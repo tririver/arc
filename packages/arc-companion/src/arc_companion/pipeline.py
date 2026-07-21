@@ -65,6 +65,7 @@ from .prompts import (
     TRANSLATION_COVERAGE_REPAIR_SCHEMA,
     TRANSLATION_SCHEMA,
     TRANSLATION_SLOT_REPAIR_SCHEMA,
+    COMMENTARY_REVIEW_SCHEMA,
     REVIEW_SCHEMA,
     SECTION_REVIEW_SCHEMA,
     PROMPT_VERSION,
@@ -74,6 +75,7 @@ from .prompts import (
     TRANSLATION_RETRY_PROMPT_VERSION,
     TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
     annotation_prompt,
+    commentary_review_prompt,
     review_prompt,
     section_review_prompt,
     translation_coverage_repair_prompt,
@@ -110,7 +112,7 @@ from .stateful_pipeline import (
 )
 
 
-WORKFLOW_VERSION = "arc.companion.workflow.v10"
+WORKFLOW_VERSION = "arc.companion.workflow.v11"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -132,16 +134,17 @@ ANNOTATION_PROMPT_MAX_BYTES = 60 * 1024
 ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
 ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
 REVIEW_TIER = "medium"
-REVIEW_VERSION = "arc.companion.review.v4"
+REVIEW_VERSION = "arc.companion.review.v5"
 ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v6"
 SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v1"
+COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v1"
 SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v1"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
-FINAL_RENDER_VERSION = "arc.companion.final-render.v4"
+FINAL_RENDER_VERSION = "arc.companion.final-render.v5"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
 CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
 CONTEXT_SEGMENT_CHARS_TOTAL = 12_000
@@ -251,6 +254,7 @@ class BuildOptions:
     domain_id: str | None = None
     domain_manifest: Path | None = None
     allow_internet: bool = True
+    skip_translation: bool = False
     context_paper_ids: tuple[str, ...] = ()
     stop_after_first_chapter: bool = False
     document_kind: str = "auto"
@@ -366,6 +370,7 @@ def _build_companion_unlocked(
         state_path,
         status="loading_source",
         paper_id=options.paper_id,
+        translation_mode="skipped" if options.skip_translation else "enabled",
         notice=notice,
         diagnostics=[],
     )
@@ -502,11 +507,12 @@ def _build_companion_unlocked(
         )
         translations = first_wave_results["translation"]
         raw_annotations = first_wave_results["annotation"]
-        write_json(checkpoint_dir / "translations.first-wave.v1.json", {
-            "schema_version": "arc.companion.translations-first-wave.v1",
-            "segment_ids": [str(item["segment_id"]) for item in first_wave],
-            "translations": translations,
-        })
+        if not options.skip_translation:
+            write_json(checkpoint_dir / "translations.first-wave.v1.json", {
+                "schema_version": "arc.companion.translations-first-wave.v1",
+                "segment_ids": [str(item["segment_id"]) for item in first_wave],
+                "translations": translations,
+            })
         write_json(checkpoint_dir / "annotations.first-wave.v1.json", {
             "schema_version": "arc.companion.annotations-first-wave.v1",
             "segment_ids": [str(item["segment_id"]) for item in first_wave],
@@ -517,7 +523,7 @@ def _build_companion_unlocked(
             document=_first_wave_preview_document(bundle.document, first_wave),
             segments=first_wave,
             annotations=raw_annotations,
-            translations=translations,
+            translations=None if options.skip_translation else translations,
             evidence=evidence,
             glossary=glossary,
             metadata=bundle.metadata,
@@ -594,8 +600,8 @@ def _build_companion_unlocked(
 
         _state(state_path, status="reviewing", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
                segment_count=len(expanded))
-        reviewed_path = checkpoint_dir / "annotations.reviewed.v4.json"
-        review_path = checkpoint_dir / "review.v4.json"
+        reviewed_path = checkpoint_dir / "annotations.reviewed.v5.json"
+        review_path = checkpoint_dir / "review.v5.json"
         if (
             reviewed_path.is_file()
             and review_path.is_file()
@@ -609,14 +615,16 @@ def _build_companion_unlocked(
                 or cached_reviewed.get("schema_version") != REVIEW_VERSION
             ):
                 raise RuntimeError("invalid review checkpoint")
-            cached_reviewed, normalized_cached_segments = (
-                _repair_reviewed_translation_checkpoint(
-                    reviewed_path,
-                    expanded,
-                    {block_id(block): block for block in bundle.document.get("blocks") or []},
-                    protected_names=protected_names,
+            normalized_cached_segments: list[str] = []
+            if not options.skip_translation:
+                cached_reviewed, normalized_cached_segments = (
+                    _repair_reviewed_translation_checkpoint(
+                        reviewed_path,
+                        expanded,
+                        {block_id(block): block for block in bundle.document.get("blocks") or []},
+                        protected_names=protected_names,
+                    )
                 )
-            )
             if normalized_cached_segments:
                 review = {
                     **review,
@@ -629,9 +637,14 @@ def _build_companion_unlocked(
             reviewed_translations = cached_reviewed.get("translations")
             if (
                 not isinstance(reviewed, dict)
-                or not isinstance(reviewed_translations, dict)
                 or set(reviewed) != {segment["segment_id"] for segment in expanded}
-                or set(reviewed_translations) != set(reviewed)
+                or (
+                    not options.skip_translation
+                    and (
+                        not isinstance(reviewed_translations, dict)
+                        or set(reviewed_translations) != set(reviewed)
+                    )
+                )
             ):
                 raise RuntimeError("review checkpoint does not match current segments")
             cached_reader_evidence = _reader_evidence_by_segment(
@@ -648,16 +661,23 @@ def _build_companion_unlocked(
                 )
                 for segment_id, annotation in reviewed.items()
             }
-            reviewed_translations = {
-                str(segment_id): clean_reader_translation(translation)
-                for segment_id, translation in reviewed_translations.items()
-            }
+            if not options.skip_translation:
+                reviewed_translations = {
+                    str(segment_id): clean_reader_translation(translation)
+                    for segment_id, translation in reviewed_translations.items()
+                }
+            else:
+                reviewed_translations = None
             if (
                 reviewed != cached_reviewed.get("annotations")
-                or reviewed_translations != cached_reviewed.get("translations")
+                or (
+                    not options.skip_translation
+                    and reviewed_translations != cached_reviewed.get("translations")
+                )
             ):
                 cached_reviewed["annotations"] = reviewed
-                cached_reviewed["translations"] = reviewed_translations
+                if not options.skip_translation:
+                    cached_reviewed["translations"] = reviewed_translations
                 write_json(reviewed_path, cached_reviewed)
         else:
             reviewed_translations, reviewed, review = _review(
@@ -672,11 +692,14 @@ def _build_companion_unlocked(
                 llm=llm,
                 checkpoint_dir=checkpoint_dir,
             )
-            write_json(reviewed_path, {
+            reviewed_payload = {
                 "schema_version": REVIEW_VERSION,
-                "translations": reviewed_translations,
+                "translation_mode": "skipped" if options.skip_translation else "enabled",
                 "annotations": reviewed,
-            })
+            }
+            if not options.skip_translation:
+                reviewed_payload["translations"] = reviewed_translations
+            write_json(reviewed_path, reviewed_payload)
             write_json(review_path, review)
 
         _state(state_path, status="typesetting", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
@@ -719,6 +742,7 @@ def _build_companion_unlocked(
             source_manifest_path=str(manifest_path),
             validation_path=str(validation_path),
             final_render_version=FINAL_RENDER_VERSION,
+            translation_mode="skipped" if options.skip_translation else "enabled",
             checkpoint_dir=str(checkpoint_dir),
             diagnostics=list(diagnostics),
         )
@@ -791,6 +815,7 @@ def _build_chaptered_companion(
         "schema_version": "arc.companion.migration-metadata.v1",
         "source_hash": migration_source_hash,
         "language": options.annotation_language,
+        "translation_mode": "skipped" if options.skip_translation else "enabled",
         "prompt_hash": migration_prompt_hash,
         "validator_hash": migration_validator_hash,
     })
@@ -819,7 +844,13 @@ def _build_chaptered_companion(
             "read_only_source": True,
             "cuts": cut_migration,
             "glossary": glossary_migration,
-            "translations": {"ledgers": {}, "receipts": []},
+            "translations": {
+                "ledgers": {},
+                "receipts": ([{
+                    "status": "skipped",
+                    "reason": "translation_disabled_for_same_language_source",
+                }] if options.skip_translation else []),
+            },
             "never_migrated": list(NEVER_MIGRATED_ARTIFACTS),
         }
         write_json(checkpoint_dir / "legacy-migration.json", migration_report)
@@ -890,7 +921,7 @@ def _build_chaptered_companion(
         segments = [{**item, "chapter_id": chapter_id,
                      "segment_id": f"{chapter_id}.seg-{index:04d}"}
                     for index, item in enumerate(raw, 1)]
-        if legacy is not None:
+        if legacy is not None and not options.skip_translation:
             translation_migration = migrate_legacy_translations(
                 legacy_translation_candidates(legacy),
                 metadata=_legacy_metadata_view(legacy),
@@ -1303,7 +1334,10 @@ def _build_chaptered_companion(
             "workers": options.workers,
             "prepare_guide": prepare_guide,
             "prepare_segments": prepare_segments,
-            "run_translation": lambda prepared, segment: run_lane(prepared, segment, "translation"),
+            "run_translation": (
+                None if options.skip_translation
+                else lambda prepared, segment: run_lane(prepared, segment, "translation")
+            ),
             "run_companion": lambda prepared, segment: run_lane(prepared, segment, "companion"),
             "stop_event": supervision_event,
         }
@@ -1340,8 +1374,10 @@ def _build_chaptered_companion(
                 "error": {"code": "companion_needs_supervision", "message": str(exc)},
                 "errors": [], "meta": {"diagnostics": list(diagnostics)}}
     segments = [item for chapter in chapter_results.values() for item in chapter["segments"]]
-    translations = {key: value for chapter in chapter_results.values()
-                    for key, value in chapter["translation"].items()}
+    translations = None if options.skip_translation else {
+        key: value for chapter in chapter_results.values()
+        for key, value in chapter["translation"].items()
+    }
     annotations = {key: value for chapter in chapter_results.values()
                    for key, value in chapter["companion"].items()}
     annotations, evidence = _resolve_and_rerun_evidence_requests(
@@ -1394,13 +1430,20 @@ def _build_chaptered_companion(
         first_id = selected_chapters[0]["chapter_id"]
         first_segment_ids = [item["segment_id"] for item in chapter_results[first_id]["segments"]]
         freeze = {
-            "schema_version": "arc.companion.first-chapter-freeze.v2",
+            "schema_version": "arc.companion.first-chapter-freeze.v3",
+            "translation_mode": "skipped" if options.skip_translation else "enabled",
             "chapter_id": first_id,
             "chapter_sha256": sha256_json(selected_chapters[0]),
             "guide_sha256": sha256_json(guides[first_id]),
-            "pre_review_translation_sha256": sha256_json(chapter_results[first_id]["translation"]),
+            "pre_review_translation_sha256": (
+                None if options.skip_translation
+                else sha256_json(chapter_results[first_id]["translation"])
+            ),
             "pre_review_annotation_sha256": sha256_json(chapter_results[first_id]["companion"]),
-            "translation_sha256": sha256_json({value: translations[value] for value in first_segment_ids}),
+            "translation_sha256": (
+                None if options.skip_translation
+                else sha256_json({value: translations[value] for value in first_segment_ids})
+            ),
             "annotation_sha256": sha256_json({value: annotations[value] for value in first_segment_ids}),
             "tex_sha256": artifact["tex_sha256"], "pdf_sha256": artifact["pdf_sha256"],
             "manifest_sha256": artifact["manifest_sha256"],
@@ -1423,6 +1466,7 @@ def _build_chaptered_companion(
                    validation_path=artifact["validation_path"],
                    validation_sha256=artifact["validation_sha256"],
                    final_render_version=FINAL_RENDER_VERSION,
+                   translation_mode="skipped" if options.skip_translation else "enabled",
                    notice=notice, diagnostics=list(diagnostics))
     progress.safe_boundary(status, artifact_paths=[artifact["pdf_path"]], substantive=True)
     return {"ok": True, "status": status, "data": final, "errors": [],
@@ -1659,6 +1703,7 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "domain_id": options.domain_id,
         "domain_manifest": str(options.domain_manifest) if options.domain_manifest else None,
         "allow_internet": options.allow_internet,
+        "skip_translation": options.skip_translation,
         "context_paper_ids": list(options.context_paper_ids),
         "stop_after_first_chapter": options.stop_after_first_chapter,
         "document_kind": options.document_kind,
@@ -1681,6 +1726,7 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         domain_id=value.get("domain_id"),
         domain_manifest=Path(value["domain_manifest"]) if value.get("domain_manifest") else None,
         allow_internet=bool(value.get("allow_internet", True)),
+        skip_translation=bool(value.get("skip_translation", False)),
         context_paper_ids=tuple(value.get("context_paper_ids") or ()),
         stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
         document_kind=str(value.get("document_kind") or "auto"),
@@ -1701,9 +1747,10 @@ def _load_first_chapter_freeze(
         return None
     freeze = read_json(path)
     if (
-        freeze.get("schema_version") != "arc.companion.first-chapter-freeze.v2"
+        freeze.get("schema_version") != "arc.companion.first-chapter-freeze.v3"
         or not chapters or freeze.get("chapter_id") != chapters[0].get("chapter_id")
         or freeze.get("chapter_sha256") != sha256_json(chapters[0])
+        or freeze.get("translation_mode") not in {"enabled", "skipped"}
     ):
         raise RuntimeError("the confirmed first chapter freeze manifest is invalid")
     return freeze
@@ -1714,9 +1761,15 @@ def _verify_frozen_first_chapter_pre_review(
 ) -> None:
     chapter_id = str(freeze["chapter_id"])
     result = results.get(chapter_id)
-    if not result or any((
+    if not isinstance(result, dict):
+        raise RuntimeError("the confirmed first chapter result is missing before review")
+    translation_hash = (
+        None if freeze.get("translation_mode") == "skipped"
+        else sha256_json(result["translation"])
+    )
+    if any((
         sha256_json(result["guide"]) != freeze.get("guide_sha256"),
-        sha256_json(result["translation"]) != freeze.get("pre_review_translation_sha256"),
+        translation_hash != freeze.get("pre_review_translation_sha256"),
         sha256_json(result["companion"]) != freeze.get("pre_review_annotation_sha256"),
     )):
         raise RuntimeError("the confirmed first chapter changed before remaining chapters started")
@@ -1724,13 +1777,19 @@ def _verify_frozen_first_chapter_pre_review(
 
 def _verify_frozen_first_chapter_final(
     freeze: dict[str, Any], results: dict[str, dict[str, Any]], *,
-    translations: dict[str, Any], annotations: dict[str, Any],
+    translations: dict[str, Any] | None, annotations: dict[str, Any],
 ) -> None:
     chapter_id = str(freeze["chapter_id"])
-    segment_ids = [item["segment_id"] for item in results[chapter_id]["segments"]]
+    result = results.get(chapter_id)
+    if not isinstance(result, dict):
+        raise RuntimeError("the confirmed first chapter result is missing after review")
+    segment_ids = [item["segment_id"] for item in result["segments"]]
+    translation_hash = (
+        None if freeze.get("translation_mode") == "skipped"
+        else sha256_json({value: translations[value] for value in segment_ids})
+    )
     if (
-        sha256_json({value: translations[value] for value in segment_ids})
-        != freeze.get("translation_sha256")
+        translation_hash != freeze.get("translation_sha256")
         or sha256_json({value: annotations[value] for value in segment_ids})
         != freeze.get("annotation_sha256")
     ):
@@ -1739,11 +1798,14 @@ def _verify_frozen_first_chapter_final(
 
 def _write_review_overlays(
     checkpoint_dir: Path, chapter_results: dict[str, dict[str, Any]], *,
-    translations: dict[str, Any], annotations: dict[str, Any],
+    translations: dict[str, Any] | None, annotations: dict[str, Any],
 ) -> None:
     for chapter_id, result in chapter_results.items():
         segment_ids = [str(item["segment_id"]) for item in result["segments"]]
-        for lane, values in (("translation", translations), ("companion", annotations)):
+        lanes = [("companion", annotations)]
+        if translations is not None:
+            lanes.insert(0, ("translation", translations))
+        for lane, values in lanes:
             ledger_path = checkpoint_dir / "chapters" / chapter_id / f"{lane}-ledger.json"
             ledger = read_json(ledger_path)
             reviewed = {value: values[value] for value in segment_ids}
@@ -1790,18 +1852,8 @@ def _generate_first_round_lanes(
     """Drain translation and annotation concurrently for one scheduled wave."""
     if not segments:
         return {"translation": {}, "annotation": {}}
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=1 if options.skip_translation else 2) as executor:
         lane_futures = {
-            "translation": executor.submit(
-                _generate_translations,
-                segments,
-                options=options,
-                bundle=bundle,
-                glossary=glossary,
-                protected_names=protected_names,
-                checkpoint_dir=checkpoint_dir,
-                llm=llm,
-            ),
             "annotation": executor.submit(
                 _generate_annotations,
                 segments,
@@ -1815,7 +1867,18 @@ def _generate_first_round_lanes(
                 llm=llm,
             ),
         }
-        lane_results: dict[str, dict[str, dict[str, Any]]] = {}
+        if not options.skip_translation:
+            lane_futures["translation"] = executor.submit(
+                _generate_translations,
+                segments,
+                options=options,
+                bundle=bundle,
+                glossary=glossary,
+                protected_names=protected_names,
+                checkpoint_dir=checkpoint_dir,
+                llm=llm,
+            )
+        lane_results: dict[str, dict[str, dict[str, Any]]] = {"translation": {}}
         lane_failures: dict[str, BaseException] = {}
         for lane, future in lane_futures.items():
             try:
@@ -1922,7 +1985,7 @@ def _publish_pdf_artifact(
     document: dict[str, Any],
     segments: list[dict[str, Any]],
     annotations: dict[str, dict[str, Any]],
-    translations: dict[str, dict[str, Any]],
+    translations: dict[str, dict[str, Any]] | None,
     glossary: dict[str, Any],
     metadata: dict[str, Any],
     language: str,
@@ -3741,7 +3804,7 @@ def _generate_translations(
 
 def _review(
     segments: list[dict[str, Any]],
-    translations: dict[str, dict[str, Any]],
+    translations: dict[str, dict[str, Any]] | None,
     annotations: dict[str, dict[str, Any]],
     *,
     document: dict[str, Any],
@@ -3751,7 +3814,21 @@ def _review(
     options: BuildOptions,
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
-) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]] | None, dict[str, dict[str, Any]], dict[str, Any]]:
+    if options.skip_translation:
+        if translations not in (None, {}):
+            raise RuntimeError("skip-translation review received translation content")
+        reviewed, review = _review_commentary_only(
+            segments,
+            annotations,
+            document=document,
+            glossary=glossary,
+            evidence=evidence,
+            options=options,
+            llm=llm,
+            checkpoint_dir=checkpoint_dir,
+        )
+        return None, reviewed, review
     translations = {
         str(segment_id): clean_reader_translation(translation)
         for segment_id, translation in translations.items()
@@ -3983,6 +4060,355 @@ def _review(
         "issues": [str(item) for item in review.get("issues") or []],
         "patched_segment_ids": sorted(patched),
         "citation_delimiter_normalized_segment_ids": sorted(citation_normalized),
+    }
+
+
+def _review_commentary_only(
+    segments: list[dict[str, Any]],
+    annotations: dict[str, dict[str, Any]],
+    *,
+    document: dict[str, Any],
+    glossary: dict[str, Any],
+    evidence: dict[str, Any],
+    options: BuildOptions,
+    llm: Callable[..., dict[str, Any]],
+    checkpoint_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Review commentary without exposing a translation field to the model."""
+    by_id = {block_id(block): block for block in document.get("blocks") or []}
+    reader_evidence = _reader_evidence_by_segment(
+        segments, document=document, evidence=evidence, annotations=annotations
+    )
+    reviewed = {
+        str(segment_id): clean_reader_annotation(
+            annotation,
+            evidence_records=reader_evidence.get(str(segment_id), []),
+            language=options.annotation_language,
+        )
+        for segment_id, annotation in annotations.items()
+    }
+    segment_payloads = [{
+        "segment": segment,
+        "source_blocks": [
+            _annotation_input_block(by_id[value], document)
+            for value in segment["block_ids"]
+        ],
+        "annotation": reviewed[str(segment["segment_id"])],
+        "context_evidence": _review_context_evidence(
+            segment, blocks_by_id=by_id, evidence=evidence
+        ),
+    } for segment in segments]
+    base = {"glossary": glossary}
+    direct_prompt = commentary_review_prompt(
+        {**base, "segments": segment_payloads}, language=options.annotation_language
+    )
+    limit = _review_prompt_byte_limit(options)
+    payload_groups: list[tuple[list[dict[str, Any]], dict[str, Any]]] = [
+        (segment_payloads, glossary)
+    ]
+    hierarchical = _utf8_size(direct_prompt) > min(
+        REVIEW_PROMPT_MAX_BYTES, max(1, int(options.review_context_chars))
+    )
+    if hierarchical:
+        payload_groups = [
+            (
+                [item],
+                _commentary_review_glossary_projection(
+                    glossary, [item], max_bytes=ANNOTATION_GLOSSARY_MAX_BYTES,
+                ),
+            )
+            for item in segment_payloads
+        ]
+
+    recovered_reviews = (
+        {} if options.force or not hierarchical
+        else _load_recovered_commentary_reviews(
+            checkpoint_dir, [group for group, _ in payload_groups]
+        )
+    )
+
+    def inspect(
+        index: int, group: list[dict[str, Any]], group_glossary: dict[str, Any],
+    ) -> dict[str, Any]:
+        prompt = commentary_review_prompt(
+            {"glossary": group_glossary, "segments": group},
+            language=options.annotation_language,
+        )
+        if _utf8_size(prompt) > limit and hierarchical and group_glossary.get("entries"):
+            group_glossary = _empty_commentary_review_glossary(glossary)
+            prompt = commentary_review_prompt(
+                {"glossary": group_glossary, "segments": group},
+                language=options.annotation_language,
+            )
+        _require_review_prompt_within_limit(
+            prompt, label=f"commentary-only review {index}", max_prompt_bytes=limit
+        )
+        input_sha256 = sha256_json({
+            "prompt": prompt,
+            "schema": COMMENTARY_REVIEW_SCHEMA,
+            "model_tier": REVIEW_TIER,
+        })
+        path = checkpoint_dir / "commentary-reviews" / f"{index:04d}.json"
+        if path.is_file() and not options.force:
+            checkpoint = read_json(path)
+            if (
+                isinstance(checkpoint, dict)
+                and checkpoint.get("schema_version")
+                == COMMENTARY_REVIEW_CHECKPOINT_VERSION
+                and checkpoint.get("input_sha256") == input_sha256
+                and _commentary_review_validation_error(
+                    checkpoint.get("review"), group
+                ) is None
+            ):
+                return checkpoint["review"]
+        value = recovered_reviews.get(index)
+        if value is None:
+            value = _llm_call(
+                llm,
+                prompt,
+                COMMENTARY_REVIEW_SCHEMA,
+                options=options,
+                artifact_dir=checkpoint_dir / "llm" / "commentary-review" / str(index),
+                call_label=f"companion-commentary-review-{index}",
+                model_tier=REVIEW_TIER,
+            )
+        validation_error = _commentary_review_validation_error(value, group)
+        if validation_error is not None:
+            if validation_error == "attempted a translation patch":
+                raise RuntimeError("commentary-only review attempted a translation patch")
+            raise RuntimeError(f"commentary-only review {index} {validation_error}")
+        write_json(path, {
+            "schema_version": COMMENTARY_REVIEW_CHECKPOINT_VERSION,
+            "group_index": index,
+            "input_sha256": input_sha256,
+            "reviewed_segment_ids": sorted(
+                str(item["segment"]["segment_id"]) for item in group
+            ),
+            "review": value,
+        })
+        return value
+
+    responses: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(options.workers, len(payload_groups))) as executor:
+        futures = [
+            executor.submit(inspect, index, group, group_glossary)
+            for index, (group, group_glossary) in enumerate(payload_groups)
+        ]
+        responses = [future.result() for future in futures]
+
+    valid_ids = set(reviewed)
+    patched: set[str] = set()
+    issues: list[str] = []
+    for (group, _), response in zip(payload_groups, responses):
+        group_ids = {
+            str(item["segment"]["segment_id"]) for item in group
+        }
+        issues.extend(str(item) for item in response.get("issues") or [])
+        for patch in response.get("patches") or []:
+            if "translation" in patch or "translation_blocks" in patch:
+                raise RuntimeError("commentary-only review attempted a translation patch")
+            segment_id = str(patch.get("segment_id") or "")
+            if segment_id not in group_ids or segment_id not in valid_ids or segment_id in patched:
+                raise RuntimeError(
+                    f"review returned out-of-group, invalid, or duplicate annotation patch: {segment_id}"
+                )
+            original = dict(reviewed[segment_id])
+            fields = ("commentary", "explanation", "prior_work", "later_work", "evidence_ids")
+            changed = [field for field in fields if patch.get(field) is not None]
+            if not changed:
+                raise RuntimeError(f"review returned an empty patch: {segment_id}")
+            for field in changed:
+                if field == "evidence_ids":
+                    segment = next(item for item in segments if item["segment_id"] == segment_id)
+                    segment_evidence = _evidence_for_segment(segment, by_id, evidence)
+                    reviewed[segment_id][field] = _validated_evidence_ids(
+                        patch[field], {"related_papers": segment_evidence["papers"]}
+                    )
+                elif field in {"prior_work", "later_work"}:
+                    reviewed[segment_id][field] = _normalize_related_work(patch[field])
+                else:
+                    reviewed[segment_id][field] = str(patch[field])
+            if any(field in changed for field in ("prior_work", "later_work")):
+                _sync_claim_evidence_ids(reviewed[segment_id])
+            segment = next(item for item in segments if item["segment_id"] == segment_id)
+            _validate_annotation_evidence(
+                clean_reader_annotation(
+                    reviewed[segment_id],
+                    evidence_records=reader_evidence.get(segment_id, []),
+                    language=options.annotation_language,
+                ),
+                _evidence_for_segment(segment, by_id, evidence)["papers"],
+            )
+            reviewed[segment_id] = clean_reader_annotation(
+                reviewed[segment_id],
+                evidence_records=reader_evidence.get(segment_id, []),
+                language=options.annotation_language,
+            )
+            _assert_review_did_not_add_related_work(original, reviewed[segment_id])
+            patched.add(segment_id)
+    return reviewed, {
+        "translation_mode": "skipped",
+        "hierarchical": hierarchical,
+        "review_group_count": len(payload_groups),
+        "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
+        "issues": issues,
+        "patched_segment_ids": sorted(patched),
+    }
+
+
+def _empty_commentary_review_glossary(glossary: dict[str, Any]) -> dict[str, Any]:
+    entries = glossary.get("entries") or [] if isinstance(glossary, dict) else []
+    return {
+        "schema_version": "arc.companion.commentary-review-glossary-projection.v1",
+        "source_glossary_schema_version": (
+            glossary.get("schema_version") if isinstance(glossary, dict) else None
+        ),
+        "source_glossary_sha256": sha256_json(
+            glossary if isinstance(glossary, dict) else {}
+        ),
+        "entries": [],
+        "source_entry_count": len(entries),
+        "selected_entry_count": 0,
+        "omitted_entry_count": len(entries),
+    }
+
+
+def _commentary_review_glossary_projection(
+    glossary: dict[str, Any],
+    group: list[dict[str, Any]],
+    *,
+    max_bytes: int,
+) -> dict[str, Any]:
+    """Keep only complete glossary entries relevant to one local review group."""
+    projection = _empty_commentary_review_glossary(glossary)
+    entries = [
+        dict(item) for item in (glossary.get("entries") or [])
+        if isinstance(item, dict)
+    ] if isinstance(glossary, dict) else []
+    group_block_ids = {
+        str(block_id_value)
+        for item in group
+        for block_id_value in (item.get("segment") or {}).get("block_ids") or []
+    }
+    group_text = _normalized_glossary_match_text(group)
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for index, entry in enumerate(entries):
+        terms = [
+            entry.get("source_term"), entry.get("target_term"),
+            *(entry.get("aliases") or []),
+        ]
+        normalized_terms = [
+            _normalized_glossary_match_text(value)
+            for value in terms if str(value or "").strip()
+        ]
+        if str(entry.get("first_block_id") or "") in group_block_ids:
+            priority = 0
+        elif any(_glossary_term_in_text(term, group_text) for term in normalized_terms):
+            priority = 1
+        else:
+            continue
+        candidates.append((priority, index, entry))
+
+    selected: list[tuple[int, dict[str, Any]]] = []
+    for _, index, entry in sorted(candidates):
+        proposed = [*selected, (index, entry)]
+        ordered = [value for _, value in sorted(proposed)]
+        candidate = {
+            **projection,
+            "entries": ordered,
+            "selected_entry_count": len(ordered),
+            "omitted_entry_count": len(entries) - len(ordered),
+        }
+        if _utf8_size(json.dumps(candidate, ensure_ascii=False)) <= max_bytes:
+            selected = proposed
+    ordered = [value for _, value in sorted(selected)]
+    return {
+        **projection,
+        "entries": ordered,
+        "selected_entry_count": len(ordered),
+        "omitted_entry_count": len(entries) - len(ordered),
+    }
+
+
+def _commentary_review_validation_error(
+    review: Any, group: list[dict[str, Any]],
+) -> str | None:
+    expected_ids = {
+        str((item.get("segment") or {}).get("segment_id") or "") for item in group
+    }
+    if not expected_ids or "" in expected_ids:
+        return "has invalid expected segment coverage"
+    if not isinstance(review, dict):
+        return "is malformed"
+    patches = review.get("patches")
+    issues = review.get("issues")
+    if not isinstance(patches, list) or not isinstance(issues, list):
+        return "is missing patches or issues"
+    patch_ids: list[str] = []
+    for patch in patches:
+        if not isinstance(patch, dict):
+            return "contains a malformed patch"
+        if "translation" in patch or "translation_blocks" in patch:
+            return "attempted a translation patch"
+        segment_id = str(patch.get("segment_id") or "")
+        if segment_id not in expected_ids:
+            return "returned a patch outside its review group"
+        patch_ids.append(segment_id)
+    if len(patch_ids) != len(set(patch_ids)):
+        return "returned duplicate patches"
+    return None
+
+
+def _load_recovered_commentary_reviews(
+    checkpoint_dir: Path, groups: list[list[dict[str, Any]]],
+) -> dict[int, dict[str, Any]]:
+    """Import recovered local reviews only when exact disjoint groups still match."""
+    path = checkpoint_dir / "commentary-reviews.recovered-from-failed-review.v1.json"
+    if not path.is_file():
+        return {}
+    recovered = read_json(path)
+    if (
+        not isinstance(recovered, dict)
+        or recovered.get("schema_version")
+        != "arc.companion.recovered-commentary-reviews.v1"
+        or not isinstance(recovered.get("commentary_reviews"), list)
+    ):
+        raise RuntimeError("invalid recovered commentary-review checkpoint")
+    expected_all = {
+        str(item["segment"]["segment_id"]) for group in groups for item in group
+    }
+    if set(str(value) for value in recovered.get("reviewed_segment_ids") or []) != expected_all:
+        raise RuntimeError("recovered commentary reviews do not match current segment coverage")
+    by_ids: dict[frozenset[str], dict[str, Any]] = {}
+    covered: set[str] = set()
+    for item in recovered["commentary_reviews"]:
+        if not isinstance(item, dict):
+            raise RuntimeError("recovered commentary review is malformed")
+        declared_values = [str(value) for value in item.get("reviewed_segment_ids") or []]
+        declared_ids = set(declared_values)
+        review = item.get("review")
+        if review is None:
+            review = {"patches": item.get("patches"), "issues": item.get("issues")}
+        synthetic_group = [
+            {"segment": {"segment_id": segment_id}} for segment_id in declared_values
+        ]
+        if (
+            not declared_ids
+            or len(declared_values) != len(declared_ids)
+            or _commentary_review_validation_error(review, synthetic_group) is not None
+        ):
+            raise RuntimeError("recovered commentary review does not match its group")
+        frozen = frozenset(declared_ids)
+        if frozen in by_ids or covered.intersection(declared_ids):
+            raise RuntimeError("recovered commentary reviews have duplicate or overlapping groups")
+        covered.update(declared_ids)
+        by_ids[frozen] = review
+    if covered != expected_all:
+        raise RuntimeError("recovered commentary reviews do not cover every group")
+    return {
+        index: by_ids[ids]
+        for index, group in enumerate(groups)
+        if (ids := frozenset(str(item["segment"]["segment_id"]) for item in group)) in by_ids
     }
 
 
@@ -4223,6 +4649,7 @@ def _fingerprint_payload(
             or bundle.parsed.get("asset_manifest_hash")
         ),
         "language": options.annotation_language,
+        "translation_mode": "skipped" if options.skip_translation else "enabled",
         "provider": options.provider,
         "model": options.model,
         "model_tiers": {

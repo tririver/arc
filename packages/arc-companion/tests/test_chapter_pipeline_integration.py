@@ -13,6 +13,126 @@ from arc_companion.io import sha256_json
 from arc_llm.sessions import LLMSessionManager
 
 
+def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
+    tmp_path: Path,
+) -> None:
+    blocks = [
+        {"block_id": "c1", "type": "section", "title": "Chapter One"},
+        {"block_id": "p1", "type": "text", "text": "Energy is conserved."},
+    ]
+    document = {
+        "schema_version": "arc.paper.document.v2",
+        "front_matter": {},
+        "blocks": blocks,
+        "equations": [],
+        "figures": [],
+        "tables": [],
+        "assets": [],
+        "links": [],
+        "bibliography": [],
+        "integrity": {"status": "complete", "document_hash": "skip-chapter"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:skip-chapter",
+        document=document,
+        parsed={
+            "paper_id": "local:skip-chapter",
+            "document": document,
+            "source_hash": "skip-chapter",
+            "structure": {
+                "document_kind": "book",
+                "chapters": [{"title": "Chapter One", "block_ids": ["c1", "p1"]}],
+            },
+        },
+        metadata={"title": "Book"},
+        references=[],
+        citers=[],
+    )
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({
+        "metadata": {"source_hash": "skip-chapter", "language": "en"},
+        "translations": {
+            "old": {"segment_id": "old", "translation": {"blocks": [
+                {"block_id": "p1", "text": "This must not migrate."},
+            ]}},
+        },
+    }), encoding="utf-8")
+    labels: list[str] = []
+    result_calls: list[dict[str, object]] = []
+
+    def llm(_prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        labels.append(label)
+        if "translation" in label:
+            raise AssertionError(f"translation call was submitted: {label}")
+        if label.startswith("companion-glossary-"):
+            return {"entries": []}
+        if label.startswith("companion-guide-"):
+            return {
+                "motivation": "Motivation.", "main_content": "Conservation.",
+                "section_logic": None, "book_position": None, "prerequisites": None,
+                "supplementary_reading": [],
+            }
+        if label.startswith("companion-segmentation-"):
+            return {"cut_after_ordinals": []}
+        if label.startswith("companion-annotation-"):
+            return {
+                "explanation": "Commentary remains.", "commentary": "",
+                "prior_work": [], "later_work": [], "context_claims": [],
+                "evidence_ids": [], "key_points": [], "source_notes": [],
+                "evidence_requests": [],
+            }
+        if label.startswith("companion-commentary-review-"):
+            return {"issues": [], "patches": []}
+        raise AssertionError(label)
+
+    def result_llm(prompt: str, **kwargs):
+        result_calls.append(dict(kwargs))
+        return SimpleNamespace(
+            value=llm(prompt, **kwargs),
+            logical_receipt={"idempotency_key": kwargs["idempotency_key"]},
+        )
+
+    result = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "run",
+            annotation_language="en",
+            workers=2,
+            skip_translation=True,
+            stop_after_first_chapter=True,
+            legacy_checkpoint=legacy,
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm,
+        result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result["ok"], result
+    checkpoint = Path(result["data"]["checkpoint_dir"])
+    assert not any("translation" in label for label in labels)
+    assert not any(":translation:" in str(call.get("idempotency_key")) for call in result_calls)
+    assert not list((checkpoint / "chapters").rglob("translation-ledger.json"))
+    assert not list(checkpoint.rglob("translations*"))
+    receipt = json.loads((checkpoint / "legacy-migration.json").read_text())
+    assert receipt["translations"]["ledgers"] == {}
+    assert receipt["translations"]["receipts"] == [{
+        "status": "skipped",
+        "reason": "translation_disabled_for_same_language_source",
+    }]
+    freeze = json.loads((checkpoint / "first-chapter-freeze.json").read_text())
+    assert freeze["translation_mode"] == "skipped"
+    assert freeze["pre_review_translation_sha256"] is None
+    assert freeze["translation_sha256"] is None
+    tex = Path(result["data"]["output_tex"]).read_text(encoding="utf-8")
+    manifest = json.loads(Path(result["data"]["source_manifest_path"]).read_text())
+    assert "ARC-TRANSLATION-" not in tex
+    assert manifest["companion_layers"]["translation_mode"] is False
+    assert manifest["companion_layers"]["rendered_translation_segment_ids"] == []
+
+
 def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> None:
     blocks = [
         {"block_id": "c1", "type": "section", "title": "Chapter One"},
@@ -105,7 +225,8 @@ def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> 
     freeze = json.loads(
         (Path(result["data"]["checkpoint_dir"]) / "first-chapter-freeze.json").read_text()
     )
-    assert freeze["schema_version"] == "arc.companion.first-chapter-freeze.v2"
+    assert freeze["schema_version"] == "arc.companion.first-chapter-freeze.v3"
+    assert freeze["translation_mode"] == "enabled"
     assert freeze["translation_sha256"] and freeze["annotation_sha256"]
 
     freeze["guide_sha256"] = "tampered"

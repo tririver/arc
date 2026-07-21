@@ -173,6 +173,30 @@ def test_interactive_scheduler_never_starts_second_chapter() -> None:
     assert list(result) == ["ch-0001"]
 
 
+def test_chapter_scheduler_can_disable_translation_lane_completely() -> None:
+    companion_calls: list[str] = []
+    result = run_chapter_pipeline(
+        [{"chapter_id": "ch-0001"}],
+        workers=2,
+        prepare_guide=lambda _chapter: {"main_content": "Guide"},
+        prepare_segments=lambda _chapter: [
+            {"segment_id": "ch-0001.seg-0001"},
+            {"segment_id": "ch-0001.seg-0002"},
+        ],
+        run_translation=None,
+        run_companion=lambda _prepared, segment: companion_calls.append(
+            str(segment["segment_id"])
+        ) or {"explanation": "Commentary"},
+    )
+
+    assert companion_calls == ["ch-0001.seg-0001", "ch-0001.seg-0002"]
+    assert result["ch-0001"]["translation"] == {}
+    assert set(result["ch-0001"]["companion"]) == {
+        "ch-0001.seg-0001",
+        "ch-0001.seg-0002",
+    }
+
+
 def test_scheduler_stops_queued_calls_after_a_lane_failure() -> None:
     paid: list[str] = []
 

@@ -50,6 +50,11 @@ def main(argv: list[str] | None = None) -> int:
         help="disable internet access independently of MCP access",
     )
     build.add_argument(
+        "--skip-translation",
+        action="store_true",
+        help="omit the translation lane when source and target languages already match",
+    )
+    build.add_argument(
         "--context-paper-id",
         action="append",
         default=[],
@@ -145,6 +150,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 domain_id=args.domain_id,
                 domain_manifest=Path(args.domain_manifest) if args.domain_manifest else None,
                 allow_internet=not args.no_internet,
+                skip_translation=args.skip_translation,
                 context_paper_ids=tuple(args.context_paper_id),
                 stop_after_first_chapter=args.stop_after_first_chapter,
                 document_kind=args.document_kind,

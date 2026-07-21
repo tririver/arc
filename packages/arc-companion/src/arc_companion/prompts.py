@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "arc.companion.prompts.v13"
-SCHEMA_VERSION = "arc.companion.schemas.v10"
+PROMPT_VERSION = "arc.companion.prompts.v14"
+SCHEMA_VERSION = "arc.companion.schemas.v11"
 TRANSLATION_RETRY_PROMPT_VERSION = "arc.companion.translation-retry-prompt.v5"
 TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION = "arc.companion.translation-slot-repair-schema.v4"
 TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION = (
@@ -269,6 +269,43 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "evidence_ids": {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
+                    },
+                    "reason": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "issues": {"type": "array", "items": {"type": "string"}},
+    },
+    "additionalProperties": False,
+}
+
+COMMENTARY_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["patches", "issues"],
+    "properties": {
+        "patches": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "segment_id", "commentary", "explanation", "prior_work",
+                    "later_work", "evidence_ids", "reason",
+                ],
+                "properties": {
+                    "segment_id": {"type": "string"},
+                    "commentary": {"type": ["string", "null"]},
+                    "explanation": {"type": ["string", "null"]},
+                    "prior_work": {
+                        "type": ["array", "null"],
+                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
+                    },
+                    "later_work": {
+                        "type": ["array", "null"],
+                        "oneOf": [{"type": "null"}, RELATED_WORK_SCHEMA],
+                    },
+                    "evidence_ids": {
+                        "type": ["array", "null"], "items": {"type": "string"},
                     },
                     "reason": {"type": "string"},
                 },
@@ -604,6 +641,23 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
         "block locator, controller label, or phrases such as 'context evidence' or 'supplied context'. "
         f"All replacements must be in {language}.\n\nCOMPANION:\n"
         f"{json.dumps(payload, ensure_ascii=False)}{extra}"
+    )
+
+
+def commentary_review_prompt(payload: dict[str, Any], *, language: str) -> str:
+    return (
+        "Review this source/companion theoretical-physics paper for technical accuracy, "
+        "terminology consistency, and unsupported literature claims. Translation is intentionally "
+        "disabled because the source already uses the target language; do not propose, reconstruct, "
+        "or patch any translation. Source blocks and the frozen glossary are immutable. Return one "
+        "patch only for a segment needing a commentary correction. Every patch field is required: "
+        "use null for unchanged fields, an empty string to clear commentary/explanation, and an empty "
+        "array only to clear prior_work or later_work. Remove paraphrase and generic teaching filler. "
+        "Review may correct or remove an existing claim but must not create a related-work fact or a "
+        "new evidence binding. An empty patches list is valid. Reader-facing source mentions must use "
+        "the supplied title and locator, never controller labels or evidence IDs. "
+        f"All replacements must be in {language}.\n\nCOMPANION:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
     )
 
 

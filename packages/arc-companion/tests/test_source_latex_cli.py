@@ -452,6 +452,7 @@ def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
         "--project-dir",
         str(tmp_path),
         "--stop-after-first-chapter",
+        "--skip-translation",
         "--document-kind",
         "book",
         "--idle-timeout-seconds",
@@ -462,6 +463,7 @@ def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
     ]) == 0
     options = captured["options"]
     assert options.stop_after_first_chapter is True
+    assert options.skip_translation is True
     assert options.document_kind == "book"
     assert options.idle_timeout_seconds == 90
     assert options.regenerate_commentary is True
@@ -537,6 +539,16 @@ def test_companion_docs_describe_chaptered_stateful_cli_contract() -> None:
     assert "must stop automatic advancement and write `needs_supervision`" in workflow_text
     assert "after each 30 minutes" in workflow_text
     assert "MCP is not part of this workflow" in workflow_text
+    assert "beginning, middle, and end" in workflow_text
+    assert "`EN_US`, `EN_UK`, and `en-GB` are `en`" in workflow_text
+    assert "simplified and traditional Chinese" in workflow_text
+    assert "Mixed-language or uncertain source text" in workflow_text
+    assert "`translation_mode=skip`" in workflow_text
+    assert "`--skip-translation`" in manual_text
+    assert "The CLI deliberately performs no automatic language detection" in manual_text
+    assert "translation session, provider call, ledger, checkpoint, review overlay" in manual_text
+    assert "translations=None" in manual_text
+    assert "The CLI itself does not perform language detection" in readme_text
 
 
 def test_package_includes_only_validated_deliverables(tmp_path: Path) -> None:

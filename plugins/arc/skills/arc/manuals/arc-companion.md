@@ -51,6 +51,9 @@ Useful flags:
 - `--refresh`: refresh remote inputs; mutually exclusive with `--recache`.
 - `--idle-timeout-seconds <seconds>`: override provider inactivity timeout.
 - `--regenerate-commentary`: keep reusable translations and rebuild commentary.
+- `--skip-translation`: omit translation only after the workflow agent has
+  confirmed from beginning, middle, and end body samples that the source and
+  target have the same base language.
 - `--stop-after-first-chapter`: schedule only the first substantive chapter.
 - `--domain-id` or `--domain-manifest`: reuse one explicitly named domain;
   companion does not discover or build one.
@@ -58,6 +61,17 @@ Useful flags:
 `workers` is one global LLM-call concurrency budget shared by chapter
 preparation, translation, commentary, evidence, and review. Changing it does
 not invalidate content checkpoints.
+
+The CLI deliberately performs no automatic language detection. The agent
+running `workflows/companion.md` inspects substantive source body text near the
+beginning, middle, and end, then compares normalized base languages. Language
+tags are case-insensitive and `_` is equivalent to `-`: `EN_US`, `EN_UK`, and
+`en-GB` are all `en`, while simplified and traditional Chinese are both `zh`.
+Mixed or uncertain samples retain translation. The agent records
+`source_language`, `source_base_language`, `target_language`,
+`target_base_language`, `translation_mode`, and `translation_reason` in
+`context.json`, and passes `--skip-translation` only for a clear same-language
+decision.
 
 Inspect and validate without changing generation state:
 
@@ -137,7 +151,15 @@ an explicit supplementary-reading label.
 
 After guide and segmentation validation, translation uses a medium-tier session
 and commentary uses an independent high-tier session. The lanes may run in
-parallel, while each advances strictly by segment order.
+parallel, while each advances strictly by segment order. With
+`--skip-translation`, the translation lane is disabled completely: no
+translation session, provider call, ledger, checkpoint, review overlay, or
+migrated translation artifact is created. Guide, segmentation, glossary,
+commentary, evidence resolution, and companion review are unchanged.
+Review uses its commentary-only contract and rejects any proposed translation
+patch. Legacy migration records a receipt saying that prior translations were
+not migrated. Both chaptered builds and the legacy non-chaptered path support
+this mode. Omitting the flag preserves the normal two-lane behavior.
 
 The generation bootstrap carries fixed rules, guide, structure, chapter
 glossary, and first source segment. Delta turns carry only the current segment,
@@ -177,17 +199,20 @@ invalidate the suffix, and rotate generation.
 
 With `--stop-after-first-chapter`, ARC must not schedule chapter two. It returns
 `first_chapter_ready` only after the first substantive chapter's guide,
-translation, commentary, evidence, review, typesetting, and PDF validation
-complete. Rerun without the flag after approval. The accepted first chapter is
-frozen and cannot be silently rewritten by final consistency review. The first
-chapter artifact is not the full-document deliverable.
+all enabled lanes, evidence, review, typesetting, and PDF validation complete.
+Rerun without the flag after approval. The accepted first chapter is frozen and
+cannot be silently rewritten by final consistency review. Its freeze record
+includes the translation mode and uses a null translation hash in skip mode.
+The first chapter artifact is not the full-document deliverable.
 
 ### Step 2: Render and validate
 
 Each chapter contains exactly one guide after its title and before its first
-segment. Each segment renders original, translation, then commentary. Styling,
-not visible controller labels, identifies layers: reader text must not contain
-`译文`, `伴读`, or `本段解释`; use `解释` when needed.
+segment. Normally each segment renders original, translation, then commentary.
+In skip mode, typesetting receives `translations=None` and renders original
+followed by commentary, with no translation layer. Styling, not visible
+controller labels, identifies layers: reader text must not contain `译文`,
+`伴读`, or `本段解释`; use `解释` when needed.
 
 Source, guides, translations, commentary, and glossary use sans-serif text.
 CJK fallbacks are Noto Sans CJK SC, Source Han Sans SC/CN, then
@@ -196,7 +221,9 @@ Invisible manifest or TeX markers validate hierarchy.
 
 `arc-companion validate` checks exact coverage, glossary completeness, guide
 placement, formulas, figures, tables, links, names, accepted ledgers, searchable
-text, fonts, clipping, and overlap. Deliver only the validated full PDF.
+text, fonts, clipping, and overlap. In skip mode it also rejects translation IDs
+in the manifest and translation markers in TeX. Deliver only the validated full
+PDF.
 
 Create a reproducibility package only when explicitly requested:
 
