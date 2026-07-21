@@ -9,8 +9,14 @@ import zipfile
 import pytest
 
 from arc_companion import pdf as pdf_module
+from arc_companion.io import canonical_json, sha256_json
 from arc_companion.package import package_project
 from arc_companion.pdf import PDFError, compile_latex, validate_pdf
+from arc_companion.web import (
+    READER_SNAPSHOT_VERSION,
+    WEB_MANIFEST_VERSION,
+    WEB_RENDER_VERSION,
+)
 
 
 PDFINFO = """Title: fixture
@@ -77,6 +83,53 @@ def test_validate_pdf_rejects_removed_visible_labels(tmp_path: Path, monkeypatch
         if Path(command[0]).name == "pdftotext":
             Path(command[-1]).write_text("原文\n译文\n", encoding="utf-8")
         return result
+    with pytest.raises(PDFError, match="visible layer labels"):
+        validate_pdf(source, runner=labeled_runner)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "伴读语言: zh-CN\n可检索正文。",
+        "本文讨论译文的准确性以及伴读材料的作用。",
+        "正文按“原文—译文—伴读”的顺序编排。",
+        "这里不是本段解释，而是对该术语的普通引用。",
+    ],
+)
+def test_validate_pdf_allows_layer_words_in_metadata_and_prose(
+    tmp_path: Path, monkeypatch, text: str,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF fixture")
+    monkeypatch.setattr(pdf_module.shutil, "which", lambda name: f"/tools/{name}")
+    runner, _ = _pdf_runner(tmp_path)
+
+    def prose_runner(command, **kwargs):
+        result = runner(command, **kwargs)
+        if Path(command[0]).name == "pdftotext":
+            Path(command[-1]).write_text(text, encoding="utf-8")
+        return result
+
+    report = validate_pdf(source, runner=prose_runner)
+
+    assert report["pages"] == 3
+
+
+@pytest.mark.parametrize("label", ["译 文：", "【伴读】", "## 本段解释", "— 译文 —"])
+def test_validate_pdf_rejects_decorated_standalone_layer_labels(
+    tmp_path: Path, monkeypatch, label: str,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF fixture")
+    monkeypatch.setattr(pdf_module.shutil, "which", lambda name: f"/tools/{name}")
+    runner, _ = _pdf_runner(tmp_path)
+
+    def labeled_runner(command, **kwargs):
+        result = runner(command, **kwargs)
+        if Path(command[0]).name == "pdftotext":
+            Path(command[-1]).write_text(f"正文\n{label}\n", encoding="utf-8")
+        return result
+
     with pytest.raises(PDFError, match="visible layer labels"):
         validate_pdf(source, runner=labeled_runner)
 
@@ -233,3 +286,239 @@ def test_package_rejects_asset_path_outside_project(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert "escapes companion project" in result["errors"][0]["message"]
+
+
+def _add_web_reader(root: Path) -> dict[str, Path]:
+    reader = root / "reader"
+    data = reader / "data"
+    asset_root = reader / "assets" / f"builtin-{'a' * 64}"
+    assets = asset_root / "katex" / "fonts"
+    data.mkdir(parents=True)
+    assets.mkdir(parents=True)
+    snapshot = {
+        "schema_version": READER_SNAPSHOT_VERSION,
+        "chapters": [],
+        "coverage": {
+            "chapter_ids": [], "segment_ids": [],
+            "translation_segment_ids": [], "annotation_segment_ids": [],
+        },
+    }
+    snapshot["revision"] = sha256_json(snapshot)
+    snapshot_path = _write_content_addressed_json(data, "snapshot", snapshot)
+    data_text = "window.__ARC_COMPANION_SNAPSHOT__ = " + canonical_json(snapshot) + ";\n"
+    data_hash = hashlib.sha256(data_text.encode("utf-8")).hexdigest()
+    paths = {
+        "index": reader / "index.html",
+        "snapshot": snapshot_path,
+        "data_script": data / f"snapshot-{data_hash}.js",
+        "reader_css": asset_root / "reader.css",
+        "reader_js": asset_root / "reader.js",
+        "katex_css": asset_root / "katex" / "katex.min.css",
+        "katex_js": asset_root / "katex" / "katex.min.js",
+        "asset": assets / "KaTeX_Main-Regular.woff2",
+    }
+    asset_relative = asset_root.relative_to(reader).as_posix()
+    paths["index"].write_text(
+        f"""<html><head>
+<link href="{asset_relative}/reader.css"><link href="{asset_relative}/katex/katex.min.css">
+<script src="{asset_relative}/katex/katex.min.js"></script>
+<script src="data/{paths['data_script'].name}"></script>
+<script src="{asset_relative}/reader.js"></script>
+</head></html>""",
+        encoding="utf-8",
+    )
+    paths["data_script"].write_text(data_text, encoding="utf-8")
+    paths["reader_css"].write_text("body{}", encoding="utf-8")
+    paths["reader_js"].write_text("void 0;", encoding="utf-8")
+    paths["katex_css"].write_text(".katex{}", encoding="utf-8")
+    paths["katex_js"].write_text("window.katex={};", encoding="utf-8")
+    paths["asset"].write_bytes(b"font")
+
+    def record(path: Path) -> dict[str, object]:
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "bytes": path.stat().st_size,
+        }
+
+    manifest = {
+        "schema_version": WEB_MANIFEST_VERSION,
+        "web_render_version": WEB_RENDER_VERSION,
+        "index": record(paths["index"]),
+        "snapshot": record(paths["snapshot"]),
+        "data_script": record(paths["data_script"]),
+        "assets": [
+            record(paths[key]) for key in (
+                "reader_css", "reader_js", "katex_css", "katex_js", "asset"
+            )
+        ],
+        "coverage": {
+            "chapter_ids": [], "segment_ids": [],
+            "translation_segment_ids": [], "annotation_segment_ids": [],
+        },
+    }
+    manifest_path = _write_content_addressed_json(data, "manifest", manifest)
+    paths["manifest"] = manifest_path
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update({
+        "output_html": str(paths["index"]),
+        "output_html_sha256": record(paths["index"])["sha256"],
+        "reader_snapshot_path": str(paths["snapshot"]),
+        "reader_snapshot_sha256": record(paths["snapshot"])["sha256"],
+        "web_manifest_path": str(manifest_path),
+        "web_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "web_render_version": WEB_RENDER_VERSION,
+    })
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    return paths
+
+
+def _write_content_addressed_json(directory: Path, prefix: str, value: object) -> Path:
+    payload = (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n"
+    ).encode("utf-8")
+    path = directory / f"{prefix}-{hashlib.sha256(payload).hexdigest()}.json"
+    path.write_bytes(payload)
+    return path
+
+
+def _replace_web_manifest(
+    root: Path, manifest: dict[str, object], *, state_updates: dict[str, object] | None = None,
+) -> Path:
+    manifest_path = _write_content_addressed_json(root / "reader" / "data", "manifest", manifest)
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(state_updates or {})
+    state["web_manifest_path"] = str(manifest_path)
+    state["web_manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    return manifest_path
+
+
+def test_package_collects_every_web_manifest_file(tmp_path: Path) -> None:
+    _complete_project(tmp_path)
+    paths = _add_web_reader(tmp_path)
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is True
+    with zipfile.ZipFile(result["data"]["archive_path"]) as handle:
+        names = set(handle.namelist())
+    assert {path.relative_to(tmp_path).as_posix() for path in paths.values()} <= names
+    assert any(name.startswith("reader/data/manifest-") for name in names)
+
+
+def test_package_rejects_web_asset_hash_mismatch(tmp_path: Path) -> None:
+    _complete_project(tmp_path)
+    paths = _add_web_reader(tmp_path)
+    paths["asset"].write_bytes(b"tampered")
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is False
+    assert "hash mismatch" in result["errors"][0]["message"]
+
+
+def test_package_rejects_web_manifest_path_escape(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _complete_project(project)
+    _add_web_reader(project)
+    outside = tmp_path / "outside.css"
+    outside.write_text("body{}", encoding="utf-8")
+    state = json.loads((project / "state.json").read_text(encoding="utf-8"))
+    manifest_path = Path(state["web_manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["assets"].append({
+        "path": str(outside),
+        "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+        "bytes": outside.stat().st_size,
+    })
+    _replace_web_manifest(project, manifest)
+
+    result = package_project(project)
+
+    assert result["ok"] is False
+    assert "unsafe path" in result["errors"][0]["message"]
+
+
+def test_package_rejects_semantically_incoherent_web_bundle(tmp_path: Path) -> None:
+    _complete_project(tmp_path)
+    paths = _add_web_reader(tmp_path)
+    snapshot = json.loads(paths["snapshot"].read_text(encoding="utf-8"))
+    snapshot["coverage"]["segment_ids"] = ["missing-segment"]
+    snapshot["revision"] = sha256_json({
+        key: value for key, value in snapshot.items() if key != "revision"
+    })
+    snapshot_path = _write_content_addressed_json(
+        tmp_path / "reader" / "data", "snapshot", snapshot
+    )
+
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    manifest_path = Path(state["web_manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["snapshot"]["path"] = snapshot_path.relative_to(tmp_path).as_posix()
+    manifest["snapshot"]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    manifest["snapshot"]["bytes"] = snapshot_path.stat().st_size
+    manifest["coverage"] = snapshot["coverage"]
+    _replace_web_manifest(tmp_path, manifest, state_updates={
+        "reader_snapshot_path": str(snapshot_path),
+        "reader_snapshot_sha256": manifest["snapshot"]["sha256"],
+    })
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is False
+    assert "reader chapter content differs" in result["errors"][0]["message"]
+
+
+@pytest.mark.parametrize("field", ["manifest", "render"])
+def test_package_state_v2_requires_current_web_versions(tmp_path: Path, field: str) -> None:
+    _complete_project(tmp_path)
+    _add_web_reader(tmp_path)
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["schema_version"] = "arc.companion.state.v2"
+    if field == "render":
+        state["web_render_version"] = "arc.companion.web-render.v999"
+    else:
+        manifest_path = Path(state["web_manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = "arc.companion.web-manifest.v999"
+        _replace_web_manifest(tmp_path, manifest, state_updates={
+            "schema_version": "arc.companion.state.v2",
+        })
+    if field == "render":
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is False
+    assert "current" in result["errors"][0]["message"] or "schema is invalid" in result["errors"][0]["message"]
+
+
+def test_package_requires_complete_web_contract_for_state_v2(tmp_path: Path) -> None:
+    _complete_project(tmp_path)
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["schema_version"] = "arc.companion.state.v2"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is False
+    assert "State v2 is missing the required web reader contract" in result["errors"][0]["message"]
+
+
+def test_package_keeps_pdf_only_compatibility_for_legacy_state(tmp_path: Path) -> None:
+    _complete_project(tmp_path)
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["schema_version"] = "arc.companion.state.v1"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from pathlib import Path
 import re
 import shutil
@@ -231,6 +232,12 @@ def render_companion_tex(
         block_records.append({"block_id": bid, "sha256": source_hash})
         body.append(_source_block_marker(bid, source_hash))
         segment_id = segment_by_block.get(bid)
+        chapter_id = chapter_after_block.get(bid)
+        if chapter_id:
+            # Keep the source chapter heading, guide heading, and the opening
+            # guide lines together while leaving long guides breakable across
+            # subsequent pages.
+            body.append("\\Needspace{10\\baselineskip}\n")
         if segment_id and first_by_segment.get(segment_id) == bid:
             body.append(_render_unit_heading())
         if bid in renderable_ids:
@@ -251,7 +258,6 @@ def render_companion_tex(
                 copied_assets=copied_assets,
                 rendered_links=rendered_links,
             ))
-            chapter_id = chapter_after_block.get(bid)
             if chapter_id:
                 body.append(_render_chapter_guide(chapter_guides.get(chapter_id) or {}, language=language))
                 rendered_chapter_guides.append(chapter_id)
@@ -321,6 +327,11 @@ def render_companion_tex(
         language=language, include_translation=bool(translations)
     )
     glossary_tex = _render_glossary(glossary, language=language)
+    annotation_sources_by_segment = {
+        str(segment_id): source_manifest
+        for segment_id, annotation in annotations.items()
+        if (source_manifest := _annotation_source_manifest(annotation))
+    }
     tex = (
         _preamble(
             title=title,
@@ -360,6 +371,7 @@ def render_companion_tex(
             "provided_annotation_segment_ids": sorted(str(value) for value in annotations),
             "rendered_translation_segment_ids": rendered_translation_ids,
             "rendered_annotation_segment_ids": rendered_annotation_ids,
+            "annotation_sources_by_segment": annotation_sources_by_segment,
             "translations": translation_audits,
             "chapter_ids": [str(item.get("chapter_id") or "") for item in chapters or []],
             "rendered_chapter_guide_ids": rendered_chapter_guides,
@@ -469,9 +481,11 @@ def _preamble(
 \definecolor{{ArcCompanionRule}}{{HTML}}{{A8735D}}
 \newenvironment{{arcsource}}{{\par\begingroup}}{{\par\endgroup}}
 {translation_definitions}
-\newtcolorbox{{arccompanion}}[1][]{{enhanced,breakable,sharp corners,boxrule=0pt,
+\tcbset{{arccompanionsurface/.style={{enhanced,breakable,sharp corners,boxrule=0pt,
   leftrule=1.2pt,colback=ArcCompanionBackground,colframe=ArcCompanionRule,
-  left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=12pt,#1}}
+  left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=12pt}}}}
+\newtcolorbox{{arccompanion}}[1][]{{arccompanionsurface,#1}}
+\newtcolorbox{{arcchapterguide}}[1][]{{arccompanionsurface,#1}}
 \setlength{{\parindent}}{{1.5em}}
 \setlength{{\parskip}}{{0.35em}}
 \begin{{document}}
@@ -926,7 +940,11 @@ def _render_annotation(
     later = annotation.get("later_work")
     combined_explanation = _merge_annotation_prose(explanation, commentary)
     if combined_explanation:
-        sections.append(_annotation_section(labels["explanation"], combined_explanation))
+        sections.append(_annotation_section(
+            labels["explanation"],
+            combined_explanation,
+            sources=annotation.get("commentary_sources"),
+        ))
     if prior:
         sections.append(_annotation_section(labels["prior"], prior))
     if later:
@@ -1060,19 +1078,68 @@ def _render_translated_inline_runs(value: Any, source: dict[str, Any]) -> str:
     return "".join(output)
 
 
-def _annotation_section(title: str, value: Any) -> str:
+def _annotation_section(
+    title: str,
+    value: Any,
+    *,
+    sources: Any = None,
+) -> str:
     if isinstance(value, list):
         rendered = []
         for item in value:
             if isinstance(item, dict):
                 text = item.get("text") or item.get("summary") or item.get("claim") or item.get("title") or ""
-                rendered.append(_render_rich_text(text))
+                rendered.append(
+                    _render_rich_text(text)
+                    + _render_annotation_sources(item.get("sources"))
+                )
             else:
                 rendered.append(_render_rich_text(item))
         content = "\\begin{itemize}\n" + "\n".join(f"\\item {item}" for item in rendered) + "\n\\end{itemize}"
     else:
-        content = _render_rich_text(value)
-    return f"\\medskip\\noindent\\textbf{{{escape_tex(title)}}}\\par\n{content}\n"
+        content = _render_rich_text(value) + _render_annotation_sources(sources)
+    return (
+        "\\Needspace{4\\baselineskip}\n"
+        f"\\medskip\\noindent\\textbf{{{escape_tex(title)}}}\\par\n{content}\n"
+    )
+
+
+def _render_annotation_sources(value: Any) -> str:
+    sources = value if isinstance(value, list) else []
+    rendered: list[str] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        title = str(source.get("title") or "").strip()
+        url = str(source.get("url") or "").strip()
+        locator = str(source.get("locator") or "").strip()
+        if not (title and url and locator):
+            continue
+        rendered.append(
+            f"\\href{{{_escape_url(url)}}}{{{escape_tex(title)}}}"
+            f"\\,---\\,{escape_tex(locator)}"
+        )
+    if not rendered:
+        return ""
+    return (
+        "\\par\\smallskip\\noindent{\\footnotesize "
+        + "; ".join(rendered)
+        + "}"
+    )
+
+
+def _annotation_source_manifest(annotation: dict[str, Any]) -> dict[str, Any]:
+    """Preserve direct citations and their claim association without rewriting."""
+    output: dict[str, Any] = {}
+    if "commentary_sources" in annotation:
+        output["commentary_sources"] = deepcopy(annotation["commentary_sources"])
+    for field in ("prior_work", "later_work"):
+        claims = annotation.get(field)
+        if isinstance(claims, list) and any(
+            isinstance(claim, dict) and "sources" in claim for claim in claims
+        ):
+            output[field] = deepcopy(claims)
+    return output
 
 
 def _render_rich_text(value: Any) -> str:
@@ -1354,10 +1421,11 @@ def _render_reading_guide(*, language: str, include_translation: bool) -> str:
 def _render_chapter_guide(guide: dict[str, Any], *, language: str) -> str:
     fields = (
         ("motivation", "学习动机"), ("main_content", "主要内容"),
-        ("section_logic", "节间逻辑"), ("book_position", "全书位置"),
+        ("section_logic", "节间逻辑"), ("book_position", "原文位置"),
         ("prerequisites", "前置知识"),
     )
     parts = [
+        "\\Needspace{4\\baselineskip}\n"
         f"\\medskip\\noindent\\textbf{{{escape_tex(title)}}}\\par\n{_render_rich_text(guide[key])}\n"
         for key, title in fields if str(guide.get(key) or "").strip()
     ]
@@ -1367,11 +1435,17 @@ def _render_chapter_guide(guide: dict[str, Any], *, language: str) -> str:
             f"\\item {_render_rich_text(item.get('title'))}: {_render_rich_text(item.get('reason'))}"
             for item in reading if isinstance(item, dict)
         )
-        parts.append(f"\\medskip\\noindent\\textbf{{补充阅读}}\\par\n\\begin{{itemize}}\n{items}\n\\end{{itemize}}\n")
+        parts.append(
+            "\\Needspace{4\\baselineskip}\n"
+            f"\\medskip\\noindent\\textbf{{补充阅读}}\\par\n"
+            f"\\begin{{itemize}}\n{items}\n\\end{{itemize}}\n"
+        )
     heading = "章导读" if str(language).lower().startswith("zh") else "Chapter guide"
     return (
-        f"% ARC-CHAPTER-GUIDE-BEGIN\n\\begin{{quote}}\\noindent\\textbf{{{heading}}}\\par\n"
-        + "".join(parts) + "\\end{quote}\n% ARC-CHAPTER-GUIDE-END\n"
+        f"% ARC-CHAPTER-GUIDE-BEGIN\n\\begin{{arcchapterguide}}\n"
+        f"\\noindent\\textbf{{{heading}}}\\par\n"
+        + "".join(parts)
+        + "\\end{arcchapterguide}\n% ARC-CHAPTER-GUIDE-END\n"
     )
 
 
@@ -1411,14 +1485,14 @@ def _labels(language: str) -> dict[str, Any]:
     chinese = str(language).lower().replace("_", "-").startswith("zh")
     if chinese:
         return {
-            "is_chinese": True, "language": "伴读语言", "guide": "阅读导览", "glossary": "术语表",
+            "is_chinese": True, "language": "阅读语言", "guide": "阅读导览", "glossary": "术语表",
             "source": "原文", "translation": "译文", "companion": "伴读", "unit": "伴读单元",
             "source_term": "英文术语", "target_term": "中文译法", "glossary_explanation": "简要解释",
             "explanation": "解释",
             "prior": "前人工作", "later": "后续工作",
         }
     return {
-        "is_chinese": False, "language": "Companion language", "guide": "Reading guide", "glossary": "Glossary",
+        "is_chinese": False, "language": "Reading language", "guide": "Reading guide", "glossary": "Glossary",
         "source": "Original", "translation": "Translation", "companion": "Companion", "unit": "Companion unit",
         "source_term": "Source term", "target_term": "Translation", "glossary_explanation": "Brief explanation",
         "explanation": "Explanation",

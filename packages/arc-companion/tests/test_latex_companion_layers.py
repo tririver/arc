@@ -63,8 +63,52 @@ def test_annotation_merges_distinct_explanation_and_commentary_without_repetitio
     assert "EXPLANATION-UNIQUE" in rendered
     assert "COMMENTARY-UNIQUE" in rendered
     assert rendered.count(r"\textbf{解释}") == 1
+    assert (
+        "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{解释}"
+        in rendered
+    )
     assert repeated.count("共享解释") == 1
     assert r"\Needspace{6\baselineskip}" in rendered
+
+
+def test_annotation_renders_direct_sources_as_linked_titles_with_locators() -> None:
+    rendered = _render_annotation(
+        "s-direct-sources",
+        {
+            "explanation": "A sourced explanation.",
+            "commentary": "",
+            "commentary_sources": [{
+                "title": "Primary Source",
+                "url": "https://example.test/paper_a#section-3",
+                "locator": "Section 3 / p. 12",
+            }],
+            "prior_work": [{
+                "text": "An earlier result.",
+                "sources": [{
+                    "title": "Earlier Paper",
+                    "url": "https://example.test/earlier?view=full&lang=en",
+                    "locator": "Abstract",
+                }],
+            }],
+            "later_work": [],
+        },
+        language="en",
+    )
+
+    assert (
+        r"\href{https://example.test/paper\_a\#section-3}{Primary Source}"
+        in rendered
+    )
+    assert "Section 3 / p. 12" in rendered
+    assert (
+        "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{Prior work}"
+        in rendered
+    )
+    assert (
+        r"\href{https://example.test/earlier?view=full\&lang=en}{Earlier Paper}"
+        in rendered
+    )
+    assert "Abstract" in rendered
 
 
 @pytest.mark.skipif(
@@ -215,6 +259,9 @@ def test_renderer_orders_layers_and_repeats_only_unnumbered_equations(tmp_path: 
     assert r"\newenvironment{arcsource}{\par\begingroup}{\par\endgroup}" in tex
     assert "ArcTranslationBackground" in tex
     assert "ArcCompanionBackground" in tex
+    assert tex.count("colback=ArcCompanionBackground") == 1
+    assert r"\newtcolorbox{arccompanion}[1][]{arccompanionsurface,#1}" in tex
+    assert r"\newtcolorbox{arcchapterguide}[1][]{arccompanionsurface,#1}" in tex
     assert validate_tex_fidelity(tex, document, manifest) == []
 
 
@@ -999,8 +1046,66 @@ def test_preamble_uses_sans_body_and_serif_math_with_cjk_fallbacks() -> None:
     assert "FandolHei-Regular" in tex
     assert "\\begin{document}\n\\sffamily" in tex
     assert r"\setCJKmainfont{Noto Serif CJK SC}" in tex
+    assert "阅读语言: zh-CN" in tex
+    assert "伴读语言" not in tex
+    english = _preamble(title="T", authors="A", language="en")
+    assert "Reading language: en" in english
+    assert "Companion language" not in english
     equation = _equation_environment(r"x=\text{mass}", number=None, label=None)
     assert r"\begingroup\rmfamily" in equation
+
+
+def test_chapter_opening_reserves_space_for_title_and_guide_body(tmp_path: Path) -> None:
+    document = {
+        "front_matter": {},
+        "blocks": [
+            {"block_id": "chapter-title", "kind": "heading", "text": "Chapter One"},
+            {"block_id": "body", "kind": "prose", "text": "Source body."},
+        ],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    tex, _ = render_companion_tex(
+        document,
+        [{"segment_id": "s1", "block_ids": ["chapter-title", "body"]}],
+        {"s1": {"explanation": "Reader explanation.", "commentary": ""}},
+        output_dir=tmp_path,
+        language="zh-CN",
+        chapters=[{
+            "chapter_id": "ch-1",
+            "block_ids": ["chapter-title", "body"],
+        }],
+        chapter_guides={"ch-1": {
+            "main_content": "Guide opening text.",
+            "book_position": "Source pp. 16–17.",
+            "supplementary_reading": [{"title": "Further source", "reason": "Context"}],
+        }},
+    )
+
+    opening_guard = tex.index(r"\Needspace{10\baselineskip}")
+    assert opening_guard < tex.index("Chapter One") < tex.index("ARC-CHAPTER-GUIDE-BEGIN")
+    guide_region = tex[
+        tex.index("ARC-CHAPTER-GUIDE-BEGIN"):tex.index("ARC-CHAPTER-GUIDE-END")
+    ]
+    assert r"\begin{arcchapterguide}" in guide_region
+    assert r"\end{arcchapterguide}" in guide_region
+    assert r"\begin{quote}" not in guide_region
+    assert r"\Needspace{4\baselineskip}" in guide_region
+    assert tex.index("章导读") < tex.index("Guide opening text.")
+    assert (
+        "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{主要内容}"
+        in tex
+    )
+    assert (
+        "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{原文位置}"
+        in tex
+    )
+    assert (
+        "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{补充阅读}"
+        in tex
+    )
+    assert "原文位置" in tex
+    assert "全书位置" not in tex
 
 
 @pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")

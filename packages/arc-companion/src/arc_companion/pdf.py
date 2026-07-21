@@ -12,6 +12,16 @@ class PDFError(RuntimeError):
     """Raised when LaTeX compilation or PDF inspection fails."""
 
 
+_VISIBLE_LAYER_LABELS = {
+    "译文": r"译\s*文",
+    "伴读": r"伴\s*读",
+    "本段解释": r"本\s*段\s*解\s*释",
+}
+_VISIBLE_LAYER_LABEL_DECORATION = r"[#>*\-–—]*"
+_VISIBLE_LAYER_LABEL_OPEN = r"[【\[(（「『《〈]?"
+_VISIBLE_LAYER_LABEL_CLOSE = r"[】\])）」』》〉]?"
+
+
 def compile_latex(tex_path: Path, pdf_path: Path, *, timeout_seconds: float = 300.0) -> None:
     executable = shutil.which("latexmk")
     if executable is None:
@@ -66,7 +76,7 @@ def validate_pdf(pdf_path: Path, *, runner: Callable[..., subprocess.CompletedPr
     extracted_text = text_path.read_text(encoding="utf-8", errors="ignore") if text_path.is_file() else ""
     if not extracted_text.strip():
         raise PDFError("PDF contains no searchable text")
-    forbidden = [value for value in ("译文", "伴读", "本段解释") if value in extracted_text]
+    forbidden = _visible_layer_labels(extracted_text)
     if forbidden:
         raise PDFError(f"PDF contains removed visible layer labels: {', '.join(forbidden)}")
 
@@ -107,6 +117,19 @@ def validate_pdf(pdf_path: Path, *, runner: Callable[..., subprocess.CompletedPr
         "text_path": str(text_path),
         "render_paths": render_paths,
     }
+
+
+def _visible_layer_labels(extracted_text: str) -> list[str]:
+    found: list[str] = []
+    for label, label_pattern in _VISIBLE_LAYER_LABELS.items():
+        pattern = re.compile(
+            rf"^\s*{_VISIBLE_LAYER_LABEL_DECORATION}\s*"
+            rf"{_VISIBLE_LAYER_LABEL_OPEN}\s*{label_pattern}\s*"
+            rf"{_VISIBLE_LAYER_LABEL_CLOSE}\s*[:：\-–—]?\s*$"
+        )
+        if any(pattern.fullmatch(line) for line in extracted_text.splitlines()):
+            found.append(label)
+    return found
 
 
 def _parse_pdfinfo(output: str) -> tuple[int, bool]:

@@ -7,6 +7,11 @@ import zipfile
 
 from .io import read_json, sha256_file, write_json
 from .results import err, ok
+from .web import (
+    WEB_MANIFEST_VERSION,
+    WEB_RENDER_VERSION,
+    validate_reader_project,
+)
 
 
 def package_project(project_dir: Path) -> dict[str, object]:
@@ -25,8 +30,14 @@ def package_project(project_dir: Path) -> dict[str, object]:
             checkpoint_path = _inside_project(root, Path(str(checkpoint)))
             if not checkpoint_path.is_dir():
                 raise ValueError("State checkpoint_dir is missing or is not a directory")
-        source_manifest_path = root / "source-manifest.json"
-        validation_path = root / "validation.json"
+        source_manifest_path = (
+            _state_file(root, state, "source_manifest_path")
+            if state.get("source_manifest_path") else root / "source-manifest.json"
+        )
+        validation_path = (
+            _state_file(root, state, "validation_path")
+            if state.get("validation_path") else root / "validation.json"
+        )
         if not source_manifest_path.is_file() or not validation_path.is_file():
             raise ValueError("Source manifest or validation report is missing")
         validation = read_json(validation_path)
@@ -44,12 +55,13 @@ def package_project(project_dir: Path) -> dict[str, object]:
             if expected_hash and sha256_file(asset_path) != expected_hash:
                 raise ValueError(f"TeX asset hash mismatch: {asset_path}")
             files.append(asset_path)
-    except (OSError, ValueError, TypeError) as exc:
+        files.extend(_web_files(root, state))
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
         return err("companion_package_failed", str(exc))
 
     unique_files = sorted(set(files), key=lambda path: path.relative_to(root).as_posix())
     manifest = {
-        "schema_version": "arc.companion.package.v1",
+        "schema_version": "arc.companion.package.v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "paper_id": state.get("paper_id"),
         "fingerprint": state.get("fingerprint"),
@@ -74,6 +86,125 @@ def package_project(project_dir: Path) -> dict[str, object]:
         archive.unlink(missing_ok=True)
         return err("companion_package_failed", f"Package verification failed: {exc}")
     return ok({"archive_path": str(archive), "manifest_path": str(manifest_path), "files": manifest["files"]})
+
+
+_WEB_STATE_KEYS = {
+    "output_html",
+    "output_html_sha256",
+    "reader_snapshot_path",
+    "reader_snapshot_sha256",
+    "web_manifest_path",
+    "web_manifest_sha256",
+    "web_render_version",
+}
+
+
+def _web_files(root: Path, state: dict[str, object]) -> list[Path]:
+    """Resolve and verify every deliverable declared by the web manifest."""
+    present = {key for key in _WEB_STATE_KEYS if state.get(key) not in (None, "")}
+    if not present:
+        if state.get("schema_version") == "arc.companion.state.v2":
+            raise ValueError("State v2 is missing the required web reader contract")
+        return []
+    if present != _WEB_STATE_KEYS:
+        missing = sorted(_WEB_STATE_KEYS - present)
+        raise ValueError(f"State has an incomplete web reader contract: missing {missing}")
+
+    if (
+        state.get("schema_version") == "arc.companion.state.v2"
+        and state.get("web_render_version") != WEB_RENDER_VERSION
+    ):
+        raise ValueError("State v2 web_render_version is not current")
+
+    # Validate the browser-facing bundle as a coherent reader before collecting
+    # its individual files.  Hash and containment checks below remain the
+    # packaging boundary; this call additionally verifies index/data/coverage
+    # relationships that a self-consistent manifest alone cannot establish.
+    validate_reader_project(root, state=state)
+
+    manifest_path = _state_hashed_file(
+        root, state, "web_manifest_path", "web_manifest_sha256"
+    )
+    manifest = read_json(manifest_path)
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != WEB_MANIFEST_VERSION:
+        raise ValueError("Web manifest has an unsupported schema")
+    if manifest.get("web_render_version") != WEB_RENDER_VERSION:
+        raise ValueError("Web manifest render version is not current")
+    if manifest.get("web_render_version") != state.get("web_render_version"):
+        raise ValueError("Web manifest render version does not match state")
+
+    declared: list[tuple[str, dict[str, object]]] = []
+    for key in ("index", "snapshot", "data_script"):
+        record = manifest.get(key)
+        if not isinstance(record, dict):
+            raise ValueError(f"Web manifest {key} record is missing or invalid")
+        declared.append((key, record))
+    assets = manifest.get("assets")
+    if not isinstance(assets, list):
+        raise ValueError("Web manifest assets must be an array")
+    for index, record in enumerate(assets):
+        if not isinstance(record, dict):
+            raise ValueError(f"Web manifest asset {index} is invalid")
+        declared.append((f"asset {index}", record))
+
+    output: list[Path] = [manifest_path]
+    seen: set[Path] = {manifest_path}
+    records_by_path: dict[Path, tuple[str, str]] = {}
+    for label, record in declared:
+        raw_path = record.get("path")
+        expected_hash = str(record.get("sha256") or "")
+        if not isinstance(raw_path, str) or not raw_path or not expected_hash:
+            raise ValueError(f"Web manifest {label} must contain path and sha256")
+        path = _inside_project(root, Path(raw_path))
+        if not path.is_file():
+            raise ValueError(f"Web reader file is missing: {path}")
+        actual_hash = sha256_file(path)
+        if actual_hash != expected_hash:
+            raise ValueError(f"Web reader file hash mismatch: {path}")
+        expected_bytes = record.get("bytes")
+        if expected_bytes is not None and (
+            not isinstance(expected_bytes, int)
+            or isinstance(expected_bytes, bool)
+            or expected_bytes != path.stat().st_size
+        ):
+            raise ValueError(f"Web reader file byte count mismatch: {path}")
+        previous = records_by_path.get(path)
+        identity = (expected_hash, label)
+        if previous is not None and previous[0] != expected_hash:
+            raise ValueError(f"Web manifest has conflicting duplicate path: {path}")
+        records_by_path[path] = identity
+        if path not in seen:
+            seen.add(path)
+            output.append(path)
+
+    index_path = _state_hashed_file(root, state, "output_html", "output_html_sha256")
+    snapshot_path = _state_hashed_file(
+        root, state, "reader_snapshot_path", "reader_snapshot_sha256"
+    )
+    if index_path != _manifest_record_path(root, manifest["index"]):
+        raise ValueError("State output_html does not match the web manifest index")
+    if snapshot_path != _manifest_record_path(root, manifest["snapshot"]):
+        raise ValueError("State reader_snapshot_path does not match the web manifest snapshot")
+    return output
+
+
+def _state_hashed_file(
+    root: Path,
+    state: dict[str, object],
+    path_key: str,
+    hash_key: str,
+) -> Path:
+    path = _state_file(root, state, path_key)
+    expected_hash = str(state.get(hash_key) or "")
+    if not expected_hash or sha256_file(path) != expected_hash:
+        raise ValueError(f"State {hash_key} does not match {path_key}")
+    return path
+
+
+def _manifest_record_path(root: Path, record: object) -> Path:
+    if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+        raise ValueError("Web manifest contains an invalid file record")
+    return _inside_project(root, Path(record["path"]))
 
 
 def _state_file(root: Path, state: dict[str, object], key: str) -> Path:
