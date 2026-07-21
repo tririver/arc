@@ -548,7 +548,10 @@ def test_worker_prompt_advertises_only_the_paper_cli_and_nested_llm_guard():
 
     assert "you may invoke arc-paper-worker directly and repeatedly" in rendered
     assert "Never invoke raw arc-paper, Python arc_paper modules" in rendered
-    assert "trusted controller validates and promotes" in rendered
+    assert "validated artifacts are promoted atomically" in rendered
+    assert "Command capability metadata rejects" in rendered
+    assert "worker guard" not in rendered
+    assert "trusted controller" not in rendered
     assert "Except for arc-paper-worker" in rendered
 
 

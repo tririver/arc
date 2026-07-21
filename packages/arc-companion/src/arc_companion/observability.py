@@ -38,6 +38,7 @@ def enrich_status(project_dir: Path, state: Mapping[str, Any]) -> dict[str, Any]
 
     root = project_dir.resolve()
     calls = _call_counts(root, state)
+    pending_calls = _pending_calls(root, state)
     timings, last_progress = _phase_timings(root)
     provider_progress = _latest_provider_progress(root, state)
     if provider_progress and (last_progress is None or provider_progress > last_progress):
@@ -50,6 +51,8 @@ def enrich_status(project_dir: Path, state: Mapping[str, Any]) -> dict[str, Any]
         "wait_reason": _wait_reason(phase, calls, lock_owner),
         "lock_owner": lock_owner,
         "calls": calls,
+        "pending_call_count": len(pending_calls),
+        "pending_calls": pending_calls,
         "last_progress_at": last_progress or state.get("updated_at"),
         "phase_elapsed_seconds": timings,
     }
@@ -75,6 +78,162 @@ def _call_counts(root: Path, state: Mapping[str, Any]) -> dict[str, int]:
         elif call_state == "draining":
             counts["draining"] += 1
     return counts
+
+
+def _pending_calls(root: Path, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Merge durable call and resume-transaction supervision inventories."""
+
+    checkpoint = Path(str(state.get("checkpoint_dir") or ""))
+    if not checkpoint.is_absolute():
+        checkpoint = root / checkpoint
+    result_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
+    checkpoints_by_key: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for path in sorted(checkpoint.rglob("call-checkpoints/*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        submission_state = str(value.get("submission_state") or "unknown")
+        call_state = str(value.get("state") or "unknown")
+        if submission_state not in {"submitted", "unknown"}:
+            continue
+        if call_state not in {"submitted", "resuming", "failed"}:
+            continue
+        logical = value.get("logical_identity")
+        logical = logical if isinstance(logical, dict) else {}
+        key = str(logical.get("idempotency_key") or "")
+        if key:
+            checkpoints_by_key[key] = (path, value)
+        resumable = bool(value.get("resumable"))
+        identity = (("key", key) if key else ("checkpoint", str(path.resolve())))
+        result_by_identity[identity] = {
+            "checkpoint": str(path.relative_to(checkpoint)),
+            "idempotency_key": key or None,
+            "session_key": logical.get("session_key"),
+            "generation": logical.get("generation"),
+            "state": call_state,
+            "submission_state": submission_state,
+            "recovery_action": "resume-native" if resumable else "operator-supervision",
+            "blocking_reason": (
+                str(value.get("last_error") or value.get("error") or "")
+                or "submitted_call_without_an_accepted_response"
+            ),
+            "entry_status": None,
+        }
+
+    transaction_path = root / ".arc-companion" / "resume-transaction.json"
+    try:
+        transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        transaction = None
+    if isinstance(transaction, dict):
+        action = str(transaction.get("action") or "resume-native")
+        context_keys = {
+            str(item.get("idempotency_key") or "")
+            for item in transaction.get("native_resume_contexts") or []
+            if isinstance(item, dict)
+        }
+        for raw in transaction.get("entries") or []:
+            if not isinstance(raw, dict) or raw.get("status") == "resolved":
+                continue
+            entry = dict(raw)
+            key = str(entry.get("idempotency_key") or "")
+            session_key = str(entry.get("session_key") or "")
+            segment_id = str(entry.get("segment_id") or "")
+            ledger_path = Path(str(entry.get("ledger_path") or ""))
+            if not ledger_path.is_absolute():
+                ledger_path = (root / ledger_path).resolve(strict=False)
+            else:
+                ledger_path = ledger_path.resolve(strict=False)
+            identity = (
+                ("key", key) if key else (
+                    "entry", str(ledger_path), session_key, segment_id,
+                )
+            )
+            checkpoint_item = checkpoints_by_key.get(key) if key else None
+            checkpoint_path, checkpoint_value = (
+                checkpoint_item if checkpoint_item is not None else (None, {})
+            )
+            recovery_context = entry.get("recovery_context")
+            recovery_context = (
+                recovery_context if isinstance(recovery_context, dict) else {}
+            )
+            ledger, ledger_block, supervision = _pending_ledger_context(
+                ledger_path, segment_id,
+            )
+            supervision_context = supervision.get("recovery_context")
+            supervision_context = (
+                supervision_context if isinstance(supervision_context, dict) else {}
+            )
+            submission_state = _effective_submission_state(
+                recovery_context.get("submission_state"),
+                supervision_context.get("submission_state"),
+                (ledger_block or {}).get("submission_state"),
+                checkpoint_value.get("submission_state"),
+            )
+            blocking_reason = str(
+                entry.get("blocking_reason")
+                or supervision.get("reason")
+                or checkpoint_value.get("last_error")
+                or checkpoint_value.get("error")
+                or "submitted_call_without_an_accepted_response"
+            )
+            can_resume_native = bool(
+                key in context_keys
+                or recovery_context.get("resumable")
+                or recovery_context.get("native_session_id")
+            )
+            existing = result_by_identity.get(identity, {})
+            result_by_identity[identity] = {
+                **existing,
+                "checkpoint": (
+                    str(checkpoint_path.relative_to(checkpoint))
+                    if checkpoint_path is not None else existing.get("checkpoint")
+                ),
+                "idempotency_key": key or existing.get("idempotency_key"),
+                "session_key": session_key or existing.get("session_key"),
+                "generation": entry.get("generation") or entry.get("initial_generation")
+                or existing.get("generation"),
+                "state": str((ledger_block or {}).get("state") or existing.get("state") or "pending"),
+                "submission_state": submission_state,
+                "recovery_action": (
+                    action if action == "resume-native" and can_resume_native
+                    else "operator-supervision"
+                ),
+                "blocking_reason": blocking_reason,
+                "entry_status": str(entry.get("status") or "pending"),
+                "ledger_path": str(ledger_path),
+                "segment_id": segment_id or None,
+            }
+    return list(result_by_identity.values())
+
+
+def _pending_ledger_context(
+    ledger_path: Path, segment_id: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    try:
+        value = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}, None, {}
+    if not isinstance(value, dict):
+        return {}, None, {}
+    block = next((
+        item for item in value.get("blocks") or []
+        if isinstance(item, dict) and str(item.get("segment_id") or "") == segment_id
+    ), None)
+    supervision = value.get("needs_supervision")
+    return value, block, supervision if isinstance(supervision, dict) else {}
+
+
+def _effective_submission_state(*values: Any) -> str:
+    states = {str(value) for value in values if value is not None}
+    if "submitted" in states:
+        return "submitted"
+    if "unknown" in states:
+        return "unknown"
+    return next(iter(states), "unknown")
 
 
 def _phase_timings(root: Path) -> tuple[dict[str, float], str | None]:

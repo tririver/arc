@@ -769,7 +769,319 @@ def test_token_repair_persists_response_before_apply_and_reuses_failed_response(
     assert calls == 1
 
 
-def test_started_token_repair_is_lifetime_bounded_and_fails_closed(
+def test_paid_token_repair_with_segment_wide_fake_slots_never_resubmits(
+    tmp_path: Path,
+) -> None:
+    """The invalid response shape observed in production stays single-call supervised."""
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    segment = {"segment_id": "seg-invalid-paid", "block_ids": ["body"]}
+    calls = 0
+
+    def invalid_repair(prompt: str, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {"repairs": [
+            {"block_id": "unrequested", "slots": [{
+                "slot_id": "translation", "start_offset": 0, "end_offset": 0,
+            }]},
+            {"block_id": "body", "slots": [{
+                "slot_id": "translation", "start_offset": 0, "end_offset": 0,
+            }]},
+        ]}
+
+    arguments = dict(
+        segment=segment,
+        translation={"blocks": [{"block_id": "body", "text": "译文。"}]},
+        blocks_by_id={"body": block}, protected_names=[],
+        options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+        checkpoint_dir=tmp_path / "checkpoints", artifact_dir=tmp_path / "llm",
+        input_sha256="invalid-paid-input",
+    )
+    with pytest.raises(
+        pipeline_module.TranslationRepairNeedsSupervision,
+        match="refusing resubmission",
+    ) as first:
+        pipeline_module._repair_translation_token_placement(
+            **arguments, llm=invalid_repair,
+        )
+    assert first.value.recovery_context["submission_state"] == "submitted"
+    assert first.value.recovery_context["resumable"] is False
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("invalid paid repair response must never be resubmitted")
+
+    with pytest.raises(pipeline_module.TranslationRepairNeedsSupervision):
+        pipeline_module._repair_translation_token_placement(
+            **arguments, llm=forbidden_llm,
+        )
+    assert calls == 1
+
+
+def test_wrapped_paid_repair_failure_is_persisted_on_lane_ledger(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "translation-ledger.json"
+    pipeline_module.initialize_lane_ledger(
+        ledger_path, chapter_id="ch-1", lane="translation", segment_ids=["seg-1"],
+    )
+    pipeline_module.mark_submitted(ledger_path, segment_id="seg-1")
+    pipeline_module.mark_response_received(ledger_path, segment_id="seg-1")
+    paid_failure = pipeline_module.TranslationRepairNeedsSupervision(
+        segment_id="seg-1", marker_path=tmp_path / "paid-marker.json",
+        reason="changed failing block coverage",
+    )
+    wrapped = pipeline_module.CompanionLaneError(
+        "translation", [("seg-1", paid_failure)],
+    )
+
+    assert pipeline_module._mark_translation_repair_supervision(
+        ledger_path, segment_id="seg-1", exc=wrapped,
+    )
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    supervision = ledger["needs_supervision"]
+    assert supervision["segment_id"] == "seg-1"
+    assert supervision["recovery_context"]["submission_state"] == "submitted"
+    assert supervision["recovery_context"]["resumable"] is False
+    assert supervision["recovery_context"]["repair_marker"].endswith(
+        "paid-marker.json"
+    )
+
+
+def test_paid_repair_finalizer_classifies_later_same_lane_responses(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    blocks = []
+    for index in range(1, 4):
+        blocks.append({
+            "block_id": f"b{index}", "type": "text", "text": f"Value x{index}.",
+            "inline_runs": [
+                _inline_run("text", "Value ", index * 10 + 1),
+                _inline_run("math", f"x{index}", index * 10 + 2, tex=f"x_{index}"),
+                _inline_run("text", ".", index * 10 + 3),
+            ],
+        })
+    pipeline_module.write_json(
+        checkpoint / "document.json", {"document": {"blocks": blocks}},
+    )
+    ledger_path = checkpoint / "chapters" / "ch-1" / "translation-ledger.json"
+    pipeline_module.initialize_lane_ledger(
+        ledger_path, chapter_id="ch-1", lane="translation",
+        segment_ids=["s1", "s2", "s3"],
+    )
+    # Source-order ledger progress stops at s1, while already-submitted worker
+    # responses for s2/s3 can still land durably after that failure.
+    pipeline_module.mark_submitted(ledger_path, segment_id="s1")
+    pipeline_module.mark_response_received(ledger_path, segment_id="s1")
+
+    for index, segment_id in enumerate(("s1", "s2", "s3"), start=1):
+        key = f"repair-{index}"
+        token_id = str(blocks[index - 1]["inline_runs"][1]["token_id"])
+        valid = index == 3
+        response = {"repairs": [{
+            "block_id": f"b{index}" if valid else "unexpected",
+            "slots": [{
+                "slot_id": token_id if valid else "translation",
+                "start_offset": 2 if valid else 0,
+                "end_offset": 2 if valid else 0,
+            }],
+        }]}
+        pipeline_module.write_json(
+            checkpoint / "translation-drafts" / f"{key}.json", {
+                "schema_version": "arc.companion.translation-primary-draft.v1",
+                "segment_id": segment_id, "input_sha256": f"input-{index}",
+                "translation": {"blocks": [{
+                    "block_id": f"b{index}", "text": "译文。",
+                }]},
+            },
+        )
+        pipeline_module.write_json(
+            checkpoint / "translation-token-offset-attempts" / f"{key}.json", {
+                "segment_id": segment_id, "input_sha256": f"input-{index}",
+                "status": "response_received", "block_ids": [f"b{index}"],
+                "raw_response": response,
+            },
+        )
+        pipeline_module.write_json(
+            checkpoint / "llm" / "translations" / key / "retry-offset-1"
+            / "call-checkpoints" / f"call-{index}.json", {
+                "state": "validated", "submission_state": "submitted",
+                "logical_identity": {"idempotency_key": f"idem-{index}"},
+            },
+        )
+
+    entries = pipeline_module._finalize_paid_translation_repairs(checkpoint)
+
+    assert {item["segment_id"] for item in entries} == {"s1", "s2", "s3"}
+    actions = {item["segment_id"]: item["recovery_action"] for item in entries}
+    assert actions == {
+        "s1": "operator-supervision", "s2": "operator-supervision",
+        "s3": "deterministic-replay",
+    }
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert [item["segment_id"] for item in ledger["supervision_entries"]] == [
+        "s1", "s2",
+    ]
+    assert ledger["needs_supervision"]["segment_id"] == "s1"
+
+
+def test_paid_repair_finalizer_runs_full_protected_name_validation(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    block = {
+        "block_id": "body", "type": "text", "text": "Hertz value x.",
+        "inline_runs": [
+            _inline_run("text", "Hertz value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    pipeline_module.write_json(
+        checkpoint / "document.json", {"paper_id": "paper", "document": {"blocks": [block]}},
+    )
+    pipeline_module.write_json(checkpoint / "glossary.json", {"entries": [{
+        "source_term": "Hertz equations", "protected_names": ["Hertz"],
+    }]})
+    ledger_path = checkpoint / "chapters" / "ch-1" / "translation-ledger.json"
+    pipeline_module.initialize_lane_ledger(
+        ledger_path, chapter_id="ch-1", lane="translation", segment_ids=["s1"],
+    )
+    pipeline_module.mark_submitted(ledger_path, segment_id="s1")
+    pipeline_module.mark_response_received(ledger_path, segment_id="s1")
+    key = "repair-name"
+    pipeline_module.write_json(
+        checkpoint / "translation-drafts" / f"{key}.json", {
+            "segment_id": "s1", "input_sha256": "input",
+            "translation": {"blocks": [{"block_id": "body", "text": "译文。"}]},
+        },
+    )
+    token_id = str(block["inline_runs"][1]["token_id"])
+    pipeline_module.write_json(
+        checkpoint / "translation-token-offset-attempts" / f"{key}.json", {
+            "segment_id": "s1", "input_sha256": "input",
+            "status": "response_received", "block_ids": ["body"],
+            "raw_response": {"repairs": [{"block_id": "body", "slots": [{
+                "slot_id": token_id, "start_offset": 2, "end_offset": 2,
+            }]}]},
+        },
+    )
+    pipeline_module.write_json(
+        checkpoint / "llm" / "translations" / key / "retry-offset-1"
+        / "call-checkpoints" / "call.json", {
+            "state": "validated", "submission_state": "submitted",
+            "logical_identity": {"idempotency_key": "repair-idem"},
+        },
+    )
+
+    entries = pipeline_module._finalize_paid_translation_repairs(checkpoint)
+
+    assert len(entries) == 1
+    assert entries[0]["recovery_action"] == "operator-supervision"
+    assert "Hertz" in entries[0]["blocking_reason"]
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["needs_supervision"]["segment_id"] == "s1"
+    assert ledger["needs_supervision"]["recovery_context"]["resumable"] is False
+
+
+def test_dynamic_paid_repair_discovery_enriches_existing_transaction_entry(
+    tmp_path: Path,
+) -> None:
+    from arc_companion.resume_transaction import (
+        append_entries, begin_transaction, load_transaction, mark_entry,
+    )
+
+    identity = {
+        "ledger_path": str(tmp_path / "ledger.json"),
+        "session_key": "ch-1:translation", "segment_id": "s2",
+        "idempotency_key": "primary-call", "initial_generation": 1,
+        "target_generation": 1,
+        "recovery_action": "deterministic-replay",
+    }
+    begin_transaction(
+        tmp_path, action="resume-native", recovery_options={}, entries=[identity],
+        native_resume_contexts=[{
+            **identity, "native_session_id": "native-old", "resumable": True,
+        }],
+    )
+    mark_entry(tmp_path, 0, status="reconciling")
+    append_entries(tmp_path, [{
+        **identity, "idempotency_key": "paid-repair-call",
+        "recovery_action": "operator-supervision",
+        "blocking_reason": "paid repair failed local validation",
+        "recovery_context": {"repair_marker": "/checkpoint/marker.json"},
+    }])
+
+    transaction = load_transaction(tmp_path)
+    assert transaction is not None
+    assert len(transaction["entries"]) == 1
+    entry = transaction["entries"][0]
+    assert entry["status"] == "reconciling"
+    assert entry["idempotency_key"] == "paid-repair-call"
+    assert entry["recovery_action"] == "operator-supervision"
+    assert entry["recovery_context"].get("resumable", False) is False
+    assert entry["recovery_context"]["repair_marker"].endswith("marker.json")
+    assert transaction["native_resume_contexts"] == []
+
+
+def test_response_received_token_insertion_offsets_recover_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    """Replay the paid response shape found after the production crash."""
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    segment = {"segment_id": "seg-crash", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    attempt_path = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    attempt_path.parent.mkdir(parents=True)
+    token_id = str(block["inline_runs"][1]["token_id"])
+    paid_response = {"repairs": [{"block_id": "body", "slots": [{
+        "slot_id": token_id, "start_offset": 2, "end_offset": 2,
+    }]}]}
+    attempt_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-attempt.v2",
+        "segment_id": segment["segment_id"], "input_sha256": "crash-input",
+        "status": "response_received", "started_at": "2026-01-01T00:00:00+00:00",
+        "response_received_at": "2026-01-01T00:01:00+00:00",
+        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": pipeline_module.TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+        "model_tier": pipeline_module.TRANSLATION_RETRY_TIER,
+        "block_ids": ["body"], "raw_response": paid_response,
+    }), encoding="utf-8")
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("a paid response_received repair must not be resubmitted")
+
+    repaired, _ = pipeline_module._repair_translation_token_placement(
+        segment,
+        {"blocks": [{"block_id": "body", "text": "译文。"}]},
+        blocks_by_id={"body": block}, protected_names=[],
+        options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        input_sha256="crash-input", llm=forbidden_llm,
+    )
+
+    token = pipeline_module._opaque_inline_tokens(block)[0]
+    assert repaired["blocks"][0]["text"] == f"译文{token}。"
+    marker = json.loads(attempt_path.read_text(encoding="utf-8"))
+    assert marker["status"] == "validated"
+    draft = pipeline_module._matching_translation_token_repair_draft(
+        checkpoint_dir, segment["segment_id"], "crash-input",
+    )
+    assert draft is not None
+    assert draft["raw_response"] == paid_response
+
+
+def test_started_token_repair_without_call_checkpoint_is_safe_to_retry(
     tmp_path: Path,
 ) -> None:
     block = {
@@ -798,8 +1110,10 @@ def test_started_token_repair_is_lifetime_bounded_and_fails_closed(
     calls: list[str] = []
 
     def repair_llm(prompt: str, **kwargs):
-        calls.append(str(kwargs["model_tier"]))
-        raise AssertionError("a started offset attempt must never call the model again")
+        calls.append(str(kwargs["call_label"]))
+        return {"repairs": [{"block_id": "body", "slots": [
+            *_offset_slots(block, "译文。", [2]),
+        ]}]}
 
     arguments = dict(
         segment=segment,
@@ -809,12 +1123,59 @@ def test_started_token_repair_is_lifetime_bounded_and_fails_closed(
         checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
         input_sha256="resume-input",
     )
+    repaired, _ = pipeline_module._repair_translation_token_placement(
+        **arguments, llm=repair_llm,
+    )
+    assert calls == ["companion-translation-seg-resume-retry-offset-1"]
+    assert repaired["blocks"][0]["text"] != "译文。"
+    assert json.loads(attempt_path.read_text(encoding="utf-8"))["status"] == "validated"
+
+
+@pytest.mark.parametrize("submission_state", ["submitted", "unknown"])
+def test_started_token_repair_after_submission_barrier_fails_closed(
+    tmp_path: Path, submission_state: str,
+) -> None:
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    segment = {"segment_id": "seg-submitted", "block_ids": ["body"]}
+    checkpoint_dir = tmp_path / "checkpoints"
+    attempt_path = pipeline_module._translation_token_attempt_path(
+        checkpoint_dir, segment["segment_id"],
+    )
+    attempt_path.parent.mkdir(parents=True)
+    attempt_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-attempt.v2",
+        "segment_id": segment["segment_id"], "input_sha256": "submitted-input",
+        "status": "started", "started_at": "2026-01-01T00:00:00+00:00",
+        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": pipeline_module.TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+        "model_tier": pipeline_module.TRANSLATION_RETRY_TIER,
+        "block_ids": ["body"],
+    }), encoding="utf-8")
+    call_dir = tmp_path / "llm" / "retry-offset-1" / "call-checkpoints"
+    call_dir.mkdir(parents=True)
+    (call_dir / "call.json").write_text(json.dumps({
+        "state": "submitted", "submission_state": submission_state,
+    }), encoding="utf-8")
+
+    def forbidden_llm(prompt: str, **kwargs):
+        raise AssertionError("submitted or unknown repair must never be replayed")
+
     with pytest.raises(RuntimeError, match="already started"):
         pipeline_module._repair_translation_token_placement(
-            **arguments, llm=repair_llm,
+            segment,
+            {"blocks": [{"block_id": "body", "text": "译文。"}]},
+            blocks_by_id={"body": block}, protected_names=[],
+            options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
+            checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+            input_sha256="submitted-input", llm=forbidden_llm,
         )
-    assert calls == []
-    assert json.loads(attempt_path.read_text(encoding="utf-8"))["status"] == "started"
 
 
 def test_v4_upgrade_without_primary_draft_blocks_before_low_model(tmp_path: Path) -> None:
@@ -2456,6 +2817,11 @@ def test_concurrent_legacy_coverage_upgrades_stop_at_build_circuit(
     def fatal_provider(prompt: str, **kwargs):
         with calls_lock:
             calls.append(str(kwargs["call_label"]))
+        call_dir = Path(kwargs["artifact_dir"]) / "call-checkpoints"
+        call_dir.mkdir(parents=True, exist_ok=True)
+        (call_dir / "submitted.json").write_text(json.dumps({
+            "state": "submitted", "submission_state": "unknown",
+        }), encoding="utf-8")
         initial_budget.wait(timeout=5)
         try:
             raise FatalProviderError("usage quota exhausted")
@@ -2542,6 +2908,15 @@ def test_current_started_coverage_attempt_fails_closed(tmp_path: Path) -> None:
         "model_tier": pipeline_module.TRANSLATION_COVERAGE_REPAIR_TIER,
         "missing_block_ids": ["body"],
     }), encoding="utf-8")
+    call_dir = (
+        checkpoint_dir / "llm" / "translations"
+        / pipeline_module._segment_checkpoint_name(segment["segment_id"])
+        / "coverage-repair-1" / "call-checkpoints"
+    )
+    call_dir.mkdir(parents=True)
+    (call_dir / "submitted.json").write_text(json.dumps({
+        "state": "submitted", "submission_state": "submitted",
+    }), encoding="utf-8")
 
     def forbidden_llm(prompt: str, **kwargs):
         raise AssertionError("current started coverage attempt must not call the model")
@@ -2621,6 +2996,39 @@ def test_offline_runtime_env_overrides_polluted_parent_access(monkeypatch) -> No
     assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
     assert "ARC_CODEX_MCP_MODE" not in env
     assert "ARC_CLAUDE_MCP_MODE" not in env
+
+
+@pytest.mark.parametrize("user_allows_internet", [False, True])
+def test_translation_primary_and_repairs_share_offline_runtime_recipe(
+    tmp_path: Path, user_allows_internet: bool,
+) -> None:
+    options = BuildOptions(
+        paper_id="arXiv:1234.5678", project_dir=tmp_path,
+        allow_internet=user_allows_internet,
+    )
+    environments: list[dict[str, str]] = []
+
+    def capture(_prompt: str, **kwargs):
+        environments.append(dict(kwargs["env"]))
+        return {"ok": True}
+
+    for label in ("primary", "token-repair", "coverage-repair"):
+        pipeline_module._llm_call(
+            capture, label, {"type": "object"}, options=options,
+            artifact_dir=tmp_path / label, call_label=label,
+            model_tier=pipeline_module.TRANSLATION_TIER,
+            force_offline=True,
+        )
+
+    recipes = [{
+        key: env.get(key) for key in (
+            "ARC_CODEX_ALLOW_INTERNET", "ARC_CLAUDE_ALLOW_INTERNET",
+            "ARC_CODEX_ENABLE_MCP", "ARC_CLAUDE_ALLOW_MCP",
+            "ARC_LLM_INHERIT_HOST_TOOLS",
+        )
+    } for env in environments]
+    assert recipes[0] == recipes[1] == recipes[2]
+    assert recipes[0]["ARC_CODEX_ALLOW_INTERNET"] == "false"
 
 
 def test_coverage_repair_uses_no_second_model_call_for_token_placement(tmp_path: Path) -> None:
@@ -2951,6 +3359,8 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
             return {"repairs": [{"block_id": block_id_value, "slots": slots}]}
         else:
             assert kwargs["model_tier"] == pipeline_module.TRANSLATION_TIER == "medium"
+            assert kwargs["env"]["ARC_CODEX_ALLOW_INTERNET"] == "false"
+            assert kwargs["env"]["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
             assert "perform this exact checklist" in prompt
             assert "every protected personal name" in prompt
         text = (
@@ -3025,6 +3435,79 @@ def test_translation_opaque_token_retry_is_bounded_and_checkpoints_successes(tmp
     }
     assert all("slot repair" in str(error) for _, error in exc_info.value.failures)
 
+
+def test_offline_translation_session_keeps_same_runtime_for_token_repair(
+    tmp_path: Path,
+) -> None:
+    from arc_llm.runner import _runtime_fp
+    from arc_llm.sessions import LLMSessionManager
+
+    block = {
+        "block_id": "body", "type": "text", "text": "Value x.",
+        "inline_runs": [
+            _inline_run("text", "Value ", 1),
+            _inline_run("math", "x", 2, tex="x"),
+            _inline_run("text", ".", 3),
+        ],
+    }
+    document = {
+        "front_matter": {}, "blocks": [block], "equations": [], "figures": [],
+        "tables": [], "bibliography": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:runtime", parsed={"document": document}, document=document,
+        metadata={}, references=[], citers=[],
+    )
+    options = BuildOptions(
+        paper_id=bundle.paper_id, project_dir=tmp_path, workers=1,
+        provider="codex-cli",
+    )
+    manager = LLMSessionManager(tmp_path / "sessions")
+    offline_env = pipeline_module._llm_runtime_env(
+        allow_internet=False, force_disable_internet=True, inherit_host_tools=False,
+    )
+    runtime_fingerprint = _runtime_fp(
+        provider_used="codex-cli", model=None,
+        model_tier=pipeline_module.TRANSLATION_TIER,
+        env=offline_env, process_chain=None,
+    )
+    manager.get_or_create(
+        key="ch:translation", provider="codex-cli", model=None,
+        runtime_fingerprint=runtime_fingerprint,
+    )
+    labels: list[str] = []
+
+    def stateful_llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        labels.append(label)
+        fingerprint = _runtime_fp(
+            provider_used="codex-cli", model=kwargs.get("model"),
+            model_tier=kwargs.get("model_tier"), env=kwargs.get("env"),
+            process_chain=None,
+        )
+        with manager.locked_turn(
+            key="ch:translation", provider="codex-cli", model=None,
+            runtime_fingerprint=fingerprint,
+        ):
+            pass
+        if label.endswith("retry-offset-1"):
+            return {"repairs": [{"block_id": "body", "slots": [
+                *_offset_slots(block, "译文。", [2]),
+            ]}]}
+        return {"blocks": [{"block_id": "body", "text": "译文。"}]}
+
+    result = _generate_translations(
+        [{"segment_id": "seg-runtime", "block_ids": ["body"]}],
+        options=options, bundle=bundle, glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=tmp_path / "checkpoints", llm=stateful_llm,
+    )
+
+    assert list(result) == ["seg-runtime"]
+    assert labels == [
+        "companion-translation-seg-runtime",
+        "companion-translation-seg-runtime-retry-offset-1",
+    ]
 
 def test_empty_translation_uses_bounded_coverage_repair_and_names_remain_deterministic(
     tmp_path: Path,
@@ -3389,8 +3872,9 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert externally_enabled
     for call in externally_enabled:
         env = call["env"]
-        assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
-        assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
+        expected_internet = "false" if "translation" in str(call["call_label"]) else "true"
+        assert env["ARC_CODEX_ALLOW_INTERNET"] == expected_internet
+        assert env["ARC_CLAUDE_ALLOW_INTERNET"] == expected_internet
         assert env["ARC_CODEX_ENABLE_MCP"] == "false"
         assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
         assert "ARC_CODEX_MCP_MODE" not in env
@@ -4510,6 +4994,40 @@ def test_first_round_preview_failure_stops_before_evidence_and_review(tmp_path: 
     )["status"] == "failed"
 
 
+def test_outer_failure_preserves_supervised_lane_status(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    bundle = _bundle(tmp_path)
+    bundle.parsed["structure"] = {"document_kind": "book", "chapters": []}
+
+    def fail_after_lane_supervision(**kwargs):
+        ledger_path = (
+            kwargs["checkpoint_dir"] / "chapters" / "ch-0001" / "translation-ledger.json"
+        )
+        pipeline_module.initialize_lane_ledger(
+            ledger_path, chapter_id="ch-0001", lane="translation", segment_ids=["s1"],
+        )
+        pipeline_module.mark_needs_supervision(
+            ledger_path, segment_id="s1", reason="submitted call cancelled",
+            recovery_context={"submission_state": "unknown", "resumable": True},
+        )
+        raise RuntimeError("aggregate lane cancellation")
+
+    monkeypatch.setattr(
+        pipeline_module, "_build_chaptered_companion", fail_after_lane_supervision,
+    )
+    result = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=tmp_path / "supervised"),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=FakeLLM(),
+    )
+
+    assert result["status"] == "needs_supervision"
+    state = json.loads((tmp_path / "supervised" / "state.json").read_text())
+    assert state["status"] == "needs_supervision"
+    assert state["recovery_options"]["paper_id"] == bundle.paper_id
+
+
 def test_non_json_status_prefers_ready_preview_path(capsys) -> None:
     _emit(
         {"ok": True, "data": {"status": "preview_ready", "preview_pdf": "/run/preview.pdf"}, "meta": {}},
@@ -4626,10 +5144,11 @@ def test_shared_llm_limiter_bounds_aggregate_concurrency_across_lanes() -> None:
     assert peak == 2
 
 
-def test_shared_llm_limiter_trips_queued_work_across_lanes_after_batch_abort() -> None:
+def test_shared_llm_limiter_stops_queued_work_but_drains_submitted_calls() -> None:
     lock = threading.Lock()
     both_started = threading.Event()
     release_abort = threading.Event()
+    release_drain = threading.Event()
     calls: list[str] = []
     active = 0
 
@@ -4651,9 +5170,9 @@ def test_shared_llm_limiter_trips_queued_work_across_lanes_after_batch_abort() -
             except FatalProviderError as exc:
                 raise RuntimeError("wrapped provider failure") from exc
         assert cancel_check is not None
-        while not cancel_check():
-            threading.Event().wait(0.001)
-        raise RuntimeError("active call cancelled by build circuit")
+        assert release_drain.wait(timeout=5)
+        assert cancel_check() is False
+        return {"prompt": prompt}
 
     limited = _limit_llm_concurrency(model, 2)
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -4671,8 +5190,8 @@ def test_shared_llm_limiter_trips_queued_work_across_lanes_after_batch_abort() -
         release_abort.set()
         with pytest.raises(RuntimeError, match="wrapped provider failure"):
             active_futures[0].result(timeout=5)
-        with pytest.raises(RuntimeError, match="cancelled by build circuit"):
-            active_futures[1].result(timeout=5)
+        release_drain.set()
+        assert active_futures[1].result(timeout=5) == {"prompt": "annotation-active"}
         for future in queued_futures:
             with pytest.raises(CompanionLLMCircuitOpen):
                 future.result(timeout=5)
@@ -4730,6 +5249,53 @@ def test_shared_llm_limiter_stops_successors_after_any_call_failure() -> None:
     with pytest.raises(CompanionLLMCircuitOpen):
         limited("independent-unit")
     assert calls == ["bad-unit"]
+
+
+def test_24_worker_preflight_failure_drains_all_submitted_calls() -> None:
+    """A local failure must not fan out cancellation to 23 provider calls."""
+    all_calls_started = threading.Event()
+    release_failure = threading.Event()
+    release_submitted = threading.Event()
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    def model(prompt: str, *, cancel_check=None) -> dict[str, str]:
+        with calls_lock:
+            calls.append(prompt)
+            if len(calls) == 24:
+                all_calls_started.set()
+        assert all_calls_started.wait(timeout=5)
+        if prompt == "local-preflight-failure":
+            assert release_failure.wait(timeout=5)
+            raise ValueError("local schema preflight failed")
+        assert cancel_check is not None
+        assert release_submitted.wait(timeout=5)
+        assert cancel_check() is False
+        return {"prompt": prompt}
+
+    limited = _limit_llm_concurrency(model, 24)
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        active = [
+            executor.submit(limited, "local-preflight-failure"),
+            *[
+                executor.submit(limited, f"submitted-{index}")
+                for index in range(23)
+            ],
+        ]
+        assert all_calls_started.wait(timeout=5)
+        queued = executor.submit(limited, "queued-after-failure")
+        release_failure.set()
+        with pytest.raises(ValueError, match="local schema preflight failed"):
+            active[0].result(timeout=5)
+        release_submitted.set()
+        assert [future.result(timeout=5) for future in active[1:]] == [
+            {"prompt": f"submitted-{index}"} for index in range(23)
+        ]
+        with pytest.raises(CompanionLLMCircuitOpen):
+            queued.result(timeout=5)
+
+    assert "queued-after-failure" not in calls
+    assert len(calls) == 24
 
 
 def test_legacy_worker_fingerprint_checkpoint_is_exactly_migrated(tmp_path: Path) -> None:

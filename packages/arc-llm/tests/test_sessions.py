@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import signal
 import threading
 import time
 
 import pytest
 
 from arc_llm import sessions as sessions_module
-from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
+from arc_llm.runtime_manifest import RUNTIME_MANIFEST_VERSION, runtime_manifest
+from arc_llm.sessions import (
+    LLMSessionManager, legacy_runtime_fingerprint, runtime_fingerprint,
+)
 
 
 def _create_session_for_process(args):
@@ -131,6 +133,99 @@ def test_session_manager_rejects_runtime_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="runtime fingerprint changed"):
         manager.get_or_create(key="k", provider="codex-cli", model="m1", runtime_fingerprint="fp-2")
+
+
+@pytest.mark.parametrize("durable_state", ["started", "native", "turn"])
+def test_proven_legacy_fingerprint_migrates_started_generation_in_place(
+    tmp_path, durable_state: str,
+) -> None:
+    env = {"ARC_CODEX_ALLOW_INTERNET": "false"}
+    legacy = legacy_runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier="medium",
+        env=env, process_chain=[],
+    )
+    current = runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier="medium", env=env,
+    )
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(
+        key="k", provider="codex-cli", model="m", runtime_fingerprint=legacy,
+    )
+    if durable_state == "started":
+        with manager.locked_turn(
+            key="k", provider="codex-cli", model="m", runtime_fingerprint=legacy,
+        ):
+            pass
+    elif durable_state == "native":
+        manager.update_native_session_id("k", "native-1")
+    else:
+        manager.record_turn(
+            "k", call_label="turn", prompt_sha256="prompt",
+            static_prefix_sha256=None, schema_sha256=None, usage={},
+            provider_used="codex-cli", model_used="m",
+            native_session_id=None, generation=1,
+        )
+
+    migrated = manager.migrate_legacy_runtime_fingerprint(
+        "k", expected_legacy_fingerprint=legacy,
+        runtime_fingerprint=current, provider="codex-cli", model="m",
+    )
+
+    assert migrated is not None
+    assert migrated.runtime_fingerprint == current
+    assert migrated.native_session_id == ("native-1" if durable_state == "native" else None)
+    assert migrated.metadata["arc_runtime_fingerprint_migrated_from"] == legacy
+    assert manager.turn_count("k") == (1 if durable_state == "turn" else 0)
+
+
+def test_legacy_fingerprint_migration_requires_exact_recipe_proof(tmp_path) -> None:
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(
+        key="k", provider="codex-cli", model="m", runtime_fingerprint="recorded",
+    )
+
+    assert manager.migrate_legacy_runtime_fingerprint(
+        "k", expected_legacy_fingerprint="different",
+        runtime_fingerprint="new", provider="codex-cli", model="m",
+    ) is None
+    assert manager.get_existing("k").runtime_fingerprint == "recorded"
+
+
+def test_transaction_validated_runtime_identity_migrates_native_session(tmp_path) -> None:
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(
+        key="k", provider="codex-cli", model="m", runtime_fingerprint="old",
+    )
+    manager.update_native_session_id("k", "native-1")
+    identity = {
+        "session_key": "k", "provider": "codex-cli", "model": "m",
+        "generation": 1, "native_session_id": "native-1", "recorded_fp": "old",
+    }
+
+    migrated = manager.migrate_validated_runtime_identity(
+        "k", identity=identity, runtime_fingerprint="manifest",
+    )
+
+    assert migrated is not None
+    assert migrated.runtime_fingerprint == "manifest"
+    assert migrated.native_session_id == "native-1"
+    assert migrated.metadata["arc_runtime_identity_transaction_validated"] is True
+
+
+def test_transaction_runtime_identity_rejects_any_field_mismatch(tmp_path) -> None:
+    manager = LLMSessionManager(tmp_path / "sessions")
+    manager.get_or_create(
+        key="k", provider="codex-cli", model="m", runtime_fingerprint="old",
+    )
+    identity = {
+        "session_key": "k", "provider": "codex-cli", "model": "m",
+        "generation": 1, "native_session_id": None, "recorded_fp": "different",
+    }
+
+    assert manager.migrate_validated_runtime_identity(
+        "k", identity=identity, runtime_fingerprint="manifest",
+    ) is None
+    assert manager.get_existing("k").runtime_fingerprint == "old"
 
 
 def test_rotated_unused_generation_can_rebind_runtime_fingerprint(tmp_path):
@@ -291,117 +386,54 @@ def test_session_lock_serializes_threads(tmp_path):
     assert events in (["a:enter", "a:exit", "b:enter", "b:exit"], ["b:enter", "b:exit", "a:enter", "a:exit"])
 
 
-def test_session_lock_times_out_on_unrecoverable_foreign_lock(tmp_path):
+def test_preexisting_session_lock_file_does_not_imply_owner(tmp_path):
+    root = tmp_path / "sessions"
+    key = "available"
+    lock_path = root / "locks" / f"{sessions_module._safe_lock_name(key)}.lock"  # noqa: SLF001
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("legacy metadata is not ownership\n", encoding="utf-8")
+
+    with LLMSessionManager(root).lock(key):
+        pass
+
+
+def test_session_lock_times_out_while_os_lock_is_held(tmp_path):
     from multiprocessing import get_context
 
     root = tmp_path / "sessions"
     key = "blocked"
-    lock_path = root / "locks" / f"{sessions_module._safe_lock_name(key)}.lock"  # noqa: SLF001
-    lock_path.parent.mkdir(parents=True)
-    lock_path.write_text(
-        json.dumps({"pid": 1, "thread_id": 1, "host": "other-host", "created_at": "2026-01-01T00:00:00+00:00"})
-        + "\n",
-        encoding="utf-8",
-    )
     ctx = get_context()
+    owner_queue = ctx.Queue()
+    owner = ctx.Process(target=_hold_lock_for_process, args=(str(root), key, owner_queue))
+    owner.start()
+    owner_queue.get(timeout=2)
     queue = ctx.Queue()
     process = ctx.Process(target=_attempt_lock_for_process, args=(str(root), key, 0.05, queue))
-
-    process.start()
-    process.join(1)
-    if process.is_alive():
-        process.terminate()
-        process.join()
-        pytest.fail("lock acquisition hung instead of timing out")
-
-    assert process.exitcode == 0
-    assert str(queue.get()).startswith("timeout:")
-
-
-def test_session_lock_owner_metadata_includes_process_start_identity(tmp_path):
-    manager = LLMSessionManager(tmp_path / "sessions")
-    lock_path = manager.root / "locks" / f"{sessions_module._safe_lock_name('owned')}.lock"
-
-    with manager.lock("owned"):
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-
-    assert payload["pid"] == os.getpid()
-    process_start_id = sessions_module._process_start_identity(os.getpid())  # noqa: SLF001
-    if process_start_id is not None:
-        assert payload["process_start_id"] == process_start_id
-
-
-def test_session_lock_does_not_recover_live_owner(tmp_path):
-    lock_path = tmp_path / "live.lock"
-    lock_path.write_text(
-        json.dumps({
-            "pid": os.getpid(),
-            "thread_id": 1,
-            "host": sessions_module._hostname(),  # noqa: SLF001
-            "process_start_id": sessions_module._process_start_identity(os.getpid()),  # noqa: SLF001
-        }) + "\n",
-        encoding="utf-8",
-    )
-
-    assert sessions_module._recover_dead_process_lock(lock_path) is False  # noqa: SLF001
-    assert lock_path.exists()
-
-
-def test_session_lock_recovers_reused_pid_identity(tmp_path):
-    lock_path = tmp_path / "reused.lock"
-    lock_path.write_text(
-        json.dumps({
-            "pid": os.getpid(),
-            "thread_id": 1,
-            "host": sessions_module._hostname(),  # noqa: SLF001
-            "process_start_id": "procfs:different-boot:1",
-        }) + "\n",
-        encoding="utf-8",
-    )
-
-    if sessions_module._process_start_identity(os.getpid()) is None:  # noqa: SLF001
-        pytest.skip("host does not expose process-start identity")
-    assert sessions_module._recover_dead_process_lock(lock_path) is True  # noqa: SLF001
-    assert not lock_path.exists()
-
-
-@pytest.mark.parametrize("content", ["", "{}\n", "[]\n", "not-json\n"])
-def test_session_lock_keeps_ownerless_legacy_lock_fail_closed(tmp_path, content):
-    lock_path = tmp_path / "legacy.lock"
-    lock_path.write_text(content, encoding="utf-8")
-
-    assert sessions_module._recover_dead_process_lock(lock_path) is False  # noqa: SLF001
-    assert lock_path.exists()
-
-
-@pytest.mark.skipif(not Path("/proc/self/stat").is_file(), reason="requires procfs zombie state")
-def test_sigterm_zombie_owner_does_not_leave_permanent_session_lock(tmp_path):
-    from multiprocessing import get_context
-
-    root = tmp_path / "sessions"
-    key = "interrupted"
-    ctx = get_context("fork")
-    queue = ctx.Queue()
-    process = ctx.Process(target=_hold_lock_for_process, args=(str(root), key, queue))
-    process.start()
-    pid = queue.get(timeout=2)
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 2
-    state = None
-    while time.monotonic() < deadline:
-        _identity, state = sessions_module._process_identity(pid)  # noqa: SLF001
-        if state == "Z":
-            break
-        time.sleep(0.01)
     try:
-        assert state == "Z"
-        with LLMSessionManager(root).lock(key):
-            pass
+        process.start()
+        process.join(1)
+        assert process.exitcode == 0
+        assert str(queue.get()).startswith("timeout:")
     finally:
-        process.join(timeout=2)
-        if process.is_alive():
-            process.kill()
-            process.join()
+        owner.terminate()
+        owner.join(timeout=2)
+
+
+def test_advisory_lock_propagates_unexpected_os_error(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("fcntl-specific error injection")
+    import fcntl
+
+    handle = (tmp_path / "lock").open("a+b")
+    monkeypatch.setattr(
+        fcntl, "flock",
+        lambda *_args: (_ for _ in ()).throw(OSError(5, "I/O failure")),
+    )
+    try:
+        with pytest.raises(OSError, match="I/O failure"):
+            sessions_module._try_advisory_lock(handle)  # noqa: SLF001
+    finally:
+        handle.close()
 
 
 def test_locked_turn_serializes_turn_count_across_manager_instances(tmp_path):
@@ -514,6 +546,46 @@ def test_runtime_fingerprint_includes_provider_config_env():
 
     assert codex_config != base
     assert claude_mcp != base
+
+
+def test_runtime_manifest_is_provider_specific_and_normalizes_false_defaults():
+    base = runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier="high", env={},
+        process_chain=["codex", "bash"],
+    )
+    equivalent = runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier="high",
+        env={
+            "ARC_CODEX_ALLOW_INTERNET": "false",
+            "ARC_CLAUDE_ALLOW_INTERNET": "true",
+            "ARC_LLM_KIMI_HIGH_MODEL": "unrelated",
+        },
+        process_chain=["claude", "python"],
+    )
+    manifest = runtime_manifest(
+        provider="codex-cli", model="m", model_tier="high", env={},
+    )
+
+    assert base == equivalent
+    assert manifest["schema_version"] == RUNTIME_MANIFEST_VERSION
+    assert manifest["provider"] == "codex-cli"
+
+
+def test_kimi_runtime_manifest_ignores_unused_tier_mappings():
+    base = runtime_fingerprint(
+        provider="kimi-code-cli", model="m", model_tier="high", env={},
+    )
+    unused = runtime_fingerprint(
+        provider="kimi-code-cli", model="m", model_tier="high",
+        env={"ARC_LLM_KIMI_LOW_MODEL": "unused"},
+    )
+    selected = runtime_fingerprint(
+        provider="kimi-code-cli", model="m", model_tier="high",
+        env={"ARC_LLM_KIMI_HIGH_MODEL": "selected"},
+    )
+
+    assert unused == base
+    assert selected != base
 
 
 @pytest.mark.parametrize(

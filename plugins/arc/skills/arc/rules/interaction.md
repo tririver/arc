@@ -1,45 +1,61 @@
 # ARC Interaction Reference
 
-Use this reference whenever ARC needs any user question, choice,
-confirmation, or mode decision.
+Use this reference whenever ARC needs any user question, choice, confirmation,
+or runtime automation decision.
 
-## Automation Mode Gate
+## Automation Policy
 
-- `Run automatically (Recommended)` / `auto`: continue without asking
-  additional questions. Use safe defaults,
-  preserve warnings, and write decisions to `<project-dir>/context.json` when a
-  managed workflow creates one.
-- `Confirm major steps` / `interactive`: ask for confirmation after each major
-  workflow step and before destructive or ambiguous actions.
-- `Discuss before running`: stop before ARC workflow tool calls and ask what the
-  user wants to change.
+- Default to `automation_level: auto` and do not ask an execution-mode question
+  at startup. Continue with safe defaults, preserve visible warnings, and
+  record decisions in `<project-dir>/context.json` when a managed run has one.
+- Set `automation_level: interactive` only when the user explicitly requests
+  manual, step-by-step, staged review, or confirmation at key steps. Pause only
+  at the major milestones defined by the owning workflow, not after every tool
+  call.
+- A request to discuss before running creates a pause before workflow tool calls. It is
+  not an automation-level option; after the discussion, apply the user's latest
+  explicit instruction or retain the prior level.
 
-Ask for an automation mode only when both conditions are true:
+The latest explicit steer between `auto` and `interactive` overrides the
+current level and persists until the managed run ends or another explicit
+steer changes it. A bounded instruction such as "stop after the first chapter"
+adds one checkpoint only and does not permanently switch the level. Bare
+`continue`, `resume`, or approval at one checkpoint passes that checkpoint but
+does not change the automation level.
 
-1. The current request came directly from a human whose prompt explicitly
-   names ARC. Quoted, forwarded, or delegated text does not count as a direct
-   human invocation. If the host does not expose reliable provenance, this
-   condition is not satisfied.
-2. The task is a managed ARC workflow run: domain construction, idea
-   generation, note checking, planning, calculation, or project-local workflow
-   artifacts owned by those workflows, including recommendations, research
-   directions, scientific rankings, or ARC reports.
+For managed runs, write the current `automation_level` when creating or
+resuming `<project-dir>/context.json`, and update that field in place after a
+runtime switch. Direct ARC tool tasks do not create an extra state file; use
+the latest explicit instruction in the current session.
 
-When both conditions hold, ask once before resolving seeds, creating project
-directories, building domains, suggesting ideas, checking notes, planning, or
-calculating. Do not gather "just context" with ARC paper/domain/LLM tools before
-the mode choice.
+An `auto` to `interactive` switch takes effect at the next safe, controllable
+boundary. Do not cancel a provider call, CLI command, or background job already
+submitted. An `interactive` to `auto` switch while awaiting ordinary milestone
+confirmation also approves that checkpoint and continues.
 
-For an agent-invoked managed workflow, or a human prompt that does not
-explicitly name ARC, do not ask for a mode; set the execution mode to `auto`
-and perform exactly the scope requested by the caller. Automatic execution
-removes routine confirmations; it does not authorize a downstream workflow.
+Automation steering never bypasses authorization requirements, destructive
+action review, duplicate-charge risk, unresolved scientific ambiguity, a
+`Human expert question:`, error recovery, or another mandatory safety gate.
+It also does not authorize a downstream workflow. Perform exactly the scope
+requested by the caller.
+
+In `interactive`, use these major milestones: Domain pauses after domain
+artifacts and the manifest are complete and before an explicitly requested
+downstream workflow; Ideas pauses after the top three and before candidate
+selection or requested planning/calculation; Check pauses after main-agent
+preflight and before the planning handoff; Plan pauses after the work note
+passes internal review and before requested calculation; Calculate pauses after
+each accepted step or coherent chunk and before the next; Companion uses
+`--stop-after-first-chapter` and pauses only after the complete first chapter is
+rendered and validated. Direct tool orchestration pauses only between major
+user-requested stages, such as after collection/filtering and before batch
+summarization or export, never after every underlying call.
 For example, stop after domain construction when domain construction was the
 requested outcome, and stop after ranked ideas when ideas were the requested
 outcome. Run prerequisites required by the requested workflow, but do not turn
 them into additional outcomes.
 
-Direct ARC tool tasks do not need an automation mode. Run them automatically
+Direct ARC tool tasks default to automatic execution
 with safe defaults unless the user explicitly asks to review or confirm steps.
 Direct tasks may include several ARC calls, such as collecting citers,
 filtering papers by date, generating summaries, using summary batches, looking
@@ -50,28 +66,24 @@ project-local workflow artifacts.
 
 Examples:
 
-- Direct human prompt, `use ARC, in field arXiv:0911.3380, recommend research directions`: ask
-  for `Run automatically (Recommended)`, `Confirm major steps`, or
-  `Discuss before running` before any ARC paper/domain tool call.
-- Direct human prompt, `use ARC, suggest ideas for massive scalar exchange around arXiv:0911.3380`:
-  ask for mode first; after the choice, route through Case 1 and Case 2.
-- Agent-delegated request, `build the research domain around arXiv:0911.3380`:
-  do not ask for mode; use `auto`, build the domain, and stop.
-- Direct human prompt, `build the research domain around arXiv:0911.3380`,
-  without naming ARC: do not ask for mode; use `auto`, build the domain, and
-  stop.
+- `use ARC, in field arXiv:0911.3380, recommend research directions`: use
+  `auto` without asking, perform the requested workflows, and stop at scope.
+- `use ARC, suggest ideas step by step for massive scalar exchange`: use
+  `interactive` and pause after the top three before candidate selection or a
+  requested planning/calculation workflow.
+- `build the research domain around arXiv:0911.3380`: use `auto`, build the
+  domain, and stop.
 - `use arc, what is the title and abstract of arXiv:0911.3380?`: direct paper lookup allowed;
   no automation mode question is needed.
 - `use arc to download papers that cited 0911.3380 since 2024 and create a full
   summary of these papers`: direct tool orchestration allowed; no automation
-  mode question is needed.
-
-If a mode-eligible managed workflow run lacks an explicit mode, stop before
-tool calls and ask for mode. Otherwise default to `auto` without asking. Do not
-infer `auto` from `continue`, `resume`, or a bare approval in a mode-eligible
-human invocation.
+  question is needed. If staged review was requested, pause only between the
+  major collection/filtering and batch-summary/export stages.
 
 ## Selection Protocol
+
+Use this protocol for real business choices such as seeds, project directories,
+or candidate ideas. Do not use it to choose an automation level.
 
 Ask user questions through the host's selection/menu tool when one is
 available. Use a typed fallback only when no suitable selection/menu tool is

@@ -21,7 +21,34 @@ from .providers.base import (
 )
 
 
-SCHEMA_VERSION = "arc.llm.call_checkpoint.v3"
+SCHEMA_VERSION = "arc.llm.call_checkpoint.v4"
+
+
+class CallIdentity(str):
+    """String-compatible checkpoint identity with v4 structured components."""
+
+    logical_identity: dict[str, Any]
+    request_digest: str
+    request_recipe: dict[str, Any]
+
+    def __new__(
+        cls,
+        *,
+        logical_identity: Mapping[str, Any],
+        request_digest: str,
+        request_recipe: Mapping[str, Any],
+    ) -> "CallIdentity":
+        logical = dict(logical_identity)
+        recipe = dict(request_recipe)
+        value = sha256_text(canonical_json({
+            "logical_identity": logical,
+            "request_digest": request_digest,
+        }))
+        instance = str.__new__(cls, value)
+        instance.logical_identity = logical
+        instance.request_digest = request_digest
+        instance.request_recipe = recipe
+        return instance
 
 
 class LLMCallCheckpointError(LLMWorkerError):
@@ -91,23 +118,30 @@ def checkpoint_path(
     generation: int | None = None,
     progress_contract_scope: str | None = None,
 ) -> tuple[Path, str]:
-    identity_payload = {
-        "prompt_sha256": sha256_text(prompt),
-        "schema": dict(schema) if schema is not None else None,
+    logical_identity = {
         "provider": provider,
         "model": model,
+        "session_key": session_key,
+        "generation": generation,
+        "idempotency_key": idempotency_key,
+    }
+    request_recipe = {
+        "prompt_sha256": sha256_text(prompt),
+        "schema_sha256": sha256_text(canonical_json(dict(schema))) if schema is not None else None,
         "call_label": call_label,
         "session_policy": session_policy,
-        "session_key": session_key,
         # A stable logical key must survive a crash after the session receipt
         # advanced the observable turn count.
         "session_turn": None if idempotency_key else session_turn,
         "runtime_fingerprint": runtime_fingerprint,
-        "idempotency_key": idempotency_key,
-        "generation": generation,
         "progress_contract_scope": progress_contract_scope,
     }
-    identity = sha256_text(canonical_json(identity_payload))
+    request_digest = sha256_text(canonical_json(request_recipe))
+    identity = CallIdentity(
+        logical_identity=logical_identity,
+        request_digest=request_digest,
+        request_recipe=request_recipe,
+    )
     safe_label = "".join(
         character if character.isalnum() or character in "-_." else "_"
         for character in str(call_label or "call")
@@ -131,6 +165,7 @@ def prepare_call(
     supervised_native_resume: bool = False,
     native_session_available: bool = False,
     runtime_capabilities: Mapping[str, Any] | None = None,
+    validated_legacy_logical_identity: Mapping[str, Any] | None = None,
 ) -> PreparedCall:
     del retry_delay_seconds
     current_time = time.time() if now is None else now
@@ -138,13 +173,46 @@ def prepare_call(
     try:
         existing = _read(path)
         if existing is not None:
-            if existing.get("identity") != identity:
-                raise LLMCallCheckpointError(f"LLM call checkpoint identity mismatch: {path}")
-            if existing.get("schema_version") == "arc.llm.call_checkpoint.v2":
-                existing = _upgrade_v2_checkpoint(existing)
+            if existing.get("schema_version") in {
+                "arc.llm.call_checkpoint.v2", "arc.llm.call_checkpoint.v3",
+            }:
+                existing = _upgrade_legacy_checkpoint(existing)
+                if validated_legacy_logical_identity is not None:
+                    existing["logical_identity"] = dict(validated_legacy_logical_identity)
+                    existing["legacy_logical_identity_validated"] = True
+                _write(path, existing)
+            elif (
+                validated_legacy_logical_identity is not None
+                and existing.get("legacy_checkpoint_upgraded") is True
+                and existing.get("logical_identity") is None
+            ):
+                existing["logical_identity"] = dict(validated_legacy_logical_identity)
+                existing["legacy_logical_identity_validated"] = True
                 _write(path, existing)
             if existing.get("schema_version") != SCHEMA_VERSION:
                 raise LLMCallCheckpointError(f"LLM call checkpoint identity mismatch: {path}")
+            incoming = _identity_parts(identity)
+            reconciliation_identity: str | None = None
+            if existing.get("identity") != str(identity):
+                if _can_rebuild_prepared(existing, incoming):
+                    existing = _new_checkpoint_payload(
+                        identity=identity, current_time=current_time,
+                        runtime_capabilities=runtime_capabilities,
+                    )
+                    _write(path, existing)
+                elif not _can_resume_changed_request(
+                    existing,
+                    incoming=incoming,
+                    supervised_native_resume=supervised_native_resume,
+                    native_session_available=native_session_available,
+                ):
+                    raise LLMCallCheckpointError(
+                        f"LLM call checkpoint identity mismatch: {path}"
+                    )
+                # Preserve the submitted request digest.  The current prompt is
+                # used only to ask the original native session for reconciliation.
+                reconciliation_identity = str(identity)
+                identity = str(existing["identity"])
             state = existing.get("state")
             if state in {"response_received", "validated"}:
                 response = _response_from_json(existing.get("response"))
@@ -171,7 +239,10 @@ def prepare_call(
                         raise LLMCallCheckpointError(
                             "supervised native resume requires an existing provider session id"
                         )
-                    _authorize_native_resume(existing, current_time=current_time)
+                    _authorize_native_resume(
+                        existing, current_time=current_time,
+                        reconciliation_identity=reconciliation_identity,
+                    )
                     _write(path, existing)
                     return PreparedCall(
                         path=path,
@@ -186,7 +257,10 @@ def prepare_call(
                         raise LLMCallCheckpointError(
                             "supervised native resume requires an existing provider session id"
                         )
-                    _authorize_native_resume(existing, current_time=current_time)
+                    _authorize_native_resume(
+                        existing, current_time=current_time,
+                        reconciliation_identity=reconciliation_identity,
+                    )
                     _write(path, existing)
                     return PreparedCall(
                         path=path,
@@ -202,20 +276,12 @@ def prepare_call(
                 raise LLMCallCheckpointError(f"Invalid LLM call checkpoint state {state!r}: {path}")
         else:
             next_attempt = 1
-        _write(
-            path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "identity": identity,
-                "state": "prepared",
-                "submission_state": "not_submitted",
-                "attempt": next_attempt,
-                "started_at": current_time,
-                "updated_at": current_time,
-                "runtime_capabilities": dict(runtime_capabilities or {}),
-            },
+        payload = _new_checkpoint_payload(
+            identity=identity, current_time=current_time,
+            runtime_capabilities=runtime_capabilities,
         )
-        return PreparedCall(path=path, identity=identity, attempt=next_attempt, _lock_handle=lock_handle)
+        _write(path, payload)
+        return PreparedCall(path=path, identity=str(identity), attempt=next_attempt, _lock_handle=lock_handle)
     except BaseException:
         _release_handle(lock_handle)
         raise
@@ -310,7 +376,10 @@ def record_failure(prepared: PreparedCall, exc: BaseException) -> None:
         prepared.release_lock()
 
 
-def _authorize_native_resume(checkpoint: dict[str, Any], *, current_time: float) -> None:
+def _authorize_native_resume(
+    checkpoint: dict[str, Any], *, current_time: float,
+    reconciliation_identity: str | None = None,
+) -> None:
     """Record the explicit, single invocation that may reconcile a submitted turn."""
 
     checkpoint.update(
@@ -322,13 +391,101 @@ def _authorize_native_resume(checkpoint: dict[str, Any], *, current_time: float)
             "updated_at": current_time,
         }
     )
+    if reconciliation_identity is not None:
+        checkpoint["reconciliation_identity"] = reconciliation_identity
 
 
-def _upgrade_v2_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
-    """Upgrade the old eager-unknown boundary without making it replayable."""
+def _can_resume_changed_request(
+    checkpoint: Mapping[str, Any],
+    *,
+    incoming: Mapping[str, Any],
+    supervised_native_resume: bool,
+    native_session_available: bool,
+) -> bool:
+    stored_logical = checkpoint.get("logical_identity")
+    if stored_logical is None:
+        # Legacy checkpoints did not persist enough structure to prove that a
+        # changed request still names the same provider turn.  Exact identity
+        # remains resumable; changed identity must stay supervised.
+        return False
+    if stored_logical != incoming.get("logical_identity"):
+        return False
+    state = checkpoint.get("state")
+    submission_state = checkpoint.get("submission_state")
+    if state in {"response_received", "validated"}:
+        # A paid stateful logical turn may have advanced its durable session
+        # receipt before its caller ledger was accepted.  Replay that response
+        # by logical identity even if restart reconstruction changes bootstrap
+        # versus delta prompt shape.  Stateless keys retain digest strictness.
+        logical = checkpoint.get("logical_identity")
+        return bool(
+            isinstance(logical, Mapping)
+            and logical.get("session_key")
+        ) or checkpoint.get("reconciliation_identity") == incoming.get("identity")
+    if not supervised_native_resume or not native_session_available:
+        return False
+    if state in {"submitted", "resuming"}:
+        return submission_state in {"submitted", "unknown"}
+    return bool(
+        state == "failed"
+        and checkpoint.get("resumable")
+        and submission_state in {"submitted", "unknown"}
+    )
+
+
+def _can_rebuild_prepared(
+    checkpoint: Mapping[str, Any], incoming: Mapping[str, Any]
+) -> bool:
+    return bool(
+        checkpoint.get("state") == "prepared"
+        and checkpoint.get("submission_state") == "not_submitted"
+        and checkpoint.get("logical_identity") == incoming.get("logical_identity")
+    )
+
+
+def _identity_parts(identity: str) -> dict[str, Any]:
+    if isinstance(identity, CallIdentity):
+        return {
+            "identity": str(identity),
+            "logical_identity": dict(identity.logical_identity),
+            "request_digest": identity.request_digest,
+            "request_recipe": dict(identity.request_recipe),
+        }
+    return {
+        "identity": str(identity), "logical_identity": None,
+        "request_digest": str(identity), "request_recipe": {},
+    }
+
+
+def _new_checkpoint_payload(
+    *, identity: str, current_time: float,
+    runtime_capabilities: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    parts = _identity_parts(identity)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "identity": str(identity),
+        "logical_identity": parts["logical_identity"],
+        "request_digest": parts["request_digest"],
+        "request_recipe": parts["request_recipe"],
+        "state": "prepared",
+        "submission_state": "not_submitted",
+        "attempt": 1,
+        "started_at": current_time,
+        "updated_at": current_time,
+        "runtime_capabilities": dict(runtime_capabilities or {}),
+    }
+
+
+def _upgrade_legacy_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade v2/v3 without making an uncertain provider call replayable."""
 
     upgraded = dict(checkpoint)
     upgraded["schema_version"] = SCHEMA_VERSION
+    upgraded.setdefault("logical_identity", None)
+    upgraded.setdefault("request_digest", str(upgraded.get("identity") or ""))
+    upgraded.setdefault("request_recipe", {})
+    upgraded["legacy_checkpoint_upgraded"] = True
     if upgraded.get("state") == "started":
         upgraded["state"] = "submitted"
         upgraded["submission_state"] = "unknown"

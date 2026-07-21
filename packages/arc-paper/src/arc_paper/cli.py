@@ -15,6 +15,29 @@ from .summary.model import DEFAULT_SUMMARY_MODEL_TIER
 from .worker_guard import in_worker_context, wrapper_call_authorized
 
 
+RECURSIVE_LLM_CAPABILITY = "recursive_llm"
+COMMAND_CAPABILITIES = {
+    "llm-infer-main-references": frozenset({RECURSIVE_LLM_CAPABILITY}),
+    "infer-main-references": frozenset({RECURSIVE_LLM_CAPABILITY}),
+    "get-llm-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
+    "llm-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
+    "generate-llm-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
+    "llm-generate-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
+    "summary-batch run": frozenset({RECURSIVE_LLM_CAPABILITY}),
+}
+
+
+def command_capabilities(argv: list[str]) -> frozenset[str]:
+    """Return declared side-effect capabilities for one canonical CLI command."""
+
+    if not argv:
+        return frozenset()
+    key = argv[0]
+    if key == "summary-batch":
+        key = f"{key} {argv[1] if len(argv) > 1 else ''}"
+    return COMMAND_CAPABILITIES.get(key, frozenset())
+
+
 def main(argv: list[str] | None = None) -> int:
     if in_worker_context() and not wrapper_call_authorized():
         result = err(

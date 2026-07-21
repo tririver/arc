@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import threading
 import time
@@ -162,10 +163,10 @@ def test_lane_ledger_v1_upgrade_preserves_uncertain_submission(tmp_path) -> None
     assert ledger["blocks"][1]["submission_state"] == "submitted"
 
 
-def test_scheduler_failure_event_cancels_other_active_lane() -> None:
-    stopped = threading.Event()
+def test_scheduler_local_failure_drains_other_active_lane() -> None:
     both_active = threading.Barrier(2)
-    companion_cancelled = threading.Event()
+    release_companion = threading.Event()
+    companion_completed = threading.Event()
 
     def translation(_prepared, _segment):
         both_active.wait(timeout=5)
@@ -173,24 +174,25 @@ def test_scheduler_failure_event_cancels_other_active_lane() -> None:
 
     def companion(_prepared, _segment):
         both_active.wait(timeout=5)
-        while not stopped.is_set():
-            time.sleep(0.001)
-        companion_cancelled.set()
-        raise RuntimeError("peer cancellation observed")
+        assert release_companion.wait(timeout=5)
+        companion_completed.set()
+        return {"ok": True}
 
-    with pytest.raises(ValueError, match="ordinary local lane failure"):
-        run_chapter_pipeline(
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(
+            run_chapter_pipeline,
             [{"chapter_id": "ch-0001"}],
             workers=2,
             prepare_guide=lambda _chapter: {},
             prepare_segments=lambda _chapter: [{"segment_id": "s1"}],
             run_translation=translation,
             run_companion=companion,
-            stop_event=stopped,
-            cancel_check=stopped.is_set,
         )
+        release_companion.set()
+        with pytest.raises(ValueError, match="ordinary local lane failure"):
+            result.result(timeout=5)
 
-    assert companion_cancelled.is_set()
+    assert companion_completed.is_set()
 
 
 def test_build_review_is_emitted_only_at_a_safe_boundary(tmp_path) -> None:
@@ -319,7 +321,7 @@ def test_scheduler_stops_queued_calls_after_a_lane_failure() -> None:
             ),
         )
 
-    assert paid == ["s1"]
+    assert paid == ["s1", "companion:s1", "companion:s2"]
 
 
 def test_chapter_guide_rejects_unverified_supplementary_reading(tmp_path) -> None:

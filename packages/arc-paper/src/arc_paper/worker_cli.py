@@ -26,7 +26,7 @@ from typing import Any
 from . import cli
 from .ids import extract_paper_ids
 from .results import err, ok
-from .worker_guard import authorized_wrapper_call, validate_worker_guard_if_required
+from .worker_guard import authorized_wrapper_call
 from .worker_session import WorkerCacheSession
 
 
@@ -36,55 +36,6 @@ MAX_INLINE_BYTES = 64 * 1024
 MAX_PAGE_BYTES = 46 * 1024
 DEFAULT_PAGE_BYTES = MAX_PAGE_BYTES
 
-# An allow-list makes newly added arc-paper commands fail closed until they are
-# reviewed for nested-model behavior.  ``store-llm-summary`` only validates and
-# stores caller-supplied JSON; it does not invoke a model.
-SAFE_COMMANDS = frozenset(
-    {
-        "extract-paper-ids",
-        "extract-ids",
-        "safe-dir-name",
-        "paper-ids-safe-dir-name",
-        "get-title",
-        "get-abstract",
-        "get-authors",
-        "get-metadata",
-        "get-references",
-        "get-citers",
-        "get-citer-count",
-        "get-toc",
-        "store-llm-summary",
-        "get-section",
-        "search-full-text",
-        "get-equation-context",
-        "source-cache",
-        "source-probe",
-        "parse",
-        "get-parsed",
-        "get-parsed-toc",
-        "get-parsed-section",
-        "get-parsed-equations",
-        "get-parsed-equation",
-        "mark-parsed-equation",
-        "search-parsed",
-        "cache",
-        "doctor",
-        "summary-batch",
-    }
-)
-NESTED_LLM_COMMANDS = frozenset(
-    {
-        "llm-infer-main-references",
-        "infer-main-references",
-        "get-llm-summary",
-        "llm-summary",
-        "generate-llm-summary",
-        "llm-generate-summary",
-    }
-)
-SAFE_BATCH_COMMANDS = frozenset(
-    {"create", "status", "retry-failed", "prefetch", "export"}
-)
 HANDLE_RE = re.compile(r"^sha256-[0-9a-f]{64}\.json$")
 
 
@@ -96,15 +47,6 @@ def main(argv: list[str] | None = None) -> int:
         result = _worker_error(
             "paper_cli_disabled",
             "arc-paper-worker is disabled for this worker or execution stage",
-        )
-        return _finish(result, session_dir, command_argv, settings, None)
-    try:
-        validate_worker_guard_if_required()
-    except Exception as exc:
-        result = _worker_error(
-            "paper_cli_guard_invalid",
-            str(exc) or exc.__class__.__name__,
-            error_type=exc.__class__.__name__,
         )
         return _finish(result, session_dir, command_argv, settings, None)
     try:
@@ -215,27 +157,16 @@ def _policy_error(
     session_dir: Path | None,
 ) -> dict[str, Any] | None:
     command = argv[0]
-    if command in NESTED_LLM_COMMANDS:
-        return _nested_llm_error(command)
     if command == "summary-batch":
         subcommand = argv[1] if len(argv) > 1 else ""
-        if subcommand == "run":
-            return _nested_llm_error("summary-batch run")
-        if subcommand not in SAFE_BATCH_COMMANDS:
-            return _worker_error(
-                "worker_command_forbidden",
-                f"summary-batch subcommand {subcommand or '<missing>'!r} is not approved for workers",
-            )
         if subcommand == "export":
             run_root = cache_session.run_root if cache_session is not None else session_dir
             path_error = _export_path_error(argv, run_root)
             if path_error is not None:
                 return path_error
-    if command not in SAFE_COMMANDS:
-        return _worker_error(
-            "worker_command_forbidden",
-            f"arc-paper command {command!r} is not approved for workers",
-        )
+    if cli.RECURSIVE_LLM_CAPABILITY in cli.command_capabilities(argv):
+        operation = command if command != "summary-batch" else f"summary-batch {subcommand}"
+        return _nested_llm_error(operation)
     return None
 
 

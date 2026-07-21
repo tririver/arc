@@ -99,8 +99,9 @@ def test_legacy_database_is_migrated_additively(monkeypatch, tmp_path):
     assert {"lease_token", "owner_pid", "owner_started_at", "heartbeat_at"} <= columns
 
 
-def test_expired_lease_is_not_reclaimed_from_live_owner_but_dead_owner_is(monkeypatch, tmp_path):
+def test_expired_lease_is_reclaimed_only_after_advisory_lock_releases(monkeypatch, tmp_path):
     import sqlite3
+    from arc_paper.batch import db as db_module
 
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     db = BatchDB.default()
@@ -115,11 +116,11 @@ def test_expired_lease_is_not_reclaimed_from_live_owner_but_dead_owner_is(monkey
 
     assert BatchDB(db.path).claim_ready_items("qft", limit=1, worker_id="worker-2") == []
 
-    with sqlite3.connect(db.path) as connection:
-        connection.execute(
-            "UPDATE batch_items SET owner_pid = ?, owner_started_at = ? WHERE batch_name = ? AND paper_id = ?",
-            (999999999, "dead", "qft", first.paper_id),
-        )
+    with db_module._LEASE_HANDLES_LOCK:
+        handle = db_module._LEASE_HANDLES.pop(str(first.lease_token))
+    db_module.BatchDB._unlock_close(handle)
     reclaimed = BatchDB(db.path).claim_ready_items("qft", limit=1, worker_id="worker-2")
     assert len(reclaimed) == 1
     assert reclaimed[0].lease_token != first.lease_token
+    assert reclaimed[0].owner_pid is None
+    assert reclaimed[0].owner_started_at is None

@@ -92,10 +92,11 @@ arc-companion render-web --project-dir <dir> --json
 arc-companion validate --project-dir <dir> --json
 ```
 
-Status includes `current_phase`, `wait_reason`, build-lock owner PID/start
-identity, active/queued/draining call counts, `last_progress_at`, and persisted
-per-phase elapsed time. A stale lock-file payload is diagnostic only; the
-reported `active` field comes from the OS lock.
+Status includes `current_phase`, `wait_reason`, active/queued/draining call
+counts, `pending_call_count`, each pending call's submission state, recovery
+action and blocking reason, `last_progress_at`, and persisted per-phase elapsed
+time. Lock-file payloads are diagnostic only; the reported `active` field comes
+from the OS advisory lock.
 
 `render-web` manually rebuilds the static reader from durable checkpoints; it
 does not repeat generation calls. `validate` checks both the PDF and web bundle.
@@ -243,7 +244,7 @@ Send fixed context and a hash-based continuity capsule, not accepted source or
 commentary prose. If an earlier accepted block changes, retain the unchanged prefix,
 invalidate the suffix, and rotate generation.
 
-## Phase 5: Interactive Review and Rendering
+## Phase 5: First-Chapter Review and Rendering
 
 ### Step 1: Stop after the first chapter
 
@@ -251,7 +252,9 @@ With `--stop-after-first-chapter`, ARC must not schedule chapter two. It returns
 `first_chapter_ready` only after the first substantive chapter's guide,
 all enabled lanes, review, PDF typesetting, static-web publication, and
 validation complete.
-Rerun without the flag after approval. The accepted first chapter is frozen and
+Use this flag for `interactive` mode or a one-shot first-chapter checkpoint.
+Rerun without the flag after approval; that approval does not switch the
+managed run to `auto`. The accepted first chapter is frozen and
 cannot be silently rewritten by final consistency review. Its freeze record
 includes the translation mode and uses a null translation hash in skip mode.
 The first chapter artifact is not the full-document deliverable.

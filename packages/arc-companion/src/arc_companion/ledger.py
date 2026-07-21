@@ -126,12 +126,25 @@ def mark_needs_supervision(
         block["state"] = "submitted"
         block["submission_state"] = submission_state
         ledger["blocks"][index] = block
-    ledger["needs_supervision"] = {
+    marker = {
         "segment_id": segment_id,
         "reason": reason,
         "recovery_context": dict(recovery_context),
         "created_at": time.time(),
     }
+    raw_entries = list(ledger.get("supervision_entries") or [])
+    if not raw_entries and isinstance(ledger.get("needs_supervision"), Mapping):
+        raw_entries.append(dict(ledger["needs_supervision"]))
+    entries = [
+        dict(item) for item in raw_entries
+        if isinstance(item, Mapping) and str(item.get("segment_id") or "") != segment_id
+    ]
+    entries.append(marker)
+    ledger["supervision_entries"] = entries
+    # Preserve the earliest unresolved lane stop for legacy readers while the
+    # complete per-segment inventory remains available to recovery finalizers.
+    if not ledger.get("needs_supervision"):
+        ledger["needs_supervision"] = marker
     ledger["updated_at"] = time.time()
     _write(path, ledger)
     return ledger
@@ -142,7 +155,16 @@ def clear_needs_supervision(path: Path) -> dict[str, Any]:
     ledger = _read(path)
     if not ledger.get("needs_supervision"):
         raise LaneLedgerError("lane ledger does not need supervision")
-    ledger["needs_supervision"] = None
+    current_segment = str(
+        (ledger.get("needs_supervision") or {}).get("segment_id") or ""
+    )
+    entries = [
+        dict(item) for item in ledger.get("supervision_entries") or []
+        if isinstance(item, Mapping)
+        and str(item.get("segment_id") or "") != current_segment
+    ]
+    ledger["supervision_entries"] = entries
+    ledger["needs_supervision"] = entries[0] if entries else None
     ledger["updated_at"] = time.time()
     _write(path, ledger)
     return ledger

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import BoundedSemaphore, Event, Lock
+from threading import BoundedSemaphore, Event
 from typing import Any, Callable, Mapping
 
 
@@ -36,17 +36,8 @@ def run_chapter_pipeline(
     selected = [dict(chapters[0])] if stop_after_first_chapter and chapters else [dict(item) for item in chapters]
     budget = BoundedSemaphore(workers)
     stopped = stop_event or Event()
-    first_failure: list[BaseException] = []
-    failure_lock = Lock()
-
     def is_stopped() -> bool:
         return stopped.is_set() or bool(cancel_check is not None and cancel_check())
-
-    def remember_failure(exc: BaseException) -> None:
-        with failure_lock:
-            if not first_failure:
-                first_failure.append(exc)
-        stopped.set()
 
     def guarded(call: Callable[..., Any], *args: Any) -> Any:
         if is_stopped():
@@ -54,23 +45,28 @@ def run_chapter_pipeline(
         with budget:
             if is_stopped():
                 raise _ChapterPipelineStopped("chapter pipeline stopped before another call")
-            try:
-                return call(*args)
-            except BaseException as exc:
-                remember_failure(exc)
-                raise
+            return call(*args)
 
     def prepare(chapter: dict[str, Any]) -> PreparedChapter:
         with ThreadPoolExecutor(max_workers=2) as phase:
             guide_future = phase.submit(guarded, prepare_guide, chapter)
             segments_future = phase.submit(guarded, prepare_segments, chapter)
-            try:
-                guide = guide_future.result()
-                segments = segments_future.result()
-            except BaseException:
-                if first_failure:
-                    raise first_failure[0]
-                raise
+            failures: list[BaseException] = []
+            guide = None
+            segments = None
+            for future, target in ((guide_future, "guide"), (segments_future, "segments")):
+                try:
+                    value = future.result()
+                except BaseException as exc:
+                    failures.append(exc)
+                else:
+                    if target == "guide":
+                        guide = value
+                    else:
+                        segments = value
+            if failures:
+                raise failures[0]
+            assert isinstance(guide, dict) and isinstance(segments, list)
             return PreparedChapter(chapter, guide, segments)
 
     def lane(prepared: PreparedChapter, call: Callable[[PreparedChapter, Mapping[str, Any]], Any]) -> dict[str, Any]:
@@ -90,13 +86,14 @@ def run_chapter_pipeline(
                 futures["translation"] = phase.submit(lane, prepared, run_translation)
             futures["companion"] = phase.submit(lane, prepared, run_companion)
             outputs: dict[str, Any] = {}
+            failures: list[BaseException] = []
             for name, future in futures.items():
                 try:
                     outputs[name] = future.result()
-                except BaseException:
-                    pass
-            if first_failure:
-                raise first_failure[0]
+                except BaseException as exc:
+                    failures.append(exc)
+            if failures:
+                raise failures[0]
             return {
                 "guide": prepared.guide,
                 "segments": prepared.segments,
@@ -110,10 +107,16 @@ def run_chapter_pipeline(
             (str(chapter.get("chapter_id") or ""), executor.submit(run_chapter, chapter))
             for chapter in selected
         ]
+        failures: list[BaseException] = []
         for chapter_id, future in pending:
             if not chapter_id:
                 raise ValueError("chapter is missing chapter_id")
-            results[chapter_id] = future.result()
+            try:
+                results[chapter_id] = future.result()
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise failures[0]
     return results
 
 

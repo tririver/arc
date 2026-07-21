@@ -218,11 +218,6 @@ def reconcile_headings_to_pages(
         })
         if authoritative_pages:
             matches = authoritative_pages
-        elif isinstance(heading.get("pdf_page_start"), int):
-            # Equation/prose matching in the paired parser already produced a
-            # PDF-side anchor for this section; it is stronger than a repeated
-            # running heading in the page text.
-            matches = [int(heading["pdf_page_start"])]
         else:
             matches = [
                 page_number
@@ -239,6 +234,14 @@ def reconcile_headings_to_pages(
             # verbatim, but their immediately following source prose can
             # still provide a unique PDF-side anchor.
             matches = prose_matches
+        if not authoritative_pages and len(matches) != 1:
+            page_hint = heading.get("pdf_page_start")
+            if isinstance(page_hint, int) and (not matches or page_hint in matches):
+                # Paired parsing can infer a section page from one of its
+                # equations. Use that as a tie-breaker or last resort, not as
+                # stronger evidence than a uniquely matched heading/prose
+                # anchor: a section commonly begins before its first equation.
+                matches = [page_hint]
         if not matches:
             raise ValueError(f"PDF reconciliation found no page for heading {heading.get('title')!r}.")
         candidates.append(matches)
@@ -330,7 +333,7 @@ def reconcile_blocks_to_pages(
         transport_block = in_transport_details or bool(re.search(r"<\s*details\b", raw_text, re.IGNORECASE))
         if re.search(r"<\s*details\b", raw_text, re.IGNORECASE):
             in_transport_details = True
-        if isinstance(equation_page, int):
+        if isinstance(equation_page, int) and lower <= equation_page <= upper:
             matches = [equation_page]
             method = "equation_anchor"
         elif str(block.get("kind") or "") == "heading" and section:

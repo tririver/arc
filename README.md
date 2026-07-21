@@ -287,8 +287,9 @@ arc-companion validate --project-dir ./0911.3380-companion --json
 Use `--document-kind auto|article|book` to select the structure policy,
 `--idle-timeout-seconds` to override provider inactivity timeout, and
 `--regenerate-commentary` to rebuild commentary while retaining reusable
-translations. `--stop-after-first-chapter` provides the interactive validation
-boundary.
+translations. `--stop-after-first-chapter` provides the first-chapter
+validation checkpoint for `interactive` runs or a one-time review gate; it
+does not permanently change the managed run's automation level.
 
 For a managed companion workflow, the executing agent inspects substantive
 source body text near the beginning, middle, and end before building. It
@@ -441,16 +442,17 @@ Use ARC to plan and execute the task to be planned.
 Managed ARC workflows use two automation modes:
 
 - `auto`: continue with safe defaults, while preserving visible warnings.
-- `interactive`: ask for confirmation after major workflow steps.
+- `interactive`: pause at workflow-defined major milestones.
 
-The skill asks for a mode only when a human directly invokes a managed workflow
-and explicitly names ARC in the prompt. Agent-invoked workflows, and human
-prompts that do not name ARC, run automatically within the exact requested
-scope. Automatic execution never opts into downstream workflows: a domain-only
-request stops after the domain, and an ideas-only request stops after ranked
-ideas. Direct ARC tool tasks, such as metadata lookup, citer collection, or
-paper summary batches, also run automatically unless you ask to review or
-confirm steps.
+The skill defaults to `auto` without presenting a startup menu. Ask explicitly
+for manual, step-by-step, staged review, or key-step confirmation to use
+`interactive`; asking to discuss first creates a pre-run pause. You can steer a
+managed run in either direction while it is active, with the change taking
+effect at the next safe boundary. Automatic execution stays within the exact
+requested scope: a domain-only request stops after the domain, and an ideas-only
+request stops after ranked ideas. Direct ARC tool tasks also default to auto.
+Neither mode bypasses authorization, safety, duplicate-charge, scientific, or
+error-recovery gates.
 
 ## Use ARC From The CLI
 

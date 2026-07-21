@@ -1,15 +1,32 @@
 from __future__ import annotations
 
+import contextlib
+import errno
+import hashlib
 import os
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+if os.name == "nt":  # pragma: no cover - selected on Windows hosts
+    import msvcrt as _msvcrt
+
+    _fcntl = None
+else:  # pragma: no branch - one implementation is selected at import time
+    import fcntl as _fcntl
+
+    _msvcrt = None
+
 from ..cache import cache_root, now_iso
 from ..ids import normalize_paper_id
+
+
+_LEASE_HANDLES: dict[str, object] = {}
+_LEASE_HANDLES_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -101,12 +118,11 @@ class BatchDB:
                 (name, now),
             ).fetchall()
             claimed: list[sqlite3.Row] = []
-            owner_pid = os.getpid()
-            owner_started_at = _process_start_identity(owner_pid)
             for row in rows:
                 if len(claimed) >= limit:
                     break
-                if row["status"] == "running" and _owner_is_alive(row):
+                lock_handle = self._try_item_lock(name, str(row["paper_id"]))
+                if lock_handle is None:
                     continue
                 paper_id = str(row["paper_id"])
                 lease_token = uuid.uuid4().hex
@@ -133,8 +149,8 @@ class BatchDB:
                         worker_id,
                         lease_token,
                         lease_until,
-                        owner_pid,
-                        owner_started_at,
+                        None,
+                        None,
                         now,
                         now,
                         name,
@@ -143,12 +159,16 @@ class BatchDB:
                     ),
                 )
                 if updated.rowcount:
+                    with _LEASE_HANDLES_LOCK:
+                        _LEASE_HANDLES[lease_token] = lock_handle
                     claimed.append(
                         conn.execute(
                             "SELECT * FROM batch_items WHERE batch_name = ? AND paper_id = ? AND lease_token = ?",
                             (name, paper_id, lease_token),
                         ).fetchone()
                     )
+                else:
+                    self._unlock_close(lock_handle)
         return [_item_from_row(row) for row in claimed]
 
     def heartbeat(
@@ -216,7 +236,13 @@ class BatchDB:
                 f"UPDATE batch_items SET {assignments} WHERE batch_name = ? AND paper_id = ?{ownership_clause}",
                 values,
             )
-        return bool(updated.rowcount)
+        changed = bool(updated.rowcount)
+        if changed and lease_token is not None and status not in {"running", "prefetching"}:
+            with _LEASE_HANDLES_LOCK:
+                handle = _LEASE_HANDLES.pop(lease_token, None)
+            if handle is not None:
+                self._unlock_close(handle)
+        return changed
 
     def status_counts(self, name: str) -> dict[str, int]:
         with self._connect() as conn:
@@ -241,6 +267,23 @@ class BatchDB:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _try_item_lock(self, batch_name: str, paper_id: str):
+        material = f"{batch_name}\0{normalize_paper_id(paper_id)}".encode()
+        digest = hashlib.sha256(material).hexdigest()
+        path = self.path.with_suffix(self.path.suffix + ".batch-locks") / f"{digest}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+        if not _advisory_try_lock(handle):
+            handle.close()
+            return None
+        return handle
+
+    @staticmethod
+    def _unlock_close(handle: object) -> None:
+        _advisory_unlock(handle)
+        with contextlib.suppress(OSError):
+            handle.close()
 
     def _init(self) -> None:
         with self._connect() as conn:
@@ -292,25 +335,28 @@ def _item_from_row(row: sqlite3.Row) -> BatchItem:
     return BatchItem(**{key: row[key] for key in row.keys()})
 
 
-def _process_start_identity(pid: int) -> str | None:
+def _advisory_try_lock(handle: object) -> bool:
     try:
-        # Linux /proc stat field 22 is stable for a process lifetime and protects
-        # against PID reuse. Split after the parenthesized command because the
-        # command itself may contain spaces. The suffix starts at field 3.
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        return stat[stat.rfind(")") + 2 :].split()[19]
-    except (OSError, IndexError):
-        return None
+        if _fcntl is not None:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        else:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError as exc:
+        if isinstance(exc, BlockingIOError) or exc.errno in {errno.EACCES, errno.EAGAIN}:
+            return False
+        raise
 
 
-def _owner_is_alive(row: sqlite3.Row) -> bool:
-    pid = row["owner_pid"] if "owner_pid" in row.keys() else None
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
-        return False
-    expected = row["owner_started_at"] if "owner_started_at" in row.keys() else None
-    actual = _process_start_identity(pid)
-    return not expected or not actual or str(expected) == actual
+def _advisory_unlock(handle: object) -> None:
+    with contextlib.suppress(OSError):
+        if _fcntl is not None:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        else:
+            handle.seek(0)
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)

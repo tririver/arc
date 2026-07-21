@@ -1595,25 +1595,6 @@ def test_new_call_constructs_shared_paper_overlay_before_submission(tmp_path):
     assert env["ARC_PAPER_WORKER_TOMBSTONE_DIR"] == str(state / "tombstones")
     assert env["ARC_PAPER_WORKER_SESSION_ID"].startswith("arc-llm-")
     assert env["ARC_LLM_WORKER_CONTEXT"] == "true"
-    assert Path(env["ARC_PAPER_WORKER_GUARD"]).is_file()
-    assert env["ARC_PAPER_WORKER_TOKEN"]
-    guard = json.loads(Path(env["ARC_PAPER_WORKER_GUARD"]).read_text(encoding="utf-8"))
-    assert guard["schema_version"] == "arc.paper.worker-guard.v1"
-    assert guard["token_sha256"] == sha256_text(env["ARC_PAPER_WORKER_TOKEN"])
-    controller_token = runner._PAPER_CONTROLLER_SESSIONS[env["ARC_PAPER_WORKER_SESSION_ID"]]["controller_token"]
-    assert controller_token not in json.dumps(guard)
-    controller_guard_path = Path(
-        runner._PAPER_CONTROLLER_SESSIONS[env["ARC_PAPER_WORKER_SESSION_ID"]]["controller_guard"]
-    )
-    controller_guard = json.loads(controller_guard_path.read_text(encoding="utf-8"))
-    assert controller_guard == {
-        "schema_version": "arc.paper.controller-guard.v1",
-        "session_id": env["ARC_PAPER_WORKER_SESSION_ID"],
-        "run_root": str(run_root),
-        "base_root": str(base_cache),
-        "token_sha256": sha256_text(controller_token),
-    }
-    assert controller_guard_path.stat().st_mode & 0o077 == 0
     assert state.is_dir()
     assert env["ARC_CODEX_SANDBOX"] == "workspace-write"
     assert env["ARC_CODEX_WORK_DIR"] == str(run_root)
@@ -1727,8 +1708,6 @@ def test_disabled_paper_cli_hides_inherited_global_cache(tmp_path):
         "ARC_PAPER_CLI_ACCESS": "none",
         "ARC_PAPER_CACHE": str(global_cache),
         "ARC_PAPER_WORKER_BASE_CACHE": str(global_cache),
-        "ARC_PAPER_WORKER_GUARD": str(tmp_path / "forged-guard"),
-        "ARC_PAPER_WORKER_TOKEN": "forged",
     }
 
     runner._configure_paper_worker_session(
@@ -1739,11 +1718,9 @@ def test_disabled_paper_cli_hides_inherited_global_cache(tmp_path):
     assert env["ARC_LLM_WORKER_CONTEXT"] == "true"
     assert "ARC_PAPER_WORKER_BASE_CACHE" not in env
     assert "ARC_PAPER_WORKER_SESSION_DIR" not in env
-    assert "ARC_PAPER_WORKER_GUARD" not in env
-    assert "ARC_PAPER_WORKER_TOKEN" not in env
 
 
-def test_controller_finalizer_uses_secret_not_exposed_to_worker(tmp_path, monkeypatch):
+def test_controller_finalizer_uses_session_paths_without_local_auth_tokens(tmp_path, monkeypatch):
     run_root = tmp_path / "run"
     env = {
         "ARC_PAPER_CLI_ACCESS": "full",
@@ -1769,7 +1746,4 @@ def test_controller_finalizer_uses_secret_not_exposed_to_worker(tmp_path, monkey
     assert captured["command"][1:4] == ["-m", "arc_paper.worker_controller", "finalize"]
     assert captured["command"][-2:] == ["--status", "failed"]
     controller_env = captured["env"]
-    assert controller_env["ARC_PAPER_CONTROLLER_MODE"] == "trusted"
-    assert controller_env["ARC_PAPER_CONTROLLER_TOKEN"]
-    assert controller_env["ARC_PAPER_CONTROLLER_TOKEN"] != env["ARC_PAPER_WORKER_TOKEN"]
-    assert "ARC_PAPER_WORKER_TOKEN" not in controller_env
+    assert "ARC_LLM_WORKER_CONTEXT" not in controller_env

@@ -120,6 +120,10 @@ Record the same question in `Open Questions` or `Calculation Status`.
 
 ## Phase 5: Update Work Note
 
+After each accepted step or coherent calculation chunk is written back and
+exported, pause in `interactive` mode before starting the next block. This is a
+general milestone; do not pause after each underlying tool call.
+
 For an accepted step, update the work note and remove it from the executable backlog:
 
 - accepted step result goes to `## Accepted Derived Results`

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
 import os
+import sqlite3
 import subprocess
 import sys
 
@@ -19,6 +22,7 @@ from arc_llm.safety import (
     LLMSafetyConfigurationError,
     LLMSafetyController,
 )
+from arc_llm import safety as safety_module
 
 
 def controller(tmp_path, *, env=None, clock=None):
@@ -137,6 +141,40 @@ def test_default_global_concurrency_is_24(tmp_path):
     assert controller(tmp_path).effective_max_concurrency() == GLOBAL_MAX_CONCURRENCY == 24
 
 
+def test_advisory_lock_treats_eacces_as_contention(monkeypatch, tmp_path):
+    class ContendedFcntl:
+        LOCK_EX = 1
+        LOCK_NB = 2
+
+        @staticmethod
+        def flock(_fd, _flags):
+            raise OSError(errno.EACCES, "contended")
+
+    monkeypatch.setattr(safety_module, "_fcntl", ContendedFcntl())
+    with (tmp_path / "lock").open("a+b") as handle:
+        assert safety_module._advisory_try_lock(handle) is False
+
+
+def test_advisory_lock_windows_branch_uses_one_byte_region(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeMsvcrt:
+        LK_NBLCK = 10
+        LK_UNLCK = 11
+
+        @staticmethod
+        def locking(fd, mode, length):
+            calls.append((fd, mode, length))
+
+    monkeypatch.setattr(safety_module, "_fcntl", None)
+    monkeypatch.setattr(safety_module, "_msvcrt", FakeMsvcrt())
+    with (tmp_path / "lock").open("a+b") as handle:
+        assert safety_module._advisory_try_lock(handle) is True
+        safety_module._advisory_unlock(handle)
+        assert handle.tell() == 0
+    assert [item[1:] for item in calls] == [(FakeMsvcrt.LK_NBLCK, 1), (FakeMsvcrt.LK_UNLCK, 1)]
+
+
 def test_provider_limit_does_not_reduce_capacity_for_other_providers(tmp_path):
     safety = controller(
         tmp_path,
@@ -154,25 +192,40 @@ def test_provider_limit_does_not_reduce_capacity_for_other_providers(tmp_path):
         kimi.release()
 
 
+def test_lower_limit_counts_slots_acquired_at_higher_limit(tmp_path):
+    permissive = controller(tmp_path, env={"ARC_LLM_MAX_CONCURRENCY": "24"})
+    held = [permissive.acquire_slot("codex-cli") for _ in range(3)]
+    restrictive = controller(tmp_path, env={"ARC_LLM_MAX_CONCURRENCY": "2"})
+    try:
+        with pytest.raises(LLMWorkerError, match="LLM capacity"):
+            restrictive.acquire_slot("claude-cli", timeout_seconds=0.02)
+    finally:
+        for slot in held:
+            slot.release()
+
+
 @pytest.mark.parametrize(
     "category",
     [LLMFailureCategory.QUOTA, LLMFailureCategory.AUTHENTICATION, LLMFailureCategory.PERMISSION],
 )
-def test_persistent_provider_circuit_survives_new_controller_until_reset(tmp_path, category):
-    first = controller(tmp_path)
+def test_provider_circuit_survives_new_controller_only_until_ttl(tmp_path, category):
+    clock = [100.0]
+    first = controller(tmp_path, clock=clock)
     first.report_failure(
         "kimi-code-cli",
         LLMWorkerError("provider blocked", category=category, abort_scope="provider"),
     )
 
-    second = controller(tmp_path)
+    second = controller(tmp_path, clock=clock)
     with pytest.raises(LLMCircuitOpen) as caught:
         second.check_circuit("kimi-code-cli")
     assert caught.value.category == category
-    assert caught.value.retry_after_seconds is None
+    assert caught.value.retry_after_seconds == pytest.approx(900)
 
-    assert second.reset_circuit("kimi-code-cli") == 1
-    assert second.check_circuit("kimi-code-cli").probe_token is None
+    clock[0] += 901
+    probe = second.check_circuit("kimi-code-cli")
+    assert probe.probe_token
+    second.report_success("kimi-code-cli", permit=probe)
 
 
 def test_rate_limit_uses_15_minimum_cooldown_and_one_half_open_probe(tmp_path):
@@ -206,6 +259,60 @@ def test_rate_limit_uses_15_minimum_cooldown_and_one_half_open_probe(tmp_path):
 
     first.report_success("codex-cli", permit=probe)
     assert first.status()["circuits"] == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("local failure"),
+        LLMWorkerError("invalid request", category="invalid_request"),
+    ],
+)
+def test_non_circuit_failure_releases_half_open_probe(tmp_path, error):
+    clock = [100.0]
+    safety = controller(tmp_path, clock=clock)
+    safety.report_failure(
+        "codex-cli",
+        LLMWorkerError("authentication", category="authentication"),
+    )
+    clock[0] += 901
+    probe = safety.check_circuit("codex-cli")
+
+    safety.report_failure("codex-cli", error, permit=probe)
+
+    replacement = controller(tmp_path, clock=clock).check_circuit("codex-cli")
+    assert replacement.probe_token
+    safety.report_success("codex-cli", permit=replacement)
+
+
+def test_circuit_record_error_releases_half_open_probe(tmp_path, monkeypatch):
+    clock = [100.0]
+    safety = controller(tmp_path, clock=clock)
+    safety.report_failure(
+        "codex-cli",
+        LLMWorkerError("authentication", category="authentication"),
+    )
+    clock[0] += 901
+    probe = safety.check_circuit("codex-cli")
+    original_transaction = safety._transaction
+
+    @contextmanager
+    def failing_transaction():
+        raise sqlite3.OperationalError("database unavailable")
+        yield
+
+    monkeypatch.setattr(safety, "_transaction", failing_transaction)
+    with pytest.raises(sqlite3.OperationalError, match="database unavailable"):
+        safety.report_failure(
+            "codex-cli",
+            LLMWorkerError("quota", category="quota"),
+            permit=probe,
+        )
+    monkeypatch.setattr(safety, "_transaction", original_transaction)
+
+    replacement = controller(tmp_path, clock=clock).check_circuit("codex-cli")
+    assert replacement.probe_token
+    safety.report_success("codex-cli", permit=replacement)
 
 
 def test_endpoint_identity_strips_credentials_and_query_from_status(tmp_path):

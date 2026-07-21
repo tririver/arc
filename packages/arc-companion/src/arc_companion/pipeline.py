@@ -113,6 +113,10 @@ from .stateful_pipeline import (
     StatefulPromptStream,
     StatefulSessionError,
     continuity_capsule,
+    read_stream_state,
+    pin_lane_runtime_profile,
+    resolve_lane_runtime_profile,
+    write_stream_state,
 )
 
 
@@ -235,6 +239,24 @@ class TranslationOpaqueTokenError(RuntimeError):
 
 class TranslationCoverageError(RuntimeError):
     """A translation candidate does not map exactly once to every expected block."""
+
+
+class TranslationRepairNeedsSupervision(RuntimeError):
+    """A persisted, paid repair response is invalid and must not be resubmitted."""
+
+    def __init__(self, *, segment_id: str, marker_path: Path, reason: str) -> None:
+        self.segment_id = segment_id
+        self.recovery_context = {
+            "submission_state": "submitted",
+            "resumable": False,
+            "recovery_action": "operator-supervision",
+            "blocked_reason": "persisted_repair_response_failed_local_validation",
+            "repair_marker": str(marker_path),
+        }
+        super().__init__(
+            f"persisted paid translation repair is invalid for {segment_id}; "
+            f"refusing resubmission: {reason}"
+        )
 
 
 class CompanionLLMCircuitOpen(RuntimeError):
@@ -528,6 +550,7 @@ def _build_companion_unlocked(
             checkpoint_dir=str(checkpoint_dir),
             translation_mode="skipped" if options.skip_translation else "enabled",
             annotation_language=options.annotation_language,
+            recovery_options=_recovery_options(options),
             notice=notice,
             diagnostics=list(diagnostics),
         )
@@ -922,6 +945,29 @@ def _build_companion_unlocked(
         failure_diagnostics: list[dict[str, Any]] = [dict(item) for item in diagnostics]
         if isinstance(exc, SegmentationError):
             failure_diagnostics.append(exc.diagnostic())
+        if checkpoint_dir is not None and _supervised_lane_ledger_paths(checkpoint_dir):
+            supervised = _state(
+                state_path,
+                status="needs_supervision",
+                paper_id=options.paper_id,
+                fingerprint=fingerprint,
+                checkpoint_dir=str(checkpoint_dir),
+                recovery_options=_recovery_options(options),
+                notice=notice,
+                error=str(exc),
+                diagnostics=failure_diagnostics,
+            )
+            return {
+                "ok": False,
+                "status": "needs_supervision",
+                "data": supervised,
+                "error": {
+                    "code": "companion_needs_supervision",
+                    "message": str(exc),
+                },
+                "errors": [],
+                "meta": {"diagnostics": failure_diagnostics, "notice": notice},
+            }
         failure = _state(
             state_path,
             status="failed",
@@ -1118,10 +1164,9 @@ def _build_chaptered_companion(
     progress = CompanionProgress()
     supervision_event = threading.Event()
 
-    def chapter_cancel_check() -> bool:
-        return supervision_event.is_set() or bool(
-            cancel_check is not None and cancel_check()
-        )
+    def cancel_inflight_check() -> bool:
+        """Only explicit caller cancellation may interrupt submitted calls."""
+        return bool(cancel_check is not None and cancel_check())
 
     session_manager = None
     submission_limiter = LLMSubmissionLimiter(options.workers)
@@ -1457,7 +1502,30 @@ def _build_chaptered_companion(
                         supervised_native_resume=(
                             idempotency_key in options.supervised_native_resume_keys
                         ),
-                        cancel_check=chapter_cancel_check,
+                        validated_legacy_logical_identity=(
+                            {
+                                "provider": existing_session.provider,
+                                "model": existing_session.model,
+                                "session_key": session_key,
+                                "generation": generation,
+                                "idempotency_key": idempotency_key,
+                            }
+                            if idempotency_key in options.supervised_native_resume_keys
+                            and existing_session is not None else None
+                        ),
+                        validated_legacy_runtime_identity=(
+                            {
+                                "session_key": existing_session.key,
+                                "provider": existing_session.provider,
+                                "model": existing_session.model,
+                                "generation": existing_session.generation,
+                                "native_session_id": existing_session.native_session_id,
+                                "recorded_fp": existing_session.runtime_fingerprint,
+                            }
+                            if idempotency_key in options.supervised_native_resume_keys
+                            and existing_session is not None else None
+                        ),
+                        cancel_check=cancel_inflight_check,
                         progress_callback=lambda event: (
                             mark_submitted(
                                 guide_ledger_path, segment_id=guide_segment_id
@@ -1554,6 +1622,7 @@ def _build_chaptered_companion(
     stream_lock = threading.Lock()
     prompt_streams: dict[tuple[str, str, int], StatefulPromptStream] = {}
     rollover_budgets: dict[tuple[str, str, int], ContextRolloverBudget] = {}
+    lane_runtime_profiles: dict[tuple[str, str, int], dict[str, Any]] = {}
     correction_budget = CorrectionBudget()
 
     def record_segment_reuse(
@@ -1580,8 +1649,75 @@ def _build_chaptered_companion(
     def lane_stream(prepared, lane: str, generation: int) -> StatefulPromptStream:
         key = (str(prepared.chapter["chapter_id"]), lane, generation)
         with stream_lock:
+            session_key = f"{key[0]}:{lane}"
+            ref = session_manager.get_existing(session_key)
+            existing_generation = bool(
+                ref is not None and ref.generation == generation and (
+                    ref.native_session_id
+                    or session_manager.turn_count(session_key, generation=generation) > 0
+                    or ref.metadata.get("arc_runtime_started_generation") == generation
+                )
+            )
+            lane_runtime_profiles[key] = resolve_lane_runtime_profile(
+                checkpoint_dir / "chapters" / key[0]
+                / f"{lane}-runtime-generation-{generation}.json",
+                chapter_id=key[0], lane=lane, generation=generation,
+                requested_allow_internet=options.allow_internet,
+                inherit_host_tools=options.inherit_host_tools,
+                existing_generation=existing_generation,
+                # rotate() deliberately retains the previous generation's
+                # provider identity as a selection hint, but its runtime
+                # manifest does not belong to the new generation.
+                recorded_runtime_fingerprint=(
+                    ref.runtime_fingerprint if existing_generation else None
+                ),
+                provider=options.provider, model=options.model,
+                model_tier=(TRANSLATION_TIER if lane == "translation" else ANNOTATION_TIER),
+            )
             stream = prompt_streams.get(key)
             if stream is None:
+                state_path = (
+                    checkpoint_dir / "chapters" / key[0]
+                    / f"{lane}-stream-generation-{generation}.json"
+                )
+                receipt_turns = session_manager.turn_count(
+                    f"{key[0]}:{lane}", generation=generation,
+                )
+                restored = read_stream_state(
+                    state_path, receipt_turn_count=receipt_turns,
+                )
+                if restored is not None:
+                    stream, _persisted_budget = restored
+                    if (stream.chapter_id, stream.lane, stream.generation) != key:
+                        raise StatefulSessionError(
+                            f"stateful stream identity changed for {key[0]}:{lane}:{generation}"
+                        )
+                    rollover_budgets[key] = ContextRolloverBudget.from_turn_records(
+                        session_manager.turn_records(
+                            f"{key[0]}:{lane}", generation=generation,
+                        )
+                    )
+                    prompt_streams[key] = stream
+                    return stream
+                capsule = None
+                if generation > 1:
+                    ledger_path = (
+                        checkpoint_dir / "chapters" / key[0] / f"{lane}-ledger.json"
+                    )
+                    if ledger_path.exists():
+                        prior = [
+                            block for block in (read_json(ledger_path).get("blocks") or [])
+                            if block.get("state") == "accepted"
+                            and int(block.get("generation") or 1) < generation
+                        ]
+                        if prior:
+                            block = prior[-1]
+                            capsule = continuity_capsule(
+                                accepted_chain_sha256=str(block.get("accepted_chain_sha256") or ""),
+                                segment_id=str(block.get("segment_id") or ""),
+                                input_sha256=str(block.get("input_sha256") or ""),
+                                output_sha256=str(block.get("output_sha256") or ""),
+                            )
                 stream = StatefulPromptStream(
                     chapter_id=key[0], lane=lane, generation=generation,
                     fixed_rules={
@@ -1621,9 +1757,18 @@ def _build_chaptered_companion(
                             )
                         ),
                     },
+                    continuity_capsule=capsule,
                 )
+                stream.reconcile_turn_count(receipt_turns)
                 prompt_streams[key] = stream
-                rollover_budgets[key] = ContextRolloverBudget()
+                rollover_budgets[key] = ContextRolloverBudget.from_turn_records(
+                    session_manager.turn_records(
+                        f"{key[0]}:{lane}", generation=generation,
+                    )
+                )
+                write_stream_state(
+                    state_path, stream=stream, budget=rollover_budgets[key],
+                )
             return stream
 
     def run_lane(prepared, segment, lane):
@@ -1828,6 +1973,9 @@ def _build_chaptered_companion(
                     ),
                 }
                 current_payload["segment_glossary"] = segment_glossary
+                runtime_profile = lane_runtime_profiles[
+                    (chapter_id, lane, block_generation)
+                ]
                 stateful_prompt = stream.request(
                     (prompt if correction else (
                         "Translate the current segment payload under the generation rules."
@@ -1841,10 +1989,20 @@ def _build_chaptered_companion(
                 )
                 try:
                     with submission_limiter.permit():
+                        existing_session = session_manager.get_existing(session_key)
                         outcome = result_llm(
-                            stateful_prompt, schema=kwargs.get("schema"), provider=kwargs.get("provider", "auto"),
-                            model=kwargs.get("model"), model_tier=kwargs.get("model_tier"),
-                            env=kwargs.get("env"), artifact_dir=artifact_dir, call_label=call_label,
+                            stateful_prompt, schema=kwargs.get("schema"),
+                            provider=str(runtime_profile["provider"]),
+                            model=runtime_profile.get("model"),
+                            model_tier=(
+                                None if runtime_profile.get("model")
+                                else runtime_profile.get("model_tier")
+                            ),
+                            env=_llm_runtime_env(
+                                allow_internet=bool(runtime_profile["allow_internet"]),
+                                force_disable_internet=not bool(runtime_profile["allow_internet"]),
+                                inherit_host_tools=bool(runtime_profile["inherit_host_tools"]),
+                            ), artifact_dir=artifact_dir, call_label=call_label,
                             idle_timeout_seconds=kwargs.get("idle_timeout_seconds"),
                             session_policy="stateful", session_manager=session_manager,
                             session_key=session_key, idempotency_key=idempotency_key,
@@ -1852,7 +2010,30 @@ def _build_chaptered_companion(
                             supervised_native_resume=(
                                 idempotency_key in options.supervised_native_resume_keys
                             ),
-                            cancel_check=chapter_cancel_check,
+                            validated_legacy_logical_identity=(
+                                {
+                                    "provider": existing_session.provider,
+                                    "model": existing_session.model,
+                                    "session_key": session_key,
+                                    "generation": block_generation,
+                                    "idempotency_key": idempotency_key,
+                                }
+                                if idempotency_key in options.supervised_native_resume_keys
+                                and existing_session is not None else None
+                            ),
+                            validated_legacy_runtime_identity=(
+                                {
+                                    "session_key": existing_session.key,
+                                    "provider": existing_session.provider,
+                                    "model": existing_session.model,
+                                    "generation": existing_session.generation,
+                                    "native_session_id": existing_session.native_session_id,
+                                    "recorded_fp": existing_session.runtime_fingerprint,
+                                }
+                                if idempotency_key in options.supervised_native_resume_keys
+                                and existing_session is not None else None
+                            ),
+                            cancel_check=cancel_inflight_check,
                             progress_callback=lambda event: (
                                 mark_submitted(path, segment_id=segment_id)
                                 if event.get("event") == "submitted"
@@ -1887,31 +2068,70 @@ def _build_chaptered_companion(
                     "call_id": str(logical.get("idempotency_key") or logical.get("call_id") or call_label),
                     "usage": dict(usage_json) if isinstance(usage_json, dict) else {},
                 }
-                rollover_budgets[(chapter_id, lane, block_generation)].record(
+                generation_key = (chapter_id, lane, block_generation)
+                profile_path = (
+                    checkpoint_dir / "chapters" / chapter_id
+                    / f"{lane}-runtime-generation-{block_generation}.json"
+                )
+                refreshed_session = session_manager.get_existing(session_key)
+                lane_runtime_profiles[generation_key] = pin_lane_runtime_profile(
+                    profile_path, runtime_profile,
+                    provider=(refreshed_session.provider if refreshed_session else options.provider),
+                    model=(refreshed_session.model if refreshed_session else options.model),
+                    runtime_fingerprint=str(getattr(outcome, "runtime_fingerprint", "")),
+                    migrated_from_fingerprint=(
+                        str(refreshed_session.metadata.get(
+                            "arc_runtime_fingerprint_migrated_from"
+                        ))
+                        if refreshed_session is not None
+                        and refreshed_session.metadata.get(
+                            "arc_runtime_fingerprint_migrated_from"
+                        ) else None
+                    ),
+                )
+                rollover_budgets[generation_key].record(
                     getattr(outcome, "usage", {}),
                     prompt_bytes=getattr(outcome, "prompt_bytes", None),
                 )
+                stream.reconcile_turn_count(
+                    session_manager.turn_count(
+                        session_key, generation=block_generation,
+                    )
+                )
+                write_stream_state(
+                    checkpoint_dir / "chapters" / chapter_id
+                    / f"{lane}-stream-generation-{block_generation}.json",
+                    stream=stream, budget=rollover_budgets[generation_key],
+                )
                 return dict(outcome.value)
-        if reused_artifact is not None:
-            pass
-        elif migrated_translation is not None:
-            value = migrated_translation
-        elif lane == "translation":
-            value = _generate_translations(
-                [segment], options=options, bundle=bundle,
-                glossary=segment_glossary, protected_names=protected_names,
-                checkpoint_dir=checkpoint_dir, llm=lane_llm,
-                force_generation="translation" in regeneration or semantic_invalidated,
-            )[segment_id]
-        else:
-            value = _generate_annotations(
-                [segment], options=options, bundle=bundle, evidence=evidence,
-                domain_context=domain_context, glossary=segment_glossary,
-                # Only current-block explanations are repeated on delta turns; the
-                # complete source-to-target mapping lives in the generation bootstrap.
-                protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=lane_llm,
-                force_generation="commentary" in regeneration or semantic_invalidated,
-            )[segment_id]
+        try:
+            if reused_artifact is not None:
+                pass
+            elif migrated_translation is not None:
+                value = migrated_translation
+            elif lane == "translation":
+                value = _generate_translations(
+                    [segment], options=options, bundle=bundle,
+                    glossary=segment_glossary, protected_names=protected_names,
+                    checkpoint_dir=checkpoint_dir, llm=lane_llm,
+                    force_generation="translation" in regeneration or semantic_invalidated,
+                )[segment_id]
+            else:
+                value = _generate_annotations(
+                    [segment], options=options, bundle=bundle, evidence=evidence,
+                    domain_context=domain_context, glossary=segment_glossary,
+                    # Only current-block explanations are repeated on delta turns; the
+                    # complete source-to-target mapping lives in the generation bootstrap.
+                    protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=lane_llm,
+                    force_generation="commentary" in regeneration or semantic_invalidated,
+                )[segment_id]
+        except BaseException as exc:
+            _mark_translation_repair_supervision(
+                path, segment_id=segment_id, exc=exc,
+            )
+            # A paid-repair supervision failure is local.  This path does not
+            # set the shared stop/cancel event, so unrelated work may drain.
+            raise
         if newly_accepted:
             # A successfully returned stateless call is itself a definitive
             # submission/response receipt; stateful calls normally crossed
@@ -1989,6 +2209,12 @@ def _build_chaptered_companion(
                         ),
                     )
                     rollover_budgets[(chapter_id, lane, rotated.generation)] = ContextRolloverBudget()
+                    write_stream_state(
+                        checkpoint_dir / "chapters" / chapter_id
+                        / f"{lane}-stream-generation-{rotated.generation}.json",
+                        stream=prompt_streams[(chapter_id, lane, rotated.generation)],
+                        budget=rollover_budgets[(chapter_id, lane, rotated.generation)],
+                    )
         with reader_data_lock:
             target = reader_translations if lane == "translation" else reader_annotations
             target[str(segment_id)] = dict(value)
@@ -2008,8 +2234,11 @@ def _build_chaptered_companion(
                 else lambda prepared, segment: run_lane(prepared, segment, "translation")
             ),
             "run_companion": lambda prepared, segment: run_lane(prepared, segment, "companion"),
+            # An uncertain submitted provider call stops new batch submissions
+            # but never cancels calls already in flight. Deterministic local
+            # failures remain contained to their lane/chapter.
             "stop_event": supervision_event,
-            "cancel_check": chapter_cancel_check,
+            "cancel_check": cancel_inflight_check,
         }
         freeze_path = checkpoint_dir / "first-chapter-freeze.json"
         existing_freeze = _load_first_chapter_freeze(
@@ -2215,7 +2444,40 @@ def _build_chaptered_companion(
             "meta": {"diagnostics": list(diagnostics), "notice": notice}}
 
 
+def _supervised_lane_ledger_paths(checkpoint_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in _all_lane_ledger_paths(checkpoint_dir):
+        try:
+            ledger = read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(ledger, dict) and ledger.get("needs_supervision"):
+            paths.append(path)
+    return paths
+
+
+def _all_lane_ledger_paths(checkpoint_dir: Path) -> list[Path]:
+    """Find production ledgers regardless of their chapter artifact layout."""
+    paths: list[Path] = []
+    for path in sorted(checkpoint_dir.rglob("*-ledger.json")):
+        try:
+            value = read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if (
+            value.get("schema_version") == "arc.companion.chapter-lane-ledger.v2"
+            and value.get("chapter_id")
+            and value.get("lane")
+        ):
+            paths.append(path)
+    return paths
+
+
 def _chapter_failure_requires_supervision(exc: BaseException) -> bool:
+    if isinstance(exc, TranslationRepairNeedsSupervision):
+        return True
     if isinstance(exc, TimeoutError):
         return True
     try:
@@ -2243,6 +2505,45 @@ def _chapter_failure_requires_supervision(exc: BaseException) -> bool:
             for value in failures
         )
     return bool(exc.__cause__ and _chapter_failure_requires_supervision(exc.__cause__))
+
+
+def _translation_repair_supervision(
+    exc: BaseException,
+) -> TranslationRepairNeedsSupervision | None:
+    """Find a paid-repair supervision signal through lane aggregation wrappers."""
+    if isinstance(exc, TranslationRepairNeedsSupervision):
+        return exc
+    failures = getattr(exc, "failures", None)
+    values: list[Any] = []
+    if isinstance(failures, dict):
+        values.extend(failures.values())
+    elif isinstance(failures, list):
+        values.extend(
+            item[1] if isinstance(item, tuple) and len(item) == 2 else item
+            for item in failures
+        )
+    for value in values:
+        if isinstance(value, BaseException):
+            found = _translation_repair_supervision(value)
+            if found is not None:
+                return found
+    if exc.__cause__ is not None:
+        return _translation_repair_supervision(exc.__cause__)
+    return None
+
+
+def _mark_translation_repair_supervision(
+    path: Path, *, segment_id: str, exc: BaseException,
+) -> bool:
+    """Persist one local supervision marker even when lane errors are wrapped."""
+    supervision = _translation_repair_supervision(exc)
+    if supervision is None:
+        return False
+    mark_needs_supervision(
+        path, segment_id=segment_id, reason=str(supervision),
+        recovery_context=supervision.recovery_context,
+    )
+    return True
 
 
 def validate_and_expand_segments(
@@ -2286,6 +2587,206 @@ def read_status(project_dir: Path) -> dict[str, Any]:
     from .observability import enrich_status
 
     return ok(enrich_status(project_dir, read_json(path)))
+
+
+def _finalize_paid_translation_repairs(
+    checkpoint_dir: Path,
+) -> list[dict[str, Any]]:
+    """Classify every unaccepted paid token repair without provider calls."""
+    document_payload = _read_checkpoint_json(checkpoint_dir / "document.json")
+    document = (
+        document_payload.get("document")
+        if isinstance(document_payload, dict) else None
+    )
+    if not isinstance(document, dict):
+        return []
+    glossary = _read_checkpoint_json(checkpoint_dir / "glossary.json")
+    protected_names = _protected_names(
+        SourceBundle(
+            paper_id=str(document_payload.get("paper_id") or "checkpoint"),
+            parsed={}, document=document, metadata={}, references=[], citers=[],
+        ),
+        glossary=glossary if isinstance(glossary, dict) else None,
+    )
+    blocks_by_id = {
+        block_id(item): item for item in document.get("blocks") or []
+        if isinstance(item, dict)
+    }
+    ledgers: dict[str, tuple[Path, dict[str, Any], dict[str, Any]]] = {}
+    for ledger_path in _all_lane_ledger_paths(checkpoint_dir):
+        ledger = read_json(ledger_path)
+        if ledger.get("lane") != "translation":
+            continue
+        for block in ledger.get("blocks") or []:
+            if isinstance(block, dict) and block.get("state") != "accepted":
+                ledgers[str(block.get("segment_id") or "")] = (
+                    ledger_path, ledger, block,
+                )
+    entries: list[dict[str, Any]] = []
+    marker_dir = checkpoint_dir / "translation-token-offset-attempts"
+    for marker_path in sorted(marker_dir.glob("*.json")) if marker_dir.is_dir() else []:
+        marker = _read_checkpoint_json(marker_path)
+        if not isinstance(marker, dict) or marker.get("status") not in {
+            "response_received", "validated",
+        }:
+            continue
+        segment_id = str(marker.get("segment_id") or "")
+        located = ledgers.get(segment_id)
+        if located is None:
+            continue
+        ledger_path, ledger, ledger_block = located
+        draft = _read_checkpoint_json(
+            checkpoint_dir / "translation-drafts" / marker_path.name
+        )
+        source_ids = [str(value) for value in marker.get("block_ids") or []]
+        raw_response = marker.get("raw_response")
+        error: str | None = None
+        supervision_markers = [
+            item for item in [
+                ledger.get("needs_supervision"),
+                *(ledger.get("supervision_entries") or []),
+            ]
+            if isinstance(item, dict)
+            and str(item.get("segment_id") or "") == segment_id
+        ]
+        prior_operator_supervision = next((
+            item for item in supervision_markers
+            if str((item.get("recovery_context") or {}).get("recovery_action") or "")
+            == "operator-supervision"
+        ), None)
+        if prior_operator_supervision is not None:
+            error = str(
+                prior_operator_supervision.get("reason")
+                or "existing operator supervision takes precedence"
+            )
+        if not (
+            isinstance(draft, dict)
+            and draft.get("segment_id") == segment_id
+            and draft.get("input_sha256") == marker.get("input_sha256")
+            and isinstance(draft.get("translation"), dict)
+            and isinstance(raw_response, dict)
+            and source_ids
+            and all(value in blocks_by_id for value in source_ids)
+        ) and error is None:
+            error = "paid repair is missing its matching draft, response, or source blocks"
+        elif error is None:
+            try:
+                draft_block_ids = [
+                    str(item.get("block_id") or "")
+                    for item in draft["translation"].get("blocks") or []
+                    if isinstance(item, dict)
+                    and str(item.get("block_id") or "") in blocks_by_id
+                ]
+                segmentation = _read_checkpoint_json(
+                    ledger_path.parent / "segmentation.json"
+                )
+                local_segment_id = segment_id.rsplit(".", 1)[-1]
+                segment_record = next((
+                    item for item in (
+                        segmentation.get("segments")
+                        if isinstance(segmentation, dict) else []
+                    ) or []
+                    if isinstance(item, dict)
+                    and str(item.get("segment_id") or "") == local_segment_id
+                ), None)
+                validation_block_ids = (
+                    [str(value) for value in segment_record.get("block_ids") or []]
+                    if isinstance(segment_record, dict) else draft_block_ids
+                )
+                validation_segment = {
+                    "segment_id": segment_id, "block_ids": validation_block_ids,
+                }
+                candidate, _ = _canonicalize_translation_opaque_candidates(
+                    draft["translation"], blocks_by_id,
+                )
+                candidate, missing_blocks, _ = _normalize_translation_coverage(
+                    validation_segment, candidate, blocks_by_id,
+                )
+                if missing_blocks:
+                    raise RuntimeError(
+                        "paid token repair cannot recover missing translation blocks"
+                    )
+                repaired = _apply_translation_slot_repairs(
+                    candidate,
+                    [blocks_by_id[value] for value in source_ids],
+                    raw_response,
+                    protected_names=protected_names, offset_only=True,
+                )
+                for source_id in source_ids:
+                    source = blocks_by_id[source_id]
+                    prior_text = next(
+                        str(item.get("text") or "")
+                        for item in candidate.get("blocks") or []
+                        if isinstance(item, dict) and item.get("block_id") == source_id
+                    )
+                    repaired_text = next(
+                        str(item.get("text") or "")
+                        for item in repaired.get("blocks") or []
+                        if isinstance(item, dict) and item.get("block_id") == source_id
+                    )
+                    if (
+                        _translation_natural_residue(prior_text)
+                        != _translation_natural_residue(repaired_text)
+                        or _OPAQUE_INLINE_PATTERN.findall(repaired_text)
+                        != _opaque_inline_tokens(source)
+                    ):
+                        raise RuntimeError(
+                            "deterministic repair replay changed residue or token order"
+                        )
+                _validate_translation(
+                    validation_segment,
+                    repaired, blocks_by_id, protected_names,
+                )
+            except (RuntimeError, StopIteration) as exc:
+                error = str(exc)
+        call_checkpoints = sorted(
+            (checkpoint_dir / "llm" / "translations" / marker_path.stem
+             / "retry-offset-1" / "call-checkpoints").glob("*.json")
+        )
+        call_checkpoint = next((
+            value for value in (
+                _read_checkpoint_json(path) for path in call_checkpoints
+            )
+            if isinstance(value, dict)
+            and value.get("submission_state") in {"submitted", "unknown"}
+        ), {})
+        logical = dict(call_checkpoint.get("logical_identity") or {})
+        context = {
+            "submission_state": str(
+                call_checkpoint.get("submission_state") or "submitted"
+            ),
+            "resumable": False,
+            "recovery_action": (
+                "operator-supervision" if error else "deterministic-replay"
+            ),
+            "repair_marker": str(marker_path),
+            "checkpoint_path": (
+                str(call_checkpoints[0]) if call_checkpoints else ""
+            ),
+            "idempotency_key": str(logical.get("idempotency_key") or ""),
+            "blocked_reason": (
+                f"persisted_repair_response_failed_local_validation: {error}"
+                if error else "paid_repair_ready_for_deterministic_replay"
+            ),
+        }
+        if error:
+            mark_needs_supervision(
+                ledger_path, segment_id=segment_id,
+                reason=context["blocked_reason"], recovery_context=context,
+            )
+        generation = int(ledger_block.get("generation") or ledger.get("generation") or 1)
+        entries.append({
+            "ledger_path": str(ledger_path),
+            "session_key": f"{ledger.get('chapter_id')}:{ledger.get('lane')}",
+            "segment_id": segment_id,
+            "idempotency_key": context["idempotency_key"],
+            "initial_generation": generation,
+            "target_generation": generation,
+            "recovery_action": context["recovery_action"],
+            "blocking_reason": context["blocked_reason"] if error else "",
+            "recovery_context": context,
+        })
+    return entries
 
 
 def resume_companion(
@@ -2354,12 +2855,13 @@ def _resume_companion_unlocked(
             action=action,
         )
     state = read_json(state_path)
-    if state.get("status") != "needs_supervision":
+    if state.get("status") not in {"needs_supervision", "failed"}:
         return err("companion_not_supervised", "The companion build does not need supervision")
     checkpoint_dir = Path(str(state.get("checkpoint_dir") or ""))
     if not checkpoint_dir.is_dir():
         return err("companion_checkpoint_not_found", "The supervised checkpoint directory is missing")
     from .resume_transaction import (
+        append_entries,
         begin_transaction,
         load_transaction,
         mark_entry,
@@ -2376,18 +2878,33 @@ def _resume_companion_unlocked(
                 "resume_transaction_action_mismatch",
                 "An incomplete resume transaction uses a different action",
             )
-        ledger_paths = [Path(str(item["ledger_path"])) for item in transaction.get("entries") or []]
+        ledger_paths = {
+            Path(str(item["ledger_path"])).resolve(strict=False)
+            for item in transaction.get("entries") or []
+            if item.get("ledger_path")
+        }
+        # A continuation may itself be interrupted after another provider call
+        # crossed the barrier. Discover it on every retry instead of freezing
+        # the transaction's initial inventory.
+        ledger_paths.update(
+            path.resolve(strict=False) for path in _all_lane_ledger_paths(checkpoint_dir)
+        )
     else:
         transaction = None
-        ledger_paths = sorted((checkpoint_dir / "chapters").glob("*/**/*-ledger.json"))
+        ledger_paths = {
+            path.resolve(strict=False) for path in _all_lane_ledger_paths(checkpoint_dir)
+        }
     supervised_ledgers = []
-    for path in ledger_paths:
+    transaction_paths = {
+        str(Path(str(item.get("ledger_path") or "")).resolve(strict=False))
+        for item in (transaction or {}).get("entries") or []
+    }
+    for path in sorted(ledger_paths):
+        if not path.is_file():
+            continue
         ledger = read_json(path)
-        if ledger.get("needs_supervision") or transaction is not None:
+        if ledger.get("needs_supervision") or str(path) in transaction_paths:
             supervised_ledgers.append((path, ledger))
-    if not supervised_ledgers:
-        return err("companion_supervision_context_missing", "No supervised chapter lane was found")
-
     saved = transaction.get("recovery_options") if transaction else state.get("recovery_options")
     if not isinstance(saved, dict):
         return err(
@@ -2403,22 +2920,37 @@ def _resume_companion_unlocked(
     native_resume_keys: list[str] = [
         str(item["idempotency_key"]) for item in native_resume_contexts
     ]
+    blocked_native_entries: dict[tuple[str, str, str], dict[str, Any]] = {}
     if action == "resume-native":
-        for ledger_path, ledger in supervised_ledgers if transaction is None else []:
+        for ledger_path, ledger in supervised_ledgers:
+            if not ledger.get("needs_supervision"):
+                continue
             context = dict(ledger["needs_supervision"].get("recovery_context") or {})
             session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+            segment_id = str(ledger["needs_supervision"].get("segment_id") or "")
+            identity = (str(ledger_path.resolve(strict=False)), session_key, segment_id)
+            if str(context.get("idempotency_key") or "") in native_resume_keys:
+                continue
             if not context.get("idempotency_key"):
-                return err(
-                    "native_resume_idempotency_key_missing",
-                    f"The supervised call for {session_key} has no logical call key",
-                )
+                blocked_native_entries[identity] = {
+                    "blocking_code": "native_resume_idempotency_key_missing",
+                    "blocking_reason": (
+                        f"The supervised call for {session_key} has no logical call key"
+                    ),
+                    "recovery_context": context,
+                }
+                continue
             if not context.get("resumable") or not (
                 context.get("native_session_id") or manager.has_native_session(session_key)
             ):
-                return err(
-                    "native_session_not_resumable",
-                    f"The supervised call for {session_key} has no resumable native session",
-                )
+                blocked_native_entries[identity] = {
+                    "blocking_code": "native_session_not_resumable",
+                    "blocking_reason": (
+                        f"The supervised call for {session_key} has no resumable native session"
+                    ),
+                    "recovery_context": context,
+                }
+                continue
             try:
                 validated = _validate_native_resume_context(
                     checkpoint_dir=checkpoint_dir,
@@ -2427,24 +2959,84 @@ def _resume_companion_unlocked(
                     session_manager=manager,
                 )
             except ValueError as exc:
-                return err(
-                    "native_resume_context_invalid",
-                    str(exc),
-                )
+                blocked_native_entries[identity] = {
+                    "blocking_code": "native_resume_context_invalid",
+                    "blocking_reason": str(exc),
+                    "recovery_context": context,
+                }
+                continue
             native_resume_contexts.append(validated)
             native_resume_keys.append(validated["idempotency_key"])
-    if transaction is None:
-        entries = []
-        for path, ledger in supervised_ledgers:
-            supervision = dict(ledger.get("needs_supervision") or {})
-            generation = int(ledger.get("generation") or 1)
+        reconstructed = _reconstruct_unresolved_native_resume_contexts(
+            checkpoint_dir,
+            session_manager=manager,
+            excluded_keys=set(native_resume_keys),
+        )
+        native_resume_contexts.extend(reconstructed)
+        native_resume_keys.extend(
+            str(item["idempotency_key"]) for item in reconstructed
+        )
+    entries = []
+    existing_entry_identities = {
+        (
+            str(Path(str(item.get("ledger_path") or "")).resolve(strict=False)),
+            str(item.get("session_key") or ""),
+            str(item.get("segment_id") or ""),
+        )
+        for item in (transaction or {}).get("entries") or []
+    }
+    for path, ledger in supervised_ledgers:
+        supervision = dict(ledger.get("needs_supervision") or {})
+        segment_id = str(supervision.get("segment_id") or "")
+        if not segment_id:
+            # Existing transaction entries remain authoritative after a v1
+            # coordinator cleared supervision too early.
+            continue
+        identity = (
+            str(path.resolve(strict=False)), f"{ledger['chapter_id']}:{ledger['lane']}", segment_id,
+        )
+        if identity in existing_entry_identities:
+            continue
+        generation = int(ledger.get("generation") or 1)
+        entry = {
+            "ledger_path": str(path),
+            "session_key": identity[1],
+            "segment_id": segment_id,
+            "idempotency_key": str(
+                (supervision.get("recovery_context") or {}).get("idempotency_key") or ""
+            ),
+            "initial_generation": generation,
+            "target_generation": generation + (1 if action == "restart-generation" else 0),
+        }
+        entry.update(blocked_native_entries.get(identity) or {})
+        entries.append(entry)
+        existing_entry_identities.add(identity)
+    if action == "resume-native":
+        for context in native_resume_contexts:
+            ledger_path = str(
+                Path(str(context.get("ledger_path") or "")).resolve(strict=False)
+            ) if context.get("ledger_path") else ""
+            segment_id = str(context.get("segment_id") or "")
+            session_key = str(context.get("session_key") or "")
+            identity = (ledger_path, session_key, segment_id)
+            if not all(identity) or identity in existing_entry_identities:
+                continue
+            generation = int(context.get("generation") or 1)
             entries.append({
-                "ledger_path": str(path),
-                "session_key": f"{ledger['chapter_id']}:{ledger['lane']}",
-                "segment_id": str(supervision.get("segment_id") or ""),
+                "ledger_path": ledger_path,
+                "session_key": session_key,
+                "segment_id": segment_id,
+                "idempotency_key": str(context.get("idempotency_key") or ""),
                 "initial_generation": generation,
-                "target_generation": generation + (1 if action == "restart-generation" else 0),
+                "target_generation": generation,
+                "reconstructed_from_durable_state": bool(
+                    context.get("reconstructed_from_durable_state")
+                ),
             })
+            existing_entry_identities.add(identity)
+    if transaction is None and not entries:
+        return err("companion_not_supervised", "The companion build does not need supervision")
+    if transaction is None:
         try:
             transaction = begin_transaction(
                 project_dir,
@@ -2455,30 +3047,81 @@ def _resume_companion_unlocked(
             )
         except ValueError as exc:
             return err("resume_transaction_invalid", str(exc))
+    elif entries or len(native_resume_contexts) != len(
+        transaction.get("native_resume_contexts") or []
+    ):
+        try:
+            transaction = append_entries(
+                project_dir, entries,
+                native_resume_contexts=native_resume_contexts,
+            )
+        except ValueError as exc:
+            return err("resume_transaction_invalid", str(exc))
     resumed: list[dict[str, Any]] = []
+    reconcilable_native_entries = 0
     for index, entry in enumerate(transaction.get("entries") or []):
         path = Path(str(entry["ledger_path"]))
         ledger = read_json(path)
         segment_id = str(entry.get("segment_id") or "")
         session_key = str(entry["session_key"])
-        if entry.get("status") == "applied":
+        if entry.get("status") == "resolved":
             resumed.append(dict(entry))
             continue
         if action == "resume-native":
-            validated = next(
-                item for item in native_resume_contexts if item["session_key"] == session_key
-            )
+            recovery_action = str(entry.get("recovery_action") or "")
+            if recovery_action == "deterministic-replay":
+                reconcilable_native_entries += 1
+                if entry.get("status") in {"pending", "authorized"}:
+                    mark_entry(
+                        project_dir, index, status="reconciling",
+                        recovery_action=recovery_action,
+                    )
+                resumed.append(dict(entry))
+                continue
+            if recovery_action == "operator-supervision":
+                # The response is already paid and locally proven invalid.
+                # Retain its per-call authorization/context without attempting
+                # native reconciliation or a normal resend.
+                continue
+            entry_key = str(entry.get("idempotency_key") or "")
+            validated = next((
+                item for item in native_resume_contexts
+                if (entry_key and item["idempotency_key"] == entry_key)
+                or (not entry_key and item["session_key"] == session_key)
+            ), None)
+            if validated is None:
+                identity = (str(path.resolve(strict=False)), session_key, segment_id)
+                blocked = blocked_native_entries.get(identity) or {}
+                reason = str(
+                    blocked.get("blocking_reason")
+                    or entry.get("blocking_reason")
+                    or f"No durable native authorization exists for {session_key}:{segment_id}"
+                )
+                mark_entry(
+                    project_dir, index,
+                    status=("authorized" if entry.get("status") == "authorized" else "pending"),
+                    blocking_reason=reason,
+                    recovery_context=dict(
+                        blocked.get("recovery_context")
+                        or entry.get("recovery_context")
+                        or {}
+                    ),
+                )
+                continue
+            reconcilable_native_entries += 1
             native_id = validated.get("native_session_id_to_restore")
             if native_id:
                 try:
                     _restore_native_session_id(manager, validated, str(native_id))
                 except ValueError as exc:
                     return err("native_resume_context_invalid", str(exc))
-            updated = (
-                clear_needs_supervision(path)
-                if ledger.get("needs_supervision")
-                else ledger
-            )
+            updated = ledger
+            if entry.get("status") == "pending":
+                mark_entry(
+                    project_dir, index, status="authorized",
+                    idempotency_key=validated["idempotency_key"],
+                    generation=validated["generation"],
+                )
         else:
             ref = manager.get_existing(session_key)
             if ref is None:
@@ -2501,14 +3144,35 @@ def _resume_companion_unlocked(
                 or ledger.get("needs_supervision")
                 else ledger
             )
+            mark_entry(
+                project_dir, index, status="resolved",
+                ledger_path=str(path), session_key=session_key,
+                segment_id=segment_id, generation=updated["generation"],
+            )
+            resumed.append(dict(entry))
+            continue
         receipt = {
             "ledger_path": str(path), "session_key": session_key,
             "segment_id": segment_id, "generation": updated["generation"],
+            "idempotency_key": validated["idempotency_key"],
         }
-        mark_entry(project_dir, index, status="applied", **receipt)
+        if entry.get("status") in {"pending", "authorized"}:
+            mark_entry(project_dir, index, status="reconciling", **receipt)
         resumed.append(receipt)
 
-    mark_transaction(project_dir, "continuation_ready")
+    if action == "resume-native" and reconcilable_native_entries == 0:
+        mark_transaction(project_dir, "continuation_failed")
+        return err(
+            str(next(iter(blocked_native_entries.values()), {}).get(
+                "blocking_code", "native_resume_authorization_missing"
+            )),
+            str(next(iter(blocked_native_entries.values()), {}).get(
+                "blocking_reason", "No pending call has a durable native resume authorization"
+            )),
+            pending_calls=len(transaction.get("entries") or []),
+        )
+
+    mark_transaction(project_dir, "continuing")
 
     options = _options_from_recovery(project_dir.resolve(), saved)
     if action == "resume-native":
@@ -2532,7 +3196,96 @@ def _resume_companion_unlocked(
             result_llm=None,
             cancel_check=cancel_check,
         )
-    mark_transaction(project_dir, "complete")
+    if action == "resume-native":
+        # Calls submitted by the continuation can finish after an earlier
+        # source-order block has failed.  Classify their paid repair responses
+        # directly from durable state so none become orphan checkpoints.
+        finalized_repairs = _finalize_paid_translation_repairs(checkpoint_dir)
+        if finalized_repairs:
+            append_entries(project_dir, finalized_repairs)
+        latest = load_transaction(project_dir) or transaction
+        known = {
+            (
+                str(Path(str(item.get("ledger_path") or "")).resolve(strict=False)),
+                str(item.get("session_key") or ""),
+                str(item.get("segment_id") or ""),
+            )
+            for item in latest.get("entries") or []
+        }
+        discovered_entries: list[dict[str, Any]] = []
+        discovered_contexts: list[dict[str, Any]] = []
+        for path in _all_lane_ledger_paths(checkpoint_dir):
+            ledger = read_json(path)
+            supervision = dict(ledger.get("needs_supervision") or {})
+            segment_id = str(supervision.get("segment_id") or "")
+            session_key = f"{ledger.get('chapter_id')}:{ledger.get('lane')}"
+            identity = (str(path.resolve(strict=False)), session_key, segment_id)
+            if not segment_id or identity in known:
+                continue
+            context = dict(supervision.get("recovery_context") or {})
+            entry = {
+                "ledger_path": str(path),
+                "session_key": session_key,
+                "segment_id": segment_id,
+                "idempotency_key": str(context.get("idempotency_key") or ""),
+                "initial_generation": int(ledger.get("generation") or 1),
+                "target_generation": int(ledger.get("generation") or 1),
+            }
+            try:
+                discovered_contexts.append(_validate_native_resume_context(
+                    checkpoint_dir=checkpoint_dir,
+                    ledger_path=path,
+                    ledger=ledger,
+                    session_manager=manager,
+                ))
+            except ValueError as exc:
+                entry["blocking_reason"] = str(exc)
+            discovered_entries.append(entry)
+        if discovered_entries:
+            append_entries(
+                project_dir, discovered_entries,
+                native_resume_contexts=discovered_contexts,
+            )
+    if action == "resume-native":
+        # Supervision is cleared only after the recovered response has been
+        # durably validated and accepted into the lane ledger.
+        current_transaction = load_transaction(project_dir) or transaction
+        for index, entry in enumerate(current_transaction.get("entries") or []):
+            if entry.get("status") == "resolved":
+                continue
+            path = Path(str(entry["ledger_path"]))
+            if not path.is_file():
+                continue
+            ledger = read_json(path)
+            block = next((
+                item for item in ledger.get("blocks") or []
+                if str(item.get("segment_id") or "") == str(entry.get("segment_id") or "")
+            ), None)
+            if isinstance(block, dict) and block.get("state") == "accepted":
+                if str(
+                    (ledger.get("needs_supervision") or {}).get("segment_id") or ""
+                ) == str(entry.get("segment_id") or ""):
+                    clear_needs_supervision(path)
+                mark_entry(
+                    project_dir, index, status="resolved",
+                    accepted_chain_sha256=str(
+                        block.get("accepted_chain_sha256") or ""
+                    ),
+                    output_sha256=str(block.get("output_sha256") or ""),
+                )
+    # Re-scan after continuation: new submitted/unknown failures join this
+    # transaction on the next invocation and remain explicitly supervised.
+    final_transaction = load_transaction(project_dir) or transaction
+    all_resolved = all(
+        item.get("status") == "resolved"
+        for item in final_transaction.get("entries") or []
+    )
+    mark_transaction(
+        project_dir,
+        "complete" if all_resolved and (
+            not isinstance(result, dict) or bool(result.get("ok"))
+        ) else "continuation_failed",
+    )
     return result
 
 
@@ -2641,6 +3394,167 @@ def _validate_native_resume_context(
         "native_session_id_to_restore": fresh.native_session_id,
         "ledger_path": str(ledger_path),
     }
+
+
+def _reconstruct_unresolved_native_resume_contexts(
+    checkpoint_dir: Path,
+    *,
+    session_manager: Any,
+    excluded_keys: set[str],
+) -> list[dict[str, Any]]:
+    """Recover submitted calls even when the lane callback never ran."""
+    from arc_llm import read_recovery_context
+
+    recovered: list[dict[str, Any]] = []
+    progress_paths = sorted(checkpoint_dir.rglob("progress.jsonl"))
+    durable_checkpoints: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(checkpoint_dir.rglob("call-checkpoints/*.json")):
+        checkpoint = _read_checkpoint_json(path)
+        if not isinstance(checkpoint, dict):
+            continue
+        state = checkpoint.get("state")
+        if (
+            (
+                state in {"submitted", "resuming"}
+                or (state == "failed" and checkpoint.get("resumable"))
+            )
+            and checkpoint.get("submission_state") in {"submitted", "unknown"}
+        ):
+            durable_checkpoints.append((path, checkpoint))
+    for ledger_path in _all_lane_ledger_paths(checkpoint_dir):
+        ledger = read_json(ledger_path)
+        unresolved_ids = {
+            str(item.get("segment_id") or "")
+            for item in ledger.get("blocks") or []
+            if item.get("state") != "accepted"
+        }
+        if not unresolved_ids:
+            continue
+        session_key = f"{ledger.get('chapter_id')}:{ledger.get('lane')}"
+        ref = session_manager.get_existing(session_key)
+        if ref is None or not ref.native_session_id:
+            continue
+        generation = int(ledger.get("generation") or 0)
+        if generation != ref.generation:
+            continue
+        candidates: dict[str, tuple[Path, dict[str, Any]]] = {}
+        for checkpoint_path, checkpoint in durable_checkpoints:
+            logical = checkpoint.get("logical_identity")
+            recipe = checkpoint.get("request_recipe")
+            if not isinstance(logical, dict):
+                continue
+            key = str(logical.get("idempotency_key") or "")
+            if (
+                logical.get("session_key") != session_key
+                or logical.get("generation") != generation
+                or logical.get("provider") != ref.provider
+                or logical.get("model") != ref.model
+                or not key
+                or key in excluded_keys
+            ):
+                continue
+            candidates[key] = (checkpoint_path.parent.parent, {
+                "session_key": session_key,
+                "idempotency_key": key,
+                "generation": generation,
+                "provider": ref.provider,
+                "model": ref.model,
+                "runtime_fingerprint": (
+                    recipe.get("runtime_fingerprint")
+                    if isinstance(recipe, dict) else None
+                ),
+            })
+        for progress_path in progress_paths:
+            try:
+                lines = progress_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(event, dict) or event.get("session_key") != session_key:
+                    continue
+                key = str(event.get("idempotency_key") or "")
+                if (
+                    not key
+                    or key in excluded_keys
+                    or event.get("generation") != generation
+                ):
+                    continue
+                candidates[key] = (progress_path.parent, event)
+        for key, (artifact_dir, event) in sorted(candidates.items()):
+            checkpoint_path = (
+                artifact_dir / "call-checkpoints"
+                / f"idempotency-{hashlib.sha256(key.encode('utf-8')).hexdigest()}.json"
+            )
+            checkpoint = _read_checkpoint_json(checkpoint_path)
+            if not isinstance(checkpoint, dict):
+                continue
+            state = checkpoint.get("state")
+            if not (
+                state in {"submitted", "resuming"}
+                or (state == "failed" and checkpoint.get("resumable"))
+            ) or checkpoint.get("submission_state") not in {"submitted", "unknown"}:
+                continue
+            if any(
+                event.get(field) is not None and event.get(field) != expected
+                for field, expected in (
+                    ("provider", ref.provider),
+                    ("model", ref.model),
+                    ("runtime_fingerprint", ref.runtime_fingerprint),
+                )
+            ):
+                continue
+            matching_ids = [
+                segment_id for segment_id in unresolved_ids
+                if segment_id and segment_id in key
+            ]
+            if len(matching_ids) == 1:
+                segment_id = matching_ids[0]
+            elif len(unresolved_ids) == 1:
+                segment_id = next(iter(unresolved_ids))
+            else:
+                continue
+            fresh = read_recovery_context(
+                artifact_dir,
+                idempotency_key=key,
+                session_manager=session_manager,
+                session_key=session_key,
+            )
+            if (
+                fresh.checkpoint_path is None
+                or fresh.checkpoint_path.resolve(strict=False)
+                != checkpoint_path.resolve(strict=False)
+                or fresh.generation != generation
+                or fresh.provider != ref.provider
+                or fresh.model != ref.model
+                or fresh.runtime_fingerprint != ref.runtime_fingerprint
+            ):
+                continue
+            current_ledger = read_json(ledger_path)
+            if not current_ledger.get("needs_supervision"):
+                mark_needs_supervision(
+                    ledger_path,
+                    segment_id=segment_id,
+                    reason="submitted call discovered before lane progress was persisted",
+                    recovery_context=_recovery_context_json(fresh),
+                )
+            recovered.append({
+                "session_key": session_key,
+                "idempotency_key": key,
+                "provider": ref.provider,
+                "model": ref.model,
+                "runtime_fingerprint": ref.runtime_fingerprint,
+                "generation": ref.generation,
+                "native_session_id_to_restore": None,
+                "ledger_path": str(ledger_path),
+                "segment_id": segment_id,
+                "reconstructed_from_durable_state": True,
+            })
+            excluded_keys.add(key)
+    return recovered
 
 
 def _restore_native_session_id(session_manager: Any, validated: dict[str, Any], native_id: str) -> None:
@@ -3861,6 +4775,22 @@ def _seed_translation_coverage_draft(
     return path
 
 
+def _repair_call_crossed_submission_barrier(artifact_dir: Path) -> bool:
+    """Fail closed unless durable call state proves no provider submission."""
+    checkpoint_dir = artifact_dir / "call-checkpoints"
+    paths = sorted(checkpoint_dir.glob("*.json")) if checkpoint_dir.is_dir() else []
+    if not paths:
+        return False
+    for path in paths:
+        checkpoint = _read_checkpoint_json(path)
+        if (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("submission_state") != "not_submitted"
+        ):
+            return True
+    return False
+
+
 def _repair_translation_token_placement(
     segment: dict[str, Any],
     translation: dict[str, Any],
@@ -3998,10 +4928,17 @@ def _repair_translation_token_placement(
                 )
             value = raw_response
         elif status == "started":
-            raise RuntimeError(
-                f"translation token repair attempt already started for {segment_id}; "
-                "refusing another model call"
-            )
+            if _repair_call_crossed_submission_barrier(
+                artifact_dir / "retry-offset-1"
+            ):
+                raise RuntimeError(
+                    f"translation token repair attempt already started for {segment_id}; "
+                    "refusing another model call"
+                )
+            # The provider call checkpoint is durable before submission. Its
+            # absence (or explicit not-submitted state) proves that local
+            # preflight did not consume the bounded repair turn.
+            attempt = None
         else:
             raise RuntimeError(
                 f"translation token repair marker has invalid status {status!r} for {segment_id}"
@@ -4028,7 +4965,7 @@ def _repair_translation_token_placement(
             artifact_dir=artifact_dir / "retry-offset-1",
             call_label=f"companion-translation-{segment_id}-retry-offset-1",
             model_tier=TRANSLATION_RETRY_TIER,
-            allow_internet=False,
+            force_offline=True,
         )
         write_json(attempt_path, {
             **marker_base,
@@ -4037,16 +4974,24 @@ def _repair_translation_token_placement(
             "response_received_at": datetime.now(timezone.utc).isoformat(),
             "raw_response": value,
         })
-    repaired = _apply_translation_slot_repairs(
-        repair_input,
-        source_blocks,
-        value,
-        protected_names=protected_names,
-        allow_clause_rewrite=False,
-        primary_translation=None,
-        offset_only=True,
-    )
-    _validate_translation(segment, repaired, blocks_by_id, protected_names)
+    try:
+        repaired = _apply_translation_slot_repairs(
+            repair_input,
+            source_blocks,
+            value,
+            protected_names=protected_names,
+            allow_clause_rewrite=False,
+            primary_translation=None,
+            offset_only=True,
+        )
+        _validate_translation(segment, repaired, blocks_by_id, protected_names)
+    except RuntimeError as exc:
+        # The raw response is durably stored before this local application
+        # step.  It consumed the bounded provider turn, so invalid structure
+        # is a single-call supervision case, never permission to resend.
+        raise TranslationRepairNeedsSupervision(
+            segment_id=segment_id, marker_path=attempt_path, reason=str(exc),
+        ) from exc
     provenance = {
         "kind": "token-placement",
         "attempt": 1,
@@ -4274,7 +5219,7 @@ def _generate_translations(
                     artifact_dir=artifact_dir,
                     call_label=f"companion-translation-{segment_id}",
                     model_tier=TRANSLATION_TIER,
-                    allow_internet=True,
+                    force_offline=True,
                 )
                 draft = _translation_primary_draft_payload(
                     segment,
@@ -4367,10 +5312,16 @@ def _generate_translations(
                             )
                         coverage_response = raw_response
                     elif status == "started":
-                        raise RuntimeError(
-                            f"translation coverage repair attempt already started for {segment_id}; "
-                            "refusing another model call"
-                        )
+                        if _repair_call_crossed_submission_barrier(
+                            artifact_dir / "coverage-repair-1"
+                        ):
+                            raise RuntimeError(
+                                f"translation coverage repair attempt already started for {segment_id}; "
+                                "refusing another model call"
+                            )
+                        # A local crash before a durable provider submission is
+                        # safe to heal without consuming the bounded repair.
+                        attempt = None
                     else:
                         raise RuntimeError(
                             "translation coverage repair marker has invalid status "
@@ -4403,7 +5354,6 @@ def _generate_translations(
                             artifact_dir=artifact_dir / "coverage-repair-1",
                             call_label=f"companion-translation-{segment_id}-coverage-repair-1",
                             model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
-                            allow_internet=False,
                             force_offline=True,
                         )
                     except CompanionLLMCircuitOpen:
@@ -5244,7 +6194,12 @@ def _limit_llm_concurrency(
     *,
     cancel_check: Callable[[], bool] | None = None,
 ) -> Callable[..., dict[str, Any]]:
-    """Share one total call budget and stop queued work after an explicit batch abort."""
+    """Share one call budget without cancelling unrelated submitted calls.
+
+    A local/preflight failure opens the submission barrier for queued work only.
+    The provider-facing cancellation callback remains tied exclusively to the
+    caller's explicit cancellation signal, so already submitted calls drain.
+    """
     external_cancel_check = cancel_check
     permits = threading.BoundedSemaphore(max_concurrent_calls)
     tripped = threading.Event()
@@ -5273,7 +6228,7 @@ def _limit_llm_concurrency(
                 parent_cancel_check = kwargs.get("cancel_check")
 
                 def cancel_check() -> bool:
-                    return tripped.is_set() or bool(
+                    return bool(
                         callable(parent_cancel_check) and parent_cancel_check()
                     ) or bool(external_cancel_check is not None and external_cancel_check())
 
@@ -6089,6 +7044,50 @@ def _translation_repair_slot_ids(source_block: dict[str, Any]) -> list[str]:
     ]
 
 
+def _translation_token_slot_ids(source_block: dict[str, Any]) -> list[str]:
+    """Return token occurrence IDs used by an early v5 response variant."""
+    token_ids: list[str] = []
+    for token in _opaque_inline_tokens(source_block):
+        if not _OPAQUE_INLINE_PATTERN.fullmatch(token):
+            raise RuntimeError("source block has an invalid opaque token")
+        token_ids.append(token[len("[[ARC_INLINE:"):-2].rsplit(":", 1)[0])
+    return token_ids
+
+
+def _translation_slots_from_token_insertion_offsets(
+    raw_slots: list[dict[str, Any]], residue: str,
+) -> list[str]:
+    """Convert paid token-position responses into the canonical N+1 spans.
+
+    A short-lived response shape identified each source token and returned a
+    zero-width insertion offset instead of identifying the surrounding N+1
+    repair slots.  The conversion is deterministic and preserves every byte of
+    the already translated natural-language residue.
+    """
+    positions: list[int] = []
+    for item in raw_slots:
+        start = item.get("start_offset")
+        end = item.get("end_offset")
+        if type(start) is not int or type(end) is not int:
+            raise RuntimeError(
+                "translation token insertion repair returned non-integer offsets"
+            )
+        if start != end or start < 0 or start > len(residue):
+            raise RuntimeError(
+                "translation token insertion repair returned an invalid insertion point"
+            )
+        if positions and start < positions[-1]:
+            raise RuntimeError(
+                "translation token insertion repair changed source token order"
+            )
+        positions.append(start)
+    boundaries = [0, *positions, len(residue)]
+    return [
+        residue[boundaries[index]:boundaries[index + 1]]
+        for index in range(len(boundaries) - 1)
+    ]
+
+
 def _apply_translation_slot_repairs(
     previous_translation: dict[str, Any],
     source_blocks: list[dict[str, Any]],
@@ -6149,7 +7148,7 @@ def _apply_translation_slot_repair_block(
     actual_slot_ids = [
         str(item.get("slot_id") or "") for item in raw_slots if isinstance(item, dict)
     ]
-    if actual_slot_ids != expected_slot_ids or len(actual_slot_ids) != len(raw_slots):
+    if len(actual_slot_ids) != len(raw_slots):
         raise RuntimeError("translation slot repair changed slot coverage or order")
     previous_blocks = previous_translation.get("blocks") if isinstance(previous_translation, dict) else None
     if not isinstance(previous_blocks, list):
@@ -6163,7 +7162,12 @@ def _apply_translation_slot_repair_block(
         raise RuntimeError("translation slot repair cannot find the prior failed block")
     previous_text = str(previous_blocks[failed_index].get("text") or "")
     residue = _translation_natural_residue(previous_text)
-    if all("start_offset" in item and "end_offset" in item for item in raw_slots):
+    token_insertion_shape = actual_slot_ids == _translation_token_slot_ids(source_block)
+    if token_insertion_shape:
+        slots = _translation_slots_from_token_insertion_offsets(raw_slots, residue)
+    elif actual_slot_ids != expected_slot_ids:
+        raise RuntimeError("translation slot repair changed slot coverage or order")
+    elif all("start_offset" in item and "end_offset" in item for item in raw_slots):
         spans = [
             (item.get("start_offset"), item.get("end_offset")) for item in raw_slots
         ]

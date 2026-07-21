@@ -11,13 +11,12 @@ or reimplementing paper/domain workflows.
 
 ## Preflight Gate
 
-Before any ARC CLI call, decide whether the request is a managed ARC
-workflow run or a direct ARC tool task. Also determine whether the current
-request came directly from a human who explicitly named ARC, rather than from
-another agent or from a human request that did not name ARC. Use the message
-provenance exposed by the host; do not classify quoted or forwarded text as a
-direct human invocation. If provenance is unavailable or ambiguous, treat the
-request as not mode-eligible and continue in `auto` without asking.
+Before any ARC CLI call, decide whether the request is a managed ARC workflow
+run or a direct ARC tool task. All requests default to `automation_level: auto`;
+never ask the user to choose an execution mode at startup. Use
+`interactive` only when the user explicitly asks for manual, step-by-step, or
+major-step review or confirmation. A request to discuss before running creates
+a pre-run pause rather than a third mode.
 
 Managed workflow runs follow `workflows/domain.md`, `workflows/ideas.md`,
 `workflows/check.md`, `workflows/plan.md`, `workflows/calculate.md`, or
@@ -25,30 +24,23 @@ Managed workflow runs follow `workflows/domain.md`, `workflows/ideas.md`,
 create project-local workflow artifacts such as domain references, ranked
 ideas, work notes, note-check records, calculation records, reports, rankings,
 recommendations, research directions, or follow-up project directories. For
-these, read `rules/interaction.md`. Ask for an automation mode only when the
-managed workflow was invoked directly by a human whose current prompt
-explicitly names ARC. In that case, obtain the mode before calling ARC
-paper/domain/LLM tools; do not perform preliminary calls such as `get_metadata`,
-`get_citers`, `llm_get_summary`, `domain_get_summary`, seed resolution, or
-project-directory derivation before the mode choice. There is no "lightweight
-recommendation" exception for a mode-eligible managed workflow.
-
-For every other managed invocation, do not ask for an automation mode. Use
-`auto` as the execution mode and perform exactly the workflow scope requested
+these, read `rules/interaction.md`. Use the latest explicit user steer as the
+current automation level through the end of the managed run or until another
+explicit steer changes it. Perform exactly the workflow scope requested
 by the caller. Finish at that scope boundary: an automatic domain request does
 not authorize idea generation, and automatic idea generation does not
 authorize planning or calculation. Required prerequisites named by the owning
 workflow may still run, but they do not expand the requested outcome.
 
-Direct ARC tool tasks are exempt from the automation mode gate. These include
+Direct ARC tool tasks use the same default-auto and explicit-review policy. These include
 bounded paper facts such as title, authors, abstract, citation count, section
 text, or equation context, plus user-directed tool orchestration such as
 collecting citers or references, filtering papers by date, generating paper
 summaries or summary batches, translating named reports, or combining those
 steps into a non-evaluative paper-data output. Direct tasks must not produce
 recommendations, research directions, scientific rankings, ARC reports, or
-project-local workflow artifacts; route those through the managed workflow
-gate. Run direct tasks automatically with safe defaults unless the user
+project-local workflow artifacts; route those through the owning managed
+workflow. Run direct tasks automatically with safe defaults unless the user
 explicitly asks to review or confirm steps. Example: `use arc to download
 papers that cited 0911.3380 since 2024 and create a full summary of these
 papers` is direct ARC tool orchestration, not a managed workflow mode prompt.
@@ -71,8 +63,8 @@ Read the relevant reference before calling ARC tools. These reads are required,
 not optional.
 
 - User choices, automation mode, and confirmation behavior: read
-  `rules/interaction.md`. Any ARC user question must use the
-  selection tool; do not wait for typed input.
+  `rules/interaction.md`. Use its Selection Protocol only for a real business
+  choice; mandatory safety or scientific gates may require a direct question.
 - Scientific claims, gap scoring, automated workflow decisions, warning
   behavior, or robustness-sensitive execution: read
   `rules/integrity.md`.
@@ -140,26 +132,17 @@ cancel any job because it is slow or time consuming.
 
 ### Phase 1: Setup
 
-Step 1: Decide the automation level and requested scope.
+Step 1: Set the automation level and requested scope.
 Use this step only for managed ARC workflow runs. For direct ARC tool tasks,
 skip the Workflow section and use the relevant manuals and CLI tools
 directly.
 
-For managed workflows invoked directly by a human whose current prompt
-explicitly names ARC, use an explicit user choice. If that human asks for
-automatic or non-interactive work, use `auto`. If they ask to review or confirm
-steps, use `interactive`. If they did not specify `auto` or `interactive`, do
-not infer the mode. Use the host's selection/menu tool, following
-`rules/interaction.md`, with these options: `Run automatically (Recommended)`,
-`Confirm major steps`, and `Discuss before running`. If no suitable
-selection/menu tool is available, use the typed fallback from
-`rules/interaction.md`. Do not treat `continue`, `resume`, or a bare approval
-to proceed as `auto`.
-
-For agent-invoked managed workflows and human prompts that do not explicitly
-name ARC, set `automation_level` to `auto` without asking. Preserve the
-caller's requested workflow boundary; `auto` suppresses routine confirmation
-questions but never opts the caller into downstream workflows.
+Default to `auto` without asking. If the user explicitly requests manual,
+step-by-step, staged review, or confirmation at key steps, use `interactive`.
+Follow runtime steering, one-shot checkpoints, and hard-gate rules in
+`rules/interaction.md`. Preserve the caller's requested workflow boundary;
+`auto` suppresses routine confirmation questions but never opts the caller
+into downstream workflows.
 
 Step 2: Extract `<user-intent>`.
 Keep the research/scientific request. Remove operational instructions such as
@@ -226,6 +209,11 @@ for example a short intent slug plus UTC timestamp. Set `skill_dir` to the ARC
 skill directory and `skill_workflow_json_dir` to
 `<skill-dir>/workflows/json`.
 
+When resuming a managed run, reconcile `automation_level` with the latest
+explicit user steer and update the existing `context.json` in place. Do the
+same after a runtime switch. Direct tool tasks do not create a state file solely
+for this field; follow the latest explicit instruction in the current session.
+
 ### Phase 2: Route Selection
 
 Resolve the user's intent and classify it into one of the five cases below.
@@ -260,7 +248,8 @@ when requested coverage is complete and no triggered rough/pending item remains.
 
 Case 4: Calculate from an explicit idea.
 If the idea is not explicit enough, first complete Case 1 and Case 2, then ask
-the user to select one concrete idea.
+the user to select one concrete idea only in `interactive` mode. In `auto`
+mode, use ranked idea #1 without asking.
 If the idea is explicit enough:
 Step 1: Read and execute `workflows/plan.md`. It writes or updates
 `<project-dir>/work-note.md` and an immutable version under

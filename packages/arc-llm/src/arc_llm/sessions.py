@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import shutil
-import socket
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -13,6 +13,7 @@ from threading import Lock, RLock, get_ident
 from typing import Any, Iterator, Mapping, Sequence
 
 from .schema_cache import canonical_json, sha256_text
+from .runtime_manifest import runtime_manifest, runtime_manifest_fingerprint
 
 
 SessionPolicy = str
@@ -116,6 +117,73 @@ class LLMSessionManager:
                 self._reload_sessions_from_disk_locked()
                 return self._sessions.get(key)
 
+    def migrate_legacy_runtime_fingerprint(
+        self, key: str, *, expected_legacy_fingerprint: str,
+        runtime_fingerprint: str, provider: str, model: str | None,
+    ) -> LLMSessionRef | None:
+        """Rebind a generation only when its recorded v0 recipe hash is proven."""
+        with self.lock(key):
+            with self._sessions_store_lock():
+                with self._state_lock:
+                    self._reload_sessions_from_disk_locked()
+                    ref = self._sessions.get(key)
+                    if ref is None or ref.runtime_fingerprint == runtime_fingerprint:
+                        return ref
+                    if (
+                        ref.provider != provider or ref.model != model
+                        or ref.runtime_fingerprint != expected_legacy_fingerprint
+                    ):
+                        return None
+                    migrated = LLMSessionRef(
+                        key=ref.key, provider=ref.provider, model=ref.model,
+                        runtime_fingerprint=runtime_fingerprint,
+                        native_session_id=ref.native_session_id, name=ref.name,
+                        metadata={
+                            **dict(ref.metadata),
+                            "arc_runtime_fingerprint_migrated_from": ref.runtime_fingerprint,
+                            "arc_runtime_manifest_version": "arc.llm.runtime_manifest.v1",
+                        },
+                        generation=ref.generation,
+                    )
+                    self._sessions[key] = migrated
+                    self._write_sessions()
+                    return migrated
+
+    def migrate_validated_runtime_identity(
+        self, key: str, *, identity: Mapping[str, Any],
+        runtime_fingerprint: str,
+    ) -> LLMSessionRef | None:
+        """Migrate only an externally validated native-resume session identity."""
+        with self.lock(key):
+            with self._sessions_store_lock():
+                with self._state_lock:
+                    self._reload_sessions_from_disk_locked()
+                    ref = self._sessions.get(key)
+                    if ref is None:
+                        return None
+                    expected = {
+                        "session_key": ref.key, "provider": ref.provider,
+                        "model": ref.model, "generation": ref.generation,
+                        "native_session_id": ref.native_session_id,
+                        "recorded_fp": ref.runtime_fingerprint,
+                    }
+                    if dict(identity) != expected:
+                        return None
+                    migrated = LLMSessionRef(
+                        key=ref.key, provider=ref.provider, model=ref.model,
+                        runtime_fingerprint=runtime_fingerprint,
+                        native_session_id=ref.native_session_id, name=ref.name,
+                        metadata={
+                            **dict(ref.metadata),
+                            "arc_runtime_fingerprint_migrated_from": ref.runtime_fingerprint,
+                            "arc_runtime_manifest_version": "arc.llm.runtime_manifest.v1",
+                            "arc_runtime_identity_transaction_validated": True,
+                        }, generation=ref.generation,
+                    )
+                    self._sessions[key] = migrated
+                    self._write_sessions()
+                    return migrated
+
     def reload(self) -> None:
         with self._sessions_store_lock():
             with self._state_lock:
@@ -185,11 +253,17 @@ class LLMSessionManager:
                 return True
 
     def turn_count(self, key: str, *, generation: int | None = None) -> int:
+        return len(self.turn_records(key, generation=generation))
+
+    def turn_records(
+        self, key: str, *, generation: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return durable, receipt-reconciled turns for restart reconstruction."""
         with self._calls_store_lock():
             try:
                 lines = self.calls_path.read_text(encoding="utf-8").splitlines()
             except OSError:
-                return 0
+                lines = []
         records: list[dict[str, Any]] = []
         for line in lines:
             try:
@@ -215,7 +289,7 @@ class LLMSessionManager:
                     seen.add(idem)
         if generation is not None:
             records = [record for record in records if int(record.get("generation") or 1) == generation]
-        return len(records)
+        return records
 
     def rotate(
         self,
@@ -429,11 +503,50 @@ def runtime_fingerprint(
     env: Mapping[str, str] | None,
     process_chain: Sequence[str] | None = None,
 ) -> str:
-    env = os.environ if env is None and provider == "kimi-code-cli" else (env or {})
+    del process_chain
+    return runtime_manifest_fingerprint(runtime_manifest(
+        provider=provider, model=model, model_tier=model_tier, env=env,
+    ))
+
+
+def legacy_runtime_fingerprint(
+    *, provider: str, model: str | None, model_tier: str | None,
+    env: Mapping[str, str] | None,
+    process_chain: Sequence[str] | None = None,
+) -> str:
+    """Reproduce the pre-manifest hash solely for proof-gated migration."""
+    values = os.environ if env is None and provider == "kimi-code-cli" else (env or {})
     interesting = {
-        key: env.get(key)
-        for key in sorted(
-            {
+        key: values.get(key)
+        for key in sorted(_legacy_runtime_fingerprint_inputs())
+        if values.get(key) is not None
+        and not (
+            (key == "ARC_PAPER_CLI_ACCESS" and values.get(key) == "none")
+            or (key == "ARC_LLM_INHERIT_HOST_TOOLS" and values.get(key) == "false")
+            or (key == "ARC_LLM_HOST_TOOLS_RISK" and values.get(key) == "none")
+        )
+    }
+    if values.get("ARC_PAPER_CLI_ACCESS") == "none":
+        interesting.pop("ARC_LLM_WORKER_CONTEXT", None)
+        for key in (
+            "ARC_PAPER_CACHE", "ARC_PAPER_WORKER_BASE_CACHE",
+            "ARC_PAPER_WORKER_SESSION_DIR", "ARC_PAPER_WORKER_TOMBSTONE_DIR",
+            "ARC_PAPER_WORKER_SESSION_ID",
+        ):
+            interesting.pop(key, None)
+    payload: dict[str, Any] = {
+        "provider": provider, "model": model, "model_tier": model_tier,
+        "env": interesting, "file_hashes": _runtime_file_hashes(values),
+        "process_chain": list(process_chain or []),
+    }
+    if provider_runtime := _provider_runtime_values(provider, values):
+        payload["provider_runtime"] = provider_runtime
+    return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _legacy_runtime_fingerprint_inputs() -> set[str]:
+    """Kept as a source-level inventory for downstream compatibility audits."""
+    return {
                 "ARC_CODEX_SANDBOX",
                 "ARC_CODEX_CONFIG",
                 "ARC_CODEX_CONFIG_JSON",
@@ -480,36 +593,7 @@ def runtime_fingerprint(
                 "ARC_CLAUDE_BARE",
                 "ARC_CLAUDE_EXCLUDE_DYNAMIC_SYSTEM_PROMPT_SECTIONS",
                 "ARC_CLAUDE_ALLOW_INTERNET",
-            }
-        )
-        if env.get(key) is not None
-        and not (
-            (key == "ARC_PAPER_CLI_ACCESS" and env.get(key) == "none")
-            or (key == "ARC_LLM_INHERIT_HOST_TOOLS" and env.get(key) == "false")
-            or (key == "ARC_LLM_HOST_TOOLS_RISK" and env.get(key) == "none")
-        )
     }
-    if env.get("ARC_PAPER_CLI_ACCESS") == "none":
-        interesting.pop("ARC_LLM_WORKER_CONTEXT", None)
-        for key in (
-            "ARC_PAPER_CACHE",
-            "ARC_PAPER_WORKER_BASE_CACHE",
-            "ARC_PAPER_WORKER_SESSION_DIR",
-            "ARC_PAPER_WORKER_TOMBSTONE_DIR",
-            "ARC_PAPER_WORKER_SESSION_ID",
-        ):
-            interesting.pop(key, None)
-    payload = {
-        "provider": provider,
-        "model": model,
-        "model_tier": model_tier,
-        "env": interesting,
-        "file_hashes": _runtime_file_hashes(env),
-        "process_chain": list(process_chain or []),
-    }
-    if provider_runtime := _provider_runtime_values(provider, env):
-        payload["provider_runtime"] = provider_runtime
-    return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
 def _provider_runtime_values(provider: str, env: Mapping[str, str]) -> dict[str, Any]:
@@ -643,13 +727,6 @@ def _safe_lock_name(key: str) -> str:
     return sha256_text(key)[:32]
 
 
-def _hostname() -> str:
-    try:
-        return socket.gethostname()
-    except OSError:
-        return ""
-
-
 def _process_lock(lock_path: Path) -> RLock:
     resolved = lock_path.resolve()
     with _PROCESS_LOCKS_GUARD:
@@ -682,144 +759,40 @@ def _file_lock(lock_path: Path) -> Iterator[None]:
                 else:
                     del _HELD_FILE_LOCKS[held_key]
         return
-    payload = {
-        "pid": os.getpid(),
-        "thread_id": get_ident(),
-        "host": _hostname(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    if process_start_id := _process_start_identity(os.getpid()):
-        payload["process_start_id"] = process_start_id
     timeout = _lock_timeout_seconds()
     started = time.monotonic()
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            break
-        except FileExistsError:
-            if _recover_dead_process_lock(lock_path):
-                continue
-            if timeout is not None:
-                elapsed = time.monotonic() - started
-                if elapsed >= timeout:
-                    raise TimeoutError(_lock_timeout_message(lock_path, timeout))
-                time.sleep(min(0.01, max(timeout - elapsed, 0.001)))
-            else:
-                time.sleep(0.01)
+    handle = lock_path.open("a+b")
+    if os.name == "nt":
+        handle.seek(0)
+        if not handle.read(1):
+            handle.write(b"0")
+            handle.flush()
     try:
+        while not _try_advisory_lock(handle):
+            if timeout is not None and time.monotonic() - started >= timeout:
+                raise TimeoutError(
+                    f"timed out after {timeout:g}s waiting for LLM session lock {lock_path}"
+                )
+            time.sleep(0.01)
         with _HELD_FILE_LOCKS_GUARD:
             _HELD_FILE_LOCKS[held_key] = 1
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
         yield
     finally:
-        unlink = False
         with _HELD_FILE_LOCKS_GUARD:
             remaining = _HELD_FILE_LOCKS.get(held_key, 1) - 1
             if remaining:
                 _HELD_FILE_LOCKS[held_key] = remaining
             else:
                 _HELD_FILE_LOCKS.pop(held_key, None)
-                unlink = True
-        if unlink:
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
-
-
-def _recover_dead_process_lock(lock_path: Path) -> bool:
-    try:
-        handle = lock_path.open("r+b")
-    except OSError:
-        return False
-    try:
-        if not _try_lock_recovery_handle(handle):
-            return False
-        try:
-            owner_stat = os.fstat(handle.fileno())
-            handle.seek(0)
-            payload = json.loads(handle.read().decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return False
-        if not isinstance(payload, dict):
-            return False
-        if payload.get("host") != _hostname():
-            return False
-        pid = payload.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            return False
-        stale = False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            stale = True
-        except PermissionError:
-            return False
-        if not stale:
-            current_start_id, process_state = _process_identity(pid)
-            recorded_start_id = payload.get("process_start_id")
-            if (
-                isinstance(recorded_start_id, str)
-                and recorded_start_id
-                and current_start_id is not None
-                and recorded_start_id != current_start_id
-            ):
-                stale = True
-            elif process_state in {"Z", "X", "x"}:
-                # A zombie has exited and cannot still own application state,
-                # even though kill(pid, 0) reports that its PID exists.
-                stale = True
-        if not stale:
-            return False
-        try:
-            path_stat = lock_path.stat()
-            if (path_stat.st_dev, path_stat.st_ino) != (owner_stat.st_dev, owner_stat.st_ino):
-                return False
-            lock_path.unlink()
-            return True
-        except OSError:
-            return False
-    finally:
-        _unlock_recovery_handle(handle)
+        _unlock_advisory_lock(handle)
         handle.close()
 
 
-def _process_start_identity(pid: int) -> str | None:
-    identity, _state = _process_identity(pid)
-    return identity
-
-
-def _process_identity(pid: int) -> tuple[str | None, str | None]:
-    """Return a process-start identity and state when the host exposes them."""
-
-    try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
-            encoding="utf-8"
-        ).strip()
-    except OSError:
-        return None, None
-    close = stat_text.rfind(")")
-    if close < 0:
-        return None, None
-    fields = stat_text[close + 1 :].split()
-    if len(fields) <= 19 or not boot_id:
-        return None, fields[0] if fields else None
-    return f"procfs:{boot_id}:{fields[19]}", fields[0]
-
-
-def _try_lock_recovery_handle(handle: Any) -> bool:
+def _try_advisory_lock(handle: Any) -> bool:
     try:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
-            if not handle.read(1):
-                return False
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
@@ -827,11 +800,15 @@ def _try_lock_recovery_handle(handle: Any) -> bool:
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    except (BlockingIOError, OSError):
+    except BlockingIOError:
         return False
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            return False
+        raise
 
 
-def _unlock_recovery_handle(handle: Any) -> None:
+def _unlock_advisory_lock(handle: Any) -> None:
     try:
         if os.name == "nt":
             import msvcrt
@@ -857,19 +834,6 @@ def _lock_timeout_seconds() -> float | None:
     if value <= 0:
         return None
     return value
-
-
-def _lock_timeout_message(lock_path: Path, timeout: float) -> str:
-    try:
-        owner = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        owner = {}
-    owner_bits = []
-    for key in ("host", "pid", "process_start_id", "thread_id", "created_at"):
-        if owner.get(key) is not None:
-            owner_bits.append(f"{key}={owner[key]}")
-    owner_text = ", ".join(owner_bits) if owner_bits else "owner=unknown"
-    return f"timed out after {timeout:g}s waiting for LLM session lock {lock_path} ({owner_text})"
 
 
 def _append_jsonl(path: Path, item: Any) -> None:

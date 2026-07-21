@@ -74,6 +74,39 @@ def test_reconciliation_fails_when_alignment_is_ambiguous() -> None:
         reconcile_headings_to_pages(headings, ["Introduction", "Introduction"])
 
 
+def test_reconciliation_prefers_unique_text_anchor_over_equation_page_hint() -> None:
+    headings = [
+        {
+            "section_id": "s1",
+            "title": "First Principle",
+            "text": "First Principle\nA distinctive opening argument begins the section.",
+            "pdf_page_start": 2,
+        },
+        {
+            "section_id": "s2",
+            "title": "Second Principle",
+            "text": "Second Principle\nA separate conclusion begins the next section.",
+            "pdf_page_start": 2,
+        },
+    ]
+    pages = [
+        "First Principle\nA distinctive opening argument begins the section.",
+        "Second Principle\nA separate conclusion begins the next section.\nEquations",
+    ]
+
+    anchors = reconcile_headings_to_pages(headings, pages)
+
+    assert [item["pdf_page_start"] for item in anchors] == [1, 2]
+
+
+def test_reconciliation_uses_equation_page_hint_to_disambiguate_running_heading() -> None:
+    headings = [{"section_id": "s1", "title": "Introduction", "pdf_page_start": 2}]
+
+    anchors = reconcile_headings_to_pages(headings, ["Introduction", "Introduction"])
+
+    assert anchors[0]["pdf_page_start"] == 2
+
+
 def test_block_reconciliation_uses_text_fingerprints_and_monotonic_order() -> None:
     blocks = [
         {"block_id": "h1", "kind": "heading", "section_id": "s1", "text": "Introduction"},
@@ -93,6 +126,30 @@ def test_block_reconciliation_uses_text_fingerprints_and_monotonic_order() -> No
     anchors = reconcile_blocks_to_pages(blocks, pages, section_anchors=sections)
 
     assert [item["pdf_page_start"] for item in anchors] == [1, 1, 2, 2]
+
+
+def test_block_reconciliation_ignores_equation_anchor_outside_section() -> None:
+    blocks = [
+        {
+            "block_id": "eq1",
+            "source_id": "eq1",
+            "kind": "equation",
+            "section_id": "s1",
+            "text": "alpha beta gamma delta",
+        }
+    ]
+    sections = [{"section_id": "s1", "pdf_page_start": 1, "pdf_page_end": 1}]
+    equations = [{"id": "eq1", "pdf_page": 2}]
+
+    anchors = reconcile_blocks_to_pages(
+        blocks,
+        ["alpha beta gamma delta", "unrelated material"],
+        section_anchors=sections,
+        equations=equations,
+    )
+
+    assert anchors[0]["pdf_page_start"] == 1
+    assert anchors[0]["alignment_method"] == "text_fingerprint"
 
 
 def test_block_reconciliation_fails_for_repeated_text_across_section_pages() -> None:

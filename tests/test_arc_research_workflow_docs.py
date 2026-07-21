@@ -42,7 +42,7 @@ def test_arc_skill_routes_check_and_calculation_workflows() -> None:
     assert "work-note.md" in text
 
 
-def test_arc_skill_has_preflight_gate_for_managed_workflows() -> None:
+def test_arc_skill_defaults_managed_workflows_to_auto_without_startup_menu() -> None:
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
     text_flat = " ".join(text.split())
 
@@ -52,8 +52,9 @@ def test_arc_skill_has_preflight_gate_for_managed_workflows() -> None:
     assert "domain references" in text
     assert "ranked ideas" in text_flat
     assert "recommendations, research directions" in text_flat
-    assert "There is no \"lightweight recommendation\" exception for a mode-eligible managed workflow." in text_flat
-    assert "Direct ARC tool tasks are exempt from the automation mode gate" in text_flat
+    assert "All requests default to `automation_level: auto`" in text_flat
+    assert "never ask the user to choose an execution mode at startup" in text_flat
+    assert "Use `interactive` only when the user explicitly asks" in text_flat
     assert "collecting citers or references" in text_flat
     assert "generating paper summaries or summary batches" in text_flat
     assert "non-evaluative paper-data output" in text_flat
@@ -61,8 +62,10 @@ def test_arc_skill_has_preflight_gate_for_managed_workflows() -> None:
     assert "ARC reports, or project-local workflow artifacts" in text_flat
     assert "download papers that cited 0911.3380 since 2024" in text_flat
     assert "direct ARC tool orchestration" in text_flat
-    assert "get_metadata" in text
-    assert "domain_get_summary" in text
+    assert "mode-eligible" not in text
+    assert "provenance exposed by the host" not in text
+    assert "Run automatically (Recommended)" not in text
+    assert "Confirm major steps" not in text
     assert text.index("## Preflight Gate") < text.index("## Required References")
 
 
@@ -281,50 +284,76 @@ def test_interaction_rules_define_portable_selection_menu() -> None:
     assert "`(Recommended)`" in text
 
 
-def test_interaction_rules_define_automation_mode_gate_examples() -> None:
+def test_interaction_rules_define_default_auto_and_explicit_interactive() -> None:
     text = (SKILL / "rules/interaction.md").read_text(encoding="utf-8")
     lower = text.lower()
     lower_flat = " ".join(lower.split())
 
-    assert "## Automation Mode Gate" in text
+    assert "## Automation Policy" in text
     text_flat = " ".join(text.split())
-    assert "Do not gather \"just context\"" in text_flat
-    assert "managed ARC workflow run" in text_flat
-    assert "Direct ARC tool tasks do not need an automation mode" in text_flat
-    assert "recommendations, research directions, scientific rankings, or ARC reports" in text_flat
+    assert "Default to `automation_level: auto`" in text_flat
+    assert "do not ask an execution-mode question at startup" in text_flat
+    assert "manual, step-by-step, staged review, or confirmation at key steps" in text_flat
+    assert "Direct ARC tool tasks default to automatic execution" in text_flat
+    assert "recommendations, research directions, scientific rankings, ARC reports" in text_flat
     assert "non-evaluative paper-data outputs" in text_flat
     assert "Direct tasks must not produce" in text_flat
     assert "recommend research directions" in text
-    assert "suggest ideas" in text
+    assert "suggest ideas step by step" in text
     assert "what is the title and abstract" in text
     assert "direct paper lookup allowed" in text
     assert "download papers that cited 0911.3380 since 2024" in text_flat
     assert "direct tool orchestration allowed" in text_flat
     assert "do not include list numbering inside option labels" in lower_flat
-    assert "Run automatically (Recommended)" in text
-    assert "Confirm major steps" in text
-    assert "Discuss before running" in text
+    assert "Run automatically (Recommended)" not in text
+    assert "Confirm major steps" not in text
+    assert "Discuss before running" not in text
 
 
-def test_automation_mode_gate_depends_on_direct_human_arc_invocation() -> None:
+def test_runtime_automation_steering_semantics_are_explicit() -> None:
     skill = " ".join((SKILL / "SKILL.md").read_text(encoding="utf-8").split())
     interaction = " ".join(
         (SKILL / "rules/interaction.md").read_text(encoding="utf-8").split()
     )
 
-    assert "directly by a human whose current prompt explicitly names ARC" in skill
-    assert "Ask for an automation mode only when both conditions are true" in interaction
-    assert "directly from a human whose prompt explicitly names ARC" in interaction
-    assert "Quoted, forwarded, or delegated text does not count" in interaction
-    assert "does not expose reliable provenance" in interaction
-    assert "provenance is unavailable or ambiguous" in skill
-    assert "For an agent-invoked managed workflow" in interaction
-    assert "a human prompt that does not explicitly name ARC" in interaction
-    assert "do not ask for a mode" in interaction
-    assert "set the execution mode to `auto`" in interaction
-    assert "Agent-delegated request" in interaction
-    assert "Direct human prompt" in interaction
-    assert "without naming ARC: do not ask for mode" in interaction
+    assert "latest explicit steer" in interaction
+    assert "persists until the managed run ends" in interaction
+    assert "adds one checkpoint only" in interaction
+    assert "`continue`, `resume`, or approval at one checkpoint" in interaction
+    assert "does not change the automation level" in interaction
+    assert "next safe, controllable boundary" in interaction
+    assert "Do not cancel a provider call, CLI command, or background job already submitted" in interaction
+    assert "also approves that checkpoint and continues" in interaction
+    assert "update that field in place after a runtime switch" in interaction
+    assert "Direct ARC tool tasks do not create an extra state file" in interaction
+    assert "provenance exposed by the host" not in skill
+    assert "explicitly names ARC" not in interaction
+
+
+def test_runtime_steering_preserves_hard_gates_and_major_milestones() -> None:
+    interaction = " ".join(
+        (SKILL / "rules/interaction.md").read_text(encoding="utf-8").split()
+    )
+
+    for phrase in [
+        "authorization requirements",
+        "destructive action review",
+        "duplicate-charge risk",
+        "unresolved scientific ambiguity",
+        "`Human expert question:`",
+        "error recovery",
+        "after domain artifacts and the manifest are complete",
+        "after the top three",
+        "after main-agent preflight",
+        "after the work note passes internal review",
+        "after each accepted step or coherent chunk",
+        "`--stop-after-first-chapter`",
+        "Direct tool orchestration pauses only between major",
+    ]:
+        assert phrase in interaction
+
+    assert "Use this protocol for real business choices" in interaction
+    assert "Do not use it to choose an automation level" in interaction
 
 
 def test_automatic_workflows_preserve_requested_scope() -> None:
@@ -335,14 +364,15 @@ def test_automatic_workflows_preserve_requested_scope() -> None:
     domain = " ".join((WF / "domain.md").read_text(encoding="utf-8").split())
     ideas = " ".join((WF / "ideas.md").read_text(encoding="utf-8").split())
 
-    assert "perform exactly the workflow scope requested by the caller" in skill
-    assert "never opts the caller into downstream workflows" in skill
-    assert "it does not authorize a downstream workflow" in interaction
+    assert "Perform exactly the workflow scope requested" in skill
+    assert "does not authorize a downstream workflow" in interaction
     assert "stop after domain construction" in interaction
     assert "stop after ranked ideas" in interaction
     assert "`auto` does not authorize idea generation" in domain
-    assert "`auto` does not authorize either a selection question or a move to calculation" in ideas
+    assert "`auto` does not authorize a move to calculation outside that scope" in ideas
     assert "proceed with ranked idea #1 in `auto` mode without asking" in ideas
+    assert "In `auto` mode, use ranked idea #1 without asking" in skill
+    assert "only in `interactive` mode" in skill
 
 
 def test_workflow_docs_stay_human_readable() -> None:
@@ -860,10 +890,12 @@ def test_ideas_workflow_points_to_active_runner_without_global_review() -> None:
 
 def test_ideas_workflow_requires_context_and_runner_artifacts() -> None:
     text = (WF / "ideas.md").read_text(encoding="utf-8")
+    text_flat = " ".join(text.split())
 
     assert "If `<project-dir>/context.json` is missing" in text
-    assert "explicit `automation_level`" in text
-    assert "return to `SKILL.md` Phase 1 Step 1" in text
+    assert "lacks `automation_level`" in text
+    assert "initialize that field to `auto` in place" in text_flat
+    assert "without asking an execution-mode question" in text_flat
     assert "Do not synthesize ideas manually" in text
     assert "Final ranked ideas must come from `ideas_runner.py` artifacts" in text
 

@@ -59,8 +59,9 @@ malformed equations, or target/source mapping problems.
 
 Step 2: Record these as preflight findings, not verified results.
 
-Step 3: In `interactive` mode, pause after preflight and ask the user to review
-obvious issues. In `auto` mode, continue after recording findings.
+Step 3: In `interactive` mode, pause after preflight, before writing the
+planning handoff, and ask the user to review obvious issues. In `auto` mode,
+continue after recording findings.
 
 ## Phase 3: Write Planning Handoff
 

@@ -19,6 +19,11 @@ from .failure_classification import classify_provider_diagnostic, disposition_er
 from .host import HostDetection, ProviderSelection, detect_host, select_llm_provider
 from .model import ModelTierError, resolve_model
 from .recovery_context import LLMRecoveryContext, read_recovery_context
+from .runtime_manifest import (
+    RUNTIME_MANIFEST_VERSION,
+    runtime_manifest,
+    runtime_manifest_fingerprint,
+)
 from .providers.base import (
     LLMAbortScope,
     LLMFailureCategory,
@@ -66,6 +71,7 @@ __all__ = [
     "LLMSafetyController",
     "LLMSubmissionState",
     "LLMWorkerError",
+    "RUNTIME_MANIFEST_VERSION",
     "ModelTierError",
     "MAX_EVIDENCE_ROUNDS",
     "ProviderSelection",
@@ -82,6 +88,8 @@ __all__ = [
     "resolve_evidence_round",
     "resolve_model",
     "read_recovery_context",
+    "runtime_manifest",
+    "runtime_manifest_fingerprint",
     "run_proposers_reviewer_batch",
     "run_proposers_reviewer_bench",
     "run_json",

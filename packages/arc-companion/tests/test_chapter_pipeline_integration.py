@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import os
 import sys
 import threading
 
 import pytest
 
 import arc_companion.pipeline as pipeline
+from arc_companion.chapter_scheduler import run_chapter_pipeline
 from arc_companion.ledger import initialize_lane_ledger, mark_needs_supervision
 from arc_companion.pipeline import BuildOptions, build_companion
 from arc_companion.source import SourceBundle
@@ -27,7 +29,6 @@ def test_reader_final_checkpoint_is_shared_by_both_pipeline_shapes(tmp_path: Pat
         "glossary": {"entries": []}, "metadata": {},
         "translation_mode": "enabled",
     }
-
     path = pipeline._write_reader_final_checkpoint(checkpoint, overrides)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
@@ -36,6 +37,103 @@ def test_reader_final_checkpoint_is_shared_by_both_pipeline_shapes(tmp_path: Pat
         "final_overrides": overrides,
     }
 
+
+def test_resume_v2_compacts_absolute_and_relative_ledger_entries(tmp_path: Path) -> None:
+    from arc_companion.resume_transaction import load_transaction
+
+    project = tmp_path / "compact"
+    ledger_path = project / "checkpoint" / "production" / "translation-ledger.json"
+    ledger_path.parent.mkdir(parents=True)
+    relative_path = os.path.relpath(ledger_path, Path.cwd())
+    key = "ch-0001:translation:companion-translation-s1:generation-1"
+    journal = project / ".arc-companion" / "resume-transaction.json"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({
+        "schema_version": "arc.companion.resume-transaction.v2",
+        "action": "resume-native", "status": "continuation_failed",
+        "recovery_options": {"paper_id": "local:book"},
+        "entries": [
+            {
+                "ledger_path": relative_path, "session_key": "ch-0001:translation",
+                "segment_id": "s1", "status": "pending",
+                "blocking_reason": "older supervision detail",
+                "recovery_context": {"submission_state": "unknown"},
+            },
+            {
+                "ledger_path": str(ledger_path.resolve()),
+                "session_key": "ch-0001:translation", "segment_id": "s1",
+                "idempotency_key": key, "status": "resolved",
+                "output_sha256": "accepted-output", "generation": 1,
+            },
+        ],
+        "native_resume_contexts": [
+            {"idempotency_key": key, "session_key": "ch-0001:translation"},
+            {"idempotency_key": key, "generation": 1},
+        ],
+    }))
+
+    compacted = load_transaction(project)
+
+    assert compacted is not None
+    assert len(compacted["entries"]) == 1
+    entry = compacted["entries"][0]
+    assert entry["ledger_path"] == str(ledger_path.resolve())
+    assert entry["idempotency_key"] == key
+    assert entry["status"] == "resolved"
+    assert entry["output_sha256"] == "accepted-output"
+    assert entry["blocking_reason"] == "older supervision detail"
+    assert entry["recovery_context"] == {"submission_state": "unknown"}
+    assert compacted["native_resume_contexts"] == [{
+        "idempotency_key": key,
+        "session_key": "ch-0001:translation",
+        "generation": 1,
+    }]
+    assert json.loads(journal.read_text()) == compacted
+
+
+def test_resume_local_repair_failure_does_not_block_other_native_lanes() -> None:
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def record(label: str) -> dict[str, str]:
+        with lock:
+            calls.append(label)
+        return {"logical_key": label}
+
+    def translation(prepared, segment):
+        label = f"{prepared.chapter['chapter_id']}:translation:{segment['segment_id']}"
+        record(label)
+        if prepared.chapter["chapter_id"] == "ch-0008":
+            raise ValueError("local token repair reconstruction failed")
+        return {"ok": "translation"}
+
+    def companion(prepared, segment):
+        return record(
+            f"{prepared.chapter['chapter_id']}:companion:{segment['segment_id']}"
+        )
+
+    with pytest.raises(ValueError, match="local token repair reconstruction failed"):
+        run_chapter_pipeline(
+            [{"chapter_id": "ch-0008"}, {"chapter_id": "ch-0009"}],
+            workers=4,
+            prepare_guide=lambda chapter: record(f"{chapter['chapter_id']}:guide"),
+            prepare_segments=lambda chapter: [{
+                "segment_id": f"{chapter['chapter_id']}.seg-0001",
+            }],
+            run_translation=translation,
+            run_companion=companion,
+        )
+
+    expected = {
+        "ch-0008:guide",
+        "ch-0008:translation:ch-0008.seg-0001",
+        "ch-0008:companion:ch-0008.seg-0001",
+        "ch-0009:guide",
+        "ch-0009:translation:ch-0009.seg-0001",
+        "ch-0009:companion:ch-0009.seg-0001",
+    }
+    assert set(calls) == expected
+    assert len(calls) == len(expected)
 
 def test_incremental_reader_failure_preserves_last_published_state(
     tmp_path: Path, monkeypatch,
@@ -618,7 +716,13 @@ def test_resume_native_passes_one_shot_call_authorization_to_build(
 
     assert result["ok"] is True
     assert captured["options"].supervised_native_resume_keys == (logical_key,)
-    assert json.loads(ledger_path.read_text())["needs_supervision"] is None
+    assert json.loads(ledger_path.read_text())["needs_supervision"] is not None
+    transaction = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    assert transaction["schema_version"] == "arc.companion.resume-transaction.v2"
+    assert transaction["status"] == "continuation_failed"
+    assert transaction["entries"][0]["status"] == "reconciling"
     assert manager.get_existing("ch-0001:translation").native_session_id == "native-1"
 
 
@@ -722,7 +826,416 @@ def test_resume_native_restores_valid_progress_session_missing_from_store(
     manager = LLMSessionManager(fixture["checkpoint"] / "sessions")
     assert manager.get_existing(fixture["session_key"]).native_session_id == "native-progress"
     assert captured["options"].supervised_native_resume_keys == (fixture["logical_key"],)
-    assert json.loads(fixture["ledger_path"].read_text())["needs_supervision"] is None
+    assert json.loads(fixture["ledger_path"].read_text())["needs_supervision"] is not None
+
+
+def test_resume_native_recognizes_failed_state_with_supervised_lane(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    fixture = _missing_store_native_resume_fixture(tmp_path)
+    state_path = fixture["project"] / "state.json"
+    state = json.loads(state_path.read_text())
+    state["status"] = "failed"
+    state_path.write_text(json.dumps(state))
+    captured = {}
+
+    def resumed_build(options):
+        captured["options"] = options
+        return {"ok": True, "status": "complete"}
+
+    monkeypatch.setattr(pipeline, "build_companion", resumed_build)
+
+    result = pipeline.resume_companion(fixture["project"], action="resume-native")
+
+    assert result["ok"] is True
+    assert captured["options"].supervised_native_resume_keys == (fixture["logical_key"],)
+
+
+def test_reconstructs_cleared_unresolved_authorization_from_durable_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _missing_store_native_resume_fixture(tmp_path)
+    manager = LLMSessionManager(fixture["checkpoint"] / "sessions")
+    manager.update_native_session_id(fixture["session_key"], "native-progress")
+    pipeline.clear_needs_supervision(fixture["ledger_path"])
+
+    recovered = pipeline._reconstruct_unresolved_native_resume_contexts(
+        fixture["checkpoint"], session_manager=manager, excluded_keys=set(),
+    )
+
+    assert recovered == [{
+        "session_key": fixture["session_key"],
+        "idempotency_key": fixture["logical_key"],
+        "provider": "codex-cli",
+        "model": "m",
+        "runtime_fingerprint": "runtime",
+        "generation": 1,
+        "native_session_id_to_restore": None,
+        "ledger_path": str(fixture["ledger_path"]),
+        "segment_id": "ch-0008:guide",
+        "reconstructed_from_durable_state": True,
+    }]
+
+
+def test_resume_discovers_submitted_checkpoint_before_ledger_progress(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = tmp_path / "barrier-crash"
+    checkpoint = project / "checkpoint"
+    chapter_id = "ch-0042"
+    session_key = f"{chapter_id}:translation"
+    segment_id = f"{chapter_id}.seg-0003"
+    logical_key = f"{session_key}:companion-translation-{segment_id}:generation-1"
+    ledger_path = checkpoint / "production" / "lanes" / chapter_id / "translation-ledger.json"
+    ledger = initialize_lane_ledger(
+        ledger_path, chapter_id=chapter_id, lane="translation",
+        segment_ids=[segment_id],
+    )
+    assert ledger["blocks"][0]["state"] == "prepared"
+    manager = LLMSessionManager(checkpoint / "sessions")
+    manager.get_or_create(
+        key=session_key, provider="codex-cli", model="m",
+        runtime_fingerprint="runtime",
+    )
+    manager.update_native_session_id(session_key, "native-existing")
+    artifact_dir = checkpoint / "production" / "provider-calls" / "nested" / segment_id
+    call_path, identity = checkpoint_path(
+        artifact_dir, prompt="translate", schema={"type": "object"},
+        provider="codex-cli", model="m", call_label=f"call-{segment_id}",
+        session_policy="stateful", session_key=session_key, session_turn=0,
+        runtime_fingerprint="runtime", idempotency_key=logical_key, generation=1,
+    )
+    prepared = prepare_call(call_path, identity=identity)
+    record_submitted(prepared)
+    prepared.release_lock()
+    assert not (artifact_dir / "progress.jsonl").exists()
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "state.json").write_text(json.dumps({
+        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "recovery_options": {"paper_id": "local:book", "workers": 1},
+    }))
+    captured = {}
+
+    def resumed_build(options):
+        captured["keys"] = options.supervised_native_resume_keys
+        pipeline.mark_response_received(ledger_path, segment_id=segment_id)
+        pipeline.advance_block(ledger_path, segment_id=segment_id, state="schema_valid")
+        pipeline.advance_block(ledger_path, segment_id=segment_id, state="invariant_valid")
+        pipeline.advance_block(
+            ledger_path, segment_id=segment_id, state="accepted",
+            input_sha256="input", output_sha256="output",
+        )
+        return {"ok": True, "status": "complete"}
+
+    monkeypatch.setattr(pipeline, "build_companion", resumed_build)
+
+    result = pipeline.resume_companion(project, action="resume-native")
+
+    assert result["ok"] is True
+    assert captured["keys"] == (logical_key,)
+    final_ledger = json.loads(ledger_path.read_text())
+    assert final_ledger["blocks"][0]["state"] == "accepted"
+    assert final_ledger["needs_supervision"] is None
+    transaction = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    assert transaction["status"] == "complete"
+    assert transaction["entries"][0]["status"] == "resolved"
+    assert transaction["entries"][0]["idempotency_key"] == logical_key
+
+
+def test_v1_complete_migration_recovers_all_17_pending_calls(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = tmp_path / "v1-seventeen"
+    checkpoint = project / "checkpoint"
+    manager = LLMSessionManager(checkpoint / "sessions")
+    v1_entries = []
+    v1_contexts = []
+    logical_keys = []
+    for index in range(1, 18):
+        chapter_id = f"ch-{index:04d}"
+        session_key = f"{chapter_id}:translation"
+        segment_id = f"{chapter_id}.seg-0001"
+        key = f"{session_key}:companion-translation-{segment_id}:generation-1"
+        logical_keys.append(key)
+        ledger_path = checkpoint / "production" / chapter_id / "translation-ledger.json"
+        initialize_lane_ledger(
+            ledger_path, chapter_id=chapter_id, lane="translation",
+            segment_ids=[segment_id],
+        )
+        manager.get_or_create(
+            key=session_key, provider="codex-cli", model="m",
+            runtime_fingerprint="runtime",
+        )
+        manager.update_native_session_id(session_key, f"native-{index}")
+        artifact_dir = checkpoint / "production" / chapter_id / "requests" / segment_id
+        call_path, identity = checkpoint_path(
+            artifact_dir, prompt="resume", schema={"type": "object"},
+            provider="codex-cli", model="m", call_label=f"call-{index}",
+            session_policy="stateful", session_key=session_key, session_turn=0,
+            runtime_fingerprint="runtime", idempotency_key=key, generation=1,
+        )
+        prepared = prepare_call(call_path, identity=identity)
+        record_submitted(prepared)
+        ProgressJournal(
+            artifact_dir=artifact_dir, call_label=f"call-{index}",
+            provider="codex-cli", callback=None,
+            identity={
+                "idempotency_key": key, "session_key": session_key,
+                "generation": 1, "model": "m", "runtime_fingerprint": "runtime",
+            },
+        )({"event": "provider_progress", "native_session_id": f"native-{index}"})
+        prepared.release_lock()
+        recovery = read_recovery_context(
+            artifact_dir, idempotency_key=key,
+            session_manager=manager, session_key=session_key,
+        )
+        mark_needs_supervision(
+            ledger_path, segment_id=segment_id, reason="interrupted",
+            recovery_context=pipeline._recovery_context_json(recovery),
+        )
+        if index <= 8:
+            v1_entries.append({
+                "ledger_path": str(ledger_path), "session_key": session_key,
+                "segment_id": segment_id, "initial_generation": 1,
+                "target_generation": 1, "status": "applied",
+            })
+            v1_contexts.append({
+                "session_key": session_key, "idempotency_key": key,
+                "provider": "codex-cli", "model": "m",
+                "runtime_fingerprint": "runtime", "generation": 1,
+                "native_session_id_to_restore": None,
+            })
+        else:
+            pipeline.clear_needs_supervision(ledger_path)
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "state.json").write_text(json.dumps({
+        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "recovery_options": {"paper_id": "local:book", "workers": 1},
+    }))
+    journal = project / ".arc-companion" / "resume-transaction.json"
+    journal.parent.mkdir()
+    journal.write_text(json.dumps({
+        "schema_version": "arc.companion.resume-transaction.v1",
+        "action": "resume-native", "status": "complete",
+        "recovery_options": {"paper_id": "local:book", "workers": 1},
+        "entries": v1_entries, "native_resume_contexts": v1_contexts,
+    }))
+    captured = {}
+    monkeypatch.setattr(
+        pipeline, "build_companion",
+        lambda options: captured.setdefault("options", options)
+        and {"ok": False, "status": "needs_supervision"},
+    )
+
+    result = pipeline.resume_companion(project, action="resume-native")
+
+    assert result["ok"] is False
+    migrated = json.loads(journal.read_text())
+    assert migrated["schema_version"] == "arc.companion.resume-transaction.v2"
+    assert migrated["status"] == "continuation_failed"
+    assert len(migrated["entries"]) == 17
+    assert {item["idempotency_key"] for item in migrated["entries"]} == set(logical_keys)
+    assert captured["options"].supervised_native_resume_keys == tuple(logical_keys)
+
+
+def test_resume_native_isolates_conflicting_entry_and_resolves_other_lane(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = tmp_path / "mixed-native"
+    checkpoint = project / "checkpoint"
+    manager = LLMSessionManager(checkpoint / "sessions")
+    ledgers: dict[str, Path] = {}
+    keys: dict[str, str] = {}
+    for chapter_id in ("ch-good", "ch-conflict"):
+        session_key = f"{chapter_id}:translation"
+        segment_id = f"{chapter_id}.seg-0001"
+        key = f"{session_key}:companion-translation-{segment_id}:generation-1"
+        keys[chapter_id] = key
+        ledger_path = checkpoint / "production" / chapter_id / "translation-ledger.json"
+        ledgers[chapter_id] = ledger_path
+        initialize_lane_ledger(
+            ledger_path, chapter_id=chapter_id, lane="translation",
+            segment_ids=[segment_id],
+        )
+        manager.get_or_create(
+            key=session_key, provider="codex-cli", model="m",
+            runtime_fingerprint="runtime",
+        )
+        manager.update_native_session_id(session_key, f"native-{chapter_id}")
+        mark_needs_supervision(
+            ledger_path, segment_id=segment_id, reason="interrupted",
+            recovery_context={
+                "idempotency_key": key, "resumable": True,
+                "native_session_id": f"native-{chapter_id}",
+                "submission_state": "submitted",
+                "provider": (
+                    "wrong-provider" if chapter_id == "ch-conflict" else "codex-cli"
+                ),
+                "model": "m", "runtime_fingerprint": "runtime",
+                "session_key": session_key, "generation": 1,
+            },
+        )
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "state.json").write_text(json.dumps({
+        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "recovery_options": {"paper_id": "local:book", "workers": 2},
+    }))
+    calls = []
+
+    def resumed_build(options):
+        calls.append(options.supervised_native_resume_keys)
+        chapter_id = "ch-good" if len(calls) == 1 else "ch-later"
+        ledger_path = ledgers[chapter_id]
+        segment_id = f"{chapter_id}.seg-0001"
+        pipeline.mark_response_received(ledger_path, segment_id=segment_id)
+        pipeline.advance_block(ledger_path, segment_id=segment_id, state="schema_valid")
+        pipeline.advance_block(ledger_path, segment_id=segment_id, state="invariant_valid")
+        pipeline.advance_block(
+            ledger_path, segment_id=segment_id, state="accepted",
+            input_sha256="input", output_sha256="output",
+        )
+        return {"ok": True, "status": "complete"}
+
+    monkeypatch.setattr(pipeline, "build_companion", resumed_build)
+
+    result = pipeline.resume_companion(project, action="resume-native")
+
+    assert result["ok"] is True
+    assert calls == [(keys["ch-good"],)]
+    assert json.loads(ledgers["ch-good"].read_text())["needs_supervision"] is None
+    assert json.loads(ledgers["ch-conflict"].read_text())["needs_supervision"] is not None
+    transaction = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    assert transaction["status"] == "continuation_failed"
+    by_session = {item["session_key"]: item for item in transaction["entries"]}
+    assert by_session["ch-good:translation"]["status"] == "resolved"
+    conflict = by_session["ch-conflict:translation"]
+    assert conflict["status"] == "pending"
+    assert "provider" in conflict["blocking_reason"]
+    assert conflict["recovery_context"]["provider"] == "wrong-provider"
+    assert int(conflict["target_generation"]) == 1
+
+    # A later pending call is still reconciled even though the conflicting
+    # entry remains in the same continuation-failed transaction.
+    later = "ch-later"
+    later_session = f"{later}:translation"
+    later_segment = f"{later}.seg-0001"
+    later_key = f"{later_session}:companion-translation-{later_segment}:generation-1"
+    later_ledger = checkpoint / "new-production-layout" / later / "translation-ledger.json"
+    ledgers[later] = later_ledger
+    initialize_lane_ledger(
+        later_ledger, chapter_id=later, lane="translation", segment_ids=[later_segment],
+    )
+    manager.get_or_create(
+        key=later_session, provider="codex-cli", model="m", runtime_fingerprint="runtime",
+    )
+    manager.update_native_session_id(later_session, "native-later")
+    mark_needs_supervision(
+        later_ledger, segment_id=later_segment, reason="interrupted",
+        recovery_context={
+            "idempotency_key": later_key, "resumable": True,
+            "native_session_id": "native-later", "submission_state": "submitted",
+            "provider": "codex-cli", "model": "m", "runtime_fingerprint": "runtime",
+            "session_key": later_session, "generation": 1,
+        },
+    )
+
+    second = pipeline.resume_companion(project, action="resume-native")
+
+    assert second["ok"] is True
+    assert later_key in calls[1]
+    assert keys["ch-conflict"] not in calls[1]
+    assert json.loads(later_ledger.read_text())["needs_supervision"] is None
+    second_transaction = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    assert second_transaction["status"] == "continuation_failed"
+    assert len(second_transaction["entries"]) == 3
+
+
+def test_resume_native_applies_many_supervised_ledgers_idempotently(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = tmp_path / "many-supervised"
+    checkpoint = project / "checkpoint"
+    manager = LLMSessionManager(checkpoint / "sessions")
+    logical_keys: list[str] = []
+    for index in range(1, 18):
+        chapter_id = f"ch-{index:04d}"
+        session_key = f"{chapter_id}:translation"
+        segment_id = f"{chapter_id}.seg-0001"
+        logical_key = (
+            f"{session_key}:companion-translation-{segment_id}:generation-1"
+        )
+        logical_keys.append(logical_key)
+        ledger_path = checkpoint / "chapters" / chapter_id / "translation-ledger.json"
+        initialize_lane_ledger(
+            ledger_path, chapter_id=chapter_id, lane="translation",
+            segment_ids=[segment_id],
+        )
+        mark_needs_supervision(
+            ledger_path,
+            segment_id=segment_id,
+            reason="unknown submitted response",
+            recovery_context={
+                "idempotency_key": logical_key,
+                "resumable": True,
+                "native_session_id": f"native-{index}",
+                "submission_state": "submitted",
+            },
+        )
+        manager.get_or_create(
+            key=session_key, provider="codex", model="m",
+            runtime_fingerprint="runtime",
+        )
+        manager.update_native_session_id(session_key, f"native-{index}")
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "state.json").write_text(json.dumps({
+        "status": "needs_supervision",
+        "checkpoint_dir": str(checkpoint),
+        "recovery_options": {"paper_id": "local:book", "workers": 1},
+    }))
+
+    monkeypatch.setattr(
+        pipeline, "build_companion",
+        lambda _options: {"ok": False, "status": "needs_supervision"},
+    )
+    first_result = pipeline.resume_companion(project, action="resume-native")
+    assert first_result["ok"] is False
+
+    transaction = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    assert transaction["status"] == "continuation_failed"
+    assert sum(item["status"] == "reconciling" for item in transaction["entries"]) == 17
+
+    captured = {}
+
+    def resumed_build(options):
+        captured["options"] = options
+        for path in (checkpoint / "chapters").glob("*/translation-ledger.json"):
+            ledger = json.loads(path.read_text())
+            segment_id = ledger["needs_supervision"]["segment_id"]
+            pipeline.mark_response_received(path, segment_id=segment_id)
+            pipeline.advance_block(path, segment_id=segment_id, state="schema_valid")
+            pipeline.advance_block(path, segment_id=segment_id, state="invariant_valid")
+            pipeline.advance_block(
+                path, segment_id=segment_id, state="accepted",
+                input_sha256="input", output_sha256="output",
+            )
+        return {"ok": True, "status": "complete"}
+
+    monkeypatch.setattr(pipeline, "build_companion", resumed_build)
+    result = pipeline.resume_companion(project, action="resume-native")
+
+    assert result["ok"] is True
+    assert captured["options"].supervised_native_resume_keys == tuple(logical_keys)
+    ledgers = list((checkpoint / "chapters").glob("*/translation-ledger.json"))
+    assert len(ledgers) == 17
+    assert all(json.loads(path.read_text())["needs_supervision"] is None for path in ledgers)
 
 
 @pytest.mark.parametrize(

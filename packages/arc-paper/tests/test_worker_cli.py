@@ -1,5 +1,4 @@
 import base64
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,8 +22,6 @@ def _enable_paper_cli(monkeypatch):
         "ARC_PAPER_WORKER_SESSION_DIR",
         "ARC_PAPER_WORKER_SESSION_ID",
         "ARC_LLM_WORKER_CONTEXT",
-        "ARC_PAPER_WORKER_GUARD",
-        "ARC_PAPER_WORKER_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -50,35 +47,13 @@ def test_direct_service_module_cannot_bypass_worker_wrapper(monkeypatch):
     assert "paper_worker_wrapper_required" in result["error"]["message"]
 
 
-def test_worker_context_requires_matching_owner_only_guard(monkeypatch, tmp_path, capsys):
+def test_worker_context_uses_session_paths_without_local_bearer_guard(monkeypatch, tmp_path, capsys):
     base = tmp_path / "base"
     base.mkdir()
     session = WorkerCacheSession(base_root=base, run_root=tmp_path / "run", session_id="s1")
     for key, value in session.environment().items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("ARC_LLM_WORKER_CONTEXT", "true")
-
-    assert worker_cli.main(["extract-ids", "0911.3380", "--json"]) == 1
-    assert _output(capsys)["error"]["code"] == "paper_cli_guard_invalid"
-
-    token = "w" * 48
-    guard = tmp_path / "worker-guard.json"
-    guard.write_text(
-        json.dumps(
-            {
-                "schema_version": "arc.paper.worker-guard.v1",
-                "session_id": session.session_id,
-                "run_root": str(session.run_root),
-                "base_root": str(session.base_root),
-                "overlay_root": str(session.overlay_root),
-                "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
-            }
-        ),
-        encoding="utf-8",
-    )
-    guard.chmod(0o600)
-    monkeypatch.setenv("ARC_PAPER_WORKER_GUARD", str(guard))
-    monkeypatch.setenv("ARC_PAPER_WORKER_TOKEN", token)
 
     assert worker_cli.main(["extract-ids", "0911.3380", "--json"]) == 0
     assert _output(capsys)["data"] == ["arXiv:0911.3380"]
@@ -114,10 +89,22 @@ def test_worker_delegates_safe_command_and_preserves_result(monkeypatch, capsys)
     assert _output(capsys) == expected
 
 
-def test_worker_fails_closed_for_unclassified_command(monkeypatch, capsys):
-    monkeypatch.setattr(worker_cli.cli, "main", lambda _argv: (_ for _ in ()).throw(AssertionError()))
+def test_worker_defers_unclassified_command_to_canonical_cli(monkeypatch, capsys):
     assert worker_cli.main(["future-command"]) == 1
-    assert _output(capsys)["error"]["code"] == "worker_command_forbidden"
+    assert _output(capsys)["error"]["code"] == "worker_arguments_invalid"
+
+
+def test_worker_capability_metadata_defaults_new_deterministic_command_to_allowed(monkeypatch, capsys):
+    expected = {"ok": True, "data": "future", "errors": [], "meta": {}}
+
+    def fake_main(argv):
+        assert argv == ["future-deterministic-command"]
+        print(json.dumps(expected))
+        return 0
+
+    monkeypatch.setattr(worker_cli.cli, "main", fake_main)
+    assert worker_cli.main(["future-deterministic-command"]) == 0
+    assert _output(capsys) == expected
 
 
 def test_large_result_is_externalized_and_pageable(monkeypatch, tmp_path, capsys):

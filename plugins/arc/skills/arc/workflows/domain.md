@@ -229,12 +229,10 @@ cannot be written or any referenced artifact is missing.
 
 ### Phase 4: Scope Boundary and Interactive Review
 
-Case 1: In `interactive` mode, show the domain artifact paths and ask with the
-selection protocol using these options: `Continue with this domain
-(Recommended)`, `Rebuild domain`, and `Discuss before continuing`.
-
-Case 2: In `auto` mode, continue without asking unless a warning or failure
-occurred. Continue only to another workflow that the caller explicitly
-requested or that `SKILL.md` identifies as a prerequisite of the requested
-outcome. If domain construction was the requested outcome, report the domain
-artifacts and stop; `auto` does not authorize idea generation.
+Show the completed domain artifact and manifest paths. If domain construction
+was the requested outcome, report them and stop in either automation level.
+When the caller explicitly requested a downstream workflow, `interactive`
+mode pauses here before entering it; `auto` continues without asking unless a
+warning or failure occurred. Continue only to a workflow the caller requested
+or that `SKILL.md` identifies as a prerequisite. `auto` does not authorize idea
+generation or otherwise expand scope.

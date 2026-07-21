@@ -121,7 +121,7 @@ def test_successful_call_replays_when_caller_checkpoint_was_not_written(tmp_path
     assert provider.calls == 1
 
 
-def test_same_key_single_flight_and_input_mismatch(tmp_path, monkeypatch):
+def test_paid_stateful_logical_key_replays_before_rebuilt_prompt_digest(tmp_path, monkeypatch):
     provider = CountingProvider()
     manager = LLMSessionManager(tmp_path / "sessions")
     monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: provider)
@@ -130,8 +130,35 @@ def test_same_key_single_flight_and_input_mismatch(tmp_path, monkeypatch):
         outcomes = list(pool.map(lambda _: run_json_result("prompt", **kwargs), range(2)))
     assert provider.calls == 1
     assert all(outcome.value["ok"] for outcome in outcomes)
-    with pytest.raises(RuntimeError, match="identity mismatch"):
-        run_json_result("changed prompt", **kwargs)
+    replay = run_json_result("rebuilt delta after receipt advanced", **kwargs)
+    assert replay.logical_receipt["replayed"] is True
+    assert provider.calls == 1
+
+
+def test_receipt_persisted_before_caller_acceptance_replays_rebuilt_stream(
+    tmp_path, monkeypatch,
+):
+    provider = CountingProvider()
+    manager = LLMSessionManager(tmp_path / "sessions")
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: provider)
+    real_validated = runner.record_validated
+
+    def crash_after_receipt(prepared):
+        real_validated(prepared)
+        raise RuntimeError("caller ledger crash")
+
+    monkeypatch.setattr(runner, "record_validated", crash_after_receipt)
+    with pytest.raises(RuntimeError, match="caller ledger crash"):
+        run_json_result("generation bootstrap", **_kwargs(tmp_path, manager, "turn-crash"))
+    assert manager.turn_count("chapter/translation") == 1
+
+    monkeypatch.setattr(runner, "record_validated", real_validated)
+    replay = run_json_result(
+        "delta rebuilt after restart", **_kwargs(tmp_path, manager, "turn-crash")
+    )
+
+    assert replay.value == {"ok": True}
+    assert replay.logical_receipt["replayed"] is True
     assert provider.calls == 1
 
 
@@ -207,7 +234,7 @@ def test_submitted_timeout_only_explicitly_resumes_native_session(tmp_path, monk
     assert provider.calls == 1
 
     outcome = run_json_result(
-        "original paid request", **kwargs, supervised_native_resume=True,
+        "rebuilt stateful stream", **kwargs, supervised_native_resume=True,
     )
     assert outcome.value == {"ok": True}
     assert provider.calls == 2
@@ -215,7 +242,7 @@ def test_submitted_timeout_only_explicitly_resumes_native_session(tmp_path, monk
     assert "original paid request" not in provider.prompts[-1]
 
     replay = run_json_result(
-        "original paid request", **kwargs, supervised_native_resume=True,
+        "rebuilt stateful stream", **kwargs, supervised_native_resume=True,
     )
     assert replay.logical_receipt["replayed"] is True
     assert provider.calls == 2

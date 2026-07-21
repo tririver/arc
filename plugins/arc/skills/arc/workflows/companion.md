@@ -238,11 +238,13 @@ arc-jobs watch <job-id> --until-review --json
 
 ### Step 6: Use the first-chapter review boundary
 
-For interactive review, add `--stop-after-first-chapter`. Schedule only the
-first substantive chapter. Return `first_chapter_ready` only after its guide,
+In `interactive` mode, or for a one-shot request to stop after chapter one, add
+`--stop-after-first-chapter`. Schedule only the first substantive chapter.
+Return `first_chapter_ready` only after its guide,
 all enabled ordered lanes, chapter review, PDF typesetting, static-web
 publication, and validation finish. Do not start chapter two. After approval, rerun without the
-flag; the accepted first chapter remains frozen. Never present the first-chapter
+flag after approval; a bare approval passes this checkpoint but does not change
+`automation_level`. The accepted first chapter remains frozen. Never present the first-chapter
 PDF or web reader as the completed document.
 
 ## Phase 3: Render and Validate

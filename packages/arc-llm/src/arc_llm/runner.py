@@ -6,10 +6,8 @@ import time
 from dataclasses import dataclass, replace
 import inspect
 import os
-import secrets
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -41,7 +39,10 @@ from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import schema_hash, sha256_text
 from .safety import LLMSafetyController
-from .sessions import LLMSessionManager, LLMSessionRef, runtime_fingerprint
+from .sessions import (
+    LLMSessionManager, LLMSessionRef, legacy_runtime_fingerprint,
+    runtime_fingerprint,
+)
 from .structured_recovery import recover_json_output, structured_metadata
 from .usage import LLMProviderResponse, LLMUsage
 
@@ -54,10 +55,6 @@ NATIVE_RESUME_RECONCILIATION_PROMPT = (
     "Do not repeat its work. Reconcile the native session and return the final answer "
     "for that preceding request in the required format."
 )
-_PAPER_CONTROLLER_SESSIONS: dict[str, dict[str, str]] = {}
-_PAPER_CONTROLLER_GUARD_LOCK = threading.Lock()
-
-
 def _runtime_capabilities(env: Mapping[str, str] | None) -> dict[str, Any]:
     values = env or {}
     return {
@@ -141,8 +138,6 @@ def _configure_paper_worker_session(
             "ARC_PAPER_WORKER_SESSION_DIR",
             "ARC_PAPER_WORKER_TOMBSTONE_DIR",
             "ARC_PAPER_WORKER_SESSION_ID",
-            "ARC_PAPER_WORKER_GUARD",
-            "ARC_PAPER_WORKER_TOKEN",
         ):
             env.pop(key, None)
         return
@@ -154,65 +149,11 @@ def _configure_paper_worker_session(
     for path in (overlay, state, tombstones):
         path.mkdir(parents=True, exist_ok=True)
     session_id = f"arc-llm-{sha256_text(str(run_root.resolve(strict=False)))[:20]}"
-    from .paths import llm_cache_root
-
-    guard_root = llm_cache_root(env) / "paper-worker-authorizations"
-    guard_root.mkdir(parents=True, exist_ok=True)
-    worker_guard_path = guard_root / f"{session_id}.worker.json"
-    controller_guard_path = guard_root / f"{session_id}.controller.json"
-    with _PAPER_CONTROLLER_GUARD_LOCK:
-        controller_session = _PAPER_CONTROLLER_SESSIONS.get(session_id)
-        if controller_session is None:
-            worker_token = secrets.token_urlsafe(32)
-            controller_token = secrets.token_urlsafe(32)
-            worker_guard_payload = {
-                "schema_version": "arc.paper.worker-guard.v1",
-                "session_id": session_id,
-                "run_root": str(run_root),
-                "base_root": str(base_cache),
-                "overlay_root": str(overlay),
-                "token_sha256": sha256_text(worker_token),
-            }
-            controller_guard_payload = {
-                "schema_version": "arc.paper.controller-guard.v1",
-                "session_id": session_id,
-                "run_root": str(run_root),
-                "base_root": str(base_cache),
-                "token_sha256": sha256_text(controller_token),
-            }
-            temporary_worker_guard = worker_guard_path.with_name(
-                f".{worker_guard_path.name}.{secrets.token_hex(8)}.tmp"
-            )
-            temporary_controller_guard = controller_guard_path.with_name(
-                f".{controller_guard_path.name}.{secrets.token_hex(8)}.tmp"
-            )
-            temporary_worker_guard.write_text(
-                json.dumps(worker_guard_payload, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            temporary_controller_guard.write_text(
-                json.dumps(controller_guard_payload, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            os.chmod(temporary_worker_guard, 0o600)
-            os.chmod(temporary_controller_guard, 0o600)
-            os.replace(temporary_worker_guard, worker_guard_path)
-            os.replace(temporary_controller_guard, controller_guard_path)
-            controller_session = {
-                "run_root": str(run_root),
-                "base_cache": str(base_cache),
-                "worker_guard": str(worker_guard_path),
-                "controller_guard": str(controller_guard_path),
-                "worker_token": worker_token,
-                "controller_token": controller_token,
-            }
-            _PAPER_CONTROLLER_SESSIONS[session_id] = controller_session
-        worker_token = controller_session["worker_token"]
     env.update({
         "ARC_PAPER_WORKER_BASE_CACHE": str(base_cache),
         "ARC_PAPER_WORKER_SESSION_DIR": str(run_root),
         "ARC_PAPER_WORKER_TOMBSTONE_DIR": str(tombstones),
         "ARC_PAPER_WORKER_SESSION_ID": session_id,
-        "ARC_PAPER_WORKER_GUARD": controller_session["worker_guard"],
-        "ARC_PAPER_WORKER_TOKEN": worker_token,
         "ARC_LLM_WORKER_CONTEXT": "true",
         "ARC_PAPER_CACHE": str(overlay),
     })
@@ -238,8 +179,11 @@ def _finalize_paper_worker_call(
     if values.get("ARC_PAPER_CLI_ACCESS") != "full":
         return
     session_id = values.get("ARC_PAPER_WORKER_SESSION_ID")
-    controller = _PAPER_CONTROLLER_SESSIONS.get(str(session_id or ""))
-    if not controller or not _paper_overlay_has_staged_changes(Path(controller["run_root"])):
+    run_root = values.get("ARC_PAPER_WORKER_SESSION_DIR")
+    base_root = values.get("ARC_PAPER_WORKER_BASE_CACHE")
+    if not session_id or not run_root or not base_root:
+        return
+    if not _paper_overlay_has_staged_changes(Path(run_root)):
         return
     command = [
         sys.executable,
@@ -247,9 +191,9 @@ def _finalize_paper_worker_call(
         "arc_paper.worker_controller",
         "finalize",
         "--run-root",
-        controller["run_root"],
+        run_root,
         "--base-root",
-        controller["base_cache"],
+        base_root,
         "--session-id",
         str(session_id),
         "--worker-id",
@@ -267,13 +211,6 @@ def _finalize_paper_worker_call(
             "ARC_LLM_WORKER_CONTEXT",
         }:
             controller_env.pop(key, None)
-    controller_env.update(
-        {
-            "ARC_PAPER_CONTROLLER_MODE": "trusted",
-            "ARC_PAPER_CONTROLLER_GUARD": controller["controller_guard"],
-            "ARC_PAPER_CONTROLLER_TOKEN": controller["controller_token"],
-        }
-    )
     completed = subprocess.run(
         command,
         env=controller_env,
@@ -458,6 +395,8 @@ def run_json(
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
     supervised_native_resume: bool = False,
+    validated_legacy_logical_identity: Mapping[str, Any] | None = None,
+    validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convenience wrapper returning the JSON value with its audit record."""
 
@@ -487,6 +426,8 @@ def run_json(
         idempotency_key=idempotency_key,
         progress_contract_scope=progress_contract_scope,
         supervised_native_resume=supervised_native_resume,
+        validated_legacy_logical_identity=validated_legacy_logical_identity,
+        validated_legacy_runtime_identity=validated_legacy_runtime_identity,
     )
     return attach_arc_llm_call_record(outcome.value, dict(outcome.call_record or {}))
 
@@ -518,6 +459,8 @@ def run_json_result(
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
     supervised_native_resume: bool = False,
+    validated_legacy_logical_identity: Mapping[str, Any] | None = None,
+    validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> LLMCallOutcome:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
@@ -599,6 +542,8 @@ def run_json_result(
             idempotency_key=idempotency_key,
             progress_contract_scope=progress_contract_scope,
             supervised_native_resume=supervised_native_resume,
+            validated_legacy_logical_identity=validated_legacy_logical_identity,
+            validated_legacy_runtime_identity=validated_legacy_runtime_identity,
         ),
     )
 
@@ -625,6 +570,8 @@ def run_text(
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
     supervised_native_resume: bool = False,
+    validated_legacy_logical_identity: Mapping[str, Any] | None = None,
+    validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> str:
     return run_text_result(
         prompt,
@@ -647,6 +594,8 @@ def run_text(
         idempotency_key=idempotency_key,
         progress_contract_scope=progress_contract_scope,
         supervised_native_resume=supervised_native_resume,
+        validated_legacy_logical_identity=validated_legacy_logical_identity,
+        validated_legacy_runtime_identity=validated_legacy_runtime_identity,
     ).value
 
 
@@ -672,6 +621,8 @@ def run_text_result(
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
     supervised_native_resume: bool = False,
+    validated_legacy_logical_identity: Mapping[str, Any] | None = None,
+    validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> LLMCallOutcome:
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
@@ -746,6 +697,8 @@ def run_text_result(
             idempotency_key=idempotency_key,
             progress_contract_scope=progress_contract_scope,
             supervised_native_resume=supervised_native_resume,
+            validated_legacy_logical_identity=validated_legacy_logical_identity,
+            validated_legacy_runtime_identity=validated_legacy_runtime_identity,
         ),
     )
 
@@ -962,6 +915,8 @@ def _generate_json(
     idempotency_key: str | None,
     progress_contract_scope: str,
     supervised_native_resume: bool,
+    validated_legacy_logical_identity: Mapping[str, Any] | None,
+    validated_legacy_runtime_identity: Mapping[str, Any] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
         provider_used=provider_used,
@@ -1023,6 +978,7 @@ def _generate_json(
                 supervised_native_resume=supervised_native_resume,
                 native_session_available=bool(session and session.native_session_id),
                 runtime_capabilities=_runtime_capabilities(env),
+                validated_legacy_logical_identity=validated_legacy_logical_identity,
             )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
@@ -1084,6 +1040,12 @@ def _generate_json(
     if session_policy == "stateful":
         assert session_manager is not None
         assert session_key is not None
+        _migrate_legacy_session_runtime(
+            session_manager, session_key=session_key, provider=provider_used,
+            model=model, model_tier=model_tier, env=env,
+            process_chain=process_chain, runtime_fp=runtime_fp,
+            validated_runtime_identity=validated_legacy_runtime_identity,
+        )
         with session_manager.locked_turn(
             key=session_key,
             provider=provider_used,
@@ -1239,6 +1201,8 @@ def _generate_text(
     idempotency_key: str | None,
     progress_contract_scope: str,
     supervised_native_resume: bool,
+    validated_legacy_logical_identity: Mapping[str, Any] | None,
+    validated_legacy_runtime_identity: Mapping[str, Any] | None,
 ) -> LLMCallOutcome:
     runtime_fp = _runtime_fp(
         provider_used=provider_used,
@@ -1300,6 +1264,7 @@ def _generate_text(
                 supervised_native_resume=supervised_native_resume,
                 native_session_available=bool(session and session.native_session_id),
                 runtime_capabilities=_runtime_capabilities(env),
+                validated_legacy_logical_identity=validated_legacy_logical_identity,
             )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
@@ -1357,6 +1322,12 @@ def _generate_text(
     if session_policy == "stateful":
         assert session_manager is not None
         assert session_key is not None
+        _migrate_legacy_session_runtime(
+            session_manager, session_key=session_key, provider=provider_used,
+            model=model, model_tier=model_tier, env=env,
+            process_chain=process_chain, runtime_fp=runtime_fp,
+            validated_runtime_identity=validated_legacy_runtime_identity,
+        )
         with session_manager.locked_turn(
             key=session_key,
             provider=provider_used,
@@ -1450,6 +1421,32 @@ def _runtime_fp(
         model_tier=model_tier,
         env=env,
         process_chain=process_chain,
+    )
+
+
+def _migrate_legacy_session_runtime(
+    session_manager: LLMSessionManager, *, session_key: str, provider: str,
+    model: str | None, model_tier: str | None, env: Mapping[str, str] | None,
+    process_chain: Sequence[str] | None, runtime_fp: str,
+    validated_runtime_identity: Mapping[str, Any] | None,
+) -> None:
+    existing = session_manager.get_existing(session_key)
+    if existing is None or existing.runtime_fingerprint == runtime_fp:
+        return
+    if validated_runtime_identity is not None:
+        migrated = session_manager.migrate_validated_runtime_identity(
+            session_key, identity=validated_runtime_identity,
+            runtime_fingerprint=runtime_fp,
+        )
+        if migrated is not None:
+            return
+    legacy_fp = legacy_runtime_fingerprint(
+        provider=provider, model=model, model_tier=model_tier,
+        env=env, process_chain=process_chain,
+    )
+    session_manager.migrate_legacy_runtime_fingerprint(
+        session_key, expected_legacy_fingerprint=legacy_fp,
+        runtime_fingerprint=runtime_fp, provider=provider, model=model,
     )
 
 

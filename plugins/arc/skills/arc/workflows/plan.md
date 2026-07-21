@@ -217,4 +217,4 @@ and follow `manuals/arc-jobs.md` Markdown Report Export. Record any returned job
 id in host/run logs or the next work-note version, not by editing the immutable
 version just written. If PDF generation appears bugged, report it and continue
 this workflow; do not debug or fix PDF generation unless the user explicitly asks.
-Then hand off ready steps to `calculate.md` for consensus execution.
+After the work note passes review, enter calculation only when it is in the caller's requested scope: pause first in `interactive` mode, or hand off ready steps directly in `auto` mode.

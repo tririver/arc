@@ -13,6 +13,10 @@ from arc_companion.stateful_pipeline import (
     LLMSubmissionLimiter,
     STATEFUL_TURN_VERSION,
     StatefulPromptStream,
+    read_stream_state,
+    pin_lane_runtime_profile,
+    resolve_lane_runtime_profile,
+    write_stream_state,
 )
 
 
@@ -64,6 +68,168 @@ def test_delta_size_does_not_grow_with_prior_payloads() -> None:
     )
     assert len(delta) < 1_000
     assert "large" not in delta
+
+
+def test_stream_restart_uses_receipts_not_crash_incomplete_turn_count(tmp_path) -> None:
+    stream = _stream()
+    stream.request(
+        "submitted", cursor="s1", source_sha256="a", current_payload={},
+    )
+    # A second request was prepared in memory but crashed before provider submission.
+    stream.request(
+        "not submitted", cursor="s2", source_sha256="b", current_payload={},
+    )
+    budget = ContextRolloverBudget(context_window_tokens=100)
+    budget.record({"total_input_tokens": 40, "output_tokens": 5})
+    path = tmp_path / "stream.json"
+    write_stream_state(path, stream=stream, budget=budget)
+
+    restored = read_stream_state(path, receipt_turn_count=1)
+    assert restored is not None
+    recovered_stream, recovered_budget = restored
+    assert recovered_stream.turn_count == 1
+    assert recovered_budget.input_tokens == 40
+    turn = json.loads(recovered_stream.request(
+        "retry", cursor="s2", source_sha256="b", current_payload={},
+    ))
+    assert turn["turn_kind"] == "delta"
+
+
+def test_rollover_capsule_and_usage_survive_restart(tmp_path) -> None:
+    stream = StatefulPromptStream(
+        chapter_id="ch-0001", lane="translation", generation=2,
+        fixed_rules={"immutable": True}, static_context={"chapter": "one"},
+        continuity_capsule={
+            "accepted_chain_sha256": "chain", "last_accepted_segment_id": "s1",
+            "last_input_sha256": "in", "last_output_sha256": "out",
+        },
+    )
+    budget = ContextRolloverBudget(context_window_tokens=100)
+    write_stream_state(tmp_path / "stream.json", stream=stream, budget=budget)
+
+    restored = read_stream_state(tmp_path / "stream.json", receipt_turn_count=0)
+    assert restored is not None
+    recovered_stream, _ = restored
+    turn = json.loads(recovered_stream.request(
+        "continue", cursor="s2", source_sha256="next", current_payload={},
+    ))
+    assert turn["turn_kind"] == "generation_bootstrap"
+    assert turn["continuity_capsule"]["accepted_chain_sha256"] == "chain"
+
+
+@pytest.mark.parametrize("requested_allow_internet", [False, True])
+def test_new_translation_generation_pins_primary_and_repairs_offline(
+    tmp_path, requested_allow_internet: bool,
+) -> None:
+    path = tmp_path / "profile.json"
+    primary = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=2,
+        requested_allow_internet=requested_allow_internet,
+        inherit_host_tools=False, existing_generation=False,
+        recorded_runtime_fingerprint=None,
+        provider="codex-cli", model="fixed-model", model_tier="medium",
+    )
+    # Coverage/token repairs resolve the same durable generation profile.
+    repair = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=2,
+        requested_allow_internet=not requested_allow_internet,
+        inherit_host_tools=True, existing_generation=True,
+        recorded_runtime_fingerprint="different-current-runtime",
+        provider="claude-cli", model="drifted-model", model_tier="high",
+    )
+
+    assert primary == repair
+    assert primary["allow_internet"] is False
+    assert primary["provider"] == "codex-cli"
+    assert primary["model"] == "fixed-model"
+
+
+def test_existing_translation_and_commentary_generations_preserve_access_choice(tmp_path) -> None:
+    translation = resolve_lane_runtime_profile(
+        tmp_path / "translation.json", chapter_id="ch-1", lane="translation",
+        generation=1, requested_allow_internet=True, inherit_host_tools=False,
+        existing_generation=True, recorded_runtime_fingerprint="recorded",
+    )
+    commentary = resolve_lane_runtime_profile(
+        tmp_path / "commentary.json", chapter_id="ch-1", lane="companion",
+        generation=1, requested_allow_internet=True, inherit_host_tools=False,
+        existing_generation=False, recorded_runtime_fingerprint=None,
+    )
+
+    assert translation["allow_internet"] is True
+    assert translation["recorded_runtime_fingerprint"] == "recorded"
+    assert commentary["allow_internet"] is True
+
+
+def test_auto_profile_pins_actual_provider_and_model_across_restart(tmp_path) -> None:
+    path = tmp_path / "profile.json"
+    selected = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=1,
+        requested_allow_internet=False, inherit_host_tools=False,
+        existing_generation=False, recorded_runtime_fingerprint=None,
+        provider="auto", model=None, model_tier="medium",
+    )
+    pinned = pin_lane_runtime_profile(
+        path, selected, provider="codex-cli", model="actual-model",
+        runtime_fingerprint="manifest-hash",
+    )
+    restarted = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=1,
+        requested_allow_internet=True, inherit_host_tools=True,
+        existing_generation=True, recorded_runtime_fingerprint="drifted",
+        provider="claude-cli", model="other", model_tier="high",
+    )
+
+    assert restarted == pinned
+    assert restarted["provider"] == "codex-cli"
+    assert restarted["model"] == "actual-model"
+
+
+def test_provisional_rollover_profile_migrates_preceding_generation_fingerprint(
+    tmp_path,
+) -> None:
+    """A paid first turn pins an auto profile polluted by legacy rollover state."""
+    path = tmp_path / "profile.json"
+    provisional = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=2,
+        requested_allow_internet=True, inherit_host_tools=False,
+        existing_generation=False,
+        recorded_runtime_fingerprint="preceding-generation-manifest",
+        provider="auto", model=None, model_tier="medium",
+    )
+
+    pinned = pin_lane_runtime_profile(
+        path, provisional, provider="codex-cli", model="actual-model",
+        runtime_fingerprint="generation-two-manifest",
+    )
+
+    assert pinned["provider"] == "codex-cli"
+    assert pinned["model"] == "actual-model"
+    assert pinned["recorded_runtime_fingerprint"] == "generation-two-manifest"
+    assert (
+        pinned["migrated_from_runtime_fingerprint"]
+        == "preceding-generation-manifest"
+    )
+
+
+def test_pinned_lane_profile_still_rejects_runtime_fingerprint_drift(tmp_path) -> None:
+    path = tmp_path / "profile.json"
+    selected = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=2,
+        requested_allow_internet=False, inherit_host_tools=False,
+        existing_generation=False, recorded_runtime_fingerprint=None,
+        provider="codex-cli", model="fixed-model", model_tier="medium",
+    )
+    pinned = pin_lane_runtime_profile(
+        path, selected, provider="codex-cli", model="fixed-model",
+        runtime_fingerprint="generation-two-manifest",
+    )
+
+    with pytest.raises(ValueError, match="fingerprint changed"):
+        pin_lane_runtime_profile(
+            path, pinned, provider="codex-cli", model="fixed-model",
+            runtime_fingerprint="drifted-manifest",
+        )
 
 
 def test_context_rollover_uses_seventy_percent_and_prompt_estimate() -> None:
