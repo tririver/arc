@@ -86,6 +86,7 @@ arc-companion build <source-id> \
   --document-kind auto \
   --provider <provider> \
   --workers <workers> \
+  --recovery-policy auto \
   --json
 ```
 
@@ -204,26 +205,32 @@ or commentary prose. Some repetition after rollover or restart is acceptable.
 A changed earlier segment preserves the valid prefix, invalidates the
 suffix, and starts a new generation.
 
-### Step 5: Supervise exceptional states
+### Step 5: Recover eligible blocked lanes
 
-Timeout, cancellation, unknown submission state, provider error, or native
-session loss must stop automatic advancement and write `needs_supervision`.
-Never automatically resubmit an uncertain paid call. Inspect without mutation:
+The default `--recovery-policy auto` drains submitted work, replays durable
+responses, and attempts native session reconciliation before starting at most
+one replacement generation for an eligible blocked translation or commentary
+lane suffix. Inspect recovery state without mutation:
 
 ```bash
 arc-companion status --project-dir <project-dir> --json
 ```
 
-Then explicitly choose native recovery or a new generation:
+Bare `resume` selects automatic recovery. Alternatively, explicitly request
+strict native recovery or a confirmed new generation:
 
 ```bash
+arc-companion resume --project-dir <project-dir> --json
 arc-companion resume --project-dir <project-dir> --action resume-native --json
 arc-companion resume --project-dir <project-dir> --action restart-generation \
   --confirm-possible-duplicate-charge --json
 ```
 
-Use restart only after accepting that an uncertain submitted call may be billed
-twice. The ledger must retain call IDs, hashes, accepted-chain predecessor,
+Explicit native recovery must not upgrade automatically. Use explicit restart
+only after accepting that an uncertain submitted call may be billed twice.
+Cancellation, authentication, quota, rate-limit, missing-source, local-I/O, and
+uncertain authoritative-identity failures remain supervised rather than being
+masked by replacement. The ledger must retain call IDs, hashes, accepted-chain predecessor,
 session and generation, native ID, usage, and validation receipt.
 
 For background builds, forward provider progress plus `chapter_prepared`,

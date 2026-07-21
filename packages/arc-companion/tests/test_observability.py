@@ -151,3 +151,90 @@ def test_status_merges_unresolved_resume_transaction_entries(tmp_path) -> None:
     assert by_session["ch-0003:translation"]["entry_status"] == "authorized"
     assert by_session["ch-0003:translation"]["state"] == "prepared"
     assert by_session["ch-0004:translation"]["recovery_action"] == "operator-supervision"
+
+
+def test_status_reports_automatic_replacement_provenance(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    ledger = checkpoint / "translation-ledger.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(json.dumps({
+        "chapter_id": "ch-0004", "lane": "translation",
+        "blocks": [{
+            "segment_id": "s8", "state": "prepared",
+            "submission_state": "not_submitted", "generation": 2,
+        }],
+    }))
+    journal = tmp_path / ".arc-companion" / "resume-transaction.json"
+    journal.parent.mkdir()
+    journal.write_text(json.dumps({
+        "schema_version": "arc.companion.resume-transaction.v2",
+        "action": "auto", "policy": "auto", "status": "continuing",
+        "action_history": [{
+            "action": "resume-native", "policy": "manual", "at": "before",
+        }, {
+            "action": "auto", "policy": "auto", "at": "after",
+        }],
+        "entries": [{
+            "ledger_path": str(ledger), "session_key": "ch-0004:translation",
+            "segment_id": "s8", "idempotency_key": "old-key", "status": "reconciling",
+        }],
+        "replacements": [{
+            "replacement_id": "replacement-1", "session_key": "ch-0004:translation",
+            "segment_id": "s8", "source_generation": 1, "target_generation": 2,
+            "suffix_start_segment_id": "s8", "suffix_segment_ids": ["s8", "s9", "s10"],
+            "attempt": 1, "trigger_code": "native_session_missing",
+            "trigger_reason": "provider session no longer exists",
+            "possible_duplicate_charge": True, "status": "suffix_invalidated",
+            "abandoned_logical_key": "old-key",
+        }],
+    }))
+
+    result = enrich_status(
+        tmp_path, {"status": "needs_supervision", "checkpoint_dir": str(checkpoint)},
+    )
+
+    assert result["recovery_policy"] == "auto"
+    assert [item["action"] for item in result["recovery_action_history"]] == [
+        "resume-native", "auto",
+    ]
+    replacement = result["recovery_replacements"][0]
+    assert replacement["source_generation"] == 1
+    assert replacement["target_generation"] == 2
+    assert replacement["suffix_segment_ids"] == ["s8", "s9", "s10"]
+    assert replacement["restart_attempt"] == 1
+    assert replacement["restart_trigger_code"] == "native_session_missing"
+    assert replacement["possible_duplicate_charge"] is True
+    pending = result["pending_calls"][0]
+    assert pending["recovery_action"] == "restart-generation"
+    assert pending["replacement_status"] == "suffix_invalidated"
+
+
+def test_resolved_transaction_entry_hides_stale_failed_checkpoint(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    call_path = checkpoint / "llm" / "call-checkpoints" / "call.json"
+    call_path.parent.mkdir(parents=True)
+    call_path.write_text(json.dumps({
+        "state": "failed", "submission_state": "submitted",
+        "logical_identity": {
+            "idempotency_key": "accepted-key",
+            "session_key": "ch-0001:translation", "generation": 1,
+        },
+    }))
+    journal = tmp_path / ".arc-companion" / "resume-transaction.json"
+    journal.parent.mkdir()
+    journal.write_text(json.dumps({
+        "schema_version": "arc.companion.resume-transaction.v2",
+        "action": "auto", "policy": "auto", "status": "complete",
+        "entries": [{
+            "ledger_path": str(checkpoint / "translation-ledger.json"),
+            "session_key": "ch-0001:translation", "segment_id": "s1",
+            "idempotency_key": "accepted-key", "status": "resolved",
+        }],
+    }))
+
+    result = enrich_status(
+        tmp_path, {"status": "complete", "checkpoint_dir": str(checkpoint)},
+    )
+
+    assert result["pending_call_count"] == 0
+    assert result["pending_calls"] == []

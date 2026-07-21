@@ -928,6 +928,35 @@ def test_paid_repair_finalizer_classifies_later_same_lane_responses(tmp_path: Pa
     assert ledger["needs_supervision"]["segment_id"] == "s1"
 
 
+def test_paid_repair_finalizer_ignores_marker_from_abandoned_generation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    pipeline_module.write_json(
+        checkpoint / "document.json", {"document": {"blocks": [{
+            "block_id": "body", "type": "text", "text": "Source text.",
+        }]}},
+    )
+    ledger_path = checkpoint / "chapters" / "ch-1" / "translation-ledger.json"
+    pipeline_module.initialize_lane_ledger(
+        ledger_path, chapter_id="ch-1", lane="translation", segment_ids=["s1"],
+    )
+    pipeline_module.invalidate_suffix(
+        ledger_path, from_segment_id="s1", generation=2,
+    )
+    pipeline_module.write_json(
+        checkpoint / "translation-token-offset-attempts" / "s1.json", {
+            "segment_id": "s1", "generation": 1, "input_sha256": "old",
+            "status": "response_received", "block_ids": ["body"],
+            "raw_response": {"repairs": []},
+        },
+    )
+
+    assert pipeline_module._finalize_paid_translation_repairs(checkpoint) == []
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["needs_supervision"] is None
+
+
 def test_paid_repair_finalizer_runs_full_protected_name_validation(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint"
     block = {
@@ -4042,6 +4071,244 @@ def test_legacy_string_annotation_checkpoint_is_rerun_and_upgraded(tmp_path: Pat
     assert second["seg-0001"]["prior_work"] == []
     assert calls_after == calls_before + 1
     assert upgraded["schema_version"] == pipeline_module.ANNOTATION_CHECKPOINT_VERSION
+
+
+def test_replacement_generation_isolates_commentary_checkpoint_and_provider_artifacts(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    segment = {
+        "segment_id": "seg-generation", "block_ids": ["b1", "b2"],
+        "start_block_id": "b1", "end_block_id": "b2",
+    }
+    checkpoint_dir = tmp_path / "checkpoint"
+    artifact_dirs: list[Path] = []
+
+    def llm(_prompt: str, **kwargs):
+        artifact_dirs.append(Path(kwargs["artifact_dir"]))
+        return {
+            "explanation": "解释", "prior_work": [], "later_work": [],
+            "commentary": "伴读", "evidence_ids": [], "key_points": [],
+            "source_notes": [],
+        }
+
+    kwargs = dict(
+        options=BuildOptions(bundle.paper_id, tmp_path, workers=1), bundle=bundle,
+        evidence={"related_papers": []}, domain_context=None, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir, llm=llm,
+    )
+    pipeline_module._generate_annotations([segment], generation=1, **kwargs)
+    pipeline_module._generate_annotations([segment], generation=2, **kwargs)
+
+    name = f"{_segment_checkpoint_name(segment['segment_id'])}.json"
+    assert (checkpoint_dir / "annotations" / name).is_file()
+    assert (checkpoint_dir / "annotations" / "generation-2" / name).is_file()
+    assert artifact_dirs == [
+        checkpoint_dir / "llm" / "annotations" / name.removesuffix(".json"),
+        checkpoint_dir / "llm" / "annotations" / "generation-2"
+        / name.removesuffix(".json"),
+    ]
+
+
+def test_replacement_generation_does_not_read_translation_generation_one_artifacts(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    segment = {
+        "segment_id": "seg-generation", "block_ids": ["b1", "b2"],
+        "start_block_id": "b1", "end_block_id": "b2",
+    }
+    checkpoint_dir = tmp_path / "checkpoint"
+    calls: list[tuple[str, Path]] = []
+
+    def llm(_prompt: str, **kwargs):
+        calls.append((str(kwargs["call_label"]), Path(kwargs["artifact_dir"])))
+        return {"blocks": [
+            {"block_id": "b1", "text": "设定"},
+            {"block_id": "b2", "text": "令 x 小于 y 且 y 大于零。"},
+        ]}
+
+    kwargs = dict(
+        options=BuildOptions(bundle.paper_id, tmp_path, workers=1), bundle=bundle,
+        glossary={"entries": []}, protected_names=[], checkpoint_dir=checkpoint_dir,
+        llm=llm,
+    )
+    pipeline_module._generate_translations([segment], generation=1, **kwargs)
+    pipeline_module._generate_translations([segment], generation=2, **kwargs)
+
+    name = f"{_segment_checkpoint_name(segment['segment_id'])}.json"
+    assert len(calls) == 2
+    assert calls[1][1] == (
+        checkpoint_dir / "llm" / "translations" / "generation-2"
+        / name.removesuffix(".json")
+    )
+    assert (checkpoint_dir / "translation-drafts" / name).is_file()
+    assert (checkpoint_dir / "translation-drafts" / "generation-2" / name).is_file()
+    assert (checkpoint_dir / "translations" / name).is_file()
+    assert (checkpoint_dir / "translations" / "generation-2" / name).is_file()
+
+
+def test_generationless_artifacts_use_persisted_nonfirst_generation_owner(
+    tmp_path: Path,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    segment_id = "seg-owned"
+    pipeline_module._record_legacy_generation_owners(
+        checkpoint_dir,
+        lane="translation",
+        segment_ids=[segment_id],
+        generation=3,
+    )
+    pipeline_module._record_legacy_generation_owners(
+        checkpoint_dir,
+        lane="companion",
+        segment_ids=[segment_id],
+        generation=3,
+    )
+
+    for artifact_name in (
+        "translations", "translation-drafts",
+        "translation-coverage-attempts",
+        "translation-token-offset-attempts", "translation-token-attempts",
+        "translation-token-offset-repair-drafts", "llm/translations",
+        "annotations", "llm/annotations",
+    ):
+        assert pipeline_module._generation_segment_artifact_dir(
+            checkpoint_dir, artifact_name, segment_id, 3,
+        ) == checkpoint_dir / artifact_name
+        assert pipeline_module._generation_segment_artifact_dir(
+            checkpoint_dir, artifact_name, segment_id, 4,
+        ) == checkpoint_dir / artifact_name / "generation-4"
+        # Legacy payloads did not carry an explicit generation.  The persisted
+        # path owner supplies it instead of silently treating them as gen 1.
+        assert pipeline_module._artifact_payload_generation(
+            {}, checkpoint_dir, artifact_name, segment_id,
+        ) == 3
+
+    owner = json.loads(
+        (checkpoint_dir / "legacy-generation-owners.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert owner["schema_version"] == (
+        pipeline_module.LEGACY_GENERATION_OWNERS_SCHEMA_VERSION
+    )
+
+    coverage_path = pipeline_module._translation_coverage_attempt_path(
+        checkpoint_dir, segment_id, 3,
+    )
+    coverage_path.parent.mkdir(parents=True, exist_ok=True)
+    coverage_path.write_text(json.dumps({
+        "schema_version": pipeline_module.TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION,
+        "prompt_version": pipeline_module.TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
+        "response_schema_version": (
+            pipeline_module.TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
+        ),
+        "segment_id": segment_id,
+        "input_sha256": "input",
+    }), encoding="utf-8")
+    assert pipeline_module._matching_translation_coverage_attempt(
+        checkpoint_dir, segment_id, "input", 3,
+    ) is not None
+    assert pipeline_module._matching_translation_coverage_attempt(
+        checkpoint_dir, segment_id, "input", 1,
+    ) is None
+
+
+def test_generationless_generation_three_translation_and_commentary_replay(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    checkpoint_dir = tmp_path / "checkpoint"
+    segment = {
+        "segment_id": "seg-owned-replay", "block_ids": ["b1", "b2"],
+        "start_block_id": "b1", "end_block_id": "b2",
+    }
+    segment_id = str(segment["segment_id"])
+    pipeline_module._record_legacy_generation_owners(
+        checkpoint_dir, lane="translation", segment_ids=[segment_id], generation=3,
+    )
+    pipeline_module._record_legacy_generation_owners(
+        checkpoint_dir, lane="companion", segment_ids=[segment_id], generation=3,
+    )
+    translation_calls = 0
+    commentary_calls = 0
+    provider_artifact_dirs: list[Path] = []
+
+    def translation_llm(_prompt: str, **kwargs):
+        nonlocal translation_calls
+        translation_calls += 1
+        provider_artifact_dirs.append(Path(kwargs["artifact_dir"]))
+        return {"blocks": [
+            {"block_id": "b1", "text": "设定"},
+            {"block_id": "b2", "text": "令 x 小于 y 且 y 大于零。"},
+        ]}
+
+    def commentary_llm(_prompt: str, **kwargs):
+        nonlocal commentary_calls
+        commentary_calls += 1
+        provider_artifact_dirs.append(Path(kwargs["artifact_dir"]))
+        return {
+            "explanation": "解释", "prior_work": [], "later_work": [],
+            "commentary": "伴读", "evidence_ids": [], "key_points": [],
+            "source_notes": [],
+        }
+
+    options = BuildOptions(bundle.paper_id, tmp_path, workers=1)
+    pipeline_module._generate_translations(
+        [segment], options=options, bundle=bundle, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir,
+        llm=translation_llm, generation=3,
+    )
+    pipeline_module._generate_annotations(
+        [segment], options=options, bundle=bundle,
+        evidence={"related_papers": []}, domain_context=None,
+        glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=commentary_llm, generation=3,
+    )
+    name = f"{_segment_checkpoint_name(segment_id)}.json"
+    translation_path = checkpoint_dir / "translations" / name
+    annotation_path = checkpoint_dir / "annotations" / name
+    for path in (translation_path, annotation_path):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("generation", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    pipeline_module._generate_translations(
+        [segment], options=options, bundle=bundle, glossary={"entries": []},
+        protected_names=[], checkpoint_dir=checkpoint_dir,
+        llm=translation_llm, generation=3,
+    )
+    pipeline_module._generate_annotations(
+        [segment], options=options, bundle=bundle,
+        evidence={"related_papers": []}, domain_context=None,
+        glossary={"entries": []}, protected_names=[],
+        checkpoint_dir=checkpoint_dir, llm=commentary_llm, generation=3,
+    )
+
+    assert translation_calls == 1
+    assert commentary_calls == 1
+    assert provider_artifact_dirs == [
+        checkpoint_dir / "llm" / "translations" / name.removesuffix(".json"),
+        checkpoint_dir / "llm" / "annotations" / name.removesuffix(".json"),
+    ]
+
+    repair_path = pipeline_module._translation_token_repair_draft_path(
+        checkpoint_dir, segment_id, 3,
+    )
+    repair_path.parent.mkdir(parents=True, exist_ok=True)
+    repair_path.write_text(json.dumps({
+        "schema_version": "arc.companion.translation-token-repair-draft.v1",
+        "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+        "response_schema_version": pipeline_module.TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+        "segment_id": segment_id, "input_sha256": "repair-input",
+        "translation": {"blocks": []},
+        "repair_provenance": {"repair_mode": "offset-only"},
+        "raw_response": {},
+    }), encoding="utf-8")
+    assert pipeline_module._matching_translation_token_repair_draft(
+        checkpoint_dir, segment_id, "repair-input", 3,
+    ) is not None
 
 
 @pytest.mark.parametrize(

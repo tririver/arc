@@ -45,6 +45,7 @@ def enrich_status(project_dir: Path, state: Mapping[str, Any]) -> dict[str, Any]
         last_progress = provider_progress
     lock_owner = inspect_lock(root / ".arc-companion-build.lock")
     phase = str(state.get("status") or "unknown")
+    recovery = _recovery_status(root)
     return {
         **dict(state),
         "current_phase": phase,
@@ -55,6 +56,7 @@ def enrich_status(project_dir: Path, state: Mapping[str, Any]) -> dict[str, Any]
         "pending_calls": pending_calls,
         "last_progress_at": last_progress or state.get("updated_at"),
         "phase_elapsed_seconds": timings,
+        **recovery,
     }
 
 
@@ -130,16 +132,24 @@ def _pending_calls(root: Path, state: Mapping[str, Any]) -> list[dict[str, Any]]
         transaction = None
     if isinstance(transaction, dict):
         action = str(transaction.get("action") or "resume-native")
+        replacements = [
+            dict(item) for item in transaction.get("replacements") or []
+            if isinstance(item, dict)
+        ]
         context_keys = {
             str(item.get("idempotency_key") or "")
             for item in transaction.get("native_resume_contexts") or []
             if isinstance(item, dict)
         }
         for raw in transaction.get("entries") or []:
-            if not isinstance(raw, dict) or raw.get("status") == "resolved":
+            if not isinstance(raw, dict):
                 continue
             entry = dict(raw)
             key = str(entry.get("idempotency_key") or "")
+            if entry.get("status") == "resolved":
+                if key:
+                    result_by_identity.pop(("key", key), None)
+                continue
             session_key = str(entry.get("session_key") or "")
             segment_id = str(entry.get("segment_id") or "")
             ledger_path = Path(str(entry.get("ledger_path") or ""))
@@ -186,6 +196,11 @@ def _pending_calls(root: Path, state: Mapping[str, Any]) -> list[dict[str, Any]]
                 or recovery_context.get("native_session_id")
             )
             existing = result_by_identity.get(identity, {})
+            replacement = next((
+                item for item in replacements
+                if str(item.get("session_key") or "") == session_key
+                and str(item.get("segment_id") or "") == segment_id
+            ), None)
             result_by_identity[identity] = {
                 **existing,
                 "checkpoint": (
@@ -199,15 +214,60 @@ def _pending_calls(root: Path, state: Mapping[str, Any]) -> list[dict[str, Any]]
                 "state": str((ledger_block or {}).get("state") or existing.get("state") or "pending"),
                 "submission_state": submission_state,
                 "recovery_action": (
-                    action if action == "resume-native" and can_resume_native
+                    "restart-generation" if replacement is not None
+                    else action if action == "resume-native" and can_resume_native
+                    else "automatic-recovery" if action == "auto"
                     else "operator-supervision"
                 ),
                 "blocking_reason": blocking_reason,
                 "entry_status": str(entry.get("status") or "pending"),
                 "ledger_path": str(ledger_path),
                 "segment_id": segment_id or None,
+                **(_replacement_fields(replacement) if replacement is not None else {}),
             }
     return list(result_by_identity.values())
+
+
+def _recovery_status(root: Path) -> dict[str, Any]:
+    path = root / ".arc-companion" / "resume-transaction.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    replacements = [
+        _replacement_fields(item)
+        for item in value.get("replacements") or []
+        if isinstance(item, dict)
+    ]
+    return {
+        "recovery_policy": str(
+            value.get("policy")
+            or ("auto" if value.get("action") == "auto" else "manual")
+        ),
+        "recovery_action_history": [
+            dict(item) for item in value.get("action_history") or []
+            if isinstance(item, dict)
+        ],
+        "recovery_replacements": replacements,
+    }
+
+
+def _replacement_fields(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "replacement_id": value.get("replacement_id"),
+        "source_generation": value.get("source_generation"),
+        "target_generation": value.get("target_generation"),
+        "suffix_start_segment_id": value.get("suffix_start_segment_id"),
+        "suffix_segment_ids": list(value.get("suffix_segment_ids") or []),
+        "restart_attempt": value.get("attempt"),
+        "restart_trigger_code": value.get("trigger_code"),
+        "restart_trigger_reason": value.get("trigger_reason"),
+        "possible_duplicate_charge": bool(value.get("possible_duplicate_charge")),
+        "replacement_status": value.get("status"),
+        "abandoned_logical_key": value.get("abandoned_logical_key") or None,
+    }
 
 
 def _pending_ledger_context(

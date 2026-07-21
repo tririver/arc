@@ -66,6 +66,9 @@ Useful flags:
   generation, reuse, migration, projection, prompt context, and output; a
   source Index remains source-only content.
 - `--stop-after-first-chapter`: schedule only the first substantive chapter.
+- `--recovery-policy auto|manual`: automatically recover eligible blocked
+  translation/commentary lanes by default, or retain a supervised stop for an
+  explicit recovery decision.
 - `--domain-id` or `--domain-manifest`: reuse one explicitly named domain;
   companion does not discover or build one.
 
@@ -101,22 +104,30 @@ from the OS advisory lock.
 `render-web` manually rebuilds the static reader from durable checkpoints; it
 does not repeat generation calls. `validate` checks both the PDF and web bundle.
 
-### Step 2: Resume a supervised call
+### Step 2: Recover a blocked call
 
-Routine accepted blocks automatically advance. A timeout, cancellation,
-unknown submitted state, provider failure, or native session loss instead
-returns `needs_supervision`; ARC never automatically repeats an uncertain paid
-call.
+Routine accepted blocks automatically advance. With the default
+`--recovery-policy auto`, ARC first replays durable responses and attempts one
+native session reconciliation. When an eligible translation or commentary call
+cannot be safely reused, ARC automatically starts one replacement generation
+for the affected lane suffix. Possible duplicate charging is recorded in the
+recovery journal.
 
 ```bash
+arc-companion resume --project-dir <dir> --json
 arc-companion resume --project-dir <dir> --action resume-native --json
 arc-companion resume --project-dir <dir> --action restart-generation \
   --confirm-possible-duplicate-charge --json
 ```
 
-Prefer `resume-native` when the recovery context says the provider session is
-resumable. `restart-generation` creates a new generation and requires explicit
-confirmation because an uncertain submitted call may be billed twice.
+The default `auto` action selects automatic recovery, even for a build that
+previously used `--recovery-policy manual`. Explicit
+`resume-native` is strict and does not upgrade to a replacement generation.
+Explicit `restart-generation` remains available after automatic restart budget
+is exhausted and requires confirmation because an uncertain submitted call may
+be billed twice. Cancellation, authentication, quota, rate-limit, missing
+source, local I/O, and uncertain authoritative-identity errors are not hidden
+by automatic generation replacement; they remain in `needs_supervision`.
 
 ### Step 3: Use background review checkpoints
 

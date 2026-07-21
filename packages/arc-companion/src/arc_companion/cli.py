@@ -86,6 +86,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     build.add_argument("--idle-timeout-seconds", type=float, default=None)
     build.add_argument(
+        "--recovery-policy",
+        choices=("auto", "manual"),
+        default="auto",
+        help="recover eligible blocked generation lanes automatically (default: auto)",
+    )
+    build.add_argument(
         "--regenerate", action="append", default=[],
         choices=("segmentation", "glossary", "guide", "translation", "commentary", "review", "all"),
         help="repeat to explicitly regenerate only selected content lanes",
@@ -108,7 +114,9 @@ def main(argv: list[str] | None = None) -> int:
     resume = sub.add_parser("resume", help="Resume a supervised companion generation")
     resume.add_argument("--project-dir", required=True)
     resume.add_argument(
-        "--action", required=True, choices=("resume-native", "restart-generation")
+        "--action",
+        choices=("auto", "resume-native", "restart-generation"),
+        default="auto",
     )
     resume.add_argument(
         "--confirm-possible-duplicate-charge",
@@ -198,6 +206,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 stop_after_first_chapter=args.stop_after_first_chapter,
                 document_kind=args.document_kind,
                 idle_timeout_seconds=args.idle_timeout_seconds,
+                recovery_policy=args.recovery_policy,
                 regenerate_lanes=tuple(args.regenerate),
                 confirm_expensive_regeneration=args.confirm_expensive_regeneration,
                 regenerate_commentary=args.regenerate_commentary,

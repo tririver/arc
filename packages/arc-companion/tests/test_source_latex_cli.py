@@ -516,6 +516,8 @@ def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
         "book",
         "--idle-timeout-seconds",
         "90",
+        "--recovery-policy",
+        "manual",
         "--regenerate-commentary",
         "--legacy-checkpoint",
         str(legacy),
@@ -525,6 +527,7 @@ def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
     assert options.skip_translation is True
     assert options.document_kind == "book"
     assert options.idle_timeout_seconds == 90
+    assert options.recovery_policy == "manual"
     assert options.regenerate_commentary is True
     assert options.legacy_checkpoint == legacy.resolve()
 
@@ -537,6 +540,40 @@ def test_cli_resume_requires_duplicate_charge_confirmation(tmp_path: Path, capsy
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "needs_supervision"
     assert result["error"]["code"] == "duplicate_charge_confirmation_required"
+
+
+def test_cli_defaults_build_recovery_policy_and_resume_action_to_auto(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import arc_companion.pipeline as pipeline_module
+
+    captured: dict[str, object] = {}
+
+    def fake_build(options):
+        captured["recovery_policy"] = options.recovery_policy
+        return {"ok": True, "data": {"status": "complete"}, "meta": {}}
+
+    def fake_resume(project_dir, *, action, confirm_possible_duplicate_charge=False):
+        captured["resume_project_dir"] = project_dir
+        captured["resume_action"] = action
+        captured["resume_confirmation"] = confirm_possible_duplicate_charge
+        return {"ok": True, "data": {"status": "complete"}, "meta": {}}
+
+    monkeypatch.setattr(cli, "build_companion", fake_build)
+    monkeypatch.setattr(pipeline_module, "resume_companion", fake_resume)
+
+    assert cli.main([
+        "build", "local:auto-recovery", "--project-dir", str(tmp_path),
+        "--annotation-language", "en", "--json",
+    ]) == 0
+    assert cli.main([
+        "resume", "--project-dir", str(tmp_path), "--json",
+    ]) == 0
+
+    assert captured["recovery_policy"] == "auto"
+    assert captured["resume_project_dir"] == tmp_path
+    assert captured["resume_action"] == "auto"
+    assert captured["resume_confirmation"] is False
 
 
 def test_cli_prints_structured_evidence_warnings(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -592,6 +629,8 @@ def test_companion_docs_describe_chaptered_stateful_cli_contract() -> None:
     assert "`needs_supervision`" in manual_text
     assert "`--stop-after-first-chapter`" in manual_text
     assert "--action resume-native" in manual_text
+    assert "--recovery-policy auto|manual" in manual_text
+    assert "arc-companion resume --project-dir <dir> --json" in manual_text
     assert "--action restart-generation" in manual_text
     assert "--confirm-possible-duplicate-charge" in manual_text
     assert "after every 30 minutes" in manual_text
@@ -601,7 +640,7 @@ def test_companion_docs_describe_chaptered_stateful_cli_contract() -> None:
     assert "stateful guide session" in workflow_text
     assert "strictly in segment order" in workflow_text
     assert "`--stop-after-first-chapter`" in workflow_text
-    assert "must stop automatic advancement and write `needs_supervision`" in workflow_text
+    assert "remain supervised rather than being masked by replacement" in workflow_text
     assert "after each 30 minutes" in workflow_text
     assert "MCP is not part of this workflow" in workflow_text
     assert "beginning, middle, and end" in workflow_text

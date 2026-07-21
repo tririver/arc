@@ -67,6 +67,8 @@ def test_skip_translation_round_trips_through_recovery_options(tmp_path: Path) -
 
     assert serialized["skip_translation"] is True
     assert recovered.skip_translation is True
+    assert serialized["recovery_policy"] == "auto"
+    assert recovered.recovery_policy == "auto"
 
 
 def test_old_recovery_options_keep_translation_enabled(tmp_path: Path) -> None:
@@ -76,6 +78,25 @@ def test_old_recovery_options_keep_translation_enabled(tmp_path: Path) -> None:
     )
 
     assert recovered.skip_translation is False
+    assert recovered.recovery_policy == "auto"
+
+
+def test_recovery_policy_round_trips_and_validates(tmp_path: Path) -> None:
+    original = BuildOptions(
+        paper_id="local:skip-translation",
+        project_dir=tmp_path,
+        recovery_policy="manual",
+    )
+
+    recovered = _options_from_recovery(tmp_path, _recovery_options(original))
+
+    assert recovered.recovery_policy == "manual"
+    with pytest.raises(ValueError, match="recovery_policy"):
+        BuildOptions(
+            paper_id="local:skip-translation",
+            project_dir=tmp_path,
+            recovery_policy="invalid",
+        )
 
 
 def test_commentary_only_render_has_no_translation_ids_or_tex_markers(tmp_path: Path) -> None:

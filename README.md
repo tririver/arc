@@ -342,11 +342,14 @@ validates the returned title, HTTP(S) URL, and reader-understandable locator
 without a separate evidence-controller rewrite pass. Companion workers do not
 depend on MCP or project-file reading.
 
-Timeout, cancellation, unknown submission state, provider failure, and native
-session loss return `needs_supervision` instead of automatically repeating a
-possibly paid call. Resume explicitly:
+`--recovery-policy auto|manual` controls blocked-call recovery and defaults to
+`auto`. Automatic recovery replays durable responses, attempts native session
+reconciliation, and may start one replacement generation for an eligible
+translation or commentary lane suffix. Bare `resume` selects automatic
+recovery; choose an explicit action for strict/manual behavior:
 
 ```bash
+arc-companion resume --project-dir ./0911.3380-companion --json
 arc-companion resume --project-dir ./0911.3380-companion \
   --action resume-native --json
 arc-companion resume --project-dir ./0911.3380-companion \

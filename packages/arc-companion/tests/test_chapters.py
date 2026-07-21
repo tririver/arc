@@ -163,6 +163,35 @@ def test_lane_ledger_v1_upgrade_preserves_uncertain_submission(tmp_path) -> None
     assert ledger["blocks"][1]["submission_state"] == "submitted"
 
 
+def test_invalidate_suffix_archives_all_suffix_supervision_idempotently(tmp_path) -> None:
+    path = tmp_path / "ledger.json"
+    initialize_lane_ledger(
+        path, chapter_id="ch-0001", lane="translation",
+        segment_ids=["s1", "s2", "s3"],
+    )
+    for state in ("submitted", "response_received", "schema_valid", "invariant_valid", "accepted"):
+        advance_block(path, segment_id="s1", state=state)
+    mark_needs_supervision(
+        path, segment_id="s2", reason="native session missing",
+        recovery_context={"submission_state": "submitted"},
+    )
+    mark_needs_supervision(
+        path, segment_id="s3", reason="invalid paid response",
+        recovery_context={"submission_state": "submitted"},
+    )
+
+    first = invalidate_suffix(path, from_segment_id="s2", generation=2)
+    second = invalidate_suffix(path, from_segment_id="s2", generation=2)
+
+    assert first["needs_supervision"] is None
+    assert first["supervision_entries"] == []
+    assert [item["segment_id"] for item in first["supervision_history"]] == ["s2", "s3"]
+    assert all(item["source_generation"] == 1 for item in first["supervision_history"])
+    assert all(item["target_generation"] == 2 for item in first["supervision_history"])
+    assert all(item["suffix_start_segment_id"] == "s2" for item in first["supervision_history"])
+    assert second["supervision_history"] == first["supervision_history"]
+
+
 def test_scheduler_local_failure_drains_other_active_lane() -> None:
     both_active = threading.Barrier(2)
     release_companion = threading.Event()

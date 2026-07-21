@@ -16,7 +16,7 @@ import threading
 import unicodedata
 import uuid
 from urllib.parse import urlparse
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from bs4 import BeautifulSoup
 from .context_sources import load_context_evidence
@@ -287,6 +287,7 @@ class BuildOptions:
     stop_after_first_chapter: bool = False
     document_kind: str = "auto"
     idle_timeout_seconds: float | None = None
+    recovery_policy: str = "auto"
     regenerate_lanes: tuple[str, ...] = ()
     confirm_expensive_regeneration: bool = False
     regenerate_commentary: bool = False
@@ -306,6 +307,8 @@ class BuildOptions:
             raise ValueError("document_kind must be auto, article, or book")
         if self.idle_timeout_seconds is not None and self.idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be positive")
+        if self.recovery_policy not in {"auto", "manual"}:
+            raise ValueError("recovery_policy must be auto or manual")
         requested_regeneration = tuple(self.regenerate_lanes) + (
             ("commentary",) if self.regenerate_commentary else ()
         )
@@ -367,7 +370,7 @@ def build_companion(
         from arc_llm.cancellation import install_signal_cancel_chain
 
         with install_signal_cancel_chain() as cancel_check:
-            return _build_companion_unlocked(
+            result = _build_companion_unlocked(
                 options,
                 source_loader=source_loader,
                 llm=llm,
@@ -376,6 +379,29 @@ def build_companion(
                 result_llm=result_llm,
                 cancel_check=cancel_check,
             )
+            if (
+                options.recovery_policy == "auto"
+                and isinstance(result, dict)
+                and result.get("status") == "needs_supervision"
+            ):
+                return _resume_companion_unlocked(
+                    options.project_dir.resolve(),
+                    action="auto",
+                    cancel_check=cancel_check,
+                    continuation=lambda recovered_options: _build_companion_unlocked(
+                        recovered_options,
+                        source_loader=source_loader,
+                        llm=llm,
+                        compiler=compiler,
+                        pdf_validator=pdf_validator,
+                        result_llm=result_llm,
+                        cancel_check=cancel_check,
+                    ),
+                    source_preflight=lambda: _preflight_automatic_recovery_source(
+                        options,
+                    ),
+                )
+            return result
     finally:
         lock.release()
 
@@ -558,6 +584,16 @@ def _build_companion_unlocked(
         write_json(checkpoint_dir / "evidence.json", evidence)
         if domain_context is not None:
             write_json(checkpoint_dir / "domain-context.json", domain_context)
+        write_json(checkpoint_dir / "source-snapshot-receipt.json", {
+            "schema_version": "arc.companion.source-snapshot-receipt.v1",
+            "paper_id": bundle.paper_id,
+            "fingerprint": fingerprint,
+            "document_payload_sha256": sha256_json(bundle.parsed),
+            "evidence_sha256": sha256_json(evidence),
+            "domain_context_sha256": (
+                sha256_json(domain_context) if domain_context is not None else None
+            ),
+        })
         if isinstance(bundle.parsed.get("structure"), dict):
             return _build_chaptered_companion(
                 options=options, bundle=bundle, evidence=evidence,
@@ -2114,6 +2150,7 @@ def _build_chaptered_companion(
                     [segment], options=options, bundle=bundle,
                     glossary=segment_glossary, protected_names=protected_names,
                     checkpoint_dir=checkpoint_dir, llm=lane_llm,
+                    generation=block_generation,
                     force_generation="translation" in regeneration or semantic_invalidated,
                 )[segment_id]
             else:
@@ -2123,6 +2160,7 @@ def _build_chaptered_companion(
                     # Only current-block explanations are repeated on delta turns; the
                     # complete source-to-target mapping lives in the generation bootstrap.
                     protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=lane_llm,
+                    generation=block_generation,
                     force_generation="commentary" in regeneration or semantic_invalidated,
                 )[segment_id]
         except BaseException as exc:
@@ -2456,6 +2494,28 @@ def _supervised_lane_ledger_paths(checkpoint_dir: Path) -> list[Path]:
     return paths
 
 
+def _active_supervision_entries(ledger: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return every active marker once, preserving earliest-first lane order."""
+
+    raw = [ledger.get("needs_supervision"), *(ledger.get("supervision_entries") or [])]
+    by_segment: dict[str, dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        segment_id = str(item.get("segment_id") or "")
+        if segment_id and segment_id not in by_segment:
+            by_segment[segment_id] = dict(item)
+    positions = {
+        str(item.get("segment_id") or ""): index
+        for index, item in enumerate(ledger.get("blocks") or [])
+        if isinstance(item, dict)
+    }
+    return sorted(
+        by_segment.values(),
+        key=lambda item: positions.get(str(item.get("segment_id") or ""), len(positions)),
+    )
+
+
 def _all_lane_ledger_paths(checkpoint_dir: Path) -> list[Path]:
     """Find production ledgers regardless of their chapter artifact layout."""
     paths: list[Path] = []
@@ -2624,19 +2684,34 @@ def _finalize_paid_translation_repairs(
                 )
     entries: list[dict[str, Any]] = []
     marker_dir = checkpoint_dir / "translation-token-offset-attempts"
-    for marker_path in sorted(marker_dir.glob("*.json")) if marker_dir.is_dir() else []:
+    for marker_path in sorted(marker_dir.rglob("*.json")) if marker_dir.is_dir() else []:
         marker = _read_checkpoint_json(marker_path)
         if not isinstance(marker, dict) or marker.get("status") not in {
             "response_received", "validated",
         }:
             continue
         segment_id = str(marker.get("segment_id") or "")
+        try:
+            marker_generation = _artifact_payload_generation(
+                marker, checkpoint_dir, "translation-token-offset-attempts",
+                segment_id,
+            )
+        except (TypeError, ValueError):
+            continue
         located = ledgers.get(segment_id)
         if located is None:
             continue
         ledger_path, ledger, ledger_block = located
+        block_generation = int(
+            ledger_block.get("generation") or ledger.get("generation") or 1
+        )
+        if marker_generation != block_generation:
+            continue
         draft = _read_checkpoint_json(
-            checkpoint_dir / "translation-drafts" / marker_path.name
+            _generation_segment_artifact_dir(
+                checkpoint_dir, "translation-drafts", segment_id,
+                marker_generation,
+            ) / marker_path.name
         )
         source_ids = [str(value) for value in marker.get("block_ids") or []]
         raw_response = marker.get("raw_response")
@@ -2740,7 +2815,10 @@ def _finalize_paid_translation_repairs(
             except (RuntimeError, StopIteration) as exc:
                 error = str(exc)
         call_checkpoints = sorted(
-            (checkpoint_dir / "llm" / "translations" / marker_path.stem
+            (_generation_segment_artifact_dir(
+                checkpoint_dir, "llm/translations", segment_id,
+                marker_generation,
+            ) / marker_path.stem
              / "retry-offset-1" / "call-checkpoints").glob("*.json")
         )
         call_checkpoint = next((
@@ -2774,14 +2852,13 @@ def _finalize_paid_translation_repairs(
                 ledger_path, segment_id=segment_id,
                 reason=context["blocked_reason"], recovery_context=context,
             )
-        generation = int(ledger_block.get("generation") or ledger.get("generation") or 1)
         entries.append({
             "ledger_path": str(ledger_path),
             "session_key": f"{ledger.get('chapter_id')}:{ledger.get('lane')}",
             "segment_id": segment_id,
             "idempotency_key": context["idempotency_key"],
-            "initial_generation": generation,
-            "target_generation": generation,
+            "initial_generation": block_generation,
+            "target_generation": block_generation,
             "recovery_action": context["recovery_action"],
             "blocking_reason": context["blocked_reason"] if error else "",
             "recovery_context": context,
@@ -2792,7 +2869,7 @@ def _finalize_paid_translation_repairs(
 def resume_companion(
     project_dir: Path,
     *,
-    action: str,
+    action: str = "auto",
     confirm_possible_duplicate_charge: bool = False,
 ) -> dict[str, Any]:
     """Resolve supervision and continue while retaining the project lock."""
@@ -2828,10 +2905,13 @@ def _resume_companion_unlocked(
     action: str,
     confirm_possible_duplicate_charge: bool = False,
     cancel_check: Callable[[], bool] | None = None,
+    continuation: Callable[[BuildOptions], dict[str, Any]] | None = None,
+    source_preflight: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Mutate supervised state and continue under the caller's project lock."""
-    if action not in {"resume-native", "restart-generation"}:
-        raise ValueError("action must be resume-native or restart-generation")
+    if action not in {"auto", "resume-native", "restart-generation"}:
+        raise ValueError("action must be auto, resume-native, or restart-generation")
+    native_mode = action in {"auto", "resume-native"}
     if action == "restart-generation" and not confirm_possible_duplicate_charge:
         return {
             "ok": False,
@@ -2857,7 +2937,9 @@ def _resume_companion_unlocked(
     state = read_json(state_path)
     if state.get("status") not in {"needs_supervision", "failed"}:
         return err("companion_not_supervised", "The companion build does not need supervision")
-    checkpoint_dir = Path(str(state.get("checkpoint_dir") or ""))
+    active_run = state.get("active_run")
+    active_run = active_run if isinstance(active_run, dict) else {}
+    checkpoint_dir = _checkpoint_dir_from_recovery_state(project_dir, state)
     if not checkpoint_dir.is_dir():
         return err("companion_checkpoint_not_found", "The supervised checkpoint directory is missing")
     from .resume_transaction import (
@@ -2873,11 +2955,33 @@ def _resume_companion_unlocked(
     except ValueError as exc:
         return err("resume_transaction_invalid", str(exc))
     if transaction and transaction.get("status") != "complete":
-        if transaction.get("action") != action:
+        if (
+            action == "restart-generation"
+            and transaction.get("action") == "auto"
+        ):
+            try:
+                from .resume_transaction import authorize_manual_restart
+
+                transaction = authorize_manual_restart(project_dir)
+            except ValueError as exc:
+                return err("resume_transaction_invalid", str(exc))
+        if transaction.get("action") != action and not (
+            action == "auto" and transaction.get("action") == "resume-native"
+        ):
             return err(
                 "resume_transaction_action_mismatch",
                 "An incomplete resume transaction uses a different action",
             )
+        if action == "auto" and transaction.get("action") == "resume-native":
+            try:
+                from .resume_transaction import upgrade_transaction_action
+
+                transaction = upgrade_transaction_action(
+                    project_dir, action="auto", policy="auto",
+                    reason="automatic recovery resumed an incomplete native transaction",
+                )
+            except (ImportError, ValueError) as exc:
+                return err("resume_transaction_invalid", str(exc))
         ledger_paths = {
             Path(str(item["ledger_path"])).resolve(strict=False)
             for item in transaction.get("entries") or []
@@ -2894,6 +2998,8 @@ def _resume_companion_unlocked(
         ledger_paths = {
             path.resolve(strict=False) for path in _all_lane_ledger_paths(checkpoint_dir)
         }
+    if transaction is not None:
+        _backfill_legacy_generation_owners(checkpoint_dir, transaction)
     supervised_ledgers = []
     transaction_paths = {
         str(Path(str(item.get("ledger_path") or "")).resolve(strict=False))
@@ -2905,7 +3011,10 @@ def _resume_companion_unlocked(
         ledger = read_json(path)
         if ledger.get("needs_supervision") or str(path) in transaction_paths:
             supervised_ledgers.append((path, ledger))
-    saved = transaction.get("recovery_options") if transaction else state.get("recovery_options")
+    saved = (
+        transaction.get("recovery_options")
+        if transaction else state.get("recovery_options") or active_run.get("recovery_options")
+    )
     if not isinstance(saved, dict):
         return err(
             "companion_recovery_options_missing",
@@ -2914,59 +3023,73 @@ def _resume_companion_unlocked(
 
     from arc_llm.sessions import LLMSessionManager
     manager = LLMSessionManager(checkpoint_dir / "sessions")
-    native_resume_contexts: list[dict[str, Any]] = list(
+    native_resume_contexts: list[dict[str, Any]] = []
+    for raw_context in (
         transaction.get("native_resume_contexts") or [] if transaction else []
-    )
+    ):
+        context = dict(raw_context)
+        session_key = str(context.get("session_key") or "")
+        ref = manager.get_existing(session_key) if session_key else None
+        ledger_path = Path(str(context.get("ledger_path") or ""))
+        ledger_generation = None
+        if ledger_path.is_file():
+            ledger_generation = int(read_json(ledger_path).get("generation") or 0)
+        if (
+            ref is not None
+            and int(context.get("generation") or 0) == ref.generation
+            and (ledger_generation is None or ledger_generation == ref.generation)
+        ):
+            native_resume_contexts.append(context)
     native_resume_keys: list[str] = [
         str(item["idempotency_key"]) for item in native_resume_contexts
     ]
     blocked_native_entries: dict[tuple[str, str, str], dict[str, Any]] = {}
-    if action == "resume-native":
+    if native_mode:
         for ledger_path, ledger in supervised_ledgers:
-            if not ledger.get("needs_supervision"):
-                continue
-            context = dict(ledger["needs_supervision"].get("recovery_context") or {})
-            session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
-            segment_id = str(ledger["needs_supervision"].get("segment_id") or "")
-            identity = (str(ledger_path.resolve(strict=False)), session_key, segment_id)
-            if str(context.get("idempotency_key") or "") in native_resume_keys:
-                continue
-            if not context.get("idempotency_key"):
-                blocked_native_entries[identity] = {
-                    "blocking_code": "native_resume_idempotency_key_missing",
-                    "blocking_reason": (
-                        f"The supervised call for {session_key} has no logical call key"
-                    ),
-                    "recovery_context": context,
-                }
-                continue
-            if not context.get("resumable") or not (
-                context.get("native_session_id") or manager.has_native_session(session_key)
-            ):
-                blocked_native_entries[identity] = {
-                    "blocking_code": "native_session_not_resumable",
-                    "blocking_reason": (
-                        f"The supervised call for {session_key} has no resumable native session"
-                    ),
-                    "recovery_context": context,
-                }
-                continue
-            try:
-                validated = _validate_native_resume_context(
-                    checkpoint_dir=checkpoint_dir,
-                    ledger_path=ledger_path,
-                    ledger=ledger,
-                    session_manager=manager,
-                )
-            except ValueError as exc:
-                blocked_native_entries[identity] = {
-                    "blocking_code": "native_resume_context_invalid",
-                    "blocking_reason": str(exc),
-                    "recovery_context": context,
-                }
-                continue
-            native_resume_contexts.append(validated)
-            native_resume_keys.append(validated["idempotency_key"])
+            for supervision in _active_supervision_entries(ledger):
+                context = dict(supervision.get("recovery_context") or {})
+                session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+                segment_id = str(supervision.get("segment_id") or "")
+                identity = (str(ledger_path.resolve(strict=False)), session_key, segment_id)
+                if str(context.get("idempotency_key") or "") in native_resume_keys:
+                    continue
+                if not context.get("idempotency_key"):
+                    blocked_native_entries[identity] = {
+                        "blocking_code": "native_resume_idempotency_key_missing",
+                        "blocking_reason": (
+                            f"The supervised call for {session_key} has no logical call key"
+                        ),
+                        "recovery_context": context,
+                    }
+                    continue
+                if not context.get("resumable") or not (
+                    context.get("native_session_id") or manager.has_native_session(session_key)
+                ):
+                    blocked_native_entries[identity] = {
+                        "blocking_code": "native_session_not_resumable",
+                        "blocking_reason": (
+                            f"The supervised call for {session_key} has no resumable native session"
+                        ),
+                        "recovery_context": context,
+                    }
+                    continue
+                try:
+                    validated = _validate_native_resume_context(
+                        checkpoint_dir=checkpoint_dir,
+                        ledger_path=ledger_path,
+                        ledger=ledger,
+                        session_manager=manager,
+                        supervision=supervision,
+                    )
+                except ValueError as exc:
+                    blocked_native_entries[identity] = {
+                        "blocking_code": "native_resume_context_invalid",
+                        "blocking_reason": str(exc),
+                        "recovery_context": context,
+                    }
+                    continue
+                native_resume_contexts.append(validated)
+                native_resume_keys.append(validated["idempotency_key"])
         reconstructed = _reconstruct_unresolved_native_resume_contexts(
             checkpoint_dir,
             session_manager=manager,
@@ -2986,32 +3109,39 @@ def _resume_companion_unlocked(
         for item in (transaction or {}).get("entries") or []
     }
     for path, ledger in supervised_ledgers:
-        supervision = dict(ledger.get("needs_supervision") or {})
-        segment_id = str(supervision.get("segment_id") or "")
-        if not segment_id:
-            # Existing transaction entries remain authoritative after a v1
-            # coordinator cleared supervision too early.
-            continue
-        identity = (
-            str(path.resolve(strict=False)), f"{ledger['chapter_id']}:{ledger['lane']}", segment_id,
-        )
-        if identity in existing_entry_identities:
-            continue
-        generation = int(ledger.get("generation") or 1)
-        entry = {
-            "ledger_path": str(path),
-            "session_key": identity[1],
-            "segment_id": segment_id,
-            "idempotency_key": str(
-                (supervision.get("recovery_context") or {}).get("idempotency_key") or ""
-            ),
-            "initial_generation": generation,
-            "target_generation": generation + (1 if action == "restart-generation" else 0),
-        }
-        entry.update(blocked_native_entries.get(identity) or {})
-        entries.append(entry)
-        existing_entry_identities.add(identity)
-    if action == "resume-native":
+        for supervision in _active_supervision_entries(ledger):
+            segment_id = str(supervision.get("segment_id") or "")
+            if not segment_id:
+                continue
+            identity = (
+                str(path.resolve(strict=False)),
+                f"{ledger['chapter_id']}:{ledger['lane']}", segment_id,
+            )
+            if identity in existing_entry_identities:
+                continue
+            generation = int(ledger.get("generation") or 1)
+            context = dict(supervision.get("recovery_context") or {})
+            entry = {
+                "ledger_path": str(path),
+                "session_key": identity[1],
+                "segment_id": segment_id,
+                "idempotency_key": str(context.get("idempotency_key") or ""),
+                "initial_generation": generation,
+                "target_generation": generation + (
+                    1 if action == "restart-generation" else 0
+                ),
+                "recovery_context": context,
+                "recovery_action": str(
+                    context.get("recovery_action") or ""
+                ),
+                "blocking_reason": str(
+                    supervision.get("reason") or context.get("blocked_reason") or ""
+                ),
+            }
+            entry.update(blocked_native_entries.get(identity) or {})
+            entries.append(entry)
+            existing_entry_identities.add(identity)
+    if native_mode:
         for context in native_resume_contexts:
             ledger_path = str(
                 Path(str(context.get("ledger_path") or "")).resolve(strict=False)
@@ -3059,6 +3189,32 @@ def _resume_companion_unlocked(
             return err("resume_transaction_invalid", str(exc))
     resumed: list[dict[str, Any]] = []
     reconcilable_native_entries = 0
+    manual_restart_groups: dict[str, dict[str, Any]] = {}
+    if action == "restart-generation":
+        for raw in transaction.get("entries") or []:
+            if raw.get("status") == "resolved":
+                continue
+            session_key = str(raw.get("session_key") or "")
+            path = Path(str(raw.get("ledger_path") or ""))
+            if not session_key or not path.is_file():
+                continue
+            ledger = read_json(path)
+            ordered_ids = [
+                str(item.get("segment_id") or "")
+                for item in ledger.get("blocks") or []
+            ]
+            positions = {value: index for index, value in enumerate(ordered_ids)}
+            segment_id = str(raw.get("segment_id") or "")
+            candidate = {
+                "ledger_path": path,
+                "source_generation": int(raw.get("initial_generation") or ledger.get("generation") or 1),
+                "target_generation": int(raw.get("target_generation") or (int(ledger.get("generation") or 1) + 1)),
+                "suffix_start_segment_id": segment_id,
+                "position": positions.get(segment_id, len(ordered_ids)),
+            }
+            current = manual_restart_groups.get(session_key)
+            if current is None or candidate["position"] < current["position"]:
+                manual_restart_groups[session_key] = candidate
     for index, entry in enumerate(transaction.get("entries") or []):
         path = Path(str(entry["ledger_path"]))
         ledger = read_json(path)
@@ -3067,7 +3223,7 @@ def _resume_companion_unlocked(
         if entry.get("status") == "resolved":
             resumed.append(dict(entry))
             continue
-        if action == "resume-native":
+        if native_mode:
             recovery_action = str(entry.get("recovery_action") or "")
             if recovery_action == "deterministic-replay":
                 reconcilable_native_entries += 1
@@ -3099,7 +3255,11 @@ def _resume_companion_unlocked(
                 )
                 mark_entry(
                     project_dir, index,
-                    status=("authorized" if entry.get("status") == "authorized" else "pending"),
+                    status=str(entry.get("status") or "pending"),
+                    blocking_code=str(
+                        blocked.get("blocking_code")
+                        or entry.get("blocking_code") or ""
+                    ),
                     blocking_reason=reason,
                     recovery_context=dict(
                         blocked.get("recovery_context")
@@ -3123,14 +3283,27 @@ def _resume_companion_unlocked(
                     generation=validated["generation"],
                 )
         else:
+            group = manual_restart_groups[session_key]
             ref = manager.get_existing(session_key)
             if ref is None:
                 return err(
                     "native_session_not_found",
                     f"No saved logical session exists for {session_key}",
                 )
-            initial_generation = int(entry["initial_generation"])
-            target_generation = int(entry["target_generation"])
+            initial_generation = int(group["source_generation"])
+            target_generation = int(group["target_generation"])
+            suffix_start = str(group["suffix_start_segment_id"])
+            ordered_ids = [
+                str(item.get("segment_id") or "")
+                for item in ledger.get("blocks") or []
+            ]
+            suffix_position = ordered_ids.index(suffix_start)
+            _record_legacy_generation_owners(
+                checkpoint_dir,
+                lane=session_key.rsplit(":", 1)[-1],
+                segment_ids=ordered_ids[suffix_position:],
+                generation=initial_generation,
+            )
             if ref.generation == initial_generation:
                 ref = manager.rotate(session_key, reason="supervised restart-generation")
             elif ref.generation != target_generation:
@@ -3138,16 +3311,25 @@ def _resume_companion_unlocked(
                     "resume_transaction_generation_mismatch",
                     f"Session {session_key} changed outside the resume transaction",
                 )
-            updated = (
-                invalidate_suffix(path, from_segment_id=segment_id, generation=target_generation)
-                if int(ledger.get("generation") or 0) != target_generation
-                or ledger.get("needs_supervision")
-                else ledger
-            )
+            updated = read_json(path)
+            if not group.get("applied"):
+                updated = (
+                    invalidate_suffix(
+                        path,
+                        from_segment_id=str(group["suffix_start_segment_id"]),
+                        generation=target_generation,
+                    )
+                    if int(updated.get("generation") or 0) != target_generation
+                    or updated.get("needs_supervision")
+                    else updated
+                )
+                group["applied"] = True
             mark_entry(
-                project_dir, index, status="resolved",
+                project_dir, index, status="reconciling",
                 ledger_path=str(path), session_key=session_key,
                 segment_id=segment_id, generation=updated["generation"],
+                target_generation=target_generation,
+                suffix_start_segment_id=str(group["suffix_start_segment_id"]),
             )
             resumed.append(dict(entry))
             continue
@@ -3175,7 +3357,7 @@ def _resume_companion_unlocked(
     mark_transaction(project_dir, "continuing")
 
     options = _options_from_recovery(project_dir.resolve(), saved)
-    if action == "resume-native":
+    if native_mode:
         options = replace(
             options,
             supervised_native_resume_keys=tuple(native_resume_keys),
@@ -3184,19 +3366,26 @@ def _resume_companion_unlocked(
     # that would expose partially coordinated session/ledger mutations. Tests
     # may replace ``build_companion`` with a capture stub, which is safe to call
     # because it does not acquire an OS lock.
-    if build_companion is not _BUILD_COMPANION_ENTRYPOINT:
-        result = build_companion(options)
-    else:
-        result = _build_companion_unlocked(
-            options,
-            source_loader=load_source_bundle,
-            llm=None,
-            compiler=compile_latex,
-            pdf_validator=validate_pdf,
-            result_llm=None,
-            cancel_check=cancel_check,
+    should_continue_native = not (
+        action == "auto" and reconcilable_native_entries == 0
+    )
+    if should_continue_native:
+        result = _continue_supervised_build(
+            options, cancel_check=cancel_check, continuation=continuation,
         )
-    if action == "resume-native":
+    else:
+        result = {
+            "ok": False,
+            "status": "needs_supervision",
+            "data": state,
+            "error": {
+                "code": "native_resume_authorization_missing",
+                "message": "No pending call has a durable native resume authorization",
+            },
+            "errors": [],
+            "meta": {},
+        }
+    if native_mode:
         # Calls submitted by the continuation can finish after an earlier
         # source-order block has failed.  Classify their paid repair responses
         # directly from durable state so none become orphan checkpoints.
@@ -3216,37 +3405,47 @@ def _resume_companion_unlocked(
         discovered_contexts: list[dict[str, Any]] = []
         for path in _all_lane_ledger_paths(checkpoint_dir):
             ledger = read_json(path)
-            supervision = dict(ledger.get("needs_supervision") or {})
-            segment_id = str(supervision.get("segment_id") or "")
             session_key = f"{ledger.get('chapter_id')}:{ledger.get('lane')}"
-            identity = (str(path.resolve(strict=False)), session_key, segment_id)
-            if not segment_id or identity in known:
-                continue
-            context = dict(supervision.get("recovery_context") or {})
-            entry = {
-                "ledger_path": str(path),
-                "session_key": session_key,
-                "segment_id": segment_id,
-                "idempotency_key": str(context.get("idempotency_key") or ""),
-                "initial_generation": int(ledger.get("generation") or 1),
-                "target_generation": int(ledger.get("generation") or 1),
-            }
-            try:
-                discovered_contexts.append(_validate_native_resume_context(
-                    checkpoint_dir=checkpoint_dir,
-                    ledger_path=path,
-                    ledger=ledger,
-                    session_manager=manager,
-                ))
-            except ValueError as exc:
-                entry["blocking_reason"] = str(exc)
-            discovered_entries.append(entry)
+            for supervision in _active_supervision_entries(ledger):
+                segment_id = str(supervision.get("segment_id") or "")
+                identity = (str(path.resolve(strict=False)), session_key, segment_id)
+                if not segment_id or identity in known:
+                    continue
+                context = dict(supervision.get("recovery_context") or {})
+                entry = {
+                    "ledger_path": str(path),
+                    "session_key": session_key,
+                    "segment_id": segment_id,
+                    "idempotency_key": str(context.get("idempotency_key") or ""),
+                    "initial_generation": int(ledger.get("generation") or 1),
+                    "target_generation": int(ledger.get("generation") or 1),
+                    "recovery_context": context,
+                    "recovery_action": str(context.get("recovery_action") or ""),
+                    "blocking_reason": str(
+                        supervision.get("reason") or context.get("blocked_reason") or ""
+                    ),
+                }
+                # Only the primary lane stop is eligible for exact native
+                # validation; additional drained failures remain durable and
+                # are grouped into the same suffix replacement if needed.
+                if supervision == ledger.get("needs_supervision"):
+                    try:
+                        discovered_contexts.append(_validate_native_resume_context(
+                            checkpoint_dir=checkpoint_dir,
+                            ledger_path=path,
+                            ledger=ledger,
+                            session_manager=manager,
+                        ))
+                    except ValueError as exc:
+                        entry["blocking_reason"] = str(exc)
+                discovered_entries.append(entry)
+                known.add(identity)
         if discovered_entries:
             append_entries(
                 project_dir, discovered_entries,
                 native_resume_contexts=discovered_contexts,
             )
-    if action == "resume-native":
+    if native_mode or action == "restart-generation":
         # Supervision is cleared only after the recovered response has been
         # durably validated and accepted into the lane ledger.
         current_transaction = load_transaction(project_dir) or transaction
@@ -3273,6 +3472,81 @@ def _resume_companion_unlocked(
                     ),
                     output_sha256=str(block.get("output_sha256") or ""),
                 )
+    if action == "auto":
+        recovery_journal = load_transaction(project_dir) or transaction
+        prior_replacements = [
+            dict(item) for item in recovery_journal.get("replacements") or []
+            if str(item.get("status") or "") not in {"accepted"}
+        ]
+        prior_exhausted = _finalize_automatic_generation_restarts(
+            project_dir, replacements=prior_replacements,
+        )
+        if prior_exhausted is not None:
+            mark_transaction(project_dir, "continuation_failed")
+            return prior_exhausted
+        reconciled_journal = load_transaction(project_dir) or recovery_journal
+        if (
+            reconciled_journal.get("entries")
+            and all(
+                item.get("status") == "resolved"
+                for item in reconciled_journal.get("entries") or []
+            )
+            and (not isinstance(result, dict) or not result.get("ok"))
+        ):
+            result = _continue_supervised_build(
+                replace(options, supervised_native_resume_keys=()),
+                cancel_check=cancel_check,
+                continuation=continuation,
+            )
+        if source_preflight is not None or (
+            continuation is None and build_companion is _BUILD_COMPANION_ENTRYPOINT
+        ):
+            try:
+                if source_preflight is not None:
+                    source_preflight()
+                else:
+                    _preflight_automatic_recovery_source(options)
+            except (SourceError, OSError) as exc:
+                mark_transaction(project_dir, "continuation_failed")
+                return err(
+                    "companion_source_unavailable",
+                    str(exc),
+                    project_dir=str(project_dir),
+                    automatic_generation_restart=False,
+                )
+        restart = _prepare_automatic_generation_restarts(
+            project_dir,
+            checkpoint_dir=checkpoint_dir,
+            session_manager=manager,
+        )
+        if restart.get("error") is not None:
+            mark_transaction(project_dir, "continuation_failed")
+            return restart["error"]
+        replacements = list(restart.get("replacements") or [])
+        if replacements:
+            options = replace(options, supervised_native_resume_keys=())
+            result = _continue_supervised_build(
+                options, cancel_check=cancel_check, continuation=continuation,
+            )
+            exhausted = _finalize_automatic_generation_restarts(
+                project_dir, replacements=replacements,
+            )
+            if exhausted is not None:
+                mark_transaction(project_dir, "continuation_failed")
+                return exhausted
+            if (
+                isinstance(result, dict)
+                and result.get("status") == "needs_supervision"
+            ):
+                # A replacement continuation may discover a different logical
+                # blocker. Re-enter the same durable transaction so that call
+                # first receives replay/native reconciliation before spending
+                # its own segment restart budget.
+                return _resume_companion_unlocked(
+                    project_dir, action="auto", cancel_check=cancel_check,
+                    continuation=continuation,
+                    source_preflight=source_preflight,
+                )
     # Re-scan after continuation: new submitted/unknown failures join this
     # transaction on the next invocation and remain explicitly supervised.
     final_transaction = load_transaction(project_dir) or transaction
@@ -3289,15 +3563,480 @@ def _resume_companion_unlocked(
     return result
 
 
+_AUTO_RESTART_EXCLUDED_CATEGORIES = {
+    "authentication", "quota", "permission", "rate_limit", "cancelled",
+    "local_io", "invalid_request",
+}
+_AUTO_RESTART_IDENTITY_BLOCKS = {
+    "native_resume_idempotency_key_missing", "native_resume_context_invalid",
+}
+
+
+def _automatic_restart_blocker(entry: Mapping[str, Any]) -> str | None:
+    """Return why an unresolved entry must remain under operator control."""
+
+    session_key = str(entry.get("session_key") or "")
+    lane = session_key.rsplit(":", 1)[-1]
+    if lane not in {"translation", "companion"}:
+        return "automatic recovery only replaces translation and companion lanes"
+    context = entry.get("recovery_context")
+    context = context if isinstance(context, dict) else {}
+    category = str(context.get("failure_category") or "").casefold()
+    if category in _AUTO_RESTART_EXCLUDED_CATEGORIES:
+        return f"failure category {category} is not eligible for generation replacement"
+    blocking_code = str(entry.get("blocking_code") or "")
+    if blocking_code in _AUTO_RESTART_IDENTITY_BLOCKS:
+        return "authoritative logical-call identity could not be confirmed"
+    if not str(entry.get("idempotency_key") or context.get("idempotency_key") or ""):
+        return "authoritative logical-call identity could not be confirmed"
+    return None
+
+
+def _prepare_automatic_generation_restarts(
+    project_dir: Path,
+    *,
+    checkpoint_dir: Path,
+    session_manager: Any,
+) -> dict[str, Any]:
+    """Rotate each affected lane once and invalidate its earliest blocked suffix."""
+
+    from .resume_transaction import (
+        AutomaticRegenerationExhausted,
+        claim_automatic_restart,
+        load_transaction,
+        mark_entry,
+        mark_replacement,
+    )
+
+    transaction = load_transaction(project_dir)
+    if transaction is None:
+        return {"replacements": []}
+    _backfill_legacy_generation_owners(checkpoint_dir, transaction)
+    pending: list[tuple[int, dict[str, Any], Path, dict[str, Any]]] = []
+    blockers: list[str] = []
+    for index, raw in enumerate(transaction.get("entries") or []):
+        entry = dict(raw)
+        if entry.get("status") == "resolved":
+            continue
+        path = Path(str(entry.get("ledger_path") or ""))
+        if not path.is_file():
+            blockers.append(f"lane ledger is missing: {path}")
+            continue
+        ledger = read_json(path)
+        segment_id = str(entry.get("segment_id") or "")
+        block = next((
+            item for item in ledger.get("blocks") or []
+            if str(item.get("segment_id") or "") == segment_id
+        ), None)
+        if isinstance(block, dict) and block.get("state") == "accepted":
+            mark_entry(
+                project_dir, index, status="resolved",
+                accepted_chain_sha256=str(block.get("accepted_chain_sha256") or ""),
+                output_sha256=str(block.get("output_sha256") or ""),
+            )
+            continue
+        reason = _automatic_restart_blocker(entry)
+        if reason is not None:
+            blockers.append(reason)
+            continue
+        pending.append((index, entry, path, ledger))
+    if blockers:
+        return {"replacements": [], "blocked_reasons": blockers}
+    groups: dict[str, list[tuple[int, dict[str, Any], Path, dict[str, Any]]]] = {}
+    for item in pending:
+        groups.setdefault(str(item[1].get("session_key") or ""), []).append(item)
+    replacements: list[dict[str, Any]] = []
+    for session_key, items in sorted(groups.items()):
+        ledger = items[0][3]
+        path = items[0][2]
+        ordered_ids = [str(item.get("segment_id") or "") for item in ledger.get("blocks") or []]
+        positions = {value: index for index, value in enumerate(ordered_ids)}
+        earliest = min(
+            items, key=lambda item: positions.get(str(item[1].get("segment_id") or ""), len(ordered_ids))
+        )
+        earliest_id = str(earliest[1].get("segment_id") or "")
+        source_generation = int(
+            earliest[1].get("initial_generation") or ledger.get("generation") or 1
+        )
+        target_generation = source_generation + 1
+        suffix_ids = ordered_ids[positions[earliest_id]:]
+        ref = session_manager.get_existing(session_key)
+        if ref is None:
+            # Session identity is an authority boundary, not permission to
+            # create a fresh paid generation under guessed provider settings.
+            return {
+                "replacements": replacements,
+                "blocked_reasons": [
+                    f"No saved logical session exists for {session_key}"
+                ],
+            }
+        group_records: list[dict[str, Any]] = []
+        try:
+            for index, entry, _entry_path, _entry_ledger in items:
+                segment_id = str(entry.get("segment_id") or "")
+                context = entry.get("recovery_context")
+                context = context if isinstance(context, dict) else {}
+                record = claim_automatic_restart(
+                    project_dir,
+                    session_key=session_key,
+                    segment_id=segment_id,
+                    ledger_path=path,
+                    source_generation=source_generation,
+                    target_generation=target_generation,
+                    suffix_segment_ids=suffix_ids,
+                    trigger_code=str(
+                        entry.get("blocking_code") or context.get("blocked_reason")
+                        or "generation_restart_required"
+                    ),
+                    trigger_reason=str(
+                        entry.get("blocking_reason") or context.get("blocked_reason")
+                        or "native reconciliation or persisted response could not be accepted"
+                    ),
+                    abandoned_logical_key=str(entry.get("idempotency_key") or ""),
+                    possible_duplicate_charge=str(
+                        context.get("submission_state") or ""
+                    ) in {"submitted", "unknown"},
+                )
+                group_records.append(record)
+                mark_entry(
+                    project_dir, index,
+                    status=str(entry.get("status") or "pending"),
+                    recovery_action="generation_restart_required",
+                    target_generation=target_generation,
+                    replacement_id=record["replacement_id"],
+                )
+        except AutomaticRegenerationExhausted as exc:
+            return {
+                "replacements": replacements,
+                "error": err(
+                    "automatic_regeneration_exhausted", str(exc),
+                    session_key=session_key, segment_id=earliest_id,
+                ),
+            }
+        _record_legacy_generation_owners(
+            checkpoint_dir,
+            lane=session_key.rsplit(":", 1)[-1],
+            segment_ids=suffix_ids,
+            generation=source_generation,
+        )
+        if ref.generation == source_generation:
+            ref = session_manager.rotate(
+                session_key, reason="automatic generation restart",
+            )
+        if ref.generation != target_generation:
+            return {
+                "replacements": replacements,
+                "error": err(
+                    "resume_transaction_generation_mismatch",
+                    f"Session {session_key} changed outside automatic recovery",
+                ),
+            }
+        for record in group_records:
+            if str(record.get("status") or "claimed") == "claimed":
+                record = mark_replacement(
+                    project_dir, record["replacement_id"], status="rotated",
+                    rotated_generation=ref.generation,
+                )
+        current = read_json(path)
+        if int(current.get("generation") or 0) == source_generation:
+            current = invalidate_suffix(
+                path, from_segment_id=earliest_id, generation=target_generation,
+            )
+        if int(current.get("generation") or 0) != target_generation:
+            return {
+                "replacements": replacements,
+                "error": err(
+                    "resume_transaction_generation_mismatch",
+                    f"Lane ledger {path} changed outside automatic recovery",
+                ),
+            }
+        for record in group_records:
+            if str(record.get("status") or "claimed") in {"claimed", "rotated"}:
+                updated = mark_replacement(
+                    project_dir, record["replacement_id"], status="suffix_invalidated",
+                    suffix_start_segment_id=earliest_id,
+                    suffix_segment_ids=suffix_ids,
+                )
+            else:
+                updated = record
+            replacements.append(updated)
+    return {"replacements": replacements}
+
+
+def _finalize_automatic_generation_restarts(
+    project_dir: Path,
+    *,
+    replacements: list[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve originals only after their replacement-generation blocks are accepted."""
+
+    from .resume_transaction import load_transaction, mark_entry, mark_replacement
+
+    transaction = load_transaction(project_dir)
+    if transaction is None:
+        return err("resume_transaction_invalid", "Resume transaction journal is missing")
+    by_replacement = {
+        str(item.get("replacement_id") or ""): (index, dict(item))
+        for index, item in enumerate(transaction.get("entries") or [])
+        if item.get("replacement_id")
+    }
+    exhausted_result: dict[str, Any] | None = None
+    for raw in replacements:
+        replacement_id = str(raw.get("replacement_id") or "")
+        located = by_replacement.get(replacement_id)
+        if located is None:
+            continue
+        index, entry = located
+        path = Path(str(entry.get("ledger_path") or raw.get("ledger_path") or ""))
+        if not path.is_file():
+            continue
+        ledger = read_json(path)
+        block = next((
+            item for item in ledger.get("blocks") or []
+            if str(item.get("segment_id") or "") == str(entry.get("segment_id") or "")
+        ), None)
+        target_generation = int(raw.get("target_generation") or 0)
+        if (
+            isinstance(block, dict)
+            and int(block.get("generation") or 0) == target_generation
+            and block.get("state") == "accepted"
+        ):
+            mark_entry(
+                project_dir, index, status="resolved",
+                accepted_chain_sha256=str(block.get("accepted_chain_sha256") or ""),
+                output_sha256=str(block.get("output_sha256") or ""),
+            )
+            mark_replacement(
+                project_dir, replacement_id, status="accepted",
+                accepted_chain_sha256=str(block.get("accepted_chain_sha256") or ""),
+                output_sha256=str(block.get("output_sha256") or ""),
+            )
+            continue
+        if (
+            isinstance(block, dict)
+            and int(block.get("generation") or 0) == target_generation
+            and block.get("state") in {
+                "response_received", "schema_valid", "formula_valid", "token_valid",
+            }
+            and str(raw.get("status") or "") in {
+                "claimed", "rotated", "suffix_invalidated",
+            }
+        ):
+            mark_replacement(
+                project_dir, replacement_id, status="response_persisted",
+                block_state=str(block.get("state") or ""),
+            )
+        matching_supervision = next((
+            item for item in _active_supervision_entries(ledger)
+            if str(item.get("segment_id") or "")
+            == str(entry.get("segment_id") or "")
+        ), None)
+        if (
+            matching_supervision is not None
+            and int(ledger.get("generation") or 0) == target_generation
+        ):
+            mark_replacement(
+                project_dir, replacement_id, status="failed",
+                failure_reason=str(
+                    matching_supervision.get("reason")
+                    or "replacement failed validation"
+                ),
+            )
+            if exhausted_result is None:
+                exhausted_result = err(
+                    "automatic_regeneration_exhausted",
+                    f"automatic replacement failed for {entry.get('session_key')}:{entry.get('segment_id')}",
+                    session_key=entry.get("session_key"),
+                    segment_id=entry.get("segment_id"),
+                    target_generation=target_generation,
+                )
+    return exhausted_result
+
+
+def _continue_supervised_build(
+    options: BuildOptions,
+    *,
+    cancel_check: Callable[[], bool] | None,
+    continuation: Callable[[BuildOptions], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Continue a build without releasing the already-held project lock."""
+
+    if continuation is not None:
+        return continuation(options)
+    if build_companion is not _BUILD_COMPANION_ENTRYPOINT:
+        return build_companion(options)
+    return _build_companion_unlocked(
+        options,
+        source_loader=lambda paper_id, **kwargs: _load_recovery_source_bundle(
+            options, paper_id=paper_id, load_kwargs=kwargs,
+        ),
+        llm=None,
+        compiler=compile_latex,
+        pdf_validator=validate_pdf,
+        result_llm=None,
+        cancel_check=cancel_check,
+    )
+
+
+def _load_recovery_source_bundle(
+    options: BuildOptions,
+    *,
+    paper_id: str,
+    load_kwargs: Mapping[str, Any],
+) -> SourceBundle:
+    """Load source normally, or verify and reuse the immutable build snapshot."""
+
+    try:
+        return load_source_bundle(paper_id, **dict(load_kwargs))
+    except SourceError as original_error:
+        state = _read_optional_json(options.project_dir.resolve() / "state.json")
+        active_run = state.get("active_run")
+        active_run = active_run if isinstance(active_run, dict) else {}
+        checkpoint_dir = _checkpoint_dir_from_recovery_state(
+            options.project_dir.resolve(), state,
+        )
+        payload = _read_checkpoint_json(checkpoint_dir / "document.json")
+        evidence = _read_checkpoint_json(checkpoint_dir / "evidence.json")
+        if not (
+            isinstance(payload, dict)
+            and str(payload.get("paper_id") or "") == paper_id
+            and isinstance(payload.get("document"), dict)
+            and isinstance(evidence, dict)
+        ):
+            raise original_error
+        document = dict(payload["document"])
+        integrity = document.get("integrity")
+        if not isinstance(integrity, dict) or integrity.get("status") != "complete":
+            raise original_error
+        source = document.get("source")
+        source = source if isinstance(source, dict) else {}
+        front_matter = document.get("front_matter")
+        front_matter = front_matter if isinstance(front_matter, dict) else {}
+        metadata = {
+            "title": str(
+                front_matter.get("title") or source.get("title") or paper_id
+            ),
+            "_arc_companion_metadata_source": "checkpoint_snapshot",
+        }
+        bundle = SourceBundle(
+            paper_id=paper_id,
+            parsed=dict(payload),
+            document=document,
+            metadata=metadata,
+            references=[
+                dict(item) for item in evidence.get("references") or []
+                if isinstance(item, dict)
+            ],
+            citers=[
+                dict(item) for item in evidence.get("citers") or []
+                if isinstance(item, dict)
+            ],
+            diagnostics=tuple(
+                dict(item) for item in evidence.get("diagnostics") or []
+                if isinstance(item, dict)
+            ),
+            related_evidence=tuple(
+                dict(item) for item in evidence.get("related_papers") or []
+                if isinstance(item, dict)
+            ),
+        )
+        expected_fingerprint = str(
+            state.get("fingerprint") or active_run.get("fingerprint") or checkpoint_dir.name
+        )
+        actual_fingerprint = _fingerprint(
+            bundle, options, evidence=_evidence(bundle), domain_context=None,
+        )
+        if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
+            raise SourceError(
+                "The cached source is unavailable and the checkpoint snapshot "
+                "does not match the authoritative build fingerprint"
+            ) from original_error
+        receipt = _read_checkpoint_json(
+            checkpoint_dir / "source-snapshot-receipt.json"
+        )
+        if receipt is not None:
+            domain_context = _read_checkpoint_json(
+                checkpoint_dir / "domain-context.json"
+            )
+            if not (
+                isinstance(receipt, dict)
+                and receipt.get("schema_version")
+                == "arc.companion.source-snapshot-receipt.v1"
+                and receipt.get("paper_id") == paper_id
+                and receipt.get("fingerprint") == expected_fingerprint
+                and receipt.get("document_payload_sha256") == sha256_json(payload)
+                and receipt.get("evidence_sha256") == sha256_json(evidence)
+                and receipt.get("domain_context_sha256") == (
+                    sha256_json(domain_context) if domain_context is not None else None
+                )
+            ):
+                raise SourceError(
+                    "The checkpoint source snapshot receipt is invalid or changed"
+                ) from original_error
+        return bundle
+
+
+def _preflight_automatic_recovery_source(options: BuildOptions) -> None:
+    """Prove source authority before spending any replacement budget."""
+
+    _load_recovery_source_bundle(
+        options,
+        paper_id=options.paper_id,
+        load_kwargs={
+            "refresh": options.refresh,
+            "recache": options.recache,
+            "document_kind": options.document_kind,
+        },
+    )
+
+
+def _checkpoint_dir_from_recovery_state(
+    project_dir: Path, state: Mapping[str, Any],
+) -> Path:
+    """Recover the checkpoint root even after a failed state write lost pointers."""
+
+    active_run = state.get("active_run")
+    active_run = active_run if isinstance(active_run, dict) else {}
+    saved = str(
+        state.get("checkpoint_dir") or active_run.get("checkpoint_dir") or ""
+    )
+    if saved:
+        candidate = Path(saved)
+        if candidate.is_dir():
+            return candidate
+    transaction = _read_checkpoint_json(
+        project_dir / ".arc-companion" / "resume-transaction.json"
+    )
+    if isinstance(transaction, dict):
+        for entry in transaction.get("entries") or []:
+            if not isinstance(entry, dict) or not entry.get("ledger_path"):
+                continue
+            ledger_path = Path(str(entry["ledger_path"])).resolve(strict=False)
+            try:
+                candidate = ledger_path.parents[2]
+            except IndexError:
+                continue
+            if (
+                candidate.is_dir()
+                and (candidate / "document.json").is_file()
+                and (candidate / "sessions").is_dir()
+            ):
+                return candidate
+    return Path(saved)
+
+
 def _validate_native_resume_context(
     *,
     checkpoint_dir: Path,
     ledger_path: Path,
     ledger: dict[str, Any],
     session_manager: Any,
+    supervision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    supervision = dict(ledger.get("needs_supervision") or {})
-    context = dict(supervision.get("recovery_context") or {})
+    active_supervision = dict(
+        supervision if supervision is not None else ledger.get("needs_supervision") or {}
+    )
+    context = dict(active_supervision.get("recovery_context") or {})
     session_key = f"{ledger.get('chapter_id')}:{ledger.get('lane')}"
     ref = session_manager.get_existing(session_key)
     if ref is None:
@@ -3343,6 +4082,8 @@ def _validate_native_resume_context(
             "runtime_fingerprint": ref.runtime_fingerprint,
             "generation": ref.generation,
             "native_session_id_to_restore": None,
+            "ledger_path": str(ledger_path),
+            "segment_id": str(active_supervision.get("segment_id") or ""),
         }
     if str(context_session_key or "") != session_key or context_generation is None:
         raise ValueError(f"The recovery context for {session_key} lacks exact session identity")
@@ -3393,6 +4134,7 @@ def _validate_native_resume_context(
         "generation": ref.generation,
         "native_session_id_to_restore": fresh.native_session_id,
         "ledger_path": str(ledger_path),
+        "segment_id": str(active_supervision.get("segment_id") or ""),
     }
 
 
@@ -3575,6 +4317,10 @@ def _restore_native_session_id(session_manager: Any, validated: dict[str, Any], 
 
 
 def _recovery_context_json(context: Any) -> dict[str, Any]:
+    checkpoint = (
+        _read_checkpoint_json(context.checkpoint_path)
+        if context.checkpoint_path else None
+    )
     return {
         "idempotency_key": context.idempotency_key,
         "checkpoint_path": str(context.checkpoint_path) if context.checkpoint_path else None,
@@ -3589,6 +4335,10 @@ def _recovery_context_json(context: Any) -> dict[str, Any]:
         "provider": context.provider,
         "model": context.model,
         "runtime_fingerprint": context.runtime_fingerprint,
+        "failure_category": (
+            str(checkpoint.get("failure_category") or "")
+            if isinstance(checkpoint, dict) else ""
+        ),
     }
 
 
@@ -3610,6 +4360,7 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "stop_after_first_chapter": options.stop_after_first_chapter,
         "document_kind": options.document_kind,
         "idle_timeout_seconds": options.idle_timeout_seconds,
+        "recovery_policy": options.recovery_policy,
         "regenerate_lanes": list(options.regenerate_lanes),
         "confirm_expensive_regeneration": options.confirm_expensive_regeneration,
         "regenerate_commentary": options.regenerate_commentary,
@@ -3636,6 +4387,7 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
         document_kind=str(value.get("document_kind") or "auto"),
         idle_timeout_seconds=value.get("idle_timeout_seconds"),
+        recovery_policy=str(value.get("recovery_policy") or "auto"),
         regenerate_lanes=tuple(value.get("regenerate_lanes") or ()),
         confirm_expensive_regeneration=bool(value.get("confirm_expensive_regeneration")),
         regenerate_commentary=bool(value.get("regenerate_commentary")),
@@ -4113,6 +4865,7 @@ def _generate_annotations(
     protected_names: list[str],
     checkpoint_dir: Path,
     llm: Callable[..., dict[str, Any]],
+    generation: int = 1,
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     force_generation: bool = False,
 ) -> dict[str, dict[str, Any]]:
@@ -4124,13 +4877,15 @@ def _generate_annotations(
         )
         for segment in segments
     }
-    annotation_dir = checkpoint_dir / "annotations"
     segment_evidence_dir = checkpoint_dir / "segment-evidence"
-    annotation_dir.mkdir(parents=True, exist_ok=True)
     segment_evidence_dir.mkdir(parents=True, exist_ok=True)
     output: dict[str, dict[str, Any]] = {}
     pending: list[dict[str, Any]] = []
     for segment in segments:
+        annotation_dir = _generation_segment_artifact_dir(
+            checkpoint_dir, "annotations", str(segment["segment_id"]), generation,
+        )
+        annotation_dir.mkdir(parents=True, exist_ok=True)
         path = annotation_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json"
         segment_evidence = segment_evidence_by_id[str(segment["segment_id"])]
         segment_glossary = (
@@ -4169,6 +4924,10 @@ def _generate_annotations(
                 isinstance(checkpoint, dict)
                 and checkpoint.get("schema_version") == ANNOTATION_CHECKPOINT_VERSION
                 and checkpoint.get("segment_id") == segment["segment_id"]
+                and _artifact_payload_generation(
+                    checkpoint, checkpoint_dir, "annotations",
+                    str(segment["segment_id"]),
+                ) == generation
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("annotation"), dict)
             ):
@@ -4219,7 +4978,10 @@ def _generate_annotations(
             ANNOTATION_SCHEMA,
             options=options,
             artifact_dir=(
-                checkpoint_dir / "llm" / "annotations"
+                _generation_segment_artifact_dir(
+                    checkpoint_dir, "llm/annotations",
+                    str(segment["segment_id"]), generation,
+                )
                 / _segment_checkpoint_name(segment["segment_id"])
             ),
             call_label=f"companion-annotation-{segment['segment_id']}",
@@ -4249,10 +5011,13 @@ def _generate_annotations(
                 output[segment_id] = value
                 segment = next(item for item in segments if item["segment_id"] == segment_id)
                 write_json(
-                    annotation_dir / f"{_segment_checkpoint_name(segment_id)}.json",
+                    _generation_segment_artifact_dir(
+                        checkpoint_dir, "annotations", segment_id, generation,
+                    ) / f"{_segment_checkpoint_name(segment_id)}.json",
                     {
                         "schema_version": ANNOTATION_CHECKPOINT_VERSION,
                         "segment_id": segment_id,
+                        "generation": generation,
                         "input_sha256": _segment_input_hash(
                             segment,
                             by_id,
@@ -4467,14 +5232,143 @@ def _deduplicate_evidence_records(
     return output
 
 
-def _translation_draft_path(checkpoint_dir: Path, segment_id: str) -> Path:
-    return checkpoint_dir / "translation-drafts" / f"{_segment_checkpoint_name(segment_id)}.json"
+LEGACY_GENERATION_OWNERS_SCHEMA_VERSION = (
+    "arc.companion.legacy-generation-owners.v1"
+)
 
 
-def _translation_coverage_attempt_path(checkpoint_dir: Path, segment_id: str) -> Path:
+def _legacy_generation_owners_path(checkpoint_dir: Path) -> Path:
+    return checkpoint_dir / "legacy-generation-owners.json"
+
+
+def _legacy_generation_owner(
+    checkpoint_dir: Path, artifact_name: str, segment_id: str,
+) -> int | None:
+    value = _read_checkpoint_json(_legacy_generation_owners_path(checkpoint_dir))
+    if not isinstance(value, dict):
+        return None
+    owners = value.get("owners")
+    if not isinstance(owners, dict):
+        return None
+    artifact_owners = owners.get(artifact_name)
+    if not isinstance(artifact_owners, dict):
+        return None
+    try:
+        owner = int(artifact_owners.get(segment_id) or 0)
+    except (TypeError, ValueError):
+        return None
+    return owner if owner > 0 else None
+
+
+def _artifact_payload_generation(
+    value: Mapping[str, Any],
+    checkpoint_dir: Path,
+    artifact_name: str,
+    segment_id: str,
+) -> int:
+    """Resolve missing legacy payload generations through durable ownership."""
+
+    if value.get("generation") is not None:
+        return int(value["generation"])
+    return _legacy_generation_owner(
+        checkpoint_dir, artifact_name, segment_id,
+    ) or 1
+
+
+def _record_legacy_generation_owners(
+    checkpoint_dir: Path,
+    *,
+    lane: str,
+    segment_ids: list[str],
+    generation: int,
+) -> dict[str, Any]:
+    """Bind generationless artifacts before rotating their lane generation."""
+
+    path = _legacy_generation_owners_path(checkpoint_dir)
+    current = _read_checkpoint_json(path)
+    value = dict(current) if isinstance(current, dict) else {}
+    owners = {
+        str(kind): dict(items)
+        for kind, items in (value.get("owners") or {}).items()
+        if isinstance(items, dict)
+    }
+    artifact_names = (
+        (
+            "translations", "translation-drafts",
+            "translation-coverage-attempts",
+            "translation-token-offset-attempts", "translation-token-attempts",
+            "translation-token-offset-repair-drafts", "llm/translations",
+        )
+        if lane == "translation"
+        else ("annotations", "llm/annotations")
+    )
+    for artifact_name in artifact_names:
+        artifact_owners = owners.setdefault(artifact_name, {})
+        for segment_id in segment_ids:
+            # The first durable attribution wins: a later crash replay or
+            # manual override must not relabel an abandoned generation.
+            artifact_owners.setdefault(str(segment_id), int(generation))
+    value.update({
+        "schema_version": LEGACY_GENERATION_OWNERS_SCHEMA_VERSION,
+        "owners": owners,
+    })
+    write_json(path, value)
+    return value
+
+
+def _backfill_legacy_generation_owners(
+    checkpoint_dir: Path, transaction: Mapping[str, Any],
+) -> None:
+    """Recover owner metadata after a crash that already persisted rotation."""
+
+    for raw in transaction.get("replacements") or []:
+        if not isinstance(raw, dict):
+            continue
+        session_key = str(raw.get("session_key") or "")
+        suffix_ids = [str(value) for value in raw.get("suffix_segment_ids") or []]
+        try:
+            source_generation = int(raw.get("source_generation") or 0)
+        except (TypeError, ValueError):
+            continue
+        if session_key and suffix_ids and source_generation > 0:
+            _record_legacy_generation_owners(
+                checkpoint_dir,
+                lane=session_key.rsplit(":", 1)[-1],
+                segment_ids=suffix_ids,
+                generation=source_generation,
+            )
+
+
+def _generation_segment_artifact_dir(
+    checkpoint_dir: Path,
+    artifact_name: str,
+    segment_id: str,
+    generation: int,
+) -> Path:
+    """Resolve a segment artifact using its persisted generationless owner."""
+
+    owner = _legacy_generation_owner(checkpoint_dir, artifact_name, segment_id)
+    base = checkpoint_dir / artifact_name
+    if owner == generation or (owner is None and generation == 1):
+        return base
+    return base / f"generation-{generation}"
+
+
+def _translation_draft_path(
+    checkpoint_dir: Path, segment_id: str, generation: int = 1,
+) -> Path:
+    return _generation_segment_artifact_dir(
+        checkpoint_dir, "translation-drafts", segment_id, generation,
+    ) / f"{_segment_checkpoint_name(segment_id)}.json"
+
+
+def _translation_coverage_attempt_path(
+    checkpoint_dir: Path, segment_id: str, generation: int = 1,
+) -> Path:
     return (
-        checkpoint_dir
-        / "translation-coverage-attempts"
+        _generation_segment_artifact_dir(
+            checkpoint_dir, "translation-coverage-attempts", segment_id, generation,
+        )
         / f"{_segment_checkpoint_name(segment_id)}.json"
     )
 
@@ -4486,8 +5380,9 @@ TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION = (
 
 def _matching_translation_coverage_attempt(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
+    generation: int = 1,
 ) -> dict[str, Any] | None:
-    path = _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+    path = _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation)
     value = _read_checkpoint_json(path)
     if (
         isinstance(value, dict)
@@ -4497,6 +5392,9 @@ def _matching_translation_coverage_attempt(
         == TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
+        and _artifact_payload_generation(
+            value, checkpoint_dir, "translation-coverage-attempts", segment_id,
+        ) == generation
     ):
         return value
     return None
@@ -4504,10 +5402,11 @@ def _matching_translation_coverage_attempt(
 
 def _matching_legacy_translation_coverage_attempt(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
+    generation: int = 1,
 ) -> dict[str, Any] | None:
     """Return the v1 marker whose response could not be persisted for replay."""
     value = _read_checkpoint_json(
-        _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+        _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation)
     )
     if (
         isinstance(value, dict)
@@ -4517,25 +5416,32 @@ def _matching_legacy_translation_coverage_attempt(
         == TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
+        and _artifact_payload_generation(
+            value, checkpoint_dir, "translation-coverage-attempts", segment_id,
+        ) == generation
     ):
         return value
     return None
 
 
-def _translation_token_attempt_path(checkpoint_dir: Path, segment_id: str) -> Path:
+def _translation_token_attempt_path(
+    checkpoint_dir: Path, segment_id: str, generation: int = 1,
+) -> Path:
     return (
-        checkpoint_dir
-        / "translation-token-offset-attempts"
+        _generation_segment_artifact_dir(
+            checkpoint_dir, "translation-token-offset-attempts", segment_id, generation,
+        )
         / f"{_segment_checkpoint_name(segment_id)}.json"
     )
 
 
 def _legacy_translation_token_attempt_path(
-    checkpoint_dir: Path, segment_id: str,
+    checkpoint_dir: Path, segment_id: str, generation: int = 1,
 ) -> Path:
     return (
-        checkpoint_dir
-        / "translation-token-attempts"
+        _generation_segment_artifact_dir(
+            checkpoint_dir, "translation-token-attempts", segment_id, generation,
+        )
         / f"{_segment_checkpoint_name(segment_id)}.json"
     )
 
@@ -4550,8 +5456,9 @@ def _read_checkpoint_json(path: Path) -> Any | None:
 
 def _matching_translation_token_attempt(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
+    generation: int = 1,
 ) -> dict[str, Any] | None:
-    path = _translation_token_attempt_path(checkpoint_dir, segment_id)
+    path = _translation_token_attempt_path(checkpoint_dir, segment_id, generation)
     value = _read_checkpoint_json(path)
     if (
         isinstance(value, dict)
@@ -4559,6 +5466,9 @@ def _matching_translation_token_attempt(
         and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
+        and _artifact_payload_generation(
+            value, checkpoint_dir, "translation-token-offset-attempts", segment_id,
+        ) == generation
     ):
         return value
     return None
@@ -4566,15 +5476,19 @@ def _matching_translation_token_attempt(
 
 def _matching_superseded_translation_text_attempt(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
+    generation: int = 1,
 ) -> dict[str, Any] | None:
     """Return a same-input legacy text repair for audit and low-rerun guards."""
     value = _read_checkpoint_json(
-        _legacy_translation_token_attempt_path(checkpoint_dir, segment_id)
+        _legacy_translation_token_attempt_path(checkpoint_dir, segment_id, generation)
     )
     if (
         isinstance(value, dict)
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
+        and _artifact_payload_generation(
+            value, checkpoint_dir, "translation-token-attempts", segment_id,
+        ) == generation
         and str(value.get("prompt_version") or "") in {
             "arc.companion.translation-retry-prompt.v3",
             "arc.companion.translation-retry-prompt.v4",
@@ -4586,12 +5500,14 @@ def _matching_superseded_translation_text_attempt(
 
 def _guard_translation_token_attempt_before_primary(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
+    generation: int = 1,
 ) -> dict[str, Any] | None:
     """Fail closed on an unreadable or malformed current marker before low work."""
-    path = _translation_token_attempt_path(checkpoint_dir, segment_id)
+    path = _translation_token_attempt_path(checkpoint_dir, segment_id, generation)
     if not path.is_file():
         return _matching_superseded_translation_text_attempt(
             checkpoint_dir, segment_id, input_sha256,
+            generation,
         )
     value = _read_checkpoint_json(path)
     if not isinstance(value, dict):
@@ -4610,6 +5526,9 @@ def _guard_translation_token_attempt_before_primary(
         and value.get("prompt_version") == TRANSLATION_RETRY_PROMPT_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
+        and _artifact_payload_generation(
+            value, checkpoint_dir, "translation-token-offset-attempts", segment_id,
+        ) == generation
     ):
         raise RuntimeError(
             f"translation token repair marker has malformed current identity for {segment_id}; "
@@ -4619,19 +5538,23 @@ def _guard_translation_token_attempt_before_primary(
 
 
 def _translation_token_repair_draft_path(
-    checkpoint_dir: Path, segment_id: str,
+    checkpoint_dir: Path, segment_id: str, generation: int = 1,
 ) -> Path:
     return (
-        checkpoint_dir
-        / "translation-token-offset-repair-drafts"
+        _generation_segment_artifact_dir(
+            checkpoint_dir, "translation-token-offset-repair-drafts", segment_id, generation,
+        )
         / f"{_segment_checkpoint_name(segment_id)}.json"
     )
 
 
 def _matching_translation_token_repair_draft(
     checkpoint_dir: Path, segment_id: str, input_sha256: str,
+    generation: int = 1,
 ) -> dict[str, Any] | None:
-    path = _translation_token_repair_draft_path(checkpoint_dir, segment_id)
+    path = _translation_token_repair_draft_path(
+        checkpoint_dir, segment_id, generation,
+    )
     value = _read_checkpoint_json(path)
     if (
         isinstance(value, dict)
@@ -4641,6 +5564,10 @@ def _matching_translation_token_repair_draft(
         == TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION
         and value.get("segment_id") == segment_id
         and value.get("input_sha256") == input_sha256
+        and _artifact_payload_generation(
+            value, checkpoint_dir,
+            "translation-token-offset-repair-drafts", segment_id,
+        ) == generation
         and isinstance(value.get("translation"), dict)
         and isinstance(value.get("repair_provenance"), dict)
         and value["repair_provenance"].get("repair_mode") == "offset-only"
@@ -4658,12 +5585,16 @@ def _write_validated_translation_token_marker(
     repaired: dict[str, Any],
     raw_response: dict[str, Any],
     repaired_block_ids: list[str],
+    generation: int = 1,
     prior_marker: dict[str, Any] | None = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    write_json(_translation_token_attempt_path(checkpoint_dir, segment_id), {
+    write_json(_translation_token_attempt_path(
+        checkpoint_dir, segment_id, generation,
+    ), {
         "schema_version": "arc.companion.translation-token-attempt.v2",
         "segment_id": segment_id,
+        "generation": generation,
         "input_sha256": input_sha256,
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
         "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
@@ -4718,11 +5649,13 @@ def _translation_primary_draft_payload(
     *,
     input_sha256: str,
     origin: str,
+    generation: int = 1,
 ) -> dict[str, Any]:
     model_generated = origin == "primary-model"
     return {
         "schema_version": "arc.companion.translation-primary-draft.v1",
         "segment_id": str(segment["segment_id"]),
+        "generation": generation,
         "input_sha256": input_sha256,
         "candidate_provenance": {
             "origin": origin,
@@ -4742,6 +5675,7 @@ def _seed_translation_coverage_draft(
     glossary: dict[str, Any],
     protected_names: list[str],
     checkpoint_dir: Path,
+    generation: int = 1,
     translation: dict[str, Any] | None = None,
 ) -> Path:
     """Seed an auditable repair-only candidate without invoking the primary model."""
@@ -4762,7 +5696,9 @@ def _seed_translation_coverage_draft(
             "runtime_access": _generation_runtime_policy(options),
         },
     )
-    path = _translation_draft_path(checkpoint_dir, str(segment["segment_id"]))
+    path = _translation_draft_path(
+        checkpoint_dir, str(segment["segment_id"]), generation,
+    )
     write_json(
         path,
         _translation_primary_draft_payload(
@@ -4770,6 +5706,7 @@ def _seed_translation_coverage_draft(
             translation or {"blocks": []},
             input_sha256=input_sha256,
             origin="controller-seed",
+            generation=generation,
         ),
     )
     return path
@@ -4802,6 +5739,7 @@ def _repair_translation_token_placement(
     artifact_dir: Path,
     input_sha256: str,
     llm: Callable[..., dict[str, Any]],
+    generation: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the single lifetime-bounded token-placement repair for a segment input."""
     segment_id = str(segment["segment_id"])
@@ -4812,10 +5750,10 @@ def _repair_translation_token_placement(
             f"translation token repair has no structurally failing blocks for {segment_id}"
         )
     repair_draft_path = _translation_token_repair_draft_path(
-        checkpoint_dir, segment_id,
+        checkpoint_dir, segment_id, generation,
     )
     persisted = _matching_translation_token_repair_draft(
-        checkpoint_dir, segment_id, input_sha256,
+        checkpoint_dir, segment_id, input_sha256, generation,
     )
     invalid_persisted_draft = False
     if persisted is not None:
@@ -4834,7 +5772,7 @@ def _repair_translation_token_placement(
             invalid_persisted_draft = True
         else:
             prior_marker = _read_checkpoint_json(
-                _translation_token_attempt_path(checkpoint_dir, segment_id)
+                _translation_token_attempt_path(checkpoint_dir, segment_id, generation)
             )
             _write_validated_translation_token_marker(
                 checkpoint_dir,
@@ -4845,10 +5783,13 @@ def _repair_translation_token_placement(
                 repaired_block_ids=list(
                     persisted["repair_provenance"].get("repaired_block_ids") or []
                 ),
+                generation=generation,
                 prior_marker=prior_marker if isinstance(prior_marker, dict) else None,
             )
             return repaired, dict(persisted["repair_provenance"])
-    attempt_path = _translation_token_attempt_path(checkpoint_dir, segment_id)
+    attempt_path = _translation_token_attempt_path(
+        checkpoint_dir, segment_id, generation,
+    )
     raw_attempt = _read_checkpoint_json(attempt_path)
     if attempt_path.is_file() and raw_attempt is None:
         raise RuntimeError(
@@ -4856,7 +5797,7 @@ def _repair_translation_token_placement(
             "refusing a new model call"
         )
     attempt = _matching_translation_token_attempt(
-        checkpoint_dir, segment_id, input_sha256,
+        checkpoint_dir, segment_id, input_sha256, generation,
     )
     if invalid_persisted_draft and not (
         isinstance(attempt, dict)
@@ -4901,6 +5842,7 @@ def _repair_translation_token_placement(
     marker_base = {
         "schema_version": "arc.companion.translation-token-attempt.v2",
         "segment_id": segment_id,
+        "generation": generation,
         "input_sha256": input_sha256,
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
         "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
@@ -4908,11 +5850,13 @@ def _repair_translation_token_placement(
         "block_ids": [block_id(block) for block in source_blocks],
     }
     superseded_text_attempt = _matching_superseded_translation_text_attempt(
-        checkpoint_dir, segment_id, input_sha256,
+        checkpoint_dir, segment_id, input_sha256, generation,
     )
     if isinstance(superseded_text_attempt, dict):
         marker_base["superseded_text_attempt"] = {
-            "path": str(_legacy_translation_token_attempt_path(checkpoint_dir, segment_id)),
+            "path": str(_legacy_translation_token_attempt_path(
+                checkpoint_dir, segment_id, generation,
+            )),
             "sha256": sha256_json(superseded_text_attempt),
             "prompt_version": str(superseded_text_attempt.get("prompt_version") or ""),
             "status": str(superseded_text_attempt.get("status") or ""),
@@ -5009,6 +5953,7 @@ def _repair_translation_token_placement(
     write_json(repair_draft_path, {
         "schema_version": "arc.companion.translation-token-repair-draft.v1",
         "segment_id": segment_id,
+        "generation": generation,
         "input_sha256": input_sha256,
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
         "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
@@ -5017,7 +5962,7 @@ def _repair_translation_token_placement(
         "repair_provenance": provenance,
     })
     marker = _matching_translation_token_attempt(
-        checkpoint_dir, segment_id, input_sha256,
+        checkpoint_dir, segment_id, input_sha256, generation,
     ) or marker_base
     _write_validated_translation_token_marker(
         checkpoint_dir,
@@ -5026,6 +5971,7 @@ def _repair_translation_token_placement(
         repaired=repaired,
         raw_response=value,
         repaired_block_ids=[block_id(block) for block in source_blocks],
+        generation=generation,
         prior_marker=marker,
     )
     return repaired, provenance
@@ -5040,18 +5986,21 @@ def _generate_translations(
     protected_names: list[str],
     checkpoint_dir: Path,
     llm: Callable[..., dict[str, Any]],
+    generation: int = 1,
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     force_generation: bool = False,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
-    translation_dir = checkpoint_dir / "translations"
-    translation_dir.mkdir(parents=True, exist_ok=True)
     output: dict[str, dict[str, Any]] = {}
     pending: list[dict[str, Any]] = []
     input_hashes: dict[str, str] = {}
     v4_upgrade_ids: set[str] = set()
     protected_name_upgrade_ids: set[str] = set()
     for segment in segments:
+        translation_dir = _generation_segment_artifact_dir(
+            checkpoint_dir, "translations", str(segment["segment_id"]), generation,
+        )
+        translation_dir.mkdir(parents=True, exist_ok=True)
         path = translation_dir / f"{_segment_checkpoint_name(segment['segment_id'])}.json"
         paper_context = _full_paper_context(
             bundle.document, segment, blocks_by_id=by_id, options=options
@@ -5076,6 +6025,10 @@ def _generate_translations(
             if (
                 isinstance(checkpoint, dict)
                 and checkpoint.get("segment_id") == segment["segment_id"]
+                and _artifact_payload_generation(
+                    checkpoint, checkpoint_dir, "translations",
+                    str(segment["segment_id"]),
+                ) == generation
                 and checkpoint.get("input_sha256") == expected_hash
                 and isinstance(checkpoint.get("translation"), dict)
             ):
@@ -5110,21 +6063,25 @@ def _generate_translations(
             bundle.document, segment, blocks_by_id=by_id, options=options
         )
         artifact_dir = (
-            checkpoint_dir / "llm" / "translations" / _segment_checkpoint_name(segment_id)
+            _generation_segment_artifact_dir(
+                checkpoint_dir, "llm/translations", segment_id, generation,
+            ) / _segment_checkpoint_name(segment_id)
         )
-        draft_path = _translation_draft_path(checkpoint_dir, segment_id)
+        draft_path = _translation_draft_path(checkpoint_dir, segment_id, generation)
         draft = _read_checkpoint_json(draft_path)
         attempt = _matching_translation_coverage_attempt(
-            checkpoint_dir, segment_id, input_hashes[segment_id]
+            checkpoint_dir, segment_id, input_hashes[segment_id], generation
         )
         legacy_coverage_attempt = _matching_legacy_translation_coverage_attempt(
-            checkpoint_dir, segment_id, input_hashes[segment_id]
+            checkpoint_dir, segment_id, input_hashes[segment_id], generation
         )
         raw_coverage_attempt = _read_checkpoint_json(
-            _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+            _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation)
         )
         if (
-            _translation_coverage_attempt_path(checkpoint_dir, segment_id).is_file()
+            _translation_coverage_attempt_path(
+                checkpoint_dir, segment_id, generation,
+            ).is_file()
             and raw_coverage_attempt is None
         ):
             raise RuntimeError(
@@ -5147,6 +6104,9 @@ def _generate_translations(
             isinstance(draft, dict)
             and draft.get("schema_version") == "arc.companion.translation-primary-draft.v1"
             and draft.get("segment_id") == segment_id
+            and _artifact_payload_generation(
+                draft, checkpoint_dir, "translation-drafts", segment_id,
+            ) == generation
             and draft.get("input_sha256") == input_hashes[segment_id]
             and isinstance(draft.get("translation"), dict)
         ):
@@ -5198,7 +6158,7 @@ def _generate_translations(
         if translatable:
             if translation is None:
                 guarded_attempt = _guard_translation_token_attempt_before_primary(
-                    checkpoint_dir, segment_id, input_hashes[segment_id]
+                    checkpoint_dir, segment_id, input_hashes[segment_id], generation
                 )
                 if guarded_attempt is not None:
                     raise RuntimeError(
@@ -5226,6 +6186,7 @@ def _generate_translations(
                     translation,
                     input_sha256=input_hashes[segment_id],
                     origin="primary-model",
+                    generation=generation,
                 )
                 write_json(draft_path, draft)
                 candidate_provenance = dict(draft["candidate_provenance"])
@@ -5275,11 +6236,14 @@ def _generate_translations(
                 repair_contexts = [
                     _translation_coverage_repair_context(block) for block in missing_blocks
                 ]
-                attempt_path = _translation_coverage_attempt_path(checkpoint_dir, segment_id)
+                attempt_path = _translation_coverage_attempt_path(
+                    checkpoint_dir, segment_id, generation,
+                )
                 missing_block_ids = [block_id(block) for block in missing_blocks]
                 coverage_marker_base = {
                     "schema_version": TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION,
                     "segment_id": segment_id,
+                    "generation": generation,
                     "input_sha256": input_hashes[segment_id],
                     "prompt_version": TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
                     "response_schema_version": TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
@@ -5405,6 +6369,7 @@ def _generate_translations(
                         artifact_dir=artifact_dir,
                         input_sha256=input_hashes[segment_id],
                         llm=llm,
+                        generation=generation,
                     )
                     repair_provenance.append(provenance)
             if missing_blocks:
@@ -5433,6 +6398,7 @@ def _generate_translations(
                 artifact_dir=artifact_dir,
                 input_sha256=input_hashes[segment_id],
                 llm=llm,
+                generation=generation,
             )
             repair_provenance.append(provenance)
         translation, normalized_citation_ids = (
@@ -5445,10 +6411,12 @@ def _generate_translations(
         _validate_translation(segment, translation, by_id, protected_names)
         if coverage_response is not None and coverage_marker_base is not None:
             prior_marker = _matching_translation_coverage_attempt(
-                checkpoint_dir, segment_id, input_hashes[segment_id]
+                checkpoint_dir, segment_id, input_hashes[segment_id], generation
             )
             now = datetime.now(timezone.utc).isoformat()
-            write_json(_translation_coverage_attempt_path(checkpoint_dir, segment_id), {
+            write_json(_translation_coverage_attempt_path(
+                checkpoint_dir, segment_id, generation,
+            ), {
                 **coverage_marker_base,
                 "status": "validated",
                 "started_at": str((prior_marker or {}).get("started_at") or now),
@@ -5478,10 +6446,13 @@ def _generate_translations(
                 output[segment_id] = value
                 segment = next(item for item in segments if item["segment_id"] == segment_id)
                 write_json(
-                    translation_dir / f"{_segment_checkpoint_name(segment_id)}.json",
+                    _generation_segment_artifact_dir(
+                        checkpoint_dir, "translations", segment_id, generation,
+                    ) / f"{_segment_checkpoint_name(segment_id)}.json",
                     {
                         "schema_version": "arc.companion.translation-checkpoint.v2",
                         "segment_id": segment_id,
+                        "generation": generation,
                         "input_sha256": _segment_input_hash(
                             segment,
                             by_id,

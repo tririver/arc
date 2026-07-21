@@ -173,6 +173,7 @@ def clear_needs_supervision(path: Path) -> dict[str, Any]:
 def invalidate_suffix(path: Path, *, from_segment_id: str, generation: int) -> dict[str, Any]:
     ledger = _read(path)
     index = _block_index(ledger, from_segment_id)
+    source_generation = int(ledger.get("generation") or 1)
     prefix = list(ledger["blocks"][:index])
     if any(str(item.get("state")) != "accepted" for item in prefix):
         raise LaneLedgerError("only an accepted prefix may be preserved")
@@ -186,7 +187,37 @@ def invalidate_suffix(path: Path, *, from_segment_id: str, generation: int) -> d
         })
     ledger["blocks"] = prefix + suffix
     ledger["generation"] = generation
-    ledger["needs_supervision"] = None
+    suffix_ids = {str(item["segment_id"]) for item in suffix}
+    active = [
+        dict(item) for item in ledger.get("supervision_entries") or []
+        if isinstance(item, Mapping)
+    ]
+    if not active and isinstance(ledger.get("needs_supervision"), Mapping):
+        active = [dict(ledger["needs_supervision"])]
+    archived_at = time.time()
+    archived = []
+    remaining = []
+    for marker in active:
+        if str(marker.get("segment_id") or "") in suffix_ids:
+            archived.append({
+                **marker,
+                "archived_at": archived_at,
+                "archive_reason": "generation_suffix_invalidated",
+                "source_generation": source_generation,
+                "target_generation": generation,
+                "suffix_start_segment_id": from_segment_id,
+            })
+        else:
+            remaining.append(marker)
+    ledger["supervision_history"] = [
+        *[
+            dict(item) for item in ledger.get("supervision_history") or []
+            if isinstance(item, Mapping)
+        ],
+        *archived,
+    ]
+    ledger["supervision_entries"] = remaining
+    ledger["needs_supervision"] = remaining[0] if remaining else None
     ledger["accepted_chain_sha256"] = (
         str(prefix[-1].get("accepted_chain_sha256")) if prefix else _hash("")
     )
