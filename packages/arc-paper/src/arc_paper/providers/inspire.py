@@ -17,6 +17,7 @@ from ..cache import (
     write_paper_alias,
 )
 from ..ids import arxiv_path_id, doi_value, inspire_recid, normalize_paper_id
+from ..worker_session import worker_fetch_once
 from .base import ProviderError
 
 
@@ -144,24 +145,33 @@ class InspireProvider:
         if not recid:
             return []
 
-        response = self.client.get(
-            f"{BASE_URL}/literature",
-            params={
-                "q": f"refersto:recid:{recid}",
-                "size": str(limit),
-                "sort": sort,
-                "fields": SUMMARY_FIELDS,
-                "format": "json",
-            },
-            timeout=self.timeout,
-        )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise ProviderError("inspire_citers_fetch_failed", str(exc)) from exc
+        def fetch() -> list[dict[str, Any]]:
+            response = self.client.get(
+                f"{BASE_URL}/literature",
+                params={
+                    "q": f"refersto:recid:{recid}",
+                    "size": str(limit),
+                    "sort": sort,
+                    "fields": SUMMARY_FIELDS,
+                    "format": "json",
+                },
+                timeout=self.timeout,
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise ProviderError(
+                    "inspire_citers_fetch_failed", str(exc), status_code=exc.response.status_code
+                ) from exc
+            data = response.json()
+            return [_normalize_record(hit) for hit in data.get("hits", {}).get("hits", [])]
 
-        data = response.json()
-        citers = [_normalize_record(hit) for hit in data.get("hits", {}).get("hits", [])]
+        citers = worker_fetch_once(
+            paper_id,
+            fetch,
+            operation=f"inspire-citers-{sort}-{limit}",
+            replay_success=not refresh,
+        )
         cache_path = _citers_cache_path(paper_id, sort, limit)
         write_json(cache_path, citers)
         return citers
@@ -173,6 +183,13 @@ class InspireProvider:
         normalized_id = normalize_paper_id(paper_id)
         if not refresh and (cached := _cached_raw_record(normalized_id)):
             return cached
+
+        fetch = lambda: self._fetch_raw_record(normalized_id, requested_id=paper_id)
+        return worker_fetch_once(
+            normalized_id, fetch, operation="inspire-metadata", replay_success=not refresh
+        )
+
+    def _fetch_raw_record(self, normalized_id: str, *, requested_id: str) -> dict[str, Any]:
 
         recid = inspire_recid(normalized_id)
         aid = arxiv_path_id(normalized_id)
@@ -188,16 +205,18 @@ class InspireProvider:
         else:
             raise ProviderError(
                 "unsupported_paper_id",
-                f"INSPIRE requires an arXiv ID, DOI, or INSPIRE recid: {paper_id}",
+                f"INSPIRE requires an arXiv ID, DOI, or INSPIRE recid: {requested_id}",
             )
 
         response = self.client.get(url, timeout=self.timeout)
         if response.status_code == 404:
-            raise ProviderError("inspire_not_found", f"INSPIRE record not found for {paper_id}")
+            raise ProviderError("inspire_not_found", f"INSPIRE record not found for {requested_id}")
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise ProviderError("inspire_fetch_failed", str(exc)) from exc
+            raise ProviderError(
+                "inspire_fetch_failed", str(exc), status_code=exc.response.status_code
+            ) from exc
 
         raw = response.json()
         _cache_raw_record(raw, requested_id=normalized_id)
@@ -212,7 +231,9 @@ class InspireProvider:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise ProviderError("inspire_fetch_failed", str(exc)) from exc
+            raise ProviderError(
+                "inspire_fetch_failed", str(exc), status_code=exc.response.status_code
+            ) from exc
 
         hits = response.json().get("hits", {}).get("hits", [])
         if not hits:

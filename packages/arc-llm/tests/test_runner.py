@@ -18,11 +18,12 @@ from arc_llm.providers.base import (
     LLMConfigurationError,
     LLMFailureCategory,
     LLMSubmissionState,
+    LLMWorkerCancelled,
     LLMWorkerError,
 )
 from arc_llm.progress_prompt import ensure_runtime_progress_contract
+from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
 from arc_llm.schema_cache import sha256_text
-from arc_llm.sessions import LLMSessionManager
 from arc_llm.structured_recovery import structured_metadata
 from arc_llm import runner
 from arc_llm.runner import LLMTaskError, resolve_llm_config, run_json, run_text, run_text_result
@@ -1328,6 +1329,54 @@ def test_run_text_uses_selected_provider_and_model(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("provider", "expected_status", "error_type"),
+    [
+        (FakeProvider(), "success", None),
+        (FlakyTextProvider(name="codex-cli"), "failed", RuntimeError),
+    ],
+)
+def test_controller_finalizes_paper_overlay_after_success_and_failure(
+    monkeypatch, provider, expected_status, error_type
+):
+    finalized = []
+    monkeypatch.setattr(runner, "select_provider", lambda _name, **_kwargs: provider)
+    monkeypatch.setattr(
+        runner,
+        "_finalize_paper_worker_call",
+        lambda _env, **kwargs: finalized.append(kwargs),
+    )
+
+    if error_type is None:
+        run_text("prompt", provider="codex-cli", env={}, process_chain=[], call_label="call-1")
+    else:
+        with pytest.raises(error_type):
+            run_text("prompt", provider="codex-cli", env={}, process_chain=[], call_label="call-1")
+
+    assert finalized == [{"status": expected_status, "worker_id": None, "call_id": "call-1"}]
+
+
+def test_controller_finalizes_paper_overlay_after_cancel(monkeypatch):
+    class CancelledProvider:
+        name = "codex-cli"
+
+        def generate_text(self, _prompt, *, model=None):
+            raise LLMWorkerCancelled("cancelled")
+
+    finalized = []
+    monkeypatch.setattr(runner, "select_provider", lambda _name, **_kwargs: CancelledProvider())
+    monkeypatch.setattr(
+        runner,
+        "_finalize_paper_worker_call",
+        lambda _env, **kwargs: finalized.append(kwargs),
+    )
+
+    with pytest.raises(LLMWorkerCancelled):
+        run_text("prompt", provider="codex-cli", env={}, process_chain=[], call_label="call-2")
+
+    assert finalized == [{"status": "cancelled", "worker_id": None, "call_id": "call-2"}]
+
+
+@pytest.mark.parametrize(
     ("explicit", "env", "expected"),
     [
         (7, {"ARC_CODEX_IDLE_TIMEOUT_SECONDS": "11", "ARC_LLM_IDLE_TIMEOUT_SECONDS": "22"}, 7),
@@ -1458,3 +1507,189 @@ def test_run_json_explicit_provider_does_not_replay_without_proof(tmp_path, monk
         )
 
     assert codex.attempts == 1
+
+
+def test_legacy_session_without_capability_metadata_resumes_with_paper_cli_disabled(tmp_path):
+    manager = LLMSessionManager(tmp_path / "sessions")
+    legacy_env = {"ARC_AGENT_HOST": "codex"}
+    legacy_fp = runtime_fingerprint(
+        provider="codex-cli",
+        model="m",
+        model_tier=None,
+        env=legacy_env,
+    )
+    manager.get_or_create(
+        key="legacy",
+        provider="codex-cli",
+        model="m",
+        runtime_fingerprint=legacy_fp,
+    )
+
+    env, metadata = runner._runtime_compatibility_policy(
+        {**legacy_env, "ARC_PAPER_CLI_ACCESS": "full"},
+        session_policy="stateful",
+        session_manager=manager,
+        session_key="legacy",
+        session_metadata=None,
+        artifact_dir=None,
+        idempotency_key=None,
+    )
+    assert env["ARC_PAPER_CLI_ACCESS"] == "none"
+    assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "none"
+    assert runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier=None, env=env
+    ) == legacy_fp
+
+
+def test_legacy_checkpoint_without_capability_metadata_resumes_with_paper_cli_disabled(tmp_path):
+    key = "legacy-call"
+    checkpoint_dir = tmp_path / "call-checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / f"idempotency-{sha256_text(key)}.json"
+    checkpoint.write_text('{"schema_version":"arc.llm.call_checkpoint.v2"}\n', encoding="utf-8")
+
+    env, _metadata = runner._runtime_compatibility_policy(
+        {"ARC_PAPER_CLI_ACCESS": "full"},
+        session_policy="stateless",
+        session_manager=None,
+        session_key=None,
+        session_metadata=None,
+        artifact_dir=tmp_path,
+        idempotency_key=key,
+    )
+
+    assert env["ARC_PAPER_CLI_ACCESS"] == "none"
+
+
+def test_new_call_constructs_shared_paper_overlay_before_submission(tmp_path):
+    run_root = tmp_path / "run"
+    artifact_dir = run_root / "loops" / "loop_1" / "rounds" / "round_001"
+    artifact_dir.mkdir(parents=True)
+    (run_root / "config.json").write_text("{}\n", encoding="utf-8")
+    (run_root / "manifest.json").write_text("{}\n", encoding="utf-8")
+    base_cache = tmp_path / "global-paper-cache"
+
+    env, metadata = runner._runtime_compatibility_policy(
+        {
+            "ARC_PAPER_CLI_ACCESS": "full",
+            "ARC_PAPER_CACHE": str(base_cache),
+            "ARC_CODEX_ADD_DIRS": '["/unrelated"]',
+        },
+        session_policy="stateless",
+        session_manager=None,
+        session_key=None,
+        session_metadata=None,
+        artifact_dir=artifact_dir,
+        idempotency_key=None,
+    )
+    runner._configure_paper_worker_session(
+        env, artifact_dir=artifact_dir, session_manager=None
+    )
+    metadata["arc_runtime_capabilities"] = runner._runtime_capabilities(env)
+
+    overlay = run_root / "paper-cache-overlay"
+    state = overlay / ".arc-paper-worker"
+    assert env["ARC_PAPER_WORKER_BASE_CACHE"] == str(base_cache)
+    assert env["ARC_PAPER_CACHE"] == str(overlay)
+    assert env["ARC_PAPER_WORKER_SESSION_DIR"] == str(run_root)
+    assert env["ARC_PAPER_WORKER_TOMBSTONE_DIR"] == str(state / "tombstones")
+    assert env["ARC_PAPER_WORKER_SESSION_ID"].startswith("arc-llm-")
+    assert env["ARC_LLM_WORKER_CONTEXT"] == "true"
+    assert Path(env["ARC_PAPER_WORKER_GUARD"]).is_file()
+    assert env["ARC_PAPER_WORKER_TOKEN"]
+    guard = json.loads(Path(env["ARC_PAPER_WORKER_GUARD"]).read_text(encoding="utf-8"))
+    assert guard["schema_version"] == "arc.paper.worker-guard.v1"
+    assert guard["token_sha256"] == sha256_text(env["ARC_PAPER_WORKER_TOKEN"])
+    controller_token = runner._PAPER_CONTROLLER_SESSIONS[env["ARC_PAPER_WORKER_SESSION_ID"]]["controller_token"]
+    assert controller_token not in json.dumps(guard)
+    controller_guard_path = Path(
+        runner._PAPER_CONTROLLER_SESSIONS[env["ARC_PAPER_WORKER_SESSION_ID"]]["controller_guard"]
+    )
+    controller_guard = json.loads(controller_guard_path.read_text(encoding="utf-8"))
+    assert controller_guard == {
+        "schema_version": "arc.paper.controller-guard.v1",
+        "session_id": env["ARC_PAPER_WORKER_SESSION_ID"],
+        "run_root": str(run_root),
+        "base_root": str(base_cache),
+        "token_sha256": sha256_text(controller_token),
+    }
+    assert controller_guard_path.stat().st_mode & 0o077 == 0
+    assert state.is_dir()
+    assert env["ARC_CODEX_SANDBOX"] == "workspace-write"
+    assert env["ARC_CODEX_WORK_DIR"] == str(run_root)
+    assert "ARC_CODEX_ADD_DIRS" not in env
+    assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "full"
+
+
+def test_new_call_without_artifact_or_session_root_uses_managed_tmp_overlay(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC_LLM_TMP_DIR", str(tmp_path / "llm-tmp"))
+    env, metadata = runner._runtime_compatibility_policy(
+        {"ARC_PAPER_CLI_ACCESS": "full", "ARC_LLM_TMP_DIR": str(tmp_path / "llm-tmp")},
+        session_policy="stateless",
+        session_manager=None,
+        session_key=None,
+        session_metadata=None,
+        artifact_dir=None,
+        idempotency_key=None,
+    )
+    runner._configure_paper_worker_session(env, artifact_dir=None, session_manager=None)
+    metadata["arc_runtime_capabilities"] = runner._runtime_capabilities(env)
+
+    assert env["ARC_PAPER_CLI_ACCESS"] == "full"
+    assert "paper-worker-isolation/paper-cache-overlay" in env["ARC_PAPER_CACHE"]
+    assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "full"
+
+
+def test_disabled_paper_cli_hides_inherited_global_cache(tmp_path):
+    artifact_dir = tmp_path / "isolated-stage"
+    global_cache = tmp_path / "global-paper-cache"
+    env = {
+        "ARC_PAPER_CLI_ACCESS": "none",
+        "ARC_PAPER_CACHE": str(global_cache),
+        "ARC_PAPER_WORKER_BASE_CACHE": str(global_cache),
+        "ARC_PAPER_WORKER_GUARD": str(tmp_path / "forged-guard"),
+        "ARC_PAPER_WORKER_TOKEN": "forged",
+    }
+
+    runner._configure_paper_worker_session(
+        env, artifact_dir=artifact_dir, session_manager=None
+    )
+
+    assert env["ARC_PAPER_CACHE"] == str(artifact_dir / "paper-cache-disabled")
+    assert env["ARC_LLM_WORKER_CONTEXT"] == "true"
+    assert "ARC_PAPER_WORKER_BASE_CACHE" not in env
+    assert "ARC_PAPER_WORKER_SESSION_DIR" not in env
+    assert "ARC_PAPER_WORKER_GUARD" not in env
+    assert "ARC_PAPER_WORKER_TOKEN" not in env
+
+
+def test_controller_finalizer_uses_secret_not_exposed_to_worker(tmp_path, monkeypatch):
+    run_root = tmp_path / "run"
+    env = {
+        "ARC_PAPER_CLI_ACCESS": "full",
+        "ARC_PAPER_CACHE": str(tmp_path / "base"),
+        "ARC_LLM_CACHE": str(tmp_path / "llm-cache"),
+    }
+    runner._configure_paper_worker_session(env, artifact_dir=run_root, session_manager=None)
+    staged = Path(env["ARC_PAPER_CACHE"]) / "sources" / "paper.json"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("{}\n", encoding="utf-8")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update({"command": command, **kwargs})
+        return SimpleNamespace(returncode=0, stdout='{"ok":true}', stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    runner._finalize_paper_worker_call(
+        env, status="failed", worker_id="worker-1", call_id="call-1"
+    )
+
+    assert captured["command"][1:4] == ["-m", "arc_paper.worker_controller", "finalize"]
+    assert captured["command"][-2:] == ["--status", "failed"]
+    controller_env = captured["env"]
+    assert controller_env["ARC_PAPER_CONTROLLER_MODE"] == "trusted"
+    assert controller_env["ARC_PAPER_CONTROLLER_TOKEN"]
+    assert controller_env["ARC_PAPER_CONTROLLER_TOKEN"] != env["ARC_PAPER_WORKER_TOKEN"]
+    assert "ARC_PAPER_WORKER_TOKEN" not in controller_env

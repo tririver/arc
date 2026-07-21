@@ -437,6 +437,24 @@ def test_runtime_fingerprint_includes_claude_mcp_config_file_contents(tmp_path):
     assert first != second
 
 
+def test_runtime_fingerprint_fail_closes_when_inherited_host_config_changes(tmp_path):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text('model = "first"\n', encoding="utf-8")
+    env = {
+        "ARC_LLM_INHERIT_HOST_TOOLS": "true",
+        "ARC_LLM_HOST_TOOLS_RISK": "high",
+        "CODEX_HOME": str(codex_home),
+    }
+
+    first = runtime_fingerprint(provider="codex-cli", model="m", model_tier=None, env=env)
+    config_path.write_text('model = "second"\n', encoding="utf-8")
+    second = runtime_fingerprint(provider="codex-cli", model="m", model_tier=None, env=env)
+
+    assert first != second
+
+
 def test_generated_claude_arc_mcp_path_does_not_change_fingerprint_when_file_appears(tmp_path):
     config_path = tmp_path / "arc-claude-mcp.json"
     env = {

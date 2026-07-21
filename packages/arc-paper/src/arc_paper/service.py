@@ -16,14 +16,17 @@ from arc_llm.runner import resolve_llm_config
 
 from .cache import (
     CachePaths,
+    cache_path_exists,
     cache_root,
     content_lock,
     now_iso,
+    iter_cache_paths,
     parsed_source_annotations_cache_path,
     parsed_source_cache_path,
     parsed_source_lock,
     read_paper_alias,
     read_json,
+    resolve_cache_read_path,
     rich_document_cache_path,
     text_query_cache_path,
     write_json,
@@ -894,9 +897,9 @@ def doctor_cache(paper_id: str | None = None) -> dict[str, Any]:
         data["paper"] = {
             "paper_id": normalized,
             "paper_dir": str(paths.paper_dir),
-            "paper_dir_exists": paths.paper_dir.exists(),
+            "paper_dir_exists": cache_path_exists(paths.paper_dir),
             "latest_summary_path": str(latest_summary_path),
-            "latest_summary_exists": latest_summary_path.exists(),
+            "latest_summary_exists": cache_path_exists(latest_summary_path),
             "latest_summary_title": latest.get("title") if isinstance(latest, dict) else None,
             "latest_summary_source_hash": (
                 (latest.get("provenance") or {}).get("source_hash") if isinstance(latest, dict) else None
@@ -941,7 +944,25 @@ def remove_cached_papers(
     removed_paths: list[str] = []
     skipped_paths: list[dict[str, str]] = []
     if not dry_run:
+        worker_session = None
+        if os.environ.get("ARC_PAPER_WORKER_BASE_CACHE"):
+            from .worker_session import WorkerCacheSession
+
+            worker_session = WorkerCacheSession.from_environment()
         for path in _unique_selected_paths(items):
+            if worker_session is not None:
+                raw_path = Path(path).resolve(strict=False)
+                for root in (worker_session.overlay_root, worker_session.base_root):
+                    try:
+                        relative = raw_path.relative_to(root)
+                    except ValueError:
+                        continue
+                    worker_session.tombstone(relative, source={"operation": "cache remove"})
+                    removed_paths.append(str(worker_session.overlay_path(relative)))
+                    break
+                else:
+                    skipped_paths.append({"path": path, "reason": "outside worker cache roots"})
+                continue
             safe_path = _safe_cache_path(Path(path))
             if safe_path is None:
                 skipped_paths.append({"path": str(path), "reason": "outside cache root"})
@@ -994,17 +1015,16 @@ def _select_cached_papers(
 
 def _cached_paper_items() -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
-    root = cache_root()
-    for paper_dir in sorted((root / "papers").iterdir() if (root / "papers").is_dir() else []):
+    for paper_dir in iter_cache_paths("papers"):
         if paper_dir.is_dir():
             _add_cache_path(grouped, unquote(paper_dir.name), "paper_dir", paper_dir)
-    for source_path in sorted((root / "sources").glob("*.json")):
+    for source_path in iter_cache_paths("sources", "*.json"):
         paper_id = _paper_id_from_json(source_path, default=source_path.stem)
         _add_cache_path(grouped, paper_id, "source", source_path)
-    for annotation_path in sorted((root / "source-annotations").glob("*.json")):
+    for annotation_path in iter_cache_paths("source-annotations", "*.json"):
         paper_id = _source_id_from_annotation_json(annotation_path, default=annotation_path.stem)
         _add_cache_path(grouped, paper_id, "source_annotation", annotation_path)
-    for alias_path in sorted((root / "paper-aliases").glob("*.json")):
+    for alias_path in iter_cache_paths("paper-aliases", "*.json"):
         paper_id = _paper_id_from_json(alias_path, default=unquote(alias_path.stem))
         _add_cache_path(grouped, paper_id, "paper_alias", alias_path)
     return [_finalize_cache_item(item) for item in grouped.values()]
@@ -1520,14 +1540,16 @@ def _full_text_search_files(
     for raw in raw_ids:
         normalized_raw = normalize_paper_id(str(raw))
         local_path = parsed_source_cache_path(normalized_raw)
-        if not refresh and not arxiv_path_id(normalized_raw) and local_path.exists():
-            files_by_path[local_path] = FullTextSearchFile(normalized_raw, local_path)
+        resolved_local_path = resolve_cache_read_path(local_path)
+        if not refresh and not arxiv_path_id(normalized_raw) and resolved_local_path is not None:
+            files_by_path[resolved_local_path] = FullTextSearchFile(normalized_raw, resolved_local_path)
             continue
         full_text_id = _full_text_paper_id(str(raw), refresh=refresh)
         path = parsed_source_cache_path(full_text_id)
         _parsed(full_text_id, refresh=refresh)
-        if path.exists():
-            files_by_path[path] = FullTextSearchFile(full_text_id, path)
+        resolved_path = resolve_cache_read_path(path)
+        if resolved_path is not None:
+            files_by_path[resolved_path] = FullTextSearchFile(full_text_id, resolved_path)
         else:
             missing.append(full_text_id)
     return list(files_by_path.values()), missing
@@ -1535,7 +1557,7 @@ def _full_text_search_files(
 
 def _all_cached_full_text_files() -> list[FullTextSearchFile]:
     files = []
-    for path in sorted((cache_root() / "sources").glob("*.json")):
+    for path in iter_cache_paths("sources", "*.json"):
         parsed = read_json(path)
         if isinstance(parsed, dict) and parsed.get("paper_id"):
             files.append(FullTextSearchFile(str(parsed["paper_id"]), path))

@@ -12,6 +12,7 @@ import httpx
 
 from ..cache import CachePaths, now_iso, read_json, write_bytes, write_json
 from ..ids import arxiv_path_id, normalize_paper_id
+from ..worker_session import worker_fetch_once
 from .base import ProviderError
 
 
@@ -48,6 +49,30 @@ class ArxivSourceProvider:
             if _valid_cached_manifest(cached, paper_id=paths.paper_id, version=version):
                 return cached
 
+        fetch = lambda: self._cache_source_uncached(
+            paper_id,
+            arxiv_id=arxiv_id,
+            version=version,
+            license_url=license_url,
+        )
+        return worker_fetch_once(
+            paper_id,
+            fetch,
+            operation=f"arxiv-source-v{version}",
+            replay_success=not refresh,
+        )
+
+    def _cache_source_uncached(
+        self,
+        paper_id: str,
+        *,
+        arxiv_id: str,
+        version: int,
+        license_url: str,
+    ) -> dict[str, Any]:
+        paths = CachePaths.for_paper(paper_id)
+        manifest_path = paths.arxiv_source_manifest(version)
+
         url = f"https://export.arxiv.org/e-print/{arxiv_id}v{version}"
         response = self.client.get(url, timeout=self.timeout)
         if response.status_code == 404:
@@ -55,7 +80,9 @@ class ArxivSourceProvider:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise ProviderError("arxiv_source_fetch_failed", str(exc)) from exc
+            raise ProviderError(
+                "arxiv_source_fetch_failed", str(exc), status_code=exc.response.status_code
+            ) from exc
         data = response.content
         if len(data) > MAX_ARCHIVE_BYTES:
             raise ProviderError("arxiv_source_archive_too_large", f"source archive exceeds {MAX_ARCHIVE_BYTES} bytes")

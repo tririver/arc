@@ -6,6 +6,10 @@ import time
 from dataclasses import dataclass, replace
 import inspect
 import os
+import secrets
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -49,6 +53,267 @@ NATIVE_RESUME_RECONCILIATION_PROMPT = (
     "Do not repeat its work. Reconcile the native session and return the final answer "
     "for that preceding request in the required format."
 )
+_PAPER_CONTROLLER_SESSIONS: dict[str, dict[str, str]] = {}
+_PAPER_CONTROLLER_GUARD_LOCK = threading.Lock()
+
+
+def _runtime_capabilities(env: Mapping[str, str] | None) -> dict[str, Any]:
+    values = env or {}
+    return {
+        "arc_paper_cli_access": values.get("ARC_PAPER_CLI_ACCESS", "full"),
+        "inherit_host_tools": values.get("ARC_LLM_INHERIT_HOST_TOOLS", "false").strip().lower()
+        == "true",
+    }
+
+
+def _runtime_compatibility_policy(
+    env: Mapping[str, str] | None,
+    *,
+    session_policy: str,
+    session_manager: LLMSessionManager | None,
+    session_key: str | None,
+    session_metadata: Mapping[str, Any] | None,
+    artifact_dir: Path | None,
+    idempotency_key: str | None,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Default new calls to paper access while keeping legacy resumptions closed."""
+    effective_env = dict(os.environ if env is None else env)
+    effective_env.setdefault("ARC_PAPER_CLI_ACCESS", "full")
+    effective_env.setdefault("ARC_LLM_INHERIT_HOST_TOOLS", "false")
+    legacy_resume = False
+
+    if session_policy == "stateful" and session_manager is not None and session_key:
+        existing = session_manager.get_existing(session_key)
+        if existing is not None and "arc_runtime_capabilities" not in existing.metadata:
+            legacy_resume = True
+
+    if artifact_dir is not None and idempotency_key:
+        checkpoint = artifact_dir / "call-checkpoints" / f"idempotency-{sha256_text(idempotency_key)}.json"
+        if checkpoint.exists():
+            try:
+                payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if "runtime_capabilities" not in payload:
+                legacy_resume = True
+
+    if legacy_resume:
+        # Before this capability was serialized, ARC workers had no direct
+        # paper CLI. Never enlarge such a run merely because it was resumed by
+        # a newer package version.
+        effective_env["ARC_PAPER_CLI_ACCESS"] = "none"
+        effective_env["ARC_LLM_INHERIT_HOST_TOOLS"] = "false"
+
+    effective_metadata = dict(session_metadata or {})
+    effective_metadata["arc_runtime_capabilities"] = _runtime_capabilities(effective_env)
+    return effective_env, effective_metadata
+
+
+def _configure_paper_worker_session(
+    env: dict[str, str],
+    *,
+    artifact_dir: Path | None,
+    session_manager: LLMSessionManager | None,
+) -> None:
+    """Create the arc-paper overlay contract without importing arc-paper."""
+    access = env.get("ARC_PAPER_CLI_ACCESS", "none")
+    if access == "full" and env.get("ARC_PAPER_WORKER_SESSION_DIR"):
+        return
+    location = artifact_dir or (session_manager.root if session_manager is not None else None)
+    if location is None:
+        from .paths import llm_tmp_root
+
+        location = llm_tmp_root(env) / "paper-worker-isolation"
+
+    run_root = _paper_worker_run_root(location)
+    if access != "full":
+        disabled_cache = run_root / "paper-cache-disabled"
+        disabled_cache.mkdir(parents=True, exist_ok=True)
+        env["ARC_PAPER_CACHE"] = str(disabled_cache)
+        env["ARC_LLM_WORKER_CONTEXT"] = "true"
+        for key in (
+            "ARC_PAPER_WORKER_BASE_CACHE",
+            "ARC_PAPER_WORKER_SESSION_DIR",
+            "ARC_PAPER_WORKER_TOMBSTONE_DIR",
+            "ARC_PAPER_WORKER_SESSION_ID",
+            "ARC_PAPER_WORKER_GUARD",
+            "ARC_PAPER_WORKER_TOKEN",
+        ):
+            env.pop(key, None)
+        return
+
+    base_cache = _paper_base_cache(env)
+    overlay = run_root / "paper-cache-overlay"
+    state = overlay / ".arc-paper-worker"
+    tombstones = state / "tombstones"
+    for path in (overlay, state, tombstones):
+        path.mkdir(parents=True, exist_ok=True)
+    session_id = f"arc-llm-{sha256_text(str(run_root.resolve(strict=False)))[:20]}"
+    from .paths import llm_cache_root
+
+    guard_root = llm_cache_root(env) / "paper-worker-authorizations"
+    guard_root.mkdir(parents=True, exist_ok=True)
+    worker_guard_path = guard_root / f"{session_id}.worker.json"
+    controller_guard_path = guard_root / f"{session_id}.controller.json"
+    with _PAPER_CONTROLLER_GUARD_LOCK:
+        controller_session = _PAPER_CONTROLLER_SESSIONS.get(session_id)
+        if controller_session is None:
+            worker_token = secrets.token_urlsafe(32)
+            controller_token = secrets.token_urlsafe(32)
+            worker_guard_payload = {
+                "schema_version": "arc.paper.worker-guard.v1",
+                "session_id": session_id,
+                "run_root": str(run_root),
+                "base_root": str(base_cache),
+                "overlay_root": str(overlay),
+                "token_sha256": sha256_text(worker_token),
+            }
+            controller_guard_payload = {
+                "schema_version": "arc.paper.controller-guard.v1",
+                "session_id": session_id,
+                "run_root": str(run_root),
+                "base_root": str(base_cache),
+                "token_sha256": sha256_text(controller_token),
+            }
+            temporary_worker_guard = worker_guard_path.with_name(
+                f".{worker_guard_path.name}.{secrets.token_hex(8)}.tmp"
+            )
+            temporary_controller_guard = controller_guard_path.with_name(
+                f".{controller_guard_path.name}.{secrets.token_hex(8)}.tmp"
+            )
+            temporary_worker_guard.write_text(
+                json.dumps(worker_guard_payload, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            temporary_controller_guard.write_text(
+                json.dumps(controller_guard_payload, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            os.chmod(temporary_worker_guard, 0o600)
+            os.chmod(temporary_controller_guard, 0o600)
+            os.replace(temporary_worker_guard, worker_guard_path)
+            os.replace(temporary_controller_guard, controller_guard_path)
+            controller_session = {
+                "run_root": str(run_root),
+                "base_cache": str(base_cache),
+                "worker_guard": str(worker_guard_path),
+                "controller_guard": str(controller_guard_path),
+                "worker_token": worker_token,
+                "controller_token": controller_token,
+            }
+            _PAPER_CONTROLLER_SESSIONS[session_id] = controller_session
+        worker_token = controller_session["worker_token"]
+    env.update({
+        "ARC_PAPER_WORKER_BASE_CACHE": str(base_cache),
+        "ARC_PAPER_WORKER_SESSION_DIR": str(run_root),
+        "ARC_PAPER_WORKER_TOMBSTONE_DIR": str(tombstones),
+        "ARC_PAPER_WORKER_SESSION_ID": session_id,
+        "ARC_PAPER_WORKER_GUARD": controller_session["worker_guard"],
+        "ARC_PAPER_WORKER_TOKEN": worker_token,
+        "ARC_LLM_WORKER_CONTEXT": "true",
+        "ARC_PAPER_CACHE": str(overlay),
+    })
+    if env.get("ARC_LLM_INHERIT_HOST_TOOLS", "false").strip().lower() != "true":
+        # Keep Codex writes inside the run tree. The global base cache remains
+        # outside the sandbox and is reachable only through the wrapper's
+        # validated read/promotion contract.
+        env["ARC_CODEX_SANDBOX"] = "workspace-write"
+        env["ARC_CODEX_WORK_DIR"] = str(run_root)
+        env.pop("ARC_CODEX_ADD_DIRS", None)
+
+
+
+
+def _finalize_paper_worker_call(
+    env: Mapping[str, str] | None,
+    *,
+    status: str,
+    worker_id: str | None,
+    call_id: str | None,
+) -> None:
+    values = env or {}
+    if values.get("ARC_PAPER_CLI_ACCESS") != "full":
+        return
+    session_id = values.get("ARC_PAPER_WORKER_SESSION_ID")
+    controller = _PAPER_CONTROLLER_SESSIONS.get(str(session_id or ""))
+    if not controller or not _paper_overlay_has_staged_changes(Path(controller["run_root"])):
+        return
+    command = [
+        sys.executable,
+        "-m",
+        "arc_paper.worker_controller",
+        "finalize",
+        "--run-root",
+        controller["run_root"],
+        "--base-root",
+        controller["base_cache"],
+        "--session-id",
+        str(session_id),
+        "--worker-id",
+        worker_id or "",
+        "--call-id",
+        call_id or "",
+        "--status",
+        status,
+    ]
+    controller_env = dict(os.environ)
+    for key in tuple(controller_env):
+        if key.startswith("ARC_PAPER_WORKER_") or key in {
+            "ARC_PAPER_CLI_ACCESS",
+            "ARC_PAPER_CACHE",
+            "ARC_LLM_WORKER_CONTEXT",
+        }:
+            controller_env.pop(key, None)
+    controller_env.update(
+        {
+            "ARC_PAPER_CONTROLLER_MODE": "trusted",
+            "ARC_PAPER_CONTROLLER_GUARD": controller["controller_guard"],
+            "ARC_PAPER_CONTROLLER_TOKEN": controller["controller_token"],
+        }
+    )
+    completed = subprocess.run(
+        command,
+        env=controller_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "controller finalizer failed"
+        raise RuntimeError(detail)
+
+
+def _paper_overlay_has_staged_changes(run_root: Path) -> bool:
+    overlay = run_root / "paper-cache-overlay"
+    if not overlay.is_dir():
+        return False
+    return any(
+        path.is_file()
+        and not (path.parent.name == ".arc-paper-worker" and path.name == "session.json")
+        for path in overlay.rglob("*")
+    )
+
+
+def _paper_worker_run_root(location: Path) -> Path:
+    candidate = location.expanduser().resolve(strict=False)
+    if candidate.suffix:
+        candidate = candidate.parent
+    for parent in (candidate, *candidate.parents):
+        if (parent / "manifest.json").exists() and (parent / "config.json").exists():
+            return parent
+    return candidate
+
+
+def _paper_base_cache(env: Mapping[str, str]) -> Path:
+    if value := env.get("ARC_PAPER_WORKER_BASE_CACHE"):
+        return Path(value).expanduser().resolve(strict=False)
+    if value := env.get("ARC_PAPER_CACHE"):
+        return Path(value).expanduser().resolve(strict=False)
+    if value := env.get("ARC_HOME"):
+        return (Path(value).expanduser() / "cache" / "arc-paper").resolve(strict=False)
+    if value := env.get("XDG_CACHE_HOME"):
+        return (Path(value).expanduser() / "arc" / "arc-paper").resolve(strict=False)
+    home = Path(env["HOME"]).expanduser() if env.get("HOME") else Path.home()
+    return (home / ".cache" / "arc" / "arc-paper").resolve(strict=False)
 
 
 class LLMTaskError(RuntimeError):
@@ -263,6 +528,15 @@ def run_json_result(
         raise ValueError("idempotency_key requires artifact_dir")
     if supervised_native_resume and session_policy != "stateful":
         raise ValueError("supervised_native_resume requires a stateful session")
+    env, session_metadata = _runtime_compatibility_policy(
+        env,
+        session_policy=session_policy,
+        session_manager=session_manager,
+        session_key=session_key,
+        session_metadata=session_metadata,
+        artifact_dir=Path(artifact_dir) if artifact_dir else None,
+        idempotency_key=idempotency_key,
+    )
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -271,6 +545,13 @@ def run_json_result(
         process_chain=process_chain,
     )
     _raise_if_auto_resolved_manual(provider, configs)
+    _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
+    _configure_paper_worker_session(
+        env,
+        artifact_dir=Path(artifact_dir) if artifact_dir else None,
+        session_manager=session_manager,
+    )
+    session_metadata["arc_runtime_capabilities"] = _runtime_capabilities(env)
     return _run_with_retries(
         configs,
         provider_requested=provider,
@@ -284,6 +565,8 @@ def run_json_result(
         idle_timeout_seconds=idle_timeout_seconds,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        paper_worker_id=session_name,
+        paper_call_id=call_label or idempotency_key,
         call=lambda selected, config, effective_idle_timeout_seconds: _generate_json(
             selected,
             prompt,
@@ -397,6 +680,15 @@ def run_text_result(
         raise ValueError("idempotency_key requires artifact_dir")
     if supervised_native_resume and session_policy != "stateful":
         raise ValueError("supervised_native_resume requires a stateful session")
+    env, session_metadata = _runtime_compatibility_policy(
+        env,
+        session_policy=session_policy,
+        session_manager=session_manager,
+        session_key=session_key,
+        session_metadata=session_metadata,
+        artifact_dir=Path(artifact_dir) if artifact_dir else None,
+        idempotency_key=idempotency_key,
+    )
     configs = resolve_llm_configs(
         provider=provider,
         model=model,
@@ -405,6 +697,13 @@ def run_text_result(
         process_chain=process_chain,
     )
     _raise_if_auto_resolved_manual(provider, configs)
+    _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
+    _configure_paper_worker_session(
+        env,
+        artifact_dir=Path(artifact_dir) if artifact_dir else None,
+        session_manager=session_manager,
+    )
+    session_metadata["arc_runtime_capabilities"] = _runtime_capabilities(env)
     return _run_with_retries(
         configs,
         provider_requested=provider,
@@ -418,6 +717,8 @@ def run_text_result(
         idle_timeout_seconds=idle_timeout_seconds,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        paper_worker_id=session_name,
+        paper_call_id=call_label or idempotency_key,
         call=lambda selected, config, effective_idle_timeout_seconds: _generate_text(
             selected,
             prompt,
@@ -449,6 +750,25 @@ def _raise_if_auto_resolved_manual(provider_requested: str, configs: Sequence[LL
         raise LLMNeedsLLM(configs[0])
 
 
+def _validate_runtime_preflight(
+    configs: Sequence[LLMConfig],
+    *,
+    env: Mapping[str, str],
+    idle_timeout_seconds: float | None,
+) -> None:
+    """Validate provider runtime inputs before creating run artifacts."""
+    for config in configs:
+        provider_env = _env_with_tier_reasoning_default(env, config.provider, None)
+        try:
+            resolve_idle_timeout_seconds(
+                idle_timeout_seconds,
+                env=provider_env,
+                provider=config.provider,
+            )
+        except (TypeError, ValueError) as exc:
+            raise LLMConfigurationError(str(exc)) from exc
+
+
 def _run_with_retries(
     configs: Sequence[LLMConfig],
     *,
@@ -463,6 +783,8 @@ def _run_with_retries(
     idle_timeout_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    paper_worker_id: str | None = None,
+    paper_call_id: str | None = None,
     call: Callable[[Any, LLMConfig, float], Any],
 ) -> Any:
     del progress_callback
@@ -483,7 +805,28 @@ def _run_with_retries(
         for attempt in range(1, max_attempts + 1):
             try:
                 _check_cancel(cancel_check)
-                result = call(selected, config, effective_idle_timeout_seconds)
+                try:
+                    result = call(selected, config, effective_idle_timeout_seconds)
+                except BaseException as call_exc:
+                    final_status = (
+                        "cancelled" if isinstance(call_exc, (LLMWorkerCancelled, KeyboardInterrupt)) else "failed"
+                    )
+                    try:
+                        _finalize_paper_worker_call(
+                            env,
+                            status=final_status,
+                            worker_id=paper_worker_id,
+                            call_id=paper_call_id,
+                        )
+                    except Exception as finalize_exc:
+                        call_exc.add_note(f"paper overlay finalization failed: {finalize_exc}")
+                    raise
+                _finalize_paper_worker_call(
+                    env,
+                    status="success",
+                    worker_id=paper_worker_id,
+                    call_id=paper_call_id,
+                )
                 value = result.value if isinstance(result, LLMCallOutcome) else result
                 attempt_record = _attempt_record(
                     config,
@@ -663,6 +1006,7 @@ def _generate_json(
                 cancel_check=cancel_check,
                 supervised_native_resume=supervised_native_resume,
                 native_session_available=bool(session and session.native_session_id),
+                runtime_capabilities=_runtime_capabilities(env),
             )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
@@ -927,6 +1271,7 @@ def _generate_text(
                 cancel_check=cancel_check,
                 supervised_native_resume=supervised_native_resume,
                 native_session_available=bool(session and session.native_session_id),
+                runtime_capabilities=_runtime_capabilities(env),
             )
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
@@ -1372,6 +1717,10 @@ def _recover_warn_schema_output(
                 formatter_kwargs["idempotency_key"] = f"{idempotency_key}/schema_formatter"
             return run_json(format_prompt, **formatter_kwargs)
 
+        # Schema formatting is an isolated recovery stage. It must not inherit
+        # paper access or the user's host tools from the scientific worker.
+        from .proposers_reviewer.config import isolated_worker_env
+
         formatted = format_to_schema_or_retry(
             raw_text=source,
             schema=schema or {"type": "object"},
@@ -1380,7 +1729,7 @@ def _recover_warn_schema_output(
             provider=provider,
             model=model,
             model_tier=model_tier,
-            env=env,
+            env=isolated_worker_env(env),
             process_chain=list(process_chain) if process_chain is not None else None,
         )
     except (LLMWorkerCancelled, LLMWorkerTimeout, LLMSchemaError):

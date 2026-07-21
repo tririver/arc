@@ -8,6 +8,33 @@ paper-summary batches.
 All single-paper operations in higher-level tools should go through
 `arc-paper`.
 
+## Worker CLI
+
+Ordinary ARC LLM workers receive the deterministic paper interface as
+`arc-paper-worker`. It uses the same non-LLM commands documented below, can
+read the complete shared ARC paper cache, and may fetch missing paper data
+through ARC's built-in providers. Summary generation, reference inference,
+LLM batch execution, and every alias that can start a model are rejected with
+`nested_llm_forbidden`.
+
+Each run uses a writable cache overlay in front of the read-only shared cache.
+Parsing, refreshes, imports, annotations, and removals first change the
+overlay; removals are recoverable tombstones. At the end of a worker call ARC
+validates overlay records and atomically promotes valid content. Invalid data
+is quarantined, and conflicting content is preserved as a version with a
+conflict record rather than silently overwriting the shared cache.
+
+Worker results larger than 64 KiB are stored under the run artifacts. The
+result envelope contains a hash and page handle; read it with:
+
+```bash
+arc-paper-worker artifact-read <handle> --offset <byte-offset> --limit <bytes> --json
+```
+
+There is no total paper-query limit. Calls are audited without credentials or
+full host configuration. Files obtained with explicitly inherited host tools
+must be imported with `arc-paper-worker parse` before they are ARC evidence.
+
 ## Deterministic CLI
 
 Use `extract-paper-ids` when the input is natural-language text that may

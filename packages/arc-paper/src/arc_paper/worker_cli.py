@@ -1,0 +1,568 @@
+"""Restricted ``arc-paper`` entry point for ARC LLM workers.
+
+The worker entry point deliberately classifies commands rather than trying to
+hide provider binaries from a child process.  Only deterministic paper
+operations are delegated to :mod:`arc_paper.cli`; commands which can start an
+LLM are rejected before the ordinary CLI parser or service layer is entered.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import uuid
+from typing import Any
+
+from . import cli
+from .ids import extract_paper_ids
+from .results import err, ok
+from .worker_guard import authorized_wrapper_call, validate_worker_guard_if_required
+from .worker_session import WorkerCacheSession
+
+
+MAX_INLINE_BYTES = 64 * 1024
+# Base64 adds one third to the response.  Keep a complete page envelope below
+# the same 64 KiB inline boundary rather than returning an oversized page.
+MAX_PAGE_BYTES = 46 * 1024
+DEFAULT_PAGE_BYTES = MAX_PAGE_BYTES
+
+# An allow-list makes newly added arc-paper commands fail closed until they are
+# reviewed for nested-model behavior.  ``store-llm-summary`` only validates and
+# stores caller-supplied JSON; it does not invoke a model.
+SAFE_COMMANDS = frozenset(
+    {
+        "extract-paper-ids",
+        "extract-ids",
+        "safe-dir-name",
+        "paper-ids-safe-dir-name",
+        "get-title",
+        "get-abstract",
+        "get-authors",
+        "get-metadata",
+        "get-references",
+        "get-citers",
+        "get-citer-count",
+        "get-toc",
+        "store-llm-summary",
+        "get-section",
+        "search-full-text",
+        "get-equation-context",
+        "source-cache",
+        "source-probe",
+        "parse",
+        "get-parsed",
+        "get-parsed-toc",
+        "get-parsed-section",
+        "get-parsed-equations",
+        "get-parsed-equation",
+        "mark-parsed-equation",
+        "search-parsed",
+        "cache",
+        "doctor",
+        "summary-batch",
+    }
+)
+NESTED_LLM_COMMANDS = frozenset(
+    {
+        "llm-infer-main-references",
+        "infer-main-references",
+        "get-llm-summary",
+        "llm-summary",
+        "generate-llm-summary",
+        "llm-generate-summary",
+    }
+)
+SAFE_BATCH_COMMANDS = frozenset(
+    {"create", "status", "retry-failed", "prefetch", "export"}
+)
+HANDLE_RE = re.compile(r"^sha256-[0-9a-f]{64}\.json$")
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    settings, command_argv, parse_error = _parse_worker_options(raw_argv)
+    session_dir = _session_dir(settings.session_dir)
+    if os.environ.get("ARC_PAPER_CLI_ACCESS", "").strip().lower() != "full":
+        result = _worker_error(
+            "paper_cli_disabled",
+            "arc-paper-worker is disabled for this worker or execution stage",
+        )
+        return _finish(result, session_dir, command_argv, settings, None)
+    try:
+        validate_worker_guard_if_required()
+    except Exception as exc:
+        result = _worker_error(
+            "paper_cli_guard_invalid",
+            str(exc) or exc.__class__.__name__,
+            error_type=exc.__class__.__name__,
+        )
+        return _finish(result, session_dir, command_argv, settings, None)
+    try:
+        cache_session = WorkerCacheSession.open_or_create_from_environment()
+    except Exception as exc:
+        result = _worker_error(
+            "worker_session_invalid",
+            str(exc) or exc.__class__.__name__,
+            error_type=exc.__class__.__name__,
+        )
+        return _finish(result, session_dir, command_argv, settings, None)
+    if cache_session is not None and session_dir != cache_session.run_root:
+        result = _worker_error(
+            "worker_session_invalid",
+            "--session-dir must match the controller-authorized worker run directory",
+        )
+        return _finish(result, cache_session.run_root, command_argv, settings, cache_session)
+    if parse_error is not None:
+        return _finish(parse_error, session_dir, [], settings, cache_session)
+
+    if not command_argv:
+        result = _worker_error("worker_command_required", "An arc-paper command is required")
+        return _finish(result, session_dir, command_argv, settings, cache_session)
+
+    if cache_session is not None and not settings.call_id:
+        settings.call_id = f"call-{uuid.uuid4().hex}"
+
+    command = command_argv[0]
+    if command == "artifact-read":
+        result = _read_artifact(command_argv[1:], session_dir)
+        return _finish(result, session_dir, command_argv, settings, cache_session)
+
+    policy_error = _policy_error(command_argv, cache_session, session_dir)
+    if policy_error is not None:
+        return _finish(policy_error, session_dir, command_argv, settings, cache_session)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        activation = cache_session.activated() if cache_session is not None else nullcontext()
+        call_scope = cache_session.call_scope(settings.call_id) if cache_session is not None else nullcontext()
+        with (
+            activation,
+            call_scope,
+            authorized_wrapper_call(),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            exit_code = cli.main(command_argv)
+        result = json.loads(stdout.getvalue())
+        if not isinstance(result, dict):
+            raise ValueError("arc-paper returned a non-object JSON result")
+        if exit_code and result.get("ok") is not False:
+            result = _worker_error(
+                "worker_command_failed",
+                f"arc-paper exited with status {exit_code}",
+            )
+    except KeyboardInterrupt:
+        result = _worker_error("worker_command_cancelled", "arc-paper command was cancelled")
+        result["status"] = "cancelled"
+    except SystemExit as exc:
+        result = _worker_error(
+            "worker_arguments_invalid", f"arc-paper rejected the command arguments (status {exc.code})"
+        )
+    except Exception as exc:
+        result = _worker_error(
+            "worker_command_failed", str(exc) or exc.__class__.__name__, error_type=exc.__class__.__name__
+        )
+    finally:
+        diagnostics = stderr.getvalue()
+        if diagnostics:
+            print(diagnostics, file=sys.stderr, end="")
+
+    return _finish(result, session_dir, command_argv, settings, cache_session)
+
+
+def _parse_worker_options(
+    argv: list[str],
+) -> tuple[argparse.Namespace, list[str], dict[str, Any] | None]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--session-dir")
+    parser.add_argument("--worker-id", default=os.environ.get("ARC_LLM_WORKER_ID", ""))
+    parser.add_argument("--call-id", default=os.environ.get("ARC_LLM_CALL_ID", ""))
+    parser.add_argument("--max-inline-bytes", type=int, default=MAX_INLINE_BYTES)
+    try:
+        settings, remainder = parser.parse_known_args(argv)
+    except SystemExit:
+        settings = argparse.Namespace(
+            session_dir=None, worker_id="", call_id="", max_inline_bytes=MAX_INLINE_BYTES
+        )
+        return settings, [], _worker_error("worker_arguments_invalid", "Invalid worker options")
+    if settings.max_inline_bytes < 1 or settings.max_inline_bytes > MAX_INLINE_BYTES:
+        return settings, remainder, _worker_error(
+            "worker_arguments_invalid",
+            f"--max-inline-bytes must be between 1 and {MAX_INLINE_BYTES}",
+        )
+    return settings, remainder, None
+
+
+def _session_dir(explicit: str | None) -> Path | None:
+    value = explicit or os.environ.get("ARC_PAPER_WORKER_SESSION_DIR")
+    return Path(value).expanduser().resolve() if value else None
+
+
+def _policy_error(
+    argv: list[str],
+    cache_session: WorkerCacheSession | None,
+    session_dir: Path | None,
+) -> dict[str, Any] | None:
+    command = argv[0]
+    if command in NESTED_LLM_COMMANDS:
+        return _nested_llm_error(command)
+    if command == "summary-batch":
+        subcommand = argv[1] if len(argv) > 1 else ""
+        if subcommand == "run":
+            return _nested_llm_error("summary-batch run")
+        if subcommand not in SAFE_BATCH_COMMANDS:
+            return _worker_error(
+                "worker_command_forbidden",
+                f"summary-batch subcommand {subcommand or '<missing>'!r} is not approved for workers",
+            )
+        if subcommand == "export":
+            run_root = cache_session.run_root if cache_session is not None else session_dir
+            path_error = _export_path_error(argv, run_root)
+            if path_error is not None:
+                return path_error
+    if command not in SAFE_COMMANDS:
+        return _worker_error(
+            "worker_command_forbidden",
+            f"arc-paper command {command!r} is not approved for workers",
+        )
+    return None
+
+
+def _export_path_error(argv: list[str], run_root: Path | None) -> dict[str, Any] | None:
+    output: str | None = None
+    output_index: int | None = None
+    joined = False
+    for index, token in enumerate(argv):
+        if token == "--output" and index + 1 < len(argv):
+            output = argv[index + 1]
+            output_index = index + 1
+        elif token.startswith("--output="):
+            output = token.split("=", 1)[1]
+            output_index = index
+            joined = True
+    if output is None:
+        return None  # The ordinary parser will report the missing required argument.
+    if run_root is None:
+        return _worker_error(
+            "worker_session_required",
+            "summary-batch export requires a worker run directory",
+        )
+    root = run_root.expanduser().resolve()
+    destination = Path(output).expanduser()
+    if not destination.is_absolute():
+        destination = root / destination
+    destination = destination.resolve()
+    if destination == root or not destination.is_relative_to(root):
+        return _worker_error(
+            "worker_output_path_forbidden",
+            "summary-batch export output must remain inside the worker run directory",
+        )
+    if output_index is not None:
+        argv[output_index] = (
+            f"--output={destination}" if joined else str(destination)
+        )
+    return None
+
+
+def _nested_llm_error(operation: str) -> dict[str, Any]:
+    return _worker_error(
+        "nested_llm_forbidden",
+        f"{operation!r} can start an LLM and is disabled in arc-paper-worker",
+    )
+
+
+def _worker_error(code: str, message: str, **details: Any) -> dict[str, Any]:
+    result = err(code, message)
+    result["status"] = "error"
+    if details:
+        result["error"].update(details)
+    return result
+
+
+def _externalize_large_result(
+    result: dict[str, Any], session_dir: Path | None, *, max_inline_bytes: int
+) -> dict[str, Any]:
+    payload = _canonical_json(result)
+    if len(_display_json(result)) + 1 <= max_inline_bytes:
+        return result
+    if session_dir is None:
+        return _worker_error(
+            "worker_session_required",
+            "A worker session directory is required for results larger than 64 KiB",
+        )
+
+    digest = hashlib.sha256(payload).hexdigest()
+    handle = f"sha256-{digest}.json"
+    artifact_dir = session_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    destination = artifact_dir / handle
+    if destination.exists() and _sha256_file(destination) != digest:
+        _atomic_write(destination, payload)
+    elif not destination.exists():
+        _atomic_write(destination, payload)
+    source_meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    return ok(
+        {
+            "artifact": {
+                "handle": handle,
+                "sha256": digest,
+                "size_bytes": len(payload),
+                "media_type": "application/json",
+            },
+            "summary": _result_summary(result),
+            "paging": {
+                "command": f"artifact-read {handle}",
+                "offset_unit": "byte",
+                "default_limit": DEFAULT_PAGE_BYTES,
+            },
+        },
+        externalized=True,
+        overlay_promotion=source_meta.get("overlay_promotion"),
+        worker_audit=source_meta.get("worker_audit"),
+    )
+
+
+def _read_artifact(argv: list[str], session_dir: Path | None) -> dict[str, Any]:
+    parser = argparse.ArgumentParser(prog="arc-paper-worker artifact-read", add_help=False)
+    parser.add_argument("handle")
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=DEFAULT_PAGE_BYTES)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return _worker_error("artifact_read_invalid", "Invalid artifact-read arguments")
+    if session_dir is None:
+        return _worker_error("worker_session_required", "A worker session directory is required")
+    if not HANDLE_RE.fullmatch(args.handle):
+        return _worker_error("artifact_handle_invalid", "Artifact handle is invalid")
+    if args.offset < 0 or args.limit < 1 or args.limit > MAX_PAGE_BYTES:
+        return _worker_error(
+            "artifact_page_invalid",
+            f"offset must be non-negative and limit must be between 1 and {MAX_PAGE_BYTES}",
+        )
+    path = session_dir / "artifacts" / args.handle
+    try:
+        size = path.stat().st_size
+        expected_digest = args.handle.removeprefix("sha256-").removesuffix(".json")
+        if _sha256_file(path) != expected_digest:
+            return _worker_error(
+                "artifact_integrity_failed", f"Artifact {args.handle!r} failed its content hash check"
+            )
+        with path.open("rb") as handle:
+            handle.seek(args.offset)
+            chunk = handle.read(args.limit)
+    except FileNotFoundError:
+        return _worker_error("artifact_not_found", f"Artifact {args.handle!r} was not found")
+    return ok(
+        {
+            "handle": args.handle,
+            "offset": args.offset,
+            "next_offset": args.offset + len(chunk),
+            "size_bytes": size,
+            "eof": args.offset + len(chunk) >= size,
+            "encoding": "base64",
+            "content": base64.b64encode(chunk).decode("ascii"),
+        }
+    )
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _finish(
+    result: dict[str, Any],
+    session_dir: Path | None,
+    argv: list[str],
+    settings: argparse.Namespace,
+    cache_session: WorkerCacheSession | None,
+) -> int:
+    call_status = _call_status(result)
+    intended_exit_code = cli._exit_code(result)
+    if cache_session is not None:
+        meta = result.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            result["meta"] = meta
+        meta["overlay_promotion"] = {"status": "pending_controller"}
+        meta["worker_audit"] = {
+            "schema_version": "arc.paper.worker-session.v1",
+            "status": "recorded",
+        }
+
+    result = _externalize_large_result(
+        result,
+        session_dir,
+        max_inline_bytes=settings.max_inline_bytes,
+    )
+    if cache_session is not None:
+        audit_error = _record_cache_call(
+            cache_session, argv, result, settings, call_status=call_status
+        )
+        if audit_error is not None:
+            intended_exit_code = 1
+            result = _externalize_large_result(
+                audit_error,
+                session_dir,
+                max_inline_bytes=settings.max_inline_bytes,
+            )
+    else:
+        _write_audit_event(session_dir, argv, result, settings, call_status=call_status)
+    sys.stdout.write(_display_json(result).decode("utf-8") + "\n")
+    return intended_exit_code
+
+
+def _record_cache_call(
+    session: WorkerCacheSession,
+    argv: list[str],
+    result: dict[str, Any],
+    settings: argparse.Namespace,
+    *,
+    call_status: str,
+) -> dict[str, Any] | None:
+    result_payload = _canonical_json(result)
+    data = result.get("data")
+    artifact = (data.get("artifact") or {}) if isinstance(data, dict) else {}
+    try:
+        session.record_call(
+            worker_id=settings.worker_id,
+            call_id=settings.call_id,
+            operation=_operation(argv),
+            status=call_status,
+            paper_ids=extract_paper_ids(" ".join(argv)),
+            parameters=_parameter_summary(argv),
+            source={
+                "entrypoint": "arc-paper-worker",
+                "provider": (result.get("meta") or {}).get("provider"),
+            },
+            artifact_hash=str(artifact.get("sha256") or ""),
+            result_hash=hashlib.sha256(result_payload).hexdigest(),
+        )
+    except Exception as exc:
+        return _worker_error(
+            "worker_session_record_failed",
+            str(exc) or exc.__class__.__name__,
+            error_type=exc.__class__.__name__,
+        )
+    return None
+
+
+def _call_status(result: dict[str, Any]) -> str:
+    data = result.get("data")
+    if result.get("status") == "cancelled" or (
+        isinstance(data, dict) and data.get("cancelled") is True
+    ):
+        return "cancelled"
+    return "success" if result.get("ok") is True else "failed"
+
+
+def _operation(argv: list[str]) -> str:
+    return (
+        " ".join(argv[:2])
+        if argv and argv[0] in {"summary-batch", "cache", "doctor"}
+        else (argv[0] if argv else "")
+    )
+
+
+def _write_audit_event(
+    session_dir: Path | None,
+    argv: list[str],
+    result: dict[str, Any],
+    settings: argparse.Namespace,
+    *,
+    call_status: str,
+) -> None:
+    if session_dir is None:
+        return
+    session_dir.mkdir(parents=True, exist_ok=True)
+    operation = _operation(argv)
+    result_payload = _canonical_json(result)
+    artifact = ((result.get("data") or {}).get("artifact") or {}) if isinstance(result.get("data"), dict) else {}
+    event = {
+        "schema_version": "arc.paper.worker-audit.v1",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": os.environ.get("ARC_LLM_SESSION_ID") or session_dir.name,
+        "worker": settings.worker_id,
+        "call": settings.call_id,
+        "operation": operation,
+        "paper_ids": extract_paper_ids(" ".join(argv)),
+        "parameters": _parameter_summary(argv),
+        "status": call_status,
+        "error_code": (result.get("error") or {}).get("code"),
+        "source": (result.get("meta") or {}).get("provider"),
+        "artifact_hash": artifact.get("sha256"),
+        "result_hash": hashlib.sha256(result_payload).hexdigest(),
+        "overlay_promotion": (result.get("meta") or {}).get("overlay_promotion", "not_applicable"),
+    }
+    line = _canonical_json(event) + b"\n"
+    audit_path = session_dir / "audit.jsonl"
+    descriptor = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, line)
+    finally:
+        os.close(descriptor)
+
+
+def _parameter_summary(argv: list[str]) -> dict[str, Any]:
+    # Deliberately record shapes, not values: free text, paths, queries, and
+    # provider configuration can contain private data or credentials.
+    flags = sorted({token.split("=", 1)[0] for token in argv[1:] if token.startswith("-")})
+    positional_count = sum(1 for token in argv[1:] if not token.startswith("-"))
+    return {"flags": flags, "argument_count": max(0, len(argv) - 1), "positional_count": positional_count}
+
+
+def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    data = result.get("data")
+    summary: dict[str, Any] = {
+        "ok": result.get("ok"),
+        "status": result.get("status"),
+        "error_code": (result.get("error") or {}).get("code"),
+        "data_type": type(data).__name__,
+    }
+    if isinstance(data, (list, dict, str)):
+        summary["data_items"] = len(data)
+    return summary
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+
+
+def _display_json(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

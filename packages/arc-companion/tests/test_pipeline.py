@@ -2618,6 +2618,8 @@ def test_offline_runtime_env_overrides_polluted_parent_access(monkeypatch) -> No
     assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "false"
     assert env["ARC_CODEX_ENABLE_MCP"] == "false"
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+    assert env["ARC_PAPER_CLI_ACCESS"] == "full"
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
     assert "ARC_CODEX_MCP_MODE" not in env
     assert "ARC_CLAUDE_MCP_MODE" not in env
 
@@ -4837,6 +4839,21 @@ def test_controller_only_runtime_keeps_internet_enabled_and_scrubs_polluted_pare
             assert key not in env
 
 
+def test_explicit_host_tool_inheritance_preserves_host_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("ARC_CODEX_PROFILE", "research-tools")
+    monkeypatch.setenv("ARC_CLAUDE_MCP_CONFIG", "/tmp/research-mcp.json")
+
+    env = pipeline_module._llm_runtime_env(
+        allow_internet=True,
+        inherit_host_tools=True,
+    )
+
+    assert env["ARC_PAPER_CLI_ACCESS"] == "full"
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "true"
+    assert env["ARC_CODEX_PROFILE"] == "research-tools"
+    assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/research-mcp.json"
+
+
 def test_fingerprint_covers_runtime_access_options(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     evidence = _evidence(bundle)
@@ -4848,6 +4865,14 @@ def test_fingerprint_covers_runtime_access_options(tmp_path: Path) -> None:
     )
     assert _fingerprint(bundle, enabled, evidence=evidence) != _fingerprint(
         bundle, local_only, evidence=evidence
+    )
+    inherited = BuildOptions(
+        paper_id=bundle.paper_id,
+        project_dir=tmp_path / "run",
+        inherit_host_tools=True,
+    )
+    assert _fingerprint(bundle, enabled, evidence=evidence) != _fingerprint(
+        bundle, inherited, evidence=evidence
     )
 
 

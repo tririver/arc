@@ -81,12 +81,14 @@ experimental status, provider-side persistence, missing native usage/schema
 support, and detected risk categories and paths without printing configuration
 values or credentials.
 
-Codex and Claude internal workers disable MCP and inherited MCP configuration.
-They receive local paper evidence from the owning controller and may use
-explicitly enabled internet access. Generic `arc-llm` callers may still opt
-into their own MCP configuration, but this is an advanced provider feature and
-not an ARC workflow default. Kimi is the documented exception: it inherits its
-own configuration even when ARC denies ACP reverse requests.
+Codex and Claude internal workers disable inherited MCP, skills, plugins,
+rules, and other host configuration by default. Ordinary workers instead get
+the deterministic `arc-paper-worker` CLI. Generic `arc-llm` callers may opt in
+to all host tools with `--inherit-host-tools`; this is a high-risk per-run
+choice, is fingerprinted for audit/resume checks, and is not an ARC workflow
+default. ARC records paths and risk categories, not credentials or complete
+configuration. Kimi remains the documented exception because its host cannot
+reliably suppress all inherited configuration.
 
 ## Direct Prompt Tests
 
@@ -97,6 +99,13 @@ Text output:
 ```bash
 arc-llm run-text --prompt-text "Say hello" --provider auto
 ```
+
+New ordinary calls enable paper CLI access by default. Use
+`--no-arc-paper-cli` for an isolated call, or `--arc-paper-cli` to state the
+default explicitly. Schema formatting, output recovery, provider preflight,
+and blind-reference workers always disable it regardless of ordinary runtime
+configuration. Checkpoints created before the access field existed resume as
+`none` instead of silently gaining access.
 
 JSON output:
 
@@ -187,7 +196,8 @@ The loop runner owns all artifact writes. Worker prompts and outputs are stored
 under per-loop and per-round directories, so distinct loops can run
 concurrently without sharing mutable context.
 
-Workers may return the optional top-level `arc_evidence_requests` array. Each
+Workers without reliable direct shell access may return the optional top-level
+`arc_evidence_requests` array. Each
 request contains a loop-round-unique `request_id`, an `operation`, JSON
 `arguments`, and a `reason`. The controller resolves requests outside the
 worker process, records response data and provenance in `transcript.jsonl`,
@@ -203,7 +213,9 @@ portable operations are `paper.metadata`, `paper.section`,
 `paper.search`. Python hosts may instead pass an `evidence_controller`
 callback to `run_proposers_reviewer_batch()` or `run_ideas()`; the callback
 receives typed requests and must return one typed response per request with
-matching IDs and provenance.
+matching IDs and provenance. This controller route has the same operation
+semantics as `arc-paper-worker`; it is the portable evidence fallback rather
+than a weaker evidence class.
 
 Evidence capability is explicit and hierarchical. Batch `evidence.enabled`
 is the master switch; a loop or worker may further disable it with

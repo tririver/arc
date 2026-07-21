@@ -140,6 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cancel a worker after this many seconds without substantive provider progress.",
     )
+    _worker_capability_args(loop_parser)
 
     bench_parser = sub.add_parser("proposers-reviewer-bench")
     bench_parser.add_argument("--config", required=True)
@@ -270,6 +271,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "proposers-reviewer-loop":
         config = _read_json_file(args.config)
         _apply_loop_session_overrides(config, args)
+        _apply_loop_runtime_overrides(config, args)
         if args.idle_timeout_seconds is not None:
             config["worker_idle_timeout_seconds"] = args.idle_timeout_seconds
         return run_proposers_reviewer_batch(
@@ -404,6 +406,26 @@ def _apply_loop_session_overrides(config: dict[str, Any], args: argparse.Namespa
         config["session"] = session
 
 
+def _apply_loop_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
+    access = getattr(args, "arc_paper_cli_access", None)
+    inherit = bool(getattr(args, "inherit_host_tools", False))
+    if access is None and not inherit:
+        return
+    for loop in config.get("loops", []):
+        if not isinstance(loop, dict):
+            continue
+        for collection in ("proposers", "reviewers"):
+            for worker in loop.get(collection, []):
+                if not isinstance(worker, dict):
+                    continue
+                runtime = dict(worker.get("runtime") or {})
+                if access is not None:
+                    runtime["arc_paper_cli_access"] = access
+                if inherit:
+                    runtime["inherit_host_tools"] = True
+                worker["runtime"] = runtime
+
+
 def _shared_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-internet", action="store_true")
     parser.add_argument("--allow-mcp", action="store_true")
@@ -431,7 +453,36 @@ def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-web-search", default=None)
     parser.add_argument("--codex-network-access", choices=["true", "false"], default=None)
     parser.add_argument("--no-codex-ephemeral", action="store_true")
+    _worker_capability_args(parser)
     parser.add_argument("--codex-use-user-config", action="store_true")
+    _remaining_llm_runtime_args(parser)
+
+
+def _worker_capability_args(parser: argparse.ArgumentParser) -> None:
+    paper_cli = parser.add_mutually_exclusive_group()
+    paper_cli.add_argument(
+        "--arc-paper-cli",
+        dest="arc_paper_cli_access",
+        action="store_const",
+        const="full",
+        default=None,
+        help="Allow the non-LLM arc-paper-worker CLI (the default for new ordinary calls).",
+    )
+    paper_cli.add_argument(
+        "--no-arc-paper-cli",
+        dest="arc_paper_cli_access",
+        action="store_const",
+        const="none",
+        help="Disable arc-paper-worker for this call.",
+    )
+    parser.add_argument(
+        "--inherit-host-tools",
+        action="store_true",
+        help="HIGH RISK: inherit host user configuration, rules, skills, plugins, and MCP tools.",
+    )
+
+
+def _remaining_llm_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-ignore-user-config", action="store_true")
     parser.add_argument("--codex-use-rules", action="store_true")
     parser.add_argument("--codex-ignore-rules", action="store_true")
@@ -452,6 +503,12 @@ def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
     overrides: dict[str, str] = {}
+    # Ordinary newly submitted workers receive the paper-only CLI. Isolated
+    # internal stages override this below or at their call site.
+    overrides["ARC_PAPER_CLI_ACCESS"] = (
+        "none" if args.command == "schema-format" else (args.arc_paper_cli_access or "full")
+    )
+    overrides["ARC_LLM_INHERIT_HOST_TOOLS"] = "true" if args.inherit_host_tools else "false"
     if args.allow_internet:
         overrides["ARC_CODEX_ALLOW_INTERNET"] = "true"
         overrides["ARC_CLAUDE_ALLOW_INTERNET"] = "true"
@@ -489,6 +546,17 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
         overrides["ARC_CODEX_IGNORE_RULES"] = "false"
     if args.codex_ignore_rules:
         overrides["ARC_CODEX_IGNORE_RULES"] = "true"
+    if args.inherit_host_tools:
+        overrides.update(
+            {
+                "ARC_LLM_HOST_TOOLS_RISK": "high",
+                "ARC_CODEX_ENABLE_MCP": "true",
+                "ARC_CODEX_IGNORE_USER_CONFIG": "false",
+                "ARC_CODEX_IGNORE_RULES": "false",
+                "ARC_CLAUDE_ALLOW_MCP": "true",
+                "ARC_CLAUDE_BARE": "false",
+            }
+        )
     _put(overrides, "ARC_CLAUDE_EFFORT", args.claude_effort)
     _put(overrides, "ARC_CLAUDE_TOOLS", args.claude_tools)
     _put(overrides, "ARC_CLAUDE_ALLOWED_TOOLS", args.claude_allowed_tools)

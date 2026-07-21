@@ -35,6 +35,7 @@ pdf = ["pypdf>=5.0"]
 
 [project.scripts]
 arc-paper = "arc_paper.cli:main"
+arc-paper-worker = "arc_paper.worker_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/arc_paper"]

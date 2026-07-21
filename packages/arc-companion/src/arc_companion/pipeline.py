@@ -254,6 +254,7 @@ class BuildOptions:
     domain_id: str | None = None
     domain_manifest: Path | None = None
     allow_internet: bool = True
+    inherit_host_tools: bool = False
     skip_translation: bool = False
     context_paper_ids: tuple[str, ...] = ()
     stop_after_first_chapter: bool = False
@@ -1703,6 +1704,7 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "domain_id": options.domain_id,
         "domain_manifest": str(options.domain_manifest) if options.domain_manifest else None,
         "allow_internet": options.allow_internet,
+        "inherit_host_tools": options.inherit_host_tools,
         "skip_translation": options.skip_translation,
         "context_paper_ids": list(options.context_paper_ids),
         "stop_after_first_chapter": options.stop_after_first_chapter,
@@ -1726,6 +1728,7 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         domain_id=value.get("domain_id"),
         domain_manifest=Path(value["domain_manifest"]) if value.get("domain_manifest") else None,
         allow_internet=bool(value.get("allow_internet", True)),
+        inherit_host_tools=bool(value.get("inherit_host_tools", False)),
         skip_translation=bool(value.get("skip_translation", False)),
         context_paper_ids=tuple(value.get("context_paper_ids") or ()),
         stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
@@ -4452,6 +4455,7 @@ def _llm_call(
     runtime_env = _llm_runtime_env(
         allow_internet=not force_offline and allow_internet and options.allow_internet,
         force_disable_internet=force_offline or not options.allow_internet,
+        inherit_host_tools=options.inherit_host_tools,
     )
     return llm(
         prompt,
@@ -4550,6 +4554,8 @@ def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str,
     return {
         "allow_mcp": False,
         "allow_internet": allow_internet,
+        "arc_paper_cli_access": "full",
+        "inherit_host_tools": False if options is None else options.inherit_host_tools,
     }
 
 
@@ -4557,6 +4563,7 @@ def _llm_runtime_env(
     *,
     allow_internet: bool,
     force_disable_internet: bool = False,
+    inherit_host_tools: bool = False,
 ) -> dict[str, str] | None:
     """Map portable access intent onto both supported host runtimes."""
     env = dict(os.environ)
@@ -4564,17 +4571,18 @@ def _llm_runtime_env(
         value = "true" if allow_internet else "false"
         env["ARC_CODEX_ALLOW_INTERNET"] = value
         env["ARC_CLAUDE_ALLOW_INTERNET"] = value
-    for key in _MCP_CONFIG_ENV_KEYS:
-        env.pop(key, None)
-    # Companion evidence is controller-resolved.  Provider-native isolation is
-    # mandatory even when a parent profile injects MCP servers or tool grants.
-    env["ARC_CODEX_ENABLE_MCP"] = "false"
-    env["ARC_CLAUDE_ALLOW_MCP"] = "false"
-    env["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
-    env["ARC_CLAUDE_BARE"] = "true"
-    claude_web_tools = "WebSearch,WebFetch" if allow_internet else ""
-    env["ARC_CLAUDE_TOOLS"] = claude_web_tools
-    env["ARC_CLAUDE_ALLOWED_TOOLS"] = claude_web_tools
+    env["ARC_PAPER_CLI_ACCESS"] = "full"
+    env["ARC_LLM_INHERIT_HOST_TOOLS"] = "true" if inherit_host_tools else "false"
+    if not inherit_host_tools:
+        for key in _MCP_CONFIG_ENV_KEYS:
+            env.pop(key, None)
+        env["ARC_CODEX_ENABLE_MCP"] = "false"
+        env["ARC_CLAUDE_ALLOW_MCP"] = "false"
+        env["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
+        env["ARC_CLAUDE_BARE"] = "true"
+        claude_web_tools = "WebSearch,WebFetch" if allow_internet else ""
+        env["ARC_CLAUDE_TOOLS"] = claude_web_tools
+        env["ARC_CLAUDE_ALLOWED_TOOLS"] = claude_web_tools
     return env
 
 

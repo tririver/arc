@@ -6,6 +6,13 @@ note, or book. It consumes a rich source plus its paired PDF through
 renders and validates the PDF deterministically. The core workflow is CLI-only
 and portable across supported agent hosts.
 
+Chapter workers use `arc-paper-worker` by default for deterministic access to
+the shared paper cache and run overlay. They do not inherit the user's MCP,
+skills, plugins, rules, or extra CLIs unless the run explicitly enables the
+high-risk `inherit_host_tools` option. Imported external files must pass
+through `arc-paper-worker parse` before the companion may cite them as ARC
+evidence.
+
 ## Phase 1: Source and Structure
 
 ### Step 1: Supply a paired source

@@ -7,7 +7,12 @@ import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
 from arc_llm.evidence import EVIDENCE_REQUESTS_FIELD
-from arc_llm.proposers_reviewer.config import ConfigError, load_batch_config, worker_env
+from arc_llm.proposers_reviewer.config import (
+    ConfigError,
+    isolated_worker_env,
+    load_batch_config,
+    worker_env,
+)
 from arc_llm.proposers_reviewer.prompts import proposer_context, render_prompt, reviewer_context
 
 
@@ -81,6 +86,8 @@ def test_valid_config_parses_and_merges_defaults():
     assert proposer.model_tier == "high"
     assert proposer.runtime["allow_internet"] is True
     assert proposer.runtime["allow_mcp"] is False
+    assert proposer.runtime["arc_paper_cli_access"] == "full"
+    assert proposer.runtime["inherit_host_tools"] is False
     assert proposer.evidence_enabled is True
     assert EVIDENCE_REQUESTS_FIELD in proposer.output_schema.get("properties", {})
     assert ARC_LLM_CALL_RECORD_FIELD not in proposer.output_schema.get("properties", {})
@@ -260,6 +267,62 @@ def test_worker_env_maps_runtime_without_mutating_base_env():
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
     assert "ARC_LLM_MODEL_TIER" not in env
     assert env["ARC_CODEX_REASONING_EFFORT"] == "high"
+    assert env["ARC_PAPER_CLI_ACCESS"] == "full"
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
+
+
+def test_worker_runtime_can_disable_paper_cli_and_rejects_invalid_access():
+    payload = minimal_config()
+    payload["loops"][0]["proposers"][0]["runtime"]["arc_paper_cli_access"] = "none"
+    config = load_batch_config(payload)
+
+    env = worker_env(config.loops[0].proposers[0], base_env={})
+    assert env["ARC_PAPER_CLI_ACCESS"] == "none"
+
+    payload["loops"][0]["proposers"][0]["runtime"]["arc_paper_cli_access"] = "read"
+    with pytest.raises(ConfigError, match="arc_paper_cli_access must be one of"):
+        load_batch_config(payload)
+
+
+def test_worker_runtime_inherit_host_tools_is_explicit_and_all_or_nothing():
+    payload = minimal_config()
+    payload["loops"][0]["proposers"][0]["runtime"].update(
+        {"allow_mcp": False, "inherit_host_tools": True}
+    )
+    worker = load_batch_config(payload).loops[0].proposers[0]
+
+    env = worker_env(worker, base_env={})
+
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "true"
+    assert env["ARC_LLM_HOST_TOOLS_RISK"] == "high"
+    assert env["ARC_CODEX_ENABLE_MCP"] == "true"
+    assert env["ARC_CODEX_IGNORE_USER_CONFIG"] == "false"
+    assert env["ARC_CODEX_IGNORE_RULES"] == "false"
+    assert env["ARC_CLAUDE_ALLOW_MCP"] == "true"
+    assert env["ARC_CLAUDE_BARE"] == "false"
+
+
+def test_isolated_worker_env_fail_closes_paper_and_host_tools():
+    env = isolated_worker_env(
+        {
+            "ARC_PAPER_CLI_ACCESS": "full",
+            "ARC_LLM_INHERIT_HOST_TOOLS": "true",
+            "ARC_CODEX_ENABLE_MCP": "true",
+            "ARC_CODEX_IGNORE_USER_CONFIG": "false",
+            "ARC_CODEX_IGNORE_RULES": "false",
+            "ARC_CLAUDE_ALLOW_MCP": "true",
+            "ARC_CLAUDE_BARE": "false",
+        }
+    )
+
+    assert env["ARC_PAPER_CLI_ACCESS"] == "none"
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
+    assert env["ARC_LLM_HOST_TOOLS_RISK"] == "none"
+    assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+    assert env["ARC_CODEX_IGNORE_USER_CONFIG"] == "true"
+    assert env["ARC_CODEX_IGNORE_RULES"] == "true"
+    assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+    assert env["ARC_CLAUDE_BARE"] == "true"
 
 
 def test_worker_env_false_runtime_clears_inherited_permission_flags():
@@ -469,3 +532,60 @@ def test_worker_prompt_context_strips_arc_llm_call_records():
     assert "arc_llm_call_record" not in rendered
     assert "visible" in rendered
     assert "keep" in json.dumps(proposer, ensure_ascii=False)
+
+
+def test_worker_prompt_advertises_only_the_paper_cli_and_nested_llm_guard():
+    config = load_batch_config(minimal_config())
+    loop = config.loops[0]
+    context = proposer_context(
+        loop=loop,
+        worker=loop.proposers[0],
+        round_number=1,
+        correspondence=[],
+    )
+
+    rendered = render_prompt(loop.proposers[0], context)
+
+    assert "you may invoke arc-paper-worker directly and repeatedly" in rendered
+    assert "Never invoke raw arc-paper, Python arc_paper modules" in rendered
+    assert "trusted controller validates and promotes" in rendered
+    assert "Except for arc-paper-worker" in rendered
+
+
+def test_worker_prompt_with_paper_cli_disabled_retains_blanket_tool_guard():
+    payload = minimal_config()
+    payload["loops"][0]["proposers"][0]["runtime"]["arc_paper_cli_access"] = "none"
+    config = load_batch_config(payload)
+    loop = config.loops[0]
+    context = proposer_context(
+        loop=loop,
+        worker=loop.proposers[0],
+        round_number=1,
+        correspondence=[],
+    )
+
+    rendered = render_prompt(loop.proposers[0], context)
+
+    assert "You may invoke arc-paper-worker" not in rendered
+    assert "Do not invoke shell commands, ARC CLIs, or MCP tools yourself." in rendered
+
+
+def test_worker_prompt_rewrites_legacy_controller_only_paper_wording():
+    payload = minimal_config()
+    payload["loops"][0]["proposers"][0]["prompt"]["template"] = (
+        "Inspect evidence. Do not invoke ARC CLIs, shell commands, or MCP tools; "
+        "record missing checks."
+    )
+    config = load_batch_config(payload)
+    loop = config.loops[0]
+    context = proposer_context(
+        loop=loop,
+        worker=loop.proposers[0],
+        round_number=1,
+        correspondence=[],
+    )
+
+    rendered = render_prompt(loop.proposers[0], context)
+
+    assert "Do not invoke ARC CLIs" not in rendered
+    assert "Use arc-paper-worker for ARC paper evidence" in rendered

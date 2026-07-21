@@ -233,6 +233,68 @@ def test_runtime_env_merges_cli_llm_options(monkeypatch):
     assert env["ARC_CLAUDE_EFFORT"] == "medium"
     assert env["ARC_CLAUDE_ALLOWED_TOOLS"] == "mcp__arc__get_title"
     assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/arc-mcp.json"
+    assert env["ARC_PAPER_CLI_ACCESS"] == "full"
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
+
+
+def test_runtime_env_paper_cli_defaults_and_isolation_overrides():
+    parser = cli._build_parser()
+
+    ordinary = cli._runtime_env(parser.parse_args(["run-text", "--prompt-text", "hello"]))
+    disabled = cli._runtime_env(
+        parser.parse_args(["run-text", "--prompt-text", "hello", "--no-arc-paper-cli"])
+    )
+    isolated = cli._runtime_env(
+        parser.parse_args(["schema-format", "--schema", "schema.json"])
+    )
+
+    assert ordinary["ARC_PAPER_CLI_ACCESS"] == "full"
+    assert disabled["ARC_PAPER_CLI_ACCESS"] == "none"
+    assert isolated["ARC_PAPER_CLI_ACCESS"] == "none"
+
+
+def test_inherit_host_tools_is_explicit_and_restores_host_surface():
+    parser = cli._build_parser()
+
+    ordinary = cli._runtime_env(parser.parse_args(["run-text", "--prompt-text", "hello"]))
+    inherited = cli._runtime_env(
+        parser.parse_args(["run-text", "--prompt-text", "hello", "--inherit-host-tools"])
+    )
+
+    assert ordinary["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
+    assert inherited["ARC_LLM_INHERIT_HOST_TOOLS"] == "true"
+    assert inherited["ARC_CODEX_ENABLE_MCP"] == "true"
+    assert inherited["ARC_CODEX_IGNORE_USER_CONFIG"] == "false"
+    assert inherited["ARC_CODEX_IGNORE_RULES"] == "false"
+    assert inherited["ARC_CLAUDE_ALLOW_MCP"] == "true"
+    assert inherited["ARC_CLAUDE_BARE"] == "false"
+
+
+def test_loop_worker_capability_flags_override_all_workers():
+    config = {
+        "loops": [
+            {
+                "proposers": [{"runtime": {"arc_paper_cli_access": "full"}}],
+                "reviewers": [{"runtime": {}}],
+            }
+        ]
+    }
+    args = cli._build_parser().parse_args(
+        [
+            "proposers-reviewer-loop",
+            "--config",
+            "config.json",
+            "--no-arc-paper-cli",
+            "--inherit-host-tools",
+        ]
+    )
+
+    cli._apply_loop_runtime_overrides(config, args)
+
+    for collection in ("proposers", "reviewers"):
+        runtime = config["loops"][0][collection][0]["runtime"]
+        assert runtime["arc_paper_cli_access"] == "none"
+        assert runtime["inherit_host_tools"] is True
 
 
 def test_run_text_cli_passes_model_tier(monkeypatch):

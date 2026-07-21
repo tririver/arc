@@ -55,18 +55,18 @@ For a blind reference check, include `reviewer_reference_claim` only in the
 step object and disable source tools:
 
 ```json
-"proposer_runtime": {"allow_internet": false, "allow_mcp": false}
+"proposer_runtime": {"allow_internet": false, "allow_mcp": false, "arc_paper_cli_access": "none"}
 ```
 
 If blind proposers agree with each other but not with the reviewer reference,
 record `reference_disagrees`; use remaining recalculation budget with
 non-revealing reviewer feedback before pausing for a human decision.
 
-For a post-check new calculation, enable internet discovery but keep ARC source
-access controller-mediated:
+For a post-check new calculation, enable internet discovery and the ordinary
+deterministic `arc-paper-worker`:
 
 ```json
-"proposer_runtime": {"allow_internet": true, "allow_mcp": false}
+"proposer_runtime": {"allow_internet": true, "allow_mcp": false, "arc_paper_cli_access": "full"}
 ```
 
 External sources may guide methods, but any used identity or intermediate result must be derived or already accepted in the work note. Map all notation back to work-note conventions.

@@ -21,6 +21,7 @@ DEFAULT_OUTPUT_RECOVERY_MODE = "warn"
 DEFAULT_ALLOW_NATURAL_LANGUAGE = True
 DEFAULT_SCHEMA_VIOLATION_POLICY = "peer_visible"
 DEFAULT_SCHEMA_FORMATTER_ENABLED = True
+ARC_PAPER_CLI_ACCESS_VALUES = {"full", "none"}
 
 
 class ConfigError(ValueError):
@@ -191,6 +192,16 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
 def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     runtime = worker.runtime
+    arc_paper_cli_access = _arc_paper_cli_access(
+        runtime.get("arc_paper_cli_access", "full"),
+        "runtime.arc_paper_cli_access",
+    )
+    inherit_host_tools = _bool(
+        runtime.get("inherit_host_tools", False),
+        "runtime.inherit_host_tools",
+    )
+    env["ARC_PAPER_CLI_ACCESS"] = arc_paper_cli_access
+    env["ARC_LLM_INHERIT_HOST_TOOLS"] = "true" if inherit_host_tools else "false"
     allow_internet = _bool(runtime.get("allow_internet", False), "runtime.allow_internet")
     allow_mcp = _bool(runtime.get("allow_mcp", False), "runtime.allow_mcp")
     if allow_internet:
@@ -258,7 +269,35 @@ def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = Non
     _put(env, "ARC_CLAUDE_JSON_SCHEMA_MODE", runtime.get("claude_json_schema_mode"))
     _put(env, "ARC_CLAUDE_WARN_JSON_SCHEMA_MODE", runtime.get("claude_warn_json_schema_mode"))
     _put(env, "ARC_CLAUDE_JSON_SCHEMA_PROMPT_MODELS", runtime.get("claude_json_schema_prompt_models"))
+    if inherit_host_tools:
+        # This opt-in intentionally restores the host surface as one unit. A
+        # partial inheritance mode is difficult to audit and is not promised.
+        env["ARC_LLM_HOST_TOOLS_RISK"] = "high"
+        env["ARC_CODEX_ENABLE_MCP"] = "true"
+        env["ARC_CODEX_IGNORE_USER_CONFIG"] = "false"
+        env["ARC_CODEX_IGNORE_RULES"] = "false"
+        env["ARC_CLAUDE_ALLOW_MCP"] = "true"
+        env["ARC_CLAUDE_BARE"] = "false"
     return env
+
+
+def isolated_worker_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """Return a fail-closed environment for internal isolation stages."""
+    isolated = dict(os.environ if env is None else env)
+    isolated.update(
+        {
+            "ARC_PAPER_CLI_ACCESS": "none",
+            "ARC_LLM_WORKER_CONTEXT": "true",
+            "ARC_LLM_INHERIT_HOST_TOOLS": "false",
+            "ARC_LLM_HOST_TOOLS_RISK": "none",
+            "ARC_CODEX_ENABLE_MCP": "false",
+            "ARC_CODEX_IGNORE_USER_CONFIG": "true",
+            "ARC_CODEX_IGNORE_RULES": "true",
+            "ARC_CLAUDE_ALLOW_MCP": "false",
+            "ARC_CLAUDE_BARE": "true",
+        }
+    )
+    return isolated
 
 
 def _parse_loop(
@@ -388,6 +427,14 @@ def _parse_worker(
 
     runtime = dict(default_runtime)
     runtime.update(_dict(worker_data.get("runtime", {}), f"{field_name}.{worker_id}.runtime"))
+    runtime["arc_paper_cli_access"] = _arc_paper_cli_access(
+        runtime.get("arc_paper_cli_access", "full"),
+        f"{field_name}.{worker_id}.runtime.arc_paper_cli_access",
+    )
+    runtime["inherit_host_tools"] = _bool(
+        runtime.get("inherit_host_tools", False),
+        f"{field_name}.{worker_id}.runtime.inherit_host_tools",
+    )
     provider = str(worker_data.get("provider", default_provider) or "auto")
     model = worker_data.get("model", default_model)
     if model is not None:
@@ -417,6 +464,14 @@ def _parse_worker(
             else None
         ),
     )
+
+
+def _arc_paper_cli_access(value: Any, field_name: str) -> str:
+    access = str(value or "").strip().lower()
+    if access not in ARC_PAPER_CLI_ACCESS_VALUES:
+        allowed = ", ".join(sorted(ARC_PAPER_CLI_ACCESS_VALUES))
+        raise ConfigError(f"{field_name} must be one of: {allowed}")
+    return access
 
 
 def _parse_artifact_options(raw_options: Any) -> ArtifactOptions:

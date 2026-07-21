@@ -412,6 +412,15 @@ def runtime_fingerprint(
                 "ARC_CODEX_MODEL_VERBOSITY",
                 "ARC_CODEX_IGNORE_USER_CONFIG",
                 "ARC_CODEX_IGNORE_RULES",
+                "ARC_PAPER_CLI_ACCESS",
+                "ARC_LLM_INHERIT_HOST_TOOLS",
+                "ARC_LLM_HOST_TOOLS_RISK",
+                "ARC_LLM_WORKER_CONTEXT",
+                "ARC_PAPER_CACHE",
+                "ARC_PAPER_WORKER_BASE_CACHE",
+                "ARC_PAPER_WORKER_SESSION_DIR",
+                "ARC_PAPER_WORKER_TOMBSTONE_DIR",
+                "ARC_PAPER_WORKER_SESSION_ID",
                 "ARC_CLAUDE_TOOLS",
                 "ARC_CLAUDE_ALLOWED_TOOLS",
                 "ARC_CLAUDE_ALLOW_MCP",
@@ -431,7 +440,22 @@ def runtime_fingerprint(
             }
         )
         if env.get(key) is not None
+        and not (
+            (key == "ARC_PAPER_CLI_ACCESS" and env.get(key) == "none")
+            or (key == "ARC_LLM_INHERIT_HOST_TOOLS" and env.get(key) == "false")
+            or (key == "ARC_LLM_HOST_TOOLS_RISK" and env.get(key) == "none")
+        )
     }
+    if env.get("ARC_PAPER_CLI_ACCESS") == "none":
+        interesting.pop("ARC_LLM_WORKER_CONTEXT", None)
+        for key in (
+            "ARC_PAPER_CACHE",
+            "ARC_PAPER_WORKER_BASE_CACHE",
+            "ARC_PAPER_WORKER_SESSION_DIR",
+            "ARC_PAPER_WORKER_TOMBSTONE_DIR",
+            "ARC_PAPER_WORKER_SESSION_ID",
+        ):
+            interesting.pop(key, None)
     payload = {
         "provider": provider,
         "model": model,
@@ -495,7 +519,48 @@ def _runtime_file_hashes(env: Mapping[str, str]) -> dict[str, list[dict[str, Any
         ]
     elif generated_arc_mcp_path:
         result["ARC_CLAUDE_ARC_MCP_CONFIG_PATH"] = [_file_hash_entry(generated_arc_mcp_path)]
+    if env.get("ARC_LLM_INHERIT_HOST_TOOLS", "").strip().lower() == "true":
+        for category, paths in _inherited_host_tool_paths(env).items():
+            if paths:
+                result[f"inherited_host_{category}"] = [_file_hash_entry(str(path)) for path in paths]
     return result
+
+
+def _inherited_host_tool_paths(env: Mapping[str, str]) -> dict[str, list[Path]]:
+    """Inventory host configuration by hash without persisting its contents."""
+    codex_home = Path(env.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    claude_home = Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    work_dir = Path(env.get("ARC_CODEX_WORK_DIR") or os.getcwd()).expanduser().resolve(strict=False)
+
+    config = [codex_home / "config.toml", claude_home / "settings.json", Path.home() / ".claude.json"]
+    rules = [codex_home / "AGENTS.md", codex_home / "AGENTS.override.md"]
+    current = work_dir
+    while True:
+        rules.extend((current / "AGENTS.md", current / "AGENTS.override.md", current / "CLAUDE.md"))
+        if current.parent == current:
+            break
+        current = current.parent
+
+    skills: list[Path] = []
+    plugins: list[Path] = []
+    for root in (codex_home / "skills", claude_home / "skills"):
+        if root.is_dir():
+            skills.extend(root.glob("**/SKILL.md"))
+    for root in (codex_home / "plugins", claude_home / "plugins"):
+        if root.is_dir():
+            plugins.extend(root.glob("**/.codex-plugin/plugin.json"))
+            plugins.extend(root.glob("**/plugin.json"))
+
+    return {
+        "config": _existing_unique_paths(config),
+        "rules": _existing_unique_paths(rules),
+        "skills": _existing_unique_paths(skills),
+        "plugins": _existing_unique_paths(plugins),
+    }
+
+
+def _existing_unique_paths(paths: Sequence[Path]) -> list[Path]:
+    return sorted({path.resolve(strict=False) for path in paths if path.is_file()}, key=str)
 
 
 def _single_path(value: str | None) -> list[str]:

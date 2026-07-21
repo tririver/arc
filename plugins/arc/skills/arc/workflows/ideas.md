@@ -78,11 +78,14 @@ variable. `SIGINT`, `SIGTERM`, and background cancellation remain available.
 Step 2: Print any returned `WARNING:` messages. For loop concurrency, see
 `manuals/arc-llm.md`.
 
-The workflow controller resolves structured worker evidence requests through
-the deterministic `arc-paper` service between rounds and returns response
-provenance in the next worker context. Proposers and reviewers must not invoke
-ARC CLI, shell, or MCP tools themselves. See the controller evidence protocol
-in `manuals/arc-llm.md`.
+Proposers and reviewers use `arc-paper-worker` directly when their host offers
+reliable shell execution. They may query it repeatedly in one turn; writes go
+to the run overlay and validated records are promoted automatically. On hosts
+without direct CLI support, the workflow controller resolves equivalent
+structured evidence requests through the deterministic `arc-paper` service
+between rounds and returns provenance in the next worker context. Other ARC
+CLIs, nested LLM entry points, and MCP tools remain unavailable. See
+`manuals/arc-llm.md`.
 
 Step 3: Continue when status is `completed` or `degraded`. For `degraded`,
 print a prominent `WARNING:` with failed/degraded loop counts and the artifact

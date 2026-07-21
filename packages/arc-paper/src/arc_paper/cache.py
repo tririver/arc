@@ -17,6 +17,7 @@ from urllib.parse import quote
 import fcntl
 
 from .ids import normalize_paper_id, paper_ids_safe_dir_name
+from .worker_guard import in_worker_context, wrapper_call_authorized
 
 
 ONE_MONTH_SECONDS = 30 * 24 * 60 * 60
@@ -78,6 +79,10 @@ class CachePaths:
 
 
 def cache_root() -> Path:
+    if in_worker_context() and not wrapper_call_authorized():
+        raise PermissionError(
+            "paper_worker_wrapper_required: model workers must access the paper cache through arc-paper-worker"
+        )
     if value := os.environ.get("ARC_PAPER_CACHE"):
         return Path(value).expanduser()
     if value := os.environ.get("ARC_HOME"):
@@ -85,6 +90,60 @@ def cache_root() -> Path:
     if value := os.environ.get("XDG_CACHE_HOME"):
         return Path(value).expanduser() / "arc" / "arc-paper"
     return Path.home() / ".cache" / "arc" / "arc-paper"
+
+
+def resolve_cache_read_path(path: Path) -> Path | None:
+    """Resolve *path* through a worker overlay and its read-only base.
+
+    Worker processes keep ``ARC_PAPER_CACHE`` pointed at their writable overlay.
+    When ``ARC_PAPER_WORKER_BASE_CACHE`` is present, missing overlay entries fall
+    back to the corresponding base-cache entry.  A session tombstone suppresses
+    that fallback without modifying the base cache.
+    """
+
+    if path.exists():
+        return path
+    base_value = os.environ.get("ARC_PAPER_WORKER_BASE_CACHE")
+    if not base_value:
+        return None
+    try:
+        relative = path.resolve(strict=False).relative_to(cache_root().resolve(strict=False))
+    except ValueError:
+        return None
+    tombstone_root = os.environ.get("ARC_PAPER_WORKER_TOMBSTONE_DIR")
+    if tombstone_root:
+        digest = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()
+        if (Path(tombstone_root) / f"{digest}.json").exists():
+            return None
+    candidate = Path(base_value).expanduser() / relative
+    return candidate if candidate.exists() else None
+
+
+def cache_path_exists(path: Path) -> bool:
+    return resolve_cache_read_path(path) is not None
+
+
+def iter_cache_paths(relative_dir: str | Path, pattern: str = "*") -> list[Path]:
+    """List the visible union of one overlay directory and its worker base."""
+
+    directory = Path(relative_dir)
+    if directory.is_absolute() or ".." in directory.parts:
+        raise ValueError("cache directory must be relative")
+    overlay_dir = cache_root() / directory
+    visible: dict[str, Path] = {}
+    if overlay_dir.is_dir():
+        for path in overlay_dir.glob(pattern):
+            visible[path.relative_to(overlay_dir).as_posix()] = path
+    base_value = os.environ.get("ARC_PAPER_WORKER_BASE_CACHE")
+    if base_value:
+        base_dir = Path(base_value).expanduser() / directory
+        if base_dir.is_dir():
+            for path in base_dir.glob(pattern):
+                key = path.relative_to(base_dir).as_posix()
+                logical_overlay_path = overlay_dir / key
+                if key not in visible and resolve_cache_read_path(logical_overlay_path) is not None:
+                    visible[key] = path
+    return [visible[key] for key in sorted(visible)]
 
 
 def text_query_cache_path(namespace: str, text: str) -> Path:
@@ -201,42 +260,90 @@ def _remove_legacy_parsed_cache(paper_dir: Path) -> None:
 
 
 def read_json(path: Path, *, ttl_seconds: int | None = None) -> Any | None:
-    if not _is_fresh(path, ttl_seconds=ttl_seconds):
+    resolved = resolve_cache_read_path(path)
+    if resolved is None or not _is_fresh(resolved, ttl_seconds=ttl_seconds):
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(resolved.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
 
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _unique_tmp_path(path)
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    with _worker_cache_write_guard(path):
+        tmp = _unique_tmp_path(path)
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
 
 
 def read_text(path: Path, *, ttl_seconds: int | None = None) -> str | None:
-    if not _is_fresh(path, ttl_seconds=ttl_seconds):
+    resolved = resolve_cache_read_path(path)
+    if resolved is None or not _is_fresh(resolved, ttl_seconds=ttl_seconds):
         return None
     try:
-        return path.read_text(encoding="utf-8")
+        return resolved.read_text(encoding="utf-8")
     except OSError:
         return None
 
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _unique_tmp_path(path)
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    with _worker_cache_write_guard(path):
+        tmp = _unique_tmp_path(path)
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
 
 
 def write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _unique_tmp_path(path)
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    with _worker_cache_write_guard(path):
+        tmp = _unique_tmp_path(path)
+        tmp.write_bytes(data)
+        tmp.replace(path)
+
+
+@contextmanager
+def _worker_cache_write_guard(path: Path):
+    """Lock and attribute one worker cache write to its active CLI call."""
+
+    call_id = os.environ.get("ARC_PAPER_WORKER_CALL_ID", "").strip()
+    session_dir = os.environ.get("ARC_PAPER_WORKER_SESSION_DIR", "").strip()
+    if not call_id or not session_dir or not os.environ.get("ARC_PAPER_WORKER_BASE_CACHE"):
+        yield
+        return
+    overlay = cache_root().resolve(strict=False)
+    try:
+        relative = path.resolve(strict=False).relative_to(overlay)
+    except ValueError:
+        yield
+        return
+    digest = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()
+    state = overlay / ".arc-paper-worker"
+    lock_path = state / "write-locks" / f"{digest}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+            if path.is_file():
+                content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                record = {
+                    "schema_version": "arc.paper.worker-session.v1",
+                    "session_id": os.environ.get("ARC_PAPER_WORKER_SESSION_ID", ""),
+                    "writer_call_id": call_id,
+                    "writer": "arc_paper.cache.v1",
+                    "relative_path": relative.as_posix(),
+                    "content_hash": content_hash,
+                    "created_at": now_iso(),
+                }
+                record_path = state / "records" / f"{digest}.json"
+                record_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = _unique_tmp_path(record_path)
+                tmp.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(record_path)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _is_fresh(path: Path, *, ttl_seconds: int | None) -> bool:

@@ -580,6 +580,10 @@ def _reviewer_config(
         selectable_proposer_ids,
         allow_reference_disagrees=bool(reviewer_reference_claim),
     )
+    runtime = _dict(payload.get("runtime", {}), "calculate-reviewer.template.runtime")
+    runtime["arc_paper_cli_access"] = "none" if reviewer_reference_claim else "full"
+    runtime["inherit_host_tools"] = False
+    payload["runtime"] = runtime
     return payload
 
 
@@ -589,28 +593,40 @@ def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str,
             "allow_internet": False,
             "allow_mcp": False,
             "codex_sandbox": "read-only",
+            "arc_paper_cli_access": "none",
+            "inherit_host_tools": False,
         }
     elif step.kind == "new_calculation":
         runtime = {
             "allow_internet": True,
             "allow_mcp": False,
             "codex_sandbox": "read-only",
+            "arc_paper_cli_access": "full",
+            "inherit_host_tools": False,
         }
     else:
         runtime = {
             "allow_internet": False,
             "allow_mcp": False,
             "codex_sandbox": "read-only",
+            "arc_paper_cli_access": "full",
+            "inherit_host_tools": False,
         }
     runtime.update(_dict(config.defaults.get("proposer_runtime", {}), "defaults.proposer_runtime"))
     runtime.update(step.proposer_runtime)
+    if step.reviewer_reference_claim:
+        # Blind validation is a hard isolation boundary; ordinary runtime
+        # overrides cannot expose paper or inherited host tools here.
+        runtime["arc_paper_cli_access"] = "none"
+        runtime["inherit_host_tools"] = False
     return runtime
 
 
 def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
     allow_mcp = _bool_default(runtime.get("allow_mcp", False), False)
     allow_internet = _bool_default(runtime.get("allow_internet", False), False)
-    if not allow_mcp and not allow_internet:
+    paper_access = str(runtime.get("arc_paper_cli_access", "full"))
+    if paper_access == "none" and not allow_mcp and not allow_internet:
         return (
             "Do not use internet search. Do not use ARC paper MCP tools. "
             "Do not read paper source sections, arXiv pages, INSPIRE pages, "
@@ -619,7 +635,12 @@ def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
             "Do not use validation-only final formulas as derivation inputs."
         )
     parts = []
-    if allow_mcp:
+    if paper_access == "full":
+        parts.append(
+            "Use arc-paper-worker for deterministic cached or missing-paper evidence; "
+            "do not invoke any other ARC CLI or nested LLM command."
+        )
+    elif allow_mcp:
         parts.append(
             "You may use ARC paper MCP tools only to read the main reference and cited "
             "sections explicitly named in caller_context."

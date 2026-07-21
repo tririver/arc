@@ -12,6 +12,7 @@ import httpx
 from ..cache import CachePaths, read_json, read_text, write_bytes, write_json, write_text
 from ..ids import arxiv_path_id
 from ..parse.document import discover_asset_urls
+from ..worker_session import worker_fetch_once
 from .base import ProviderError
 
 
@@ -38,16 +39,22 @@ class Ar5ivProvider:
             if cached is not None:
                 return cached
 
-        response = self.client.get(url, timeout=self.timeout)
-        if response.status_code == 404:
-            raise ProviderError("ar5iv_not_found", f"ar5iv HTML not found for {paper_id}")
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise ProviderError("ar5iv_fetch_failed", str(exc)) from exc
+        def fetch() -> str:
+            response = self.client.get(url, timeout=self.timeout)
+            if response.status_code == 404:
+                raise ProviderError("ar5iv_not_found", f"ar5iv HTML not found for {paper_id}")
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise ProviderError(
+                    "ar5iv_fetch_failed", str(exc), status_code=exc.response.status_code
+                ) from exc
+            write_text(paths.ar5iv_html, response.text)
+            return response.text
 
-        write_text(paths.ar5iv_html, response.text)
-        return response.text
+        return worker_fetch_once(
+            paper_id, fetch, operation="ar5iv-html", replay_success=not refresh
+        )
 
     def cache_assets(self, paper_id: str, html: str, *, refresh: bool = False) -> list[dict]:
         """Cache academic assets referenced by ar5iv HTML by content hash."""
@@ -82,7 +89,14 @@ class Ar5ivProvider:
                 if reusable is not None:
                     records.append(reusable)
                     continue
-            records.append(self._cache_asset(url, item["original_url"], paths))
+            operation = f"ar5iv-asset-{hashlib.sha256(url.encode('utf-8')).hexdigest()}"
+            records.append(
+                worker_fetch_once(
+                    paths.paper_id,
+                    lambda: self._cache_asset(url, item["original_url"], paths),
+                    operation=operation,
+                )
+            )
         write_json(
             paths.ar5iv_asset_manifest,
             {
@@ -121,6 +135,11 @@ class Ar5ivProvider:
                 "status": "cached",
             }
         except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code in {401, 403, 429}:
+                raise ProviderError(
+                    "ar5iv_asset_fetch_failed", str(exc), status_code=status_code
+                ) from exc
             return {
                 "asset_id": "",
                 "source_url": url,

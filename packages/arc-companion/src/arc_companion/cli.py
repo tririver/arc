@@ -50,6 +50,14 @@ def main(argv: list[str] | None = None) -> int:
         help="disable internet access independently of MCP access",
     )
     build.add_argument(
+        "--inherit-host-tools",
+        action="store_true",
+        help=(
+            "HIGH RISK: inherit host rules, skills, plugins, MCP, and extra tools "
+            "for this run"
+        ),
+    )
+    build.add_argument(
         "--skip-translation",
         action="store_true",
         help="omit the translation lane when source and target languages already match",
@@ -130,6 +138,12 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         language = args.annotation_language or DEFAULT_LANGUAGE
         if defaulted:
             print(LANGUAGE_NOTICE, file=sys.stderr)
+        if args.inherit_host_tools:
+            print(
+                "WARNING: --inherit-host-tools exposes host rules, skills, plugins, MCP, "
+                "and extra tools to companion workers.",
+                file=sys.stderr,
+            )
         project_dir = (
             Path(args.project_dir)
             if args.project_dir
@@ -150,6 +164,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 domain_id=args.domain_id,
                 domain_manifest=Path(args.domain_manifest) if args.domain_manifest else None,
                 allow_internet=not args.no_internet,
+                inherit_host_tools=args.inherit_host_tools,
                 skip_translation=args.skip_translation,
                 context_paper_ids=tuple(args.context_paper_id),
                 stop_after_first_chapter=args.stop_after_first_chapter,

@@ -13,7 +13,9 @@
   "proposer": {
     "model_tier": "high",
     "runtime": {
-      "allow_mcp": false
+      "allow_mcp": false,
+      "arc_paper_cli_access": "none",
+      "inherit_host_tools": false
     }
   }
 }

@@ -55,16 +55,48 @@ def render_prompt(worker: WorkerConfig, context: dict[str, Any]) -> str:
     if worker.prompt.system:
         sections.extend(["### System", worker.prompt.system])
     sections.extend(["### Task", rendered_template])
+    paper_cli_access = str(worker.runtime.get("arc_paper_cli_access", "full"))
+    if paper_cli_access == "full":
+        sections.extend(
+            [
+                "## ARC Paper CLI",
+                "When the host exposes a sandboxed shell and the controller-created worker guard validates, you may invoke arc-paper-worker directly and repeatedly for non-LLM paper lookup, search, citation relations, full text, equations, parsing, cache access, and missing-paper retrieval. Commands stage results in a writable run overlay; the trusted controller validates and promotes them only after the model call ends. Use its pagination command when a result returns an artifact handle. Never invoke raw arc-paper, Python arc_paper modules, arc-llm, arc-jobs, arc-domain, summary generation, inference, batch-model commands, aliases, or another route to a nested LLM. If the host has no sandboxed shell (including a host without the required sandbox helper), do not attempt a shell bypass; request the equivalent operation through arc_evidence_requests.",
+            ]
+        )
     if worker.evidence_enabled:
         sections.extend(
             [
                 "## Controller Evidence Protocol",
-                "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a worker-prefixed request_id unique in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. Do not invoke shell commands, ARC CLIs, or MCP tools yourself.",
+                "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a worker-prefixed request_id unique in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. "
+                + (
+                    "Except for arc-paper-worker, do not invoke shell commands, ARC CLIs, or MCP tools yourself."
+                    if paper_cli_access == "full"
+                    else "Do not invoke shell commands, ARC CLIs, or MCP tools yourself."
+                ),
             ]
         )
     if worker.runtime.get("append_context", True):
         sections.extend(["## ARC Worker Context", json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)])
-    return ensure_runtime_progress_contract("\n".join(sections).rstrip() + "\n")
+    prompt = "\n".join(sections).rstrip() + "\n"
+    if paper_cli_access == "full":
+        prompt = _remove_legacy_paper_cli_blankets(prompt)
+    return ensure_runtime_progress_contract(prompt)
+
+
+def _remove_legacy_paper_cli_blankets(prompt: str) -> str:
+    """Translate older controller-only wording for direct paper CLI workers."""
+    replacement = (
+        "Use arc-paper-worker for ARC paper evidence; do not invoke other ARC CLIs, "
+        "nested LLM commands, or MCP tools"
+    )
+    for legacy in (
+        "Do not invoke ARC CLIs, shell commands, or MCP tools",
+        "do not invoke ARC CLIs, shell commands, or MCP tools",
+        "Do not invoke ARC CLI, shell, or MCP tools",
+        "do not invoke ARC CLI, shell, or MCP tools",
+    ):
+        prompt = prompt.replace(legacy, replacement)
+    return prompt
 
 
 def _replace_known_placeholders(template: str, context: dict[str, Any]) -> str:

@@ -12,9 +12,18 @@ from .batch.runner import export_batch, prefetch_batch, run_batch
 from .host import detect_host, select_llm_provider
 from .results import err, ok
 from .summary.model import DEFAULT_SUMMARY_MODEL_TIER
+from .worker_guard import in_worker_context, wrapper_call_authorized
 
 
 def main(argv: list[str] | None = None) -> int:
+    if in_worker_context() and not wrapper_call_authorized():
+        result = err(
+            "paper_worker_wrapper_required",
+            "Model workers must use arc-paper-worker instead of the unrestricted arc-paper entry point",
+        )
+        result["status"] = "error"
+        _print_json(result)
+        return 1
     parser = argparse.ArgumentParser(description="Cache-first ar5iv and INSPIRE paper query tools")
     sub = parser.add_subparsers(dest="command", required=True)
 

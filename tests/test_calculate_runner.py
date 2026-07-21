@@ -650,7 +650,9 @@ def test_calculate_rejects_invalid_config_bool_strings(tmp_path, override: dict[
 def test_proposer_source_policy_parses_string_false() -> None:
     runner = load_calculate_runner()
 
-    policy = runner._proposer_source_policy({"allow_mcp": "false", "allow_internet": "false"})  # noqa: SLF001
+    policy = runner._proposer_source_policy(  # noqa: SLF001
+        {"allow_mcp": "false", "allow_internet": "false", "arc_paper_cli_access": "none"}
+    )
 
     assert "Do not use internet search" in policy
     assert "Do not use ARC paper MCP tools" in policy
@@ -664,7 +666,38 @@ def test_new_calculation_worker_defaults_to_no_mcp(tmp_path: Path) -> None:
 
     assert runtime["allow_internet"] is True
     assert runtime["allow_mcp"] is False
+    assert runtime["arc_paper_cli_access"] == "full"
+    assert runtime["inherit_host_tools"] is False
     assert "mcp_mode" not in runtime
+
+
+def test_blind_reference_runtime_cannot_override_paper_isolation(tmp_path: Path) -> None:
+    runner = load_calculate_runner()
+    payload = minimal_config(tmp_path)
+    payload["defaults"] = {"proposer_runtime": {
+        "arc_paper_cli_access": "full",
+        "inherit_host_tools": True,
+    }}
+    payload["steps"][0]["reviewer_reference_claim"] = {"id": "target", "latex": "x"}
+    payload["steps"][0]["proposer_runtime"] = {
+        "arc_paper_cli_access": "full",
+        "inherit_host_tools": True,
+    }
+    config = runner.load_calculation_config(payload)
+
+    runtime = runner._proposer_runtime(config, config.steps[0])  # noqa: SLF001
+    reviewer = runner._reviewer_config(  # noqa: SLF001
+        config,
+        ["proposer_001", "proposer_002"],
+        ["proposer_001", "proposer_002"],
+        reviewer_reference_claim=config.steps[0].reviewer_reference_claim,
+        human_gate=config.human_gate,
+    )
+
+    assert runtime["arc_paper_cli_access"] == "none"
+    assert runtime["inherit_host_tools"] is False
+    assert reviewer["runtime"]["arc_paper_cli_access"] == "none"
+    assert reviewer["runtime"]["inherit_host_tools"] is False
 
 
 def test_calculate_worker_schemas_are_codex_strict(tmp_path) -> None:

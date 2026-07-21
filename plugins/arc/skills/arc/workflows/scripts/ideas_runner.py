@@ -524,6 +524,11 @@ def _merged_worker_payload(template: Mapping[str, Any], overrides: Mapping[str, 
 def _loop_reviewer_payload(variant: VariantConfig) -> dict[str, Any]:
     scheme = load_marking_scheme(variant.marking_scheme)
     payload = _read_json(variant.reviewer_template)
+    if not variant.context_policy.attach_arc_paper_tool_notes:
+        runtime = dict(payload.get("runtime") or {})
+        runtime["arc_paper_cli_access"] = "none"
+        runtime["inherit_host_tools"] = False
+        payload["runtime"] = runtime
     payload["output_schema"] = _reviewer_output_schema(variant, scheme=scheme)
     return payload
 

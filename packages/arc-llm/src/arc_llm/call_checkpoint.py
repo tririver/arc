@@ -130,6 +130,7 @@ def prepare_call(
     cancel_check: Callable[[], bool] | None = None,
     supervised_native_resume: bool = False,
     native_session_available: bool = False,
+    runtime_capabilities: Mapping[str, Any] | None = None,
 ) -> PreparedCall:
     del retry_delay_seconds
     current_time = time.time() if now is None else now
@@ -197,6 +198,7 @@ def prepare_call(
                 "attempt": next_attempt,
                 "started_at": current_time,
                 "updated_at": current_time,
+                "runtime_capabilities": dict(runtime_capabilities or {}),
             },
         )
         return PreparedCall(path=path, identity=identity, attempt=next_attempt, _lock_handle=lock_handle)
