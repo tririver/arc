@@ -103,6 +103,98 @@ def test_single_domain_variant_uses_mathematical_feasibility_contract() -> None:
     ]
 
 
+def test_idea_generation_requires_concrete_domain_problem_solving_value() -> None:
+    single = json.loads((WJ / "ideas-proposer.template.json").read_text(encoding="utf-8"))["prompt"][
+        "template"
+    ]
+    cross = json.loads((WJ / "ideas-cross-domain-proposer.template.json").read_text(encoding="utf-8"))[
+        "prompt"
+    ]["template"]
+
+    # Mathematical form is useful only when attached to an important, defined
+    # target-domain problem and an executable route to a substantive result.
+    assert "target-domain importance" in single
+    assert "well-defined mathematical problem" in single
+    assert "map its mathematical structure to the target problem" in single
+    assert "Only the target domain needs to receive a substantive result" in single
+    assert "mathematically convenient exercise whose answer would have little scientific value" in single
+    assert "must concretely solve or advance a consequential target-domain problem" in single
+    assert "not merely reframe it in more sophisticated or elegant language" in single
+
+    # Cross-domain vocabulary or formal resemblance is not itself a transfer:
+    # the source concept must be adapted into a concrete target capability.
+    assert "one specific mature method, mechanism, formal structure, observable, or constraint" in cross
+    assert "produces a substantive target-domain result" in cross
+    assert "State a concrete translation dictionary" in cross
+    assert "A shared word, loose analogy, parallel motivation, or unadapted import is not" in cross
+    assert "If the prior bridge is decorative" in cross
+    assert "rather than making cosmetic edits" in cross
+    assert "must concretely solve or advance a consequential target-domain problem" in cross
+    assert "not merely reframe it in more sophisticated or elegant language" in cross
+
+
+def test_idea_scoring_rejects_decorative_or_sophistication_only_reframing() -> None:
+    single_reviewer = json.loads(
+        (WJ / "ideas-domain-reviewer.template.json").read_text(encoding="utf-8")
+    )["prompt"]["template"]
+    cross_reviewer = json.loads(
+        (WJ / "ideas-cross-domain-reviewer.template.json").read_text(encoding="utf-8")
+    )["prompt"]["template"]
+    single_scheme = json.loads((WJ / "ideas-domain-marking-scheme.json").read_text(encoding="utf-8"))
+    cross_scheme = json.loads(
+        (WJ / "ideas-cross-domain-marking-scheme.json").read_text(encoding="utf-8")
+    )
+    single_guidance = {item["field"]: item["guidance"] for item in single_scheme["marks"]}
+    cross_guidance = {item["field"]: item["guidance"] for item in cross_scheme["marks"]}
+
+    # Reviewer instructions make the same distinction as proposer guidance:
+    # technical sophistication does not compensate for weak scientific payoff.
+    assert "easy but low-value mathematical exercise should score poorly" in single_reviewer
+    assert "maps to the target problem" in single_reviewer
+    assert "required adaptation is concrete" in single_reviewer
+    assert "unless it concretely solves or advances a consequential target-domain problem" in single_reviewer
+    assert "a more sophisticated or elegant reframing alone should score poorly" in single_reviewer
+    assert "Apply a functional counterfactual" in single_reviewer
+    assert "if only terminology, representation, or perceived elegance changes" in single_reviewer
+    assert "one concrete source ingredient is validly adapted" in cross_reviewer
+    assert "Require a substantive or transformative result in at least the target domain" in cross_reviewer
+    assert "Mark shared terminology, loose analogy, parallel motivation, or an unadapted import as decorative" in cross_reviewer
+    assert "to concretely solve or advance a consequential target-domain problem" in cross_reviewer
+    assert "not merely reframe it in more sophisticated or elegant language" in cross_reviewer
+    assert "If removing the connection changes only terminology, representation, or perceived elegance" in cross_reviewer
+
+    # Numeric rubrics deny high scores to formal polish, analogy, or imports
+    # that do not produce a consequential and specific domain result.
+    assert "mathematically convenient but scientifically limited exercise" in single_scheme[
+        "calibration_guidance"
+    ]
+    assert "technically neat but unimportant exercises" in single_guidance["scientific_value"]
+    assert "earn value only through concrete progress on the target-domain problem" in single_guidance[
+        "scientific_value"
+    ]
+    assert "Apply a functional counterfactual" in single_scheme["calibration_guidance"]
+    assert "a change only in terminology, representation, or perceived elegance has no substantive value" in single_scheme[
+        "calibration_guidance"
+    ]
+    assert "specificity of the new target-domain result" in cross_guidance[
+        "substantive_target_contribution"
+    ]
+    assert "decorative imports score near zero" in cross_guidance["cross_domain_transfer_quality"]
+    assert "concretely solves or advances a target-domain problem" in cross_guidance[
+        "cross_domain_transfer_quality"
+    ]
+    assert "Counterfactually removing the source connection must remove or materially weaken" in cross_guidance[
+        "cross_domain_transfer_quality"
+    ]
+    assert "not the sophistication or elegance of its interdisciplinary reframing" in cross_guidance[
+        "substantive_target_contribution"
+    ]
+    assert "transfer is concrete, adapted, compatible, and calculable" in cross_scheme[
+        "calibration_guidance"
+    ]
+    assert "Apply a functional counterfactual" in cross_scheme["calibration_guidance"]
+
+
 def test_all_ideas_loop_templates_default_to_three_rounds() -> None:
     template_names = [
         "ideas-loop.template.json",

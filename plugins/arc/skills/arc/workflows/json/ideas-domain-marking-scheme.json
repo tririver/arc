@@ -1,6 +1,6 @@
 {
   "schema_version": "arc.workflow.ideas.marking_scheme.v1",
-  "calibration_guidance": "Use the full numeric range. Do not assign mid-high scores merely because an idea is plausible. A total above 85 means the idea is strong across importance, novelty, definition, and execution. A mathematically convenient but scientifically limited exercise, or an important idea without a feasible first calculation, should not receive a high total.",
+  "calibration_guidance": "Use the full numeric range. Do not assign mid-high scores merely because an idea is plausible. A total above 85 means the idea is strong across importance, novelty, definition, and execution. Mathematical sophistication, formal elegance, or an interdisciplinary connection does not justify a high score unless it concretely solves or advances a consequential target-domain problem. Apply a functional counterfactual: removing it should remove or materially weaken a solution, constraint, prediction, capability, or executable route; a change only in terminology, representation, or perceived elegance has no substantive value. A mathematically convenient but scientifically limited exercise, an elegant reframing without substantive problem progress, or an important idea without a feasible first calculation should not receive a high total.",
   "marks": [
     {
       "field": "user_intent_relevance",
@@ -28,7 +28,7 @@
       "label": "Value",
       "minimum": 0,
       "maximum": 15,
-      "guidance": "Score the importance of the solved problem and the substantive target-domain payoff. 15: a leading researcher should regard the result as must-read. 10: useful and clearly worth knowing. 5: limited or incremental value, including technically neat but unimportant exercises. 0: the result would not be worth reading."
+      "guidance": "Score the importance of the solved problem and the substantive target-domain payoff. Mathematical concepts and interdisciplinary connections earn value only through concrete progress on the target-domain problem, not through a more sophisticated or elegant reframing. 15: a leading researcher should regard the result as must-read. 10: useful and clearly worth knowing. 5: limited or incremental value, including technically neat but unimportant exercises. 0: the result would not be worth reading."
     },
     {
       "field": "planning",
