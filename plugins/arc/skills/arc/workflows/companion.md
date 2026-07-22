@@ -25,7 +25,24 @@ Never spend tokens merely because a generation recipe changed.
 
 ## Phase 1: Prepare the Run
 
-### Step 1: Record intent
+### Step 1: Select a safe run directory
+
+Resolve `<project-dir>` before creating files. For every non-development ARC
+run launched from inside a Git worktree, require the resolved run directory to
+be ignored:
+
+```bash
+git check-ignore -q --no-index <resolved-project-dir>
+```
+
+Run this check before `arc-companion` or writing `context.json`. If it fails,
+stop and select an ignored run directory; ARC repository runs belong under
+`arc-tests/`. Do not create output in a repository root, `packages/`,
+`plugins/`, or a sibling/parent of the selected run. Outside a Git worktree,
+there is no Git-ignore preflight, but all output must still remain inside the
+exact resolved `<project-dir>`.
+
+### Step 2: Record intent
 
 Follow `rules/interaction.md`. Set `workflow` to `companion` and record the
 source identifier or path, annotation language, provider, workers, document
@@ -43,7 +60,7 @@ The language applies to generated reader material. Keep source text in its
 original language. Default to `provider=auto` and `workers=24`. Reuse a domain
 only when the user explicitly supplies `--domain-id` or `--domain-manifest`.
 
-### Step 2: Establish the authoritative source
+### Step 3: Establish the authoritative source
 
 Require a rich Markdown/TeX/HTML source paired with its PDF. The rich source
 provides faithful text, mathematics, links, tables, and assets; the PDF is
@@ -56,7 +73,7 @@ kind. A paired-PDF cache without a PDF hash and reconciliation proof is stale
 and must be recached. Never silently substitute rich-source headings when PDF
 boundaries conflict or alignment is ambiguous.
 
-### Step 3: Decide whether translation is needed
+### Step 4: Decide whether translation is needed
 
 After parsing, the agent running this workflow must inspect substantive body
 text near the beginning, middle, and end of the rich source. Do not decide from

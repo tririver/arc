@@ -15,6 +15,12 @@ generation turn.
 
 ## Phase 1: Source and Structure
 
+Repository workflows must resolve `--project-dir` and run
+`git check-ignore -q --no-index <resolved-project-dir>` before creating any run
+file. A failed check is blocking; choose a path under the repository's ignored
+`arc-tests/` tree. Outside a Git worktree this preflight does not apply. The
+generic CLI never invents a parent or sibling output directory.
+
 ### Step 1: Supply a paired source
 
 Formal output requires both:

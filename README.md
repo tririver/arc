@@ -357,10 +357,10 @@ regeneration. Bare `resume` selects automatic
 recovery; choose an explicit action for strict/manual behavior:
 
 ```bash
-arc-companion resume --project-dir ./0911.3380-companion --json
-arc-companion resume --project-dir ./0911.3380-companion \
+arc-companion resume --project-dir ./arc-tests/companion/0911.3380 --json
+arc-companion resume --project-dir ./arc-tests/companion/0911.3380 \
   --action resume-native --json
-arc-companion resume --project-dir ./0911.3380-companion \
+arc-companion resume --project-dir ./arc-tests/companion/0911.3380 \
   --action restart-generation --confirm-possible-duplicate-charge --json
 ```
 
