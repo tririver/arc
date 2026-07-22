@@ -168,6 +168,11 @@ tools it names.
   and comparable end-to-end evaluations that make many model calls. Use
   deterministic offline tests, fake providers, fixtures, and narrowly bounded
   non-generative checks instead.
+- A live-model smoke test may run automatically only when it is materially
+  needed to verify a provider or integration boundary and is explicitly
+  bounded to one worker, a small fixed call count, and a few minutes. It must
+  not expand into a complete domain, book/companion, idea-generation, benchmark,
+  or other long-running or highly parallel live workflow.
 - Do not pause an in-progress implementation to ask whether a token-expensive
   live workflow test should be run. Finish the requested implementation,
   offline verification, review, and commits without it. After all requested
