@@ -250,6 +250,16 @@ def test_only_all_render_can_complete_matching_render_failure(
 
     assert result["ok"] is True
     published_state = read_json(state_path)
+    if render_format in {"pdf", "all"}:
+        run_pdf = Path(
+            published_state["published"]["pdf"]["output_run_pdf"]
+        )
+        canonical_pdf = Path(published_state["published"]["pdf"]["output_pdf"])
+        assert run_pdf.parent == project.resolve()
+        assert run_pdf.read_bytes() == canonical_pdf.read_bytes()
+        assert not (project.parent / run_pdf.name).exists()
+    else:
+        assert not list(project.glob("*_companion_*.pdf"))
     assert published_state["status"] == expected_status
     assert ("error" not in published_state) is (render_format == "all")
     assert published_state["active_run"]["status"] == (
@@ -337,6 +347,111 @@ def test_state_commit_failure_restores_previous_web_index(
     assert result["error"]["code"] == "render_failed"
     assert index.read_bytes() == b"last-good-reader"
     assert (project / "state.json").read_bytes() == before_state
+
+
+def test_delivery_state_failure_preserves_committed_canonical_pdf(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import arc_companion.render as render_module
+
+    project, digest = _project(tmp_path)
+    _render_fakes(monkeypatch)
+    real_publish_state = render_module._publish_state
+    commits = 0
+
+    def fail_delivery_state(*args, **kwargs):
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            raise OSError("injected delivery state failure")
+        return real_publish_state(*args, **kwargs)
+
+    monkeypatch.setattr(render_module, "_publish_state", fail_delivery_state)
+    result = render_content(
+        project,
+        format="pdf",
+        content_sha256=digest,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"new-pdf"),
+        pdf_validator=lambda _pdf: {"pages": 1},
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "render_failed"
+    state = read_json(project / "state.json")
+    canonical = Path(state["published"]["pdf"]["output_pdf"])
+    assert canonical.read_bytes() == b"new-pdf"
+    assert "output_run_pdf" not in state
+    assert "output_run_pdf" not in state["published"]["pdf"]
+    delivery = list(project.glob("*_companion_*.pdf"))
+    assert len(delivery) == 1
+    assert delivery[0].read_bytes() == canonical.read_bytes()
+
+    recovered = render_content(
+        project,
+        format="pdf",
+        content_sha256=digest,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"new-pdf"),
+        pdf_validator=lambda _pdf: {"pages": 1},
+    )
+    assert recovered["ok"] is True
+    assert recovered["data"]["output_run_pdf"] == str(delivery[0])
+
+
+def test_delivery_publish_failure_migrates_early_draft_ownership_for_retry(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import arc_companion.pipeline as pipeline_module
+    import arc_companion.render as render_module
+
+    project, digest = _project(tmp_path)
+    _render_fakes(monkeypatch)
+    delivery = project / "local-fixture_companion_zh-CN.pdf"
+    delivery.write_bytes(b"old-delivery")
+    state_path = project / "state.json"
+    state = read_json(state_path)
+    old_hash = sha256_file(delivery)
+    state.update({
+        "output_project_pdf": str(delivery),
+        "output_project_pdf_sha256": old_hash,
+    })
+    state["published"]["pdf"].update({
+        "output_project_pdf": str(delivery),
+        "output_project_pdf_sha256": old_hash,
+    })
+    write_json(state_path, state)
+    real_publish = render_module.publish_run_root_pdf
+    monkeypatch.setattr(
+        render_module,
+        "publish_run_root_pdf",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("injected delivery publish failure")
+        ),
+    )
+
+    failed = render_content(
+        project,
+        format="pdf",
+        content_sha256=digest,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"new-pdf"),
+        pdf_validator=lambda _pdf: {"pages": 1},
+    )
+    assert failed["ok"] is False
+    committed = read_json(state_path)
+    assert "output_run_pdf" not in committed["published"]["pdf"]
+    assert committed["run_pdf_managed_path"] == str(delivery)
+    assert pipeline_module._run_root_pdf_output_matches(committed, project.resolve())
+    assert delivery.read_bytes() == b"old-delivery"
+
+    monkeypatch.setattr(render_module, "publish_run_root_pdf", real_publish)
+    recovered = render_content(
+        project,
+        format="pdf",
+        content_sha256=digest,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"new-pdf"),
+        pdf_validator=lambda _pdf: {"pages": 1},
+    )
+    assert recovered["ok"] is True
+    assert delivery.read_bytes() == b"new-pdf"
 
 
 def test_keyboard_interrupt_after_web_publish_rolls_back_then_propagates(

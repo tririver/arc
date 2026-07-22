@@ -490,6 +490,21 @@ def test_non_json_build_prefers_pdf_over_web_output(capsys) -> None:
     assert capsys.readouterr().out.strip() == "/project/paper.pdf"
 
 
+def test_non_json_build_prefers_run_root_pdf_delivery(capsys) -> None:
+    cli._emit(
+        {
+            "ok": True,
+            "data": {
+                "output_run_pdf": "/project/paper.pdf",
+                "output_pdf": "/project/.arc-companion/renders/rev/paper.pdf",
+            },
+            "meta": {},
+        },
+        json_output=False,
+    )
+    assert capsys.readouterr().out.strip() == "/project/paper.pdf"
+
+
 def test_public_web_contract_delegates_lazily(tmp_path: Path, monkeypatch) -> None:
     module = types.ModuleType("arc_companion.web")
     module.build_reader_snapshot = lambda project_dir, **kwargs: {  # type: ignore[attr-defined]
@@ -660,6 +675,11 @@ def test_companion_docs_describe_chaptered_stateful_cli_contract() -> None:
     assert "--confirm-possible-duplicate-charge" in manual_text
     assert "after every 30 minutes" in manual_text
     assert "`arc-jobs watch <job-id> --until-review --json`" in readme_text
+    assert "run-root delivery PDF" in manual_text
+    assert "resolved `--project-dir`" in manual_text
+    assert "run-root delivery PDF" in workflow_text
+    assert "resolved `<project-dir>`" in workflow_text
+    assert "run-root delivery PDF" in readme_text
     assert "chapter-aware" in readme_text
     assert "A real Index becomes the complete global glossary" in readme_text
     assert "stateful guide session" in workflow_text

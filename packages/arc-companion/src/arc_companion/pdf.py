@@ -1,15 +1,154 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Callable
+from typing import Callable, Mapping
 import uuid
+
+from .io import sha256_file
 
 
 class PDFError(RuntimeError):
     """Raised when LaTeX compilation or PDF inspection fails."""
+
+
+_LEGACY_RUN_PDF_PATH_KEY = "output_project_pdf"
+_LEGACY_RUN_PDF_SHA256_KEY = "output_project_pdf_sha256"
+_LEGACY_RUN_PDF_MANAGED_KEY = "project_pdf_managed_path"
+
+
+def publish_run_root_pdf(
+    pdf_path: Path,
+    run_root: Path,
+    *,
+    managed_path: Path | None = None,
+) -> dict[str, str]:
+    """Atomically maintain a final-PDF delivery in the resolved run root.
+
+    The immutable render remains authoritative.  This copy is a stable
+    user-facing delivery path and can be recreated without rendering or model
+    work when it is missing or damaged.
+    """
+
+    source = pdf_path.resolve()
+    root = run_root.resolve()
+    if not source.is_file() or source.stat().st_size == 0:
+        raise PDFError(f"Cannot publish a missing or empty PDF: {source}")
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / source.name
+    expected_sha256 = sha256_file(source)
+    managed = managed_path.absolute() if managed_path is not None else None
+    replace_existing = target.exists() or target.is_symlink()
+    if replace_existing:
+        if (
+            not target.is_symlink()
+            and target.is_file()
+            and target.stat().st_size > 0
+            and sha256_file(target) == expected_sha256
+        ):
+            return {
+                "output_run_pdf": str(target),
+                "output_run_pdf_sha256": expected_sha256,
+            }
+        if managed is None or managed != target.absolute():
+            raise PDFError(
+                f"Refusing to overwrite an unmanaged run-root delivery PDF: {target}"
+            )
+    candidate = root / (
+        f".{source.name}.arc-companion-delivery-{uuid.uuid4().hex[:12]}.tmp"
+    )
+    try:
+        shutil.copy2(source, candidate)
+        if sha256_file(candidate) != expected_sha256:
+            raise PDFError("Run-root delivery PDF does not match the immutable render")
+        if replace_existing:
+            _publish_run_root_pdf_replace(candidate, target)
+        else:
+            try:
+                _publish_run_root_pdf_create(candidate, target)
+            except FileExistsError as exc:
+                raise PDFError(
+                    f"Refusing to overwrite an unmanaged run-root delivery PDF: {target}"
+                ) from exc
+    finally:
+        candidate.unlink(missing_ok=True)
+    if not target.is_file() or sha256_file(target) != expected_sha256:
+        raise PDFError(
+            "Published run-root delivery PDF does not match the immutable render"
+        )
+    return {
+        "output_run_pdf": str(target),
+        "output_run_pdf_sha256": expected_sha256,
+    }
+
+
+def normalize_run_root_pdf_state(state: Mapping[str, object]) -> dict[str, object]:
+    """Translate early draft field names to the run-root delivery contract."""
+
+    normalized = dict(state)
+    if not normalized.get("output_run_pdf") and normalized.get(
+        _LEGACY_RUN_PDF_PATH_KEY
+    ):
+        normalized["output_run_pdf"] = normalized[_LEGACY_RUN_PDF_PATH_KEY]
+    if not normalized.get("output_run_pdf_sha256") and normalized.get(
+        _LEGACY_RUN_PDF_SHA256_KEY
+    ):
+        normalized["output_run_pdf_sha256"] = normalized[
+            _LEGACY_RUN_PDF_SHA256_KEY
+        ]
+    if not normalized.get("run_pdf_managed_path") and normalized.get(
+        _LEGACY_RUN_PDF_MANAGED_KEY
+    ):
+        normalized["run_pdf_managed_path"] = normalized[
+            _LEGACY_RUN_PDF_MANAGED_KEY
+        ]
+    for key in (
+        _LEGACY_RUN_PDF_PATH_KEY,
+        _LEGACY_RUN_PDF_SHA256_KEY,
+        _LEGACY_RUN_PDF_MANAGED_KEY,
+    ):
+        normalized.pop(key, None)
+
+    published = normalized.get("published")
+    if isinstance(published, Mapping):
+        normalized_published = dict(published)
+        pdf = normalized_published.get("pdf")
+        if isinstance(pdf, Mapping):
+            normalized_pdf = normalize_run_root_pdf_state(pdf)
+            normalized_published["pdf"] = normalized_pdf
+        normalized["published"] = normalized_published
+    return normalized
+
+
+def managed_run_root_pdf_path(state: Mapping[str, object]) -> Path | None:
+    """Return only a run-root PDF path already owned by published ARC state."""
+
+    normalized = normalize_run_root_pdf_state(state)
+    value = normalized.get("run_pdf_managed_path")
+    if not value:
+        published = normalized.get("published")
+        if isinstance(published, Mapping):
+            pdf = published.get("pdf")
+            if isinstance(pdf, Mapping):
+                value = pdf.get("output_run_pdf")
+    if not value:
+        value = normalized.get("output_run_pdf")
+    return Path(str(value)) if value else None
+
+
+def _publish_run_root_pdf_replace(source: Path, target: Path) -> None:
+    """Fault-injection seam for the atomic user-facing PDF replacement."""
+
+    source.replace(target)
+
+
+def _publish_run_root_pdf_create(source: Path, target: Path) -> None:
+    """Atomically create a delivery path without replacing a racing file."""
+
+    os.link(source, target)
 
 
 def _first_latex_error_context(value: str, *, before: int = 2, after: int = 7) -> str:

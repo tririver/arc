@@ -116,6 +116,17 @@ from the OS advisory lock.
 
 `render-web` manually rebuilds the static reader from durable checkpoints; it
 does not repeat generation calls. `validate` checks both the PDF and web bundle.
+Every successful full-document build and `render --format pdf|all` keeps its
+immutable internal PDF revision and atomically maintains a byte-identical PDF
+as the run-root delivery PDF in the resolved `--project-dir` itself, never its
+parent. ARC records the delivery path and hash, repairs a missing or damaged
+managed delivery on a completed build fast path without model or rendering
+work, and never publishes a first-chapter preview at that path. ARC may adopt
+an existing regular file only when its bytes already match the immutable
+render. It replaces different content only when prior published ARC state
+already owns that exact delivery path, and refuses unmanaged conflicts.
+JSON output and state record the delivery as `output_run_pdf` plus
+`output_run_pdf_sha256`.
 
 ### Step 2: Recover a blocked call
 
@@ -336,7 +347,13 @@ text, fonts, clipping, and overlap. In skip mode it also rejects translation IDs
 in the manifest and translation markers in TeX. It additionally validates web
 manifest containment and hashes, offline asset closure, snapshot coverage, and
 HTML source/translation/commentary ordering. Deliver the validated full PDF and
-static reader; normal non-JSON build output continues to print the PDF path.
+static reader; normal non-JSON output prints the run-root delivery PDF when present
+and otherwise falls back to the internal PDF path.
+
+The stable run-root delivery PDF is the preferred handoff path. It is written
+directly inside the resolved `--project-dir`, not its parent. The internal
+render revision remains the authoritative `output_pdf` used by validation and
+reproducibility packaging.
 
 Create a reproducibility package only when explicitly requested:
 

@@ -3956,6 +3956,11 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert "审校后的解释" in tex
     assert "解释 0002" in tex
     assert Path(data["output_pdf"]).is_file()
+    run_pdf = Path(data["output_run_pdf"])
+    assert run_pdf.parent == (tmp_path / "run").resolve()
+    assert run_pdf.read_bytes() == Path(data["output_pdf"]).read_bytes()
+    assert data["output_run_pdf_sha256"] == data["output_pdf_sha256"]
+    assert not ((tmp_path / "run").parent / run_pdf.name).exists()
     assert data["web_render_version"] == "arc.companion.web-render.v4"
     assert Path(data["output_html"]).is_file()
     assert Path(data["reader_snapshot_path"]).is_file()
@@ -3972,8 +3977,9 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert all("evidence" in json.loads(path.read_text(encoding="utf-8")) for path in saved_evidence)
 
     call_count = len(fake.calls)
-    # A missing web commit is repaired from reader-final.json without model work.
+    # Missing user-facing outputs are repaired without model work.
     Path(data["output_html"]).unlink()
+    run_pdf.unlink()
     resumed = build_companion(
         BuildOptions(
             paper_id=bundle.paper_id,
@@ -3990,6 +3996,9 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert resumed["ok"] and resumed["meta"]["resumed"] is True
     assert len(fake.calls) == call_count
     assert Path(resumed["data"]["output_html"]).is_file()
+    assert Path(resumed["data"]["output_run_pdf"]).read_bytes() == Path(
+        resumed["data"]["output_pdf"]
+    ).read_bytes()
 
     state_path = tmp_path / "run" / "state.json"
     stale_preview_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -5562,6 +5571,7 @@ def test_stop_after_first_chapter_returns_before_remaining_work_and_resumes(tmp_
     assert gated["data"]["status"] == "preview_ready"
     assert gated["data"]["preview_segment_ids"] == ["seg-0001"]
     assert Path(gated["data"]["preview_pdf"]).is_file()
+    assert "output_run_pdf" not in gated["data"]
     assert len(compiler_calls) == len(validation_calls) == 1
     first_labels = [str(call["call_label"]) for call in fake.calls]
     assert "companion-translation-seg-0001" in first_labels
@@ -5585,6 +5595,7 @@ def test_stop_after_first_chapter_returns_before_remaining_work_and_resumes(tmp_
     assert resumed["ok"], resumed
     assert resumed["data"]["status"] == "complete"
     assert Path(resumed["data"]["output_pdf"]).is_file()
+    assert Path(resumed["data"]["output_run_pdf"]).parent == project.resolve()
     all_labels = [str(call["call_label"]) for call in fake.calls]
     assert all_labels.count("companion-translation-seg-0001") == 1
     assert all_labels.count("companion-annotation-seg-0001") == 1
@@ -6117,6 +6128,163 @@ def test_completed_fast_path_requires_current_projection_guide_and_reader_versio
     legacy = {**state, "augmentation_projection_version": "arc.companion.augmentation-projection.v1"}
     assert not pipeline_module._completion_outputs_match(legacy)
     assert all(path.is_file() for path in tmp_path.iterdir())
+
+
+def test_run_root_pdf_validation_is_optional_for_legacy_state_and_strict_when_recorded(
+    tmp_path: Path,
+) -> None:
+    project = (tmp_path / "project").resolve()
+    project.mkdir()
+    canonical = project / ".arc-companion" / "renders" / "rev" / "paper.pdf"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"%PDF canonical")
+    digest = hashlib.sha256(canonical.read_bytes()).hexdigest()
+    delivery = project / "paper.pdf"
+    delivery.write_bytes(canonical.read_bytes())
+    state = {
+        "output_pdf": str(canonical),
+        "output_pdf_sha256": digest,
+        "output_run_pdf": str(delivery),
+        "output_run_pdf_sha256": digest,
+    }
+
+    assert pipeline_module._run_root_pdf_output_matches({}, project)
+    assert pipeline_module._run_root_pdf_output_matches(state, project)
+    assert pipeline_module._run_root_pdf_output_matches(
+        {
+            "output_pdf_sha256": digest,
+            "output_project_pdf": str(delivery),
+            "output_project_pdf_sha256": digest,
+        },
+        project,
+    )
+    assert not pipeline_module._run_root_pdf_output_matches(
+        {**state, "output_run_pdf_sha256": None}, project,
+    )
+    assert not pipeline_module._run_root_pdf_output_matches(
+        {**state, "output_run_pdf": str(tmp_path / "outside.pdf")}, project,
+    )
+    delivery.write_bytes(b"tampered")
+    assert not pipeline_module._run_root_pdf_output_matches(state, project)
+    delivery.unlink()
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(canonical.read_bytes())
+    delivery.symlink_to(outside)
+    assert not pipeline_module._run_root_pdf_output_matches(state, project)
+
+
+def test_run_root_pdf_state_event_failure_keeps_already_committed_delivery(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import arc_companion.observability as observability
+
+    project = (tmp_path / "project").resolve()
+    canonical = project / ".arc-companion" / "renders" / "rev" / "paper.pdf"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"%PDF canonical")
+    digest = hashlib.sha256(canonical.read_bytes()).hexdigest()
+    state_path = project / "state.json"
+    _state(
+        state_path,
+        status="complete",
+        output_pdf=str(canonical),
+        output_pdf_sha256=digest,
+    )
+    publication = pipeline_module.publish_run_root_pdf(canonical, project)
+    monkeypatch.setattr(
+        observability,
+        "append_state_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("injected event append failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="event append failure"):
+        _state(state_path, **publication)
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["output_run_pdf"] == publication["output_run_pdf"]
+    assert (
+        persisted["published"]["pdf"]["output_run_pdf"]
+        == publication["output_run_pdf"]
+    )
+    assert Path(publication["output_run_pdf"]).is_file()
+
+
+def test_run_root_pdf_precommit_failure_leaves_adoptable_delivery(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = (tmp_path / "project").resolve()
+    canonical = project / ".arc-companion" / "renders" / "rev" / "paper.pdf"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"%PDF canonical")
+    state_path = project / "state.json"
+    state_path.write_text('{"status":"complete"}', encoding="utf-8")
+    publication = pipeline_module.publish_run_root_pdf(canonical, project)
+    real_state = pipeline_module._state
+    monkeypatch.setattr(
+        pipeline_module,
+        "_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("injected state write failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="state write failure"):
+        pipeline_module._state(state_path, **publication)
+
+    assert Path(publication["output_run_pdf"]).is_file()
+    monkeypatch.setattr(pipeline_module, "_state", real_state)
+    adopted = pipeline_module.publish_run_root_pdf(canonical, project)
+    persisted = pipeline_module._state(state_path, **adopted)
+    assert persisted["output_run_pdf"] == publication["output_run_pdf"]
+
+
+def test_fingerprint_change_preserves_delivery_ownership_until_replacement(
+    tmp_path: Path,
+) -> None:
+    project = (tmp_path / "project").resolve()
+    old_pdf = project / ".arc-companion" / "renders" / "old" / "paper.pdf"
+    old_pdf.parent.mkdir(parents=True)
+    old_pdf.write_bytes(b"%PDF old")
+    state_path = project / "state.json"
+    old_hash = hashlib.sha256(old_pdf.read_bytes()).hexdigest()
+    old_publication = pipeline_module.publish_run_root_pdf(old_pdf, project)
+    _state(
+        state_path,
+        status="complete",
+        fingerprint="old-fingerprint",
+        output_pdf=str(old_pdf),
+        output_pdf_sha256=old_hash,
+        **old_publication,
+    )
+    new_pdf = project / ".arc-companion" / "renders" / "new" / "paper.pdf"
+    new_pdf.parent.mkdir(parents=True)
+    new_pdf.write_bytes(b"%PDF new")
+    new_hash = hashlib.sha256(new_pdf.read_bytes()).hexdigest()
+
+    interrupted = _state(
+        state_path,
+        status="complete",
+        fingerprint="new-fingerprint",
+        output_pdf=str(new_pdf),
+        output_pdf_sha256=new_hash,
+    )
+
+    assert "output_run_pdf" not in interrupted
+    assert "output_run_pdf" not in interrupted["published"]["pdf"]
+    assert (
+        interrupted["run_pdf_managed_path"]
+        == old_publication["output_run_pdf"]
+    )
+    assert pipeline_module._run_root_pdf_output_matches(interrupted, project)
+    managed = pipeline_module.managed_run_root_pdf_path(interrupted)
+    new_publication = pipeline_module.publish_run_root_pdf(
+        new_pdf, project, managed_path=managed,
+    )
+    recovered = _state(state_path, **new_publication)
+    assert Path(recovered["output_run_pdf"]).read_bytes() == b"%PDF new"
+    assert recovered["output_run_pdf_sha256"] == new_hash
 
 
 def test_controller_only_runtime_keeps_internet_enabled_and_scrubs_polluted_parent_env(

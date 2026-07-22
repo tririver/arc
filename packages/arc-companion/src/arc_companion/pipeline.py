@@ -77,7 +77,13 @@ from .intent_guidance import (
 )
 from .language import base_language, contains_lexical_term, normalize_language_tag
 from .latex import LatexError, render_companion_tex, validate_tex_fidelity
-from .pdf import compile_latex, validate_pdf
+from .pdf import (
+    compile_latex,
+    managed_run_root_pdf_path,
+    normalize_run_root_pdf_state,
+    publish_run_root_pdf,
+    validate_pdf,
+)
 from .prompts import (
     ANNOTATION_SCHEMA,
     TRANSLATION_COVERAGE_REPAIR_SCHEMA,
@@ -671,6 +677,11 @@ def _build_companion_unlocked(
                 plan["estimated_provider_calls"] = 0
                 write_json(plan_path, plan)
             resumed_state = {**previous_state, "diagnostics": list(diagnostics)}
+            run_pdf = publish_run_root_pdf(
+                Path(str(previous_state["output_pdf"])), project_dir,
+                managed_path=managed_run_root_pdf_path(previous_state),
+            )
+            resumed_state.update(run_pdf)
             if not _web_outputs_match(resumed_state):
                 # The reviewed reader checkpoint is authoritative.  Rebuilding a
                 # missing web bundle must never cause completed model work to run.
@@ -679,7 +690,7 @@ def _build_companion_unlocked(
                 )
                 if published is not None:
                     resumed_state = {**resumed_state, **published}
-            _state(state_path, **resumed_state)
+            resumed_state = _state(state_path, **resumed_state)
             return ok(
                 resumed_state,
                 resumed=True,
@@ -1130,6 +1141,9 @@ def _build_companion_unlocked(
             final_overrides=final_reader_overrides,
             strict=True,
         )
+        managed_run_pdf = managed_run_root_pdf_path(
+            _read_optional_json(state_path)
+        )
 
         final_state = _state(
             state_path,
@@ -1155,6 +1169,11 @@ def _build_companion_unlocked(
             checkpoint_dir=str(checkpoint_dir),
             diagnostics=list(diagnostics),
         )
+        run_pdf = publish_run_root_pdf(
+            Path(final_artifact["pdf_path"]), project_dir,
+            managed_path=managed_run_pdf,
+        )
+        final_state = _state(state_path, **run_pdf)
         return ok(
             final_state,
             resumed=False,
@@ -3657,6 +3676,9 @@ def _build_chaptered_companion(
         final_overrides=final_reader_overrides,
         strict=True,
     )
+    managed_run_pdf = managed_run_root_pdf_path(
+        _read_optional_json(state_path)
+    )
     for chapter_id in chapter_results:
         progress.safe_boundary("chapter_complete", chapter_id=chapter_id,
                                artifact_paths=[artifact["pdf_path"]], substantive=True)
@@ -3678,7 +3700,21 @@ def _build_chaptered_companion(
                    reader_final_checkpoint_version=READER_FINAL_CHECKPOINT_VERSION,
                    translation_mode="skipped" if options.skip_translation else "enabled",
                    notice=notice, diagnostics=list(diagnostics))
-    progress.safe_boundary(status, artifact_paths=[artifact["pdf_path"]], substantive=True)
+    run_pdf: dict[str, str] = {}
+    if not options.stop_after_first_chapter:
+        run_pdf = publish_run_root_pdf(
+            Path(artifact["pdf_path"]), options.project_dir.resolve(),
+            managed_path=managed_run_pdf,
+        )
+        final = _state(state_path, **run_pdf)
+    progress.safe_boundary(
+        status,
+        artifact_paths=[
+            artifact["pdf_path"],
+            *([run_pdf["output_run_pdf"]] if run_pdf else []),
+        ],
+        substantive=True,
+    )
     return {"ok": True, "status": status, "data": final, "errors": [],
             "meta": {"diagnostics": list(diagnostics), "notice": notice}}
 
@@ -3847,7 +3883,8 @@ def read_status(project_dir: Path) -> dict[str, Any]:
         return err("companion_state_not_found", f"No companion state found in {project_dir}")
     from .observability import enrich_status
 
-    return ok(enrich_status(project_dir, read_json(path)))
+    state = normalize_run_root_pdf_state(read_json(path))
+    return ok(enrich_status(project_dir, state))
 
 
 def _finalize_paid_translation_repairs(
@@ -6145,11 +6182,11 @@ def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[
     web_value = published.get("web") or {}
     if not isinstance(pdf_value, dict) or not isinstance(web_value, dict):
         return err("companion_validation_failed", "Published companion outputs are invalid")
-    effective = {
+    effective = normalize_run_root_pdf_state({
         **state,
         **dict(pdf_value),
         **dict(web_value),
-    }
+    })
     pdf = Path(str(effective.get("output_pdf") or ""))
     tex = Path(str(effective.get("output_tex") or ""))
     manifest_path = Path(str(effective.get("source_manifest_path") or ""))
@@ -6158,6 +6195,11 @@ def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[
     try:
         if not _published_pdf_outputs_match(effective):
             raise RuntimeError("completed companion outputs do not match their recorded hashes")
+        if not _run_root_pdf_output_matches(effective, project_dir.resolve()):
+            raise RuntimeError(
+                "run-root delivery PDF is missing, outside the resolved "
+                "--project-dir, or has a hash mismatch"
+            )
         content_sha256 = str(published.get("content_sha256") or "")
         if content_sha256:
             from .content import load_reader_content
@@ -6188,6 +6230,7 @@ def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[
         "web": web_report,
         "manifest": manifest,
         "output_pdf": str(pdf),
+        "output_run_pdf": effective.get("output_run_pdf"),
     })
 
 
@@ -6207,6 +6250,29 @@ def _published_pdf_outputs_match(state: dict[str, Any]) -> bool:
         if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
             return False
     return True
+
+
+def _run_root_pdf_output_matches(
+    state: Mapping[str, Any], run_root: Path,
+) -> bool:
+    """Validate an optional delivery in the exact resolved companion run root."""
+
+    normalized = normalize_run_root_pdf_state(state)
+    value = normalized.get("output_run_pdf")
+    expected = normalized.get("output_run_pdf_sha256")
+    if value is None and expected is None:
+        return True
+    if not value or not expected:
+        return False
+    path = Path(str(value))
+    return (
+        path.parent == run_root.resolve()
+        and not path.is_symlink()
+        and path.is_file()
+        and path.stat().st_size > 0
+        and sha256_file(path) == str(expected)
+        and str(expected) == str(normalized.get("output_pdf_sha256") or "")
+    )
 
 
 def _annotation_checkpoint_input_sha256(
@@ -12735,7 +12801,11 @@ def _publish_reader_update(
 
 
 def _state(path: Path, **values: Any) -> dict[str, Any]:
-    previous = _read_optional_json(path)
+    previous = normalize_run_root_pdf_state(_read_optional_json(path))
+    values = normalize_run_root_pdf_state(values)
+    previous_managed_run_pdf = managed_run_root_pdf_path(previous)
+    if previous_managed_run_pdf is not None:
+        previous["run_pdf_managed_path"] = str(previous_managed_run_pdf)
     incoming_fingerprint = values.get("fingerprint")
     previous_fingerprint = previous.get("fingerprint")
     fingerprint_changed = (
@@ -12759,6 +12829,15 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
         **previous,
         **{key: value for key, value in values.items() if value is not None},
     }
+    if (
+        values.get("output_pdf")
+        and values.get("output_pdf_sha256")
+        and not values.get("output_run_pdf")
+    ):
+        state.pop("output_run_pdf", None)
+        state.pop("output_run_pdf_sha256", None)
+    if values.get("output_run_pdf"):
+        state["run_pdf_managed_path"] = values["output_run_pdf"]
     published = dict(previous.get("published") or {})
     content_sha256 = values.get("content_sha256")
     if content_sha256:
@@ -12770,6 +12849,7 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
             key: state.get(key)
             for key in (
                 "output_tex", "output_pdf", "output_tex_sha256", "output_pdf_sha256",
+                "output_run_pdf", "output_run_pdf_sha256",
                 "source_manifest_path", "source_manifest_sha256", "validation_path",
                 "validation_sha256", "final_render_version",
             )
@@ -12777,6 +12857,16 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
         }
         if published.get("content_sha256"):
             published["pdf"]["content_sha256"] = published["content_sha256"]
+    elif (
+        values.get("output_run_pdf")
+        and values.get("output_run_pdf_sha256")
+        and isinstance(published.get("pdf"), dict)
+    ):
+        published["pdf"] = {
+            **published["pdf"],
+            "output_run_pdf": values["output_run_pdf"],
+            "output_run_pdf_sha256": values["output_run_pdf_sha256"],
+        }
     if values.get("output_html") and values.get("output_html_sha256"):
         published["web"] = {
             key: state.get(key)
@@ -12793,7 +12883,10 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
         state["published"] = published
     state["active_run"] = {
         key: value for key, value in state.items()
-        if key not in {"schema_version", "active_run", "published", "revisions"}
+        if key not in {
+            "schema_version", "active_run", "published", "revisions",
+            "run_pdf_managed_path",
+        }
         and not key.startswith("output_")
     }
     if values.get("status") and values.get("status") not in {"failed", "needs_supervision"}:

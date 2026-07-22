@@ -10,7 +10,13 @@ import uuid
 from .content import ContentBundleError, load_reader_content
 from .io import read_json, safe_name, sha256_file, write_json, write_text
 from .latex import LatexError, render_companion_tex, validate_tex_fidelity
-from .pdf import compile_latex, validate_pdf
+from .pdf import (
+    compile_latex,
+    managed_run_root_pdf_path,
+    normalize_run_root_pdf_state,
+    publish_run_root_pdf,
+    validate_pdf,
+)
 from .results import err, ok
 from .run_lock import BuildInProgressError, ProjectBuildLock
 
@@ -107,12 +113,29 @@ def render_content(
             web_commit = (index_path, previous_index)
             published["web"] = web
             phase_times["web"] = time.monotonic() - phase
-        phase_times["total"] = time.monotonic() - started
+        # Commit the immutable render before touching the mutable delivery copy.
+        # A later copy/state failure therefore cannot invalidate the last-good
+        # canonical revision recorded by state.json.
         final_state = _publish_state(
             root, content_sha256=digest, outputs=published,
             render_format=format,
         )
         state_committed = True
+        if "pdf" in published:
+            published["pdf"].update(
+                publish_run_root_pdf(
+                    Path(str(published["pdf"]["output_pdf"])),
+                    root,
+                    managed_path=managed_run_root_pdf_path(state),
+                )
+            )
+            final_state = _publish_state(
+                root,
+                content_sha256=digest,
+                outputs={"pdf": published["pdf"]},
+                render_format=format,
+            )
+        phase_times["total"] = time.monotonic() - started
         data = {
             "mode": RENDER_MODE,
             "format": format,
@@ -255,7 +278,8 @@ def _publish_state(
 ) -> dict[str, Any]:
     # Rendering is serialized with generation, but re-read at the commit point
     # so a state update made after the initial content lookup is never lost.
-    state = _state(root)
+    state = normalize_run_root_pdf_state(_state(root))
+    managed_run_pdf = managed_run_root_pdf_path(state)
     published = dict(state.get("published") or {})
     published["content_sha256"] = content_sha256
     for lane, value in outputs.items():
@@ -277,6 +301,16 @@ def _publish_state(
     }
     for value in outputs.values():
         merged.update(value)
+    if "pdf" in outputs:
+        if outputs["pdf"].get("output_run_pdf"):
+            merged["run_pdf_managed_path"] = outputs["pdf"][
+                "output_run_pdf"
+            ]
+        else:
+            merged.pop("output_run_pdf", None)
+            merged.pop("output_run_pdf_sha256", None)
+            if managed_run_pdf is not None:
+                merged["run_pdf_managed_path"] = str(managed_run_pdf)
     if _repairs_current_render_failure(
         state, content_sha256=content_sha256, render_format=render_format,
     ):

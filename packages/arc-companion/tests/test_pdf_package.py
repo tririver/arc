@@ -11,7 +11,14 @@ import pytest
 from arc_companion import pdf as pdf_module
 from arc_companion.io import canonical_json, sha256_file, sha256_json
 from arc_companion.package import _WEB_STATE_KEYS, package_project
-from arc_companion.pdf import PDFError, compile_latex, validate_pdf
+from arc_companion.pdf import (
+    PDFError,
+    compile_latex,
+    managed_run_root_pdf_path,
+    normalize_run_root_pdf_state,
+    publish_run_root_pdf,
+    validate_pdf,
+)
 from arc_companion.web import (
     READER_SNAPSHOT_VERSION,
     WEB_MANIFEST_VERSION,
@@ -29,6 +36,174 @@ ABCDEE+FandolSong-Regular            CID TrueType      Identity-H       yes yes 
 XYZZY+LatinModernRoman               Type 1C           Custom           yes yes yes      9  0
 QWERTY+NotoSansCJKSC                 CID TrueType      Identity-H       yes yes yes     10  0
 """
+
+
+def test_publish_run_root_pdf_creates_stable_byte_identical_copy(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = project / ".arc-companion" / "renders" / "pdf" / "rev" / "paper.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF stable")
+
+    published = publish_run_root_pdf(source, project)
+
+    target = project / "paper.pdf"
+    assert published == {
+        "output_run_pdf": str(target),
+        "output_run_pdf_sha256": sha256_file(source),
+    }
+    assert target.read_bytes() == source.read_bytes()
+    assert managed_run_root_pdf_path({"published": {"pdf": published}}) == target
+    assert not (project.parent / target.name).exists()
+
+
+def test_publish_run_root_pdf_resolves_exact_root_and_never_writes_parent(
+    tmp_path: Path,
+) -> None:
+    resolved_root = tmp_path / "runs" / "companion"
+    source = (
+        resolved_root / ".arc-companion" / "renders" / "pdf" / "rev" / "paper.pdf"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF stable")
+    linked_root = tmp_path / "companion-link"
+    linked_root.symlink_to(resolved_root, target_is_directory=True)
+
+    published = publish_run_root_pdf(source, linked_root)
+
+    target = resolved_root.resolve() / "paper.pdf"
+    assert published["output_run_pdf"] == str(target)
+    assert target.read_bytes() == source.read_bytes()
+    assert not (resolved_root.parent / target.name).exists()
+    assert not (tmp_path / target.name).exists()
+
+
+def test_publish_run_root_pdf_refuses_unmanaged_conflict_and_repairs_managed_copy(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = project / ".arc-companion" / "renders" / "pdf" / "rev" / "paper.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF new")
+    target = project / "paper.pdf"
+    target.write_bytes(b"user file")
+
+    with pytest.raises(PDFError, match="unmanaged run-root delivery PDF"):
+        publish_run_root_pdf(source, project)
+    assert target.read_bytes() == b"user file"
+
+    published = publish_run_root_pdf(source, project, managed_path=target)
+
+    assert target.read_bytes() == source.read_bytes()
+    assert published["output_run_pdf_sha256"] == sha256_file(source)
+
+
+def test_publish_run_root_pdf_adopts_byte_identical_unmanaged_file(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = project / ".arc-companion" / "renders" / "pdf" / "rev" / "paper.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF same")
+    target = project / "paper.pdf"
+    target.write_bytes(source.read_bytes())
+
+    published = publish_run_root_pdf(source, project)
+
+    assert target.read_bytes() == b"%PDF same"
+    assert published["output_run_pdf"] == str(target)
+    assert published["output_run_pdf_sha256"] == sha256_file(target)
+
+
+def test_publish_run_root_pdf_does_not_adopt_unmanaged_symlink(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = project / ".arc-companion" / "renders" / "pdf" / "rev" / "paper.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF stable")
+    external = tmp_path / "external.pdf"
+    external.write_bytes(source.read_bytes())
+    target = project / "paper.pdf"
+    target.symlink_to(external)
+
+    with pytest.raises(PDFError, match="unmanaged run-root delivery PDF"):
+        publish_run_root_pdf(source, project)
+
+    assert target.is_symlink()
+    assert external.read_bytes() == b"%PDF stable"
+
+
+def test_publish_run_root_pdf_replace_failure_preserves_managed_copy(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    source = project / ".arc-companion" / "renders" / "pdf" / "rev" / "paper.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF new")
+    target = project / "paper.pdf"
+    target.write_bytes(b"%PDF old")
+    monkeypatch.setattr(
+        pdf_module,
+        "_publish_run_root_pdf_replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        publish_run_root_pdf(source, project, managed_path=target)
+
+    assert target.read_bytes() == b"%PDF old"
+    assert not list(project.glob("*.arc-companion-delivery-*.tmp"))
+
+
+def test_publish_run_root_pdf_does_not_overwrite_racing_unmanaged_file(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    source = project / ".arc-companion" / "renders" / "pdf" / "rev" / "paper.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF source")
+    target = project / "paper.pdf"
+
+    def race_create(_source: Path, destination: Path) -> None:
+        destination.write_bytes(b"user race")
+        raise FileExistsError(destination)
+
+    monkeypatch.setattr(pdf_module, "_publish_run_root_pdf_create", race_create)
+    with pytest.raises(PDFError, match="unmanaged run-root delivery PDF"):
+        publish_run_root_pdf(source, project)
+
+    assert target.read_bytes() == b"user race"
+    assert not list(project.glob("*.arc-companion-delivery-*.tmp"))
+
+
+def test_early_project_pdf_draft_fields_migrate_to_run_root_contract(
+    tmp_path: Path,
+) -> None:
+    delivery = tmp_path / "paper.pdf"
+    legacy = {
+        "project_pdf_managed_path": str(delivery),
+        "output_project_pdf": str(delivery),
+        "output_project_pdf_sha256": "a" * 64,
+        "published": {
+            "pdf": {
+                "output_project_pdf": str(delivery),
+                "output_project_pdf_sha256": "a" * 64,
+            }
+        },
+    }
+
+    normalized = normalize_run_root_pdf_state(legacy)
+
+    assert normalized["run_pdf_managed_path"] == str(delivery)
+    assert normalized["output_run_pdf"] == str(delivery)
+    assert normalized["output_run_pdf_sha256"] == "a" * 64
+    assert normalized["published"]["pdf"]["output_run_pdf"] == str(delivery)
+    assert normalized["published"]["pdf"]["output_run_pdf_sha256"] == "a" * 64
+    assert managed_run_root_pdf_path(legacy) == delivery
+    assert "project_pdf_managed_path" not in normalized
+    assert "output_project_pdf" not in normalized["published"]["pdf"]
 
 
 def _pdf_runner(tmp_path: Path, *, info: str = PDFINFO, fonts: str = FONT_REPORT):

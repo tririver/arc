@@ -319,7 +319,8 @@ def _emit(result: dict[str, Any], *, json_output: bool) -> None:
     if result.get("ok"):
         data = result.get("data") or {}
         print(
-            data.get("output_pdf")
+            data.get("output_run_pdf")
+            or data.get("output_pdf")
             or data.get("preview_pdf")
             or data.get("output_html")
             or data.get("archive_path")

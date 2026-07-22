@@ -279,9 +279,12 @@ pages, and chapter-boundary reconciliation. If `--annotation-language` is
 omitted, ARC prints a language-switch notice and continues in Chinese:
 
 ```bash
-arc-companion build arXiv:0911.3380 --project-dir ./0911.3380-companion --json
-arc-companion render-web --project-dir ./0911.3380-companion --json
-arc-companion validate --project-dir ./0911.3380-companion --json
+arc-companion build arXiv:0911.3380 \
+  --project-dir ./arc-tests/companion/0911.3380 --json
+arc-companion render-web \
+  --project-dir ./arc-tests/companion/0911.3380 --json
+arc-companion validate \
+  --project-dir ./arc-tests/companion/0911.3380 --json
 ```
 
 Use `--document-kind auto|article|book` to select the structure policy,
@@ -375,8 +378,12 @@ sans-serif fonts while mathematics remains LaTeX serif. Personal names retain
 their exact source spelling in any script. Document and structural headings,
 including References and Index, render as source title plus translation but do
 not receive commentary; navigation prefers the translated title. Figure/table
-captions remain source-only. The deliverables are the validated full-document PDF and its
-static-web reader; ordinary non-JSON CLI output still prints the PDF path first.
+captions remain source-only. The deliverables are the validated full-document
+PDF and its static-web reader. A successful full build maintains a byte-identical
+run-root delivery PDF directly in the resolved `--project-dir`, never its
+parent; the immutable internal `output_pdf` remains authoritative. Ordinary
+non-JSON CLI output prints the run-root delivery PDF path first, while JSON
+records it as `output_run_pdf` and `output_run_pdf_sha256`.
 `arc-companion validate` verifies both forms, while a reproducibility ZIP that
 contains both plus every manifest-declared local web asset is generated only by
 an explicit `arc-companion package` request.

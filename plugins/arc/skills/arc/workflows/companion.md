@@ -342,10 +342,15 @@ the PDF.
 
 ### Step 3: Deliver
 
-Return the validated full-document PDF and static reader; in concise non-JSON
-handoff, lead with the PDF path. Do not list internal JSON, TeX, logs, ledgers,
-or citation data unless requested. Create a reproducibility package only on
-explicit request:
+After a successful full-document build or PDF rerender, ARC keeps the
+validated immutable render revision and atomically copies the same PDF to the
+resolved `<project-dir>` itself, never its parent. This run-root delivery PDF is
+the convenient user-facing delivery; a first-chapter preview must not create or
+replace it. Return that copy and the static reader, and lead with the run-root
+delivery PDF path when it is available. The immutable internal `output_pdf`
+remains authoritative for validation and packaging. Do not list internal JSON,
+TeX, logs, ledgers, or citation data unless requested. Create a reproducibility
+package only on explicit request:
 
 ```bash
 arc-companion package --project-dir <project-dir> --json
