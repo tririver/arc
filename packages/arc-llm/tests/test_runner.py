@@ -1602,6 +1602,67 @@ def test_new_call_constructs_shared_paper_overlay_before_submission(tmp_path):
     assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "full"
 
 
+def test_paper_access_policy_is_staged_by_content_hash(tmp_path):
+    env = {
+        "ARC_PAPER_CLI_ACCESS": "full",
+        "ARC_PAPER_CACHE": str(tmp_path / "base"),
+        "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON": '["legacy"]',
+        "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON": '{"legacy":{}}',
+    }
+    runner._configure_paper_worker_session(env, artifact_dir=tmp_path / "run", session_manager=None)
+    runner._stage_paper_access_policy(env, {
+        "allowed_operations": ["artifact-read", "get-parsed-toc", "get-parsed-section"],
+        "authorized_source_ids": ["book"],
+        "authorized_section_targets": [
+            {"source_id": "book", "locator": "chapter-2", "purpose": "terminology"}
+        ],
+    })
+
+    path = Path(env["ARC_PAPER_WORKER_READ_POLICY_PATH"])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert path.parent == tmp_path / "run" / "read-policies"
+    assert payload == {
+        "schema_version": "arc.paper.worker-read-policy.v2",
+        "operations": [
+            "artifact-read", "get-parsed-toc", "get-parsed-section", "policy-targets"
+        ],
+        "authorized_source_ids": ["book"],
+        "targets": [{
+            "source_id": "book", "locator": "chapter-2", "purpose": "terminology"
+        }],
+    }
+    assert path.name == f'sha256-{env["ARC_PAPER_WORKER_READ_POLICY_SHA256"]}.json'
+    assert env["ARC_PAPER_WORKER_READ_POLICY_SCHEMA"] == "arc.paper.worker-read-policy.v2"
+    assert "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON" not in env
+    assert "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON" not in env
+
+
+def test_run_text_result_accepts_structured_paper_access_policy(tmp_path, monkeypatch):
+    captured = {}
+
+    def select_provider(_provider, **kwargs):
+        captured.update(kwargs["env"])
+        return FakeTextResultProvider()
+
+    monkeypatch.setattr(runner, "select_provider", select_provider)
+    outcome = run_text_result(
+        "prompt",
+        provider="codex-cli",
+        model="fast",
+        env={"ARC_PAPER_CLI_ACCESS": "full"},
+        process_chain=[],
+        artifact_dir=tmp_path / "artifacts",
+        paper_access_policy={
+            "operations": ["get-parsed-section"],
+            "targets": {"book": {"sections": ["chapter-2"]}},
+        },
+    )
+
+    assert "prompt" in outcome.value
+    assert Path(captured["ARC_PAPER_WORKER_READ_POLICY_PATH"]).is_file()
+    assert len(captured["ARC_PAPER_WORKER_READ_POLICY_SHA256"]) == 64
+
+
 def test_stateful_calls_share_paper_overlay_across_artifact_directories(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeResultProvider())
     manager = LLMSessionManager(tmp_path / "sessions")

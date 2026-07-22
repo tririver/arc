@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 
 import pytest
 
@@ -8,14 +9,19 @@ from arc_companion.intent_guidance import (
     IntentGuidanceAmbiguousError,
     IntentGuidanceError,
     build_intent_guidance,
+    list_reference_targets,
     resolve_worker_evidence_requests,
     validate_worker_query,
     worker_guidance_payload,
     worker_guidance_prompt_prefix,
     worker_policy_descriptor,
+    INTENT_GUIDANCE_VERSION,
+    LEGACY_INTENT_GUIDANCE_VERSION,
+    TARGET_PAGE_HARD_BYTES,
     _controller_page,
 )
 from arc_llm import EvidenceRequest
+from arc_companion.io import sha256_json
 
 
 def _getters(*, body: str = "SECRET SECTION BODY", source_id: str = "book-cache"):
@@ -177,7 +183,7 @@ def test_all_workers_receive_identical_payload_and_strict_read_only_policy(tmp_p
 
     policy = worker_policy_descriptor(artifact)
     assert policy["allowed_operations"] == [
-        "artifact-read", "get-parsed-toc", "get-parsed-section"
+        "artifact-read", "policy-targets", "get-parsed-toc", "get-parsed-section"
     ]
     assert policy["reference_operations"] == ["get-parsed-toc", "get-parsed-section"]
     assert policy["network"] is False
@@ -280,3 +286,123 @@ def test_controller_fallback_enforces_targets_and_pages_cached_section(tmp_path)
     multibyte = _controller_page("术", offset=1, limit=1)
     assert multibyte["content"] == "术"
     assert multibyte["next_offset"] == 4
+
+
+def test_more_than_twelve_targets_use_lane_catalog_and_digest_bound_pages(tmp_path):
+    count = 1_000
+
+    def parsed(requested: str, *, include_document: bool):
+        assert requested == "book-cache"
+        assert include_document is False
+        return {"ok": True, "data": {
+            "paper_id": requested,
+            "source_hash": "many-source-hash",
+            "document_hash": "many-document-hash",
+            "metadata": {"title": "Large reference"},
+        }}
+
+    def toc(requested: str):
+        assert requested == "book-cache"
+        return {"ok": True, "data": [
+            {"id": f"ch-{index:04d}", "title": f"Chapter {index}", "level": 1}
+            for index in range(count)
+        ]}
+
+    def model(_prompt, schema, _path, _label):
+        assert "maxItems" not in schema["properties"]["reference_targets"]
+        return {
+            "guidance": "Use the authorized translation chapters only for terminology.",
+            "resolution_status": "resolved",
+            "reference_targets": [{
+                "source_id": "book-cache",
+                "locator": f"ch-{index:04d}",
+                "purpose": "Terminology " + ("术语" * 40),
+                "lanes": ["translation"],
+            } for index in range(count)],
+        }
+
+    artifact = build_intent_guidance(
+        "Use all matching reference chapters.",
+        source_language="English", target_language="Chinese", document_type="book",
+        context_paper_ids=["book-cache"], project_dir=tmp_path, call_model=model,
+        parsed_getter=parsed, toc_getter=toc,
+    )
+    assert artifact["schema_version"] == INTENT_GUIDANCE_VERSION
+    assert len(artifact["reference_targets"]) == count
+    payload = worker_guidance_payload(artifact, lane="translation")
+    assert payload["reference_target_catalog"]["inline"] is False
+    assert payload["reference_target_catalog"]["target_count"] == count
+    assert "reference_targets" not in payload
+    assert worker_guidance_payload(artifact, lane="commentary")[
+        "reference_target_catalog"
+    ]["inline"] is True
+
+    items = []
+    cursor = None
+    while True:
+        page = list_reference_targets(
+            artifact, lane="translation", cursor=cursor, limit_bytes=1400,
+        )
+        encoded_page_bytes = len(json.dumps(
+            page, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8"))
+        assert encoded_page_bytes <= 1400
+        assert encoded_page_bytes <= TARGET_PAGE_HARD_BYTES
+        items.extend(page["items"])
+        cursor = page["next_cursor"]
+        if page["eof"]:
+            break
+    assert [item["locator"] for item in items] == [
+        f"ch-{index:04d}" for index in range(count)
+    ]
+
+    first = list_reference_targets(artifact, lane="translation", limit_bytes=1400)
+    with pytest.raises(IntentGuidanceError, match="does not match"):
+        list_reference_targets(
+            artifact, lane="translation", cursor=first["next_cursor"], query="different",
+        )
+
+
+def test_valid_v1_artifact_migrates_without_model_call(tmp_path):
+    current = _build(tmp_path)
+    root = tmp_path / ".arc-companion" / "intent-guidance"
+    shutil.rmtree(root)
+    semantic_input = {
+        "user_intent": (
+            "Follow the terminology of chapter Renormalization in the cached translation."
+        ),
+        "source_language": "English",
+        "target_language": "Chinese",
+        "document_type": "book",
+        "reference_sources": current["reference_sources"],
+        "allowed_reference_operations": ["get-parsed-toc", "get-parsed-section"],
+        "guidance_contract": LEGACY_INTENT_GUIDANCE_VERSION,
+    }
+    legacy_sha = sha256_json(semantic_input)
+    legacy = {
+        "schema_version": LEGACY_INTENT_GUIDANCE_VERSION,
+        "semantic_input_sha256": legacy_sha,
+        "user_intent_sha256": current["user_intent_sha256"],
+        "output_sha256": current["output_sha256"],
+        "resolution_status": current["resolution_status"],
+        "guidance": current["guidance"],
+        "reference_targets": current["reference_targets"],
+        "reference_sources": current["reference_sources"],
+        "worker_payload": {
+            "guidance": current["guidance"],
+            "reference_targets": current["reference_targets"],
+        },
+    }
+    legacy_path = root / legacy_sha / "artifact.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    migrated = _build(
+        tmp_path, lambda *_args: pytest.fail("valid v1 migration must not call the model")
+    )
+    assert migrated["schema_version"] == INTENT_GUIDANCE_VERSION
+    assert migrated["output_sha256"] == legacy["output_sha256"]
+    assert migrated["migration"]["from_schema_version"] == LEGACY_INTENT_GUIDANCE_VERSION
+    migrated_dir = root / migrated["semantic_input_sha256"]
+    for descriptor in migrated["target_catalog"]["indexes"].values():
+        assert (migrated_dir / descriptor["catalog_file"]).is_file()

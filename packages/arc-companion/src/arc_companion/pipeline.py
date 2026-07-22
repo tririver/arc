@@ -4,6 +4,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import wraps
 import hashlib
 import inspect
 import json
@@ -181,6 +182,9 @@ COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoi
 SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
+REVIEW_PROMPT_TARGET_NUMERATOR = 9
+REVIEW_PROMPT_TARGET_DENOMINATOR = 10
+REVIEW_PROMPT_BUDGET_AUDIT_VERSION = "arc.companion.review-prompt-budget-audit.v1"
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v3"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
@@ -768,7 +772,7 @@ def _build_companion_unlocked(
                 page_count=_page_count(bundle),
                 intent_guidance_identity=intent_guidance_identity,
                 call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
-                    llm, _guided_prompt(prompt, intent_guidance), schema,
+                    llm, _guided_prompt(prompt, intent_guidance, lane="glossary"), schema,
                     options=options, artifact_dir=artifact_dir,
                     call_label=call_label, model_tier=GLOSSARY_TIER,
                     paper_access_policy=_guidance_policy(intent_guidance, lane="glossary"),
@@ -801,7 +805,9 @@ def _build_companion_unlocked(
             checkpoint_dir=checkpoint_dir,
             intent_guidance_identity=intent_guidance_identity,
             call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
-                llm, _guided_prompt(prompt, intent_guidance), schema, options=options,
+                llm,
+                _guided_prompt(prompt, intent_guidance, lane="title_translation"),
+                schema, options=options,
                 artifact_dir=artifact_dir, call_label=call_label,
                 model_tier=TITLE_TRANSLATION_TIER,
                 paper_access_policy=_guidance_policy(
@@ -970,6 +976,12 @@ def _build_companion_unlocked(
         ):
             cached_reviewed = read_json(reviewed_path)
             review = read_json(review_path)
+            if not isinstance(review, dict):
+                raise RuntimeError("invalid review checkpoint")
+            normalized_review = _with_historical_review_prompt_audit(review, options)
+            if normalized_review != review:
+                review = normalized_review
+                write_json(review_path, review)
             if (
                 not isinstance(cached_reviewed, dict)
                 or cached_reviewed.get("schema_version") != REVIEW_VERSION
@@ -1431,7 +1443,9 @@ def _build_chaptered_companion(
         prefix_guidance=True, guidance_lane=None,
     ):
         with submission_limiter.permit():
-            return _llm_call(llm, _guided_prompt(prompt, intent_guidance)
+            return _llm_call(llm, _guided_prompt(
+                                 prompt, intent_guidance, lane=guidance_lane,
+                             )
                              if guided and prefix_guidance else prompt,
                              schema, options=options,
                              artifact_dir=artifact_dir, call_label=call_label,
@@ -2042,6 +2056,11 @@ def _build_chaptered_companion(
         guide_provider_receipt: dict[str, Any] = {}
         last_guide_call: dict[str, str] = {}
         guide_policy = _guidance_policy(intent_guidance, lane="guide")
+        guide_structured_policy = bool(
+            guide_policy is not None
+            and result_llm is not None
+            and _accepts_explicit_keyword(result_llm, "paper_access_policy")
+        )
         def guide_model(prompt, schema, artifact_dir, call_label):
             if result_llm is None or session_manager is None:
                 return model(
@@ -2089,6 +2108,7 @@ def _build_chaptered_companion(
                                 if guide_policy is None else False
                             ),
                             paper_access_policy=guide_policy,
+                            serialize_paper_access_policy=not guide_structured_policy,
                         ),
                         artifact_dir=active_artifact_dir, call_label=active_label,
                         idle_timeout_seconds=options.idle_timeout_seconds,
@@ -2131,6 +2151,10 @@ def _build_chaptered_companion(
                             else None,
                             progress.provider_event(event),
                         )[-1],
+                        **(
+                            {"paper_access_policy": guide_policy}
+                            if guide_structured_policy else {}
+                        ),
                     )
             try:
                 outcome = invoke(
@@ -2359,10 +2383,12 @@ def _build_chaptered_companion(
                         **({
                             "reference_access": (
                                 "At bootstrap, read only reference_targets applicable to this lane. "
-                                "Use arc-paper-worker get-parsed-toc/get-parsed-section and "
-                                "artifact-read pagination when a sandboxed shell is available. "
-                                "Otherwise return arc_evidence_requests for the same read-only "
-                                "operations; never parse, refresh, fetch, or use an unauthorized source."
+                                "Use arc-paper-worker policy-targets for a non-inline catalog, then "
+                                "get-parsed-toc/get-parsed-section and artifact-read pagination when "
+                                "a sandboxed shell is available. Otherwise return "
+                                "arc_evidence_requests using list-reference-targets and the same "
+                                "read-only operations; never parse, refresh, fetch, or use an "
+                                "unauthorized source."
                             ),
                             "reference_authority": (
                                 "The original source is authoritative for facts, coverage, and structure. "
@@ -2396,7 +2422,10 @@ def _build_chaptered_companion(
                             )
                         ),
                         **(
-                            {"intent_guidance": worker_guidance_payload(intent_guidance)}
+                            {"intent_guidance": worker_guidance_payload(
+                                intent_guidance,
+                                lane=("commentary" if lane == "companion" else lane),
+                            )}
                             if intent_guidance is not None else {}
                         ),
                     },
@@ -2743,6 +2772,10 @@ def _build_chaptered_companion(
             stream = lane_stream(prepared, lane, block_generation)
             guidance_lane = "translation" if lane == "translation" else "commentary"
             lane_policy = _guidance_policy(intent_guidance, lane=guidance_lane)
+            lane_structured_policy = bool(
+                lane_policy is not None
+                and _accepts_explicit_keyword(result_llm, "paper_access_policy")
+            )
             def lane_llm(prompt: str, **kwargs: Any) -> dict[str, Any]:
                 call_label = str(kwargs.get("call_label") or segment_id)
                 artifact_dir = Path(kwargs["artifact_dir"])
@@ -2835,6 +2868,7 @@ def _build_chaptered_companion(
                                     if lane_policy is None else False
                                 ),
                                 paper_access_policy=lane_policy,
+                                serialize_paper_access_policy=not lane_structured_policy,
                             ),
                             artifact_dir=active_artifact_dir,
                             call_label=active_label,
@@ -2881,6 +2915,10 @@ def _build_chaptered_companion(
                                 else None,
                                 progress.provider_event(event),
                             )[-1],
+                            **(
+                                {"paper_access_policy": lane_policy}
+                                if lane_structured_policy else {}
+                            ),
                         )
                 try:
                     outcome = invoke(
@@ -3202,7 +3240,9 @@ def _build_chaptered_companion(
         review_output = dict(review_object["output"])
         translations = review_output.get("translations")
         annotations = dict(review_output["annotations"])
-        chapter_review = dict(review_output["review"])
+        chapter_review = _with_historical_review_prompt_audit(
+            dict(review_output["review"]), options,
+        )
     else:
         translations, annotations, chapter_review = _review(
             review_segments, translations, annotations, document=document, glossary=glossary,
@@ -6009,7 +6049,7 @@ def _generate_annotations(
                 paper_context=paper_context,
                 domain_context=domain_context,
                 source_language=_multilingual_prompt_source(options),
-            ), intent_guidance),
+            ), intent_guidance, lane="commentary"),
             ANNOTATION_SCHEMA,
             options=options,
             artifact_dir=(
@@ -7218,7 +7258,7 @@ def _generate_translations(
                         protected_names=protected_names,
                         paper_context=paper_context,
                         source_language=_multilingual_prompt_source(options),
-                    ), intent_guidance),
+                    ), intent_guidance, lane="translation"),
                     TRANSLATION_SCHEMA,
                     options=options,
                     artifact_dir=artifact_dir,
@@ -7647,35 +7687,25 @@ def _review(
         direct_payload,
         language=options.annotation_language,
         findings=findings,
-    ), intent_guidance)
-    # ``review_context_chars`` remains a user-controlled soft threshold for
-    # choosing hierarchical review.  Actual calls use a small viability floor
-    # and can never exceed the provider-independent 60 KiB hard ceiling.
-    review_prompt_limit = _review_prompt_byte_limit(options)
+    ), intent_guidance, lane="review")
+    # ``review_context_chars`` remains a user-controlled soft routing threshold.
+    # Every actual prompt is measured in UTF-8 after all guidance and projections
+    # are present.  Normal packing stops at 90% of the strict transport ceiling.
+    prompt_budget = _review_prompt_budget(options)
+    review_prompt_limit = int(prompt_budget["strict_limit_bytes"])
+    review_prompt_target = int(prompt_budget["target_limit_bytes"])
     hierarchy_threshold = min(
-        REVIEW_PROMPT_MAX_BYTES,
+        review_prompt_target,
         max(1, int(options.review_context_chars)),
     )
     hierarchical = _utf8_size(direct_prompt) > hierarchy_threshold
+    review_call_audits: list[dict[str, Any]] = []
     if hierarchical:
-        guidance_overhead = (
-            _utf8_size(worker_guidance_prompt_prefix(intent_guidance))
-            if intent_guidance is not None else 0
-        )
-        chunks = _review_chunks(
-            payload["segments"],
-            language=options.annotation_language,
-            max_prompt_bytes=max(1, review_prompt_limit - guidance_overhead),
-        )
-        recovered_reviews = (
-            {} if force_review else _load_recovered_section_reviews(checkpoint_dir, chunks)
-        )
-
-        def inspect(index: int, chunk: list[dict[str, Any]]) -> dict[str, Any]:
+        def render_section_prompt(chunk: list[dict[str, Any]]) -> str:
             chunk_text = json.dumps(
                 [item.get("source_blocks") or [] for item in chunk], ensure_ascii=False
             )
-            prompt = _guided_prompt(section_review_prompt(
+            return _guided_prompt(section_review_prompt(
                 {
                     "segments": chunk,
                     "glossary": _commentary_review_glossary_projection(
@@ -7686,12 +7716,51 @@ def _review(
                     ],
                 },
                 language=options.annotation_language,
-            ), intent_guidance)
-            _require_review_prompt_within_limit(
-                prompt,
-                label=f"section review {index}",
-                max_prompt_bytes=review_prompt_limit,
-            )
+            ), intent_guidance, lane="review")
+
+        section_calls = _pack_rendered_review_calls(
+            payload["segments"],
+            render_prompt=render_section_prompt,
+            target_prompt_bytes=review_prompt_target,
+            strict_prompt_bytes=review_prompt_limit,
+            label="section review",
+        )
+        chunks = [list(call["items"]) for call in section_calls]
+        # The final consolidation depends on section outputs, but its smallest
+        # complete coverage projection does not. Validate that projection before
+        # any parallel section call can incur cost.
+        _bounded_hierarchical_review_prompt(
+            [
+                {
+                    "section_index": index,
+                    "reviewed_segment_ids": list(call["segment_ids"]),
+                    "findings": [],
+                    "patch_proposals": [],
+                }
+                for index, call in enumerate(section_calls)
+            ],
+            segments,
+            blocks_by_id=by_id,
+            document=document,
+            segment_payloads=payload["segments"],
+            glossary=glossary,
+            protected_names=protected_names,
+            language=options.annotation_language,
+            max_prompt_bytes=review_prompt_target,
+            strict_prompt_bytes=review_prompt_limit,
+            intent_guidance=intent_guidance,
+            essential_only=True,
+        )
+        recovered_reviews = (
+            {} if force_review else _load_recovered_section_reviews(checkpoint_dir, chunks)
+        )
+
+        def inspect(
+            index: int, rendered: dict[str, Any],
+        ) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+            chunk = list(rendered["items"])
+            prompt = str(rendered["prompt"])
+            evidence_round_audits: list[dict[str, Any]] = []
             input_sha256 = sha256_json({
                 "prompt": prompt,
                 "schema": SECTION_REVIEW_SCHEMA,
@@ -7708,8 +7777,9 @@ def _review(
                         checkpoint.get("review"), chunk
                     ) is None
                 ):
-                    return checkpoint["review"]
+                    return checkpoint["review"], "checkpoint-reuse", []
             value = recovered_reviews.get(index)
+            disposition = "recovered-reuse" if value is not None else "provider-call"
             if value is None:
                 value = _llm_call(
                     llm,
@@ -7722,6 +7792,11 @@ def _review(
                     paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
                     intent_guidance=intent_guidance,
                     intent_guidance_lane="review",
+                    review_prompt_context=_review_prompt_context(
+                        rendered,
+                        stage="section",
+                        audit_sink=evidence_round_audits,
+                    ),
                 )
             if isinstance(value, dict) and "reviewed_segment_ids" not in value:
                 legacy_reviewed = value.get("reviewed_segments")
@@ -7744,20 +7819,36 @@ def _review(
                 "reviewed_segment_ids": sorted(
                     str(item["segment"]["segment_id"]) for item in chunk
                 ),
+                "prompt_budget_audit": _review_prompt_call_audit(
+                    rendered,
+                    stage="section",
+                    call_label=f"companion-section-review-{index}",
+                    disposition=disposition,
+                ),
+                "evidence_prompt_budget_audits": evidence_round_audits,
                 "review": value,
             })
-            return value
+            return value, disposition, evidence_round_audits
 
-        with ThreadPoolExecutor(max_workers=min(options.workers, len(chunks))) as executor:
-            futures = {executor.submit(inspect, index, chunk): index for index, chunk in enumerate(chunks)}
-            ordered: dict[int, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(options.workers, len(section_calls))) as executor:
+            futures = {
+                executor.submit(inspect, index, rendered): index
+                for index, rendered in enumerate(section_calls)
+            }
+            ordered: dict[int, tuple[dict[str, Any], str, list[dict[str, Any]]]] = {}
             for future in as_completed(futures):
-                value = future.result()
-                ordered[futures[future]] = value
+                ordered[futures[future]] = future.result()
         section_reviews: list[dict[str, Any]] = []
         review_coverage: set[str] = set()
         for index in sorted(ordered):
-            value = ordered[index]
+            value, disposition, evidence_round_audits = ordered[index]
+            review_call_audits.append(_review_prompt_call_audit(
+                section_calls[index],
+                stage="section",
+                call_label=f"companion-section-review-{index}",
+                disposition=disposition,
+            ))
+            review_call_audits.extend(evidence_round_audits)
             validation_error = _section_review_validation_error(value, chunks[index])
             if validation_error is not None:
                 raise RuntimeError(f"section review {index} {validation_error}")
@@ -7791,14 +7882,23 @@ def _review(
             glossary=glossary,
             protected_names=protected_names,
             language=options.annotation_language,
-            max_prompt_bytes=max(1, review_prompt_limit - guidance_overhead),
+            max_prompt_bytes=review_prompt_target,
+            strict_prompt_bytes=review_prompt_limit,
+            intent_guidance=intent_guidance,
         )
-        final_prompt = _guided_prompt(final_prompt, intent_guidance)
     _require_review_prompt_within_limit(
         final_prompt,
         label="final review",
         max_prompt_bytes=review_prompt_limit,
     )
+    final_rendered = _rendered_review_call(
+        payload["segments"],
+        final_prompt,
+        target_prompt_bytes=review_prompt_target,
+        strict_prompt_bytes=review_prompt_limit,
+        headroom_class="essential_final_headroom",
+    )
+    final_evidence_round_audits: list[dict[str, Any]] = []
     review = _llm_call(
         llm,
         final_prompt,
@@ -7810,7 +7910,19 @@ def _review(
         paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
         intent_guidance=intent_guidance,
         intent_guidance_lane="review",
+        review_prompt_context=_review_prompt_context(
+            final_rendered,
+            stage="hierarchical-final" if hierarchical else "direct-final",
+            audit_sink=final_evidence_round_audits,
+        ),
     )
+    review_call_audits.append(_review_prompt_call_audit(
+        final_rendered,
+        stage="hierarchical-final" if hierarchical else "direct-final",
+        call_label="companion-final-review",
+        disposition="provider-call",
+    ))
+    review_call_audits.extend(final_evidence_round_audits)
     reviewed_translations = {key: {"blocks": [dict(item) for item in value.get("blocks") or []]} for key, value in translations.items()}
     reviewed = {key: dict(value) for key, value in annotations.items()}
     valid_ids = set(reviewed)
@@ -7863,6 +7975,17 @@ def _review(
         "issues": [str(item) for item in review.get("issues") or []],
         "patched_segment_ids": sorted(patched),
         "citation_delimiter_normalized_segment_ids": sorted(citation_normalized),
+        "prompt_budget_audit": {
+            "schema_version": REVIEW_PROMPT_BUDGET_AUDIT_VERSION,
+            "budget": prompt_budget,
+            "routing": {
+                "mode": "hierarchical" if hierarchical else "direct",
+                "direct_prompt_bytes": _utf8_size(direct_prompt),
+                "hierarchy_threshold_bytes": hierarchy_threshold,
+            },
+            "calls": review_call_audits,
+            "historical_measurements_available": True,
+        },
     }
 
 
@@ -7905,24 +8028,55 @@ def _review_commentary_only(
     base = {"glossary": glossary}
     direct_prompt = _guided_prompt(commentary_review_prompt(
         {**base, "segments": segment_payloads}, language=options.annotation_language
-    ), intent_guidance)
-    limit = _review_prompt_byte_limit(options)
-    payload_groups: list[tuple[list[dict[str, Any]], dict[str, Any]]] = [
-        (segment_payloads, glossary)
-    ]
-    hierarchical = _utf8_size(direct_prompt) > min(
-        REVIEW_PROMPT_MAX_BYTES, max(1, int(options.review_context_chars))
-    )
-    if hierarchical:
-        payload_groups = [
-            (
-                [item],
-                _commentary_review_glossary_projection(
-                    glossary, [item], max_bytes=ANNOTATION_GLOSSARY_MAX_BYTES,
-                ),
+    ), intent_guidance, lane="review")
+    prompt_budget = _review_prompt_budget(options)
+    limit = int(prompt_budget["strict_limit_bytes"])
+    target = int(prompt_budget["target_limit_bytes"])
+    hierarchy_threshold = min(target, max(1, int(options.review_context_chars)))
+    hierarchical = _utf8_size(direct_prompt) > hierarchy_threshold
+
+    # Freeze every final prompt before starting any worker.  A singleton may use
+    # the ten-percent reserve, but never cross the strict ceiling.  The existing
+    # empty-glossary fallback is used only when the relevant projection itself
+    # cannot fit under that ceiling.
+    def render_commentary_prompt(group: list[dict[str, Any]]) -> str:
+        group_glossary = (
+            glossary
+            if not hierarchical else _commentary_review_glossary_projection(
+                glossary, group, max_bytes=ANNOTATION_GLOSSARY_MAX_BYTES,
             )
-            for item in segment_payloads
+        )
+        prompt = _guided_prompt(commentary_review_prompt(
+            {"glossary": group_glossary, "segments": group},
+            language=options.annotation_language,
+        ), intent_guidance, lane="review")
+        if _utf8_size(prompt) > limit and len(group) == 1 and group_glossary.get("entries"):
+            group_glossary = _empty_commentary_review_glossary(glossary)
+            prompt = _guided_prompt(commentary_review_prompt(
+                {"glossary": group_glossary, "segments": group},
+                language=options.annotation_language,
+            ), intent_guidance, lane="review")
+        return prompt
+
+    commentary_calls = (
+        _pack_rendered_review_calls(
+            segment_payloads,
+            render_prompt=render_commentary_prompt,
+            target_prompt_bytes=target,
+            strict_prompt_bytes=limit,
+            label="commentary-only review",
+        )
+        if hierarchical else [
+            _rendered_review_call(
+                segment_payloads,
+                direct_prompt,
+                target_prompt_bytes=target,
+                strict_prompt_bytes=limit,
+                headroom_class="singleton_headroom",
+            )
         ]
+    )
+    payload_groups = [(list(call["items"]), {}) for call in commentary_calls]
 
     recovered_reviews = (
         {} if options.force or not hierarchical
@@ -7932,21 +8086,11 @@ def _review_commentary_only(
     )
 
     def inspect(
-        index: int, group: list[dict[str, Any]], group_glossary: dict[str, Any],
-    ) -> dict[str, Any]:
-        prompt = _guided_prompt(commentary_review_prompt(
-            {"glossary": group_glossary, "segments": group},
-            language=options.annotation_language,
-        ), intent_guidance)
-        if _utf8_size(prompt) > limit and hierarchical and group_glossary.get("entries"):
-            group_glossary = _empty_commentary_review_glossary(glossary)
-            prompt = _guided_prompt(commentary_review_prompt(
-                {"glossary": group_glossary, "segments": group},
-                language=options.annotation_language,
-            ), intent_guidance)
-        _require_review_prompt_within_limit(
-            prompt, label=f"commentary-only review {index}", max_prompt_bytes=limit
-        )
+        index: int, rendered: dict[str, Any],
+    ) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+        group = list(rendered["items"])
+        prompt = str(rendered["prompt"])
+        evidence_round_audits: list[dict[str, Any]] = []
         input_sha256 = sha256_json({
             "prompt": prompt,
             "schema": COMMENTARY_REVIEW_SCHEMA,
@@ -7964,8 +8108,9 @@ def _review_commentary_only(
                     checkpoint.get("review"), group
                 ) is None
             ):
-                return checkpoint["review"]
+                return checkpoint["review"], "checkpoint-reuse", []
         value = recovered_reviews.get(index)
+        disposition = "recovered-reuse" if value is not None else "provider-call"
         if value is None:
             value = _llm_call(
                 llm,
@@ -7978,6 +8123,11 @@ def _review_commentary_only(
                 paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
                 intent_guidance=intent_guidance,
                 intent_guidance_lane="review",
+                review_prompt_context=_review_prompt_context(
+                    rendered,
+                    stage="commentary",
+                    audit_sink=evidence_round_audits,
+                ),
             )
         validation_error = _commentary_review_validation_error(value, group)
         if validation_error is not None:
@@ -7991,17 +8141,27 @@ def _review_commentary_only(
             "reviewed_segment_ids": sorted(
                 str(item["segment"]["segment_id"]) for item in group
             ),
+            "prompt_budget_audit": _review_prompt_call_audit(
+                rendered,
+                stage="commentary",
+                call_label=f"companion-commentary-review-{index}",
+                disposition=disposition,
+            ),
+            "evidence_prompt_budget_audits": evidence_round_audits,
             "review": value,
         })
-        return value
+        return value, disposition, evidence_round_audits
 
     responses: list[dict[str, Any]] = []
+    dispositions: list[str] = []
     with ThreadPoolExecutor(max_workers=min(options.workers, len(payload_groups))) as executor:
         futures = [
-            executor.submit(inspect, index, group, group_glossary)
-            for index, (group, group_glossary) in enumerate(payload_groups)
+            executor.submit(inspect, index, rendered)
+            for index, rendered in enumerate(commentary_calls)
         ]
-        responses = [future.result() for future in futures]
+        completed = [future.result() for future in futures]
+        responses = [value for value, _, _ in completed]
+        dispositions = [disposition for _, disposition, _ in completed]
 
     valid_ids = set(reviewed)
     patched: set[str] = set()
@@ -8047,6 +8207,31 @@ def _review_commentary_only(
         "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
         "issues": issues,
         "patched_segment_ids": sorted(patched),
+        "prompt_budget_audit": {
+            "schema_version": REVIEW_PROMPT_BUDGET_AUDIT_VERSION,
+            "budget": prompt_budget,
+            "routing": {
+                "mode": (
+                    "commentary-hierarchical" if hierarchical else "commentary-direct"
+                ),
+                "direct_prompt_bytes": _utf8_size(direct_prompt),
+                "hierarchy_threshold_bytes": hierarchy_threshold,
+            },
+            "calls": [
+                audit
+                for index, rendered in enumerate(commentary_calls)
+                for audit in (
+                    [_review_prompt_call_audit(
+                        rendered,
+                        stage="commentary",
+                        call_label=f"companion-commentary-review-{index}",
+                        disposition=dispositions[index],
+                    )]
+                    + completed[index][2]
+                )
+            ],
+            "historical_measurements_available": True,
+        },
     }
 
 
@@ -8332,8 +8517,13 @@ def _llm_call(
     disable_paper_cli: bool = False,
     intent_guidance: Mapping[str, Any] | None = None,
     intent_guidance_lane: str | None = None,
+    review_prompt_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     force_offline = force_offline or not allow_internet
+    structured_policy = bool(
+        paper_access_policy is not None
+        and _accepts_explicit_keyword(llm, "paper_access_policy")
+    )
     runtime_env = _llm_runtime_env(
         allow_internet=not force_offline and allow_internet and options.allow_internet,
         force_disable_internet=force_offline or not options.allow_internet,
@@ -8342,11 +8532,34 @@ def _llm_call(
             if paper_access_policy is None and not disable_paper_cli else False
         ),
         paper_access_policy=paper_access_policy,
+        serialize_paper_access_policy=not structured_policy,
         disable_paper_cli=disable_paper_cli,
     )
     active_prompt = prompt
     active_schema = _intent_guidance_schema(schema, intent_guidance)
     for round_number in range(0, 4):
+        active_label = (
+            call_label if round_number == 0
+            else f"{call_label}-evidence-{round_number:02d}"
+        )
+        if review_prompt_context is not None:
+            strict_limit = int(review_prompt_context["strict_limit_bytes"])
+            _require_review_prompt_within_limit(
+                active_prompt,
+                label=active_label,
+                max_prompt_bytes=strict_limit,
+            )
+            if round_number:
+                audit_sink = review_prompt_context.get("audit_sink")
+                if isinstance(audit_sink, list):
+                    audit_sink.append(_review_evidence_round_audit(
+                        active_prompt,
+                        context=review_prompt_context,
+                        call_label=active_label,
+                    ))
+        call_kwargs: dict[str, Any] = {}
+        if structured_policy:
+            call_kwargs["paper_access_policy"] = paper_access_policy
         value = llm(
             active_prompt,
             schema=active_schema,
@@ -8359,11 +8572,9 @@ def _llm_call(
                 artifact_dir if round_number == 0
                 else artifact_dir / f"evidence-round-{round_number:02d}"
             ),
-            call_label=(
-                call_label if round_number == 0
-                else f"{call_label}-evidence-{round_number:02d}"
-            ),
+            call_label=active_label,
             idle_timeout_seconds=options.idle_timeout_seconds,
+            **call_kwargs,
         )
         if intent_guidance is None:
             return value
@@ -8382,16 +8593,99 @@ def _llm_call(
             }
         if round_number >= 3:
             raise RuntimeError("companion reference evidence exceeded three controller rounds")
-        responses = resolve_evidence_round(
-            requests,
-            lambda material, *, round_number: resolve_worker_evidence_requests(
+        resolver = lambda material, *, round_number: resolve_worker_evidence_requests(
                 intent_guidance, material, round_number=round_number,
                 lane=intent_guidance_lane,
-            ),
-            round_number=round_number + 1,
-        )
-        active_prompt = active_prompt + "\n\n" + _controller_evidence_prompt(responses)
+            )
+        if review_prompt_context is None:
+            responses = resolve_evidence_round(
+                requests, resolver, round_number=round_number + 1,
+            )
+            followup = _controller_evidence_prompt(responses)
+        else:
+            responses, followup = _bounded_review_evidence_followup(
+                requests,
+                resolver=resolver,
+                round_number=round_number + 1,
+                active_prompt=active_prompt,
+                strict_prompt_bytes=int(
+                    review_prompt_context["strict_limit_bytes"]
+                ),
+            )
+        active_prompt = active_prompt + "\n\n" + followup
     raise AssertionError("unreachable evidence loop")
+
+
+def _bounded_review_evidence_followup(
+    requests: Sequence[Any],
+    *,
+    resolver: Callable[..., Any],
+    round_number: int,
+    active_prompt: str,
+    strict_prompt_bytes: int,
+) -> tuple[tuple[Any, ...], str]:
+    """Fit controller evidence into the remaining strict review prompt budget."""
+    from arc_llm import resolve_evidence_round
+
+    empty_followup = _controller_evidence_prompt(())
+    remaining = strict_prompt_bytes - _utf8_size(active_prompt + "\n\n" + empty_followup)
+    if remaining < 1:
+        raise RuntimeError(
+            "review evidence response has no remaining space under the strict prompt limit"
+        )
+    page_limit = max(1, remaining // max(1, len(requests)) - 512)
+    for _ in range(16):
+        bounded_requests = []
+        for request in requests:
+            arguments = dict(getattr(request, "arguments", {}) or {})
+            key = (
+                "limit_bytes"
+                if str(getattr(request, "operation", "")) == "list-reference-targets"
+                else "limit"
+            )
+            try:
+                requested = int(arguments.get(key, page_limit))
+            except (TypeError, ValueError):
+                requested = page_limit
+            arguments[key] = max(1, min(requested, page_limit))
+            bounded_requests.append(replace(request, arguments=arguments))
+        responses = resolve_evidence_round(
+            tuple(bounded_requests), resolver, round_number=round_number,
+        )
+        followup = _controller_evidence_prompt(responses)
+        if _utf8_size(active_prompt + "\n\n" + followup) <= strict_prompt_bytes:
+            return responses, followup
+        if page_limit == 1:
+            break
+        page_limit = max(1, page_limit // 2)
+    raise RuntimeError(
+        "review evidence response cannot fit under the strict prompt limit"
+    )
+
+
+def _review_evidence_round_audit(
+    prompt: str,
+    *,
+    context: Mapping[str, Any],
+    call_label: str,
+) -> dict[str, Any]:
+    prompt_bytes = _utf8_size(prompt)
+    target_bytes = int(context["target_limit_bytes"])
+    strict_bytes = int(context["strict_limit_bytes"])
+    return {
+        "stage": f"{context['stage']}-evidence",
+        "call_label": call_label,
+        "segment_ids": list(context.get("segment_ids") or []),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_bytes": prompt_bytes,
+        "target_headroom_bytes": max(0, target_bytes - prompt_bytes),
+        "target_overage_bytes": max(0, prompt_bytes - target_bytes),
+        "strict_headroom_bytes": strict_bytes - prompt_bytes,
+        "budget_class": (
+            "normal" if prompt_bytes <= target_bytes else "evidence_headroom"
+        ),
+        "disposition": "provider-call",
+    }
 
 
 def _limit_llm_concurrency(
@@ -8423,6 +8717,7 @@ def _limit_llm_concurrency(
             message += f": {reason}"
         raise CompanionLLMCircuitOpen(message) from reason
 
+    @wraps(llm)
     def limited(*args: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal abort_reason
         raise_if_tripped()
@@ -8504,16 +8799,20 @@ def _intent_guidance_identity(
 
 
 def _guided_prompt(
-    prompt: str, intent_guidance: Mapping[str, Any] | None,
+    prompt: str,
+    intent_guidance: Mapping[str, Any] | None,
+    *,
+    lane: str | None = None,
 ) -> str:
     if intent_guidance is None:
         return prompt
     return (
-        worker_guidance_prompt_prefix(intent_guidance)
+        worker_guidance_prompt_prefix(intent_guidance, lane=lane)
         + "\nIf this host has no sandboxed shell, request the same exact cached reads through "
-        "arc_evidence_requests. Use operations get-parsed-toc or get-parsed-section with "
-        "arguments source_id, locator, and optional byte offset/limit; return [] when no "
-        "controller read is needed.\n"
+        "arc_evidence_requests. Use list-reference-targets to inspect a non-inline target "
+        "catalog, then get-parsed-toc or get-parsed-section with arguments source_id, "
+        "locator, and optional byte offset/limit; return [] when no controller read is "
+        "needed.\n"
         + prompt
     )
 
@@ -8535,6 +8834,7 @@ def _llm_runtime_env(
     force_disable_internet: bool = False,
     inherit_host_tools: bool = False,
     paper_access_policy: Mapping[str, Any] | None = None,
+    serialize_paper_access_policy: bool = True,
     disable_paper_cli: bool = False,
 ) -> dict[str, str] | None:
     """Map portable access intent onto both supported host runtimes."""
@@ -8549,9 +8849,16 @@ def _llm_runtime_env(
     for key in (
         "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
         "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
+        "ARC_PAPER_WORKER_READ_POLICY_PATH",
+        "ARC_PAPER_WORKER_READ_POLICY_SHA256",
+        "ARC_PAPER_WORKER_READ_POLICY_SCHEMA",
     ):
         env.pop(key, None)
-    if paper_access_policy is not None and not disable_paper_cli:
+    if (
+        paper_access_policy is not None
+        and not disable_paper_cli
+        and serialize_paper_access_policy
+    ):
         operations = list(
             paper_access_policy.get("operations")
             or paper_access_policy.get("allowed_operations")
@@ -8593,6 +8900,7 @@ def _llm_runtime_env(
             claude_allowed = [
                 "Bash(arc-paper-worker get-parsed-toc:*)",
                 "Bash(arc-paper-worker get-parsed-section:*)",
+                "Bash(arc-paper-worker policy-targets:*)",
                 "Bash(arc-paper-worker artifact-read:*)",
                 *claude_allowed,
             ]
@@ -11348,6 +11656,168 @@ def _review_prompt_byte_limit(options: BuildOptions) -> int:
     )
 
 
+def _review_prompt_target_limit(options: BuildOptions) -> int:
+    """Return the packing target, leaving ten percent below the hard limit."""
+    return (
+        _review_prompt_byte_limit(options) * REVIEW_PROMPT_TARGET_NUMERATOR
+        // REVIEW_PROMPT_TARGET_DENOMINATOR
+    )
+
+
+def _review_prompt_budget(options: BuildOptions) -> dict[str, Any]:
+    strict = _review_prompt_byte_limit(options)
+    return {
+        "review_context_chars": int(options.review_context_chars),
+        "strict_limit_bytes": strict,
+        "target_limit_bytes": (
+            strict * REVIEW_PROMPT_TARGET_NUMERATOR
+            // REVIEW_PROMPT_TARGET_DENOMINATOR
+        ),
+        "target_ratio": {
+            "numerator": REVIEW_PROMPT_TARGET_NUMERATOR,
+            "denominator": REVIEW_PROMPT_TARGET_DENOMINATOR,
+        },
+    }
+
+
+def _with_historical_review_prompt_audit(
+    review: Mapping[str, Any], options: BuildOptions,
+) -> dict[str, Any]:
+    """Normalize pre-audit accepted reviews without triggering model work."""
+    normalized = dict(review)
+    if isinstance(normalized.get("prompt_budget_audit"), dict):
+        return normalized
+    target = _review_prompt_target_limit(options)
+    normalized["prompt_budget_audit"] = {
+        "schema_version": REVIEW_PROMPT_BUDGET_AUDIT_VERSION,
+        "budget": _review_prompt_budget(options),
+        "routing": {
+            "mode": "artifact-reuse",
+            "direct_prompt_bytes": 0,
+            "hierarchy_threshold_bytes": min(
+                target, max(1, int(options.review_context_chars))
+            ),
+        },
+        "calls": [],
+        "historical_measurements_available": False,
+    }
+    return normalized
+
+
+def _review_prompt_call_audit(
+    rendered: Mapping[str, Any],
+    *,
+    stage: str,
+    call_label: str,
+    disposition: str,
+) -> dict[str, Any]:
+    prompt_bytes = int(rendered["prompt_bytes"])
+    target_bytes = int(rendered["target_limit_bytes"])
+    strict_bytes = int(rendered["strict_limit_bytes"])
+    return {
+        "stage": stage,
+        "call_label": call_label,
+        "segment_ids": list(rendered["segment_ids"]),
+        "prompt_sha256": str(rendered["prompt_sha256"]),
+        "prompt_bytes": prompt_bytes,
+        "target_headroom_bytes": max(0, target_bytes - prompt_bytes),
+        "target_overage_bytes": max(0, prompt_bytes - target_bytes),
+        "strict_headroom_bytes": strict_bytes - prompt_bytes,
+        "budget_class": str(rendered["budget_class"]),
+        "disposition": disposition,
+    }
+
+
+def _review_prompt_context(
+    rendered: Mapping[str, Any],
+    *,
+    stage: str,
+    audit_sink: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Describe one logical review call for bounded evidence follow-up turns."""
+    return {
+        "stage": stage,
+        "segment_ids": list(rendered["segment_ids"]),
+        "target_limit_bytes": int(rendered["target_limit_bytes"]),
+        "strict_limit_bytes": int(rendered["strict_limit_bytes"]),
+        "audit_sink": audit_sink,
+    }
+
+
+def _rendered_review_call(
+    items: list[dict[str, Any]],
+    prompt: str,
+    *,
+    target_prompt_bytes: int,
+    strict_prompt_bytes: int,
+    headroom_class: str,
+) -> dict[str, Any]:
+    size = _utf8_size(prompt)
+    return {
+        "items": items,
+        "prompt": prompt,
+        "prompt_bytes": size,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "segment_ids": [
+            str((item.get("segment") or {}).get("segment_id") or "")
+            for item in items
+        ],
+        "target_limit_bytes": target_prompt_bytes,
+        "strict_limit_bytes": strict_prompt_bytes,
+        "budget_class": "normal" if size <= target_prompt_bytes else headroom_class,
+    }
+
+
+def _pack_rendered_review_calls(
+    items: list[dict[str, Any]],
+    *,
+    render_prompt: Callable[[list[dict[str, Any]]], str],
+    target_prompt_bytes: int,
+    strict_prompt_bytes: int,
+    label: str,
+    headroom_class: str = "singleton_headroom",
+) -> list[dict[str, Any]]:
+    """Greedily pack ordered items using the exact prompt sent to the provider."""
+    calls: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    current_prompt = ""
+    for item in items:
+        candidate = [*current, item]
+        candidate_prompt = render_prompt(candidate)
+        if _utf8_size(candidate_prompt) <= target_prompt_bytes:
+            current = candidate
+            current_prompt = candidate_prompt
+            continue
+        if current:
+            calls.append(_rendered_review_call(
+                current,
+                current_prompt,
+                target_prompt_bytes=target_prompt_bytes,
+                strict_prompt_bytes=strict_prompt_bytes,
+                headroom_class=headroom_class,
+            ))
+        single_prompt = render_prompt([item])
+        single_size = _utf8_size(single_prompt)
+        if single_size > strict_prompt_bytes:
+            segment_id = str((item.get("segment") or {}).get("segment_id") or "")
+            raise RuntimeError(
+                f"{label} segment {segment_id or '<unknown>'} requires a "
+                f"{single_size}-byte prompt, exceeding the strict "
+                f"{strict_prompt_bytes}-byte limit"
+            )
+        current = [item]
+        current_prompt = single_prompt
+    if current:
+        calls.append(_rendered_review_call(
+            current,
+            current_prompt,
+            target_prompt_bytes=target_prompt_bytes,
+            strict_prompt_bytes=strict_prompt_bytes,
+            headroom_class=headroom_class,
+        ))
+    return calls
+
+
 def _require_review_prompt_within_limit(
     prompt: str,
     *,
@@ -11373,8 +11843,14 @@ def _bounded_hierarchical_review_prompt(
     protected_names: list[str],
     language: str,
     max_prompt_bytes: int,
+    strict_prompt_bytes: int | None = None,
+    intent_guidance: Mapping[str, Any] | None = None,
+    essential_only: bool = False,
 ) -> tuple[dict[str, Any], str]:
-    """Render successively smaller complete projections and verify actual bytes."""
+    """Render successively smaller projections and measure the exact guided prompt."""
+    strict_prompt_bytes = (
+        max_prompt_bytes if strict_prompt_bytes is None else strict_prompt_bytes
+    )
     instruction = (
         "Consolidate section findings into non-conflicting translation and/or annotation patches. "
         "Use the bounded source anchor for every segment as a direct source-awareness check; "
@@ -11390,6 +11866,8 @@ def _bounded_hierarchical_review_prompt(
         (0.10, 0.05, 0.04, 0.10, True, 64),
         (0.06, 0.00, 0.00, 0.00, False, 32),
     )
+    if essential_only:
+        attempts = attempts[-1:]
     last_prompt = ""
     last_payload: dict[str, Any] = {}
     for source_ratio, context_ratio, glossary_ratio, section_ratio, include_context, minimum_excerpt in attempts:
@@ -11412,9 +11890,20 @@ def _bounded_hierarchical_review_prompt(
             glossary,
             total_chars=int(max_prompt_bytes * glossary_ratio),
         )
-        projected_sections = _bounded_section_review_projection(
-            section_reviews,
-            total_chars=int(max_prompt_bytes * section_ratio),
+        projected_sections = (
+            [
+                {
+                    "section_index": int(section["section_index"]),
+                    "reviewed_segment_ids": list(
+                        section.get("reviewed_segment_ids") or []
+                    ),
+                }
+                for section in section_reviews
+            ]
+            if section_ratio == 0.0 else _bounded_section_review_projection(
+                section_reviews,
+                total_chars=int(max_prompt_bytes * section_ratio),
+            )
         )
         last_payload = {
             "section_reviews": projected_sections,
@@ -11425,15 +11914,19 @@ def _bounded_hierarchical_review_prompt(
             "protected_names": protected_names,
             "instruction": instruction,
         }
-        last_prompt = review_prompt(last_payload, language=language, findings=None)
+        last_prompt = _guided_prompt(
+            review_prompt(last_payload, language=language, findings=None),
+            intent_guidance,
+            lane="review",
+        )
         if _utf8_size(last_prompt) <= max_prompt_bytes:
             return last_payload, last_prompt
     _require_review_prompt_within_limit(
         last_prompt,
         label="hierarchical final review essential projection",
-        max_prompt_bytes=max_prompt_bytes,
+        max_prompt_bytes=strict_prompt_bytes,
     )
-    raise AssertionError("unreachable")
+    return last_payload, last_prompt
 
 
 def _bounded_section_review_projection(
@@ -11515,34 +12008,25 @@ def _review_chunks(
     *,
     language: str,
     max_prompt_bytes: int = SECTION_REVIEW_PROMPT_MAX_BYTES,
+    strict_prompt_bytes: int | None = None,
+    render_prompt: Callable[[list[dict[str, Any]]], str] | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """Pack complete segments by the final rendered prompt's UTF-8 byte size."""
-    chunks: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for item in items:
-        candidate = [*current, item]
-        candidate_prompt = section_review_prompt(
-            {"segments": candidate}, language=language,
+    """Pack complete segments using a caller's exact final prompt renderer."""
+    renderer = render_prompt or (
+        lambda group: section_review_prompt({"segments": group}, language=language)
+    )
+    return [
+        list(call["items"])
+        for call in _pack_rendered_review_calls(
+            items,
+            render_prompt=renderer,
+            target_prompt_bytes=max_prompt_bytes,
+            strict_prompt_bytes=(
+                max_prompt_bytes if strict_prompt_bytes is None else strict_prompt_bytes
+            ),
+            label="section review",
         )
-        if len(candidate_prompt.encode("utf-8")) <= max_prompt_bytes:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        single_prompt = section_review_prompt(
-            {"segments": [item]}, language=language,
-        )
-        single_size = len(single_prompt.encode("utf-8"))
-        if single_size > max_prompt_bytes:
-            segment_id = str((item.get("segment") or {}).get("segment_id") or "")
-            raise RuntimeError(
-                f"section review segment {segment_id or '<unknown>'} requires a "
-                f"{single_size}-byte prompt, exceeding the strict {max_prompt_bytes}-byte limit"
-            )
-        current = [item]
-    if current:
-        chunks.append(current)
-    return chunks
+    ]
 
 
 def _review_source_anchors(

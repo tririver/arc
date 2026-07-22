@@ -18,10 +18,17 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 import uuid
 from typing import Any
+
+from arc_llm.paper_access_policy import (
+    PAPER_ACCESS_POLICY_VERSION,
+    POLICY_TARGETS_OPERATION,
+    validate_canonical_paper_access_policy,
+)
 
 from . import cli
 from .ids import extract_paper_ids
@@ -35,8 +42,11 @@ MAX_INLINE_BYTES = 64 * 1024
 # the same 64 KiB inline boundary rather than returning an oversized page.
 MAX_PAGE_BYTES = 46 * 1024
 DEFAULT_PAGE_BYTES = MAX_PAGE_BYTES
+POLICY_TARGETS_MAX_BYTES = 46 * 1024
+POLICY_TARGETS_DEFAULT_BYTES = POLICY_TARGETS_MAX_BYTES * 9 // 10
 
 HANDLE_RE = re.compile(r"^sha256-[0-9a-f]{64}\.json$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,6 +90,11 @@ def main(argv: list[str] | None = None) -> int:
         return _finish(policy_error, session_dir, command_argv, settings, cache_session)
     if command == "artifact-read":
         result = _read_artifact(command_argv[1:], session_dir)
+        return _finish(result, session_dir, command_argv, settings, cache_session)
+    if command == POLICY_TARGETS_OPERATION:
+        result = _read_policy_targets(
+            command_argv[1:], session_dir, include_session_meta=cache_session is not None
+        )
         return _finish(result, session_dir, command_argv, settings, cache_session)
 
     stdout = io.StringIO()
@@ -156,7 +171,7 @@ def _policy_error(
     session_dir: Path | None,
 ) -> dict[str, Any] | None:
     command = argv[0]
-    restricted_error = _restricted_read_policy_error(argv)
+    restricted_error = _restricted_read_policy_error(argv, session_dir=session_dir)
     if restricted_error is not None:
         return restricted_error
     if command == "summary-batch":
@@ -172,8 +187,17 @@ def _policy_error(
     return None
 
 
-def _restricted_read_policy_error(argv: list[str]) -> dict[str, Any] | None:
+def _restricted_read_policy_error(
+    argv: list[str], *, session_dir: Path | None
+) -> dict[str, Any] | None:
     """Enforce an optional controller-authored, fail-closed read policy."""
+    file_policy, file_error, file_configured = _read_policy_file(session_dir)
+    if file_configured:
+        if file_error is not None:
+            return file_error
+        assert file_policy is not None
+        return _v2_read_policy_error(argv, file_policy)
+
     raw_operations = os.environ.get("ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON")
     raw_targets = os.environ.get("ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON")
     if raw_operations is None and raw_targets is None:
@@ -224,6 +248,101 @@ def _restricted_read_policy_error(argv: list[str]) -> dict[str, Any] | None:
             f"Section {locator!r} is not authorized for source {source_id!r}",
         )
     return None
+
+
+def _v2_read_policy_error(
+    argv: list[str], policy: dict[str, Any]
+) -> dict[str, Any] | None:
+    command = argv[0] if argv else ""
+    if command not in set(policy["operations"]):
+        return _worker_error(
+            "worker_operation_forbidden",
+            f"{command!r} is not authorized by the controller read policy",
+        )
+    if command in {"artifact-read", POLICY_TARGETS_OPERATION}:
+        return None
+    if command not in {"get-parsed-toc", "get-parsed-section"}:
+        return _worker_error(
+            "worker_operation_forbidden",
+            f"{command!r} is not a supported restricted read operation",
+        )
+    source_id, locator, argument_error = _restricted_read_arguments(argv, command=command)
+    if argument_error is not None:
+        return argument_error
+    if source_id not in set(policy["authorized_source_ids"]):
+        return _worker_error(
+            "worker_source_forbidden",
+            f"Source {source_id!r} is not authorized by the controller read policy",
+        )
+    if command == "get-parsed-toc":
+        return None
+    if not any(
+        target["source_id"] == source_id and target["locator"] == locator
+        for target in policy["targets"]
+    ):
+        return _worker_error(
+            "worker_section_forbidden",
+            f"Section {locator!r} is not authorized for source {source_id!r}",
+        )
+    return None
+
+
+def _read_policy_file(
+    session_dir: Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+    raw_path = os.environ.get("ARC_PAPER_WORKER_READ_POLICY_PATH")
+    expected_digest = os.environ.get("ARC_PAPER_WORKER_READ_POLICY_SHA256")
+    expected_schema = os.environ.get("ARC_PAPER_WORKER_READ_POLICY_SCHEMA")
+    configured = any(value is not None for value in (raw_path, expected_digest, expected_schema))
+    if not configured:
+        return None, None, False
+    if not raw_path or not expected_digest or not expected_schema:
+        return None, _worker_error(
+            "worker_read_policy_invalid", "The controller read policy file contract is incomplete"
+        ), True
+    if expected_schema != PAPER_ACCESS_POLICY_VERSION or not SHA256_RE.fullmatch(expected_digest):
+        return None, _worker_error(
+            "worker_read_policy_invalid", "The controller read policy identity is invalid"
+        ), True
+    if session_dir is None:
+        return None, _worker_error(
+            "worker_session_required", "A worker session directory is required for read policy"
+        ), True
+    root = session_dir.expanduser().resolve(strict=False)
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        return None, _worker_error(
+            "worker_read_policy_invalid", "The controller read policy path must be absolute"
+        ), True
+    try:
+        if candidate.is_symlink():
+            raise ValueError("policy file must not be a symbolic link")
+        resolved = candidate.resolve(strict=True)
+        expected_path = root / "read-policies" / f"sha256-{expected_digest}.json"
+        if candidate != resolved or resolved != expected_path:
+            raise ValueError("policy file is not at its canonical session path")
+        metadata = resolved.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("policy path is not a regular file")
+        payload = resolved.read_bytes()
+    except (OSError, ValueError) as exc:
+        return None, _worker_error(
+            "worker_read_policy_invalid", f"The controller read policy file is invalid: {exc}"
+        ), True
+    actual_digest = hashlib.sha256(payload).hexdigest()
+    if actual_digest != expected_digest:
+        return None, _worker_error(
+            "worker_read_policy_integrity_failed",
+            "The controller read policy failed its content hash check",
+        ), True
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+        policy = validate_canonical_paper_access_policy(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return None, _worker_error(
+            "worker_read_policy_invalid", f"The controller read policy is invalid: {exc}"
+        ), True
+    return policy, None, True
 
 
 def _restricted_read_arguments(
@@ -422,6 +541,178 @@ def _read_artifact(argv: list[str], session_dir: Path | None) -> dict[str, Any]:
             "content": base64.b64encode(chunk).decode("ascii"),
         }
     )
+
+
+def _read_policy_targets(
+    argv: list[str],
+    session_dir: Path | None,
+    *,
+    include_session_meta: bool,
+) -> dict[str, Any]:
+    parser = argparse.ArgumentParser(prog="arc-paper-worker policy-targets", add_help=False)
+    parser.add_argument("--source-id")
+    parser.add_argument("--query")
+    parser.add_argument("--cursor")
+    parser.add_argument("--limit-bytes", type=int, default=POLICY_TARGETS_DEFAULT_BYTES)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return _worker_error("policy_targets_invalid", "Invalid policy-targets arguments")
+    if args.limit_bytes < 1024 or args.limit_bytes > POLICY_TARGETS_MAX_BYTES:
+        return _worker_error(
+            "policy_targets_page_invalid",
+            f"limit-bytes must be between 1024 and {POLICY_TARGETS_MAX_BYTES}",
+        )
+    policy, policy_error, configured = _read_policy_file(session_dir)
+    if not configured or policy_error is not None or policy is None:
+        return policy_error or _worker_error(
+            "worker_read_policy_required", "policy-targets requires a v2 worker read policy"
+        )
+    digest = str(os.environ["ARC_PAPER_WORKER_READ_POLICY_SHA256"])
+    source_id = str(args.source_id or "")
+    query = str(args.query or "")
+    filter_sha256 = hashlib.sha256(
+        _canonical_json({"source_id": source_id, "query": query})
+    ).hexdigest()
+    start = 0
+    if args.cursor:
+        cursor, cursor_error = _decode_policy_cursor(str(args.cursor))
+        if cursor_error is not None:
+            return cursor_error
+        assert cursor is not None
+        if cursor["policy_sha256"] != digest or cursor["filter_sha256"] != filter_sha256:
+            return _worker_error(
+                "policy_targets_cursor_invalid",
+                "The policy-targets cursor does not match this policy and filter",
+            )
+        start = cursor["next_index"]
+
+    needle = query.casefold()
+    filtered = [
+        target for target in policy["targets"]
+        if (not source_id or target["source_id"] == source_id)
+        and (
+            not needle
+            or needle in target["source_id"].casefold()
+            or needle in target["locator"].casefold()
+            or needle in target["purpose"].casefold()
+        )
+    ]
+    if start > len(filtered):
+        return _worker_error(
+            "policy_targets_cursor_invalid", "The policy-targets cursor offset is out of range"
+        )
+
+    selected: list[dict[str, str]] = []
+    for target in filtered[start:]:
+        candidate = [*selected, target]
+        candidate_result = _policy_targets_result(
+            digest=digest,
+            targets=candidate,
+            next_index=start + len(candidate),
+            total=len(filtered),
+            filter_sha256=filter_sha256,
+            include_session_meta=include_session_meta,
+        )
+        if len(_display_json(candidate_result)) + 1 > args.limit_bytes:
+            break
+        selected = candidate
+
+    if start < len(filtered) and not selected:
+        return _worker_error(
+            "policy_target_record_too_large",
+            "The next whole policy target cannot fit within limit-bytes",
+        )
+    result = _policy_targets_result(
+        digest=digest,
+        targets=selected,
+        next_index=start + len(selected),
+        total=len(filtered),
+        filter_sha256=filter_sha256,
+        include_session_meta=include_session_meta,
+    )
+    if len(_display_json(result)) + 1 > args.limit_bytes:
+        return _worker_error(
+            "policy_targets_page_invalid", "limit-bytes is too small for the page envelope"
+        )
+    return result
+
+
+def _policy_targets_result(
+    *,
+    digest: str,
+    targets: list[dict[str, str]],
+    next_index: int,
+    total: int,
+    filter_sha256: str,
+    include_session_meta: bool,
+) -> dict[str, Any]:
+    eof = next_index >= total
+    next_cursor = None if eof else _encode_policy_cursor(
+        policy_sha256=digest, filter_sha256=filter_sha256, next_index=next_index
+    )
+    result = ok({
+        "policy_sha256": digest,
+        "targets": targets,
+        "paging": {
+            "next_cursor": next_cursor,
+            "eof": eof,
+            "returned": len(targets),
+            "total_matching": total,
+        },
+    })
+    if include_session_meta:
+        result["meta"] = {
+            "overlay_promotion": {"status": "pending_controller"},
+            "worker_audit": {
+                "schema_version": "arc.paper.worker-session.v1",
+                "status": "recorded",
+            },
+        }
+    return result
+
+
+def _encode_policy_cursor(
+    *, policy_sha256: str, filter_sha256: str, next_index: int
+) -> str:
+    payload = _canonical_json({
+        "schema_version": "arc.paper.policy-targets-cursor.v1",
+        "policy_sha256": policy_sha256,
+        "filter_sha256": filter_sha256,
+        "next_index": next_index,
+    })
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_policy_cursor(
+    raw: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        padding = "=" * (-len(raw) % 4)
+        decoded = base64.b64decode(raw + padding, altchars=b"-_", validate=True)
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, _worker_error(
+            "policy_targets_cursor_invalid", "The policy-targets cursor is invalid"
+        )
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "schema_version", "policy_sha256", "filter_sha256", "next_index"
+        }
+        or payload.get("schema_version") != "arc.paper.policy-targets-cursor.v1"
+        or not isinstance(payload.get("policy_sha256"), str)
+        or not SHA256_RE.fullmatch(payload["policy_sha256"])
+        or not isinstance(payload.get("filter_sha256"), str)
+        or not SHA256_RE.fullmatch(payload["filter_sha256"])
+        or not isinstance(payload.get("next_index"), int)
+        or isinstance(payload.get("next_index"), bool)
+        or payload["next_index"] < 0
+    ):
+        return None, _worker_error(
+            "policy_targets_cursor_invalid", "The policy-targets cursor is invalid"
+        )
+    return payload, None
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:

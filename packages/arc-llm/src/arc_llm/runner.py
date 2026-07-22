@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import time
 from dataclasses import dataclass, replace
@@ -8,6 +9,7 @@ import inspect
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -25,6 +27,10 @@ from .call_checkpoint import (
 from .host import HostDetection, select_llm_provider
 from .json_schema import to_provider_json_schema
 from .model import reasoning_effort_for_model_tier, resolve_model_with_warnings
+from .paper_access_policy import (
+    PAPER_ACCESS_POLICY_VERSION,
+    canonical_paper_access_policy,
+)
 from .providers.activity import resolve_idle_timeout_seconds
 from .providers.base import (
     LLMConfigurationError,
@@ -37,7 +43,7 @@ from .progress_journal import ProgressJournal
 from .progress_prompt import apply_runtime_progress_contract
 from .providers.registry import get_provider_spec
 from .providers.select import select_provider
-from .schema_cache import schema_hash, sha256_text
+from .schema_cache import canonical_json, schema_hash, sha256_text
 from .safety import LLMSafetyController
 from .sessions import (
     LLMSessionManager, LLMSessionRef, legacy_runtime_fingerprint,
@@ -164,6 +170,57 @@ def _configure_paper_worker_session(
         env["ARC_CODEX_SANDBOX"] = "workspace-write"
         env["ARC_CODEX_WORK_DIR"] = str(run_root)
         env.pop("ARC_CODEX_ADD_DIRS", None)
+
+
+def _stage_paper_access_policy(
+    env: dict[str, str], policy: Mapping[str, Any] | None
+) -> None:
+    """Stage a content-addressed read policy inside the authorized run root."""
+    if policy is None:
+        return
+    if env.get("ARC_PAPER_CLI_ACCESS") != "full":
+        raise ValueError("paper_access_policy requires ARC paper CLI access")
+    raw_root = env.get("ARC_PAPER_WORKER_SESSION_DIR")
+    if not raw_root:
+        raise ValueError("paper_access_policy requires a paper worker session directory")
+    canonical = canonical_paper_access_policy(policy)
+    payload = canonical_json(canonical).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    root = Path(raw_root).expanduser().resolve(strict=False)
+    policy_dir = root / "read-policies"
+    if policy_dir.is_symlink():
+        raise ValueError("paper access policy directory must not be a symbolic link")
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    if not policy_dir.is_dir() or policy_dir.is_symlink():
+        raise ValueError("paper access policy directory is not a regular directory")
+    destination = policy_dir / f"sha256-{digest}.json"
+    if destination.exists():
+        if not destination.is_file() or destination.is_symlink():
+            raise ValueError("paper access policy destination is not a regular file")
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+            _atomic_write_bytes(destination, payload)
+    else:
+        _atomic_write_bytes(destination, payload)
+    env.pop("ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON", None)
+    env.pop("ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON", None)
+    env["ARC_PAPER_WORKER_READ_POLICY_PATH"] = str(destination)
+    env["ARC_PAPER_WORKER_READ_POLICY_SHA256"] = digest
+    env["ARC_PAPER_WORKER_READ_POLICY_SCHEMA"] = PAPER_ACCESS_POLICY_VERSION
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 
@@ -379,6 +436,7 @@ def run_json(
     output_recovery: str = "strict",
     schema_formatter_enabled: bool = True,
     role_hint: str | None = None,
+    paper_access_policy: Mapping[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
     session_policy: str = "stateless",
@@ -410,6 +468,7 @@ def run_json(
         output_recovery=output_recovery,
         schema_formatter_enabled=schema_formatter_enabled,
         role_hint=role_hint,
+        paper_access_policy=paper_access_policy,
         env=env,
         process_chain=process_chain,
         session_policy=session_policy,
@@ -443,6 +502,7 @@ def run_json_result(
     output_recovery: str = "strict",
     schema_formatter_enabled: bool = True,
     role_hint: str | None = None,
+    paper_access_policy: Mapping[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
     session_policy: str = "stateless",
@@ -493,12 +553,16 @@ def run_json_result(
         process_chain=process_chain,
     )
     _raise_if_auto_resolved_manual(provider, configs)
-    _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
+    _validate_runtime_inputs_before_artifacts(
+        configs, env=env, idle_timeout_seconds=idle_timeout_seconds
+    )
     _configure_paper_worker_session(
         env,
         artifact_dir=Path(artifact_dir) if artifact_dir else None,
         session_manager=session_manager,
     )
+    _stage_paper_access_policy(env, paper_access_policy)
+    _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
     session_metadata["arc_runtime_capabilities"] = _runtime_capabilities(env)
     return _run_with_retries(
         configs,
@@ -554,6 +618,7 @@ def run_text(
     provider: str = "auto",
     model: str | None = None,
     model_tier: str | None = None,
+    paper_access_policy: Mapping[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
     session_policy: str = "stateless",
@@ -578,6 +643,7 @@ def run_text(
         provider=provider,
         model=model,
         model_tier=model_tier,
+        paper_access_policy=paper_access_policy,
         env=env,
         process_chain=process_chain,
         session_policy=session_policy,
@@ -605,6 +671,7 @@ def run_text_result(
     provider: str = "auto",
     model: str | None = None,
     model_tier: str | None = None,
+    paper_access_policy: Mapping[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
     session_policy: str = "stateless",
@@ -653,12 +720,16 @@ def run_text_result(
         process_chain=process_chain,
     )
     _raise_if_auto_resolved_manual(provider, configs)
-    _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
+    _validate_runtime_inputs_before_artifacts(
+        configs, env=env, idle_timeout_seconds=idle_timeout_seconds
+    )
     _configure_paper_worker_session(
         env,
         artifact_dir=Path(artifact_dir) if artifact_dir else None,
         session_manager=session_manager,
     )
+    _stage_paper_access_policy(env, paper_access_policy)
+    _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
     session_metadata["arc_runtime_capabilities"] = _runtime_capabilities(env)
     return _run_with_retries(
         configs,
@@ -714,7 +785,19 @@ def _validate_runtime_preflight(
     env: Mapping[str, str],
     idle_timeout_seconds: float | None,
 ) -> None:
-    """Validate provider runtime inputs before creating run artifacts."""
+    """Validate the complete provider runtime after controller staging."""
+    _validate_runtime_inputs_before_artifacts(
+        configs, env=env, idle_timeout_seconds=idle_timeout_seconds
+    )
+
+
+def _validate_runtime_inputs_before_artifacts(
+    configs: Sequence[LLMConfig],
+    *,
+    env: Mapping[str, str],
+    idle_timeout_seconds: float | None,
+) -> None:
+    """Reject malformed side-effect-free inputs before creating run artifacts."""
     for config in configs:
         provider_env = _env_with_tier_reasoning_default(env, config.provider, None)
         try:

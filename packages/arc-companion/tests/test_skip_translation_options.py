@@ -426,8 +426,15 @@ def test_large_commentary_only_review_chunks_without_translation_fields(
     assert translations is None
     assert set(reviewed) == {"s1", "s2"}
     assert result["hierarchical"] is True
-    assert sorted(labels) == ["companion-commentary-review-0", "companion-commentary-review-1"]
+    assert labels == ["companion-commentary-review-0"]
     assert all('"translation"' not in prompt for prompt in prompts)
+    prompt_audit = result["prompt_budget_audit"]
+    assert prompt_audit["routing"]["mode"] == "commentary-hierarchical"
+    assert len(prompt_audit["calls"]) == 1
+    assert all(
+        call["prompt_bytes"] <= prompt_audit["budget"]["strict_limit_bytes"]
+        for call in prompt_audit["calls"]
+    )
 
 
 def test_hierarchical_commentary_review_uses_relevant_glossary_and_checkpoints(
@@ -481,12 +488,12 @@ def test_hierarchical_commentary_review_uses_relevant_glossary_and_checkpoints(
     )
     _review(llm=review, **kwargs)
 
-    assert len(prompts) == 2
+    assert len(prompts) == 1
     assert all("GLOSSARY" not in prompt for prompt in prompts)
     assert all("RELEVANT" not in prompt for prompt in prompts)
     assert all("UNRELATED-" not in prompt for prompt in prompts)
     checkpoints = sorted((tmp_path / "checkpoint" / "commentary-reviews").glob("*.json"))
-    assert len(checkpoints) == 2
+    assert len(checkpoints) == 1
     assert all(json.loads(path.read_text())["input_sha256"] for path in checkpoints)
 
     _review(llm=lambda *_args, **_kwargs: pytest.fail("checkpoint was not reused"), **kwargs)
@@ -497,8 +504,8 @@ def test_hierarchical_commentary_review_rejects_patch_from_another_group(
 ) -> None:
     document = {
         "blocks": [
-            {"block_id": "b1", "type": "text", "text": "One."},
-            {"block_id": "b2", "type": "text", "text": "Two."},
+            {"block_id": "b1", "type": "text", "text": "One." + "x" * 16_000},
+            {"block_id": "b2", "type": "text", "text": "Two." + "y" * 16_000},
         ],
         "integrity": {"status": "complete", "document_hash": "wrong-group"},
     }

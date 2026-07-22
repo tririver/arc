@@ -571,6 +571,29 @@ def test_runtime_manifest_is_provider_specific_and_normalizes_false_defaults():
     assert manifest["provider"] == "codex-cli"
 
 
+def test_runtime_fingerprint_binds_policy_identity_but_not_staged_path():
+    base_env = {
+        "ARC_PAPER_CLI_ACCESS": "full",
+        "ARC_PAPER_WORKER_READ_POLICY_SCHEMA": "arc.paper.worker-read-policy.v2",
+        "ARC_PAPER_WORKER_READ_POLICY_SHA256": "a" * 64,
+    }
+    first = runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier=None,
+        env={**base_env, "ARC_PAPER_WORKER_READ_POLICY_PATH": "/tmp/session-a/policy.json"},
+    )
+    moved = runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier=None,
+        env={**base_env, "ARC_PAPER_WORKER_READ_POLICY_PATH": "/tmp/session-b/policy.json"},
+    )
+    changed = runtime_fingerprint(
+        provider="codex-cli", model="m", model_tier=None,
+        env={**base_env, "ARC_PAPER_WORKER_READ_POLICY_SHA256": "b" * 64},
+    )
+
+    assert first == moved
+    assert first != changed
+
+
 def test_kimi_runtime_manifest_ignores_unused_tier_mappings():
     base = runtime_fingerprint(
         provider="kimi-code-cli", model="m", model_tier="high", env={},

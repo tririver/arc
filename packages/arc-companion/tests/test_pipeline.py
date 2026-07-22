@@ -4549,6 +4549,82 @@ def test_section_review_chunks_fail_closed_when_one_segment_exceeds_limit() -> N
         )
 
 
+def test_review_prompt_budget_keeps_ten_percent_transport_headroom(tmp_path: Path) -> None:
+    options = BuildOptions("local:budget", tmp_path, review_context_chars=140_000)
+    budget = pipeline_module._review_prompt_budget(options)
+
+    assert budget["strict_limit_bytes"] == 60 * 1024
+    assert budget["target_limit_bytes"] == 55_296
+    assert budget["target_ratio"] == {"numerator": 9, "denominator": 10}
+
+    floor_budget = pipeline_module._review_prompt_budget(
+        BuildOptions("local:budget-floor", tmp_path, review_context_chars=1)
+    )
+    assert floor_budget["strict_limit_bytes"] == 32 * 1024
+    assert floor_budget["target_limit_bytes"] == 29_491
+
+
+def test_rendered_review_packer_allows_only_singleton_to_use_headroom() -> None:
+    items = [
+        {"segment": {"segment_id": "s1"}},
+        {"segment": {"segment_id": "s2"}},
+    ]
+
+    calls = pipeline_module._pack_rendered_review_calls(
+        items,
+        render_prompt=lambda group: "x" * (56 if len(group) == 1 else 90),
+        target_prompt_bytes=50,
+        strict_prompt_bytes=60,
+        label="test review",
+    )
+
+    assert [call["segment_ids"] for call in calls] == [["s1"], ["s2"]]
+    assert all(call["budget_class"] == "singleton_headroom" for call in calls)
+    assert all(call["prompt_bytes"] == 56 for call in calls)
+
+    with pytest.raises(RuntimeError, match=r"s1.*strict 55-byte limit"):
+        pipeline_module._pack_rendered_review_calls(
+            items[:1],
+            render_prompt=lambda _group: "x" * 56,
+            target_prompt_bytes=50,
+            strict_prompt_bytes=55,
+            label="test review",
+        )
+
+
+def test_section_review_preflights_guided_prompts_before_provider_calls(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    segments, translations, annotations, document = _minimal_section_review_inputs()
+    provider_calls: list[str] = []
+
+    def oversized_guidance(prompt: str, _guidance, *, lane=None) -> str:
+        assert lane == "review"
+        return prompt + ("G" * pipeline_module.REVIEW_PROMPT_MAX_BYTES)
+
+    monkeypatch.setattr(pipeline_module, "_guided_prompt", oversized_guidance)
+
+    with pytest.raises(RuntimeError, match=r"section review segment seg-0.*exceeding"):
+        _review(
+            segments,
+            translations,
+            annotations,
+            document=document,
+            glossary={"entries": []},
+            protected_names=[],
+            evidence={"related_papers": []},
+            options=BuildOptions(
+                paper_id="local:preflight", project_dir=tmp_path, workers=2,
+                review_context_chars=1,
+            ),
+            llm=lambda _prompt, **kwargs: provider_calls.append(str(kwargs["call_label"])),
+            checkpoint_dir=tmp_path / "checkpoints",
+            intent_guidance={"guidance": "present"},
+        )
+
+    assert provider_calls == []
+
+
 def _minimal_section_review_inputs() -> tuple[
     list[dict[str, object]],
     dict[str, dict[str, object]],
@@ -4615,11 +4691,27 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
         ),
         llm=llm, checkpoint_dir=checkpoint_dir,
     )
-    _review(segments, translations, annotations, **kwargs)
+    _, _, first_review = _review(segments, translations, annotations, **kwargs)
     assert len(section_calls) == 1
+    prompt_audit = first_review["prompt_budget_audit"]
+    assert prompt_audit["schema_version"] == (
+        "arc.companion.review-prompt-budget-audit.v1"
+    )
+    assert prompt_audit["routing"]["mode"] == "hierarchical"
+    assert [item["stage"] for item in prompt_audit["calls"]] == [
+        "section", "hierarchical-final",
+    ]
+    assert all(
+        item["prompt_bytes"] <= prompt_audit["budget"]["strict_limit_bytes"]
+        for item in prompt_audit["calls"]
+    )
+    assert prompt_audit["calls"][0]["disposition"] == "provider-call"
 
-    _review(segments, translations, annotations, **kwargs)
+    _, _, reused_review = _review(segments, translations, annotations, **kwargs)
     assert len(section_calls) == 1
+    assert reused_review["prompt_budget_audit"]["calls"][0]["disposition"] == (
+        "checkpoint-reuse"
+    )
 
     checkpoint_path = checkpoint_dir / "section-reviews" / "0000.json"
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
@@ -4762,6 +4854,53 @@ def test_hierarchical_final_review_fails_closed_when_essential_projection_is_too
             language="zh-CN",
             max_prompt_bytes=pipeline_module.REVIEW_PROMPT_MAX_BYTES,
         )
+
+
+def test_hierarchical_final_essential_preflight_is_output_independent() -> None:
+    segment = {"segment_id": "seg-essential", "block_ids": ["b-essential"]}
+    block = {"block_id": "b-essential", "type": "text", "text": "source"}
+    common = dict(
+        segments=[segment],
+        blocks_by_id={"b-essential": block},
+        document={"blocks": [block]},
+        segment_payloads=[{
+            "segment": segment,
+            "source_blocks": [block],
+            "translation": {"blocks": []},
+            "annotation": {},
+            "context_evidence": [],
+        }],
+        glossary={"entries": []},
+        protected_names=[],
+        language="zh-CN",
+        max_prompt_bytes=55_296,
+        strict_prompt_bytes=61_440,
+        essential_only=True,
+    )
+    empty_payload, empty_prompt = pipeline_module._bounded_hierarchical_review_prompt(
+        [{
+            "section_index": 0,
+            "reviewed_segment_ids": ["seg-essential"],
+            "findings": [],
+            "patch_proposals": [],
+        }],
+        **common,
+    )
+    large_payload, large_prompt = pipeline_module._bounded_hierarchical_review_prompt(
+        [{
+            "section_index": 0,
+            "reviewed_segment_ids": ["seg-essential"],
+            "findings": [
+                {"segment_id": "seg-essential", "issue": "x" * 10_000}
+                for _ in range(100)
+            ],
+            "patch_proposals": [{"segment_id": "seg-essential"}] * 100,
+        }],
+        **common,
+    )
+
+    assert large_payload == empty_payload
+    assert large_prompt == empty_prompt
 
 
 def test_recovered_section_reviews_reject_overlapping_old_chunk_topology(
@@ -5814,6 +5953,7 @@ def test_guided_reference_policy_exposes_only_command_scoped_claude_bash() -> No
     assert env["ARC_CLAUDE_ALLOWED_TOOLS"].split(",") == [
         "Bash(arc-paper-worker get-parsed-toc:*)",
         "Bash(arc-paper-worker get-parsed-section:*)",
+        "Bash(arc-paper-worker policy-targets:*)",
         "Bash(arc-paper-worker artifact-read:*)",
     ]
     assert json.loads(env["ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON"]) == [
@@ -5830,9 +5970,14 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
     tmp_path: Path, monkeypatch,
 ) -> None:
     from arc_llm import EvidenceResponse
+    from arc_companion.intent_guidance import (
+        INTENT_GUIDANCE_VERSION,
+        _target_catalog_metadata,
+        _worker_payload_unvalidated,
+    )
 
     artifact = {
-        "schema_version": "arc.companion.intent-guidance.v1",
+        "schema_version": INTENT_GUIDANCE_VERSION,
         "semantic_input_sha256": "s" * 64,
         "user_intent_sha256": "u" * 64,
         "output_sha256": "o" * 64,
@@ -5846,14 +5991,11 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
             "source_id": "book", "source_hash": "v1", "document_hash": "v1",
             "metadata": {}, "toc": [{"locator": "ch-2", "title": "Two"}],
         }],
-        "worker_payload": {
-            "guidance": "Use the selected reference terminology.",
-            "reference_targets": [{
-                "source_id": "book", "locator": "ch-2", "purpose": "terms",
-                "lanes": ["translation"],
-            }],
-        },
     }
+    artifact["target_catalog"] = _target_catalog_metadata(
+        artifact["reference_targets"]
+    )
+    artifact["worker_payload"] = _worker_payload_unvalidated(artifact, lane=None)
     calls = []
 
     def fake_llm(prompt, **kwargs):
@@ -5873,14 +6015,18 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
         pipeline_module, "resolve_worker_evidence_requests",
         lambda _artifact, requests, *, round_number, lane=None: tuple(
             EvidenceResponse(
-                request.request_id, True, {"content": "cached chapter"},
+                request.request_id, True, {
+                    "content": "cached chapter "
+                    + "x" * int(request.arguments.get("limit", 46 * 1024)),
+                },
                 provenance={"provider": "local-cache", "round": round_number},
             )
             for request in requests
         ),
     )
+    round_audits = []
     result = _llm_call(
-        fake_llm, "prompt", {
+        fake_llm, "p" * 54_000, {
             "type": "object", "additionalProperties": False,
             "required": ["answer"], "properties": {"answer": {"type": "string"}},
         },
@@ -5889,11 +6035,21 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
         paper_access_policy=pipeline_module.worker_policy_descriptor(artifact),
         intent_guidance=artifact,
         intent_guidance_lane="translation",
+        review_prompt_context={
+            "stage": "section",
+            "segment_ids": ["seg-1"],
+            "target_limit_bytes": 55_296,
+            "strict_limit_bytes": 61_440,
+            "audit_sink": round_audits,
+        },
     )
     assert result == {"answer": "done"}
     assert len(calls) == 2
     assert "CONTROLLER REFERENCE EVIDENCE ROUND" in calls[1][0]
+    assert len(calls[1][0].encode("utf-8")) <= 61_440
     assert "arc_evidence_requests" in calls[0][1]["schema"]["properties"]
+    assert round_audits[0]["budget_class"] == "evidence_headroom"
+    assert round_audits[0]["strict_headroom_bytes"] >= 0
 
 
 def test_guided_stateful_call_uses_controller_evidence_delta(

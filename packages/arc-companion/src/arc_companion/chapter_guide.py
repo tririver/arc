@@ -151,11 +151,12 @@ def generate_chapter_guide(
         from .intent_guidance import worker_guidance_prompt_prefix
 
         guidance_prefix = (
-            worker_guidance_prompt_prefix(intent_guidance)
+            worker_guidance_prompt_prefix(intent_guidance, lane="guide")
             + "\nIf this host has no sandboxed shell, request exact cached reference reads "
-            "through arc_evidence_requests using get-parsed-toc or "
-            "get-parsed-section with source_id, locator, and optional byte "
-            "offset/limit; return [] when no controller read is needed.\n"
+            "through arc_evidence_requests. Use list-reference-targets to inspect a "
+            "non-inline target catalog, then get-parsed-toc or get-parsed-section "
+            "with source_id, locator, and optional byte offset/limit; return [] when "
+            "no controller read is needed.\n"
         )
     if len(windows) == 1:
         prompt = guidance_prefix + prompt_prefix + json.dumps(

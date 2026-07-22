@@ -50,6 +50,36 @@ def test_chapters_have_stable_ids_and_exact_substantive_coverage() -> None:
     assert result["chapters"][0]["content_block_ids"] == ["b2"]
 
 
+def test_chapters_have_no_fixed_count_limit() -> None:
+    blocks = []
+    for index in range(1, 26):
+        blocks.extend([
+            {
+                "block_id": f"h{index:04d}",
+                "type": "heading",
+                "level": 1,
+                "title": f"Chapter {index}",
+            },
+            {
+                "block_id": f"p{index:04d}",
+                "type": "prose",
+                "text": f"Body {index}.",
+            },
+        ])
+
+    result = build_chapters({"blocks": blocks})
+
+    assert len(result["chapters"]) == 25
+    assert [item["chapter_id"] for item in result["chapters"]] == [
+        f"ch-{index:04d}" for index in range(1, 26)
+    ]
+    assert [
+        block_id
+        for chapter in result["chapters"]
+        for block_id in chapter["block_ids"]
+    ] == [str(block["block_id"]) for block in blocks]
+
+
 def test_authoritative_chapter_v2_partitions_all_heading_levels_without_guessing() -> None:
     kinds = ["part", "chapter", "heading", "section", "subsection", "subsubsection"]
     blocks = [

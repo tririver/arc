@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,8 +25,36 @@ def _enable_paper_cli(monkeypatch):
         "ARC_LLM_WORKER_CONTEXT",
         "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
         "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
+        "ARC_PAPER_WORKER_READ_POLICY_PATH",
+        "ARC_PAPER_WORKER_READ_POLICY_SHA256",
+        "ARC_PAPER_WORKER_READ_POLICY_SCHEMA",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def _stage_v2_policy(monkeypatch, root: Path, *, targets, sources=None):
+    payload = {
+        "schema_version": "arc.paper.worker-read-policy.v2",
+        "operations": [
+            "artifact-read", "get-parsed-toc", "get-parsed-section", "policy-targets"
+        ],
+        "authorized_source_ids": sources or sorted({item["source_id"] for item in targets}),
+        "targets": targets,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    policy_dir = root / "read-policies"
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    path = policy_dir / f"sha256-{digest}.json"
+    path.write_bytes(encoded)
+    monkeypatch.setenv("ARC_PAPER_WORKER_READ_POLICY_PATH", str(path))
+    monkeypatch.setenv("ARC_PAPER_WORKER_READ_POLICY_SHA256", digest)
+    monkeypatch.setenv(
+        "ARC_PAPER_WORKER_READ_POLICY_SCHEMA", "arc.paper.worker-read-policy.v2"
+    )
+    return path, digest
 
 
 def test_worker_fails_closed_when_paper_cli_access_is_not_full(monkeypatch, capsys):
@@ -121,6 +150,131 @@ def test_restricted_read_policy_allows_only_authorized_cached_section(monkeypatc
     ):
         assert worker_cli.main(argv) == 1
         assert _output(capsys)["error"]["code"] == code
+
+
+def test_v2_read_policy_authorizes_the_same_exact_cached_targets(
+    monkeypatch, tmp_path, capsys,
+):
+    _stage_v2_policy(monkeypatch, tmp_path, targets=[{
+        "source_id": "cached-book", "locator": "chapter-2", "purpose": "terms"
+    }])
+    seen = []
+
+    def fake_main(argv):
+        seen.append(argv)
+        print(json.dumps({"ok": True, "data": {}, "errors": [], "meta": {}}))
+        return 0
+
+    monkeypatch.setattr(worker_cli.cli, "main", fake_main)
+    assert worker_cli.main(["--session-dir", str(tmp_path),
+        "get-parsed-section", "cached-book", "--section", "chapter-2", "--json",
+    ]) == 0
+    assert _output(capsys)["ok"] is True
+    assert seen
+
+    assert worker_cli.main(["--session-dir", str(tmp_path),
+        "get-parsed-section", "cached-book", "--section", "chapter-9", "--json",
+    ]) == 1
+    assert _output(capsys)["error"]["code"] == "worker_section_forbidden"
+
+
+def test_v2_read_policy_fails_closed_for_tamper_escape_and_symlink(
+    monkeypatch, tmp_path, capsys,
+):
+    path, digest = _stage_v2_policy(monkeypatch, tmp_path, targets=[{
+        "source_id": "book", "locator": "chapter-2", "purpose": "terms"
+    }])
+    path.write_text("{}", encoding="utf-8")
+    assert worker_cli.main(["--session-dir", str(tmp_path), "policy-targets"]) == 1
+    assert _output(capsys)["error"]["code"] == "worker_read_policy_integrity_failed"
+
+    outside = tmp_path.parent / f"outside-{digest}.json"
+    outside.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("ARC_PAPER_WORKER_READ_POLICY_PATH", str(outside))
+    assert worker_cli.main(["--session-dir", str(tmp_path), "policy-targets"]) == 1
+    assert _output(capsys)["error"]["code"] == "worker_read_policy_invalid"
+
+    path.unlink()
+    path.symlink_to(outside)
+    monkeypatch.setenv("ARC_PAPER_WORKER_READ_POLICY_PATH", str(path))
+    assert worker_cli.main(["--session-dir", str(tmp_path), "policy-targets"]) == 1
+    assert _output(capsys)["error"]["code"] == "worker_read_policy_invalid"
+
+
+def test_policy_targets_pages_unbounded_catalog_with_digest_bound_cursor(
+    monkeypatch, tmp_path, capsys,
+):
+    targets = [
+        {
+            "source_id": f"book-{index % 3}",
+            "locator": f"chapter-{index:04d}-相対性理論",
+            "purpose": f"terminology group {index}",
+        }
+        for index in range(1000)
+    ]
+    _path, digest = _stage_v2_policy(monkeypatch, tmp_path, targets=targets)
+    cursor = None
+    received = []
+    page_count = 0
+    while True:
+        argv = ["--session-dir", str(tmp_path), "policy-targets"]
+        if cursor is not None:
+            argv += ["--cursor", cursor]
+        assert worker_cli.main(argv) == 0
+        raw = capsys.readouterr().out
+        assert len(raw.encode("utf-8")) <= worker_cli.POLICY_TARGETS_DEFAULT_BYTES
+        page = json.loads(raw)["data"]
+        assert page["policy_sha256"] == digest
+        received.extend(page["targets"])
+        page_count += 1
+        cursor = page["paging"]["next_cursor"]
+        if page["paging"]["eof"]:
+            break
+    assert page_count > 1
+    assert received == targets
+
+    assert worker_cli.main([
+        "--session-dir", str(tmp_path), "policy-targets",
+        "--source-id", "book-1", "--query", "group 10",
+    ]) == 0
+    filtered = _output(capsys)["data"]["targets"]
+    assert filtered
+    assert all(item["source_id"] == "book-1" and "group 10" in item["purpose"] for item in filtered)
+
+    first_page_args = [
+        "--session-dir", str(tmp_path), "policy-targets", "--limit-bytes", "2048"
+    ]
+    assert worker_cli.main(first_page_args) == 0
+    first_cursor = _output(capsys)["data"]["paging"]["next_cursor"]
+    assert first_cursor
+    assert worker_cli.main([
+        "--session-dir", str(tmp_path), "policy-targets",
+        "--query", "different", "--cursor", first_cursor,
+        "--limit-bytes", "2048",
+    ]) == 1
+    assert _output(capsys)["error"]["code"] == "policy_targets_cursor_invalid"
+
+
+def test_policy_targets_byte_limit_includes_worker_session_metadata(
+    monkeypatch, tmp_path, capsys,
+):
+    base = tmp_path / "base"
+    base.mkdir()
+    session = WorkerCacheSession(base_root=base, run_root=tmp_path / "run", session_id="s1")
+    for key, value in session.environment().items():
+        monkeypatch.setenv(key, value)
+    _stage_v2_policy(monkeypatch, session.run_root, targets=[
+        {
+            "source_id": "book", "locator": f"chapter-{index:03d}-量子",
+            "purpose": "reference terminology" * 4,
+        }
+        for index in range(100)
+    ])
+
+    assert worker_cli.main(["policy-targets", "--limit-bytes", "2048"]) == 0
+    raw = capsys.readouterr().out
+    assert len(raw.encode("utf-8")) <= 2048
+    assert json.loads(raw)["meta"]["worker_audit"]["status"] == "recorded"
 
 
 @pytest.mark.parametrize(
