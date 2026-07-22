@@ -9,33 +9,25 @@ from typing import Any
 from . import service
 from .batch.db import BatchDB
 from .batch.runner import export_batch, prefetch_batch, run_batch
+from .capabilities import (
+    RECURSIVE_LLM_CAPABILITY,
+    get_operation_spec,
+    operation_name_from_argv,
+)
 from .host import detect_host, select_llm_provider
 from .results import err, ok
 from .summary.model import DEFAULT_SUMMARY_MODEL_TIER
 from .worker_guard import in_worker_context, wrapper_call_authorized
 
 
-RECURSIVE_LLM_CAPABILITY = "recursive_llm"
-COMMAND_CAPABILITIES = {
-    "llm-infer-main-references": frozenset({RECURSIVE_LLM_CAPABILITY}),
-    "infer-main-references": frozenset({RECURSIVE_LLM_CAPABILITY}),
-    "get-llm-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
-    "llm-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
-    "generate-llm-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
-    "llm-generate-summary": frozenset({RECURSIVE_LLM_CAPABILITY}),
-    "summary-batch run": frozenset({RECURSIVE_LLM_CAPABILITY}),
-}
-
-
 def command_capabilities(argv: list[str]) -> frozenset[str]:
-    """Return declared side-effect capabilities for one canonical CLI command."""
+    """Return catalog-owned side-effect capabilities for one CLI command."""
 
-    if not argv:
+    operation = operation_name_from_argv(argv)
+    if operation is None:
         return frozenset()
-    key = argv[0]
-    if key == "summary-batch":
-        key = f"{key} {argv[1] if len(argv) > 1 else ''}"
-    return COMMAND_CAPABILITIES.get(key, frozenset())
+    spec = get_operation_spec(operation)
+    return spec.capabilities if spec is not None else frozenset()
 
 
 def main(argv: list[str] | None = None) -> int:

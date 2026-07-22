@@ -35,6 +35,28 @@ There is no total paper-query limit. Calls are audited without credentials or
 full host configuration. Files obtained with explicitly inherited host tools
 must be imported with `arc-paper-worker parse` before they are ARC evidence.
 
+## Controller-safe capability catalog
+
+Controllers discover the structured ARC-paper surface with
+`arc_paper.catalog_document()` and execute a selected operation with
+`arc_paper.dispatch_operation()`. The versioned catalog is the authority for
+stable operation IDs, closed JSON argument schemas, result serialization,
+inline/job execution, network and cache effects, nested LLM use, and
+supervision requirements. It covers the public service operations while
+intentionally excluding CLI transport flags and Python-only callback objects.
+Catalog dispatch returns the declared ARC result envelope directly. The
+catalog's result-delivery block separately requires the Controller to apply
+64-KiB inline paging through artifact handles and to persist an operation
+receipt containing the operation identity, version, and arguments hash.
+
+Catalog dispatch accepts an operation and structured parameters only; it does
+not accept argv or shell text. Local inputs and export destinations are opaque
+`{"handle_id": "..."}` objects. The Controller must supply an artifact resolver
+that maps the issued handle to an authorized read or write path. A raw path or
+a handle without that resolver is rejected before the service is called. The
+ordinary CLI retains its trusted-local path interface for direct user and host
+operation.
+
 ## Deterministic CLI
 
 Use `extract-paper-ids` when the input is natural-language text that may

@@ -31,6 +31,7 @@ from arc_llm.paper_access_policy import (
 )
 
 from . import cli
+from .capabilities import RECURSIVE_LLM_CAPABILITY, get_operation_spec, operation_name_from_argv
 from .ids import extract_paper_ids
 from .results import err, ok
 from .worker_guard import authorized_wrapper_call
@@ -181,7 +182,9 @@ def _policy_error(
             path_error = _export_path_error(argv, run_root)
             if path_error is not None:
                 return path_error
-    if cli.RECURSIVE_LLM_CAPABILITY in cli.command_capabilities(argv):
+    catalog_operation = operation_name_from_argv(argv)
+    operation_spec = get_operation_spec(catalog_operation) if catalog_operation else None
+    if operation_spec is not None and RECURSIVE_LLM_CAPABILITY in operation_spec.capabilities:
         operation = command if command != "summary-batch" else f"summary-batch {subcommand}"
         return _nested_llm_error(operation)
     return None
