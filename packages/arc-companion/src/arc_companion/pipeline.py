@@ -119,6 +119,10 @@ from .projection import (
 )
 from .reader_text import clean_reader_annotation, clean_reader_translation
 from .regeneration import normalize_regeneration_lanes
+from .response_normalization import (
+    ResponseNormalizationError,
+    normalize_complete_response_with_receipt,
+)
 from .reuse import REUSE_PLAN_VERSION, lane_recipe_sha256, lane_semantic_sha256
 from .results import err, ok
 from .run_lock import BuildInProgressError, ProjectBuildLock
@@ -3954,24 +3958,7 @@ def _finalize_paid_translation_repairs(
         source_ids = [str(value) for value in marker.get("block_ids") or []]
         raw_response = marker.get("raw_response")
         error: str | None = None
-        supervision_markers = [
-            item for item in [
-                ledger.get("needs_supervision"),
-                *(ledger.get("supervision_entries") or []),
-            ]
-            if isinstance(item, dict)
-            and str(item.get("segment_id") or "") == segment_id
-        ]
-        prior_operator_supervision = next((
-            item for item in supervision_markers
-            if str((item.get("recovery_context") or {}).get("recovery_action") or "")
-            == "operator-supervision"
-        ), None)
-        if prior_operator_supervision is not None:
-            error = str(
-                prior_operator_supervision.get("reason")
-                or "existing operator supervision takes precedence"
-            )
+        receipt_path: Path | None = None
         if not (
             isinstance(draft, dict)
             and draft.get("segment_id") == segment_id
@@ -4019,37 +4006,72 @@ def _finalize_paid_translation_repairs(
                     raise RuntimeError(
                         "paid token repair cannot recover missing translation blocks"
                     )
-                repaired = _apply_translation_slot_repairs(
-                    candidate,
-                    [blocks_by_id[value] for value in source_ids],
-                    raw_response,
-                    protected_names=protected_names, offset_only=True,
+                source_blocks = [blocks_by_id[value] for value in source_ids]
+                normalization_artifact_dir = (
+                    _generation_segment_artifact_dir(
+                        checkpoint_dir, "llm/translations", segment_id,
+                        marker_generation,
+                    )
+                    / marker_path.stem
+                    / "retry-offset-1"
                 )
-                for source_id in source_ids:
-                    source = blocks_by_id[source_id]
-                    prior_text = next(
-                        str(item.get("text") or "")
-                        for item in candidate.get("blocks") or []
-                        if isinstance(item, dict) and item.get("block_id") == source_id
+                receipt_path = _repair_response_normalization_path(
+                    normalization_artifact_dir,
+                    marker_path,
+                    checkpoint_dir=checkpoint_dir,
+                    persisted_response=True,
+                )
+
+                def apply_and_validate_paid_response(
+                    response: Mapping[str, Any],
+                ) -> dict[str, Any]:
+                    repaired_candidate = _apply_translation_slot_repairs(
+                        candidate,
+                        source_blocks,
+                        dict(response),
+                        protected_names=protected_names,
+                        offset_only=True,
                     )
-                    repaired_text = next(
-                        str(item.get("text") or "")
-                        for item in repaired.get("blocks") or []
-                        if isinstance(item, dict) and item.get("block_id") == source_id
-                    )
-                    if (
-                        _translation_natural_residue(prior_text)
-                        != _translation_natural_residue(repaired_text)
-                        or _OPAQUE_INLINE_PATTERN.findall(repaired_text)
-                        != _opaque_inline_tokens(source)
-                    ):
-                        raise RuntimeError(
-                            "deterministic repair replay changed residue or token order"
+                    for source_id in source_ids:
+                        source = blocks_by_id[source_id]
+                        prior_text = next(
+                            str(item.get("text") or "")
+                            for item in candidate.get("blocks") or []
+                            if isinstance(item, dict)
+                            and item.get("block_id") == source_id
                         )
-                _validate_translation(
-                    validation_segment,
-                    repaired, blocks_by_id, protected_names,
+                        repaired_text = next(
+                            str(item.get("text") or "")
+                            for item in repaired_candidate.get("blocks") or []
+                            if isinstance(item, dict)
+                            and item.get("block_id") == source_id
+                        )
+                        if (
+                            _translation_natural_residue(prior_text)
+                            != _translation_natural_residue(repaired_text)
+                            or _OPAQUE_INLINE_PATTERN.findall(repaired_text)
+                            != _opaque_inline_tokens(source)
+                        ):
+                            raise RuntimeError(
+                                "deterministic repair replay changed residue or token order"
+                            )
+                    _validate_translation(
+                        validation_segment,
+                        repaired_candidate,
+                        blocks_by_id,
+                        protected_names,
+                    )
+                    return repaired_candidate
+
+                projected_response, _ = _normalize_translation_repair_response(
+                    raw_response,
+                    expected_ids=source_ids,
+                    schema=TRANSLATION_SLOT_REPAIR_SCHEMA,
+                    schema_version=TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+                    invariant_validator=apply_and_validate_paid_response,
+                    receipt_path=receipt_path,
                 )
+                repaired = apply_and_validate_paid_response(projected_response)
             except (RuntimeError, StopIteration) as exc:
                 error = str(exc)
         call_checkpoints = sorted(
@@ -4083,6 +4105,15 @@ def _finalize_paid_translation_repairs(
             "blocked_reason": (
                 f"persisted_repair_response_failed_local_validation: {error}"
                 if error else "paid_repair_ready_for_deterministic_replay"
+            ),
+            **(
+                {
+                    "response_normalization": _response_normalization_reference(
+                        receipt_path, checkpoint_dir=checkpoint_dir,
+                    )
+                }
+                if receipt_path is not None and receipt_path.is_file()
+                else {}
             ),
         }
         if error:
@@ -6922,6 +6953,142 @@ def _translation_token_attempt_path(
     )
 
 
+TRANSLATION_REPAIR_NORMALIZATION_VALIDATOR_VERSION = (
+    "arc.companion.translation-repair-normalization-validator.v1"
+)
+
+
+def _repair_response_normalization_path(
+    artifact_dir: Path,
+    marker_path: Path,
+    *,
+    checkpoint_dir: Path,
+    persisted_response: bool,
+) -> Path:
+    """Use the attempt path, falling back beside historical marker-only work."""
+
+    canonical = artifact_dir / "response-normalization.json"
+    _require_owned_response_normalization_path(
+        canonical,
+        owner=artifact_dir,
+        checkpoint_dir=checkpoint_dir,
+    )
+    if persisted_response and not artifact_dir.exists():
+        selected = marker_path.with_name(
+            f"{marker_path.stem}.response-normalization.json"
+        )
+        owner = marker_path.parent
+    else:
+        selected = canonical
+        owner = artifact_dir
+    _require_owned_response_normalization_path(
+        selected,
+        owner=owner,
+        checkpoint_dir=checkpoint_dir,
+    )
+    return selected
+
+
+def _require_owned_response_normalization_path(
+    path: Path,
+    *,
+    owner: Path,
+    checkpoint_dir: Path,
+) -> None:
+    """Reject lexical, resolved, or symlink escapes from the owning directory."""
+
+    checkpoint_absolute = Path(os.path.abspath(checkpoint_dir))
+    owner_absolute = Path(os.path.abspath(owner))
+    path_absolute = Path(os.path.abspath(path))
+    if path_absolute.parent != owner_absolute:
+        raise RuntimeError(
+            "response normalization receipt is outside its owning attempt"
+        )
+    try:
+        owner_relative = owner_absolute.relative_to(checkpoint_absolute)
+        path_absolute.relative_to(checkpoint_absolute)
+    except ValueError as exc:
+        raise RuntimeError(
+            "response normalization receipt is outside the checkpoint root"
+        ) from exc
+
+    current = checkpoint_absolute
+    for part in (*owner_relative.parts, path_absolute.name):
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(
+                "response normalization receipt path contains a symlink"
+            )
+
+    checkpoint_resolved = checkpoint_absolute.resolve()
+    owner_resolved = owner_absolute.resolve()
+    path_resolved = path_absolute.resolve()
+    try:
+        owner_resolved.relative_to(checkpoint_resolved)
+        path_resolved.relative_to(checkpoint_resolved)
+    except ValueError as exc:
+        raise RuntimeError(
+            "response normalization receipt is outside the checkpoint root"
+        ) from exc
+    if path_resolved.parent != owner_resolved:
+        raise RuntimeError(
+            "response normalization receipt is outside its owning attempt"
+        )
+
+
+def _response_normalization_reference(
+    receipt_path: Path,
+    *,
+    checkpoint_dir: Path,
+) -> dict[str, str]:
+    try:
+        rendered_path = receipt_path.resolve().relative_to(
+            checkpoint_dir.resolve()
+        ).as_posix()
+    except ValueError as exc:
+        raise RuntimeError(
+            "response normalization receipt is outside the checkpoint root"
+        ) from exc
+    return {
+        "path": rendered_path,
+        "sha256": sha256_file(receipt_path),
+    }
+
+
+def _validate_complete_response_schema(
+    value: Mapping[str, Any], schema: Mapping[str, Any],
+) -> None:
+    from jsonschema.validators import validator_for
+
+    validator = validator_for(schema)
+    validator.check_schema(schema)
+    validator(schema).validate(value)
+
+
+def _normalize_translation_repair_response(
+    raw_response: dict[str, Any],
+    *,
+    expected_ids: Sequence[str],
+    schema: Mapping[str, Any],
+    schema_version: str,
+    invariant_validator: Callable[[Mapping[str, Any]], Any],
+    receipt_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return normalize_complete_response_with_receipt(
+        raw_response,
+        "repairs",
+        expected_ids,
+        lambda item: item.get("block_id"),
+        lambda candidate: _validate_complete_response_schema(candidate, schema),
+        invariant_validator,
+        (
+            f"{TRANSLATION_REPAIR_NORMALIZATION_VALIDATOR_VERSION}:"
+            f"{schema_version}"
+        ),
+        receipt_path=receipt_path,
+    )
+
+
 def _legacy_translation_token_attempt_path(
     checkpoint_dir: Path, segment_id: str, generation: int = 1,
 ) -> Path:
@@ -7072,6 +7239,7 @@ def _write_validated_translation_token_marker(
     repaired: dict[str, Any],
     raw_response: dict[str, Any],
     repaired_block_ids: list[str],
+    response_normalization: Mapping[str, str] | None = None,
     generation: int = 1,
     prior_marker: dict[str, Any] | None = None,
 ) -> None:
@@ -7095,6 +7263,10 @@ def _write_validated_translation_token_marker(
         "validated_at": now,
         "validated_translation_sha256": sha256_json(repaired),
         "raw_response": raw_response,
+        **(
+            {"response_normalization": dict(response_normalization)}
+            if response_normalization is not None else {}
+        ),
         **(
             {"superseded_text_attempt": prior_marker["superseded_text_attempt"]}
             if isinstance((prior_marker or {}).get("superseded_text_attempt"), dict)
@@ -7235,7 +7407,11 @@ def _repair_translation_token_placement(
         raise RuntimeError(
             f"translation token repair has no structurally failing blocks for {segment_id}"
         )
+    expected_repair_ids = [block_id(block) for block in source_blocks]
     repair_draft_path = _translation_token_repair_draft_path(
+        checkpoint_dir, segment_id, generation,
+    )
+    attempt_path = _translation_token_attempt_path(
         checkpoint_dir, segment_id, generation,
     )
     persisted = _matching_translation_token_repair_draft(
@@ -7243,20 +7419,90 @@ def _repair_translation_token_placement(
     )
     invalid_persisted_draft = False
     if persisted is not None:
+        persisted_marker = _matching_translation_token_attempt(
+            checkpoint_dir, segment_id, input_sha256, generation,
+        )
+        persisted_provenance_ids = list(
+            persisted["repair_provenance"].get("repaired_block_ids") or []
+        )
+        persisted_marker_ids = (
+            list(persisted_marker.get("block_ids") or [])
+            if isinstance(persisted_marker, dict) else []
+        )
+        if (
+            persisted_provenance_ids != expected_repair_ids
+            or (
+                persisted_marker is not None
+                and persisted_marker_ids != expected_repair_ids
+            )
+        ):
+            raise TranslationRepairNeedsSupervision(
+                segment_id=segment_id,
+                marker_path=attempt_path,
+                reason=(
+                    "persisted token repair expected block IDs differ from its "
+                    "owning marker or draft provenance"
+                ),
+            )
         try:
+            receipt_path = _repair_response_normalization_path(
+                artifact_dir / "retry-offset-1",
+                attempt_path,
+                checkpoint_dir=checkpoint_dir,
+                persisted_response=True,
+            )
+
+            def validate_persisted_response(candidate: Mapping[str, Any]) -> None:
+                repaired_candidate = _apply_translation_slot_repairs(
+                    translation,
+                    source_blocks,
+                    dict(candidate),
+                    protected_names=protected_names,
+                    offset_only=True,
+                )
+                _validate_translation(
+                    segment, repaired_candidate, blocks_by_id, protected_names,
+                )
+
+            projected_response, _ = _normalize_translation_repair_response(
+                persisted["raw_response"],
+                expected_ids=expected_repair_ids,
+                schema=TRANSLATION_SLOT_REPAIR_SCHEMA,
+                schema_version=TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+                invariant_validator=validate_persisted_response,
+                receipt_path=receipt_path,
+            )
             repaired = _apply_translation_slot_repairs(
                 translation,
                 source_blocks,
-                persisted["raw_response"],
+                projected_response,
                 protected_names=protected_names,
                 offset_only=True,
             )
-            _validate_translation(segment, repaired, blocks_by_id, protected_names)
+            _validate_translation(
+                segment, repaired, blocks_by_id, protected_names,
+            )
             if sha256_json(repaired) != sha256_json(persisted["translation"]):
                 raise RuntimeError("persisted translation differs from replayed offsets")
         except RuntimeError:
             invalid_persisted_draft = True
         else:
+            normalization_reference = _response_normalization_reference(
+                receipt_path, checkpoint_dir=checkpoint_dir,
+            )
+            persisted_provenance = {
+                **dict(persisted["repair_provenance"]),
+                "response_normalization": normalization_reference,
+            }
+            if (
+                persisted.get("response_normalization") != normalization_reference
+                or persisted.get("repair_provenance") != persisted_provenance
+            ):
+                write_json(repair_draft_path, {
+                    **persisted,
+                    "response_normalization": normalization_reference,
+                    "repair_provenance": persisted_provenance,
+                })
             prior_marker = _read_checkpoint_json(
                 _translation_token_attempt_path(checkpoint_dir, segment_id, generation)
             )
@@ -7269,13 +7515,11 @@ def _repair_translation_token_placement(
                 repaired_block_ids=list(
                     persisted["repair_provenance"].get("repaired_block_ids") or []
                 ),
+                response_normalization=normalization_reference,
                 generation=generation,
                 prior_marker=prior_marker if isinstance(prior_marker, dict) else None,
             )
-            return repaired, dict(persisted["repair_provenance"])
-    attempt_path = _translation_token_attempt_path(
-        checkpoint_dir, segment_id, generation,
-    )
+            return repaired, persisted_provenance
     raw_attempt = _read_checkpoint_json(attempt_path)
     if attempt_path.is_file() and raw_attempt is None:
         raise RuntimeError(
@@ -7348,15 +7592,26 @@ def _repair_translation_token_placement(
             "status": str(superseded_text_attempt.get("status") or ""),
         }
     value: dict[str, Any] | None = None
+    response_was_persisted = False
     if attempt is not None:
         status = str(attempt.get("status") or "")
         if status in {"response_received", "validated"}:
+            if list(attempt.get("block_ids") or []) != expected_repair_ids:
+                raise TranslationRepairNeedsSupervision(
+                    segment_id=segment_id,
+                    marker_path=attempt_path,
+                    reason=(
+                        "persisted token repair expected block IDs differ from its "
+                        "owning marker"
+                    ),
+                )
             raw_response = attempt.get("raw_response")
             if not isinstance(raw_response, dict):
                 raise RuntimeError(
                     f"translation token repair marker lacks its auditable response for {segment_id}"
                 )
             value = raw_response
+            response_was_persisted = True
         elif status == "started":
             if _repair_call_crossed_submission_barrier(
                 artifact_dir / "retry-offset-1"
@@ -7405,16 +7660,50 @@ def _repair_translation_token_placement(
             "raw_response": value,
         })
     try:
+        receipt_path = _repair_response_normalization_path(
+            artifact_dir / "retry-offset-1",
+            attempt_path,
+            checkpoint_dir=checkpoint_dir,
+            persisted_response=response_was_persisted,
+        )
+
+        def validate_response(candidate: Mapping[str, Any]) -> None:
+            repaired_candidate = _apply_translation_slot_repairs(
+                repair_input,
+                source_blocks,
+                dict(candidate),
+                protected_names=protected_names,
+                allow_clause_rewrite=False,
+                primary_translation=None,
+                offset_only=True,
+            )
+            _validate_translation(
+                segment, repaired_candidate, blocks_by_id, protected_names,
+            )
+
+        try:
+            projected_response, _ = _normalize_translation_repair_response(
+                value,
+                expected_ids=expected_repair_ids,
+                schema=TRANSLATION_SLOT_REPAIR_SCHEMA,
+                schema_version=TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
+                invariant_validator=validate_response,
+                receipt_path=receipt_path,
+            )
+        except ResponseNormalizationError as exc:
+            raise RuntimeError(f"translation slot repair {exc}") from exc
         repaired = _apply_translation_slot_repairs(
             repair_input,
             source_blocks,
-            value,
+            projected_response,
             protected_names=protected_names,
             allow_clause_rewrite=False,
             primary_translation=None,
             offset_only=True,
         )
-        _validate_translation(segment, repaired, blocks_by_id, protected_names)
+        _validate_translation(
+            segment, repaired, blocks_by_id, protected_names,
+        )
     except RuntimeError as exc:
         # The raw response is durably stored before this local application
         # step.  It consumed the bounded provider turn, so invalid structure
@@ -7433,6 +7722,9 @@ def _repair_translation_token_placement(
         ),
         "model_tier": TRANSLATION_RETRY_TIER,
         "repaired_block_ids": [block_id(block) for block in source_blocks],
+        "response_normalization": _response_normalization_reference(
+            receipt_path, checkpoint_dir=checkpoint_dir,
+        ),
     }
     if isinstance(marker_base.get("superseded_text_attempt"), dict):
         provenance["superseded_text_attempt"] = marker_base["superseded_text_attempt"]
@@ -7444,6 +7736,9 @@ def _repair_translation_token_placement(
         "prompt_version": TRANSLATION_RETRY_PROMPT_VERSION,
         "response_schema_version": TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
         "raw_response": value,
+        "response_normalization": _response_normalization_reference(
+            receipt_path, checkpoint_dir=checkpoint_dir,
+        ),
         "translation": repaired,
         "repair_provenance": provenance,
     })
@@ -7457,6 +7752,9 @@ def _repair_translation_token_placement(
         repaired=repaired,
         raw_response=value,
         repaired_block_ids=[block_id(block) for block in source_blocks],
+        response_normalization=_response_normalization_reference(
+            receipt_path, checkpoint_dir=checkpoint_dir,
+        ),
         generation=generation,
         prior_marker=marker,
     )
@@ -7720,6 +8018,8 @@ def _generate_translations(
             })
         coverage_response: dict[str, Any] | None = None
         coverage_marker_base: dict[str, Any] | None = None
+        coverage_response_was_persisted = False
+        coverage_normalization_reference: dict[str, str] | None = None
         try:
             _validate_translation(segment, translation, by_id, protected_names)
         except TranslationCoverageError:
@@ -7756,11 +8056,20 @@ def _generate_translations(
                         "sha256": sha256_json(legacy_coverage_attempt),
                     }
                 if attempt is not None:
+                    status = str(attempt.get("status") or "")
                     if list(attempt.get("missing_block_ids") or []) != missing_block_ids:
+                        if status in {"response_received", "validated"}:
+                            raise TranslationRepairNeedsSupervision(
+                                segment_id=segment_id,
+                                marker_path=attempt_path,
+                                reason=(
+                                    "persisted coverage repair expected block IDs "
+                                    "differ from its owning marker"
+                                ),
+                            )
                         raise RuntimeError(
                             f"translation coverage repair marker changed missing blocks for {segment_id}"
                         )
-                    status = str(attempt.get("status") or "")
                     if status in {"response_received", "validated"}:
                         raw_response = attempt.get("raw_response")
                         if not isinstance(raw_response, dict):
@@ -7769,6 +8078,7 @@ def _generate_translations(
                                 f"response for {segment_id}"
                             )
                         coverage_response = raw_response
+                        coverage_response_was_persisted = True
                     elif status == "started":
                         if _repair_call_crossed_submission_barrier(
                             artifact_dir / "coverage-repair-1"
@@ -7832,9 +8142,60 @@ def _generate_translations(
                         "response_received_at": datetime.now(timezone.utc).isoformat(),
                         "raw_response": coverage_response,
                     })
-                translation = _apply_translation_coverage_repairs(
-                    normalized, segment, missing_blocks, coverage_response, by_id
-                )
+                try:
+                    coverage_receipt_path = _repair_response_normalization_path(
+                        artifact_dir / "coverage-repair-1",
+                        attempt_path,
+                        checkpoint_dir=checkpoint_dir,
+                        persisted_response=coverage_response_was_persisted,
+                    )
+
+                    def validate_coverage_response(candidate: Mapping[str, Any]) -> None:
+                        validation_translation = _apply_translation_coverage_repairs(
+                            normalized,
+                            segment,
+                            missing_blocks,
+                            dict(candidate),
+                            by_id,
+                        )
+                        validation_translation, _ = _restore_translation_protected_names(
+                            segment,
+                            validation_translation,
+                            by_id,
+                            protected_names,
+                        )
+                        _validate_translation(
+                            segment, validation_translation, by_id, protected_names,
+                        )
+
+                    projected_coverage_response, _ = (
+                        _normalize_translation_repair_response(
+                            coverage_response,
+                            expected_ids=missing_block_ids,
+                            schema=TRANSLATION_COVERAGE_REPAIR_SCHEMA,
+                            schema_version=TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
+                            invariant_validator=validate_coverage_response,
+                            receipt_path=coverage_receipt_path,
+                        )
+                    )
+                    coverage_normalization_reference = (
+                        _response_normalization_reference(
+                            coverage_receipt_path, checkpoint_dir=checkpoint_dir,
+                        )
+                    )
+                    translation = _apply_translation_coverage_repairs(
+                        normalized,
+                        segment,
+                        missing_blocks,
+                        projected_coverage_response,
+                        by_id,
+                    )
+                except RuntimeError as exc:
+                    raise TranslationRepairNeedsSupervision(
+                        segment_id=segment_id,
+                        marker_path=attempt_path,
+                        reason=str(exc),
+                    ) from exc
                 repair_provenance.append({
                     "kind": "coverage",
                     "attempt": 1,
@@ -7843,6 +8204,7 @@ def _generate_translations(
                     "model_tier": TRANSLATION_COVERAGE_REPAIR_TIER,
                     "repaired_block_ids": [block_id(block) for block in missing_blocks],
                     "normalization": diagnostics,
+                    "response_normalization": coverage_normalization_reference,
                 })
             else:
                 translation = normalized
@@ -7869,19 +8231,27 @@ def _generate_translations(
                     repair_provenance.append(provenance)
             if missing_blocks:
                 # Model-backed coverage repair is self-contained; never chain another model repair.
-                translation, coverage_name_ids = _restore_translation_protected_names(
-                    segment, translation, by_id, protected_names
-                )
-                if coverage_name_ids:
-                    repair_provenance.append({
-                        "kind": "protected-name-normalization",
-                        "attempt": 0,
-                        "normalizer_version": (
-                            TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION
-                        ),
-                        "repaired_block_ids": coverage_name_ids,
-                    })
-                    _validate_translation(segment, translation, by_id, protected_names)
+                try:
+                    translation, coverage_name_ids = _restore_translation_protected_names(
+                        segment, translation, by_id, protected_names
+                    )
+                    if coverage_name_ids:
+                        repair_provenance.append({
+                            "kind": "protected-name-normalization",
+                            "attempt": 0,
+                            "normalizer_version": (
+                                TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION
+                            ),
+                            "repaired_block_ids": coverage_name_ids,
+                        })
+                        _validate_translation(segment, translation, by_id, protected_names)
+                except RuntimeError as exc:
+                    assert coverage_response is not None
+                    raise TranslationRepairNeedsSupervision(
+                        segment_id=segment_id,
+                        marker_path=attempt_path,
+                        reason=str(exc),
+                    ) from exc
         except TranslationOpaqueTokenError:
             translation, provenance = _repair_translation_token_placement(
                 segment,
@@ -7896,14 +8266,25 @@ def _generate_translations(
                 generation=generation,
             )
             repair_provenance.append(provenance)
-        translation, normalized_citation_ids = (
-            _normalize_translation_citation_delimiters_for_segment(translation, by_id)
-        )
-        if normalized_citation_ids:
-            repair_provenance.append(
-                _citation_delimiter_normalization_provenance(normalized_citation_ids)
+        try:
+            translation, normalized_citation_ids = (
+                _normalize_translation_citation_delimiters_for_segment(translation, by_id)
             )
-        _validate_translation(segment, translation, by_id, protected_names)
+            if normalized_citation_ids:
+                repair_provenance.append(
+                    _citation_delimiter_normalization_provenance(normalized_citation_ids)
+                )
+            _validate_translation(segment, translation, by_id, protected_names)
+        except RuntimeError as exc:
+            if coverage_response is None:
+                raise
+            raise TranslationRepairNeedsSupervision(
+                segment_id=segment_id,
+                marker_path=_translation_coverage_attempt_path(
+                    checkpoint_dir, segment_id, generation,
+                ),
+                reason=str(exc),
+            ) from exc
         if coverage_response is not None and coverage_marker_base is not None:
             prior_marker = _matching_translation_coverage_attempt(
                 checkpoint_dir, segment_id, input_hashes[segment_id], generation
@@ -7921,6 +8302,10 @@ def _generate_translations(
                 "validated_at": now,
                 "validated_translation_sha256": sha256_json(translation),
                 "raw_response": coverage_response,
+                **(
+                    {"response_normalization": coverage_normalization_reference}
+                    if coverage_normalization_reference is not None else {}
+                ),
             })
         return segment_id, translation, {
             "candidate": candidate_provenance or {},

@@ -258,6 +258,16 @@ source order, block coverage, opaque tokens, language, protected names, and
 direct-citation structure. Acceptance atomically updates the ledger and submits the
 next block without placing the invoking agent in the critical path.
 
+For translation token-placement and missing-coverage repairs, an already
+complete structured response is reused without another provider call when it
+contains every exact requested block ID plus unrelated extra IDs. ARC discards
+only those extras, collapses only canonically identical duplicates, restores
+the requested order, and reruns the full response schema and translation
+invariants. Missing IDs, conflicting duplicates, and legacy or invalid slot
+shapes remain supervised. The original response stays in its attempt marker;
+a body-free normalization receipt records the original/projected hashes,
+discarded IDs, validator versions, and decision under the owning checkpoint.
+
 At the same accepted boundary, ARC atomically publishes a refreshed reader
 snapshot and hashed static bundle. Readers either see the previous complete
 bundle or the new complete bundle, never a partially written update. A failed

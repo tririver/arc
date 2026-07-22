@@ -385,7 +385,7 @@ def test_v5_offset_repair_preserves_v4_audit_once_and_persists_response(
     repaired, provenance = pipeline_module._repair_translation_token_placement(
         segment, translation, blocks_by_id={"body": block}, protected_names=[],
         options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        checkpoint_dir=checkpoint_dir, artifact_dir=checkpoint_dir / "llm",
         input_sha256=input_sha256, llm=repair_llm,
     )
     assert calls == ["companion-translation-seg-0016-retry-offset-1"]
@@ -420,7 +420,7 @@ def test_v5_offset_repair_preserves_v4_audit_once_and_persists_response(
     resumed, resumed_provenance = pipeline_module._repair_translation_token_placement(
         segment, translation, blocks_by_id={"body": block}, protected_names=[],
         options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        checkpoint_dir=checkpoint_dir, artifact_dir=checkpoint_dir / "llm",
         input_sha256=input_sha256, llm=forbidden_llm,
     )
     assert resumed == repaired
@@ -745,7 +745,7 @@ def test_token_repair_persists_response_before_apply_and_reuses_failed_response(
         translation={"blocks": [{"block_id": "body", "text": "译文。"}]},
         blocks_by_id={"body": block}, protected_names=[],
         options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        checkpoint_dir=checkpoint_dir, artifact_dir=checkpoint_dir / "llm",
         input_sha256="audit-input",
     )
     with pytest.raises(RuntimeError, match="slot repair"):
@@ -801,7 +801,8 @@ def test_paid_token_repair_with_segment_wide_fake_slots_never_resubmits(
         translation={"blocks": [{"block_id": "body", "text": "译文。"}]},
         blocks_by_id={"body": block}, protected_names=[],
         options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-        checkpoint_dir=tmp_path / "checkpoints", artifact_dir=tmp_path / "llm",
+        checkpoint_dir=tmp_path / "checkpoints",
+        artifact_dir=tmp_path / "checkpoints" / "llm",
         input_sha256="invalid-paid-input",
     )
     with pytest.raises(
@@ -1095,7 +1096,7 @@ def test_response_received_token_insertion_offsets_recover_without_resubmission(
         {"blocks": [{"block_id": "body", "text": "译文。"}]},
         blocks_by_id={"body": block}, protected_names=[],
         options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        checkpoint_dir=checkpoint_dir, artifact_dir=checkpoint_dir / "llm",
         input_sha256="crash-input", llm=forbidden_llm,
     )
 
@@ -1149,7 +1150,7 @@ def test_started_token_repair_without_call_checkpoint_is_safe_to_retry(
         translation={"blocks": [{"block_id": "body", "text": "译文。"}]},
         blocks_by_id={"body": block}, protected_names=[],
         options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-        checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+        checkpoint_dir=checkpoint_dir, artifact_dir=checkpoint_dir / "llm",
         input_sha256="resume-input",
     )
     repaired, _ = pipeline_module._repair_translation_token_placement(
@@ -1187,7 +1188,7 @@ def test_started_token_repair_after_submission_barrier_fails_closed(
         "model_tier": pipeline_module.TRANSLATION_RETRY_TIER,
         "block_ids": ["body"],
     }), encoding="utf-8")
-    call_dir = tmp_path / "llm" / "retry-offset-1" / "call-checkpoints"
+    call_dir = checkpoint_dir / "llm" / "retry-offset-1" / "call-checkpoints"
     call_dir.mkdir(parents=True)
     (call_dir / "call.json").write_text(json.dumps({
         "state": "submitted", "submission_state": submission_state,
@@ -1202,7 +1203,7 @@ def test_started_token_repair_after_submission_barrier_fails_closed(
             {"blocks": [{"block_id": "body", "text": "译文。"}]},
             blocks_by_id={"body": block}, protected_names=[],
             options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-            checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+            checkpoint_dir=checkpoint_dir, artifact_dir=checkpoint_dir / "llm",
             input_sha256="submitted-input", llm=forbidden_llm,
         )
 
@@ -1500,7 +1501,7 @@ def test_damaged_current_repair_draft_without_validated_raw_fails_closed(
             {"blocks": [{"block_id": "body", "text": "译文。"}]},
             blocks_by_id={"body": block}, protected_names=[],
             options=BuildOptions(paper_id="arXiv:0911.3380", project_dir=tmp_path),
-            checkpoint_dir=checkpoint_dir, artifact_dir=tmp_path / "llm",
+            checkpoint_dir=checkpoint_dir, artifact_dir=checkpoint_dir / "llm",
             input_sha256="damaged-input", llm=forbidden_llm,
         )
     assert calls == 0
