@@ -284,7 +284,7 @@ def test_auto_groups_same_lane_blockers_at_earliest_suffix_and_rotates_once(
     journal = json.loads(
         (project / ".arc-companion" / "resume-transaction.json").read_text()
     )
-    assert len(journal["replacements"]) == 2
+    assert len(journal["replacements"]) == 1
     assert {
         replacement["suffix_start_segment_id"]
         for replacement in journal["replacements"]
@@ -296,7 +296,7 @@ def test_auto_groups_same_lane_blockers_at_earliest_suffix_and_rotates_once(
     assert commentary.read_bytes() == commentary_before
 
 
-def test_failed_replacement_reports_exhaustion_without_generation_three(
+def test_failed_replacement_uses_three_generations_before_exhaustion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, _checkpoint, translation, _commentary, manager = _project(tmp_path)
@@ -330,13 +330,14 @@ def test_failed_replacement_reports_exhaustion_without_generation_three(
     result = pipeline.resume_companion(project)
 
     assert result["error"]["code"] == "automatic_regeneration_exhausted"
-    assert manager.get_existing("ch-0001:translation").generation == 2
-    assert json.loads(translation.read_text())["generation"] == 2
+    assert manager.get_existing("ch-0001:translation").generation == 4
+    assert json.loads(translation.read_text())["generation"] == 4
     journal = json.loads(
         (project / ".arc-companion" / "resume-transaction.json").read_text()
     )
-    assert journal["restart_budgets"][0]["attempts_used"] == 1
-    assert journal["replacements"][0]["status"] == "failed"
+    assert journal["restart_budgets"][0]["attempts_used"] == 3
+    assert [item["attempt"] for item in journal["replacements"]] == [1, 2, 3]
+    assert all(item["status"] == "failed" for item in journal["replacements"])
 
 
 @pytest.mark.parametrize("category", ("cancelled", "authentication", "rate_limit"))
@@ -575,7 +576,7 @@ def test_confirmed_restart_can_continue_after_auto_budget_exhaustion(
     monkeypatch.setattr(pipeline, "build_companion", failed_auto_replacement)
     exhausted = pipeline.resume_companion(project)
     assert exhausted["error"]["code"] == "automatic_regeneration_exhausted"
-    assert manager.get_existing("ch-0001:translation").generation == 2
+    assert manager.get_existing("ch-0001:translation").generation == 4
 
     statuses_before_acceptance: list[list[str]] = []
 
@@ -586,7 +587,7 @@ def test_confirmed_restart_can_continue_after_auto_budget_exhaustion(
         statuses_before_acceptance.append([
             str(entry["status"]) for entry in journal["entries"]
         ])
-        _finish_generation_suffix(translation, 3)
+        _finish_generation_suffix(translation, 5)
         return {"ok": True, "status": "complete"}
 
     monkeypatch.setattr(pipeline, "build_companion", accepted_manual_replacement)
@@ -602,9 +603,9 @@ def test_confirmed_restart_can_continue_after_auto_budget_exhaustion(
     assert all(
         status != "resolved" for status in statuses_before_acceptance[0]
     )
-    assert manager.get_existing("ch-0001:translation").generation == 3
+    assert manager.get_existing("ch-0001:translation").generation == 5
     ledger = json.loads(translation.read_text())
-    assert [block["generation"] for block in ledger["blocks"]] == [1, 3, 3]
+    assert [block["generation"] for block in ledger["blocks"]] == [1, 5, 5]
     journal = json.loads(
         (project / ".arc-companion" / "resume-transaction.json").read_text()
     )

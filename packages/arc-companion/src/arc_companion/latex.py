@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 import re
@@ -28,6 +29,7 @@ class LatexError(RuntimeError):
 
 def escape_tex(value: Any) -> str:
     text = str(value or "")
+    preserve_greek_letters = _looks_like_greek_prose(text)
     replacements = {
         "\\": r"\textbackslash{}",
         "{": r"\{",
@@ -51,7 +53,7 @@ def escape_tex(value: Any) -> str:
     for char in text:
         if ord(char) < 32 and char not in "\n\r\t":
             continue
-        atom = _unicode_math_atom(char)
+        atom = _unicode_math_atom(char, preserve_greek_letters=preserve_greek_letters)
         if atom is not None:
             math_atoms.append(atom)
             continue
@@ -110,12 +112,16 @@ _GREEK_NAME_TO_TEX = {
 }
 
 
-def _unicode_math_atom(char: str) -> str | None:
+def _unicode_math_atom(
+    char: str, *, preserve_greek_letters: bool = False
+) -> str | None:
     modifier = _UNICODE_MATH_MODIFIERS.get(char)
     if modifier is not None:
         return modifier
     direct = _UNICODE_MATH_SYMBOLS.get(char)
     if direct is not None:
+        if preserve_greek_letters and _is_greek_letter(char):
+            return None
         return direct
     name = unicodedata.name(char, "")
     if not name.startswith("MATHEMATICAL "):
@@ -147,6 +153,220 @@ def _unicode_math_atom(char: str) -> str | None:
     return base
 
 
+def _is_greek_letter(char: str) -> bool:
+    return unicodedata.category(char).startswith("L") and "GREEK" in unicodedata.name(char, "")
+
+
+def _looks_like_greek_prose(text: str) -> bool:
+    run = 0
+    for char in text:
+        if _is_greek_letter(char):
+            run += 1
+            if run >= 2 or char not in _UNICODE_MATH_SYMBOLS:
+                return True
+        elif unicodedata.category(char).startswith("M") and run:
+            continue
+        else:
+            run = 0
+    return False
+
+
+def _title_translation_index(value: Any) -> dict[str, str]:
+    if not value:
+        return {}
+    records: Any = value
+    if isinstance(value, Mapping):
+        nested = value.get("titles") or value.get("translations")
+        if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes)):
+            records = nested
+        else:
+            output: dict[str, str] = {}
+            for key, raw in value.items():
+                if key in {"schema_version", "source_language", "target_language", "source_sha256"}:
+                    continue
+                text = (
+                    str(raw.get("text") or raw.get("translated_title") or raw.get("translation") or "").strip()
+                    if isinstance(raw, Mapping)
+                    else str(raw or "").strip()
+                )
+                if text:
+                    output[str(key)] = text
+            return output
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        return {}
+    output: dict[str, str] = {}
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            continue
+        text = str(
+            raw.get("text")
+            or raw.get("translated_title")
+            or raw.get("translation")
+            or ""
+        ).strip()
+        if not text:
+            continue
+        title_id = str(raw.get("title_id") or "").strip()
+        block_value = str(raw.get("block_id") or "").strip()
+        chapter_id = str(raw.get("chapter_id") or "").strip()
+        role = str(raw.get("role") or "").casefold()
+        if title_id:
+            output[title_id] = text
+        if block_value:
+            output.setdefault(f"block:{block_value}", text)
+            output.setdefault(block_value, text)
+        if chapter_id and (
+            role in {"chapter", "chapter_title"}
+            or title_id == f"chapter:{chapter_id}"
+        ):
+            output.setdefault(f"chapter:{chapter_id}", text)
+        if role in {"document", "document_title", "paper_title", "title"}:
+            output.setdefault("document:title", text)
+    return output
+
+
+def _block_title(block: Mapping[str, Any]) -> str:
+    heading = block.get("heading") if isinstance(block.get("heading"), Mapping) else {}
+    return str(
+        block.get("title")
+        or heading.get("title")
+        or heading.get("text")
+        or (block.get("heading") if isinstance(block.get("heading"), str) else "")
+        or block.get("text")
+        or ""
+    ).strip()
+
+
+def _translated_block_title(
+    block: Mapping[str, Any], translations: Mapping[str, str]
+) -> str:
+    identifier = block_id(dict(block))
+    return str(
+        translations.get(f"block:{identifier}")
+        or translations.get(identifier)
+        or ""
+    ).strip()
+
+
+def _translated_document_title(
+    document: Mapping[str, Any], translations: Mapping[str, str]
+) -> str:
+    direct = str(translations.get("document:title") or "").strip()
+    if direct:
+        return direct
+    front_roles = _front_matter_block_roles(
+        list(document.get("blocks") or []), dict(document.get("front_matter") or {})
+    )
+    for identifier, role in front_roles.items():
+        if role != "title":
+            continue
+        value = translations.get(f"block:{identifier}") or translations.get(identifier)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _normalize_language_tag(value: str) -> str:
+    parts = [part for part in str(value or "und").strip().replace("_", "-").split("-") if part]
+    if not parts:
+        return "und"
+    normalized = [parts[0].casefold()]
+    for part in parts[1:]:
+        normalized.append(
+            part.title() if len(part) == 4 and part.isalpha()
+            else part.upper() if len(part) in {2, 3} and part.isalpha()
+            else part
+        )
+    return "-".join(normalized)
+
+
+def _language_base(value: str) -> str:
+    return _normalize_language_tag(value).split("-", 1)[0]
+
+
+def _language_direction(value: str) -> str:
+    return "rtl" if _language_base(value) in {
+        "ar", "dv", "fa", "he", "ku", "ps", "sd", "ug", "ur", "yi"
+    } else "ltr"
+
+
+def _cjk_variant(language: str) -> str | None:
+    normalized = _normalize_language_tag(language)
+    base = _language_base(normalized)
+    if base == "ja":
+        return "JP"
+    if base == "ko":
+        return "KR"
+    if base != "zh":
+        return None
+    lowered = normalized.casefold()
+    return "TC" if any(value in lowered for value in ("-hant", "-tw", "-hk", "-mo")) else "SC"
+
+
+def _font_fallback(
+    command: str,
+    candidates: Sequence[str],
+    *,
+    required: bool,
+    error_label: str = "No supported Unicode font found",
+) -> str:
+    fallback = (
+        f"\\PackageError{{arc-companion}}{{{error_label}}}"
+        "{Install Noto or Source Han fonts for the source and target languages.}"
+        if required
+        else "\\PackageWarning{arc-companion}{Preferred Unicode font unavailable}"
+    )
+    rendered = fallback
+    for candidate in reversed(list(dict.fromkeys(candidates))):
+        rendered = (
+            f"\\IfFontExistsTF{{{candidate}}}{{\\{command}{{{candidate}}}}}"
+            f"{{{rendered}}}"
+        )
+    return rendered
+
+
+def _font_setup(source_language: str, target_language: str) -> str:
+    setup = [
+        _font_fallback("setsansfont", ["Noto Sans", "DejaVu Sans", "FreeSans"], required=False),
+        _font_fallback("setmainfont", ["Noto Serif", "DejaVu Serif", "FreeSerif"], required=False),
+    ]
+    variants = [
+        value for value in (
+            _cjk_variant(target_language), _cjk_variant(source_language),
+            "SC", "TC", "JP", "KR",
+        ) if value
+    ]
+    serif: list[str] = []
+    sans: list[str] = []
+    for variant in variants:
+        serif.extend([f"Noto Serif CJK {variant}", f"Source Han Serif {variant}"])
+        sans.extend([f"Noto Sans CJK {variant}", f"Source Han Sans {variant}"])
+    if any(_cjk_variant(value) for value in (source_language, target_language)):
+        serif.extend(["Source Han Serif CN", "FandolSong-Regular"])
+        sans.extend(["Source Han Sans CN", "FandolHei-Regular"])
+        setup.append(_font_fallback(
+            "setCJKmainfont", serif, required=True,
+            error_label="No supported CJK serif font found",
+        ))
+        setup.append(_font_fallback(
+            "setCJKsansfont", sans, required=True,
+            error_label="No supported CJK sans font found",
+        ))
+    return "\n".join(setup)
+
+
+def _render_warnings(source_language: str, target_language: str) -> list[dict[str, Any]]:
+    rtl = [
+        value for value in (source_language, target_language)
+        if _language_direction(value) == "rtl"
+    ]
+    return ([{
+        "code": "rtl_pdf_layout_not_guaranteed",
+        "languages": rtl,
+        "message": "PDF bidirectional layout is best-effort; use the HTML reader for authoritative RTL direction.",
+    }] if rtl else [])
+
+
 def render_companion_tex(
     document: dict[str, Any],
     segments: list[dict[str, Any]],
@@ -161,6 +381,8 @@ def render_companion_tex(
     augmentation_scope: str = "all",
     chapters: list[dict[str, Any]] | None = None,
     chapter_guides: dict[str, dict[str, Any]] | None = None,
+    source_language: str | None = None,
+    title_translations: dict[str, Any] | list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     if augmentation_scope not in {"all", "substantive"}:
         raise ValueError(f"unsupported companion augmentation scope: {augmentation_scope}")
@@ -172,12 +394,35 @@ def render_companion_tex(
     translation_mode = translations is not None
     translations = translations or {}
     evidence_by_segment = evidence_by_segment or {}
+    source_language = _normalize_language_tag(source_language or "und")
+    language = _normalize_language_tag(language or "und")
+    title_translation_index = _title_translation_index(title_translations)
 
     copied_assets: list[dict[str, Any]] = []
     rendered_links: list[dict[str, str]] = []
     block_records: list[dict[str, str]] = []
     body: list[str] = []
     bibliography_blocks = {block_id(block) for block in blocks if _kind(block) in {"bibliography", "bibliography_item", "reference"}}
+    bibliography_section_ids = {
+        str(block.get("section_id") or "").strip()
+        for block in blocks
+        if block_id(block) in bibliography_blocks
+        and str(block.get("section_id") or "").strip()
+    }
+    bibliography_heading_ids = {
+        block_id(block)
+        for block in blocks
+        if _kind(block) in {
+            "heading", "section", "subsection", "subsubsection", "chapter", "part",
+        }
+        and (
+            str(block.get("source_role") or "").casefold() in {"references", "bibliography"}
+            or (
+                str(block.get("section_id") or "").strip()
+                and str(block.get("section_id") or "").strip() in bibliography_section_ids
+            )
+        )
+    }
     front_roles = _front_matter_block_roles(blocks, document.get("front_matter") or {})
     renderable_ids = {
         block_id(block)
@@ -202,8 +447,17 @@ def render_companion_tex(
                 end=str(segment.get("end_block_id") or ""),
             )
         visible_ids = [value for value in member_ids if value in renderable_ids]
+        projected_ids = [
+            str(value)
+            for value in (
+                segment.get("augmentation_block_ids")
+                if "augmentation_block_ids" in segment
+                else visible_ids
+            ) or []
+        ]
         augmentation_ids = [
-            value for value in visible_ids if value not in excluded_augmentation_ids
+            value for value in projected_ids
+            if value in visible_ids and value not in excluded_augmentation_ids
         ]
         renderable_by_segment[segment_id] = augmentation_ids
         for value in augmentation_ids:
@@ -257,10 +511,19 @@ def render_companion_tex(
                 output_dir=output_dir,
                 copied_assets=copied_assets,
                 rendered_links=rendered_links,
+                translated_title=_translated_block_title(
+                    block, title_translation_index
+                ) or str(
+                    title_translation_index.get(f"chapter:{chapter_id}") or ""
+                ),
             ))
             if chapter_id:
-                body.append(_render_chapter_guide(chapter_guides.get(chapter_id) or {}, language=language))
-                rendered_chapter_guides.append(chapter_id)
+                chapter_guide_tex = _render_chapter_guide(
+                    chapter_guides.get(chapter_id) or {}, language=language
+                )
+                if chapter_guide_tex:
+                    body.append(chapter_guide_tex)
+                    rendered_chapter_guides.append(chapter_id)
             if segment_id and last_by_segment.get(segment_id) == bid:
                 if source_box_open:
                     body.append("\\end{arcsource}\n")
@@ -306,7 +569,11 @@ def render_companion_tex(
 
     bibliography = document.get("bibliography") or []
     if bibliography:
-        body.append(_render_bibliography(bibliography, rendered_links=rendered_links))
+        body.append(_render_bibliography(
+            bibliography,
+            rendered_links=rendered_links,
+            include_heading=not bibliography_heading_ids,
+        ))
     elif bibliography_blocks:
         body.extend(
             _render_plain_reference(block, rendered_links=rendered_links)
@@ -317,6 +584,23 @@ def render_companion_tex(
     front = document.get("front_matter") or {}
     metadata = metadata or {}
     title = front.get("title") or metadata.get("title") or "Paper Companion"
+    translated_title = _translated_document_title(
+        document, title_translation_index
+    )
+    title_source_runs = [
+        run
+        for block in blocks
+        if front_roles.get(block_id(block)) == "title"
+        for run in block.get("inline_runs") or []
+        if isinstance(run, dict)
+    ]
+    translated_title_tex = (
+        _render_translated_inline_runs(
+            translated_title, {"inline_runs": title_source_runs}
+        )
+        if translated_title and title_source_runs
+        else escape_tex(translated_title)
+    )
     authors = front.get("authors") or metadata.get("authors") or []
     if isinstance(authors, list):
         author_text = ", ".join(_author_name(item) for item in authors)
@@ -342,8 +626,11 @@ def render_companion_tex(
     tex = (
         _preamble(
             title=title,
+            translated_title=translated_title,
+            translated_title_tex=translated_title_tex,
             authors=author_text,
             language=language,
+            source_language=source_language,
             include_translation=translation_mode,
         )
         + front_body
@@ -364,6 +651,9 @@ def render_companion_tex(
         "rendered_links": rendered_links,
         "tables": [_table_audit_record(item) for item in document.get("tables") or []],
         "assets": copied_assets,
+        "source_language": source_language,
+        "target_language": language,
+        "render_warnings": _render_warnings(source_language, language),
         "companion_layers": {
             "augmentation_scope": augmentation_scope,
             "excluded_augmentation_block_ids": [
@@ -381,6 +671,13 @@ def render_companion_tex(
             "annotation_sources_by_segment": annotation_sources_by_segment,
             "translations": translation_audits,
             "chapter_ids": [str(item.get("chapter_id") or "") for item in chapters or []],
+            "expected_chapter_guide_ids": [
+                str(item.get("chapter_id") or "")
+                for item in chapters or []
+                if _chapter_guide_has_content(
+                    chapter_guides.get(str(item.get("chapter_id") or "")) or {}
+                )
+            ],
             "rendered_chapter_guide_ids": rendered_chapter_guides,
         },
     }
@@ -446,7 +743,14 @@ def validate_tex_fidelity(tex: str, document: dict[str, Any], manifest: dict[str
 
 
 def _preamble(
-    *, title: Any, authors: str, language: str, include_translation: bool = True,
+    *,
+    title: Any,
+    translated_title: Any = "",
+    translated_title_tex: str = "",
+    authors: str,
+    language: str,
+    source_language: str = "und",
+    include_translation: bool = True,
 ) -> str:
     translation_definitions = rf"""
 \definecolor{{ArcTranslationBackground}}{{HTML}}{{F0F7F3}}
@@ -455,33 +759,17 @@ def _preamble(
   leftrule=1.2pt,colback=ArcTranslationBackground,colframe=ArcTranslationRule,
   left=8pt,right=8pt,top=6pt,bottom=6pt,before skip=5pt,after skip=8pt,#1}}
 """ if include_translation else ""
+    font_setup = _font_setup(source_language, language)
+    translated_title_tex = translated_title_tex or escape_tex(translated_title)
+    bilingual_title = escape_tex(title)
+    if translated_title_tex and str(translated_title).strip() != str(title).strip():
+        bilingual_title += rf"\par\vspace{{.55em}}{{\Large {translated_title_tex}\par}}"
     return rf"""\documentclass[11pt,a4paper]{{article}}
 \usepackage{{amsmath,amssymb,mathtools}}
 \usepackage{{graphicx,longtable,array,multirow,hyperref,xcolor,needspace}}
 \usepackage[most]{{tcolorbox}}
 \usepackage{{fontspec,xeCJK}}
-\IfFontExistsTF{{Noto Serif CJK SC}}{{
-  \setCJKmainfont{{Noto Serif CJK SC}}
-}}{{\IfFontExistsTF{{Source Han Serif SC}}{{
-  \setCJKmainfont{{Source Han Serif SC}}
-}}{{\IfFontExistsTF{{Source Han Serif CN}}{{
-  \setCJKmainfont{{Source Han Serif CN}}
-}}{{\IfFontExistsTF{{FandolSong-Regular}}{{
-  \setCJKmainfont{{FandolSong-Regular}}
-}}{{
-  \PackageError{{arc-companion}}{{No supported CJK serif font found}}{{Install Noto Serif CJK SC, Source Han Serif SC/CN, or FandolSong-Regular.}}
-}}}}}}}}
-\IfFontExistsTF{{Noto Sans CJK SC}}{{
-  \setCJKsansfont{{Noto Sans CJK SC}}
-}}{{\IfFontExistsTF{{Source Han Sans SC}}{{
-  \setCJKsansfont{{Source Han Sans SC}}
-}}{{\IfFontExistsTF{{Source Han Sans CN}}{{
-  \setCJKsansfont{{Source Han Sans CN}}
-}}{{\IfFontExistsTF{{FandolHei-Regular}}{{
-  \setCJKsansfont{{FandolHei-Regular}}
-}}{{
-  \PackageError{{arc-companion}}{{No supported CJK sans font found}}{{Install Noto Sans CJK SC, Source Han Sans SC/CN, or FandolHei-Regular.}}
-}}}}}}}}
+{font_setup}
 \usepackage[margin=25mm]{{geometry}}
 \hypersetup{{hidelinks}}
 \definecolor{{ArcCompanionBackground}}{{HTML}}{{FAF3E8}}
@@ -500,7 +788,7 @@ def _preamble(
 \begin{{titlepage}}
 \centering
 \vspace*{{\fill}}
-{{\LARGE {escape_tex(title)}\par}}
+{{\LARGE {bilingual_title}\par}}
 \vspace{{2.5em}}
 {{\large {escape_tex(authors)}\par}}
 \vspace{{2.5em}}
@@ -539,17 +827,22 @@ def _render_block(
     output_dir: Path,
     copied_assets: list[dict[str, Any]],
     rendered_links: list[dict[str, str]],
+    translated_title: str = "",
 ) -> str:
     kind = _kind(block)
     heading = block.get("heading") if isinstance(block.get("heading"), dict) else {}
-    if kind in {"section", "heading", "subsection", "subsubsection"} or block.get("heading_level") or heading:
+    if kind in {"part", "chapter", "section", "heading", "subsection", "subsubsection"} or block.get("heading_level") or heading:
         level = int(
             block.get("heading_level")
             or block.get("level")
             or heading.get("level")
             or {"section": 1, "subsection": 2, "subsubsection": 3}.get(kind, 1)
         )
-        command = {1: "section", 2: "subsection", 3: "subsubsection"}.get(level, "paragraph")
+        command = (
+            "part" if kind == "part"
+            else "section" if kind == "chapter"
+            else {1: "section", 2: "subsection", 3: "subsubsection"}.get(level, "paragraph")
+        )
         title = (
             block.get("title")
             or heading.get("title")
@@ -559,6 +852,11 @@ def _render_block(
         )
         rendered_title = _render_html_fragment(block.get("html"), rendered_links=rendered_links, contents_only=True)
         title_tex = rendered_title or escape_tex(title)
+        translated_title_tex = _render_translated_inline_runs(translated_title, block)
+        body_title_tex = title_tex
+        if translated_title_tex and str(translated_title).strip() != str(title).strip():
+            body_title_tex += rf"\protect\\{{\small {translated_title_tex}}}"
+        navigation_title_tex = translated_title_tex or title_tex
         # Source headings already carry the paper's own section number (when
         # numbered).  A numbered LaTeX command would prepend a second number,
         # e.g. ``0.1 1 Introduction`` for an ar5iv h2 rendered as a subsection.
@@ -566,8 +864,8 @@ def _render_block(
         # explicitly so its hierarchy remains available to the TOC/bookmarks.
         return (
             _anchors(block)
-            + f"\\{command}*{{{title_tex}}}\n"
-            + f"\\addcontentsline{{toc}}{{{command}}}{{{title_tex}}}\n"
+            + f"\\{command}*{{{body_title_tex}}}\n"
+            + f"\\addcontentsline{{toc}}{{{command}}}{{{navigation_title_tex}}}\n"
         )
     if kind in {"equation", "math", "display_math"}:
         entity = _entity_for(block, equations)
@@ -1326,14 +1624,17 @@ def _validate_companion_layers(tex: str, audit: dict[str, Any]) -> list[str]:
     provided_translations = {str(value) for value in audit.get("provided_translation_segment_ids") or []}
     known_ids = set(semantic_ids) | preservation_ids
     chapter_ids = [str(value) for value in audit.get("chapter_ids") or []]
+    expected_guides = [
+        str(value) for value in audit.get("expected_chapter_guide_ids") or []
+    ]
     rendered_guides = [str(value) for value in audit.get("rendered_chapter_guide_ids") or []]
     if chapter_ids:
-        if rendered_guides != chapter_ids:
-            errors.append("chapter guides do not cover every rendered chapter exactly once")
-        if tex.count("% ARC-CHAPTER-GUIDE-BEGIN") != len(chapter_ids):
-            errors.append("chapter guide begin markers do not match rendered chapters")
-        if tex.count("% ARC-CHAPTER-GUIDE-END") != len(chapter_ids):
-            errors.append("chapter guide end markers do not match rendered chapters")
+        if rendered_guides != expected_guides:
+            errors.append("chapter guides do not match substantive chapter-guide content")
+        if tex.count("% ARC-CHAPTER-GUIDE-BEGIN") != len(expected_guides):
+            errors.append("chapter guide begin markers do not match substantive guides")
+        if tex.count("% ARC-CHAPTER-GUIDE-END") != len(expected_guides):
+            errors.append("chapter guide end markers do not match substantive guides")
 
     if rendered_annotations != semantic_ids:
         errors.append("companion commentary does not cover every semantic segment exactly once")
@@ -1426,33 +1727,78 @@ def _render_reading_guide(*, language: str, include_translation: bool) -> str:
 
 
 def _render_chapter_guide(guide: dict[str, Any], *, language: str) -> str:
+    if not _chapter_guide_has_content(guide):
+        return ""
     fields = (
         ("motivation", "学习动机"), ("main_content", "主要内容"),
-        ("section_logic", "节间逻辑"), ("book_position", "原文位置"),
-        ("prerequisites", "前置知识"),
+        ("section_logic", "节间逻辑"),
     )
     parts = [
         "\\Needspace{4\\baselineskip}\n"
         f"\\medskip\\noindent\\textbf{{{escape_tex(title)}}}\\par\n{_render_rich_text(guide[key])}\n"
         for key, title in fields if str(guide.get(key) or "").strip()
     ]
+    comparison = guide.get("pedagogical_comparison")
+    if isinstance(comparison, dict) and str(comparison.get("text") or "").strip():
+        parts.append(
+            "\\Needspace{4\\baselineskip}\n"
+            f"\\medskip\\noindent\\textbf{{教材顺序比较}}\\par\n"
+            f"{_render_rich_text(comparison.get('text'))}"
+            f"{_render_annotation_sources(comparison.get('sources'))}\n"
+        )
+    if str(guide.get("prerequisites") or "").strip():
+        parts.append(
+            "\\Needspace{4\\baselineskip}\n"
+            f"\\medskip\\noindent\\textbf{{前置知识}}\\par\n"
+            f"{_render_rich_text(guide.get('prerequisites'))}\n"
+        )
+    for item in guide.get("historical_context") or []:
+        if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+            continue
+        parts.append(
+            "\\Needspace{4\\baselineskip}\n"
+            f"\\medskip\\noindent\\textbf{{历史背景}}\\par\n"
+            f"{_render_rich_text(item.get('text'))}"
+            f"{_render_annotation_sources(item.get('sources'))}\n"
+        )
     reading = guide.get("supplementary_reading") or []
     if reading:
         items = "\n".join(
             f"\\item {_render_rich_text(item.get('title'))}: {_render_rich_text(item.get('reason'))}"
             for item in reading if isinstance(item, dict)
         )
-        parts.append(
-            "\\Needspace{4\\baselineskip}\n"
-            f"\\medskip\\noindent\\textbf{{补充阅读}}\\par\n"
-            f"\\begin{{itemize}}\n{items}\n\\end{{itemize}}\n"
-        )
+        if items:
+            parts.append(
+                "\\Needspace{4\\baselineskip}\n"
+                f"\\medskip\\noindent\\textbf{{补充阅读}}\\par\n"
+                f"\\begin{{itemize}}\n{items}\n\\end{{itemize}}\n"
+            )
     heading = "章导读" if str(language).lower().startswith("zh") else "Chapter guide"
     return (
         f"% ARC-CHAPTER-GUIDE-BEGIN\n\\begin{{arcchapterguide}}\n"
         f"\\noindent\\textbf{{{heading}}}\\par\n"
         + "".join(parts)
         + "\\end{arcchapterguide}\n% ARC-CHAPTER-GUIDE-END\n"
+    )
+
+
+def _chapter_guide_has_content(guide: dict[str, Any]) -> bool:
+    if any(
+        str(guide.get(key) or "").strip()
+        for key in ("motivation", "main_content", "section_logic", "prerequisites")
+    ):
+        return True
+    comparison = guide.get("pedagogical_comparison")
+    if isinstance(comparison, dict) and str(comparison.get("text") or "").strip():
+        return True
+    return any(
+        isinstance(item, dict) and str(item.get("text") or "").strip()
+        for item in guide.get("historical_context") or []
+    ) or any(
+        isinstance(item, dict)
+        and str(item.get("title") or "").strip()
+        and str(item.get("reason") or "").strip()
+        for item in guide.get("supplementary_reading") or []
     )
 
 
@@ -1518,9 +1864,13 @@ def _inclusive_block_ids(blocks: list[dict[str, Any]], *, start: str, end: str) 
 
 
 def _render_bibliography(
-    items: list[dict[str, Any]], *, rendered_links: list[dict[str, str]]
+    items: list[dict[str, Any]], *, rendered_links: list[dict[str, str]],
+    include_heading: bool = True,
 ) -> str:
-    lines = ["\\section*{References}", "\\begin{thebibliography}{9999}"]
+    lines = []
+    if include_heading:
+        lines.append("\\section*{References}")
+    lines.append("\\begin{thebibliography}{9999}")
     for index, item in enumerate(items, 1):
         label = str(item.get("label") or item.get("display_label") or index)
         key = _safe_label(item.get("id") or item.get("bib_id") or f"ref-{index}")

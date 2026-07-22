@@ -99,6 +99,12 @@ def advance_block(
     if validation_receipt is not None:
         block["validation_receipt"] = dict(validation_receipt)
     if state == "accepted" and current != "accepted":
+        # A normal generation after a staged artifact failed local validation
+        # must not leave the rejected deferred payload attached to the newly
+        # accepted block.
+        for key in list(block):
+            if key.startswith("deferred_"):
+                block.pop(key, None)
         predecessor = str(ledger.get("accepted_chain_sha256") or _hash(""))
         block["predecessor_accepted_chain_sha256"] = predecessor
         block["accepted_chain_sha256"] = _hash(json.dumps({
@@ -170,7 +176,13 @@ def clear_needs_supervision(path: Path) -> dict[str, Any]:
     return ledger
 
 
-def invalidate_suffix(path: Path, *, from_segment_id: str, generation: int) -> dict[str, Any]:
+def invalidate_suffix(
+    path: Path,
+    *,
+    from_segment_id: str,
+    generation: int,
+    staged_outputs: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     ledger = _read(path)
     index = _block_index(ledger, from_segment_id)
     source_generation = int(ledger.get("generation") or 1)
@@ -179,12 +191,45 @@ def invalidate_suffix(path: Path, *, from_segment_id: str, generation: int) -> d
         raise LaneLedgerError("only an accepted prefix may be preserved")
     suffix = []
     for item in ledger["blocks"][index:]:
-        suffix.append({
+        replacement = {
             "segment_id": item["segment_id"],
             "state": "prepared",
             "submission_state": "not_submitted",
             "generation": generation,
-        })
+        }
+        staged = (staged_outputs or {}).get(str(item["segment_id"]))
+        if not isinstance(staged, Mapping):
+            prior_receipt = item.get("deferred_logical_receipt")
+            # Targeted regeneration may crash after invalidating the suffix.
+            # Preserve only its explicitly staged suffix payloads on re-entry;
+            # other deferred candidates belong to migration/reuse policy and
+            # must not silently survive an unrelated generation restart.
+            if (
+                isinstance(prior_receipt, Mapping)
+                and prior_receipt.get("kind")
+                == "targeted_regeneration_suffix_stage"
+                and isinstance(item.get("deferred_output"), Mapping)
+            ):
+                staged = {
+                    "output": item.get("deferred_output"),
+                    "output_sha256": item.get("deferred_output_sha256"),
+                    "logical_receipt": prior_receipt,
+                    "validation_receipt": item.get(
+                        "deferred_validation_receipt"
+                    ),
+                }
+        if isinstance(staged, Mapping):
+            replacement.update({
+                "deferred_output": staged.get("output"),
+                "deferred_output_sha256": staged.get("output_sha256"),
+                "deferred_logical_receipt": dict(
+                    staged.get("logical_receipt") or {}
+                ),
+                "deferred_validation_receipt": dict(
+                    staged.get("validation_receipt") or {}
+                ),
+            })
+        suffix.append(replacement)
     ledger["blocks"] = prefix + suffix
     ledger["generation"] = generation
     suffix_ids = {str(item["segment_id"]) for item in suffix}
@@ -265,6 +310,104 @@ def accept_reused_block(
             "provider_calls": 0,
         },
         "validation_receipt": dict(validation_receipt),
+        "predecessor_accepted_chain_sha256": predecessor,
+    })
+    block["accepted_chain_sha256"] = _hash(json.dumps({
+        "predecessor": predecessor,
+        "segment_id": segment_id,
+        "input_sha256": input_sha256,
+        "output_sha256": output_sha256,
+        "generation": block.get("generation"),
+    }, sort_keys=True, separators=(",", ":")))
+    ledger["blocks"][index] = block
+    ledger["accepted_chain_sha256"] = block["accepted_chain_sha256"]
+    ledger["updated_at"] = time.time()
+    _write(path, ledger)
+    return ledger
+
+
+def accept_deferred_block(
+    path: Path,
+    *,
+    segment_id: str,
+    input_sha256: str,
+    output_sha256: str,
+    logical_receipt: Mapping[str, Any],
+    validation_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Accept a staged, locally revalidated hit after its predecessor arrives."""
+
+    ledger = _read(path)
+    index = _block_index(ledger, segment_id)
+    block = dict(ledger["blocks"][index])
+    if block.get("state") != "prepared" or block.get("submission_state") != "not_submitted":
+        raise LaneLedgerError(f"cannot accept deferred non-prepared block {segment_id}")
+    if index and str(ledger["blocks"][index - 1].get("state")) != "accepted":
+        raise LaneLedgerError(f"cannot accept deferred {segment_id} before its predecessor")
+    staged_output_sha256 = block.get("deferred_output_sha256")
+    if (
+        staged_output_sha256 is not None
+        and str(staged_output_sha256) != output_sha256
+    ):
+        raise LaneLedgerError(f"deferred output hash changed for {segment_id}")
+    predecessor = str(ledger.get("accepted_chain_sha256") or _hash(""))
+    for key in list(block):
+        if key.startswith("deferred_"):
+            block.pop(key, None)
+    block.update({
+        "state": "accepted",
+        "submission_state": "not_submitted",
+        "input_sha256": input_sha256,
+        "output_sha256": output_sha256,
+        "logical_receipt": dict(logical_receipt),
+        "validation_receipt": dict(validation_receipt),
+        "predecessor_accepted_chain_sha256": predecessor,
+    })
+    block["accepted_chain_sha256"] = _hash(json.dumps({
+        "predecessor": predecessor,
+        "segment_id": segment_id,
+        "input_sha256": input_sha256,
+        "output_sha256": output_sha256,
+        "generation": block.get("generation"),
+    }, sort_keys=True, separators=(",", ":")))
+    ledger["blocks"][index] = block
+    ledger["accepted_chain_sha256"] = block["accepted_chain_sha256"]
+    ledger["updated_at"] = time.time()
+    _write(path, ledger)
+    return ledger
+
+
+def accept_controller_skipped_block(
+    path: Path,
+    *,
+    segment_id: str,
+    input_sha256: str,
+    output_sha256: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Accept a deterministic no-provider lane item while retaining audit lineage."""
+    ledger = _read(path)
+    index = _block_index(ledger, segment_id)
+    block = dict(ledger["blocks"][index])
+    if block.get("state") != "prepared" or block.get("submission_state") != "not_submitted":
+        raise LaneLedgerError(f"cannot locally skip non-prepared block {segment_id}")
+    if index and str(ledger["blocks"][index - 1].get("state")) != "accepted":
+        raise LaneLedgerError(f"cannot locally skip {segment_id} before its predecessor is accepted")
+    predecessor = str(ledger.get("accepted_chain_sha256") or _hash(""))
+    block.update({
+        "state": "accepted",
+        "submission_state": "not_submitted",
+        "input_sha256": input_sha256,
+        "output_sha256": output_sha256,
+        "logical_receipt": {
+            "kind": "controller_skipped_structural_heading",
+            "reason": reason,
+            "provider_calls": 0,
+        },
+        "validation_receipt": {
+            "local_validation": True,
+            "structural_only": True,
+        },
         "predecessor_accepted_chain_sha256": predecessor,
     })
     block["accepted_chain_sha256"] = _hash(json.dumps({

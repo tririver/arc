@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping
 
 from .io import read_json, write_json
 
 
-SCHEMA_VERSION = "arc.companion.resume-transaction.v2"
+SCHEMA_VERSION = "arc.companion.resume-transaction.v3"
 LEGACY_SCHEMA_VERSION = "arc.companion.resume-transaction.v1"
+LEGACY_V2_SCHEMA_VERSION = "arc.companion.resume-transaction.v2"
 ENTRY_STATES = ("pending", "authorized", "reconciling", "resolved")
 TRANSACTION_STATES = (
     "prepared", "continuing", "complete", "continuation_failed",
@@ -37,6 +39,8 @@ def load_transaction(project_dir: Path) -> dict[str, Any] | None:
         raise ValueError(f"Invalid resume transaction journal: {path}")
     if value.get("schema_version") == LEGACY_SCHEMA_VERSION:
         value = _upgrade_v1(value)
+    if value.get("schema_version") == LEGACY_V2_SCHEMA_VERSION:
+        value = _upgrade_v2(value)
         write_json(path, value)
     if value.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"Invalid resume transaction journal: {path}")
@@ -55,6 +59,9 @@ def begin_transaction(
     entries: list[Mapping[str, Any]],
     native_resume_contexts: list[Mapping[str, Any]] | None = None,
     policy: str | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_fingerprint: str | None = None,
+    authorization_source: str | None = None,
 ) -> dict[str, Any]:
     normalized_policy = _policy(action, policy)
     existing = load_transaction(project_dir)
@@ -72,6 +79,12 @@ def begin_transaction(
         "schema_version": SCHEMA_VERSION,
         "action": action,
         "policy": normalized_policy,
+        "checkpoint_path": _canonical_path(checkpoint_path),
+        "checkpoint_fingerprint": str(checkpoint_fingerprint or ""),
+        "authorization_source": str(
+            authorization_source
+            or ("recovery_policy_auto" if normalized_policy == "auto" else "operator")
+        ),
         "action_history": [{
             "action": action, "policy": normalized_policy, "at": now,
             "reason": "transaction_started",
@@ -87,6 +100,61 @@ def begin_transaction(
     }
     write_json(transaction_path(project_dir), value)
     return value
+
+
+def bind_transaction_checkpoint(
+    project_dir: Path,
+    *,
+    checkpoint_path: str | Path,
+    checkpoint_fingerprint: str,
+) -> dict[str, Any]:
+    """Bind recovery to one checkpoint, archiving any mixed/foreign journal verbatim."""
+
+    path = transaction_path(project_dir)
+    target = _canonical_path(checkpoint_path)
+    if not path.is_file():
+        return {"archived": False, "archive_path": None}
+    raw = path.read_bytes()
+    try:
+        value = read_json(path)
+    except Exception:
+        value = {}
+    recorded = _canonical_path(value.get("checkpoint_path")) if isinstance(value, dict) else ""
+    recorded_fingerprint = str(
+        value.get("checkpoint_fingerprint") or ""
+    ) if isinstance(value, dict) else ""
+    roots = _journal_checkpoint_paths(value if isinstance(value, dict) else {})
+    incompatible = bool(
+        (recorded and recorded != target)
+        or (
+            recorded_fingerprint
+            and recorded_fingerprint != checkpoint_fingerprint
+        )
+        or len(roots) > 1
+        or (roots and target not in roots)
+    )
+    if incompatible:
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archive = (
+            path.parent / "resume-transactions" / "archive"
+            / f"{stamp}-{digest}.json"
+        )
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        path.replace(archive)
+        return {"archived": True, "archive_path": str(archive)}
+    transaction = load_transaction(project_dir)
+    if transaction is not None and (
+        transaction.get("checkpoint_path") != target
+        or transaction.get("checkpoint_fingerprint") != checkpoint_fingerprint
+    ):
+        transaction.update({
+            "checkpoint_path": target,
+            "checkpoint_fingerprint": checkpoint_fingerprint,
+            "updated_at": _now(),
+        })
+        write_json(path, transaction)
+    return {"archived": False, "archive_path": None}
 
 
 def upgrade_transaction_action(
@@ -304,19 +372,30 @@ def claim_automatic_restart(
     abandoned_logical_key: str = "",
     possible_duplicate_charge: bool = False,
     suffix_start_segment_id: str | None = None,
+    group_id: str | None = None,
+    max_auto_replacements: int | None = None,
+    authorization_source: str = "recovery_policy_auto",
 ) -> dict[str, Any]:
-    """Claim the one automatic replacement, replaying the same claim idempotently."""
+    """Claim the next automatic group replacement, replaying it idempotently."""
 
     value = load_transaction(project_dir)
     if value is None:
         raise ValueError("Resume transaction journal is missing")
     canonical_ledger = _canonical_path(ledger_path)
-    budget_key = (str(session_key), str(segment_id))
+    group_id = str(group_id or f"{session_key}:{suffix_start_segment_id or segment_id}")
+    configured_max = int(
+        max_auto_replacements
+        or (value.get("recovery_options") or {}).get("max_auto_replacements")
+        or 3
+    )
+    if configured_max < 1:
+        raise ValueError("max_auto_replacements must be at least 1")
+    budget_key = (str(session_key), group_id)
     budgets = [dict(item) for item in value.get("restart_budgets") or []]
     replacements = [dict(item) for item in value.get("replacements") or []]
     existing = next((
         item for item in replacements
-        if (str(item.get("session_key") or ""), str(item.get("segment_id") or ""))
+        if (str(item.get("session_key") or ""), str(item.get("group_id") or ""))
         == budget_key
         and int(item.get("source_generation") or 0) == int(source_generation)
         and int(item.get("target_generation") or 0) == int(target_generation)
@@ -325,32 +404,42 @@ def claim_automatic_restart(
         return existing
     budget = next((
         item for item in budgets
-        if (str(item.get("session_key") or ""), str(item.get("segment_id") or ""))
+        if (str(item.get("session_key") or ""), str(item.get("group_id") or ""))
         == budget_key
     ), None)
-    if budget is not None and int(budget.get("attempts_used") or 0) >= 1:
+    attempts_used = int((budget or {}).get("attempts_used") or 0)
+    if attempts_used >= configured_max:
         raise AutomaticRegenerationExhausted(
-            f"automatic regeneration exhausted for {session_key}:{segment_id}"
+            f"automatic regeneration exhausted for {group_id} after {configured_max} attempts"
         )
     now = _now()
+    attempt = attempts_used + 1
     if budget is None:
         budget = {
-            "session_key": session_key, "segment_id": segment_id,
-            "attempts_used": 1, "max_auto_attempts": 1,
+            "session_key": session_key, "group_id": group_id,
+            "segment_id": segment_id,
+            "attempts_used": attempt, "max_auto_attempts": configured_max,
             "claimed_at": now,
         }
         budgets.append(budget)
     else:
-        budget.update({"attempts_used": 1, "claimed_at": now})
-    replacement_id = f"{session_key}:{segment_id}:replacement-1"
+        budget.update({
+            "attempts_used": attempt,
+            "max_auto_attempts": configured_max,
+            "claimed_at": now,
+        })
+    replacement_id = f"{group_id}:replacement-{attempt}"
     replacement = {
         "replacement_id": replacement_id,
         "session_key": session_key,
         "segment_id": segment_id,
+        "group_id": group_id,
         "ledger_path": canonical_ledger,
         "source_generation": int(source_generation),
         "target_generation": int(target_generation),
-        "attempt": 1,
+        "attempt": attempt,
+        "max_auto_attempts": configured_max,
+        "authorization_source": authorization_source,
         "abandoned_logical_key": abandoned_logical_key,
         "suffix_start_segment_id": suffix_start_segment_id or segment_id,
         "suffix_segment_ids": [str(value) for value in suffix_segment_ids],
@@ -384,6 +473,8 @@ def plan_replacement(
     trigger_reason: str,
     abandoned_logical_key: str = "",
     possible_duplicate_charge: bool = False,
+    group_id: str | None = None,
+    max_auto_replacements: int | None = None,
 ) -> dict[str, Any]:
     """Plan one budgeted replacement and return its durable crash-replay record."""
 
@@ -396,6 +487,8 @@ def plan_replacement(
         trigger_reason=trigger_reason,
         abandoned_logical_key=abandoned_logical_key,
         possible_duplicate_charge=possible_duplicate_charge,
+        group_id=group_id,
+        max_auto_replacements=max_auto_replacements,
     )
 
 
@@ -467,7 +560,7 @@ def _upgrade_v1(value: Mapping[str, Any]) -> dict[str, Any]:
         migrated_status = "continuation_failed"
     return {
         **dict(value),
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": LEGACY_V2_SCHEMA_VERSION,
         "status": migrated_status,
         "policy": "manual",
         "action_history": [{
@@ -481,6 +574,41 @@ def _upgrade_v1(value: Mapping[str, Any]) -> dict[str, Any]:
         "migrated_from": LEGACY_SCHEMA_VERSION,
         "updated_at": _now(),
     }
+
+
+def _upgrade_v2(value: Mapping[str, Any]) -> dict[str, Any]:
+    roots = _journal_checkpoint_paths(value)
+    policy = _policy(str(value.get("action") or "resume-native"), value.get("policy"))
+    return {
+        **dict(value),
+        "schema_version": SCHEMA_VERSION,
+        "checkpoint_path": next(iter(roots)) if len(roots) == 1 else "",
+        "checkpoint_fingerprint": "",
+        "authorization_source": (
+            "recovery_policy_auto" if policy == "auto" else "operator"
+        ),
+        "migrated_from": LEGACY_V2_SCHEMA_VERSION,
+        "updated_at": _now(),
+    }
+
+
+def _journal_checkpoint_paths(value: Mapping[str, Any]) -> set[str]:
+    roots: set[str] = set()
+    for item in [
+        *(value.get("entries") or []),
+        *(value.get("replacements") or []),
+    ]:
+        if not isinstance(item, Mapping) or not item.get("ledger_path"):
+            continue
+        path = Path(str(item["ledger_path"])).expanduser().resolve(strict=False)
+        parts = path.parts
+        try:
+            index = parts.index("checkpoints")
+        except ValueError:
+            continue
+        if index + 1 < len(parts):
+            roots.add(str(Path(*parts[: index + 2])))
+    return roots
 
 
 def _canonical_path(value: Any) -> str:

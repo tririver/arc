@@ -16,7 +16,7 @@ from .run_lock import BuildInProgressError, ProjectBuildLock
 
 
 RENDER_MODE = "render_only"
-PDF_RENDER_VERSION = "arc.companion.final-render.v10"
+PDF_RENDER_VERSION = "arc.companion.final-render.v11"
 
 
 def render_content(
@@ -77,6 +77,7 @@ def render_content(
                     "paper_id": state.get("paper_id"),
                     "translation_mode": content["translation_mode"],
                     "annotation_language": content["language"],
+                    "source_language": content.get("source_language") or "und",
                     "updated_at": state.get("updated_at"),
                 },
                 final_overrides=overrides,
@@ -126,6 +127,8 @@ def _render_pdf(
         evidence_by_segment=content["reader_evidence_by_segment"],
         augmentation_scope="substantive", chapters=content["chapters"],
         chapter_guides=content["chapter_guides"],
+        source_language=content.get("source_language") or "und",
+        title_translations=content.get("title_translations"),
     )
     fidelity_errors = validate_tex_fidelity(tex, content["document"], source_manifest)
     if fidelity_errors:
@@ -160,6 +163,7 @@ def _render_pdf(
             "render_version": PDF_RENDER_VERSION,
             "pdf": report,
             "fidelity_errors": [],
+            "warnings": list(source_manifest.get("render_warnings") or []),
         })
         _publish_replace(candidate_tex, tex_path)
         _publish_replace(candidate_pdf, pdf_path)

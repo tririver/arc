@@ -82,6 +82,7 @@ middle, and end sampling result without copying long source passages.
 ```bash
 arc-companion build <source-id> \
   --project-dir <project-dir> \
+  --source-language <source-language-tag> \
   --annotation-language <language> \
   --document-kind auto \
   --provider <provider> \
@@ -93,7 +94,8 @@ arc-companion build <source-id> \
 When Phase 1 selected `translation_mode=skip`, add `--skip-translation` to the
 build command. Otherwise omit it. Never pass the flag merely because source
 metadata, a title, or a short excerpt appears to match the target language.
-The CLI does not add a second language detector; this sampled agent decision is
+The CLI does not add a second language detector; pass the canonical BCP-47 tag
+from the sampled agent decision as `--source-language`. This decision remains
 the authoritative mode signal.
 
 Use `--recache` to rebuild cached parsing and PDF reconciliation, `--refresh`
@@ -209,8 +211,9 @@ suffix, and starts a new generation.
 
 The default `--recovery-policy auto` drains submitted work, replays durable
 responses, and attempts native session reconciliation before starting at most
-one replacement generation for an eligible blocked translation or commentary
-lane suffix. Inspect recovery state without mutation:
+three replacement generations by default for an eligible blocked translation
+or commentary lane suffix. `--max-auto-replacements N` changes that recovery
+budget without changing content fingerprints. Inspect recovery state without mutation:
 
 ```bash
 arc-companion status --project-dir <project-dir> --json
@@ -229,8 +232,10 @@ arc-companion resume --project-dir <project-dir> --action restart-generation \
 Explicit native recovery must not upgrade automatically. Use explicit restart
 only after accepting that an uncertain submitted call may be billed twice.
 Cancellation, authentication, quota, rate-limit, missing-source, local-I/O, and
-uncertain authoritative-identity failures remain supervised rather than being
-masked by replacement. The ledger must retain call IDs, hashes, accepted-chain predecessor,
+invalid-configuration failures remain supervised rather than being masked by
+replacement. Possible duplicate charging remains an audit warning under auto;
+strict native identity checks apply only to `resume-native`. The ledger must
+retain call IDs, hashes, accepted-chain predecessor,
 session and generation, native ID, usage, and validation receipt.
 
 For background builds, forward provider progress plus `chapter_prepared`,
@@ -265,6 +270,15 @@ commentary and do not create a translation layer. Distinguish layers by styling
 without visible `译文`, `伴读`, or controller labels; use `解释` where an
 explanation heading is needed.
 
+When translation is enabled, translate the document title, Part and Chapter
+titles, every section heading level, and source-only structural headings such
+as References and Index. Display the source title followed by its translation,
+and use the translation as the primary navigation label. Title translation is
+a separate document-level lane: never send titles to commentary or chapter
+guide generation. Keep figure/table captions and cited-paper titles unchanged.
+With `--skip-translation`, render each source title once and make no title
+translation call.
+
 For translated output, put the PDF glossary after references and before the
 document end. Keep one web entry point: append a standalone `#glossary` section
 to `index.html`, link it after the chapters in the sidebar, and lazy-mount large
@@ -276,9 +290,12 @@ source terms, source aliases, and target terms with subtle blue-gray text and a
 plain-text `source ↔ target` tooltip available on hover and keyboard focus.
 Never split math, URLs, citation/link text, or KaTeX-rendered DOM.
 
-Use sans-serif text for source, guide, translation, commentary, and glossary,
-with CJK fallbacks `Noto Sans CJK SC`, `Source Han Sans SC/CN`, then
-`FandolHei-Regular`. Keep mathematics and formula `\\text{}` in LaTeX serif.
+Use sans-serif text for source, guide, translation, commentary, and glossary.
+Select offline font fallbacks from both source and target language: common LTR
+scripts use Noto/DejaVu, and CJK uses the appropriate SC/TC/JP/KR family. Keep
+mathematics and formula `\\text{}` in LaTeX serif. HTML must mark each layer's
+`lang` and `dir`; RTL PDF layout is best-effort and must emit a warning rather
+than claiming full bidi support.
 Copy original text and source objects only from the pinned rich source.
 Render every direct citation with its title linked to the source URL and its
 locator visible. Preserve the per-segment citation objects unchanged in the

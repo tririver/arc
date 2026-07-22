@@ -292,7 +292,8 @@ def test_long_chapter_guide_resumes_bounded_windows_before_final(tmp_path) -> No
             return {"window_received": int(label.rsplit("-", 1)[1])}
         return {
             "motivation": None, "main_content": "content", "section_logic": None,
-            "book_position": None, "prerequisites": None, "supplementary_reading": [],
+            "prerequisites": None, "pedagogical_comparison": None,
+            "historical_context": [], "supplementary_reading": [],
         }
 
     result = generate_chapter_guide(

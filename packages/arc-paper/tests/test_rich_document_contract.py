@@ -165,7 +165,7 @@ def test_legacy_centered_preamble_has_structural_front_matter_roles_and_ids() ->
     )
     document = parsed["document"]
 
-    assert document["parser_version"] == service.RICH_PARSER_VERSION == 4
+    assert document["parser_version"] == service.RICH_PARSER_VERSION == 5
     assert document["front_matter"] == {
         "title": "A Legacy Title",
         "authors": ["First Author 1 and Second Author 2"],
@@ -239,10 +239,73 @@ def test_inline_runs_separate_text_math_citations_and_links_with_stable_tokens()
 
     assert [item["kind"] for item in runs] == ["text", "math", "text", "citation", "text", "link", "text", "math", "text"]
     assert [item.get("tex") for item in runs if item["kind"] == "math"] == [r"t_{NL}", r"f_{NL}^{2}"]
+    assert [item.get("separator_before") for item in runs] == [
+        None, " ", " ", " ", None, " ", " ", " ", None,
+    ]
     assert [(item["token_id"], item["content_hash"]) for item in runs] == [
         (item["token_id"], item["content_hash"]) for item in second["inline_runs"]
     ]
     assert len({item["token_id"] for item in runs}) == len(runs)
+
+
+def test_inline_run_separators_preserve_explicit_adjacency_without_changing_tokens():
+    spaced = r"""
+    <article class="ltx_document"><p id="p1">A <math alttext="x"/> B
+      <a href="https://example.test">link</a> C
+      <a class="ltx_ref" href="#bib.bib1">[1]</a> D</p></article>
+    """
+    adjacent = r"""
+    <article class="ltx_document"><p id="p1">A<math alttext="x"/>B<a
+      href="https://example.test">link</a>C<a class="ltx_ref"
+      href="#bib.bib1">[1]</a>D</p></article>
+    """
+
+    spaced_runs = parse_source_input(
+        html_text=spaced, source_id="inline-spaced",
+    )["document"]["blocks"][0]["inline_runs"]
+    adjacent_runs = parse_source_input(
+        html_text=adjacent, source_id="inline-adjacent",
+    )["document"]["blocks"][0]["inline_runs"]
+
+    assert [run["kind"] for run in spaced_runs] == [
+        "text", "math", "text", "link", "text", "citation", "text",
+    ]
+    assert [run.get("separator_before") for run in spaced_runs] == [
+        None, " ", " ", " ", " ", " ", " ",
+    ]
+    assert all("separator_before" not in run for run in adjacent_runs)
+    assert [
+        (run["token_id"], run["content_hash"]) for run in spaced_runs
+    ] == [
+        (run["token_id"], run["content_hash"]) for run in adjacent_runs
+    ]
+
+
+def test_inline_anchor_internal_boundary_whitespace_is_preserved_outside_hashes():
+    spaced = (
+        '<article><p id="p1">A<a href="https://example.test"> link </a>B'
+        '<a class="ltx_ref" href="#bib.1"> [1] </a>C</p></article>'
+    )
+    adjacent = (
+        '<article><p id="p1">A<a href="https://example.test">link</a>B'
+        '<a class="ltx_ref" href="#bib.1">[1]</a>C</p></article>'
+    )
+    spaced_runs = parse_source_input(
+        html_text=spaced, source_id="anchor-space",
+    )["document"]["blocks"][0]["inline_runs"]
+    adjacent_runs = parse_source_input(
+        html_text=adjacent, source_id="anchor-adjacent",
+    )["document"]["blocks"][0]["inline_runs"]
+
+    assert [run.get("separator_before") for run in spaced_runs] == [
+        None, " ", " ", " ", " ",
+    ]
+    assert all("separator_before" not in run for run in adjacent_runs)
+    assert [
+        (run["token_id"], run["content_hash"]) for run in spaced_runs
+    ] == [
+        (run["token_id"], run["content_hash"]) for run in adjacent_runs
+    ]
 
 
 def test_display_equation_layout_preserves_rows_cells_alignment_breaks_and_identity():

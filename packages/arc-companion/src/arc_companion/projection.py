@@ -11,10 +11,20 @@ NON_TRANSLATABLE_TYPES = {
     "bibliography", "bibliography_item", "reference",
 }
 
+STRUCTURAL_TYPES = {
+    "heading", "section", "subsection", "subsubsection", "chapter", "part",
+}
+
+
+def is_structural(block: dict[str, Any]) -> bool:
+    """Return whether a block is a source heading preserved only for navigation."""
+    kind = str(block.get("type") or block.get("kind") or "").casefold()
+    return kind in STRUCTURAL_TYPES
+
 
 def is_translatable(block: dict[str, Any]) -> bool:
     kind = str(block.get("type") or block.get("kind") or "").casefold()
-    if kind in NON_TRANSLATABLE_TYPES:
+    if kind in NON_TRANSLATABLE_TYPES or is_structural(block):
         return False
     return bool(str(block.get("text") or block.get("title") or "").strip())
 
@@ -25,9 +35,11 @@ def translation_input_block(block: dict[str, Any]) -> dict[str, Any]:
     text = str(block.get("text") or block.get("title") or "")
     if inline_runs:
         text = "".join(
-            str(run.get("content") or "")
-            if str(run.get("kind") or "") == "text"
-            else opaque_inline_token(run)
+            str(run.get("separator_before") or "") + (
+                str(run.get("content") or "")
+                if str(run.get("kind") or "") == "text"
+                else opaque_inline_token(run)
+            )
             for run in inline_runs
             if isinstance(run, dict)
         )
@@ -65,7 +77,7 @@ def annotation_input_block(
     kind = str(block.get("type") or block.get("kind") or "text")
     value: dict[str, Any] = {"block_id": block_id(block), "type": kind}
     for key in (
-        "text", "title", "caption", "section_id", "section_title", "level",
+        "text", "title", "caption", "section_id", "level",
         "items", "list_items",
     ):
         if key in block:

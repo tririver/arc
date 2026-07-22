@@ -114,15 +114,41 @@ def test_translation_is_revalidated_and_imported_as_accepted_ledger_prefix() -> 
     assert block["translation"]["blocks"][0]["text"] == "Einstein 质量"
 
 
-@pytest.mark.parametrize(
-    ("text", "reason"),
-    [
-        ("Einstein mass", "terminology_mismatch"),
-        ("质量", "protected_name_mismatch"),
-    ],
-)
-def test_translation_rejects_terminology_and_protected_name_failures(text: str, reason: str) -> None:
-    blocks, segments, candidates = _translation_fixture(text=text)
+def test_translation_projection_drops_legacy_structural_heading_output() -> None:
+    blocks = [
+        {"block_id": "h1", "type": "section", "title": "Introduction"},
+        {"block_id": "b1", "kind": "prose", "text": "Einstein mass"},
+    ]
+    segments = [{
+        "chapter_id": "ch-0001", "segment_id": "ch-0001.seg-0001",
+        "block_ids": ["h1", "b1"],
+    }]
+    candidates = {"old": {
+        "block_ids": ["h1", "b1"], "source_hash": "source", "language": "Chinese",
+        "translation": {"blocks": [
+            {"block_id": "h1", "text": "引言"},
+            {"block_id": "b1", "text": "Einstein 质量"},
+        ]},
+    }}
+
+    result = migrate_legacy_translations(
+        candidates, metadata={}, blocks=blocks,
+        chapters=[{"chapter_id": "ch-0001", "block_ids": ["h1", "b1"]}],
+        segments=segments, source_hash="source", language="Chinese",
+        glossary={"entries": [{"source": "mass", "target": "质量"}]},
+        protected_names=["Einstein"],
+    )
+
+    receipt = result["receipts"][0]
+    assert receipt["accepted"] is True
+    assert receipt["dropped_structural_block_ids"] == ["h1"]
+    assert result["ledgers"]["ch-0001"]["blocks"][0]["translation"] == {
+        "blocks": [{"block_id": "b1", "text": "Einstein 质量"}],
+    }
+
+
+def test_translation_reuses_terminology_mismatch_with_warning() -> None:
+    blocks, segments, candidates = _translation_fixture(text="Einstein mass")
     result = migrate_legacy_translations(
         candidates, metadata={}, blocks=blocks,
         chapters=[{"chapter_id": "ch-0001", "block_ids": ["b1"]}], segments=segments,
@@ -130,8 +156,120 @@ def test_translation_rejects_terminology_and_protected_name_failures(text: str, 
         glossary={"entries": [{"source": "mass", "target": "质量"}]},
         protected_names=["Einstein"],
     )
-    assert result["receipts"][0]["reason"] == reason
+    receipt = result["receipts"][0]
+    block = result["ledgers"]["ch-0001"]["blocks"][0]
+    assert receipt["accepted"] is True
+    assert receipt["status"] == receipt["reason"] == "warning_reuse"
+    assert receipt["terminology_warnings"] == ["mass"]
+    assert block["state"] == "accepted"
+    assert block["validation_receipt"]["terminology"] is False
+    assert block["validation_receipt"]["terminology_warnings"] == ["mass"]
+    assert block["validation_receipt"]["reuse_status"] == "warning_reuse"
+
+
+def test_translation_still_rejects_protected_name_failure() -> None:
+    blocks, segments, candidates = _translation_fixture(text="质量")
+    result = migrate_legacy_translations(
+        candidates, metadata={}, blocks=blocks,
+        chapters=[{"chapter_id": "ch-0001", "block_ids": ["b1"]}], segments=segments,
+        source_hash="source", language="Chinese",
+        glossary={"entries": [{"source": "mass", "target": "质量"}]},
+        protected_names=["Einstein"],
+    )
+    assert result["receipts"][0]["reason"] == "protected_name_mismatch"
     assert result["ledgers"]["ch-0001"]["blocks"][0]["state"] == "prepared"
+
+
+def test_translation_blocks_compose_across_merged_and_split_segments() -> None:
+    blocks = [
+        {"block_id": f"b{index}", "kind": "prose", "text": f"Source {index}"}
+        for index in range(1, 4)
+    ]
+    candidates = {
+        "old-1": {
+            "block_ids": ["b1", "b2"], "source_hash": "source", "language": "Chinese",
+            "translation": {"blocks": [
+                {"block_id": "b1", "text": "译文一"},
+                {"block_id": "b2", "text": "译文二"},
+            ]},
+        },
+        "old-2": {
+            "block_ids": ["b3"], "source_hash": "source", "language": "Chinese",
+            "translation": {"blocks": [{"block_id": "b3", "text": "译文三"}]},
+        },
+    }
+    segments = [
+        {"chapter_id": "ch-0001", "segment_id": "new-1", "block_ids": ["b1"]},
+        {"chapter_id": "ch-0001", "segment_id": "new-2", "block_ids": ["b2", "b3"]},
+    ]
+
+    result = migrate_legacy_translations(
+        candidates, metadata={}, blocks=blocks,
+        chapters=[{"chapter_id": "ch-0001", "block_ids": ["b1", "b2", "b3"]}],
+        segments=segments, source_hash="source", language="Chinese",
+        glossary={"entries": []}, protected_names=[],
+    )
+
+    assert [item["status"] for item in result["receipts"]] == [
+        "composed_hit", "composed_hit",
+    ]
+    ledger_blocks = result["ledgers"]["ch-0001"]["blocks"]
+    assert [item["state"] for item in ledger_blocks] == ["accepted", "accepted"]
+    assert ledger_blocks[0]["translation"]["blocks"] == [
+        {"block_id": "b1", "text": "译文一"},
+    ]
+    assert [item["block_id"] for item in ledger_blocks[1]["translation"]["blocks"]] == [
+        "b2", "b3",
+    ]
+
+
+def test_valid_suffix_translation_is_persisted_as_deferred_hit() -> None:
+    blocks = [
+        {"block_id": f"b{index}", "kind": "prose", "text": f"Source {index}"}
+        for index in range(1, 4)
+    ]
+    candidates = {
+        "first": {
+            "block_ids": ["b1"], "source_hash": "source", "language": "Chinese",
+            "translation": {"blocks": [{"block_id": "b1", "text": "译文一"}]},
+        },
+        "third": {
+            "block_ids": ["b3"], "source_hash": "source", "language": "Chinese",
+            "translation": {"blocks": [{"block_id": "b3", "text": "译文三"}]},
+        },
+    }
+    segments = [
+        {"chapter_id": "ch-0001", "segment_id": f"s{index}", "block_ids": [f"b{index}"]}
+        for index in range(1, 4)
+    ]
+
+    result = migrate_legacy_translations(
+        candidates, metadata={}, blocks=blocks,
+        chapters=[{"chapter_id": "ch-0001", "block_ids": ["b1", "b2", "b3"]}],
+        segments=segments, source_hash="source", language="Chinese",
+        glossary={"entries": []}, protected_names=[],
+    )
+
+    assert result["receipts"][1]["reason"] == "translation_missing_or_ambiguous"
+    deferred_receipt = result["receipts"][2]
+    assert deferred_receipt["accepted"] is False
+    assert deferred_receipt["status"] == deferred_receipt["reason"] == "deferred_hit"
+    ledger = result["ledgers"]["ch-0001"]
+    first, missing, deferred = ledger["blocks"]
+    assert first["state"] == "accepted"
+    assert missing == {
+        "segment_id": "s2", "state": "prepared",
+        "submission_state": "not_submitted", "generation": 1,
+    }
+    assert deferred["state"] == "prepared"
+    assert deferred["deferred_translation"] == {
+        "blocks": [{"block_id": "b3", "text": "译文三"}],
+    }
+    assert deferred["deferred_input_sha256"]
+    assert deferred["deferred_output_sha256"]
+    assert deferred["deferred_validation_receipt"]["reuse_status"] == "deferred_hit"
+    assert ledger["accepted_chain_sha256"] == first["accepted_chain_sha256"]
+    assert "accepted_chain_sha256" not in deferred
 
 
 def test_translation_rejects_opaque_token_loss() -> None:

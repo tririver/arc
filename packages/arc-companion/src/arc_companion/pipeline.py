@@ -25,12 +25,18 @@ from .content import (
     reader_content_from_overrides,
     store_reader_content,
 )
-from .chapters import build_chapters
+from .chapters import CHAPTERS_VERSION, build_chapters
 from .artifact_store import AcceptedArtifactStore, canonical_sha256
 from .chapter_glossary import generate_index_glossary, project_segment_glossary
-from .chapter_guide import CHAPTER_GUIDE_VERSION, generate_chapter_guide
+from .chapter_guide import (
+    CHAPTER_GUIDE_VERSION,
+    chapter_guide_artifact_valid,
+    generate_chapter_guide,
+)
 from .chapter_scheduler import run_chapter_pipeline
 from .ledger import (
+    accept_deferred_block,
+    accept_controller_skipped_block,
     accept_reused_block,
     advance_block,
     clear_needs_supervision,
@@ -44,6 +50,7 @@ from .progress import CompanionProgress
 from .migration import (
     MIGRATION_VERSION,
     NEVER_MIGRATED_ARTIFACTS,
+    accepted_translation_projection_candidates,
     import_accepted_checkpoint_objects,
     legacy_translation_candidates,
     migrate_legacy_cuts,
@@ -51,7 +58,7 @@ from .migration import (
     migrate_legacy_translations,
     read_legacy_checkpoint,
 )
-from .glossary import generate_glossary
+from .glossary import GLOSSARY_VERSION, generate_glossary, glossary_entry_limit
 from .domain import load_domain_context
 from .evidence import (
     arc_cache_descriptor,
@@ -60,6 +67,7 @@ from .evidence import (
     validate_registry,
 )
 from .io import read_json, safe_name, sha256_file, sha256_json, write_json, write_text
+from .language import base_language, contains_lexical_term, normalize_language_tag
 from .latex import LatexError, render_companion_tex, validate_tex_fidelity
 from .pdf import compile_latex, validate_pdf
 from .prompts import (
@@ -70,8 +78,10 @@ from .prompts import (
     COMMENTARY_REVIEW_SCHEMA,
     REVIEW_SCHEMA,
     SECTION_REVIEW_SCHEMA,
+    COMMENTARY_PROMPT_VERSION,
     PROMPT_VERSION,
     SCHEMA_VERSION,
+    TRANSLATION_PROMPT_VERSION,
     TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION,
     TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION,
     TRANSLATION_RETRY_PROMPT_VERSION,
@@ -86,6 +96,7 @@ from .prompts import (
 )
 from .projection import (
     annotation_input_block as _project_annotation_input_block,
+    is_structural as _project_is_structural,
     is_translatable as _project_is_translatable,
     opaque_inline_token as _project_opaque_inline_token,
     opaque_inline_tokens as _project_opaque_inline_tokens,
@@ -101,11 +112,21 @@ from .segmentation import (
     SEGMENT_HARD_MAX_BLOCKS,
     SEGMENT_HARD_MAX_SOURCE_CHARS,
     SegmentationError,
+    construct_segments_from_cuts,
     segment_document,
     validate_exact_coverage,
 )
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
 from .substantive import non_substantive_block_ids
+from .title_translation import (
+    TITLE_TRANSLATION_PROMPT_VERSION,
+    TITLE_TRANSLATION_SCHEMA,
+    TITLE_TRANSLATION_VERSION,
+    chunk_title_records,
+    collect_title_records,
+    merge_title_translation_chunks,
+    title_translation_prompt,
+)
 from .stateful_pipeline import (
     ContextRolloverBudget,
     CorrectionBudget,
@@ -121,6 +142,8 @@ from .stateful_pipeline import (
 
 
 WORKFLOW_VERSION = "arc.companion.workflow.v13"
+CHAPTER_PROJECTION_VERSION = CHAPTERS_VERSION
+AUGMENTATION_PROJECTION_VERSION = "arc.companion.augmentation-projection.v2"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_WORKERS = 24
 DEFAULT_REVIEW_CONTEXT_CHARS = 140_000
@@ -142,18 +165,19 @@ ANNOTATION_PROMPT_MAX_BYTES = 60 * 1024
 ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
 ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
 REVIEW_TIER = "medium"
-REVIEW_VERSION = "arc.companion.review.v6"
+TITLE_TRANSLATION_TIER = "medium"
+REVIEW_VERSION = "arc.companion.review.v8"
 ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v7"
-SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v2"
-COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v2"
+SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v3"
+COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v3"
 SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
-FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v2"
+FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v3"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
-FINAL_RENDER_VERSION = "arc.companion.final-render.v10"
-READER_FINAL_CHECKPOINT_VERSION = "arc.companion.reader-final.v2"
+FINAL_RENDER_VERSION = "arc.companion.final-render.v11"
+READER_FINAL_CHECKPOINT_VERSION = "arc.companion.reader-final.v3"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
 CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
 CONTEXT_SEGMENT_CHARS_TOTAL = 12_000
@@ -270,6 +294,7 @@ class BuildOptions:
     paper_id: str
     project_dir: Path
     annotation_language: str = DEFAULT_LANGUAGE
+    source_language: str | None = None
     language_was_defaulted: bool = False
     provider: str = "auto"
     model: str | None = None
@@ -288,7 +313,9 @@ class BuildOptions:
     document_kind: str = "auto"
     idle_timeout_seconds: float | None = None
     recovery_policy: str = "auto"
+    max_auto_replacements: int = 3
     regenerate_lanes: tuple[str, ...] = ()
+    regenerate_segments: tuple[str, ...] = ()
     confirm_expensive_regeneration: bool = False
     regenerate_commentary: bool = False
     supervised_native_resume_keys: tuple[str, ...] = ()
@@ -309,6 +336,22 @@ class BuildOptions:
             raise ValueError("idle_timeout_seconds must be positive")
         if self.recovery_policy not in {"auto", "manual"}:
             raise ValueError("recovery_policy must be auto or manual")
+        if self.max_auto_replacements < 1:
+            raise ValueError("max_auto_replacements must be at least 1")
+        normalized_segments: list[str] = []
+        for raw in self.regenerate_segments:
+            lane, separator, segment_id = str(raw).partition(":")
+            if separator != ":" or lane not in {"translation", "commentary"} or not segment_id:
+                raise ValueError(
+                    "regenerate_segments entries must be translation:SEGMENT_ID "
+                    "or commentary:SEGMENT_ID"
+                )
+            value = f"{lane}:{segment_id}"
+            if value not in normalized_segments:
+                normalized_segments.append(value)
+        object.__setattr__(self, "regenerate_segments", tuple(normalized_segments))
+        source_language = str(self.source_language or "").strip() or None
+        object.__setattr__(self, "source_language", source_language)
         requested_regeneration = tuple(self.regenerate_lanes) + (
             ("commentary",) if self.regenerate_commentary else ()
         )
@@ -417,6 +460,7 @@ def _build_companion_unlocked(
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Build or resume one companion while keeping source and annotations separate."""
+    options = _with_effective_source_language(options)
     chapter_result_llm = result_llm
     if llm is None:
         from arc_llm import run_json
@@ -437,6 +481,7 @@ def _build_companion_unlocked(
         state_path,
         status="loading_source",
         paper_id=options.paper_id,
+        source_language=options.source_language,
         translation_mode="skipped" if options.skip_translation else "enabled",
         notice=notice,
         diagnostics=[],
@@ -510,11 +555,22 @@ def _build_companion_unlocked(
                         prompt=(
                             REVIEW_VERSION if lane == "review"
                             else CHAPTER_GUIDE_VERSION if lane == "guide"
+                            else TITLE_TRANSLATION_PROMPT_VERSION if lane == "title_translation"
+                            else _language_prompt_contract(
+                                TRANSLATION_PROMPT_VERSION, options,
+                            ) if lane == "translation"
+                            else _language_prompt_contract(
+                                COMMENTARY_PROMPT_VERSION, options,
+                            ) if lane == "commentary"
+                            else _language_prompt_contract(
+                                PROMPT_VERSION, options,
+                            ) if lane == "glossary"
                             else PROMPT_VERSION
                         ),
                         model=options.model,
                         tier={
                             "segmentation": SEGMENTATION_TIER, "glossary": GLOSSARY_TIER,
+                            "title_translation": TITLE_TRANSLATION_TIER,
                             "guide": ANNOTATION_TIER, "translation": TRANSLATION_TIER,
                             "commentary": ANNOTATION_TIER, "review": REVIEW_TIER,
                         }[lane],
@@ -525,20 +581,35 @@ def _build_companion_unlocked(
                                 "inherit_host_tools": options.inherit_host_tools,
                             }
                             if lane in {"translation", "commentary"}
+                            else {
+                                "provider": options.provider,
+                                "allow_internet": options.allow_internet,
+                                "inherit_host_tools": options.inherit_host_tools,
+                            }
+                            if lane == "guide"
                             else {"provider": options.provider, "allow_internet": False}
                         ),
                     )
-                    for lane in ("segmentation", "glossary", "guide", "translation", "commentary", "review")
+                    for lane in (
+                        "segmentation", "glossary", "title_translation", "guide",
+                        "translation", "commentary", "review",
+                    )
                 }
                 stale_lanes = {
                     lane for lane, recipe in current_recipes.items()
                     if any(item.get("recipe_sha256") != recipe for item in AcceptedArtifactStore(project_dir).iter_kind(lane))
                 }
                 for entry in plan.get("entries") or []:
-                    if options.skip_translation and entry.get("lane") == "glossary":
+                    if options.skip_translation and entry.get("lane") in {
+                        "glossary", "title_translation",
+                    }:
                         entry.update({
                             "status": "skipped", "artifact_id": None,
-                            "reason": "glossary_disabled_for_same_language_source",
+                            "reason": (
+                                "glossary_disabled_for_same_language_source"
+                                if entry.get("lane") == "glossary"
+                                else "title_translation_disabled_for_same_language_source"
+                            ),
                             "estimated_provider_calls": 0,
                         })
                         continue
@@ -576,6 +647,7 @@ def _build_companion_unlocked(
             checkpoint_dir=str(checkpoint_dir),
             translation_mode="skipped" if options.skip_translation else "enabled",
             annotation_language=options.annotation_language,
+            source_language=options.source_language,
             recovery_options=_recovery_options(options),
             notice=notice,
             diagnostics=list(diagnostics),
@@ -631,9 +703,16 @@ def _build_companion_unlocked(
             )
 
         def glossary_task() -> dict[str, Any]:
+            glossary_document = _augmentation_document(generation_document)
+            if not glossary_document.get("blocks"):
+                return _empty_glossary(
+                    language=options.annotation_language,
+                    page_count=_page_count(bundle),
+                )
             return generate_glossary(
-                generation_document,
+                glossary_document,
                 language=options.annotation_language,
+                source_language=options.source_language,
                 protected_names=initial_names,
                 checkpoint_dir=checkpoint_dir,
                 workers=options.workers,
@@ -659,6 +738,20 @@ def _build_companion_unlocked(
         )
         glossary = {} if options.skip_translation else glossary_task()
         protected_names = _protected_names(bundle, glossary=glossary)
+        title_translations = _generate_title_translations(
+            options=options,
+            bundle=bundle,
+            document=bundle.document,
+            chapters=[],
+            glossary=glossary,
+            protected_names=protected_names,
+            checkpoint_dir=checkpoint_dir,
+            call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
+                llm, prompt, schema, options=options,
+                artifact_dir=artifact_dir, call_label=call_label,
+                model_tier=TITLE_TRANSLATION_TIER,
+            ),
+        )
 
         accepted_translations: dict[str, dict[str, Any]] = {}
         accepted_annotations: dict[str, dict[str, Any]] = {}
@@ -686,6 +779,8 @@ def _build_companion_unlocked(
                     "glossary": glossary,
                     "metadata": bundle.metadata,
                     "language": options.annotation_language,
+                    "source_language": options.source_language,
+                    "title_translations": title_translations,
                     "translation_mode": (
                         "skipped" if options.skip_translation else "enabled"
                     ),
@@ -742,6 +837,8 @@ def _build_companion_unlocked(
             glossary=glossary,
             metadata=bundle.metadata,
             language=options.annotation_language,
+            source_language=options.source_language,
+            title_translations=title_translations,
             output_dir=project_dir,
             stem=f"{stem}_first_round_preview",
             manifest_name="first-round-preview-source-manifest.json",
@@ -909,6 +1006,8 @@ def _build_companion_unlocked(
             "glossary": glossary,
             "metadata": bundle.metadata,
             "language": options.annotation_language,
+            "source_language": options.source_language,
+            "title_translations": title_translations,
             "translation_mode": "skipped" if options.skip_translation else "enabled",
         }
         content_object = _store_reviewed_content(
@@ -933,6 +1032,8 @@ def _build_companion_unlocked(
             glossary=glossary,
             metadata=bundle.metadata,
             language=options.annotation_language,
+            source_language=options.source_language,
+            title_translations=title_translations,
             output_dir=project_dir,
             stem=stem,
             manifest_name="source-manifest.json",
@@ -967,6 +1068,10 @@ def _build_companion_unlocked(
             source_manifest_path=str(manifest_path),
             validation_path=str(validation_path),
             final_render_version=FINAL_RENDER_VERSION,
+            chapter_projection_version=CHAPTER_PROJECTION_VERSION,
+            augmentation_projection_version=AUGMENTATION_PROJECTION_VERSION,
+            chapter_guide_version=CHAPTER_GUIDE_VERSION,
+            reader_final_checkpoint_version=READER_FINAL_CHECKPOINT_VERSION,
             translation_mode="skipped" if options.skip_translation else "enabled",
             checkpoint_dir=str(checkpoint_dir),
             diagnostics=list(diagnostics),
@@ -1035,6 +1140,10 @@ def _build_chaptered_companion(
 ) -> dict[str, Any]:
     """Execute the chapter contract while retaining legacy runs for old caches."""
     regeneration = set(options.regenerate_lanes)
+    targeted_regeneration = set(options.regenerate_segments)
+    targeted_suffix_reuse: set[str] = set()
+    targeted_seen: set[str] = set()
+    targeted_lock = threading.Lock()
     artifact_store = AcceptedArtifactStore(options.project_dir.resolve())
     state_path = options.project_dir.resolve() / "state.json"
     document = bundle.document
@@ -1073,7 +1182,9 @@ def _build_chaptered_companion(
     object_migration = import_accepted_checkpoint_objects(
         options.project_dir.resolve(),
         validators={
-            "guide": lambda value: isinstance(value, dict),
+            "guide": lambda value: chapter_guide_artifact_valid(
+                value, evidence=evidence, allow_internet=options.allow_internet,
+            ),
             "translation": lambda value: isinstance(value, dict) and isinstance(value.get("blocks"), list),
             "commentary": lambda value: isinstance(value, dict) and isinstance(value.get("commentary"), str),
             "review": lambda value: isinstance(value, dict),
@@ -1086,6 +1197,15 @@ def _build_chaptered_companion(
         },
     )
     write_json(checkpoint_dir / "object-migration.json", object_migration)
+    accepted_translation_candidates = (
+        {}
+        if "translation" in regeneration else
+        accepted_translation_projection_candidates(
+            artifact_store,
+            source_hash=migration_source_hash,
+            language=options.annotation_language,
+        )
+    )
     initial_reuse_entries = []
     for chapter in chapters_pack["chapters"]:
         chapter_id = str(chapter["chapter_id"])
@@ -1112,6 +1232,20 @@ def _build_chaptered_companion(
             else "explicitly selected for regeneration"
             if "glossary" in regeneration
             else "no validated project glossary object selected"
+        ),
+        "estimated_provider_calls": 0 if options.skip_translation else 1,
+    })
+    initial_reuse_entries.insert(1, {
+        "chapter_id": "project", "segment_id": None,
+        "lane": "title_translation",
+        "status": "skipped" if options.skip_translation else "miss",
+        "artifact_id": None,
+        "reason": (
+            "title_translation_disabled_for_same_language_source"
+            if options.skip_translation
+            else "explicitly selected for regeneration"
+            if "translation" in regeneration
+            else "title translation lookup waits for the exact title projection"
         ),
         "estimated_provider_calls": 0 if options.skip_translation else 1,
     })
@@ -1197,6 +1331,18 @@ def _build_chaptered_companion(
             "never_migrated": list(NEVER_MIGRATED_ARTIFACTS),
         }
         write_json(checkpoint_dir / "legacy-migration.json", migration_report)
+    elif accepted_translation_candidates and not options.skip_translation:
+        migration_report = {
+            "schema_version": MIGRATION_VERSION,
+            "source_checkpoint_sha256": sha256_json(accepted_translation_candidates),
+            "source_kind": "accepted_artifact_store",
+            "read_only_source": True,
+            "cuts": cut_migration,
+            "glossary": glossary_migration,
+            "translations": {"ledgers": {}, "receipts": []},
+            "never_migrated": list(NEVER_MIGRATED_ARTIFACTS),
+        }
+        write_json(checkpoint_dir / "legacy-migration.json", migration_report)
     progress = CompanionProgress()
     supervision_event = threading.Event()
 
@@ -1224,13 +1370,14 @@ def _build_chaptered_companion(
         glossary: dict[str, Any] = {}
     else:
         glossary_input_hash = lane_semantic_sha256("glossary", {
-            "source": _generation_document(document),
+            "source": {"source_hash": migration_source_hash},
             "target_language": options.annotation_language,
             "index": index_pack,
-            "protected_names": initial_names,
+            "protected_names": [],
         })
         glossary_recipe_hash = lane_recipe_sha256(
-            "glossary", prompt=PROMPT_VERSION, model=options.model, tier=GLOSSARY_TIER,
+            "glossary", prompt=_language_prompt_contract(PROMPT_VERSION, options),
+            model=options.model, tier=GLOSSARY_TIER,
             access_recipe={"provider": options.provider, "allow_internet": False},
         )
         glossary_object = None if "glossary" in regeneration else artifact_store.find(
@@ -1239,6 +1386,37 @@ def _build_chaptered_companion(
             predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
             output_validator=lambda value: isinstance(value, dict) and isinstance(value.get("entries"), list),
         )
+        if glossary_object is None and "glossary" not in regeneration:
+            compatible_glossaries = []
+            for record in artifact_store.iter_kind("glossary"):
+                value = record.get("output")
+                provenance = record.get("provenance")
+                if not isinstance(value, dict) or not isinstance(provenance, Mapping):
+                    continue
+                old_checkpoint = Path(str(provenance.get("checkpoint_dir") or ""))
+                old_metadata = _read_checkpoint_json(
+                    old_checkpoint / "migration-metadata.json"
+                )
+                if not isinstance(old_metadata, dict):
+                    continue
+                if (
+                    old_metadata.get("source_hash") != migration_source_hash
+                    or value.get("language") != options.annotation_language
+                    or value.get("schema_version") != GLOSSARY_VERSION
+                    or not isinstance(value.get("entries"), list)
+                ):
+                    continue
+                try:
+                    artifact_store.validate(record)
+                except Exception:
+                    continue
+                compatible_glossaries.append(record)
+            if compatible_glossaries:
+                selected = max(
+                    compatible_glossaries,
+                    key=lambda item: float(item.get("created_at") or 0),
+                )
+                glossary_object = {**selected, "reuse_status": "warning_reuse"}
     if options.skip_translation:
         pass
     elif glossary_object is not None:
@@ -1247,6 +1425,7 @@ def _build_chaptered_companion(
             reason="accepted glossary remains valid under the current contract",
         )
         glossary = dict(glossary_object["output"])
+        write_json(checkpoint_dir / "glossary.json", glossary)
     elif glossary_migration.get("accepted"):
         glossary = dict(glossary_migration["value"])
     elif index_entries:
@@ -1256,11 +1435,21 @@ def _build_chaptered_companion(
             call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
         )
     else:
-        glossary = generate_glossary(
-            _generation_document(document), language=options.annotation_language,
-            protected_names=initial_names, checkpoint_dir=checkpoint_dir,
-            workers=options.workers, force="glossary" in regeneration, page_count=_page_count(bundle),
-            call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
+        glossary_document = _augmentation_document(document)
+        glossary = (
+            _empty_glossary(
+                language=options.annotation_language,
+                page_count=_page_count(bundle),
+            )
+            if not glossary_document.get("blocks")
+            else generate_glossary(
+                glossary_document, language=options.annotation_language,
+                source_language=options.source_language,
+                protected_names=initial_names, checkpoint_dir=checkpoint_dir,
+                workers=options.workers, force="glossary" in regeneration,
+                page_count=_page_count(bundle),
+                call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
+            )
         )
     if (
         not options.skip_translation
@@ -1276,6 +1465,23 @@ def _build_chaptered_companion(
             provider=options.provider, model=options.model,
         )
     protected_names = _protected_names(bundle, glossary=glossary)
+    title_translations = _generate_title_translations(
+        options=options,
+        bundle=bundle,
+        document=document,
+        chapters=(
+            list(chapters_pack["chapters"][:1])
+            if options.stop_after_first_chapter
+            else list(chapters_pack["chapters"])
+        ),
+        glossary=glossary,
+        protected_names=protected_names,
+        checkpoint_dir=checkpoint_dir,
+        artifact_store=artifact_store,
+        call_model=lambda prompt, schema, artifact_dir, call_label: model(
+            prompt, schema, artifact_dir, call_label, TITLE_TRANSLATION_TIER,
+        ),
+    )
     blocks_by_id = {block_id(item): item for item in document.get("blocks") or []}
     reader_publish_lock = threading.RLock()
     reader_data_lock = threading.RLock()
@@ -1311,6 +1517,8 @@ def _build_chaptered_companion(
                 "glossary": glossary,
                 "metadata": bundle.metadata,
                 "language": options.annotation_language,
+                "source_language": options.source_language,
+                "title_translations": title_translations,
                 "translation_mode": (
                     "skipped" if options.skip_translation else "enabled"
                 ),
@@ -1320,7 +1528,7 @@ def _build_chaptered_companion(
         if options.skip_translation:
             return {}
         return project_segment_glossary(
-            [blocks_by_id[value] for value in segment.get("block_ids") or [] if value in blocks_by_id],
+            _augmentation_blocks(segment, blocks_by_id),
             glossary,
         )
 
@@ -1330,8 +1538,13 @@ def _build_chaptered_companion(
             blocks_by_id[value] for value in chapter["block_ids"] if value in blocks_by_id
         ]}
         segmentation_input_hash = lane_semantic_sha256("segmentation", {
-            "source": chapter_document,
-            "chapter": chapter,
+            "source": {
+                "chapter_id": chapter_id,
+                "ordered_block_ids": [
+                    block_id(item) for item in chapter_document["blocks"]
+                ],
+            },
+            "chapter": {"chapter_id": chapter_id},
             "limits": {
                 "max_blocks": SEGMENT_HARD_MAX_BLOCKS,
                 "max_source_chars": SEGMENT_HARD_MAX_SOURCE_CHARS,
@@ -1349,6 +1562,37 @@ def _build_chaptered_companion(
             predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
             output_validator=lambda value: isinstance(value, list) and bool(value),
         )
+        if segmentation_object is None and "segmentation" not in regeneration:
+            compatible = []
+            expected_ids = [block_id(item) for item in chapter_document["blocks"]]
+            for record in artifact_store.iter_kind("segmentation"):
+                raw_output = record.get("output")
+                if not isinstance(raw_output, list) or not raw_output:
+                    continue
+                actual_ids = [
+                    str(identifier)
+                    for item in raw_output if isinstance(item, Mapping)
+                    for identifier in item.get("block_ids") or []
+                ]
+                if actual_ids != expected_ids:
+                    continue
+                cuts: list[int] = []
+                cursor = 0
+                for item in raw_output[:-1]:
+                    cursor += len(item.get("block_ids") or [])
+                    cuts.append(cursor)
+                try:
+                    augmented = construct_segments_from_cuts(cuts, chapter_document)
+                except SegmentationError:
+                    continue
+                compatible.append((float(record.get("created_at") or 0), record, augmented))
+            if compatible:
+                _created, selected, augmented = max(compatible, key=lambda item: item[0])
+                segmentation_object = {
+                    **selected,
+                    "output": augmented,
+                    "reuse_status": "hit",
+                }
         if segmentation_object is not None:
             mark_plan_lane(
                 "segmentation", chapter_id=chapter_id, artifact=segmentation_object,
@@ -1378,19 +1622,115 @@ def _build_chaptered_companion(
                      "segment_id": f"{chapter_id}.seg-{index:04d}"}
                     for index, item in enumerate(raw, 1)]
         for requested_lane, ledger_lane in (("translation", "translation"), ("commentary", "companion")):
-            if requested_lane not in regeneration or (requested_lane == "translation" and options.skip_translation):
+            chapter_targets = [
+                str(item["segment_id"]) for item in segments
+                if f"{requested_lane}:{item['segment_id']}" in targeted_regeneration
+            ]
+            if (
+                requested_lane not in regeneration and not chapter_targets
+            ) or (requested_lane == "translation" and options.skip_translation):
                 continue
             ledger_path = checkpoint_dir / "chapters" / chapter_id / f"{ledger_lane}-ledger.json"
             if not ledger_path.is_file():
+                # A precise target on a fresh lane still has valid semantics:
+                # run_lane will force that segment while ordinary cache rules
+                # apply to the rest. Do not report the requested segment as
+                # missing merely because there was no suffix ledger to stage.
+                if chapter_targets:
+                    with targeted_lock:
+                        targeted_seen.update(
+                            f"{requested_lane}:{value}"
+                            for value in chapter_targets
+                        )
                 continue
             ledger = initialize_lane_ledger(
                 ledger_path, chapter_id=chapter_id, lane=ledger_lane,
                 segment_ids=[str(item["segment_id"]) for item in segments],
             )
             generation = int(ledger.get("generation") or 1) + 1
-            invalidate_suffix(
-                ledger_path, from_segment_id=str(segments[0]["segment_id"]), generation=generation,
+            start_segment_id = (
+                str(segments[0]["segment_id"])
+                if requested_lane in regeneration else chapter_targets[0]
             )
+            staged_outputs: dict[str, dict[str, Any]] = {}
+            if chapter_targets:
+                start_index = next(
+                    index for index, item in enumerate(ledger["blocks"])
+                    if str(item["segment_id"]) == start_segment_id
+                )
+                for old_block in ledger["blocks"][start_index:]:
+                    old_segment_id = str(old_block.get("segment_id") or "")
+                    if (
+                        old_segment_id in chapter_targets
+                        or old_block.get("state") != "accepted"
+                    ):
+                        continue
+                    output = old_block.get("translation")
+                    if not isinstance(output, dict):
+                        artifact_kind = (
+                            "translations" if requested_lane == "translation"
+                            else "annotations"
+                        )
+                        artifact_dir = _generation_segment_artifact_dir(
+                            checkpoint_dir, artifact_kind, old_segment_id,
+                            int(old_block.get("generation") or ledger.get("generation") or 1),
+                        )
+                        payload = _read_checkpoint_json(
+                            artifact_dir
+                            / f"{_segment_checkpoint_name(old_segment_id)}.json"
+                        )
+                        payload_key = (
+                            "translation" if requested_lane == "translation"
+                            else "annotation"
+                        )
+                        output = (
+                            payload.get(payload_key)
+                            if isinstance(payload, dict) else None
+                        )
+                    if (
+                        isinstance(output, dict)
+                        and sha256_json(output) == old_block.get("output_sha256")
+                    ):
+                        staged_outputs[old_segment_id] = {
+                            "output": output,
+                            "output_sha256": old_block.get("output_sha256"),
+                            "logical_receipt": {
+                                "kind": "targeted_regeneration_suffix_stage",
+                                "provider_calls": 0,
+                                "source_generation": int(
+                                    old_block.get("generation")
+                                    or ledger.get("generation")
+                                    or 1
+                                ),
+                                "source_logical_receipt": dict(
+                                    old_block.get("logical_receipt") or {}
+                                ),
+                            },
+                            "validation_receipt": {
+                                "staged_before_targeted_invalidation": True,
+                                "source_validation_receipt": dict(
+                                    old_block.get("validation_receipt") or {}
+                                ),
+                            },
+                        }
+            invalidate_suffix(
+                ledger_path, from_segment_id=start_segment_id, generation=generation,
+                staged_outputs=staged_outputs,
+            )
+            if chapter_targets:
+                start = next(
+                    index for index, item in enumerate(segments)
+                    if str(item["segment_id"]) == start_segment_id
+                )
+                with targeted_lock:
+                    targeted_seen.update(
+                        f"{requested_lane}:{value}" for value in chapter_targets
+                    )
+                    targeted_suffix_reuse.update(
+                        f"{requested_lane}:{item['segment_id']}"
+                        for item in segments[start:]
+                        if str(item["segment_id"]) not in chapter_targets
+                    )
             if session_manager is not None:
                 session_key = f"{chapter_id}:{ledger_lane}"
                 if session_manager.get_existing(session_key) is not None:
@@ -1408,16 +1748,30 @@ def _build_chaptered_companion(
                 options.project_dir.resolve(), state_path, reader_publish_lock,
                 final_overrides=chapter_reader_overrides(),
             )
-        if legacy is not None and not options.skip_translation:
+        translation_candidates = (
+            legacy_translation_candidates(legacy)
+            if legacy is not None else accepted_translation_candidates
+        )
+        if translation_candidates and not options.skip_translation:
             translation_migration = migrate_legacy_translations(
-                legacy_translation_candidates(legacy),
-                metadata=_legacy_metadata_view(legacy),
+                translation_candidates,
+                metadata=(
+                    _legacy_metadata_view(legacy)
+                    if legacy is not None else {
+                        "source_hash": migration_source_hash,
+                        "language": options.annotation_language,
+                    }
+                ),
                 blocks=[dict(item) for item in document.get("blocks") or []],
                 chapters=[chapter], segments=segments,
                 source_hash=migration_source_hash, language=options.annotation_language,
                 glossary=glossary, protected_names=protected_names,
                 segment_input_hash=lambda item: _segment_input_hash(
                     dict(item), blocks_by_id, glossary=segment_glossary_for(dict(item)),
+                ),
+                migration_source=(
+                    "legacy_checkpoint" if legacy is not None
+                    else "accepted_artifact_store"
                 ),
             )
             migrated_ledger = translation_migration["ledgers"].get(chapter_id)
@@ -1441,10 +1795,49 @@ def _build_chaptered_companion(
         chapter_id = str(chapter["chapter_id"])
         guide_segment_id = f"{chapter_id}:guide"
         guide_ledger_path = checkpoint_dir / "chapters" / chapter_id / "guide-ledger.json"
+        if not chapter.get("content_block_ids"):
+            guide = {
+                "schema_version": CHAPTER_GUIDE_VERSION,
+                "source_sha256": sha256_json({
+                    "chapter_projection_version": CHAPTER_PROJECTION_VERSION,
+                    "chapter_id": chapter_id,
+                    "content_block_ids": [],
+                    "target_language": options.annotation_language,
+                }),
+                "chapter_id": chapter_id,
+                "motivation": None,
+                "main_content": None,
+                "section_logic": None,
+                "prerequisites": None,
+                "pedagogical_comparison": None,
+                "historical_context": [],
+                "supplementary_reading": [],
+            }
+            guide_ledger = initialize_lane_ledger(
+                guide_ledger_path, chapter_id=chapter_id, lane="guide",
+                segment_ids=[guide_segment_id],
+            )
+            if guide_ledger["blocks"][0]["state"] != "accepted":
+                accept_controller_skipped_block(
+                    guide_ledger_path, segment_id=guide_segment_id,
+                    input_sha256=str(guide["source_sha256"]),
+                    output_sha256=sha256_json(guide),
+                    reason="chapter contains structural headings only",
+                )
+            mark_plan_lane(
+                "guide", chapter_id=chapter_id, artifact={"reuse_status": "skipped"},
+                reason="controller_skipped_structural_heading",
+            )
+            with reader_data_lock:
+                reader_guides[chapter_id] = dict(guide)
+            return guide
         guide_input_hash = lane_semantic_sha256("guide", {
             "chapter_source": {
-                "chapter": chapter,
-                "blocks": [blocks_by_id[value] for value in chapter["block_ids"] if value in blocks_by_id],
+                "chapter": _guide_chapter_descriptor(chapter),
+                "blocks": [
+                    blocks_by_id[value] for value in chapter.get("content_block_ids") or []
+                    if value in blocks_by_id
+                ],
             },
             "target_language": options.annotation_language,
             "verified_evidence": evidence,
@@ -1452,7 +1845,11 @@ def _build_chaptered_companion(
         guide_recipe_hash = lane_recipe_sha256(
             "guide", prompt=CHAPTER_GUIDE_VERSION, model=options.model,
             tier=ANNOTATION_TIER,
-            access_recipe={"provider": options.provider, "allow_internet": False},
+            access_recipe={
+                "provider": options.provider,
+                "allow_internet": options.allow_internet,
+                "inherit_host_tools": options.inherit_host_tools,
+            },
         )
         guide_ledger = None
         if result_llm is not None:
@@ -1461,14 +1858,30 @@ def _build_chaptered_companion(
                 segment_ids=[guide_segment_id],
             )
             accepted_guide = guide_ledger["blocks"][0]
+            accepted_validation = accepted_guide.get("validation_receipt")
+            accepted_recipe_hash = str(
+                accepted_validation.get("recipe_sha256")
+                if isinstance(accepted_validation, Mapping) else ""
+            )
+            recipe_changed = (
+                accepted_guide["state"] == "accepted"
+                and accepted_recipe_hash != guide_recipe_hash
+            )
             if (
                 accepted_guide["state"] == "accepted"
-                and accepted_guide.get("input_sha256") != guide_input_hash
+                and (
+                    accepted_guide.get("input_sha256") != guide_input_hash
+                    or recipe_changed
+                )
             ):
                 guide_ledger = invalidate_suffix(
                     guide_ledger_path, from_segment_id=guide_segment_id,
                     generation=int(guide_ledger.get("generation") or 1) + 1,
                 )
+                if recipe_changed and session_manager is not None:
+                    session_key = f"{chapter_id}:guide"
+                    if session_manager.get_existing(session_key) is not None:
+                        session_manager.rotate(session_key, reason="guide-recipe-change")
             if "guide" in regeneration and guide_ledger["blocks"][0]["state"] == "accepted":
                 guide_generation = int(guide_ledger.get("generation") or 1) + 1
                 guide_ledger = invalidate_suffix(
@@ -1486,8 +1899,11 @@ def _build_chaptered_companion(
                     contract_version=CHAPTER_GUIDE_VERSION,
                     predecessor_accepted_chain_sha256=str(guide_ledger.get("accepted_chain_sha256") or ""),
                     output_validator=lambda value: (
-                        isinstance(value, dict)
-                        and value.get("schema_version") == CHAPTER_GUIDE_VERSION
+                        chapter_guide_artifact_valid(
+                            value,
+                            evidence=evidence,
+                            allow_internet=options.allow_internet,
+                        )
                         and value.get("chapter_id") == chapter_id
                     ),
                 )
@@ -1497,6 +1913,10 @@ def _build_chaptered_companion(
                         reason="accepted guide remains valid under the current contract",
                     )
                     guide = dict(guide_object["output"])
+                    write_json(
+                        checkpoint_dir / "chapters" / chapter_id / "chapter-guide.json",
+                        guide,
+                    )
                     accept_reused_block(
                         guide_ledger_path, segment_id=guide_segment_id,
                         input_sha256=guide_input_hash,
@@ -1505,6 +1925,7 @@ def _build_chaptered_companion(
                         validation_receipt={
                             "local_validation": True, "object_store_revalidated": True,
                             "reuse_status": guide_object["reuse_status"],
+                            "recipe_sha256": guide_recipe_hash,
                         },
                     )
                     with reader_data_lock:
@@ -1529,7 +1950,11 @@ def _build_chaptered_companion(
                     outcome = result_llm(
                         prompt, schema=schema, provider=options.provider, model=options.model,
                         model_tier=None if options.model else ANNOTATION_TIER,
-                        env=_llm_runtime_env(allow_internet=False, force_disable_internet=True),
+                        env=_llm_runtime_env(
+                            allow_internet=options.allow_internet,
+                            force_disable_internet=not options.allow_internet,
+                            inherit_host_tools=options.inherit_host_tools,
+                        ),
                         artifact_dir=artifact_dir, call_label=call_label,
                         idle_timeout_seconds=options.idle_timeout_seconds,
                         session_policy="stateful", session_manager=session_manager,
@@ -1601,11 +2026,17 @@ def _build_chaptered_companion(
             return dict(outcome.value)
         try:
             guide = generate_chapter_guide(
-                chapter, [blocks_by_id[value] for value in chapter["block_ids"]],
+                _guide_chapter_descriptor(chapter), [
+                    blocks_by_id[value] for value in chapter.get("content_block_ids") or []
+                    if value in blocks_by_id
+                ],
                 language=options.annotation_language, evidence=evidence,
                 checkpoint_dir=checkpoint_dir / "chapters" / chapter_id,
                 force="guide" in regeneration, call_model=guide_model,
                 stateful=result_llm is not None,
+                allow_internet=options.allow_internet,
+                inherit_host_tools=options.inherit_host_tools,
+                recipe_identity=guide_recipe_hash,
             )
         except StatefulSessionError as exc:
             mark_needs_supervision(
@@ -1629,7 +2060,10 @@ def _build_chaptered_companion(
                     guide_ledger_path, segment_id=guide_segment_id, state="accepted",
                     receipt=guide_receipt, input_sha256=guide_input_hash,
                     output_sha256=sha256_json(guide),
-                    validation_receipt={"local_validation": True},
+                    validation_receipt={
+                        "local_validation": True,
+                        "recipe_sha256": guide_recipe_hash,
+                    },
                 )
                 accepted_guide_block = next(
                     item for item in accepted_guide_ledger["blocks"]
@@ -1673,7 +2107,10 @@ def _build_chaptered_companion(
                 "chapter_id": chapter_id, "segment_id": segment_id,
                 "lane": "commentary" if lane == "companion" else lane,
                 "status": status, "artifact_id": artifact_id, "reason": reason,
-                "estimated_provider_calls": 0 if status in {"hit", "recipe_stale"} else 1,
+                "estimated_provider_calls": 0 if status in {
+                    "hit", "composed_hit", "deferred_hit", "warning_reuse",
+                    "recipe_stale", "skipped",
+                } else 1,
             })
             plan["entries"] = entries
             plan["estimated_provider_calls"] = sum(
@@ -1777,6 +2214,7 @@ def _build_chaptered_companion(
                             translation_prompt(
                                 {}, [], language=options.annotation_language,
                                 glossary={}, protected_names=protected_names, paper_context={},
+                                source_language=_multilingual_prompt_source(options),
                             )
                             if lane == "translation" else
                             annotation_prompt(
@@ -1784,6 +2222,7 @@ def _build_chaptered_companion(
                                 metadata=_annotation_metadata(bundle.metadata), evidence={},
                                 glossary={}, protected_names=protected_names, paper_context={},
                                 domain_context=domain_context,
+                                source_language=_multilingual_prompt_source(options),
                             ).replace("\n\nGLOSSARY:\n{}\n\n", "\n\n")
                         ),
                         "paper": _static_paper_context(
@@ -1828,6 +2267,43 @@ def _build_chaptered_companion(
             int(item.get("generation") or ledger.get("generation") or 1)
             for item in ledger["blocks"] if item["segment_id"] == segment_id
         )
+        if bool(segment.get("structural_only")):
+            value = (
+                {"blocks": []}
+                if lane == "translation"
+                else {
+                    "explanation": "", "commentary": "", "commentary_sources": [],
+                    "prior_work": [], "later_work": [],
+                }
+            )
+            input_hash = lane_semantic_sha256(
+                "commentary" if lane == "companion" else lane,
+                {
+                    "augmentation_projection_version": AUGMENTATION_PROJECTION_VERSION,
+                    "segment_id": segment_id,
+                    "augmentation_block_ids": [],
+                    "structural_only": True,
+                },
+            )
+            if block_state != "accepted":
+                accept_controller_skipped_block(
+                    path, segment_id=segment_id, input_sha256=input_hash,
+                    output_sha256=sha256_json(value),
+                    reason="segment contains structural headings only",
+                )
+            record_segment_reuse(
+                chapter_id=chapter_id, segment_id=segment_id, lane=lane,
+                status="skipped", artifact_id=None,
+                reason="controller_skipped_structural_heading",
+            )
+            with reader_data_lock:
+                target = reader_translations if lane == "translation" else reader_annotations
+                target[segment_id] = dict(value)
+            _publish_reader_update(
+                options.project_dir.resolve(), state_path, reader_publish_lock,
+                final_overrides=chapter_reader_overrides(),
+            )
+            return value
         newly_accepted = block_state != "accepted"
         migrated_translation = None
         if lane == "translation" and not newly_accepted:
@@ -1836,6 +2312,22 @@ def _build_chaptered_companion(
             )
             if isinstance(ledger_block.get("translation"), dict):
                 migrated_translation = dict(ledger_block["translation"])
+                migration_status = str(
+                    (ledger_block.get("validation_receipt") or {}).get(
+                        "reuse_status"
+                    ) or "hit"
+                )
+                record_segment_reuse(
+                    chapter_id=chapter_id, segment_id=segment_id, lane=lane,
+                    status=migration_status, artifact_id=None,
+                    reason=(
+                        "accepted blocks were composed and locally revalidated"
+                        if migration_status == "composed_hit"
+                        else "accepted translation reused with terminology warnings"
+                        if migration_status == "warning_reuse"
+                        else "accepted translation passed current local validation"
+                    ),
+                )
         segment_glossary = segment_glossary_for(segment)
         object_lane = "commentary" if lane == "companion" else lane
         identity_block = next(
@@ -1848,11 +2340,11 @@ def _build_chaptered_companion(
             or ""
         )
         source_segment = {
-            "segment": _compact_segment_descriptor(segment),
+            "segment": _semantic_segment_descriptor(segment),
             "blocks": [
                 (_translation_input_block(blocks_by_id[value]) if lane == "translation"
                  else _annotation_input_block(blocks_by_id[value], document))
-                for value in segment.get("block_ids") or [] if value in blocks_by_id
+                for value in _augmentation_block_ids(segment, blocks_by_id)
             ],
         }
         if lane == "translation":
@@ -1862,7 +2354,7 @@ def _build_chaptered_companion(
                 "glossary": segment_glossary,
                 "protected_names": _protected_names_for_blocks(
                     protected_names,
-                    [blocks_by_id[value] for value in segment.get("block_ids") or [] if value in blocks_by_id],
+                    _augmentation_blocks(segment, blocks_by_id),
                 ),
                 "guide": prepared.guide,
                 "static_context": _full_paper_context(
@@ -1884,6 +2376,57 @@ def _build_chaptered_companion(
                 "predecessor_accepted_chain_sha256": predecessor_chain,
             }
         input_hash = lane_semantic_sha256(object_lane, semantic_context)
+        local_deferred_value: dict[str, Any] | None = None
+        deferred_translation = (
+            identity_block.get("deferred_translation")
+            if lane == "translation" else None
+        )
+        deferred_output = identity_block.get("deferred_output")
+        if isinstance(deferred_translation, dict):
+            deferred_output = deferred_translation
+        if (
+            newly_accepted
+            and isinstance(deferred_output, dict)
+            and (
+                identity_block.get("deferred_output_sha256") is None
+                or identity_block.get("deferred_output_sha256")
+                == sha256_json(deferred_output)
+            )
+            and object_lane not in regeneration
+            and f"{('translation' if lane == 'translation' else 'commentary')}:{segment_id}"
+            not in set(options.regenerate_segments)
+            and _reusable_lane_output_valid(
+                object_lane, segment, deferred_output,
+                blocks_by_id=blocks_by_id, protected_names=protected_names,
+            )
+        ):
+            value = dict(deferred_output)
+            ledger = accept_deferred_block(
+                path,
+                segment_id=segment_id,
+                input_sha256=input_hash,
+                output_sha256=sha256_json(value),
+                logical_receipt={
+                    **dict(identity_block.get("deferred_logical_receipt") or {}),
+                    "kind": "deferred_accepted_artifact_reuse",
+                    "provider_calls": 0,
+                },
+                validation_receipt={
+                    **dict(identity_block.get("deferred_validation_receipt") or {}),
+                    "local_validation": True,
+                    "reuse_status": "deferred_hit",
+                },
+            )
+            if lane == "translation":
+                migrated_translation = value
+            local_deferred_value = value
+            newly_accepted = False
+            block_state = "accepted"
+            record_segment_reuse(
+                chapter_id=chapter_id, segment_id=segment_id, lane=lane,
+                status="deferred_hit", artifact_id=None,
+                reason="staged accepted blocks passed current local validation",
+            )
         semantic_invalidated = False
         if block_state == "accepted":
             accepted_block = next(
@@ -1915,7 +2458,11 @@ def _build_chaptered_companion(
         contract_version = SCHEMA_VERSION
         recipe_hash = lane_recipe_sha256(
             object_lane,
-            prompt=PROMPT_VERSION,
+            prompt=(
+                _language_prompt_contract(TRANSLATION_PROMPT_VERSION, options)
+                if lane == "translation"
+                else _language_prompt_contract(COMMENTARY_PROMPT_VERSION, options)
+            ),
             model=options.model,
             tier=(TRANSLATION_TIER if lane == "translation" else ANNOTATION_TIER),
             access_recipe={
@@ -1925,18 +2472,54 @@ def _build_chaptered_companion(
             },
         )
         reused_artifact = None
-        if newly_accepted and object_lane not in regeneration:
+        requested_lane = "translation" if lane == "translation" else "commentary"
+        targeted_key = f"{requested_lane}:{segment_id}"
+        if (
+            newly_accepted and object_lane not in regeneration
+            and targeted_key not in targeted_regeneration
+        ):
             reused_artifact = artifact_store.find(
                 kind=object_lane,
                 semantic_input_sha256=input_hash,
                 recipe_sha256=recipe_hash,
                 contract_version=contract_version,
-                predecessor_accepted_chain_sha256=predecessor_chain,
+                predecessor_accepted_chain_sha256=(
+                    None if lane == "translation" else predecessor_chain
+                ),
                 output_validator=lambda output: _reusable_lane_output_valid(
                     object_lane, segment, output,
                     blocks_by_id=blocks_by_id, protected_names=protected_names,
                 ),
             )
+            if reused_artifact is None and targeted_key in targeted_suffix_reuse:
+                candidates = []
+                for record in artifact_store.iter_kind(object_lane):
+                    provenance = record.get("provenance")
+                    if not isinstance(provenance, Mapping):
+                        continue
+                    if str(record.get("segment_id") or "") != segment_id:
+                        continue
+                    if Path(str(provenance.get("checkpoint_dir") or "")).resolve(
+                        strict=False
+                    ) != checkpoint_dir.resolve():
+                        continue
+                    try:
+                        artifact_store.validate(
+                            record,
+                            output_validator=lambda output: _reusable_lane_output_valid(
+                                object_lane, segment, output,
+                                blocks_by_id=blocks_by_id,
+                                protected_names=protected_names,
+                            ),
+                        )
+                    except Exception:
+                        continue
+                    candidates.append(record)
+                if candidates:
+                    selected = max(
+                        candidates, key=lambda item: float(item.get("created_at") or 0)
+                    )
+                    reused_artifact = {**selected, "reuse_status": "hit"}
             if reused_artifact is not None:
                 value = dict(reused_artifact["output"])
                 ledger = accept_reused_block(
@@ -1991,11 +2574,11 @@ def _build_chaptered_companion(
                     segment, blocks_by_id, evidence, usage_state={"counts": {}, "topics": []},
                 )
                 current_payload = {
-                    "segment": _compact_segment_descriptor(segment),
+                    "segment": _semantic_segment_descriptor(segment),
                     "source_blocks": [
                         (_translation_input_block(blocks_by_id[value]) if lane == "translation"
                          else _annotation_input_block(blocks_by_id[value], document))
-                        for value in segment.get("block_ids") or [] if value in blocks_by_id
+                        for value in _augmentation_block_ids(segment, blocks_by_id)
                     ],
                     "neighbor_context": _dynamic_paper_context(paper_context),
                     "bounded_sources": segment_evidence.get("bounded_sources") or [],
@@ -2003,7 +2586,7 @@ def _build_chaptered_companion(
                         protected_names,
                         [
                             blocks_by_id[value]
-                            for value in segment.get("block_ids") or []
+                            for value in _augmentation_block_ids(segment, blocks_by_id)
                             if value in blocks_by_id
                         ],
                     ),
@@ -2143,15 +2726,24 @@ def _build_chaptered_companion(
         try:
             if reused_artifact is not None:
                 pass
+            elif local_deferred_value is not None:
+                value = local_deferred_value
             elif migrated_translation is not None:
                 value = migrated_translation
             elif lane == "translation":
                 value = _generate_translations(
                     [segment], options=options, bundle=bundle,
-                    glossary=segment_glossary, protected_names=protected_names,
+                    glossary=segment_glossary,
+                    protected_names=_protected_names_for_blocks(
+                        protected_names, _augmentation_blocks(segment, blocks_by_id),
+                    ),
                     checkpoint_dir=checkpoint_dir, llm=lane_llm,
                     generation=block_generation,
-                    force_generation="translation" in regeneration or semantic_invalidated,
+                    force_generation=(
+                        "translation" in regeneration
+                        or targeted_key in targeted_regeneration
+                        or semantic_invalidated
+                    ),
                 )[segment_id]
             else:
                 value = _generate_annotations(
@@ -2159,9 +2751,15 @@ def _build_chaptered_companion(
                     domain_context=domain_context, glossary=segment_glossary,
                     # Only current-block explanations are repeated on delta turns; the
                     # complete source-to-target mapping lives in the generation bootstrap.
-                    protected_names=protected_names, checkpoint_dir=checkpoint_dir, llm=lane_llm,
+                    protected_names=_protected_names_for_blocks(
+                        protected_names, _augmentation_blocks(segment, blocks_by_id),
+                    ), checkpoint_dir=checkpoint_dir, llm=lane_llm,
                     generation=block_generation,
-                    force_generation="commentary" in regeneration or semantic_invalidated,
+                    force_generation=(
+                        "commentary" in regeneration
+                        or targeted_key in targeted_regeneration
+                        or semantic_invalidated
+                    ),
                 )[segment_id]
         except BaseException as exc:
             _mark_translation_repair_supervision(
@@ -2311,24 +2909,34 @@ def _build_chaptered_companion(
                 "error": {"code": "companion_needs_supervision", "message": str(exc)},
                 "errors": [], "meta": {"diagnostics": list(diagnostics)}}
     segments = [item for chapter in chapter_results.values() for item in chapter["segments"]]
+    missing_targets = targeted_regeneration.difference(targeted_seen)
+    if missing_targets:
+        raise ValueError(
+            "regenerate-segment target not found: " + ", ".join(sorted(missing_targets))
+        )
     translations = None if options.skip_translation else {
         key: value for chapter in chapter_results.values()
         for key, value in chapter["translation"].items()
     }
     annotations = {key: value for chapter in chapter_results.values()
                    for key, value in chapter["companion"].items()}
+    review_segments = [item for item in segments if not item.get("structural_only")]
+    review_segment_ids = {str(item["segment_id"]) for item in review_segments}
     review_input_hash = lane_semantic_sha256("review", {
         "translation_artifacts": (
             None if translations is None else {
                 key: sha256_json(value) for key, value in sorted(translations.items())
+                if key in review_segment_ids
             }
         ),
         "commentary_artifacts": {
             key: sha256_json(value) for key, value in sorted(annotations.items())
+            if key in review_segment_ids
         },
         "review_contract": {
             "translation_mode": "skipped" if options.skip_translation else "enabled",
-            "segment_ids": [str(item["segment_id"]) for item in segments],
+            "augmentation_projection_version": AUGMENTATION_PROJECTION_VERSION,
+            "segment_ids": [str(item["segment_id"]) for item in review_segments],
         },
     })
     review_recipe_hash = lane_recipe_sha256(
@@ -2356,7 +2964,7 @@ def _build_chaptered_companion(
         chapter_review = dict(review_output["review"])
     else:
         translations, annotations, chapter_review = _review(
-            segments, translations, annotations, document=document, glossary=glossary,
+            review_segments, translations, annotations, document=document, glossary=glossary,
             protected_names=protected_names, evidence=evidence, options=options,
             llm=llm, checkpoint_dir=checkpoint_dir,
         )
@@ -2387,7 +2995,8 @@ def _build_chaptered_companion(
     index_block_ids.update(str(value) for value in structure.get("index_block_ids") or [])
     render_document = (
         {**document, "blocks": [item for item in document.get("blocks") or []
-                                if block_id(item) not in index_block_ids]}
+                                if block_id(item) not in index_block_ids
+                                or _project_is_structural(item)]}
         if index_entries and not options.skip_translation else document
     )
     final_reader_overrides = {
@@ -2403,6 +3012,8 @@ def _build_chaptered_companion(
         "glossary": glossary,
         "metadata": bundle.metadata,
         "language": options.annotation_language,
+        "source_language": options.source_language,
+        "title_translations": title_translations,
         "translation_mode": "skipped" if options.skip_translation else "enabled",
     }
     content_object = _store_reviewed_content(
@@ -2420,6 +3031,8 @@ def _build_chaptered_companion(
         document=render_document, segments=segments, annotations=annotations,
         translations=translations, evidence=evidence, glossary=glossary,
         metadata=bundle.metadata, language=options.annotation_language,
+        source_language=options.source_language,
+        title_translations=title_translations,
         output_dir=options.project_dir.resolve(), stem=stem,
         manifest_name="source-manifest.json", validation_name="validation.json",
         compiler=compiler, pdf_validator=pdf_validator, augmentation_scope="substantive",
@@ -2475,6 +3088,10 @@ def _build_chaptered_companion(
                    validation_path=artifact["validation_path"],
                    validation_sha256=artifact["validation_sha256"],
                    final_render_version=FINAL_RENDER_VERSION,
+                   chapter_projection_version=CHAPTER_PROJECTION_VERSION,
+                   augmentation_projection_version=AUGMENTATION_PROJECTION_VERSION,
+                   chapter_guide_version=CHAPTER_GUIDE_VERSION,
+                   reader_final_checkpoint_version=READER_FINAL_CHECKPOINT_VERSION,
                    translation_mode="skipped" if options.skip_translation else "enabled",
                    notice=notice, diagnostics=list(diagnostics))
     progress.safe_boundary(status, artifact_paths=[artifact["pdf_path"]], substantive=True)
@@ -2945,11 +3562,17 @@ def _resume_companion_unlocked(
     from .resume_transaction import (
         append_entries,
         begin_transaction,
+        bind_transaction_checkpoint,
         load_transaction,
         mark_entry,
         mark_transaction,
     )
 
+    checkpoint_binding = bind_transaction_checkpoint(
+        project_dir,
+        checkpoint_path=checkpoint_dir,
+        checkpoint_fingerprint=str(state.get("fingerprint") or checkpoint_dir.name),
+    )
     try:
         transaction = load_transaction(project_dir)
     except ValueError as exc:
@@ -3137,6 +3760,7 @@ def _resume_companion_unlocked(
                 "blocking_reason": str(
                     supervision.get("reason") or context.get("blocked_reason") or ""
                 ),
+                "supervision_reason": str(supervision.get("reason") or ""),
             }
             entry.update(blocked_native_entries.get(identity) or {})
             entries.append(entry)
@@ -3174,6 +3798,13 @@ def _resume_companion_unlocked(
                 recovery_options=saved,
                 entries=entries,
                 native_resume_contexts=native_resume_contexts,
+                checkpoint_path=checkpoint_dir,
+                checkpoint_fingerprint=str(
+                    state.get("fingerprint") or checkpoint_dir.name
+                ),
+                authorization_source=(
+                    "recovery_policy_auto" if action == "auto" else "operator"
+                ),
             )
         except ValueError as exc:
             return err("resume_transaction_invalid", str(exc))
@@ -3424,6 +4055,7 @@ def _resume_companion_unlocked(
                     "blocking_reason": str(
                         supervision.get("reason") or context.get("blocked_reason") or ""
                     ),
+                    "supervision_reason": str(supervision.get("reason") or ""),
                 }
                 # Only the primary lane stop is eligible for exact native
                 # validation; additional drained failures remain durable and
@@ -3567,11 +4199,6 @@ _AUTO_RESTART_EXCLUDED_CATEGORIES = {
     "authentication", "quota", "permission", "rate_limit", "cancelled",
     "local_io", "invalid_request",
 }
-_AUTO_RESTART_IDENTITY_BLOCKS = {
-    "native_resume_idempotency_key_missing", "native_resume_context_invalid",
-}
-
-
 def _automatic_restart_blocker(entry: Mapping[str, Any]) -> str | None:
     """Return why an unresolved entry must remain under operator control."""
 
@@ -3584,11 +4211,14 @@ def _automatic_restart_blocker(entry: Mapping[str, Any]) -> str | None:
     category = str(context.get("failure_category") or "").casefold()
     if category in _AUTO_RESTART_EXCLUDED_CATEGORIES:
         return f"failure category {category} is not eligible for generation replacement"
-    blocking_code = str(entry.get("blocking_code") or "")
-    if blocking_code in _AUTO_RESTART_IDENTITY_BLOCKS:
-        return "authoritative logical-call identity could not be confirmed"
-    if not str(entry.get("idempotency_key") or context.get("idempotency_key") or ""):
-        return "authoritative logical-call identity could not be confirmed"
+    if category in {"", "unknown"}:
+        supervision_reason = " ".join(
+            str(entry.get("supervision_reason") or "").casefold().split()
+        )
+        if supervision_reason in {
+            "submitted call cancelled", "submitted call canceled",
+        }:
+            return "cancelled calls are not eligible for generation replacement"
     return None
 
 
@@ -3646,6 +4276,9 @@ def _prepare_automatic_generation_restarts(
     for item in pending:
         groups.setdefault(str(item[1].get("session_key") or ""), []).append(item)
     replacements: list[dict[str, Any]] = []
+    max_auto_replacements = int(
+        (transaction.get("recovery_options") or {}).get("max_auto_replacements") or 3
+    )
     for session_key, items in sorted(groups.items()):
         ledger = items[0][3]
         path = items[0][2]
@@ -3655,55 +4288,114 @@ def _prepare_automatic_generation_restarts(
             items, key=lambda item: positions.get(str(item[1].get("segment_id") or ""), len(ordered_ids))
         )
         earliest_id = str(earliest[1].get("segment_id") or "")
-        source_generation = int(
-            earliest[1].get("initial_generation") or ledger.get("generation") or 1
+        group_id = f"{session_key}:{earliest_id}"
+        active_record = next((
+            dict(item) for item in reversed(transaction.get("replacements") or [])
+            if str(item.get("group_id") or "") == group_id
+            and str(item.get("status") or "") not in {"accepted", "failed"}
+        ), None)
+        prior_group_records = [
+            dict(item) for item in transaction.get("replacements") or []
+            if str(item.get("group_id") or "") == group_id
+        ]
+        reconstructed_inflight = bool(
+            active_record is None
+            and not prior_group_records
+            and all(
+                str(item[1].get("recovery_action") or "")
+                == "generation_restart_required"
+                for item in items
+            )
+            and any(
+                int(item[1].get("target_generation") or 0)
+                == int(ledger.get("generation") or 1)
+                for item in items
+            )
         )
-        target_generation = source_generation + 1
+        source_generation = int(
+            active_record.get("source_generation")
+            if active_record is not None else
+            min(
+                int(item[1].get("initial_generation") or ledger.get("generation") or 1)
+                for item in items
+            ) if reconstructed_inflight else
+            ledger.get("generation") or 1
+        )
+        target_generation = int(
+            active_record.get("target_generation")
+            if active_record is not None else
+            ledger.get("generation") if reconstructed_inflight else
+            source_generation + 1
+        )
         suffix_ids = ordered_ids[positions[earliest_id]:]
         ref = session_manager.get_existing(session_key)
         if ref is None:
-            # Session identity is an authority boundary, not permission to
-            # create a fresh paid generation under guessed provider settings.
+            recovery_options = transaction.get("recovery_options") or {}
+            ref = session_manager.get_or_create(
+                key=session_key,
+                provider=str(recovery_options.get("provider") or "auto"),
+                model=recovery_options.get("model"),
+                runtime_fingerprint="fresh-replacement-runtime-pending",
+                metadata={"fresh_replacement_bootstrap": True},
+            )
+        while ref.generation < source_generation:
+            ref = session_manager.rotate(
+                session_key, reason="align fresh automatic replacement generation",
+            )
+        if ref.generation not in {source_generation, target_generation}:
             return {
                 "replacements": replacements,
-                "blocked_reasons": [
-                    f"No saved logical session exists for {session_key}"
-                ],
+                "error": err(
+                    "resume_transaction_generation_mismatch",
+                    f"Session {session_key} changed outside automatic recovery",
+                ),
             }
         group_records: list[dict[str, Any]] = []
         try:
-            for index, entry, _entry_path, _entry_ledger in items:
-                segment_id = str(entry.get("segment_id") or "")
-                context = entry.get("recovery_context")
-                context = context if isinstance(context, dict) else {}
-                record = claim_automatic_restart(
+            earliest_context = earliest[1].get("recovery_context")
+            earliest_context = (
+                earliest_context if isinstance(earliest_context, dict) else {}
+            )
+            record = active_record or claim_automatic_restart(
                     project_dir,
                     session_key=session_key,
-                    segment_id=segment_id,
+                    segment_id=earliest_id,
+                    group_id=group_id,
                     ledger_path=path,
                     source_generation=source_generation,
                     target_generation=target_generation,
                     suffix_segment_ids=suffix_ids,
                     trigger_code=str(
-                        entry.get("blocking_code") or context.get("blocked_reason")
+                        earliest[1].get("blocking_code")
+                        or earliest_context.get("blocked_reason")
                         or "generation_restart_required"
                     ),
                     trigger_reason=str(
-                        entry.get("blocking_reason") or context.get("blocked_reason")
+                        earliest[1].get("blocking_reason")
+                        or earliest_context.get("blocked_reason")
                         or "native reconciliation or persisted response could not be accepted"
                     ),
-                    abandoned_logical_key=str(entry.get("idempotency_key") or ""),
-                    possible_duplicate_charge=str(
-                        context.get("submission_state") or ""
-                    ) in {"submitted", "unknown"},
+                    abandoned_logical_key=str(
+                        earliest[1].get("idempotency_key") or ""
+                    ),
+                    possible_duplicate_charge=any(
+                        str(((item[1].get("recovery_context") or {}).get(
+                            "submission_state"
+                        )) or "") in {"submitted", "unknown"}
+                        for item in items
+                    ),
+                    max_auto_replacements=max_auto_replacements,
                 )
-                group_records.append(record)
+            group_records.append(record)
+            for index, entry, _entry_path, _entry_ledger in items:
                 mark_entry(
                     project_dir, index,
                     status=str(entry.get("status") or "pending"),
                     recovery_action="generation_restart_required",
                     target_generation=target_generation,
                     replacement_id=record["replacement_id"],
+                    replacement_group_id=record["group_id"],
+                    replacement_attempt=record["attempt"],
                 )
         except AutomaticRegenerationExhausted as exc:
             return {
@@ -3775,25 +4467,28 @@ def _finalize_automatic_generation_restarts(
     transaction = load_transaction(project_dir)
     if transaction is None:
         return err("resume_transaction_invalid", "Resume transaction journal is missing")
-    by_replacement = {
-        str(item.get("replacement_id") or ""): (index, dict(item))
-        for index, item in enumerate(transaction.get("entries") or [])
-        if item.get("replacement_id")
-    }
+    by_replacement: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, item in enumerate(transaction.get("entries") or []):
+        if item.get("replacement_id"):
+            by_replacement.setdefault(
+                str(item.get("replacement_id") or ""), []
+            ).append((index, dict(item)))
     exhausted_result: dict[str, Any] | None = None
     for raw in replacements:
         replacement_id = str(raw.get("replacement_id") or "")
-        located = by_replacement.get(replacement_id)
-        if located is None:
+        located = by_replacement.get(replacement_id) or []
+        if not located:
             continue
-        index, entry = located
-        path = Path(str(entry.get("ledger_path") or raw.get("ledger_path") or ""))
+        path = Path(str(raw.get("ledger_path") or located[0][1].get("ledger_path") or ""))
         if not path.is_file():
             continue
         ledger = read_json(path)
+        replacement_segment_id = str(
+            raw.get("segment_id") or located[0][1].get("segment_id") or ""
+        )
         block = next((
             item for item in ledger.get("blocks") or []
-            if str(item.get("segment_id") or "") == str(entry.get("segment_id") or "")
+            if str(item.get("segment_id") or "") == replacement_segment_id
         ), None)
         target_generation = int(raw.get("target_generation") or 0)
         if (
@@ -3801,11 +4496,20 @@ def _finalize_automatic_generation_restarts(
             and int(block.get("generation") or 0) == target_generation
             and block.get("state") == "accepted"
         ):
-            mark_entry(
-                project_dir, index, status="resolved",
-                accepted_chain_sha256=str(block.get("accepted_chain_sha256") or ""),
-                output_sha256=str(block.get("output_sha256") or ""),
-            )
+            for index, entry in located:
+                entry_block = next((
+                    item for item in ledger.get("blocks") or []
+                    if str(item.get("segment_id") or "")
+                    == str(entry.get("segment_id") or "")
+                ), None)
+                if isinstance(entry_block, dict) and entry_block.get("state") == "accepted":
+                    mark_entry(
+                        project_dir, index, status="resolved",
+                        accepted_chain_sha256=str(
+                            entry_block.get("accepted_chain_sha256") or ""
+                        ),
+                        output_sha256=str(entry_block.get("output_sha256") or ""),
+                    )
             mark_replacement(
                 project_dir, replacement_id, status="accepted",
                 accepted_chain_sha256=str(block.get("accepted_chain_sha256") or ""),
@@ -3829,7 +4533,7 @@ def _finalize_automatic_generation_restarts(
         matching_supervision = next((
             item for item in _active_supervision_entries(ledger)
             if str(item.get("segment_id") or "")
-            == str(entry.get("segment_id") or "")
+            == replacement_segment_id
         ), None)
         if (
             matching_supervision is not None
@@ -3842,12 +4546,15 @@ def _finalize_automatic_generation_restarts(
                     or "replacement failed validation"
                 ),
             )
-            if exhausted_result is None:
+            budget_exhausted = int(raw.get("attempt") or 0) >= int(
+                raw.get("max_auto_attempts") or 3
+            )
+            if exhausted_result is None and budget_exhausted:
                 exhausted_result = err(
                     "automatic_regeneration_exhausted",
-                    f"automatic replacement failed for {entry.get('session_key')}:{entry.get('segment_id')}",
-                    session_key=entry.get("session_key"),
-                    segment_id=entry.get("segment_id"),
+                    f"automatic replacement failed for {raw.get('session_key')}:{replacement_segment_id}",
+                    session_key=raw.get("session_key"),
+                    segment_id=replacement_segment_id,
                     target_generation=target_generation,
                 )
     return exhausted_result
@@ -4346,6 +5053,7 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
     return {
         "paper_id": options.paper_id,
         "annotation_language": options.annotation_language,
+        "source_language": options.source_language,
         "language_was_defaulted": options.language_was_defaulted,
         "provider": options.provider,
         "model": options.model,
@@ -4361,7 +5069,9 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "document_kind": options.document_kind,
         "idle_timeout_seconds": options.idle_timeout_seconds,
         "recovery_policy": options.recovery_policy,
+        "max_auto_replacements": options.max_auto_replacements,
         "regenerate_lanes": list(options.regenerate_lanes),
+        "regenerate_segments": list(options.regenerate_segments),
         "confirm_expensive_regeneration": options.confirm_expensive_regeneration,
         "regenerate_commentary": options.regenerate_commentary,
         "legacy_checkpoint": (
@@ -4370,10 +5080,55 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
     }
 
 
+def _with_effective_source_language(options: BuildOptions) -> BuildOptions:
+    """Resolve persisted workflow language metadata without detecting prose."""
+    requested = str(options.source_language or "").strip()
+    if not requested:
+        context = _read_optional_json(options.project_dir.resolve() / "context.json")
+        requested = str(
+            context.get("source_base_language")
+            or context.get("source_language")
+            or ""
+        ).strip()
+    if not requested and options.skip_translation:
+        # The existing flag is an authoritative same-base-language assertion.
+        # This preserves older direct callers that predate --source-language.
+        requested = options.annotation_language
+    normalized = normalize_language_tag(requested or "und")
+    target = normalize_language_tag(options.annotation_language)
+    if (
+        options.skip_translation
+        and base_language(normalized) not in {"und", "mul"}
+        and base_language(normalized) != base_language(target)
+    ):
+        raise ValueError(
+            "--skip-translation requires source and target languages with the same base"
+        )
+    if normalized == options.source_language:
+        return options
+    return replace(options, source_language=normalized)
+
+
+def _language_prompt_contract(version: str, options: BuildOptions) -> str:
+    """Preserve English recipe identities while versioning multilingual prompts."""
+    source = normalize_language_tag(options.source_language or "und")
+    if base_language(source) == "en":
+        return version
+    return f"{version}:multilingual-source-v1:{source}"
+
+
+def _multilingual_prompt_source(options: BuildOptions) -> str | None:
+    source = normalize_language_tag(options.source_language or "und")
+    return None if base_language(source) == "en" else source
+
+
 def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOptions:
     return BuildOptions(
         paper_id=str(value["paper_id"]), project_dir=project_dir,
         annotation_language=str(value.get("annotation_language") or DEFAULT_LANGUAGE),
+        source_language=(
+            str(value.get("source_language") or "").strip() or None
+        ),
         language_was_defaulted=bool(value.get("language_was_defaulted")),
         provider=str(value.get("provider") or "auto"), model=value.get("model"),
         workers=int(value.get("workers") or DEFAULT_WORKERS),
@@ -4388,7 +5143,9 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         document_kind=str(value.get("document_kind") or "auto"),
         idle_timeout_seconds=value.get("idle_timeout_seconds"),
         recovery_policy=str(value.get("recovery_policy") or "auto"),
+        max_auto_replacements=int(value.get("max_auto_replacements") or 3),
         regenerate_lanes=tuple(value.get("regenerate_lanes") or ()),
+        regenerate_segments=tuple(value.get("regenerate_segments") or ()),
         confirm_expensive_regeneration=bool(value.get("confirm_expensive_regeneration")),
         regenerate_commentary=bool(value.get("regenerate_commentary")),
         legacy_checkpoint=(
@@ -4661,6 +5418,8 @@ def _publish_pdf_artifact(
     augmentation_scope: str = "all",
     chapters: list[dict[str, Any]] | None = None,
     chapter_guides: dict[str, dict[str, Any]] | None = None,
+    source_language: str | None = None,
+    title_translations: dict[str, Any] | list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Render, validate, and atomically publish one preview or final PDF artifact."""
     # Final builds never overwrite a path referenced by the published state.
@@ -4693,6 +5452,8 @@ def _publish_pdf_artifact(
         augmentation_scope=augmentation_scope,
         chapters=chapters,
         chapter_guides=chapter_guides,
+        source_language=source_language,
+        title_translations=title_translations,
     )
     fidelity_errors = validate_tex_fidelity(tex, document, source_manifest)
     if fidelity_errors:
@@ -4715,7 +5476,12 @@ def _publish_pdf_artifact(
         write_json(building_manifest, source_manifest)
         write_json(
             building_validation,
-            {"ok": True, "pdf": pdf_report, "fidelity_errors": []},
+            {
+                "ok": True,
+                "pdf": pdf_report,
+                "fidelity_errors": [],
+                "warnings": list(source_manifest.get("render_warnings") or []),
+            },
         )
         _publish_artifact_replace(building_tex, tex_path)
         _publish_artifact_replace(building_pdf, pdf_path)
@@ -4892,8 +5658,7 @@ def _generate_annotations(
             {}
             if options.skip_translation
             else project_segment_glossary(
-                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
-                glossary,
+                _augmentation_blocks(segment, by_id), glossary,
             )
         )
         write_json(
@@ -4905,6 +5670,17 @@ def _generate_annotations(
                 "evidence": segment_evidence,
             },
         )
+        if bool(segment.get("structural_only")):
+            empty_annotation = {
+                "explanation": "", "commentary": "", "commentary_sources": [],
+                "prior_work": [], "later_work": [],
+            }
+            output[str(segment["segment_id"])] = empty_annotation
+            if accepted_callback is not None:
+                accepted_callback(
+                    "annotation", str(segment["segment_id"]), empty_annotation
+                )
+            continue
         if path.is_file() and not force_generation and not options.regenerate_commentary:
             checkpoint = read_json(path)
             paper_context = _full_paper_context(
@@ -4949,13 +5725,15 @@ def _generate_annotations(
         pending.append(segment)
 
     def generate(segment: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        selected = [_annotation_input_block(by_id[value], bundle.document) for value in segment["block_ids"]]
+        selected = [
+            _annotation_input_block(by_id[value], bundle.document)
+            for value in _augmentation_block_ids(segment, by_id)
+        ]
         segment_glossary = (
             {}
             if options.skip_translation
             else project_segment_glossary(
-                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
-                glossary,
+                _augmentation_blocks(segment, by_id), glossary,
             )
         )
         segment_evidence = segment_evidence_by_id[str(segment["segment_id"])]
@@ -4965,7 +5743,7 @@ def _generate_annotations(
         value = _llm_call(
             llm,
             _bounded_annotation_prompt(
-                segment,
+                _semantic_segment_descriptor(segment),
                 selected,
                 language=options.annotation_language,
                 metadata=_annotation_metadata(bundle.metadata),
@@ -4974,6 +5752,7 @@ def _generate_annotations(
                 protected_names=protected_names,
                 paper_context=paper_context,
                 domain_context=domain_context,
+                source_language=_multilingual_prompt_source(options),
             ),
             ANNOTATION_SCHEMA,
             options=options,
@@ -5022,8 +5801,7 @@ def _generate_annotations(
                             segment,
                             by_id,
                             glossary=project_segment_glossary(
-                                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
-                                glossary,
+                                _augmentation_blocks(segment, by_id), glossary,
                             ),
                             extra={
                                 "evidence": segment_evidence_by_id[str(segment_id)],
@@ -5659,7 +6437,7 @@ def _translation_primary_draft_payload(
         "input_sha256": input_sha256,
         "candidate_provenance": {
             "origin": origin,
-            "prompt_version": PROMPT_VERSION if model_generated else None,
+            "prompt_version": TRANSLATION_PROMPT_VERSION if model_generated else None,
             "response_schema_version": SCHEMA_VERSION if model_generated else None,
             "model_tier": TRANSLATION_TIER if model_generated else None,
         },
@@ -5687,8 +6465,7 @@ def _seed_translation_coverage_draft(
         segment,
         by_id,
         glossary=project_segment_glossary(
-            [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
-            glossary,
+            _augmentation_blocks(segment, by_id), glossary,
         ),
         extra={
             "names": protected_names,
@@ -5899,7 +6676,7 @@ def _repair_translation_token_placement(
         value = _llm_call(
             llm,
             translation_retry_prompt(
-                segment,
+                _semantic_segment_descriptor(segment),
                 repair_contexts,
                 validation_errors=[item.prompt_payload() for item in token_errors],
                 retry_model_tier=TRANSLATION_RETRY_TIER,
@@ -6006,8 +6783,7 @@ def _generate_translations(
             bundle.document, segment, blocks_by_id=by_id, options=options
         )
         segment_glossary = project_segment_glossary(
-            [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
-            glossary,
+            _augmentation_blocks(segment, by_id), glossary,
         )
         expected_hash = _segment_input_hash(
             segment,
@@ -6056,7 +6832,7 @@ def _generate_translations(
         segment: dict[str, Any],
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         segment_id = str(segment["segment_id"])
-        selected = [by_id[value] for value in segment["block_ids"]]
+        selected = _augmentation_blocks(segment, by_id)
         segment_glossary = project_segment_glossary(selected, glossary)
         translatable = [_translation_input_block(block) for block in selected if _is_translatable(block)]
         paper_context = _full_paper_context(
@@ -6167,12 +6943,13 @@ def _generate_translations(
                 translation = _llm_call(
                     llm,
                     translation_prompt(
-                        segment,
+                        _semantic_segment_descriptor(segment),
                         translatable,
                         language=options.annotation_language,
                         glossary=segment_glossary,
                         protected_names=protected_names,
                         paper_context=paper_context,
+                        source_language=_multilingual_prompt_source(options),
                     ),
                     TRANSLATION_SCHEMA,
                     options=options,
@@ -6302,7 +7079,7 @@ def _generate_translations(
                         coverage_response = _llm_call(
                             llm,
                             translation_coverage_repair_prompt(
-                                segment,
+                                _semantic_segment_descriptor(segment),
                                 repair_contexts,
                                 language=options.annotation_language,
                                 glossary=segment_glossary,
@@ -6312,6 +7089,7 @@ def _generate_translations(
                                     "access": {"allow_mcp": False, "allow_internet": False},
                                 },
                                 repair_model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
+                                source_language=_multilingual_prompt_source(options),
                             ),
                             TRANSLATION_COVERAGE_REPAIR_SCHEMA,
                             options=options,
@@ -6457,8 +7235,7 @@ def _generate_translations(
                             segment,
                             by_id,
                             glossary=project_segment_glossary(
-                                [by_id[value] for value in segment.get("block_ids") or [] if value in by_id],
-                                glossary,
+                                _augmentation_blocks(segment, by_id), glossary,
                             ),
                             extra={
                                 "names": protected_names,
@@ -6492,9 +7269,53 @@ def _review(
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
 ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, dict[str, Any]], dict[str, Any]]:
+    active_segments = [item for item in segments if not item.get("structural_only")]
+    if len(active_segments) != len(segments):
+        active_ids = {str(item["segment_id"]) for item in active_segments}
+        active_translations = (
+            None if translations is None else {
+                key: value for key, value in translations.items() if key in active_ids
+            }
+        )
+        active_annotations = {
+            key: value for key, value in annotations.items() if key in active_ids
+        }
+        reviewed_translations, reviewed_annotations, review = _review(
+            active_segments,
+            active_translations,
+            active_annotations,
+            document=document,
+            glossary=glossary,
+            protected_names=protected_names,
+            evidence=evidence,
+            options=options,
+            llm=llm,
+            checkpoint_dir=checkpoint_dir,
+        )
+        merged_annotations = dict(annotations)
+        merged_annotations.update(reviewed_annotations)
+        if translations is None:
+            merged_translations = None
+        else:
+            merged_translations = dict(translations)
+            merged_translations.update(reviewed_translations or {})
+        return merged_translations, merged_annotations, review
     force_review = bool(
         {"translation", "commentary", "review"}.intersection(options.regenerate_lanes)
     )
+    if not segments:
+        return translations, annotations, {
+            "hierarchical": False,
+            "section_findings": [],
+            "reviewed_segment_ids": [],
+            "issues": [],
+            "patched_segment_ids": [],
+            "citation_delimiter_normalized_segment_ids": [],
+            "logical_receipt": {
+                "kind": "controller_skipped_structural_heading",
+                "provider_calls": 0,
+            },
+        }
     if options.skip_translation:
         if translations not in (None, {}):
             raise RuntimeError("skip-translation review received translation content")
@@ -6528,8 +7349,11 @@ def _review(
     payload = {
         "segments": [
             {
-                "segment": segment,
-                "source_blocks": [_annotation_input_block(by_id[value], document) for value in segment["block_ids"]],
+                "segment": _semantic_segment_descriptor(segment),
+                "source_blocks": [
+                    _annotation_input_block(by_id[value], document)
+                    for value in _augmentation_block_ids(segment, by_id)
+                ],
                 "translation": translations[segment["segment_id"]],
                 "annotation": annotations[segment["segment_id"]],
                 "context_evidence": _review_context_evidence(
@@ -6778,10 +7602,10 @@ def _review_commentary_only(
         for segment_id, annotation in annotations.items()
     }
     segment_payloads = [{
-        "segment": segment,
+        "segment": _semantic_segment_descriptor(segment),
         "source_blocks": [
             _annotation_input_block(by_id[value], document)
-            for value in segment["block_ids"]
+            for value in _augmentation_block_ids(segment, by_id)
         ],
         "annotation": reviewed[str(segment["segment_id"])],
         "context_evidence": _review_context_evidence(
@@ -7339,6 +8163,150 @@ def _store_validated_stateless_artifact(
     )
 
 
+def _generate_title_translations(
+    *,
+    options: BuildOptions,
+    bundle: SourceBundle,
+    document: dict[str, Any],
+    chapters: list[dict[str, Any]],
+    glossary: dict[str, Any],
+    protected_names: list[str],
+    checkpoint_dir: Path,
+    call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+    artifact_store: AcceptedArtifactStore | None = None,
+) -> dict[str, Any] | None:
+    """Translate every visible structural title without entering segment lanes."""
+    if options.skip_translation:
+        return None
+    projection_document = {**document, "metadata": dict(bundle.metadata or {})}
+    records = collect_title_records(projection_document, chapters)
+    source_language = str(options.source_language or "und")
+    source_sha256 = sha256_json(records)
+    title_glossary = _title_glossary_projection(records, glossary)
+    semantic_input_sha256 = lane_semantic_sha256("title_translation", {
+        "source_titles": records,
+        "source_language": source_language,
+        "target_language": options.annotation_language,
+        "glossary": title_glossary,
+        "protected_names": protected_names,
+    })
+    recipe_sha256 = lane_recipe_sha256(
+        "title_translation",
+        prompt=TITLE_TRANSLATION_PROMPT_VERSION,
+        model=options.model,
+        tier=TITLE_TRANSLATION_TIER,
+        access_recipe={"provider": options.provider, "allow_internet": False},
+    )
+    store = artifact_store or AcceptedArtifactStore(options.project_dir.resolve())
+
+    def valid(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        if (
+            value.get("schema_version") != TITLE_TRANSLATION_VERSION
+            or value.get("source_sha256") != source_sha256
+            or value.get("source_language") != source_language
+            or value.get("target_language") != options.annotation_language
+        ):
+            return False
+        try:
+            merge_title_translation_chunks(
+                records, [value], protected_names=protected_names,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        return True
+
+    accepted = None
+    if "translation" not in options.regenerate_lanes:
+        accepted = store.find(
+            kind="title_translation",
+            semantic_input_sha256=semantic_input_sha256,
+            recipe_sha256=recipe_sha256,
+            contract_version=TITLE_TRANSLATION_VERSION,
+            predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
+            output_validator=valid,
+        )
+    if accepted is not None:
+        output = dict(accepted["output"])
+        write_json(checkpoint_dir / "title-translations.json", output)
+        return output
+
+    responses: list[dict[str, Any]] = []
+    artifact_dir = checkpoint_dir / "title-translation"
+    for index, chunk in enumerate(chunk_title_records(records), 1):
+        prompt = title_translation_prompt(
+            chunk,
+            source_language=source_language,
+            target_language=options.annotation_language,
+            glossary=title_glossary,
+            protected_names=protected_names,
+        )
+        responses.append(call_model(
+            prompt,
+            TITLE_TRANSLATION_SCHEMA,
+            artifact_dir,
+            f"title-translation-{index:04d}",
+        ))
+    merged = merge_title_translation_chunks(
+        records, responses, protected_names=protected_names,
+    )
+    translated_by_id = {
+        str(item["title_id"]): str(item["text"])
+        for item in merged["titles"]
+    }
+    output = {
+        "schema_version": TITLE_TRANSLATION_VERSION,
+        "source_sha256": source_sha256,
+        "source_language": source_language,
+        "target_language": options.annotation_language,
+        "titles": [
+            {
+                "title_id": str(record["title_id"]),
+                "role": str(record.get("role") or "heading"),
+                "block_id": record.get("block_id"),
+                "chapter_id": record.get("chapter_id"),
+                "source_block_ids": list(record.get("source_block_ids") or []),
+                "text": translated_by_id[str(record["title_id"])],
+            }
+            for record in records
+        ],
+    }
+    if not valid(output):
+        raise RuntimeError("generated title translation artifact failed local validation")
+    _store_validated_stateless_artifact(
+        store,
+        kind="title_translation",
+        semantic_input_sha256=semantic_input_sha256,
+        recipe_sha256=recipe_sha256,
+        contract_version=TITLE_TRANSLATION_VERSION,
+        output=output,
+        segment_id="project:title-translation",
+        checkpoint_dir=checkpoint_dir,
+        provider=options.provider,
+        model=options.model,
+    )
+    write_json(checkpoint_dir / "title-translations.json", output)
+    return output
+
+
+def _title_glossary_projection(
+    records: list[dict[str, Any]], glossary: dict[str, Any],
+) -> dict[str, Any]:
+    source_text = "\n".join(str(item.get("source_text") or "") for item in records)
+    entries = []
+    for entry in glossary.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        terms = [
+            str(entry.get("source_term") or entry.get("source") or ""),
+            *(str(value) for value in entry.get("aliases") or []),
+        ]
+        if any(term and term.casefold() in source_text.casefold() for term in terms):
+            entries.append(dict(entry))
+    return {"entries": entries}
+
+
 def _legacy_metadata_view(legacy: dict[str, Any]) -> dict[str, Any]:
     metadata = (
         dict(legacy.get("metadata") or {})
@@ -7370,6 +8338,8 @@ def _fingerprint_payload(
         ),
         "rich_parser_version": bundle.document.get("parser_version"),
         "generation_projection_hash": sha256_json(_generation_document(bundle.document)),
+        "chapter_projection_version": CHAPTER_PROJECTION_VERSION,
+        "augmentation_projection_version": AUGMENTATION_PROJECTION_VERSION,
         "asset_manifest_hash": (
             integrity.get("asset_manifest_hash")
             or bundle.document.get("asset_manifest_hash")
@@ -7502,16 +8472,16 @@ def _segment_input_hash(
         and glossary.get("schema_version") != "arc.companion.segment-glossary.v2"
     ):
         bound_glossary = project_segment_glossary(
-            [
-                blocks_by_id[value]
-                for value in segment.get("block_ids") or []
-                if value in blocks_by_id
-            ],
+            _augmentation_blocks(segment, blocks_by_id),
             glossary,
         )
     return sha256_json({
-        "segment": segment,
-        "blocks": [blocks_by_id[value] for value in segment.get("block_ids") or []],
+        "augmentation_projection_version": AUGMENTATION_PROJECTION_VERSION,
+        "segment": _semantic_segment_descriptor(segment),
+        "blocks": [
+            _augmentation_semantic_block(block)
+            for block in _augmentation_blocks(segment, blocks_by_id)
+        ],
         "glossary_hash": sha256_json(bound_glossary) if bound_glossary is not None else None,
         "extra": extra,
     })
@@ -7525,6 +8495,14 @@ def _sha256_existing_file(path: Path) -> str:
 
 def _completion_outputs_match(state: dict[str, Any]) -> bool:
     if state.get("final_render_version") != FINAL_RENDER_VERSION:
+        return False
+    if state.get("chapter_projection_version") != CHAPTER_PROJECTION_VERSION:
+        return False
+    if state.get("augmentation_projection_version") != AUGMENTATION_PROJECTION_VERSION:
+        return False
+    if state.get("chapter_guide_version") != CHAPTER_GUIDE_VERSION:
+        return False
+    if state.get("reader_final_checkpoint_version") != READER_FINAL_CHECKPOINT_VERSION:
         return False
     checks = (
         ("output_tex", "output_tex_sha256"),
@@ -7685,7 +8663,7 @@ def _normalize_translation_coverage(
     """Keep only uniquely mapped expected blocks and restore canonical source order."""
     expected_blocks = [
         blocks_by_id[value]
-        for value in segment.get("block_ids") or []
+        for value in _augmentation_block_ids(segment, blocks_by_id)
         if _is_translatable(blocks_by_id[value])
     ]
     expected_ids = [block_id(block) for block in expected_blocks]
@@ -7787,7 +8765,7 @@ def _apply_translation_coverage_repairs(
     }
     expected_ids = [
         block_id(blocks_by_id[value])
-        for value in segment.get("block_ids") or []
+        for value in _augmentation_block_ids(segment, blocks_by_id)
         if _is_translatable(blocks_by_id[value])
     ]
     return {
@@ -8585,6 +9563,7 @@ def _bounded_annotation_prompt(
     protected_names: list[str],
     paper_context: dict[str, Any],
     domain_context: dict[str, Any] | None,
+    source_language: str | None = None,
     max_bytes: int = ANNOTATION_PROMPT_MAX_BYTES,
 ) -> str:
     """Project optional context so every submitted annotation prompt is safely bounded."""
@@ -8622,6 +9601,7 @@ def _bounded_annotation_prompt(
             protected_names=protected_names,
             paper_context=projected_paper_context,
             domain_context=domain_context,
+            source_language=source_language,
         )
         if not glossary:
             prompt = prompt.replace("\n\nGLOSSARY:\n{}\n\n", "\n\n")
@@ -8690,26 +9670,61 @@ def _full_paper_context(
     member_positions = [positions[value] for value in member_ids if value in positions]
     first = min(member_positions) if member_positions else 0
     last = max(member_positions) if member_positions else first
-    heading_kinds = {"heading", "section", "subsection", "subsubsection"}
+    heading_kinds = {
+        "heading", "section", "subsection", "subsubsection", "chapter", "part",
+    }
     navigation: list[dict[str, Any]] = []
+    equation_navigation: list[dict[str, Any]] = []
+    equation_by_id: dict[str, dict[str, Any]] = {}
+    for equation in document.get("equations") or []:
+        if not isinstance(equation, dict):
+            continue
+        for key in ("id", "equation_id", "entity_id", "block_id", "source_id"):
+            if equation.get(key) is not None:
+                equation_by_id[str(equation[key])] = equation
+    location_block_id = ""
     for index, block in enumerate(blocks):
         kind = str(block.get("type") or block.get("kind") or "").casefold()
-        if kind not in heading_kinds:
+        if kind in heading_kinds:
+            location_block_id = block_id(block)
+            anchor = ""
+            for candidate in blocks[index + 1 : min(len(blocks), index + 8)]:
+                candidate_kind = str(candidate.get("type") or candidate.get("kind") or "").casefold()
+                if candidate_kind in heading_kinds:
+                    break
+                anchor = str(candidate.get("text") or candidate.get("caption") or "").strip()
+                if anchor:
+                    break
+            navigation.append({
+                "block_id": block_id(block),
+                "level": block.get("level"),
+                "anchor": anchor[:500],
+            })
             continue
-        title = str(block.get("title") or block.get("text") or "").strip()
-        anchor = ""
-        for candidate in blocks[index + 1 : min(len(blocks), index + 8)]:
-            candidate_kind = str(candidate.get("type") or candidate.get("kind") or "").casefold()
-            if candidate_kind in heading_kinds:
-                break
-            anchor = str(candidate.get("text") or candidate.get("caption") or "").strip()
-            if anchor:
-                break
-        navigation.append({
+        if kind not in {"equation", "math", "display_math"}:
+            continue
+        entity = next((
+            equation_by_id[str(block[key])]
+            for key in ("equation_id", "entity_id", "source_id", "id", "block_id")
+            if block.get(key) is not None and str(block[key]) in equation_by_id
+        ), {})
+        printed_numbers = entity.get("printed_equation_numbers") or block.get("printed_equation_numbers")
+        if isinstance(printed_numbers, list):
+            number = ", ".join(str(value) for value in printed_numbers if str(value).strip())
+        else:
+            number = str(
+                entity.get("number") or block.get("number") or
+                entity.get("label") or block.get("label") or ""
+            ).strip()
+        formula = str(
+            entity.get("tex") or entity.get("content") or entity.get("text") or
+            block.get("tex") or block.get("content") or block.get("text") or ""
+        ).strip()
+        equation_navigation.append({
             "block_id": block_id(block),
-            "level": block.get("level"),
-            "title": title[:300],
-            "anchor": anchor[:500],
+            "number": number[:120],
+            "location_block_id": location_block_id,
+            "formula": formula[:600],
         })
 
     neighbor_indices = [
@@ -8718,7 +9733,7 @@ def _full_paper_context(
     ]
     neighbors = [
         _bounded_projection(_annotation_input_block(blocks[index], document), 1_200)
-        for index in neighbor_indices
+        for index in neighbor_indices if not _project_is_structural(blocks[index])
     ]
     front = document.get("front_matter") or {}
     abstract = front.get("abstract") or ""
@@ -8730,7 +9745,6 @@ def _full_paper_context(
         "abstract": str(abstract)[:4_000],
         "current_segment": {
             "segment_id": str(segment.get("segment_id") or ""),
-            "title": str(segment.get("title") or ""),
             "start_block_id": str(segment.get("start_block_id") or ""),
             "end_block_id": str(segment.get("end_block_id") or ""),
             "start_ordinal": first + 1,
@@ -8738,6 +9752,7 @@ def _full_paper_context(
             "total_blocks": len(blocks),
         },
         "section_navigation": navigation,
+        "equation_navigation": equation_navigation,
         "neighboring_source_anchors": neighbors,
         "access": _generation_runtime_policy(options),
     }
@@ -8751,7 +9766,8 @@ def _static_paper_context(context: dict[str, Any]) -> dict[str, Any]:
         key: context.get(key)
         for key in (
             "schema_version", "paper_id", "abstract", "section_navigation",
-            "navigation_omitted_count", "access",
+            "navigation_omitted_count", "equation_navigation",
+            "equation_navigation_omitted_count", "access",
         )
         if key in context
     }
@@ -8769,7 +9785,18 @@ def _compact_chapter_descriptor(chapter: dict[str, Any]) -> dict[str, Any]:
     return {
         key: chapter.get(key)
         for key in (
-            "chapter_id", "title", "start_block_id", "end_block_id", "page_start", "page_end",
+            "chapter_id", "start_block_id", "end_block_id", "page_start", "page_end",
+        )
+        if key in chapter
+    }
+
+
+def _guide_chapter_descriptor(chapter: Mapping[str, Any]) -> dict[str, Any]:
+    """Project chapter identity without exposing displayed structural titles."""
+    return {
+        key: chapter.get(key)
+        for key in (
+            "chapter_id", "content_block_ids", "page_start", "page_end",
         )
         if key in chapter
     }
@@ -8783,6 +9810,45 @@ def _compact_segment_descriptor(segment: dict[str, Any]) -> dict[str, Any]:
             "start_ordinal", "end_ordinal", "page_start", "page_end",
         )
         if key in segment
+    }
+
+
+def _augmentation_block_ids(
+    segment: Mapping[str, Any], blocks_by_id: Mapping[str, dict[str, Any]],
+) -> list[str]:
+    """Return the source blocks eligible for generated augmentation."""
+    explicit = segment.get("augmentation_block_ids")
+    if isinstance(explicit, list):
+        return [str(value) for value in explicit if str(value) in blocks_by_id]
+    return [
+        str(value) for value in segment.get("block_ids") or []
+        if str(value) in blocks_by_id
+        and not _project_is_structural(blocks_by_id[str(value)])
+    ]
+
+
+def _augmentation_blocks(
+    segment: Mapping[str, Any], blocks_by_id: Mapping[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [blocks_by_id[value] for value in _augmentation_block_ids(segment, blocks_by_id)]
+
+
+def _augmentation_semantic_block(block: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(_prompt_safe_value(dict(block)))
+    for key in ("section_title", "chapter_title", "part_title", "heading_title"):
+        value.pop(key, None)
+    return value
+
+
+def _semantic_segment_descriptor(segment: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe augmentation identity without controller or source heading text."""
+    return {
+        "segment_id": str(segment.get("segment_id") or ""),
+        "chapter_id": str(segment.get("chapter_id") or ""),
+        "augmentation_block_ids": [
+            str(value) for value in segment.get("augmentation_block_ids") or []
+        ],
+        "structural_only": bool(segment.get("structural_only")),
     }
 
 
@@ -8809,15 +9875,19 @@ def _shrink_paper_context(context: dict[str, Any], *, max_chars: int) -> None:
         return len(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
 
     navigation = context["section_navigation"]
+    equations = context.get("equation_navigation") or []
     if size() > max_chars:
         for item in navigation:
             item["anchor"] = str(item.get("anchor") or "")[:160]
+        for item in equations:
+            item["formula"] = str(item.get("formula") or "")[:240]
     if size() > max_chars:
         context["abstract"] = str(context.get("abstract") or "")[:1_200]
     if size() > max_chars:
         for item in navigation:
             item.pop("anchor", None)
-            item["title"] = str(item.get("title") or "")[:160]
+        for item in equations:
+            item["formula"] = str(item.get("formula") or "")[:120]
     if size() > max_chars:
         context["neighboring_source_anchors"] = [
             _bounded_projection(item, 400) for item in context["neighboring_source_anchors"]
@@ -8829,13 +9899,34 @@ def _shrink_paper_context(context: dict[str, Any], *, max_chars: int) -> None:
             indices = sorted({round(i * (original_count - 1) / max(1, keep - 1)) for i in range(keep)})
             context["section_navigation"] = [navigation[index] for index in indices]
             context["navigation_omitted_count"] = original_count - len(indices)
+    if size() > max_chars and equations:
+        original_equation_count = len(equations)
+        keep = max(1, int(original_equation_count * max_chars / size()))
+        if keep < original_equation_count:
+            indices = sorted({
+                round(index * (original_equation_count - 1) / max(1, keep - 1))
+                for index in range(keep)
+            })
+            context["equation_navigation"] = [equations[index] for index in indices]
+            context["equation_navigation_omitted_count"] = (
+                original_equation_count - len(indices)
+            )
     while size() > max_chars and len(context["section_navigation"]) > 1:
         current = context["section_navigation"]
         context["section_navigation"] = current[::2]
         context["navigation_omitted_count"] = len(navigation) - len(context["section_navigation"])
+    while size() > max_chars and len(context.get("equation_navigation") or []) > 1:
+        current_equations = context["equation_navigation"]
+        context["equation_navigation"] = current_equations[::2]
+        context["equation_navigation_omitted_count"] = (
+            len(equations) - len(context["equation_navigation"])
+        )
     if size() > max_chars:
         context["neighboring_source_anchors"] = []
         context["abstract"] = ""
+    if size() > max_chars:
+        for item in context.get("equation_navigation") or []:
+            item.pop("formula", None)
 
 
 def _validate_translation(
@@ -8902,7 +9993,11 @@ def _translation_preflight(
     blocks_by_id: dict[str, dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate segment-wide non-token invariants before any repair is allowed."""
-    expected_blocks = [blocks_by_id[value] for value in segment.get("block_ids") or [] if _is_translatable(blocks_by_id[value])]
+    expected_blocks = [
+        blocks_by_id[value]
+        for value in _augmentation_block_ids(segment, blocks_by_id)
+        if _is_translatable(blocks_by_id[value])
+    ]
     expected_ids = [block_id(block) for block in expected_blocks]
     raw_blocks = translation.get("blocks") if isinstance(translation, dict) else None
     if not isinstance(raw_blocks, list):
@@ -8965,6 +10060,36 @@ def _generation_document(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _augmentation_document(document: dict[str, Any]) -> dict[str, Any]:
+    """Return generation-eligible source while preserving headings elsewhere."""
+    projected = _generation_document(document)
+    return {
+        **projected,
+        "blocks": [
+            block for block in projected.get("blocks") or []
+            if not _project_is_structural(block)
+        ],
+    }
+
+
+def _empty_glossary(*, language: str, page_count: int | None) -> dict[str, Any]:
+    return {
+        "schema_version": GLOSSARY_VERSION,
+        "source_sha256": sha256_json({
+            "augmentation_projection_version": AUGMENTATION_PROJECTION_VERSION,
+            "blocks": [], "language": language, "page_count": page_count,
+        }),
+        "language": language,
+        "page_count": page_count,
+        "entry_limit": glossary_entry_limit(page_count),
+        "entries": [],
+        "logical_receipt": {
+            "kind": "controller_skipped_structural_heading",
+            "provider_calls": 0,
+        },
+    }
+
+
 def _generation_excluded_block_ids(document: dict[str, Any]) -> set[str]:
     return non_substantive_block_ids(document)
 
@@ -9000,8 +10125,9 @@ def _protected_names(bundle: SourceBundle, *, glossary: dict[str, Any] | None = 
         text = re.sub(r"\s+", " ", str(value)).strip()
         if text:
             unique.setdefault(text.casefold(), text)
-            # Also protect surname/name roots when a full author name is listed.
-            for token in re.findall(r"[A-Za-z][A-Za-z'’-]{2,}", text):
+            # Also protect roots in cased writing systems.  Uncased compact
+            # scripts retain the full metadata name without unsafe splitting.
+            for token in re.findall(r"[^\W\d_][^\W_\d'’-]*(?:['’-][^\W\d_]+)*", text):
                 if token.casefold() not in _AUTHOR_CONNECTOR_TOKENS and token[:1].isupper():
                     unique.setdefault(token.casefold(), token)
     return sorted(unique.values(), key=lambda value: (value.casefold(), value))
@@ -9059,8 +10185,8 @@ def _missing_protected_names(
         # A protected name is a canonical Latin spelling, not a case-folded
         # keyword.  Exact source case prevents roots such as ``May``, ``Young``,
         # or ``Lie`` from matching ordinary prose while retaining true eponyms.
-        if re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", source)
-        and not re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", generated)
+        if contains_lexical_term(source, name, case_sensitive=True)
+        and not contains_lexical_term(generated, name, case_sensitive=True)
     ]
 
 
@@ -9099,7 +10225,7 @@ def _minimal_missing_name_insertions(missing_names: list[str]) -> list[str]:
         name for name in missing_names
         if not any(
             other != name
-            and re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", other, re.IGNORECASE)
+            and contains_lexical_term(other, name)
             for other in missing_names
         )
     ]
@@ -9115,7 +10241,7 @@ def _protected_names_for_blocks(
     )
     return [
         name for name in protected_names
-        if name and re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", source)
+        if name and contains_lexical_term(source, name, case_sensitive=True)
     ]
 
 
@@ -9128,7 +10254,7 @@ def _evidence_for_segment(
 ) -> dict[str, Any]:
     source_text = " ".join(
         str(blocks_by_id[value].get("text") or blocks_by_id[value].get("title") or "")
-        for value in segment.get("block_ids") or []
+        for value in _augmentation_block_ids(segment, blocks_by_id)
     )
     source_tokens = _terms(source_text)
     citation_targets = _segment_citation_targets(segment, blocks_by_id, evidence)
@@ -9380,7 +10506,7 @@ def _segment_citation_targets(
     evidence: dict[str, Any],
 ) -> list[dict[str, Any]]:
     target_ids: list[str] = []
-    for block_id_value in segment.get("block_ids") or []:
+    for block_id_value in _augmentation_block_ids(segment, blocks_by_id):
         for run in blocks_by_id.get(str(block_id_value), {}).get("inline_runs") or []:
             if not isinstance(run, dict) or str(run.get("kind") or "") != "citation":
                 continue
@@ -9922,7 +11048,7 @@ def _review_source_anchors(
     for segment in segments:
         projection = [
             _annotation_input_block(blocks_by_id[value], document)
-            for value in segment.get("block_ids") or []
+            for value in _augmentation_block_ids(segment, blocks_by_id)
         ]
         serialized = json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
         if len(serialized) > per_segment:
@@ -9932,7 +11058,6 @@ def _review_source_anchors(
             excerpt = serialized
         anchors.append({
             "segment_id": str(segment.get("segment_id") or ""),
-            "title": str(segment.get("title") or "")[:160],
             "start_block_id": str(segment.get("start_block_id") or ""),
             "end_block_id": str(segment.get("end_block_id") or ""),
             "source_sha256": sha256_json(projection),
@@ -9996,14 +11121,21 @@ def _write_legacy_reuse_plan(checkpoint_dir: Path, options: BuildOptions) -> Pat
     """Write the legacy-path lane plan before its first provider submission."""
 
     entries = []
-    for lane in ("segmentation", "glossary", "translation", "commentary", "review"):
-        skipped = options.skip_translation and lane in {"glossary", "translation"}
+    for lane in (
+        "segmentation", "glossary", "title_translation", "translation",
+        "commentary", "review",
+    ):
+        skipped = options.skip_translation and lane in {
+            "glossary", "title_translation", "translation",
+        }
         entries.append({
             "chapter_id": "project", "segment_id": None, "lane": lane,
             "status": "skipped" if skipped else "miss", "artifact_id": None,
             "reason": (
                 "glossary_disabled_for_same_language_source"
                 if skipped and lane == "glossary"
+                else "title_translation_disabled_for_same_language_source"
+                if skipped and lane == "title_translation"
                 else "translation_disabled_for_same_language_source" if skipped
                 else "explicitly selected for regeneration" if lane in options.regenerate_lanes
                 else "legacy pipeline cache lookup follows deterministic preparation"
@@ -10167,6 +11299,10 @@ def _fingerprint_bound_state_key(key: str) -> bool:
         "segment_count",
         "annotation_language",
         "first_wave_preview_version",
+        "chapter_projection_version",
+        "augmentation_projection_version",
+        "chapter_guide_version",
+        "reader_final_checkpoint_version",
         "final_render_version",
         "web_render_version",
         "reader_snapshot_path",

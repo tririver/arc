@@ -26,6 +26,14 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("paper_id")
     build.add_argument("--project-dir", default=None)
     build.add_argument("--annotation-language", default=None)
+    build.add_argument(
+        "--source-language",
+        default=None,
+        help=(
+            "BCP-47 language tag established by source sampling; ARC does not "
+            "detect the source language automatically"
+        ),
+    )
     build.add_argument("--provider", default="auto")
     build.add_argument("--model", default=None)
     build.add_argument(
@@ -92,11 +100,24 @@ def main(argv: list[str] | None = None) -> int:
         help="recover eligible blocked generation lanes automatically (default: auto)",
     )
     build.add_argument(
+        "--max-auto-replacements",
+        type=int,
+        default=3,
+        help="maximum fresh replacement generations per blocked lane group (default: 3)",
+    )
+    build.add_argument(
         "--regenerate", action="append", default=[],
         choices=("segmentation", "glossary", "guide", "translation", "commentary", "review", "all"),
         help="repeat to explicitly regenerate only selected content lanes",
     )
     build.add_argument("--confirm-expensive-regeneration", action="store_true")
+    build.add_argument(
+        "--regenerate-segment",
+        action="append",
+        default=[],
+        metavar="LANE:SEGMENT_ID",
+        help="repeat to regenerate one translation or commentary segment",
+    )
     build.add_argument(
         "--regenerate-commentary", action="store_true",
         help="deprecated alias for --regenerate commentary",
@@ -190,6 +211,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 paper_id=args.paper_id,
                 project_dir=project_dir,
                 annotation_language=language,
+                source_language=args.source_language,
                 language_was_defaulted=defaulted,
                 provider=args.provider,
                 model=args.model,
@@ -207,7 +229,9 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 document_kind=args.document_kind,
                 idle_timeout_seconds=args.idle_timeout_seconds,
                 recovery_policy=args.recovery_policy,
+                max_auto_replacements=args.max_auto_replacements,
                 regenerate_lanes=tuple(args.regenerate),
+                regenerate_segments=tuple(args.regenerate_segment),
                 confirm_expensive_regeneration=args.confirm_expensive_regeneration,
                 regenerate_commentary=args.regenerate_commentary,
                 legacy_checkpoint=(

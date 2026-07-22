@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 
 DOCUMENT_SCHEMA_VERSION = "arc.paper.document.v2"
-RICH_DOCUMENT_PARSER_VERSION = 4
+RICH_DOCUMENT_PARSER_VERSION = 5
 _HEADING_NAMES = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _ATOMIC_NAMES = _HEADING_NAMES | {"p", "ul", "ol", "pre", "blockquote"}
 _ASSET_ATTRIBUTES = (("img", "src"), ("source", "src"), ("object", "data"))
@@ -470,21 +470,38 @@ def _inline_runs(node: Tag, *, block_id: str) -> list[dict[str, Any]]:
     translation neither dropped nor reordered source material.
     """
 
-    values: list[tuple[str, str, dict[str, Any]]] = []
+    values: list[tuple[str, str, dict[str, Any], bool]] = []
+    separator_pending = False
 
-    def append(kind: str, content: str, **extra: Any) -> None:
+    def append(
+        kind: str, content: str, *, separator_before: bool = False, **extra: Any
+    ) -> None:
         normalized = re.sub(r"\s+", " ", content).strip() if kind == "text" else content.strip()
         if not normalized:
             return
         if kind == "text" and values and values[-1][0] == "text":
-            previous_kind, previous, previous_extra = values[-1]
-            values[-1] = (previous_kind, f"{previous} {normalized}".strip(), previous_extra)
+            previous_kind, previous, previous_extra, previous_separator = values[-1]
+            joiner = " " if separator_before else ""
+            values[-1] = (
+                previous_kind,
+                f"{previous}{joiner}{normalized}",
+                previous_extra,
+                previous_separator,
+            )
             return
-        values.append((kind, normalized, extra))
+        values.append((kind, normalized, extra, separator_before and bool(values)))
 
     def visit(value: Tag | NavigableString) -> None:
+        nonlocal separator_pending
         if isinstance(value, NavigableString):
-            append("text", str(value))
+            raw = str(value)
+            has_leading_separator = bool(re.match(r"[ \t\r\n\f]", raw))
+            append(
+                "text",
+                raw,
+                separator_before=separator_pending or has_leading_separator,
+            )
+            separator_pending = bool(re.search(r"[ \t\r\n\f]$", raw))
             return
         if not isinstance(value, Tag):
             return
@@ -492,13 +509,29 @@ def _inline_runs(node: Tag, *, block_id: str) -> list[dict[str, Any]]:
             annotation = value.find("annotation", attrs={"encoding": "application/x-tex"})
             tex = _text(annotation) if isinstance(annotation, Tag) else str(value.get("alttext") or "").strip()
             mathml = str(value)
-            append("math", tex or mathml, tex=tex, mathml=mathml)
+            append(
+                "math", tex or mathml, separator_before=separator_pending,
+                tex=tex, mathml=mathml,
+            )
+            separator_pending = False
             return
         if value.name == "a":
             href = str(value.get("href") or "").strip()
+            raw_visible = "".join(
+                str(item) for item in value.descendants
+                if isinstance(item, NavigableString)
+            )
             visible = _text(value)
             kind = "citation" if "bib" in href.casefold() or "ltx_ref" in set(value.get("class") or []) else "link"
-            append(kind, visible or href, href=href, target_id=href[1:] if href.startswith("#") else "")
+            append(
+                kind, visible or href,
+                separator_before=(
+                    separator_pending
+                    or bool(re.match(r"^[ \t\r\n\f]", raw_visible))
+                ),
+                href=href, target_id=href[1:] if href.startswith("#") else "",
+            )
+            separator_pending = bool(re.search(r"[ \t\r\n\f]$", raw_visible))
             return
         for child in value.children:
             if isinstance(child, (Tag, NavigableString)):
@@ -506,7 +539,7 @@ def _inline_runs(node: Tag, *, block_id: str) -> list[dict[str, Any]]:
 
     visit(node)
     runs: list[dict[str, Any]] = []
-    for order, (kind, content, extra) in enumerate(values, start=1):
+    for order, (kind, content, extra, separator_before) in enumerate(values, start=1):
         material = {
             "kind": kind,
             "content": content,
@@ -515,16 +548,17 @@ def _inline_runs(node: Tag, *, block_id: str) -> list[dict[str, Any]]:
         content_hash = hashlib.sha256(
             repr(sorted(material.items())).encode("utf-8")
         ).hexdigest()
-        runs.append(
-            {
-                "run_id": f"{block_id}.run-{order:04d}",
-                "token_id": f"{block_id}.token-{order:04d}-{content_hash[:12]}",
-                "order": order,
-                "kind": kind,
-                "content_hash": content_hash,
-                **material,
-            }
-        )
+        run = {
+            "run_id": f"{block_id}.run-{order:04d}",
+            "token_id": f"{block_id}.token-{order:04d}-{content_hash[:12]}",
+            "order": order,
+            "kind": kind,
+            "content_hash": content_hash,
+            **material,
+        }
+        if separator_before:
+            run["separator_before"] = " "
+        runs.append(run)
     return runs
 
 

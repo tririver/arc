@@ -8,16 +8,29 @@
   const toggle = document.getElementById("sidebar-toggle");
   if (!snapshot || !app || !main || !sidebar || !toggle) return;
 
+  const targetLanguage = String(snapshot.language || "und");
+  const sourceLanguage = String(snapshot.source_language || "und");
+  const targetDirection = String(snapshot.direction || "auto");
+  const sourceDirection = String(snapshot.source_direction || "auto");
+  if (document.documentElement) {
+    document.documentElement.lang = targetLanguage;
+    document.documentElement.dir = targetDirection;
+  }
+
   const isChinese = String(snapshot.language || "").toLowerCase().startsWith("zh");
   const labels = isChinese ? {
     contents: "目录", guide: "章节导读", motivation: "动机", main_content: "主要内容",
-    section_logic: "章节逻辑", book_position: "全文位置", prerequisites: "预备知识",
+    section_logic: "章节逻辑", prerequisites: "预备知识", pedagogical_comparison: "教材顺序比较",
+    historical_context: "历史背景", supplementary_reading: "补充阅读",
+    sidebarOpen: "收起侧栏", sidebarClosed: "展开侧栏",
     explanation: "解释", prior_work: "此前工作", later_work: "后续工作",
     waiting: "尚在生成，刷新页面后将显示已通过校验的内容。", translationPending: "译文生成中",
     companionPending: "伴读生成中", glossary: "全文术语表", status: "生成状态", sourceAppendix: "原文附录"
   } : {
     contents: "Contents", guide: "Chapter guide", motivation: "Motivation", main_content: "Main content",
-    section_logic: "Section logic", book_position: "Position", prerequisites: "Prerequisites",
+    section_logic: "Section logic", prerequisites: "Prerequisites", pedagogical_comparison: "Pedagogical comparison",
+    historical_context: "Historical context", supplementary_reading: "Further reading",
+    sidebarOpen: "Collapse sidebar", sidebarClosed: "Expand sidebar",
     explanation: "Explanation", prior_work: "Prior work", later_work: "Later work",
     waiting: "Generation is in progress. Refresh to show newly accepted material.", translationPending: "Translation pending",
     companionPending: "Companion pending", glossary: "Glossary", status: "Build status", sourceAppendix: "Source appendix"
@@ -29,7 +42,7 @@
   let glossaryNode = null;
 
   restoreSidebar();
-  toggle.addEventListener("click", () => setSidebar(!app.classList.contains("sidebar-collapsed")));
+  toggle.addEventListener("click", () => setSidebar(app.classList.contains("sidebar-collapsed")));
   renderNavigation();
   renderMain();
   installScrollSpy();
@@ -43,6 +56,10 @@
 
   function setSidebar(open, remember = true) {
     app.classList.toggle("sidebar-collapsed", !open);
+    const toggleLabel = open ? labels.sidebarOpen : labels.sidebarClosed;
+    toggle.textContent = toggleLabel;
+    toggle.setAttribute("aria-label", toggleLabel);
+    toggle.setAttribute("title", toggleLabel);
     toggle.setAttribute("aria-expanded", String(open));
     if (remember) {
       try { localStorage.setItem("arc-reader-sidebar", open ? "open" : "closed"); } catch (_) { /* ignore */ }
@@ -66,7 +83,9 @@
         if (window.matchMedia("(max-width: 760px)").matches) setSidebar(false);
       });
       item.append(link);
-      if (!(chapter.segments || []).length) item.append(element("div", labels.waiting, "pending"));
+      if (!(chapter.segments || []).length && !(chapter.guide || []).length && !chapter.structural_only) {
+        item.append(element("div", labels.waiting, "pending"));
+      }
       list.append(item);
     });
     if (glossaryEnabled()) {
@@ -89,7 +108,10 @@
   function renderMain() {
     const header = document.createElement("header");
     header.className = "paper-header";
-    header.append(element("h1", snapshot.title || "Companion Reader"));
+    header.append(bilingualHeading(
+      "h1", snapshot.source_title, snapshot.translated_title,
+      snapshot.title || "Companion Reader"
+    ));
     if ((snapshot.authors || []).length) header.append(element("p", snapshot.authors.join(", "), "authors"));
     const status = document.createElement("div");
     status.className = "build-status";
@@ -108,7 +130,10 @@
       holder.className = "chapter chapter-placeholder";
       holder.id = chapterAnchor(chapter.chapter_id);
       holder.dataset.chapter = chapter.chapter_id;
-      holder.append(element("h2", chapter.title || chapterLabel(index)));
+      holder.append(bilingualHeading(
+        "h2", chapter.source_title, chapter.translated_title,
+        chapter.title || chapterLabel(index)
+      ));
       holder.append(element("p", labels.waiting));
       chapterNodes.set(chapter.chapter_id, holder);
       main.append(holder);
@@ -149,9 +174,11 @@
     list.className = "glossary-list";
     snapshot.glossary.forEach(entry => {
       const source = document.createElement("dt");
+      setLanguage(source, sourceLanguage, sourceDirection);
       source.append(termElement(entry.source || "", entry));
       const target = document.createElement("dd");
       target.className = "glossary-target";
+      setLanguage(target, targetLanguage, targetDirection);
       target.append(termElement(entry.target || "", entry));
       list.append(source, target);
       list.append(element("dd", entry.explanation || "", "glossary-explanation"));
@@ -164,8 +191,11 @@
     const section = document.createElement("section");
     section.className = "source-appendix";
     section.id = `appendix-${safeId(appendix.appendix_id || "source")}`;
-    section.append(element("h2", appendix.title || labels.sourceAppendix));
-    const source = layer("source-layer");
+    section.append(bilingualHeading(
+      "h2", appendix.source_title, appendix.translated_title,
+      appendix.title || labels.sourceAppendix
+    ));
+    const source = layer("source-layer", sourceLanguage, sourceDirection);
     (appendix.source || []).forEach(block => source.append(renderSourceBlock(block)));
     section.append(source);
     typeset(section);
@@ -191,11 +221,19 @@
     node.dataset.mounted = "true";
     node.classList.remove("chapter-placeholder");
     const index = (snapshot.chapters || []).findIndex(item => item.chapter_id === chapterId);
-    const title = element("h2", chapter.title || chapterLabel(index));
+    const title = bilingualHeading(
+      "h2", chapter.source_title, chapter.translated_title,
+      chapter.title || chapterLabel(index)
+    );
     node.replaceChildren(title);
     renderGuide(node, chapter.guide || []);
-    if (!(chapter.segments || []).length) node.append(element("p", labels.waiting, "pending-layer"));
-    (chapter.segments || []).forEach((segment, segmentIndex) => node.append(renderSegment(segment, segmentIndex)));
+    if (!(chapter.segments || []).length && !(chapter.guide || []).length && !chapter.structural_only) {
+      node.append(element("p", labels.waiting, "pending-layer"));
+    }
+    (chapter.segments || []).forEach((segment, segmentIndex) => {
+      if (segment.structural_only && !(segment.source || []).length) return;
+      node.append(renderSegment(segment, segmentIndex));
+    });
     typeset(node);
     observeReadingTargets(node);
   }
@@ -204,12 +242,14 @@
     if (!guide.length) return;
     const box = document.createElement("div");
     box.className = "chapter-guide";
+    setLanguage(box, targetLanguage, targetDirection);
     box.setAttribute("aria-label", labels.guide);
     guide.forEach(item => {
       const row = document.createElement("div");
       row.className = "guide-row";
       row.append(element("span", labels[item.kind] || item.kind, "guide-label"));
       appendRuns(row, item.runs || []);
+      appendSources(row, item.sources || []);
       box.append(row);
     });
     parent.append(box);
@@ -221,14 +261,17 @@
     unit.id = segmentAnchor(segment.segment_id);
     const grid = document.createElement("div");
     grid.className = "unit-grid";
-    const source = layer("source-layer");
-    if (segment.title) source.append(element("h3", segment.title, "segment-title"));
+    const source = layer("source-layer", sourceLanguage, sourceDirection);
     (segment.source || []).forEach(block => source.append(renderSourceBlock(block)));
     const side = document.createElement("div");
     side.className = "side-layers";
-    if (snapshot.translation_mode !== "skipped") side.append(renderTranslation(segment.translation));
-    side.append(renderCompanion(segment.companion));
-    grid.append(source, side);
+    if (!segment.structural_only) {
+      if (snapshot.translation_mode !== "skipped") side.append(renderTranslation(segment.translation));
+      side.append(renderCompanion(segment.companion));
+    }
+    grid.append(source);
+    if (side.childNodes.length) grid.append(side);
+    else grid.classList.add("source-only");
     unit.append(grid);
     return unit;
   }
@@ -236,6 +279,11 @@
   function renderSourceBlock(block) {
     const wrapper = document.createElement("div");
     wrapper.className = `source-block ${safeClass(block.kind)}`;
+    setLanguage(
+      wrapper,
+      String(block.language || sourceLanguage),
+      String(block.direction || sourceDirection)
+    );
     if (block.kind === "equation" || block.kind === "math" || block.kind === "display_math") {
       if (block.number) wrapper.append(element("span", block.number, "equation-number"));
       appendRuns(wrapper, block.math || block.runs || []);
@@ -265,6 +313,18 @@
       const list = document.createElement(block.ordered ? "ol" : "ul");
       block.items.forEach(item => list.append(element("li", item)));
       wrapper.append(list);
+    } else if (isStructuralKind(block.kind) && block.translated_title) {
+      const level = block.kind === "subsubsection" ? "h5" : block.kind === "subsection" ? "h4" : "h3";
+      const heading = document.createElement(level);
+      const sourceTitle = element("span", "", "title-source");
+      setLanguage(sourceTitle, sourceLanguage, sourceDirection);
+      appendRuns(sourceTitle, block.runs || []);
+      const translatedTitle = element("span", "", "title-translation");
+      setLanguage(translatedTitle, targetLanguage, targetDirection);
+      if ((block.translated_title_runs || []).length) appendRuns(translatedTitle, block.translated_title_runs);
+      else translatedTitle.textContent = String(block.translated_title || "");
+      heading.append(sourceTitle, translatedTitle);
+      wrapper.append(heading);
     } else {
       appendRuns(wrapper, block.runs || []);
     }
@@ -272,7 +332,7 @@
   }
 
   function renderTranslation(translation) {
-    const box = layer("translation-layer");
+    const box = layer("translation-layer", targetLanguage, targetDirection);
     if (!translation) {
       box.append(element("div", labels.translationPending, "pending-layer"));
       return box;
@@ -287,7 +347,7 @@
   }
 
   function renderCompanion(companion) {
-    const box = layer("companion-layer");
+    const box = layer("companion-layer", targetLanguage, targetDirection);
     if (!companion) {
       box.append(element("div", labels.companionPending, "pending-layer"));
       return box;
@@ -441,10 +501,38 @@
     }));
   }
 
-  function layer(name) {
+  function layer(name, language, direction) {
     const node = document.createElement("section");
     node.className = `layer ${name}`;
+    if (language) setLanguage(node, language, direction || "auto");
     return node;
+  }
+  function bilingualHeading(tag, sourceTitle, translatedTitle, fallback) {
+    const source = String(sourceTitle || "").trim();
+    const translated = String(translatedTitle || "").trim();
+    const heading = document.createElement(tag);
+    if (source && translated && source !== translated) {
+      const sourceNode = element("span", source, "title-source");
+      setLanguage(sourceNode, sourceLanguage, sourceDirection);
+      const targetNode = element("span", translated, "title-translation");
+      setLanguage(targetNode, targetLanguage, targetDirection);
+      heading.append(sourceNode, targetNode);
+    } else {
+      heading.textContent = translated || source || String(fallback || "");
+      setLanguage(
+        heading,
+        translated ? targetLanguage : source ? sourceLanguage : targetLanguage,
+        translated ? targetDirection : source ? sourceDirection : targetDirection
+      );
+    }
+    return heading;
+  }
+  function setLanguage(node, language, direction) {
+    node.setAttribute("lang", String(language || "und"));
+    node.setAttribute("dir", String(direction || "auto"));
+  }
+  function isStructuralKind(kind) {
+    return ["part", "chapter", "heading", "section", "subsection", "subsubsection"].includes(String(kind || "").toLowerCase());
   }
   function element(tag, text, className) {
     const node = document.createElement(tag);

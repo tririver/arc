@@ -9,17 +9,21 @@ from .artifact_store import AcceptedArtifactStore, canonical_sha256
 
 REUSE_PLAN_VERSION = "arc.companion.reuse-plan.v1"
 LANES = (
-    "segmentation", "glossary", "guide", "translation", "commentary", "review"
+    "segmentation", "glossary", "title_translation", "guide", "translation",
+    "commentary", "review"
 )
 
 
 _SEMANTIC_FIELDS = {
     "segmentation": ("source", "chapter", "limits"),
     "glossary": ("source", "target_language", "index", "protected_names"),
+    "title_translation": (
+        "source_titles", "source_language", "target_language", "glossary",
+        "protected_names",
+    ),
     "guide": ("chapter_source", "target_language", "verified_evidence"),
     "translation": (
         "source_segment", "target_language", "glossary", "protected_names",
-        "guide", "static_context", "predecessor_accepted_chain_sha256",
     ),
     "commentary": (
         "source_segment", "guide", "metadata", "selected_evidence",

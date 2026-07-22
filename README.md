@@ -298,7 +298,8 @@ simplified and traditional Chinese are `zh`) and records the source judgment,
 target language, translation mode, and reason in `context.json`. If all samples
 clearly match the target base language, the agent passes `--skip-translation`;
 mixed or uncertain text keeps translation. The CLI itself does not perform
-language detection.
+language detection, so the workflow also passes the sampled canonical tag with
+`--source-language`.
 
 ARC reconciles PDF structure with rich-source blocks and validates exact
 chapter and segment coverage. Chapters may prepare concurrently under one
@@ -345,7 +346,11 @@ depend on MCP or project-file reading.
 `--recovery-policy auto|manual` controls blocked-call recovery and defaults to
 `auto`. Automatic recovery replays durable responses, attempts native session
 reconciliation, and may start one replacement generation for an eligible
-translation or commentary lane suffix. Bare `resume` selects automatic
+translation or commentary lane suffix, up to three times by default. Set
+`--max-auto-replacements N` to change the persisted recovery budget without
+changing content fingerprints. Use repeatable
+`--regenerate-segment LANE:SEGMENT_ID` for precise translation/commentary
+regeneration. Bare `resume` selects automatic
 recovery; choose an explicit action for strict/manual behavior:
 
 ```bash
@@ -366,8 +371,11 @@ returns for inspection without pausing the job.
 
 Each chapter guide appears once after its title. Every segment renders original,
 translation, then commentary without visible controller layer labels. Text uses
-sans-serif fonts while mathematics remains LaTeX serif. Personal names remain
-in Latin script. The deliverables are the validated full-document PDF and its
+sans-serif fonts while mathematics remains LaTeX serif. Personal names retain
+their exact source spelling in any script. Document and structural headings,
+including References and Index, render as source title plus translation but do
+not receive commentary; navigation prefers the translated title. Figure/table
+captions remain source-only. The deliverables are the validated full-document PDF and its
 static-web reader; ordinary non-JSON CLI output still prints the PDF path first.
 `arc-companion validate` verifies both forms, while a reproducibility ZIP that
 contains both plus every manifest-declared local web asset is generated only by

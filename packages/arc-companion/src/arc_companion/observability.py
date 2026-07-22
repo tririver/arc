@@ -250,6 +250,9 @@ def _recovery_status(root: Path) -> dict[str, Any]:
             dict(item) for item in value.get("action_history") or []
             if isinstance(item, dict)
         ],
+        "recovery_checkpoint_path": value.get("checkpoint_path"),
+        "recovery_checkpoint_fingerprint": value.get("checkpoint_fingerprint"),
+        "recovery_authorization_source": value.get("authorization_source"),
         "recovery_replacements": replacements,
     }
 
@@ -262,6 +265,9 @@ def _replacement_fields(value: Mapping[str, Any]) -> dict[str, Any]:
         "suffix_start_segment_id": value.get("suffix_start_segment_id"),
         "suffix_segment_ids": list(value.get("suffix_segment_ids") or []),
         "restart_attempt": value.get("attempt"),
+        "restart_max_attempts": value.get("max_auto_attempts"),
+        "replacement_group_id": value.get("group_id"),
+        "replacement_authorization_source": value.get("authorization_source"),
         "restart_trigger_code": value.get("trigger_code"),
         "restart_trigger_reason": value.get("trigger_reason"),
         "possible_duplicate_charge": bool(value.get("possible_duplicate_charge")),

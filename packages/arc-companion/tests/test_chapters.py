@@ -8,16 +8,24 @@ import time
 import pytest
 
 from arc_companion.chapter_glossary import generate_index_glossary, project_segment_glossary
-from arc_companion.chapter_guide import generate_chapter_guide
+from arc_companion.chapter_guide import (
+    CHAPTER_GUIDE_SCHEMA,
+    CHAPTER_GUIDE_VERSION,
+    chapter_guide_artifact_valid,
+    generate_chapter_guide,
+)
 from arc_companion.chapter_scheduler import run_chapter_pipeline
 from arc_companion.chapters import ChapterStructureError, build_chapters
 from arc_companion.ledger import (
+    LaneLedgerError,
+    accept_deferred_block,
     advance_block,
     initialize_lane_ledger,
     invalidate_suffix,
     mark_needs_supervision,
     next_pending,
 )
+from arc_companion.io import sha256_json
 from arc_companion.progress import CompanionProgress
 
 
@@ -36,6 +44,42 @@ def test_chapters_have_stable_ids_and_exact_substantive_coverage() -> None:
     assert [item["chapter_id"] for item in result["chapters"]] == ["ch-0001", "ch-0002"]
     assert [value for item in result["chapters"] for value in item["block_ids"]] == ["b1", "b2", "b3", "b4"]
     assert result["excluded_block_ids"] == ["b5"]
+    assert result["schema_version"] == "arc.companion.chapters.v2"
+    assert result["chapters"][0]["title_block_ids"] == ["b1"]
+    assert result["chapters"][0]["structural_block_ids"] == ["b1"]
+    assert result["chapters"][0]["content_block_ids"] == ["b2"]
+
+
+def test_authoritative_chapter_v2_partitions_all_heading_levels_without_guessing() -> None:
+    kinds = ["part", "chapter", "heading", "section", "subsection", "subsubsection"]
+    blocks = [
+        {"block_id": f"h{index}", "type": kind, "title": f"Heading {index}"}
+        for index, kind in enumerate(kinds, 1)
+    ]
+    blocks.extend([
+        {"block_id": "p1", "type": "prose", "text": "Body."},
+        {"block_id": "e1", "type": "equation", "text": "x=y"},
+    ])
+    result = build_chapters(
+        {"blocks": blocks},
+        structure={"chapters": [{
+            "title": "Heading 2",
+            "block_ids": [item["block_id"] for item in blocks],
+        }]},
+    )
+    chapter = result["chapters"][0]
+    assert chapter["title_block_ids"] == ["h2"]
+    assert chapter["structural_block_ids"] == [f"h{index}" for index in range(1, 7)]
+    assert chapter["content_block_ids"] == ["p1", "e1"]
+
+    unmatched = build_chapters(
+        {"blocks": blocks},
+        structure={"chapters": [{
+            "title": "I PART",
+            "block_ids": [item["block_id"] for item in blocks],
+        }]},
+    )["chapters"][0]
+    assert unmatched["title_block_ids"] == []
 
 
 def test_authoritative_chapter_gap_is_rejected() -> None:
@@ -104,6 +148,22 @@ def test_segment_glossary_uses_unicode_latin_and_decimal_boundaries() -> None:
     assert [item["source"] for item in exact["entries"]] == ["résumé", "phase 2"]
 
 
+def test_segment_glossary_uses_unicode_boundaries_beyond_latin_and_keeps_cjk_runs() -> None:
+    glossary = {"entries": [
+        {"source": "Ландау", "target": "Landau"},
+        {"source": "量子", "target": "quantum"},
+    ]}
+    embedded = project_segment_glossary(
+        [{"text": "сЛандау discusses 量子场论."}], glossary,
+    )
+    assert [item["source"] for item in embedded["entries"]] == ["量子"]
+
+    exact = project_segment_glossary(
+        [{"text": "Теория Ландау discusses 量子场论."}], glossary,
+    )
+    assert [item["source"] for item in exact["entries"]] == ["Ландау", "量子"]
+
+
 def test_segment_glossary_preserves_empty_target_and_global_order() -> None:
     glossary = {"entries": [
         {"source": "second", "target": ""},
@@ -131,6 +191,88 @@ def test_lane_ledger_orders_states_and_preserves_accepted_prefix(tmp_path) -> No
     assert ledger["blocks"][1] == {
         "segment_id": "s2", "state": "prepared",
         "submission_state": "not_submitted", "generation": 2,
+    }
+
+
+def test_targeted_suffix_stage_survives_reentry_and_rebuilds_chain(tmp_path) -> None:
+    path = tmp_path / "ledger.json"
+    staged_output = {
+        "blocks": [{"block_id": "b3", "translation": "three"}],
+    }
+    staged_output_sha256 = sha256_json(staged_output)
+    initialize_lane_ledger(
+        path, chapter_id="ch-0001", lane="translation",
+        segment_ids=["s1", "s2", "s3"],
+    )
+    for segment_id in ("s1", "s2", "s3"):
+        for state in (
+            "submitted", "response_received", "schema_valid",
+            "invariant_valid", "accepted",
+        ):
+            advance_block(
+                path, segment_id=segment_id, state=state,
+                input_sha256=f"old-input-{segment_id}",
+                output_sha256=(
+                    staged_output_sha256
+                    if segment_id == "s3" else f"old-output-{segment_id}"
+                ),
+                receipt={"call_id": f"old-call-{segment_id}"},
+                validation_receipt={"old_validation": True},
+            )
+
+    staged = {
+        "s3": {
+            "output": staged_output,
+            "output_sha256": staged_output_sha256,
+            "logical_receipt": {
+                "kind": "targeted_regeneration_suffix_stage",
+                "provider_calls": 0,
+                "source_logical_receipt": {"call_id": "old-call-s3"},
+            },
+            "validation_receipt": {"staged_before_targeted_invalidation": True},
+        },
+    }
+    invalidate_suffix(
+        path, from_segment_id="s2", generation=2, staged_outputs=staged,
+    )
+
+    # Simulate a crash immediately after invalidation. Re-entering the same
+    # targeted request must retain the durable suffix candidate without also
+    # turning the selected target into a reuse candidate.
+    ledger = invalidate_suffix(path, from_segment_id="s2", generation=3)
+    assert "deferred_output" not in ledger["blocks"][1]
+    assert ledger["blocks"][2]["deferred_output"] == staged["s3"]["output"]
+
+    for state in (
+        "submitted", "response_received", "schema_valid",
+        "invariant_valid", "accepted",
+    ):
+        ledger = advance_block(
+            path, segment_id="s2", state=state,
+            input_sha256="new-input-s2", output_sha256="new-output-s2",
+        )
+    s2_chain = ledger["blocks"][1]["accepted_chain_sha256"]
+    with pytest.raises(LaneLedgerError, match="deferred output hash changed"):
+        accept_deferred_block(
+            path, segment_id="s3", input_sha256="new-input-s3",
+            output_sha256="tampered-output",
+            logical_receipt=ledger["blocks"][2]["deferred_logical_receipt"],
+            validation_receipt=ledger["blocks"][2]["deferred_validation_receipt"],
+        )
+    ledger = accept_deferred_block(
+        path, segment_id="s3", input_sha256="new-input-s3",
+        output_sha256=staged_output_sha256,
+        logical_receipt=ledger["blocks"][2]["deferred_logical_receipt"],
+        validation_receipt=ledger["blocks"][2]["deferred_validation_receipt"],
+    )
+    s3 = ledger["blocks"][2]
+    assert s3["state"] == "accepted"
+    assert s3["generation"] == 3
+    assert s3["predecessor_accepted_chain_sha256"] == s2_chain
+    assert ledger["accepted_chain_sha256"] == s3["accepted_chain_sha256"]
+    assert not any(key.startswith("deferred_") for key in s3)
+    assert s3["logical_receipt"]["source_logical_receipt"] == {
+        "call_id": "old-call-s3"
     }
 
 
@@ -359,7 +501,14 @@ def test_chapter_guide_rejects_unverified_supplementary_reading(tmp_path) -> Non
             {"chapter_id": "ch-0001", "title": "One"}, [{"block_id": "b1", "text": "Source"}],
             language="zh-CN", evidence={"papers": [{"evidence_id": "ok", "title": "Known"}]},
             checkpoint_dir=tmp_path, force=True,
-            call_model=lambda *args: {"motivation": None, "main_content": "内容", "section_logic": None, "book_position": None, "prerequisites": None, "supplementary_reading": [{"title": "Made up", "identifier": None, "reason": "x", "evidence_id": "bad"}]},
+            call_model=lambda *args: {
+                "motivation": None, "main_content": "内容", "section_logic": None,
+                "prerequisites": None, "pedagogical_comparison": None,
+                "historical_context": [], "supplementary_reading": [{
+                    "title": "Made up", "identifier": None, "reason": "x",
+                    "evidence_id": "bad",
+                }],
+            },
         )
 
 
@@ -368,8 +517,11 @@ def test_chapter_guide_excludes_original_bibliography_by_all_normalized_identiti
 
     def model(prompt, *_args):
         captured.append(prompt)
-        return {"motivation": None, "main_content": None, "section_logic": None,
-                "book_position": None, "prerequisites": None, "supplementary_reading": []}
+        return {
+            "motivation": None, "main_content": None, "section_logic": None,
+            "prerequisites": None, "pedagogical_comparison": None,
+            "historical_context": [], "supplementary_reading": [],
+        }
 
     evidence = {
         "bibliography": [
@@ -393,5 +545,195 @@ def test_chapter_guide_excludes_original_bibliography_by_all_normalized_identiti
     assert "by-arxiv" not in captured[0]
     assert "by-title" not in captured[0]
     assert '"evidence_id": "new"' in captured[0]
-    assert "book_position field describes location within the supplied source document" in captured[0]
+    assert "pedagogical_comparison" in captured[0]
+    assert "historical_context" in captured[0]
+    assert "book_position" not in captured[0]
     assert "never describe or predict pagination in the generated companion document" in captured[0]
+
+
+def test_chapter_guide_v3_schema_has_ordered_nullable_and_sourced_fields() -> None:
+    assert list(CHAPTER_GUIDE_SCHEMA["properties"]) == [
+        "motivation", "main_content", "section_logic", "prerequisites",
+        "pedagogical_comparison", "historical_context", "supplementary_reading",
+    ]
+    assert "book_position" not in str(CHAPTER_GUIDE_SCHEMA)
+    comparison = CHAPTER_GUIDE_SCHEMA["properties"]["pedagogical_comparison"]
+    assert comparison["type"] == ["object", "null"]
+    assert comparison["properties"]["sources"]["minItems"] == 1
+    history = CHAPTER_GUIDE_SCHEMA["properties"]["historical_context"]
+    assert history["maxItems"] == 3
+    assert history["items"]["properties"]["sources"]["maxItems"] == 3
+
+
+def test_chapter_guide_artifact_validator_rejects_v2_and_extra_fields() -> None:
+    valid = {
+        "schema_version": CHAPTER_GUIDE_VERSION,
+        "source_sha256": "source",
+        "chapter_id": "ch-0001",
+        "motivation": None,
+        "main_content": "Content",
+        "section_logic": None,
+        "prerequisites": None,
+        "pedagogical_comparison": None,
+        "historical_context": [],
+        "supplementary_reading": [],
+    }
+    assert chapter_guide_artifact_valid(valid)
+    assert not chapter_guide_artifact_valid({
+        **valid,
+        "schema_version": "arc.companion.chapter-guide.v2",
+        "book_position": "First",
+    })
+    assert not chapter_guide_artifact_valid({**valid, "book_position": "First"})
+
+
+def test_chapter_guide_artifact_validator_enforces_offline_evidence_policy() -> None:
+    guide = {
+        "schema_version": CHAPTER_GUIDE_VERSION,
+        "source_sha256": "source",
+        "chapter_id": "ch-0001",
+        "motivation": None,
+        "main_content": None,
+        "section_logic": None,
+        "prerequisites": None,
+        "pedagogical_comparison": {
+            "text": "The textbook reverses the order.",
+            "sources": [{
+                "title": "Textbook",
+                "url": "https://example.test/textbook",
+                "locator": "Chapter 2",
+            }],
+        },
+        "historical_context": [],
+        "supplementary_reading": [{
+            "title": "Textbook", "identifier": None, "reason": "Comparison",
+            "evidence_id": "known",
+        }],
+    }
+    evidence = {"related_papers": [{
+        "evidence_id": "known", "title": "Textbook", "doi": "10.1000/known",
+        "url": "https://example.test/textbook",
+    }]}
+
+    assert chapter_guide_artifact_valid(
+        guide, evidence=evidence, allow_internet=False,
+    )
+    assert not chapter_guide_artifact_valid(
+        guide, evidence={}, allow_internet=False,
+    )
+    assert chapter_guide_artifact_valid(
+        {**guide, "supplementary_reading": []},
+        evidence={}, allow_internet=True,
+    )
+
+
+def test_chapter_guide_offline_sources_are_limited_to_prompt_evidence_urls(tmp_path) -> None:
+    evidence = {"related_papers": [{
+        "evidence_id": "known", "title": "Known textbook", "doi": "10.1000/known",
+        "url": "https://example.test/known",
+    }]}
+
+    def result(url: str) -> dict:
+        return {
+            "motivation": None, "main_content": None, "section_logic": None,
+            "prerequisites": None,
+            "pedagogical_comparison": {
+                "text": "The reference reverses the teaching order.",
+                "sources": [{
+                    "title": "Known textbook", "url": url, "locator": "Chapter 2",
+                }],
+            },
+            "historical_context": [], "supplementary_reading": [],
+        }
+
+    accepted = generate_chapter_guide(
+        {"chapter_id": "ch-0001"}, [{"block_id": "b1", "text": "Source"}],
+        language="zh-CN", evidence=evidence, checkpoint_dir=tmp_path / "accepted",
+        force=True, allow_internet=False,
+        call_model=lambda *_args: result("https://example.test/known"),
+    )
+    assert accepted["pedagogical_comparison"]["sources"][0]["locator"] == "Chapter 2"
+
+    with pytest.raises(ValueError, match="outside supplied local evidence"):
+        generate_chapter_guide(
+            {"chapter_id": "ch-0001"}, [{"block_id": "b1", "text": "Source"}],
+            language="zh-CN", evidence=evidence, checkpoint_dir=tmp_path / "rejected",
+            force=True, allow_internet=False,
+            call_model=lambda *_args: result("https://outside.test/source"),
+        )
+
+
+def test_empty_chapter_guide_uses_silent_nulls_and_arrays(tmp_path) -> None:
+    captured: list[str] = []
+
+    def model(prompt, *_args):
+        captured.append(prompt)
+        return {
+            "motivation": None, "main_content": None, "section_logic": None,
+            "prerequisites": None, "pedagogical_comparison": None,
+            "historical_context": [], "supplementary_reading": [],
+        }
+
+    guide = generate_chapter_guide(
+        {"chapter_id": "ch-empty"}, [{"block_id": "b1", "text": "Source"}],
+        language="zh-CN", evidence={}, checkpoint_dir=tmp_path, force=True,
+        call_model=model,
+    )
+
+    assert guide["pedagogical_comparison"] is None
+    assert guide["historical_context"] == []
+    assert "never explain missing material" in captured[0]
+
+
+def test_chapter_guide_cache_identity_includes_host_tool_policy(tmp_path) -> None:
+    calls = 0
+
+    def model(*_args):
+        nonlocal calls
+        calls += 1
+        return {
+            "motivation": None, "main_content": None, "section_logic": None,
+            "prerequisites": None, "pedagogical_comparison": None,
+            "historical_context": [], "supplementary_reading": [],
+        }
+
+    arguments = {
+        "chapter": {"chapter_id": "ch-cache"},
+        "source_blocks": [{"block_id": "b1", "text": "Source"}],
+        "language": "zh-CN", "evidence": {}, "checkpoint_dir": tmp_path,
+        "force": False, "call_model": model, "allow_internet": True,
+    }
+    first = generate_chapter_guide(**arguments, inherit_host_tools=False)
+    cached = generate_chapter_guide(**arguments, inherit_host_tools=False)
+    changed = generate_chapter_guide(**arguments, inherit_host_tools=True)
+
+    assert first["source_sha256"] == cached["source_sha256"]
+    assert changed["source_sha256"] != first["source_sha256"]
+    assert calls == 2
+
+
+def test_chapter_guide_cache_identity_includes_full_lane_recipe(tmp_path) -> None:
+    calls = 0
+
+    def model(*_args):
+        nonlocal calls
+        calls += 1
+        return {
+            "motivation": None, "main_content": None, "section_logic": None,
+            "prerequisites": None, "pedagogical_comparison": None,
+            "historical_context": [], "supplementary_reading": [],
+        }
+
+    arguments = {
+        "chapter": {"chapter_id": "ch-recipe"},
+        "source_blocks": [{"block_id": "b1", "text": "Source"}],
+        "language": "zh-CN", "evidence": {}, "checkpoint_dir": tmp_path,
+        "force": False, "call_model": model,
+    }
+    first = generate_chapter_guide(**arguments, recipe_identity="provider-a:model-a")
+    cached = generate_chapter_guide(**arguments, recipe_identity="provider-a:model-a")
+    changed = generate_chapter_guide(**arguments, recipe_identity="provider-b:model-a")
+
+    assert first["source_sha256"] == cached["source_sha256"]
+    assert changed["source_sha256"] != first["source_sha256"]
+    assert calls == 2

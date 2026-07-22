@@ -19,10 +19,10 @@ from .reader_text import clean_reader_annotation, clean_reader_translation
 from .source import asset_path, block_id
 
 
-READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v2"
-READER_FINAL_VERSION = "arc.companion.reader-final.v2"
+READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v3"
+READER_FINAL_VERSION = "arc.companion.reader-final.v3"
 WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v2"
-WEB_RENDER_VERSION = "arc.companion.web-render.v2"
+WEB_RENDER_VERSION = "arc.companion.web-render.v4"
 WEB_VALIDATION_VERSION = "arc.companion.web-validation.v2"
 
 _STATE_VERSIONS = {
@@ -117,12 +117,23 @@ def build_reader_snapshot(
         for item in document.get("blocks") or []
         if isinstance(item, Mapping) and block_id(dict(item))
     }
+    paper_title_block_ids = _paper_title_block_ids(document)
     entities = _entity_indexes(document)
-    language = str(
+    language = _normalize_language_tag(str(
         overrides.get("language")
         or current_state.get("annotation_language")
         or current_state.get("language")
-        or ""
+        or "und"
+    ))
+    content = overrides.get("content") if isinstance(overrides.get("content"), Mapping) else {}
+    source_language = _normalize_language_tag(str(
+        overrides.get("source_language")
+        or content.get("source_language")
+        or current_state.get("source_language")
+        or "und"
+    ))
+    title_translations = _title_translation_index(
+        overrides.get("title_translations") or content.get("title_translations")
     )
 
     rendered_chapters: list[dict[str, Any]] = []
@@ -131,16 +142,22 @@ def build_reader_snapshot(
     annotated_ids: list[str] = []
     for chapter in chapters:
         chapter_id = str(chapter.get("chapter_id") or "")
+        chapter_title_block_ids = {
+            str(value) for value in chapter.get("title_block_ids") or [] if str(value)
+        }
         rendered_segments: list[dict[str, Any]] = []
         for segment in segments_by_chapter.get(chapter_id, []):
             segment_id = str(segment.get("segment_id") or "")
             if not segment_id:
                 continue
-            ordered_segment_ids.append(segment_id)
+            if not bool(segment.get("structural_only")):
+                ordered_segment_ids.append(segment_id)
             source_blocks = [
                 blocks_by_id[value]
                 for value in segment.get("block_ids") or []
                 if value in blocks_by_id
+                and value not in chapter_title_block_ids
+                and value not in paper_title_block_ids
             ]
             translation = translations.get(segment_id)
             annotation = annotations.get(segment_id)
@@ -151,9 +168,17 @@ def build_reader_snapshot(
             rendered_segments.append(
                 {
                     "segment_id": segment_id,
-                    "title": str(segment.get("title") or ""),
+                    "structural_only": bool(segment.get("structural_only")),
                     "source": [
-                        _source_block(item, entities=entities) for item in source_blocks
+                        _source_block(
+                            item,
+                            entities=entities,
+                            translated_title=_translated_block_title(
+                                item, title_translations
+                            ),
+                            language=source_language,
+                        )
+                        for item in source_blocks
                     ],
                     "translation": _translation_view(
                         translation, source_blocks=source_blocks, entities=entities
@@ -162,13 +187,20 @@ def build_reader_snapshot(
                     "lane_status": lane_states.get(segment_id, {}),
                 }
             )
+        source_chapter_title = str(chapter.get("title") or "")
+        translated_chapter_title = _translated_chapter_title(
+            chapter, title_translations
+        )
         rendered_chapters.append(
             {
                 "chapter_id": chapter_id,
-                "title": str(chapter.get("title") or ""),
+                "title": translated_chapter_title or source_chapter_title,
+                "source_title": source_chapter_title,
+                "translated_title": translated_chapter_title,
                 "page_start": _optional_int(chapter.get("page_start")),
                 "page_end": _optional_int(chapter.get("page_end")),
                 "guide": _guide_view(guides.get(chapter_id)),
+                "structural_only": bool(chapter.get("structural_only")),
                 "segments": rendered_segments,
             }
         )
@@ -178,20 +210,31 @@ def build_reader_snapshot(
         overrides=overrides,
         entities=entities,
         translation_mode=translation_mode,
+        source_language=source_language,
     )
+    if translation_mode != "skipped":
+        appendices.extend(_orphan_structural_appendices(
+            document,
+            chapters=chapters,
+            title_translations=title_translations,
+        ))
     if translation_mode != "skipped" and translation_mode == "pending" and translated_ids:
         translation_mode = "enabled"
     if translation_mode == "enabled" and glossary_view:
         _annotate_term_runs(rendered_chapters, glossary_view)
         _annotate_term_runs(appendices, glossary_view)
 
-    title = str(
+    source_title = str(
         overrides.get("title")
         or metadata.get("title")
         or (document.get("front_matter") or {}).get("title")
         or current_state.get("paper_id")
         or "Companion Reader"
     )
+    translated_title = _translated_document_title(
+        document, title_translations
+    )
+    title = translated_title or source_title
     snapshot: dict[str, Any] = {
         "schema_version": READER_SNAPSHOT_VERSION,
         "web_render_version": WEB_RENDER_VERSION,
@@ -199,8 +242,13 @@ def build_reader_snapshot(
         "updated_at": str(current_state.get("updated_at") or ""),
         "paper_id": str(current_state.get("paper_id") or ""),
         "title": title,
+        "source_title": source_title,
+        "translated_title": translated_title,
         "authors": _author_names(metadata.get("authors") or []),
         "language": language,
+        "source_language": source_language,
+        "direction": _language_direction(language),
+        "source_direction": _language_direction(source_language),
         "translation_mode": translation_mode,
         "glossary": glossary_view,
         "chapters": rendered_chapters,
@@ -286,6 +334,7 @@ def publish_reader(
         data_script=f"data/{data_name}",
         asset_root=builtin_root,
         title=str(value.get("title") or "Companion Reader"),
+        language=str(value.get("language") or "und"),
     )
     index_hash = hashlib.sha256(index_text.encode("utf-8")).hexdigest()
     manifest = {
@@ -487,7 +536,7 @@ def _validate_reader_bundle(
         for chapter in snapshot.get("chapters") or []
         if isinstance(chapter, Mapping)
         for segment in chapter.get("segments") or []
-        if isinstance(segment, Mapping)
+        if isinstance(segment, Mapping) and not bool(segment.get("structural_only"))
     ]
     if segment_ids != list(coverage.get("segment_ids") or []):
         raise WebReaderError("reader chapter content differs from declared segment coverage")
@@ -962,14 +1011,28 @@ def _lane_values(
     return translations, annotations, states
 
 
-def _source_block(block: Mapping[str, Any], *, entities: Mapping[str, Mapping[str, dict[str, Any]]]) -> dict[str, Any]:
+def _source_block(
+    block: Mapping[str, Any],
+    *,
+    entities: Mapping[str, Mapping[str, dict[str, Any]]],
+    translated_title: str = "",
+    language: str = "und",
+) -> dict[str, Any]:
     value = dict(block)
     kind = str(value.get("type") or value.get("kind") or "text").casefold()
     output: dict[str, Any] = {
         "kind": kind,
         "title": str(value.get("title") or ""),
         "runs": _inline_runs(value),
+        "language": language,
+        "direction": _language_direction(language),
     }
+    if translated_title and translated_title != _block_title(value):
+        output["source_title"] = _block_title(value)
+        output["translated_title"] = translated_title
+        output["translated_title_runs"] = _translation_runs(
+            translated_title, value
+        )
     if kind in {"equation", "math", "display_math"}:
         entity = _entity_for(value, entities.get("equations") or {})
         tex = (entity or value).get("tex")
@@ -998,6 +1061,154 @@ def _source_block(block: Mapping[str, Any], *, entities: Mapping[str, Mapping[st
         output["items"] = _list_items(value.get("items") or value.get("list_items") or [])
         output["ordered"] = kind in {"enumerate", "ordered_list"} or bool(value.get("ordered"))
     return output
+
+
+def _paper_title_block_ids(document: Mapping[str, Any]) -> set[str]:
+    """Return source blocks represented by the reader's single paper header."""
+    output = {
+        block_id(dict(item))
+        for item in document.get("blocks") or []
+        if isinstance(item, Mapping)
+        and (
+            str(item.get("source_role") or item.get("role") or "").casefold()
+            == "front_matter_title"
+            or "front_matter_title" in {
+                str(value).casefold() for value in item.get("front_matter_roles") or []
+            }
+        )
+    }
+    block_ids = (document.get("front_matter") or {}).get("block_ids") or {}
+    if isinstance(block_ids, Mapping):
+        explicit = block_ids.get("title") or block_ids.get("titles") or []
+        if not isinstance(explicit, Sequence) or isinstance(explicit, (str, bytes)):
+            explicit = [explicit]
+        output.update(str(value) for value in explicit if str(value))
+    return {value for value in output if value}
+
+
+def _title_translation_index(value: Any) -> dict[str, str]:
+    """Normalize reviewed title translations while accepting simple test maps."""
+    if not value:
+        return {}
+    records: Any = value
+    if isinstance(value, Mapping):
+        nested = value.get("titles") or value.get("translations")
+        if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes)):
+            records = nested
+        else:
+            output: dict[str, str] = {}
+            for key, raw in value.items():
+                if key in {"schema_version", "source_language", "target_language", "source_sha256"}:
+                    continue
+                text = (
+                    str(raw.get("text") or raw.get("translated_title") or raw.get("translation") or "").strip()
+                    if isinstance(raw, Mapping)
+                    else str(raw or "").strip()
+                )
+                if text:
+                    output[str(key)] = text
+            return output
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        return {}
+    output: dict[str, str] = {}
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            continue
+        text = str(
+            raw.get("text")
+            or raw.get("translated_title")
+            or raw.get("translation")
+            or ""
+        ).strip()
+        if not text:
+            continue
+        title_id = str(raw.get("title_id") or "").strip()
+        block_value = str(raw.get("block_id") or "").strip()
+        chapter_id = str(raw.get("chapter_id") or "").strip()
+        role = str(raw.get("role") or "").casefold()
+        if title_id:
+            output[title_id] = text
+        if block_value:
+            output.setdefault(f"block:{block_value}", text)
+            output.setdefault(block_value, text)
+        if chapter_id and (
+            role in {"chapter", "chapter_title"}
+            or title_id == f"chapter:{chapter_id}"
+        ):
+            output.setdefault(f"chapter:{chapter_id}", text)
+        if role in {"document", "document_title", "paper_title", "title"}:
+            output.setdefault("document:title", text)
+    return output
+
+
+def _block_title(block: Mapping[str, Any]) -> str:
+    heading = block.get("heading") if isinstance(block.get("heading"), Mapping) else {}
+    return str(
+        block.get("title")
+        or heading.get("title")
+        or heading.get("text")
+        or (block.get("heading") if isinstance(block.get("heading"), str) else "")
+        or block.get("text")
+        or ""
+    ).strip()
+
+
+def _translated_block_title(
+    block: Mapping[str, Any], translations: Mapping[str, str]
+) -> str:
+    identifier = block_id(dict(block))
+    return str(
+        translations.get(f"block:{identifier}")
+        or translations.get(identifier)
+        or ""
+    ).strip()
+
+
+def _translated_chapter_title(
+    chapter: Mapping[str, Any], translations: Mapping[str, str]
+) -> str:
+    for identifier in chapter.get("title_block_ids") or []:
+        value = translations.get(f"block:{identifier}") or translations.get(str(identifier))
+        if value:
+            return str(value).strip()
+    chapter_id = str(chapter.get("chapter_id") or "")
+    return str(translations.get(f"chapter:{chapter_id}") or "").strip()
+
+
+def _translated_document_title(
+    document: Mapping[str, Any], translations: Mapping[str, str]
+) -> str:
+    direct = str(translations.get("document:title") or "").strip()
+    if direct:
+        return direct
+    for identifier in _paper_title_block_ids(document):
+        value = translations.get(f"block:{identifier}") or translations.get(identifier)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _normalize_language_tag(value: str) -> str:
+    parts = [part for part in str(value or "und").strip().replace("_", "-").split("-") if part]
+    if not parts:
+        return "und"
+    normalized = [parts[0].casefold()]
+    for part in parts[1:]:
+        normalized.append(
+            part.title() if len(part) == 4 and part.isalpha()
+            else part.upper() if len(part) in {2, 3} and part.isalpha()
+            else part
+        )
+    return "-".join(normalized)
+
+
+def _language_direction(language: str) -> str:
+    base = _normalize_language_tag(language).split("-", 1)[0]
+    if base in {"ar", "dv", "fa", "he", "ku", "ps", "sd", "ug", "ur", "yi"}:
+        return "rtl"
+    if base in {"mul", "und", "zxx"}:
+        return "auto"
+    return "ltr"
 
 
 def _translation_view(
@@ -1073,12 +1284,43 @@ def _annotation_view(value: Mapping[str, Any] | None, *, language: str) -> dict[
 def _guide_view(value: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     if not value:
         return []
-    fields = ("motivation", "main_content", "section_logic", "book_position", "prerequisites")
-    return [
+    fields = ("motivation", "main_content", "section_logic")
+    output = [
         {"kind": key, "runs": _text_math_runs(str(value.get(key) or ""))}
         for key in fields
         if str(value.get(key) or "").strip()
     ]
+    comparison = value.get("pedagogical_comparison")
+    if isinstance(comparison, Mapping) and str(comparison.get("text") or "").strip():
+        output.append({
+            "kind": "pedagogical_comparison",
+            "runs": _text_math_runs(str(comparison.get("text") or "")),
+            "sources": _safe_sources(comparison.get("sources")),
+        })
+    if str(value.get("prerequisites") or "").strip():
+        output.append({
+            "kind": "prerequisites",
+            "runs": _text_math_runs(str(value.get("prerequisites") or "")),
+        })
+    for item in value.get("historical_context") or []:
+        if not isinstance(item, Mapping) or not str(item.get("text") or "").strip():
+            continue
+        output.append({
+            "kind": "historical_context",
+            "runs": _text_math_runs(str(item.get("text") or "")),
+            "sources": _safe_sources(item.get("sources")),
+        })
+    for item in value.get("supplementary_reading") or []:
+        if not isinstance(item, Mapping):
+            continue
+        title = str(item.get("title") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        if title and reason:
+            output.append({
+                "kind": "supplementary_reading",
+                "runs": _text_math_runs(f"{title}: {reason}"),
+            })
+    return output
 
 
 def _glossary_view(value: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1114,6 +1356,7 @@ def _source_only_appendices(
     overrides: Mapping[str, Any],
     entities: Mapping[str, Mapping[str, dict[str, Any]]],
     translation_mode: str,
+    source_language: str = "und",
 ) -> list[dict[str, Any]]:
     """Expose the source Index in same-language mode without lane placeholders."""
     if translation_mode != "skipped":
@@ -1130,7 +1373,7 @@ def _source_only_appendices(
                 "kind": str(raw.get("kind") or "source_only"),
                 "title": str(raw.get("title") or "Index"),
                 "source": [
-                    _source_block(item, entities=entities)
+                    _source_block(item, entities=entities, language=source_language)
                     for item in blocks if isinstance(item, Mapping)
                 ],
             })
@@ -1152,8 +1395,49 @@ def _source_only_appendices(
         "appendix_id": "source-index",
         "kind": "source_only_index",
         "title": title,
-        "source": [_source_block(item, entities=entities) for item in blocks],
+        "source": [
+            _source_block(item, entities=entities, language=source_language)
+            for item in blocks
+        ],
     }]
+
+
+def _orphan_structural_appendices(
+    document: Mapping[str, Any],
+    *,
+    chapters: Sequence[Mapping[str, Any]],
+    title_translations: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Expose translated structural headings omitted from chapter body lanes."""
+    represented = {
+        str(identifier)
+        for chapter in chapters
+        for identifier in chapter.get("block_ids") or []
+        if str(identifier)
+    }
+    represented.update(_paper_title_block_ids(document))
+    output: list[dict[str, Any]] = []
+    structural = {"part", "chapter", "heading", "section", "subsection", "subsubsection"}
+    for raw in document.get("blocks") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        identifier = block_id(dict(raw))
+        kind = str(raw.get("type") or raw.get("kind") or "").casefold()
+        if not identifier or identifier in represented or kind not in structural:
+            continue
+        source_title = _block_title(raw)
+        if not source_title:
+            continue
+        translated_title = _translated_block_title(raw, title_translations)
+        output.append({
+            "appendix_id": f"source-heading-{identifier}",
+            "kind": "source_only_structural_heading",
+            "title": translated_title or source_title,
+            "source_title": source_title,
+            "translated_title": translated_title,
+            "source": [],
+        })
+    return output
 
 
 def _unique_folded_strings(values: Any, *, excluding: str = "") -> list[str]:
@@ -1293,6 +1577,9 @@ def _inline_runs(block: Mapping[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(raw, Mapping):
                 continue
             kind = str(raw.get("kind") or "text").casefold()
+            separator = str(raw.get("separator_before") or "")
+            if separator:
+                output.append({"type": "text", "text": separator})
             if kind == "math":
                 output.append({"type": "math", "tex": str(raw.get("tex") or raw.get("content") or ""), "display": False})
             elif kind == "link":
@@ -1456,11 +1743,15 @@ def _publish_source_assets(
     return sorted(records, key=lambda record: str(record["path"]))
 
 
-def _index_html(*, data_script: str, asset_root: str, title: str) -> str:
+def _index_html(
+    *, data_script: str, asset_root: str, title: str, language: str = "und"
+) -> str:
     escaped_title = _escape_html(title)
     escaped_assets = _escape_html(asset_root.rstrip("/"))
+    normalized_language = _normalize_language_tag(language)
+    direction = _language_direction(normalized_language)
     return f"""<!doctype html>
-<html lang="en">
+<html lang="{_escape_html(normalized_language)}" dir="{direction}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1473,7 +1764,7 @@ def _index_html(*, data_script: str, asset_root: str, title: str) -> str:
   <script defer src="{escaped_assets}/reader.js"></script>
 </head>
 <body>
-  <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="chapter-sidebar" aria-expanded="true">☰</button>
+  <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="chapter-sidebar" aria-expanded="true"></button>
   <div id="reader-app" class="reader-shell">
     <aside id="chapter-sidebar" class="sidebar" aria-label="Chapter navigation"></aside>
     <main id="reader-main" class="reader-main" tabindex="-1"></main>

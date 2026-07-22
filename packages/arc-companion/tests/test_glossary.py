@@ -563,3 +563,55 @@ def test_glossary_does_not_pad_to_page_limit(tmp_path: Path) -> None:
         workers=2, force=False, call_model=lambda *args: {"entries": [entry]}, page_count=100,
     )
     assert len(result["entries"]) == 1
+
+
+def test_non_english_glossary_requires_exact_source_terms_and_preserves_unicode_names(
+    tmp_path: Path,
+) -> None:
+    document = {"blocks": [{
+        "block_id": "b1",
+        "type": "text",
+        "text": "Le théorème de 南部 contrôle cette limite.",
+    }]}
+
+    def call_model(prompt, schema, artifact_dir, call_label):
+        if "window" in call_label:
+            assert "source-language term exactly as it appears" in prompt
+        assert "preserve each name exactly in its source spelling" in prompt
+        assert "English source term" not in prompt
+        assert "Latin spelling" not in prompt
+        return {"entries": [
+            {
+                "source_term": "théorème de 南部",
+                "target_term": "定理",
+                "brief_explanation": "控制该极限的专门结果",
+                "aliases": [],
+                "protected_names": ["南部"],
+                "first_block_id": "b1",
+            },
+            {
+                # Source spelling is deliberately wrong and must not survive.
+                "source_term": "Théorème absent",
+                "target_term": "不存在的定理",
+                "brief_explanation": "模型虚构项",
+                "aliases": [],
+                "protected_names": [],
+                "first_block_id": "b1",
+            },
+        ]}
+
+    result = generate_glossary(
+        document,
+        language="zh-CN",
+        source_language="fr",
+        protected_names=["南部"],
+        checkpoint_dir=tmp_path,
+        workers=1,
+        force=False,
+        call_model=call_model,
+    )
+
+    assert [entry["source_term"] for entry in result["entries"]] == ["théorème de 南部"]
+    assert result["entries"][0]["target_term"] == "定理（南部）"
+    assert result["entries"][0]["protected_names"] == ["南部"]
+    assert result["source_language"] == "fr"

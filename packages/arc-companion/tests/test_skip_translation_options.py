@@ -11,6 +11,7 @@ from arc_companion.pipeline import (
     _fingerprint,
     _options_from_recovery,
     _recovery_options,
+    _with_effective_source_language,
     _review,
     _verify_frozen_first_chapter_final,
     _verify_frozen_first_chapter_pre_review,
@@ -53,6 +54,15 @@ def test_skip_translation_defaults_off_without_changing_source_fingerprint(tmp_p
         commentary_only,
         evidence=evidence,
     )
+    assert _fingerprint(bundle, translated, evidence=evidence) == _fingerprint(
+        bundle,
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "different-recovery-budget",
+            max_auto_replacements=9,
+        ),
+        evidence=evidence,
+    )
 
 
 def test_skip_translation_round_trips_through_recovery_options(tmp_path: Path) -> None:
@@ -69,6 +79,42 @@ def test_skip_translation_round_trips_through_recovery_options(tmp_path: Path) -
     assert recovered.skip_translation is True
     assert serialized["recovery_policy"] == "auto"
     assert recovered.recovery_policy == "auto"
+    assert serialized["max_auto_replacements"] == 3
+    assert recovered.max_auto_replacements == 3
+
+
+def test_source_language_round_trips_and_old_skip_infers_target(tmp_path: Path) -> None:
+    original = BuildOptions(
+        paper_id="local:skip-translation", project_dir=tmp_path,
+        source_language="JA_jp",
+    )
+    recovered = _options_from_recovery(tmp_path, _recovery_options(original))
+    assert recovered.source_language == "JA_jp"
+    inferred = _with_effective_source_language(BuildOptions(
+        paper_id="local:skip-translation", project_dir=tmp_path,
+        annotation_language="fr-FR", skip_translation=True,
+    ))
+    assert inferred.source_language == "fr-FR"
+
+
+def test_skip_translation_rejects_known_different_base_languages(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="same base"):
+        _with_effective_source_language(BuildOptions(
+            paper_id="local:skip-translation", project_dir=tmp_path,
+            source_language="en", annotation_language="zh-CN",
+            skip_translation=True,
+        ))
+
+
+def test_source_language_falls_back_to_workflow_context(tmp_path: Path) -> None:
+    (tmp_path / "context.json").write_text(
+        json.dumps({"source_language": "English", "source_base_language": "en"}),
+        encoding="utf-8",
+    )
+    resolved = _with_effective_source_language(BuildOptions(
+        paper_id="local:paper", project_dir=tmp_path,
+    ))
+    assert resolved.source_language == "en"
 
 
 def test_old_recovery_options_keep_translation_enabled(tmp_path: Path) -> None:
@@ -86,16 +132,30 @@ def test_recovery_policy_round_trips_and_validates(tmp_path: Path) -> None:
         paper_id="local:skip-translation",
         project_dir=tmp_path,
         recovery_policy="manual",
+        max_auto_replacements=5,
+        regenerate_segments=("translation:ch-0001.seg-0002",),
     )
 
     recovered = _options_from_recovery(tmp_path, _recovery_options(original))
 
     assert recovered.recovery_policy == "manual"
+    assert recovered.max_auto_replacements == 5
+    assert recovered.regenerate_segments == ("translation:ch-0001.seg-0002",)
     with pytest.raises(ValueError, match="recovery_policy"):
         BuildOptions(
             paper_id="local:skip-translation",
             project_dir=tmp_path,
             recovery_policy="invalid",
+        )
+    with pytest.raises(ValueError, match="max_auto_replacements"):
+        BuildOptions(
+            paper_id="local:skip-translation", project_dir=tmp_path,
+            max_auto_replacements=0,
+        )
+    with pytest.raises(ValueError, match="regenerate_segments"):
+        BuildOptions(
+            paper_id="local:skip-translation", project_dir=tmp_path,
+            regenerate_segments=("review:seg-1",),
         )
 
 

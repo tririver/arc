@@ -7,19 +7,27 @@ import pytest
 
 from arc_llm.json_schema import to_provider_json_schema
 
+from arc_companion.chapter_guide import CHAPTER_GUIDE_SCHEMA
 from arc_companion.prompts import (
     ANNOTATION_SCHEMA,
+    COMMENTARY_PROMPT_VERSION,
     COMMENTARY_REVIEW_SCHEMA,
     CUT_SCHEMA,
     GLOSSARY_SCHEMA,
     REVIEW_SCHEMA,
     SECTION_REVIEW_SCHEMA,
     TRANSLATION_COVERAGE_REPAIR_SCHEMA,
+    TRANSLATION_PROMPT_VERSION,
     TRANSLATION_SCHEMA,
     TRANSLATION_SLOT_REPAIR_SCHEMA,
     annotation_prompt,
+    commentary_review_prompt,
+    glossary_consolidation_prompt,
+    glossary_prompt,
     review_prompt,
     section_review_prompt,
+    translation_coverage_repair_prompt,
+    translation_prompt,
 )
 
 
@@ -50,6 +58,7 @@ def test_all_companion_schemas_satisfy_codex_strict_object_contract() -> None:
         REVIEW_SCHEMA,
         COMMENTARY_REVIEW_SCHEMA,
         SECTION_REVIEW_SCHEMA,
+        CHAPTER_GUIDE_SCHEMA,
     )
 
     for schema in schemas:
@@ -216,6 +225,7 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     reviews = " ".join(
         (
             review_prompt({"segments": []}, language="zh-CN"),
+            commentary_review_prompt({"segments": []}, language="zh-CN"),
             section_review_prompt({"segments": []}, language="zh-CN"),
         )
     )
@@ -238,6 +248,11 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     assert "native session" in generation
     assert "avoid unnecessary repetition" in generation
     assert "If internet access is disabled" in generation
+    assert "positive, direct statements" in generation
+    assert "Never invent a mistaken belief" in generation
+    assert "full-paper equation navigation" in generation
+    assert "historical importance, influence, or later status" in generation
+    assert "exact title, direct HTTP(S) URL, and locator" in generation
     assert "Do not chase novelty" in generation
     assert "empty explanation/commentary is valid" in reviews
     assert "notation, convention, normalization" in reviews
@@ -246,3 +261,71 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     assert "must not invent or add a source" in reviews
     assert "reviewed_segment_ids" in reviews
     assert "Never echo complete unchanged translations or annotations" in reviews
+    assert "unsupported corrective contrast" in reviews
+    assert "Never invent a reader's prior misconception" in reviews
+    assert "equation is landmark" in reviews
+
+
+def test_commentary_and_translation_prompt_recipes_are_independent() -> None:
+    translation = translation_prompt(
+        {"segment_id": "seg-1"}, [{"block_id": "b1", "text": "Source"}],
+        language="zh-CN", glossary={}, protected_names=[], paper_context={},
+    )
+
+    assert TRANSLATION_PROMPT_VERSION == "arc.companion.prompts.v15"
+    assert COMMENTARY_PROMPT_VERSION != TRANSLATION_PROMPT_VERSION
+    assert "corrective contrast" not in translation
+    assert "landmark equation" not in translation
+
+
+def test_non_english_prompt_contract_is_source_language_neutral() -> None:
+    glossary = glossary_prompt(
+        [{"block_id": "b1", "text": "Le théorème de Noether"}],
+        language="zh-CN",
+        source_language="fr",
+        protected_names=["Noether"],
+        entry_limit=50,
+    )
+    consolidation = glossary_consolidation_prompt(
+        [{"entries": []}],
+        language="zh-CN",
+        source_language="fr",
+        protected_names=["Noether"],
+        entry_limit=50,
+    )
+    translation = translation_prompt(
+        {"segment_id": "seg-1"},
+        [{"block_id": "b1", "text": "Le théorème de Noether"}],
+        language="zh-CN",
+        source_language="fr",
+        glossary={},
+        protected_names=["Noether"],
+        paper_context={},
+    )
+    coverage_repair = translation_coverage_repair_prompt(
+        {"segment_id": "seg-1"},
+        [],
+        language="zh-CN",
+        source_language="fr",
+        glossary={},
+        protected_names=["Noether"],
+        paper_context={},
+        repair_model_tier="strong",
+    )
+    annotation = annotation_prompt(
+        {"segment_id": "seg-1"},
+        [{"block_id": "b1", "text": "Le théorème de Noether"}],
+        language="zh-CN",
+        source_language="fr",
+        metadata={},
+        evidence={},
+        glossary={},
+        protected_names=["Noether"],
+        paper_context={},
+    )
+
+    prompts = "\n".join((glossary, consolidation, translation, coverage_repair, annotation))
+    assert "source-language term exactly as it appears" in glossary
+    assert "exactly in its source spelling" in prompts
+    assert "English source term" not in prompts
+    assert "Latin spelling" not in prompts

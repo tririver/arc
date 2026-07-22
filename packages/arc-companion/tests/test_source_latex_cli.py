@@ -380,6 +380,23 @@ def test_cli_explicit_language_has_no_notice(tmp_path: Path, monkeypatch, capsys
     assert "默认使用中文" not in capsys.readouterr().err
 
 
+def test_cli_passes_sampled_source_language_without_detecting_it(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    captured = {}
+
+    def fake_build(options):
+        captured["options"] = options
+        return {"ok": True, "data": {"status": "complete"}, "meta": {}}
+
+    monkeypatch.setattr(cli, "build_companion", fake_build)
+    assert cli.main([
+        "build", "local:paper", "--project-dir", str(tmp_path),
+        "--source-language", "ja-JP", "--annotation-language", "zh-CN",
+    ]) == 0
+    assert captured["options"].source_language == "ja-JP"
+
+
 def test_cli_is_controller_only_and_keeps_internet_enabled(tmp_path: Path, monkeypatch) -> None:
     captured = {}
 
@@ -518,6 +535,10 @@ def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
         "90",
         "--recovery-policy",
         "manual",
+        "--max-auto-replacements",
+        "5",
+        "--regenerate-segment",
+        "commentary:ch-0001.seg-0002",
         "--regenerate-commentary",
         "--legacy-checkpoint",
         str(legacy),
@@ -528,6 +549,8 @@ def test_cli_passes_chapter_build_options(tmp_path: Path, monkeypatch) -> None:
     assert options.document_kind == "book"
     assert options.idle_timeout_seconds == 90
     assert options.recovery_policy == "manual"
+    assert options.max_auto_replacements == 5
+    assert options.regenerate_segments == ("commentary:ch-0001.seg-0002",)
     assert options.regenerate_commentary is True
     assert options.legacy_checkpoint == legacy.resolve()
 
@@ -551,6 +574,7 @@ def test_cli_defaults_build_recovery_policy_and_resume_action_to_auto(
 
     def fake_build(options):
         captured["recovery_policy"] = options.recovery_policy
+        captured["max_auto_replacements"] = options.max_auto_replacements
         return {"ok": True, "data": {"status": "complete"}, "meta": {}}
 
     def fake_resume(project_dir, *, action, confirm_possible_duplicate_charge=False):
@@ -571,6 +595,7 @@ def test_cli_defaults_build_recovery_policy_and_resume_action_to_auto(
     ]) == 0
 
     assert captured["recovery_policy"] == "auto"
+    assert captured["max_auto_replacements"] == 3
     assert captured["resume_project_dir"] == tmp_path
     assert captured["resume_action"] == "auto"
     assert captured["resume_confirmation"] is False

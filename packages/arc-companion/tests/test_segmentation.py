@@ -10,6 +10,7 @@ import pytest
 
 from arc_companion.prompts import CUT_SCHEMA
 from arc_companion.projection import annotation_input_block
+from arc_companion.pipeline import _segment_input_hash
 from arc_companion.segmentation import (
     SegmentationError,
     build_block_inventory,
@@ -145,6 +146,37 @@ def test_cut_only_construction_is_deterministic_and_exact() -> None:
         ["b0007", "b0008"],
     ]
     validate_exact_coverage(first, document["blocks"])
+
+
+def test_segments_preserve_structural_navigation_but_project_augmentation_ids() -> None:
+    document = _document(["heading", "prose", "heading", "equation"])
+
+    segments = construct_segments_from_cuts([1, 3], document)
+
+    assert segments[0]["block_ids"] == ["b0001"]
+    assert segments[0]["augmentation_block_ids"] == []
+    assert segments[0]["structural_only"] is True
+    assert segments[1]["block_ids"] == ["b0002", "b0003"]
+    assert segments[1]["augmentation_block_ids"] == ["b0002"]
+    assert segments[1]["structural_only"] is False
+    assert segments[2]["augmentation_block_ids"] == ["b0004"]
+    assert segments[2]["structural_only"] is False
+    validate_exact_coverage(segments, document["blocks"])
+
+
+def test_augmentation_semantic_hash_ignores_heading_text_but_not_body_text() -> None:
+    document = _document(["heading", "prose"])
+    segment = construct_segments_from_cuts([], document)[0]
+    by_id = {item["block_id"]: item for item in document["blocks"]}
+    baseline = _segment_input_hash(segment, by_id)
+
+    by_id["b0001"] = {**by_id["b0001"], "title": "Renamed heading", "text": "Renamed"}
+    assert _segment_input_hash(segment, by_id) == baseline
+    by_id["b0002"] = {**by_id["b0002"], "section_title": "Renamed heading"}
+    assert _segment_input_hash(segment, by_id) == baseline
+
+    by_id["b0002"] = {**by_id["b0002"], "text": "Changed body"}
+    assert _segment_input_hash(segment, by_id) != baseline
 
 
 def test_duplicate_cuts_are_rejected_explicitly() -> None:

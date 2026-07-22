@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import re
 from typing import Any, Callable
 
 from .io import read_json, sha256_json, write_json
+from .language import base_language, contains_lexical_term
 from .prompts import GLOSSARY_SCHEMA, glossary_consolidation_prompt, glossary_prompt
 from .segmentation import build_block_inventory, build_segmentation_windows
 from .source import block_id
@@ -39,12 +39,16 @@ def generate_glossary(
     force: bool,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
     page_count: int | None = None,
+    source_language: str | None = None,
 ) -> dict[str, Any]:
+    prompt_source_language = (
+        source_language if source_language and base_language(source_language) != "en" else None
+    )
     inventory = build_block_inventory(document)
     windows = build_segmentation_windows(inventory)
     blocks = list(document.get("blocks") or [])
     canonical_records = [_glossary_record(block, document) for block in blocks]
-    source_hash = sha256_json({
+    source_hash_input = {
         "canonical_records": canonical_records,
         "language": language,
         "names": protected_names,
@@ -53,7 +57,11 @@ def generate_glossary(
         "consolidation_max_entries": CONSOLIDATION_MAX_ENTRIES,
         "consolidation_prompt_max_bytes": CONSOLIDATION_PROMPT_MAX_BYTES,
         "consolidation_prompt_target_bytes": CONSOLIDATION_PROMPT_TARGET_BYTES,
-    })
+    }
+    if prompt_source_language:
+        source_hash_input["source_language"] = prompt_source_language
+        source_hash_input["source_term_contract"] = "exact-source-spelling-v1"
+    source_hash = sha256_json(source_hash_input)
     final_path = checkpoint_dir / "glossary.json"
     if final_path.is_file() and not force:
         cached = _optional_json(final_path)
@@ -79,6 +87,7 @@ def generate_glossary(
             "language": language,
             "names": protected_names,
             "entry_limit": entry_limit,
+            **({"source_language": prompt_source_language} if prompt_source_language else {}),
         })
         if path.is_file() and not force:
             cached = _optional_json(path)
@@ -90,7 +99,8 @@ def generate_glossary(
                 "names": protected_names,
             })
             reusable_legacy = (
-                entry_limit == ABSOLUTE_GLOSSARY_LIMIT
+                not prompt_source_language
+                and entry_limit == ABSOLUTE_GLOSSARY_LIMIT
                 and cached_hash == legacy_hash
             )
             if (
@@ -112,12 +122,16 @@ def generate_glossary(
                 language=language,
                 protected_names=protected_names,
                 entry_limit=entry_limit,
+                source_language=prompt_source_language,
             ),
             GLOSSARY_SCHEMA,
             checkpoint_dir / "llm" / "glossary" / f"window-{index:04d}",
             f"companion-glossary-window-{index:04d}",
         )
-        value = {"entries": _normalize_entries(result.get("entries") or [], blocks)}
+        value = {"entries": _normalize_entries(
+            result.get("entries") or [], blocks,
+            require_exact_source=bool(prompt_source_language),
+        )}
         write_json(path, {"input_sha256": input_hash, "result": value})
         return index, value
 
@@ -139,16 +153,21 @@ def generate_glossary(
         workers=workers,
         force=force,
         call_model=call_model,
+        source_language=prompt_source_language,
     )
-    entries = _normalize_entries(consolidated.get("entries") or [], blocks)
+    entries = _normalize_entries(
+        consolidated.get("entries") or [], blocks,
+        require_exact_source=bool(prompt_source_language),
+    )
     entries = _deduplicate(entries)
     entries = entries[:glossary_entry_limit(page_count)]
-    _restore_protected_names(entries, protected_names)
+    _restore_protected_names(entries, protected_names, language=language)
     _validate_protected_names(entries, protected_names)
     output = {
         "schema_version": GLOSSARY_VERSION,
         "source_sha256": source_hash,
         "language": language,
+        **({"source_language": source_language} if source_language else {}),
         "page_count": page_count,
         "entry_limit": glossary_entry_limit(page_count),
         "entries": entries,
@@ -163,6 +182,7 @@ def _consolidate_candidates(
     blocks: list[dict[str, Any]],
     language: str,
     protected_names: list[str],
+    source_language: str | None = None,
     entry_limit: int,
     checkpoint_dir: Path,
     workers: int,
@@ -180,11 +200,13 @@ def _consolidate_candidates(
         entries,
         language=language,
         protected_names=protected_names,
+        source_language=source_language,
     )
     if _consolidation_candidates_fit(
         candidates,
         language=language,
         protected_names=protected_names,
+        source_language=source_language,
         output_limit=entry_limit,
     ):
         return _consolidate_node(
@@ -192,6 +214,7 @@ def _consolidate_candidates(
             blocks=blocks,
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             entry_limit=entry_limit,
             output_limit=entry_limit,
             cache_path=checkpoint_dir / "glossary-consolidation" / "direct.json",
@@ -211,6 +234,7 @@ def _consolidate_candidates(
             current,
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             output_limit=entry_limit,
         ):
             return _consolidate_node(
@@ -218,6 +242,7 @@ def _consolidate_candidates(
                 blocks=blocks,
                 language=language,
                 protected_names=protected_names,
+                source_language=source_language,
                 entry_limit=entry_limit,
                 output_limit=entry_limit,
                 cache_path=(
@@ -238,6 +263,7 @@ def _consolidate_candidates(
             current,
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             entry_limit=entry_limit,
         )
         maximum_following_count = sum(
@@ -256,6 +282,7 @@ def _consolidate_candidates(
                 blocks=blocks,
                 language=language,
                 protected_names=protected_names,
+                source_language=source_language,
                 entry_limit=entry_limit,
                 output_limit=output_limit,
                 cache_path=(
@@ -300,6 +327,7 @@ def _consolidate_node(
     blocks: list[dict[str, Any]],
     language: str,
     protected_names: list[str],
+    source_language: str | None = None,
     entry_limit: int,
     output_limit: int,
     cache_path: Path | None,
@@ -321,6 +349,7 @@ def _consolidate_node(
         "candidates": candidates,
         "language": language,
         "protected_names": protected_names,
+        **({"source_language": source_language} if source_language else {}),
         "entry_limit": entry_limit,
         "output_limit": output_limit,
         "max_entries": CONSOLIDATION_MAX_ENTRIES,
@@ -336,9 +365,12 @@ def _consolidate_node(
                 isinstance(entry, dict) for entry in raw_entries
             ):
                 try:
-                    normalized = _normalize_entries(raw_entries, blocks)
+                    normalized = _normalize_entries(
+                        raw_entries, blocks,
+                        require_exact_source=bool(source_language),
+                    )
                     normalized = _deduplicate(normalized)[:output_limit]
-                    _restore_protected_names(normalized, protected_names)
+                    _restore_protected_names(normalized, protected_names, language=language)
                     _validate_protected_names(normalized, protected_names)
                 except (KeyError, TypeError, ValueError, RuntimeError):
                     pass
@@ -351,6 +383,7 @@ def _consolidate_node(
         language=language,
         protected_names=protected_names,
         entry_limit=output_limit,
+        source_language=source_language,
     )
     prompt_bytes = len(prompt.encode("utf-8"))
     if prompt_bytes >= CONSOLIDATION_PROMPT_MAX_BYTES:
@@ -364,9 +397,12 @@ def _consolidate_node(
         artifact_dir,
         call_label,
     )
-    entries = _normalize_entries(result.get("entries") or [], blocks)
+    entries = _normalize_entries(
+        result.get("entries") or [], blocks,
+        require_exact_source=bool(source_language),
+    )
     entries = _deduplicate(entries)[:output_limit]
-    _restore_protected_names(entries, protected_names)
+    _restore_protected_names(entries, protected_names, language=language)
     _validate_protected_names(entries, protected_names)
     if input_entry_count > 0 and not entries:
         raise RuntimeError(
@@ -384,6 +420,7 @@ def _consolidation_input_fits(
     *,
     language: str,
     protected_names: list[str],
+    source_language: str | None = None,
     output_limit: int,
 ) -> bool:
     return (
@@ -392,6 +429,7 @@ def _consolidation_input_fits(
             [{"entries": entries}],
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             output_limit=output_limit,
         ) < CONSOLIDATION_PROMPT_TARGET_BYTES
     )
@@ -402,6 +440,7 @@ def _consolidation_candidates_fit(
     *,
     language: str,
     protected_names: list[str],
+    source_language: str | None = None,
     output_limit: int,
 ) -> bool:
     entry_count = sum(
@@ -416,6 +455,7 @@ def _consolidation_candidates_fit(
             candidates,
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             output_limit=output_limit,
         ) < CONSOLIDATION_PROMPT_TARGET_BYTES
     )
@@ -426,6 +466,7 @@ def _consolidation_prompt_bytes(
     *,
     language: str,
     protected_names: list[str],
+    source_language: str | None = None,
     output_limit: int,
 ) -> int:
     prompt = glossary_consolidation_prompt(
@@ -433,6 +474,7 @@ def _consolidation_prompt_bytes(
         language=language,
         protected_names=protected_names,
         entry_limit=output_limit,
+        source_language=source_language,
     )
     return len(prompt.encode("utf-8"))
 
@@ -442,12 +484,14 @@ def _consolidation_batches(
     *,
     language: str,
     protected_names: list[str],
+    source_language: str | None = None,
     entry_limit: int,
 ) -> list[list[dict[str, Any]]]:
     _validate_consolidation_entry_transport(
         entries,
         language=language,
         protected_names=protected_names,
+        source_language=source_language,
     )
 
     batches: list[list[dict[str, Any]]] = []
@@ -461,6 +505,7 @@ def _consolidation_batches(
                 [{"entries": proposed}],
                 language=language,
                 protected_names=protected_names,
+                source_language=source_language,
                 output_limit=proposed_output_limit,
             ) >= CONSOLIDATION_PROMPT_TARGET_BYTES
         ):
@@ -485,6 +530,7 @@ def _consolidation_batches(
                 [{"entries": proposed}],
                 language=language,
                 protected_names=protected_names,
+                source_language=source_language,
                 output_limit=min(entry_limit, max(1, len(proposed) // 2)),
             ) < CONSOLIDATION_PROMPT_TARGET_BYTES:
                 batches[index].append(batches[index + 1].pop(0))
@@ -497,6 +543,7 @@ def _consolidation_batches(
             [{"entries": proposed}],
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             output_limit=min(entry_limit, max(1, len(proposed) // 2)),
         ) < CONSOLIDATION_PROMPT_TARGET_BYTES:
             batches[index].insert(0, batches[index - 1].pop())
@@ -513,6 +560,7 @@ def _consolidation_batches(
             [{"entries": batch}],
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             output_limit=min(entry_limit, max(1, len(batch) // 2)),
         ) >= CONSOLIDATION_PROMPT_MAX_BYTES
         for batch in batches
@@ -526,6 +574,7 @@ def _validate_consolidation_entry_transport(
     *,
     language: str,
     protected_names: list[str],
+    source_language: str | None = None,
 ) -> None:
     oversized = [
         index
@@ -534,6 +583,7 @@ def _validate_consolidation_entry_transport(
             [{"entries": [entry]}],
             language=language,
             protected_names=protected_names,
+            source_language=source_language,
             output_limit=1,
         ) >= CONSOLIDATION_PROMPT_MAX_BYTES
     ]
@@ -545,7 +595,12 @@ def _validate_consolidation_entry_transport(
         )
 
 
-def _normalize_entries(entries: list[Any], blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _normalize_entries(
+    entries: list[Any],
+    blocks: list[dict[str, Any]],
+    *,
+    require_exact_source: bool = False,
+) -> list[dict[str, Any]]:
     valid_ids = {block_id(block) for block in blocks}
     positions = {block_id(block): index for index, block in enumerate(blocks)}
     normalized: list[dict[str, Any]] = []
@@ -557,9 +612,12 @@ def _normalize_entries(entries: list[Any], blocks: list[dict[str, Any]]) -> list
         explanation = str(raw.get("brief_explanation") or "").strip()
         if not source or not target or not explanation:
             continue
+        exact_first = _first_occurrence(source, blocks, case_sensitive=require_exact_source)
+        if require_exact_source and not exact_first:
+            continue
         first = str(raw.get("first_block_id") or "")
-        if first not in valid_ids:
-            first = _first_occurrence(source, blocks)
+        if first not in valid_ids or require_exact_source:
+            first = exact_first
         normalized.append({
             "source_term": source,
             "target_term": target,
@@ -592,12 +650,12 @@ def _validate_protected_names(entries: list[dict[str, Any]], protected_names: li
         names = {
             str(name)
             for name in entry.get("protected_names") or []
-            if name and _contains_latin_name(source, str(name))
+            if name and _contains_protected_name(source, str(name))
         }
         names.update(
-            name for name in protected_names if name and _contains_latin_name(source, name)
+            name for name in protected_names if name and _contains_protected_name(source, name)
         )
-        missing = [name for name in names if not _contains_latin_name(target, name)]
+        missing = [name for name in names if not _contains_protected_name(target, name)]
         if missing:
             raise RuntimeError(
                 f"glossary translated or dropped protected personal names in {source!r}: {missing}"
@@ -605,12 +663,15 @@ def _validate_protected_names(entries: list[dict[str, Any]], protected_names: li
 
 
 def _restore_protected_names(
-    entries: list[dict[str, Any]], protected_names: list[str]
+    entries: list[dict[str, Any]],
+    protected_names: list[str],
+    *,
+    language: str | None = None,
 ) -> None:
-    """Retain a translated term while restoring source-matched Latin names.
+    """Retain a translated term while restoring source-matched names.
 
     Glossary models sometimes produce a perfectly standard translation but omit
-    the Latin spelling that ARC protects (for example, ``Poisson bracket`` to
+    the source spelling that ARC protects (for example, ``Poisson bracket`` to
     ``泊松括号``).  Repair that deterministic presentation detail before the
     strict validator runs.  Names suggested by a model but absent from the
     source are discarded so substring coincidences cannot create annotations.
@@ -623,12 +684,12 @@ def _restore_protected_names(
         ])
         matched = [
             name for name in candidates
-            if name and _contains_latin_name(source, name)
+            if name and _contains_protected_name(source, name)
         ]
         entry["protected_names"] = matched
 
         target = str(entry.get("target_term") or "").strip()
-        missing = [name for name in matched if not _contains_latin_name(target, name)]
+        missing = [name for name in matched if not _contains_protected_name(target, name)]
         if not missing:
             continue
 
@@ -638,31 +699,53 @@ def _restore_protected_names(
         annotations: list[str] = []
         augmented = target
         for name in sorted(missing, key=lambda value: (-len(value), value.casefold())):
-            if _contains_latin_name(augmented, name):
+            if _contains_protected_name(augmented, name):
                 continue
             annotations.append(name)
             augmented = f"{augmented} {name}"
         if annotations:
-            entry["target_term"] = f"{target}（{'、'.join(annotations)}）"
+            if base_language(language) == "zh":
+                entry["target_term"] = f"{target}（{'、'.join(annotations)}）"
+            else:
+                entry["target_term"] = f"{target} ({', '.join(annotations)})"
 
 
-def _contains_latin_name(text: str, name: str) -> bool:
-    """Match a protected Latin name as a complete lexical unit, not a substring."""
-    return bool(
-        re.search(
-            rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
+def _contains_protected_name(text: str, name: str) -> bool:
+    """Match a protected source-form name as a complete Unicode lexical unit."""
+
+    return contains_lexical_term(text, name)
 
 
-def _first_occurrence(term: str, blocks: list[dict[str, Any]]) -> str:
-    needle = term.casefold()
+def _first_occurrence(
+    term: str,
+    blocks: list[dict[str, Any]],
+    *,
+    case_sensitive: bool = False,
+) -> str:
     for block in blocks:
-        if needle in str(_canonical_block_language(block)).casefold():
+        if contains_lexical_term(
+            _canonical_block_text(block), term, case_sensitive=case_sensitive,
+        ):
             return block_id(block)
     return ""
+
+
+def _canonical_block_text(block: dict[str, Any]) -> str:
+    values: list[str] = []
+
+    def visit(value: Any, *, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                if child_key != "type":
+                    visit(child, key=str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, key=key)
+        elif value not in (None, ""):
+            values.append(str(value))
+
+    visit(_canonical_block_language(block))
+    return "\n".join(values)
 
 
 def _glossary_record(

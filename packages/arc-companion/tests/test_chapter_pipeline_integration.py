@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
 import json
 import os
 import sys
@@ -10,15 +11,25 @@ import threading
 import pytest
 
 import arc_companion.pipeline as pipeline
+from arc_companion.artifact_store import AcceptedArtifactStore, canonical_sha256
 from arc_companion.chapter_scheduler import run_chapter_pipeline
 from arc_companion.ledger import initialize_lane_ledger, mark_needs_supervision
 from arc_companion.pipeline import BuildOptions, build_companion
 from arc_companion.source import SourceBundle
 from arc_companion.io import sha256_json
+from arc_companion.reuse import lane_recipe_sha256
 from arc_llm.call_checkpoint import checkpoint_path, prepare_call, record_submitted
 from arc_llm.progress_journal import ProgressJournal
 from arc_llm.recovery_context import read_recovery_context
 from arc_llm.sessions import LLMSessionManager
+
+
+def _title_response(prompt: str) -> dict[str, object]:
+    payload = json.loads(prompt[prompt.index("{"):])
+    return {"titles": [
+        {"title_id": item["title_id"], "text": item["source_text"]}
+        for item in payload["titles"]
+    ]}
 
 
 def test_reader_final_checkpoint_is_shared_by_both_pipeline_shapes(tmp_path: Path) -> None:
@@ -33,7 +44,7 @@ def test_reader_final_checkpoint_is_shared_by_both_pipeline_shapes(tmp_path: Pat
 
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved == {
-        "schema_version": "arc.companion.reader-final.v2",
+        "schema_version": "arc.companion.reader-final.v3",
         "final_overrides": overrides,
     }
 
@@ -239,7 +250,8 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
         if label.startswith("companion-guide-"):
             return {
                 "motivation": "Motivation.", "main_content": "Conservation.",
-                "section_logic": None, "book_position": None, "prerequisites": None,
+                "section_logic": None, "prerequisites": None,
+                "pedagogical_comparison": None, "historical_context": [],
                 "supplementary_reading": [],
             }
         if label.startswith("companion-segmentation-"):
@@ -327,6 +339,78 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
     assert manifest["companion_layers"]["rendered_translation_segment_ids"] == []
 
 
+def test_structural_only_chapter_uses_local_receipts_without_provider_calls(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "schema_version": "arc.paper.document.v2",
+        "front_matter": {},
+        "blocks": [{
+            "block_id": "part-1", "type": "part", "level": 1,
+            "title": "I PART",
+        }],
+        "equations": [], "figures": [], "tables": [], "assets": [],
+        "links": [], "bibliography": [],
+        "integrity": {"status": "complete", "document_hash": "structural-only"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:structural-only",
+        document=document,
+        parsed={
+            "paper_id": "local:structural-only",
+            "document": document,
+            "source_hash": "structural-only",
+            "structure": {
+                "document_kind": "book",
+                "chapters": [{"title": "I PART", "block_ids": ["part-1"]}],
+            },
+        },
+        metadata={"title": "Book"}, references=[], citers=[],
+    )
+    calls: list[str] = []
+
+    def llm(_prompt: str, **kwargs):
+        label = str(kwargs.get("call_label") or "")
+        calls.append(label)
+        if label.startswith("title-translation-"):
+            return _title_response(_prompt)
+        raise AssertionError("structural-only chapter submitted a non-title provider call")
+
+    result = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "run",
+            annotation_language="en",
+            workers=2,
+            stop_after_first_chapter=True,
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result["ok"], result
+    assert calls == ["title-translation-0001"]
+    checkpoint = Path(result["data"]["checkpoint_dir"])
+    chapters = json.loads((checkpoint / "chapters.json").read_text())
+    assert chapters["chapters"][0]["content_block_ids"] == []
+    segmentation = json.loads(
+        (checkpoint / "chapters" / "ch-0001" / "segmentation.json").read_text()
+    )
+    assert segmentation["segments"][0]["structural_only"] is True
+    for lane in ("guide", "translation", "companion"):
+        ledger = json.loads(
+            (checkpoint / "chapters" / "ch-0001" / f"{lane}-ledger.json").read_text()
+        )
+        receipt = ledger["blocks"][0]["logical_receipt"]
+        assert receipt["kind"] == "controller_skipped_structural_heading"
+        assert receipt["provider_calls"] == 0
+        assert ledger["blocks"][0]["submission_state"] == "not_submitted"
+    review = json.loads((checkpoint / "chapter-review.json").read_text())
+    assert review["reviewed_segment_ids"] == []
+
+
 def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> None:
     blocks = [
         {"block_id": "c1", "type": "section", "title": "Chapter One"},
@@ -356,17 +440,21 @@ def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> 
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"]); labels.append(label)
+        if label.startswith("title-translation-"):
+            return _title_response(prompt)
         if label.startswith("companion-index-glossary-"):
             return {"entries": [{"entry_id": "index-00001", "target": "能量", "explanation": "守恒量"}]}
         if label.startswith("companion-guide-"):
             return {"motivation": "理解守恒。", "main_content": "能量守恒。", "section_logic": None,
-                    "book_position": None, "prerequisites": None, "supplementary_reading": []}
+                    "prerequisites": None, "pedagogical_comparison": None,
+                    "historical_context": [], "supplementary_reading": []}
         if label.startswith("companion-segmentation-"):
             return {"cut_after_ordinals": []}
         if label.startswith("companion-translation-"):
-            return {"blocks": [{"block_id": "c1", "text": "第一章"},
-                               {"block_id": "p1", "text": "能量守恒。"}]}
+            assert "Chapter One" not in prompt
+            return {"blocks": [{"block_id": "p1", "text": "能量守恒。"}]}
         if label.startswith("companion-annotation-"):
+            assert "Chapter One" not in prompt
             return {"explanation": "解释守恒的意义。", "commentary": "", "prior_work": [],
                     "later_work": [], "context_claims": [], "evidence_ids": [], "key_points": [],
                     "source_notes": [], "evidence_requests": []}
@@ -407,6 +495,9 @@ def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> 
     assert guide_calls[0]["session_key"] == "ch-0001:guide"
     assert guide_calls[0]["session_policy"] == "stateful"
     assert guide_calls[0]["model_tier"] == "high"
+    assert guide_calls[0]["env"]["ARC_CODEX_ALLOW_INTERNET"] == "true"
+    assert guide_calls[0]["env"]["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
+    assert guide_calls[0]["env"]["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
     guide_ledger = json.loads(
         (Path(result["data"]["checkpoint_dir"]) / "chapters" / "ch-0001" / "guide-ledger.json").read_text()
     )
@@ -417,11 +508,11 @@ def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> 
     assert "Energy, 1" not in tex
     assert (tmp_path / "run" / "state.json").is_file()
     assert Path(result["data"]["output_html"]).is_file()
-    assert result["data"]["web_render_version"] == "arc.companion.web-render.v2"
+    assert result["data"]["web_render_version"] == "arc.companion.web-render.v4"
     reader_final = json.loads(
         (Path(result["data"]["checkpoint_dir"]) / "reader-final.json").read_text()
     )
-    assert reader_final["schema_version"] == "arc.companion.reader-final.v2"
+    assert reader_final["schema_version"] == "arc.companion.reader-final.v3"
     assert reader_final["final_overrides"]["status"] == "first_chapter_ready"
     freeze = json.loads(
         (Path(result["data"]["checkpoint_dir"]) / "first-chapter-freeze.json").read_text()
@@ -508,15 +599,21 @@ def test_chaptered_build_applies_read_only_legacy_migration_before_lanes(
     before = {path.relative_to(legacy): path.read_bytes() for path in legacy.rglob("*") if path.is_file()}
     labels: list[str] = []
 
-    def llm(_prompt: str, **kwargs):
+    def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"]); labels.append(label)
+        if label.startswith("title-translation-"):
+            return _title_response(prompt)
         if label.startswith("companion-guide-"):
             return {"motivation": None, "main_content": "能量守恒。", "section_logic": None,
-                    "book_position": None, "prerequisites": None, "supplementary_reading": []}
+                    "prerequisites": None, "pedagogical_comparison": None,
+                    "historical_context": [], "supplementary_reading": []}
         if label.startswith("companion-annotation-"):
             return {"explanation": "解释。", "commentary": "", "prior_work": [],
                     "later_work": [], "context_claims": [], "evidence_ids": [], "key_points": [],
                     "source_notes": [], "evidence_requests": []}
+        if label.startswith("companion-translation-"):
+            assert "Chapter One" not in prompt
+            return {"blocks": [{"block_id": "p1", "text": "能量守恒。"}]}
         if label == "companion-final-review":
             return {"issues": [], "patches": []}
         raise AssertionError(f"migration should have avoided call: {label}")
@@ -538,34 +635,283 @@ def test_chaptered_build_applies_read_only_legacy_migration_before_lanes(
     )
 
     assert result["status"] == "first_chapter_ready"
-    assert not any("translation" in label or "segmentation" in label or "glossary" in label
-                   for label in labels)
+    assert not any("segmentation" in label or "glossary" in label for label in labels)
+    assert [label for label in labels if label.startswith("companion-translation-")] == []
     checkpoint = Path(result["data"]["checkpoint_dir"])
     receipt = json.loads((checkpoint / "legacy-migration.json").read_text())
     assert receipt["read_only_source"] is True
     assert receipt["cuts"]["reused"]["ch-0001"] == []
     assert receipt["glossary"]["accepted"] is True
     assert receipt["translations"]["receipts"][0]["accepted"] is True
+    assert receipt["translations"]["receipts"][0]["reason"] == "translation_revalidated"
+    assert receipt["translations"]["receipts"][0]["dropped_structural_block_ids"] == ["c1"]
     assert receipt["never_migrated"] == ["tex", "pdf"]
     ledger = json.loads(
         (checkpoint / "chapters" / "ch-0001" / "translation-ledger.json").read_text()
     )
-    assert ledger["blocks"][0]["logical_receipt"]["provider_calls"] == 0
+    assert ledger["blocks"][0]["submission_state"] == "not_submitted"
+    assert ledger["blocks"][0]["logical_receipt"] == {
+        "kind": "legacy_migration", "provider_calls": 0,
+    }
     assert not (checkpoint / "chapters" / "ch-0001" / "chapter-glossary.json").exists()
     migrated_segment = json.loads(
         (checkpoint / "chapters" / "ch-0001" / "segmentation.json").read_text()
     )["segments"][0]
     migrated_segment = {**migrated_segment, "chapter_id": "ch-0001",
                         "segment_id": "ch-0001.seg-0001"}
-    segment_glossary = pipeline.project_segment_glossary(
-        [item for item in blocks if item["block_id"] in migrated_segment["block_ids"]],
-        receipt["glossary"]["value"],
-    )
-    assert ledger["blocks"][0]["input_sha256"] == pipeline._segment_input_hash(
-        migrated_segment,
-        {item["block_id"]: item for item in blocks}, glossary=segment_glossary,
-    )
+    translated = ledger["blocks"][0]["translation"]["blocks"]
+    assert [item["block_id"] for item in translated] == ["p1"]
     assert {path.relative_to(legacy): path.read_bytes() for path in legacy.rglob("*") if path.is_file()} == before
+
+
+def test_chaptered_build_projects_accepted_store_translation_without_legacy_option(
+    tmp_path: Path,
+) -> None:
+    blocks = [
+        {"block_id": "c1", "type": "section", "title": "Chapter One"},
+        {"block_id": "p1", "type": "text", "text": "Energy is conserved."},
+    ]
+    document = {
+        "schema_version": "arc.paper.document.v2", "front_matter": {}, "blocks": blocks,
+        "equations": [], "figures": [], "tables": [], "assets": [], "links": [],
+        "bibliography": [], "integrity": {"status": "complete", "document_hash": "chapters"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:book", document=document,
+        parsed={
+            "paper_id": "local:book", "document": document, "source_hash": "chapters",
+            "structure": {"document_kind": "book", "chapters": [{
+                "title": "Chapter One", "block_ids": ["c1", "p1"],
+            }]},
+        },
+        metadata={"title": "Book"}, references=[], citers=[],
+    )
+    project = tmp_path / "run"
+    old_checkpoint = tmp_path / "accepted-checkpoint"
+    old_chapter = old_checkpoint / "chapters" / "ch-0001"
+    old_chapter.mkdir(parents=True)
+    (old_checkpoint / "migration-metadata.json").write_text(json.dumps({
+        "source_hash": "chapters", "language": "zh-CN",
+    }))
+    (old_chapter / "segmentation.json").write_text(json.dumps({
+        "segments": [{
+            "segment_id": "seg-0001", "block_ids": ["c1", "p1"],
+        }],
+    }))
+    accepted_output = {"blocks": [
+        {"block_id": "c1", "text": "第一章"},
+        {"block_id": "p1", "text": "能量守恒。"},
+    ]}
+    input_sha = canonical_sha256({"legacy": "translation"})
+    output_sha = canonical_sha256(accepted_output)
+    empty_chain = hashlib.sha256(b"").hexdigest()
+    block = {
+        "segment_id": "seg-0001", "state": "accepted", "generation": 1,
+        "input_sha256": input_sha, "output_sha256": output_sha,
+        "predecessor_accepted_chain_sha256": empty_chain,
+        "validation_receipt": {"legacy": True},
+        "logical_receipt": {"call_id": "old-call"},
+    }
+    block["accepted_chain_sha256"] = hashlib.sha256(json.dumps({
+        "predecessor": empty_chain, "segment_id": "seg-0001",
+        "input_sha256": input_sha, "output_sha256": output_sha, "generation": 1,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    AcceptedArtifactStore(project).put_accepted(
+        kind="translation", semantic_input_sha256=input_sha,
+        recipe_sha256=canonical_sha256({"legacy": "recipe"}),
+        contract_version=pipeline.SCHEMA_VERSION, output=accepted_output,
+        ledger_block=block,
+        provider_receipt={
+            "provider": "stub", "model": "old", "call_id": "old-call", "usage": {},
+        },
+        provenance={
+            "checkpoint_dir": str(old_checkpoint),
+            "ledger": str(old_chapter / "translation-ledger.json"),
+        },
+    )
+    labels: list[str] = []
+    allow_translation_generation = False
+
+    def llm(_prompt: str, **kwargs):
+        label = str(kwargs["call_label"]); labels.append(label)
+        if label.startswith("title-translation-"):
+            return _title_response(_prompt)
+        if "translation" in label:
+            if not allow_translation_generation:
+                raise AssertionError(f"translation call was submitted: {label}")
+            return {"blocks": [{"block_id": "p1", "text": "重新生成的翻译。"}]}
+        if label.startswith("companion-glossary-"):
+            return {"entries": []}
+        if label.startswith("companion-segmentation-"):
+            return {"cut_after_ordinals": []}
+        if label.startswith("companion-guide-"):
+            return {
+                "motivation": None, "main_content": "Energy conservation.",
+                "section_logic": None, "prerequisites": None,
+                "pedagogical_comparison": None, "historical_context": [],
+                "supplementary_reading": [],
+            }
+        if label.startswith("companion-annotation-"):
+            return {
+                "explanation": "Commentary.", "commentary": "", "prior_work": [],
+                "later_work": [], "context_claims": [], "evidence_ids": [],
+                "key_points": [], "source_notes": [], "evidence_requests": [],
+            }
+        if label == "companion-final-review":
+            return {"issues": [], "patches": []}
+        raise AssertionError(label)
+
+    def result_llm(prompt: str, **kwargs):
+        return SimpleNamespace(
+            value=llm(prompt, **kwargs),
+            logical_receipt={"idempotency_key": kwargs["idempotency_key"]},
+        )
+
+    result = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id, project_dir=project, workers=1,
+            stop_after_first_chapter=True,
+        ),
+        source_loader=lambda *args, **kwargs: bundle, llm=llm, result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result["status"] == "first_chapter_ready"
+    assert not any(label.startswith("companion-translation-") for label in labels)
+    checkpoint = Path(result["data"]["checkpoint_dir"])
+    ledger = json.loads(
+        (checkpoint / "chapters" / "ch-0001" / "translation-ledger.json").read_text()
+    )
+    accepted = ledger["blocks"][0]
+    assert accepted["submission_state"] == "not_submitted"
+    assert ledger["migration_source"] == "accepted_artifact_store"
+    assert accepted["translation"] == {
+        "blocks": [{"block_id": "p1", "text": "能量守恒。"}],
+    }
+    migration = json.loads((checkpoint / "legacy-migration.json").read_text())
+    assert migration["source_kind"] == "accepted_artifact_store"
+    assert migration["translations"]["receipts"][0]["dropped_structural_block_ids"] == ["c1"]
+
+    guide_ledger_path = checkpoint / "chapters" / "ch-0001" / "guide-ledger.json"
+    old_guide_ledger = json.loads(guide_ledger_path.read_text())
+    old_generation = old_guide_ledger["generation"]
+    current_recipe = lane_recipe_sha256(
+        "guide", prompt=pipeline.CHAPTER_GUIDE_VERSION, model=None,
+        tier=pipeline.ANNOTATION_TIER,
+        access_recipe={
+            "provider": "auto", "allow_internet": True,
+            "inherit_host_tools": False,
+        },
+    )
+    replacement_guide = {
+        "schema_version": pipeline.CHAPTER_GUIDE_VERSION,
+        "source_sha256": "replacement-source",
+        "chapter_id": "ch-0001",
+        "motivation": None,
+        "main_content": "A different accepted guide.",
+        "section_logic": None,
+        "prerequisites": None,
+        "pedagogical_comparison": None,
+        "historical_context": [],
+        "supplementary_reading": [],
+    }
+    replacement_output_sha = canonical_sha256(replacement_guide)
+    replacement_block = {
+        "segment_id": "ch-0001:guide", "state": "accepted", "generation": 1,
+        "input_sha256": old_guide_ledger["blocks"][0]["input_sha256"],
+        "output_sha256": replacement_output_sha,
+        "predecessor_accepted_chain_sha256": empty_chain,
+        "validation_receipt": {
+            "local_validation": True, "recipe_sha256": current_recipe,
+        },
+        "logical_receipt": {"call_id": "replacement-guide"},
+    }
+    replacement_block["accepted_chain_sha256"] = hashlib.sha256(json.dumps({
+        "predecessor": empty_chain, "segment_id": "ch-0001:guide",
+        "input_sha256": replacement_block["input_sha256"],
+        "output_sha256": replacement_output_sha, "generation": 1,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    AcceptedArtifactStore(project).put_accepted(
+        kind="guide",
+        semantic_input_sha256=replacement_block["input_sha256"],
+        recipe_sha256=current_recipe,
+        contract_version=pipeline.CHAPTER_GUIDE_VERSION,
+        output=replacement_guide,
+        ledger_block=replacement_block,
+        provider_receipt={
+            "provider": "stub", "model": "replacement",
+            "call_id": "replacement-guide", "usage": {},
+        },
+        provenance={"checkpoint_dir": str(old_checkpoint), "chapter_id": "ch-0001"},
+    )
+    old_guide_ledger["blocks"][0]["validation_receipt"]["recipe_sha256"] = "0" * 64
+    guide_ledger_path.write_text(json.dumps(old_guide_ledger))
+    active_state = json.loads((project / "state.json").read_text())
+    active_state["status"] = "active"
+    (project / "state.json").write_text(json.dumps(active_state))
+    (checkpoint / "first-chapter-freeze.json").unlink()
+    guide_calls_before = len([label for label in labels if label.startswith("companion-guide-")])
+
+    resumed = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id, project_dir=project, workers=1,
+            stop_after_first_chapter=True,
+        ),
+        source_loader=lambda *args, **kwargs: bundle, llm=llm, result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert resumed.get("status") in {"first_chapter_ready", "complete"}, resumed
+    guide_calls_after = len([label for label in labels if label.startswith("companion-guide-")])
+    assert guide_calls_after == guide_calls_before
+    rebound_ledger = json.loads(guide_ledger_path.read_text())
+    rebound = rebound_ledger["blocks"][0]
+    assert rebound_ledger["generation"] == old_generation + 1
+    assert rebound["validation_receipt"]["recipe_sha256"] == current_recipe
+    guide = json.loads(
+        (checkpoint / "chapters" / "ch-0001" / "chapter-guide.json").read_text()
+    )
+    assert guide == replacement_guide
+    assert rebound["output_sha256"] == canonical_sha256(guide)
+
+    allow_translation_generation = True
+    regeneration_state = json.loads((project / "state.json").read_text())
+    regeneration_state["status"] = "active"
+    (project / "state.json").write_text(json.dumps(regeneration_state))
+    (checkpoint / "first-chapter-freeze.json").unlink()
+    translation_calls_before = len([
+        label for label in labels if label.startswith("companion-translation-")
+    ])
+    title_calls_before = len([
+        label for label in labels if label.startswith("title-translation-")
+    ])
+    regenerated = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id, project_dir=project, workers=1,
+            stop_after_first_chapter=True, regenerate_lanes=("translation",),
+        ),
+        source_loader=lambda *args, **kwargs: bundle, llm=llm, result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert regenerated["status"] in {"first_chapter_ready", "complete"}
+    translation_calls = [
+        label for label in labels if label.startswith("companion-translation-")
+    ]
+    assert len(translation_calls) == translation_calls_before + 1
+    assert len([
+        label for label in labels if label.startswith("title-translation-")
+    ]) == title_calls_before + 1
+    regenerated_ledger = json.loads(
+        (checkpoint / "chapters" / "ch-0001" / "translation-ledger.json").read_text()
+    )
+    assert regenerated_ledger["blocks"][0]["submission_state"] == "submitted"
+    assert "translation" not in json.loads(
+        (checkpoint / "legacy-migration.json").read_text()
+    ).get("source_kind", "")
 
 
 def test_restart_generation_rotates_session_and_invalidates_suffix(
@@ -720,7 +1066,7 @@ def test_resume_native_passes_one_shot_call_authorization_to_build(
     transaction = json.loads(
         (project / ".arc-companion" / "resume-transaction.json").read_text()
     )
-    assert transaction["schema_version"] == "arc.companion.resume-transaction.v2"
+    assert transaction["schema_version"] == "arc.companion.resume-transaction.v3"
     assert transaction["status"] == "continuation_failed"
     assert transaction["entries"][0]["status"] == "reconciling"
     assert manager.get_existing("ch-0001:translation").native_session_id == "native-1"
@@ -1033,7 +1379,7 @@ def test_v1_complete_migration_recovers_all_17_pending_calls(
 
     assert result["ok"] is False
     migrated = json.loads(journal.read_text())
-    assert migrated["schema_version"] == "arc.companion.resume-transaction.v2"
+    assert migrated["schema_version"] == "arc.companion.resume-transaction.v3"
     assert migrated["status"] == "continuation_failed"
     assert len(migrated["entries"]) == 17
     assert {item["idempotency_key"] for item in migrated["entries"]} == set(logical_keys)
@@ -1298,7 +1644,7 @@ def test_resume_native_rejects_supervision_without_logical_call_key(
     assert result["error"]["code"] == "native_resume_idempotency_key_missing"
 
 
-def test_stateful_lane_timeout_persists_recovery_and_stops_other_paid_lane(
+def test_stateful_lane_timeout_uses_auto_budget_and_stops_other_paid_lane(
     tmp_path: Path,
 ) -> None:
     blocks = [
@@ -1322,6 +1668,8 @@ def test_stateful_lane_timeout_persists_recovery_and_stops_other_paid_lane(
 
     def llm(_prompt: str, **kwargs):
         label = str(kwargs["call_label"])
+        if label.startswith("title-translation-"):
+            return _title_response(_prompt)
         if label.startswith("companion-glossary"):
             return {"entries": []}
         if label.startswith("companion-segmentation"):
@@ -1334,8 +1682,8 @@ def test_stateful_lane_timeout_persists_recovery_and_stops_other_paid_lane(
         if label.startswith("companion-guide"):
             return SimpleNamespace(value={
                 "motivation": None, "main_content": "One", "section_logic": None,
-                "book_position": None, "prerequisites": None,
-                "supplementary_reading": [],
+                "prerequisites": None, "pedagogical_comparison": None,
+                "historical_context": [], "supplementary_reading": [],
             }, logical_receipt={"idempotency_key": kwargs["idempotency_key"]})
         raise TimeoutError("unknown submitted call")
 
@@ -1345,14 +1693,20 @@ def test_stateful_lane_timeout_persists_recovery_and_stops_other_paid_lane(
         source_loader=lambda *args, **kwargs: bundle, llm=llm, result_llm=result_llm,
     )
 
-    assert result["status"] == "needs_supervision"
-    assert len([label for label in paid if "translation" in label or "annotation" in label]) == 1
-    checkpoint = Path(result["data"]["checkpoint_dir"])
+    assert result["error"]["code"] == "automatic_regeneration_exhausted"
+    assert len([label for label in paid if "translation" in label]) == 4
+    assert not any("annotation" in label for label in paid)
+    state = json.loads((project / "state.json").read_text())
+    checkpoint = Path(state["checkpoint_dir"])
     ledgers = [json.loads(path.read_text()) for path in
                (checkpoint / "chapters" / "ch-0001").glob("*-ledger.json")]
     supervised = [value for value in ledgers if value.get("needs_supervision")]
     assert len(supervised) == 1
     context = supervised[0]["needs_supervision"]["recovery_context"]
-    assert context["idempotency_key"].endswith("generation-1")
+    assert context["idempotency_key"].endswith("generation-4")
     assert context["submission_state"] is None
-    assert json.loads((project / "state.json").read_text())["recovery_options"]["paper_id"] == "local:one"
+    assert state["recovery_options"]["paper_id"] == "local:one"
+    journal = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    assert journal["restart_budgets"][0]["attempts_used"] == 3

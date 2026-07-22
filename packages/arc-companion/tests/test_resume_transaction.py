@@ -7,6 +7,7 @@ from arc_companion.resume_transaction import (
     authorize_manual_restart,
     append_entries,
     begin_transaction,
+    bind_transaction_checkpoint,
     claim_automatic_restart, ensure_auto_transaction,
     load_transaction,
     mark_entry,
@@ -47,9 +48,10 @@ def test_incomplete_native_transaction_upgrades_to_auto_without_reopening_resolv
     assert final["entries"][0] == before
 
 
-def test_automatic_restart_budget_is_one_and_same_claim_replays(tmp_path) -> None:
+def test_automatic_restart_budget_allows_three_group_attempts_and_replays(tmp_path) -> None:
     begin_transaction(
-        tmp_path, action="auto", policy="auto", recovery_options={},
+        tmp_path, action="auto", policy="auto",
+        recovery_options={"max_auto_replacements": 3},
         entries=[_entry(tmp_path)],
     )
     kwargs = {
@@ -67,10 +69,57 @@ def test_automatic_restart_budget_is_one_and_same_claim_replays(tmp_path) -> Non
 
     assert replay == first
     assert load_transaction(tmp_path)["restart_budgets"][0]["attempts_used"] == 1
+    second = claim_automatic_restart(
+        tmp_path, **{**kwargs, "source_generation": 2, "target_generation": 3},
+    )
+    third = claim_automatic_restart(
+        tmp_path, **{**kwargs, "source_generation": 3, "target_generation": 4},
+    )
+    assert (second["attempt"], third["attempt"]) == (2, 3)
+    assert second["group_id"] == third["group_id"]
+    assert load_transaction(tmp_path)["restart_budgets"][0]["attempts_used"] == 3
     with pytest.raises(AutomaticRegenerationExhausted):
         claim_automatic_restart(
-            tmp_path, **{**kwargs, "source_generation": 2, "target_generation": 3},
+            tmp_path, **{**kwargs, "source_generation": 4, "target_generation": 5},
         )
+
+
+def test_v3_checkpoint_binding_archives_mixed_checkpoint_journal_verbatim(tmp_path) -> None:
+    first = tmp_path / "checkpoints" / "first"
+    second = tmp_path / "checkpoints" / "second"
+    path = tmp_path / ".arc-companion" / "resume-transaction.json"
+    path.parent.mkdir(parents=True)
+    original = (
+        '{"schema_version":"arc.companion.resume-transaction.v2","entries":['
+        f'{{"ledger_path":"{first}/a.json"}},'
+        f'{{"ledger_path":"{second}/b.json"}}]}}'
+    ).encode()
+    path.write_bytes(original)
+
+    result = bind_transaction_checkpoint(
+        tmp_path, checkpoint_path=second, checkpoint_fingerprint="second",
+    )
+
+    assert result["archived"] is True
+    assert not path.exists()
+    assert __import__("pathlib").Path(result["archive_path"]).read_bytes() == original
+
+
+def test_v3_checkpoint_binding_archives_changed_fingerprint_at_same_path(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoints" / "current"
+    begin_transaction(
+        tmp_path, action="auto", policy="auto", recovery_options={},
+        entries=[_entry(checkpoint)], checkpoint_path=checkpoint,
+        checkpoint_fingerprint="old-fingerprint",
+    )
+
+    result = bind_transaction_checkpoint(
+        tmp_path, checkpoint_path=checkpoint,
+        checkpoint_fingerprint="new-fingerprint",
+    )
+
+    assert result["archived"] is True
+    assert not (tmp_path / ".arc-companion" / "resume-transaction.json").exists()
 
 
 def test_replacement_status_is_monotonic_and_terminal(tmp_path) -> None:

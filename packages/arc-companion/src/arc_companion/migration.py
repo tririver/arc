@@ -15,7 +15,9 @@ from .content import (
 )
 from .io import sha256_file, sha256_json
 from .ledger import LANE_LEDGER_VERSION
-from .projection import is_translatable, opaque_inline_tokens, translation_input_block
+from .projection import (
+    is_structural, is_translatable, opaque_inline_tokens, translation_input_block,
+)
 from .source import block_id
 
 
@@ -636,12 +638,13 @@ def migrate_legacy_translations(
     glossary: Mapping[str, Any],
     protected_names: list[str],
     segment_input_hash: Callable[[Mapping[str, Any]], str] | None = None,
+    migration_source: str = "legacy_checkpoint",
 ) -> dict[str, Any]:
     candidates = _translation_candidates(translations)
-    by_blocks: dict[tuple[str, ...], list[dict[str, Any]]] = {}
-    for candidate in candidates:
-        by_blocks.setdefault(tuple(str(value) for value in candidate.get("block_ids") or []), []).append(candidate)
     blocks_by_id = {block_id(dict(item)): dict(item) for item in blocks}
+    block_candidates, structural_outputs = _translation_block_candidate_index(
+        candidates, metadata=metadata, blocks_by_id=blocks_by_id,
+    )
     segments_by_chapter: dict[str, list[Mapping[str, Any]]] = {}
     for segment in segments:
         segments_by_chapter.setdefault(str(segment.get("chapter_id") or ""), []).append(segment)
@@ -655,10 +658,15 @@ def migrate_legacy_translations(
         chain = _hash("")
         for segment in ordered:
             segment_id = str(segment.get("segment_id") or "")
-            key = tuple(str(value) for value in segment.get("block_ids") or [])
-            matching = by_blocks.get(key, [])
-            receipt: dict[str, Any]
-            if len(matching) != 1:
+            composed = _compose_translation_candidate(
+                segment,
+                source_hash=source_hash,
+                language=language,
+                blocks_by_id=blocks_by_id,
+                block_candidates=block_candidates,
+                structural_outputs=structural_outputs,
+            )
+            if composed is None:
                 receipt = {
                     "segment_id": segment_id,
                     "accepted": False,
@@ -666,7 +674,7 @@ def migrate_legacy_translations(
                 }
             else:
                 receipt = _validate_translation_candidate(
-                    matching[0],
+                    composed,
                     segment=segment,
                     blocks_by_id=blocks_by_id,
                     metadata=metadata,
@@ -676,29 +684,30 @@ def migrate_legacy_translations(
                     protected_names=protected_names,
                     segment_input_hash=segment_input_hash,
                 )
-            if receipt.get("accepted") and not accepted_prefix:
-                receipt = {**receipt, "accepted": False, "reason": "not_in_contiguous_accepted_prefix"}
-            accepted_prefix = accepted_prefix and bool(receipt.get("accepted"))
+            locally_valid = bool(receipt.get("accepted"))
+            deferred = locally_valid and not accepted_prefix
+            if deferred:
+                receipt = {
+                    **receipt,
+                    "accepted": False,
+                    "status": "deferred_hit",
+                    "reason": "deferred_hit",
+                }
             receipts.append({"chapter_id": chapter_id, **receipt})
-            if accepted_prefix:
+            if locally_valid and accepted_prefix:
                 translation = receipt["translation"]
                 input_sha = str(receipt["input_sha256"])
                 output_sha = sha256_json(translation)
+                validation_receipt = _translation_migration_validation_receipt(receipt)
                 block_record = {
                     "segment_id": segment_id,
                     "state": "accepted",
+                    "submission_state": "not_submitted",
                     "generation": 1,
                     "input_sha256": input_sha,
                     "output_sha256": output_sha,
                     "logical_receipt": {"kind": "legacy_migration", "provider_calls": 0},
-                    "validation_receipt": {
-                        "schema_version": MIGRATION_VERSION,
-                        "source": True,
-                        "language": True,
-                        "terminology": True,
-                        "opaque_tokens": True,
-                        "protected_names": True,
-                    },
+                    "validation_receipt": validation_receipt,
                     "predecessor_accepted_chain_sha256": chain,
                 }
                 chain = _hash(json.dumps({
@@ -711,6 +720,24 @@ def migrate_legacy_translations(
                 block_record["accepted_chain_sha256"] = chain
                 block_record["translation"] = translation
                 ledger_blocks.append(block_record)
+            elif deferred:
+                translation = receipt["translation"]
+                ledger_blocks.append({
+                    "segment_id": segment_id,
+                    "state": "prepared",
+                    "submission_state": "not_submitted",
+                    "generation": 1,
+                    "deferred_translation": translation,
+                    "deferred_input_sha256": str(receipt["input_sha256"]),
+                    "deferred_output_sha256": sha256_json(translation),
+                    "deferred_logical_receipt": {
+                        "kind": "legacy_migration_deferred",
+                        "provider_calls": 0,
+                    },
+                    "deferred_validation_receipt": (
+                        _translation_migration_validation_receipt(receipt)
+                    ),
+                })
             else:
                 ledger_blocks.append({
                     "segment_id": segment_id,
@@ -718,6 +745,7 @@ def migrate_legacy_translations(
                     "submission_state": "not_submitted",
                     "generation": 1,
                 })
+            accepted_prefix = accepted_prefix and locally_valid
         ledgers[chapter_id] = {
             "schema_version": LANE_LEDGER_VERSION,
             "chapter_id": chapter_id,
@@ -726,10 +754,244 @@ def migrate_legacy_translations(
             "needs_supervision": None,
             "blocks": ledger_blocks,
             "accepted_chain_sha256": chain,
-            "migration_source": "legacy_checkpoint",
+            "migration_source": migration_source,
             "updated_at": 0.0,
         }
     return {"ledgers": ledgers, "receipts": receipts}
+
+
+def _translation_block_candidate_index(
+    candidates: list[dict[str, Any]],
+    *,
+    metadata: Mapping[str, Any],
+    blocks_by_id: Mapping[str, dict[str, Any]],
+) -> tuple[
+    dict[tuple[str, str, str], list[dict[str, Any]]],
+    dict[tuple[str, str], set[str]],
+]:
+    """Index accepted body translations independently of their old segment cuts."""
+
+    by_block: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    structural_outputs: dict[tuple[str, str], set[str]] = {}
+    for ordinal, candidate in enumerate(candidates):
+        candidate_source = str(
+            candidate.get("source_hash") or metadata.get("source_hash") or ""
+        )
+        candidate_language = str(
+            candidate.get("language") or metadata.get("language") or ""
+        )
+        translation = (
+            candidate.get("translation")
+            if isinstance(candidate.get("translation"), Mapping)
+            else candidate
+        )
+        raw_blocks = translation.get("blocks") if isinstance(translation, Mapping) else None
+        if not candidate_source or not candidate_language or not isinstance(raw_blocks, list):
+            continue
+        identity = (candidate_source, candidate_language)
+        candidate_block_ids = [
+            str(value) for value in candidate.get("block_ids") or []
+        ]
+        for raw in raw_blocks:
+            if not isinstance(raw, Mapping):
+                continue
+            identifier = str(raw.get("block_id") or "")
+            source_block = blocks_by_id.get(identifier)
+            if not identifier or source_block is None:
+                continue
+            if is_structural(source_block):
+                structural_outputs.setdefault(identity, set()).add(identifier)
+                continue
+            by_block.setdefault((*identity, identifier), []).append({
+                "block": dict(raw),
+                "candidate_ordinal": ordinal,
+                "candidate_block_ids": candidate_block_ids,
+                "legacy_segment_id": str(candidate.get("legacy_segment_id") or ""),
+                "accepted_artifact_id": str(candidate.get("accepted_artifact_id") or ""),
+                "created_at": candidate.get("created_at"),
+            })
+    return by_block, structural_outputs
+
+
+def _compose_translation_candidate(
+    segment: Mapping[str, Any],
+    *,
+    source_hash: str,
+    language: str,
+    blocks_by_id: Mapping[str, dict[str, Any]],
+    block_candidates: Mapping[tuple[str, str, str], list[dict[str, Any]]],
+    structural_outputs: Mapping[tuple[str, str], set[str]],
+) -> dict[str, Any] | None:
+    expected_ids = [
+        str(value)
+        for value in segment.get("block_ids") or []
+        if str(value) in blocks_by_id and is_translatable(blocks_by_id[str(value)])
+    ]
+    selected: list[dict[str, Any]] = []
+    for identifier in expected_ids:
+        matches = list(block_candidates.get((source_hash, language, identifier), []))
+        match = _select_translation_block_candidate(matches)
+        if match is None:
+            return None
+        selected.append(match)
+
+    selected_origins = {
+        (
+            item["candidate_ordinal"],
+            item["legacy_segment_id"],
+            item["accepted_artifact_id"],
+        )
+        for item in selected
+    }
+    exact_range = False
+    if len(selected_origins) == 1 and selected:
+        candidate_ids = selected[0]["candidate_block_ids"]
+        projected_ids = [
+            identifier for identifier in candidate_ids
+            if identifier in blocks_by_id and is_translatable(blocks_by_id[identifier])
+        ]
+        exact_range = projected_ids == expected_ids
+    dropped_structural_ids = [
+        str(value) for value in segment.get("block_ids") or []
+        if str(value) in structural_outputs.get((source_hash, language), set())
+    ]
+    return {
+        "source_hash": source_hash,
+        "language": language,
+        "translation": {"blocks": [dict(item["block"]) for item in selected]},
+        "reuse_status": "hit" if exact_range else "composed_hit",
+        "dropped_structural_block_ids": dropped_structural_ids,
+        "accepted_artifact_ids": sorted({
+            item["accepted_artifact_id"] for item in selected
+            if item["accepted_artifact_id"]
+        }),
+    }
+
+
+def _select_translation_block_candidate(
+    matches: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not matches:
+        return None
+    by_output: dict[str, list[dict[str, Any]]] = {}
+    for item in matches:
+        by_output.setdefault(sha256_json(item["block"]), []).append(item)
+    if len(by_output) == 1:
+        return max(matches, key=lambda item: int(item["candidate_ordinal"]))
+    dated = [
+        item for item in matches
+        if item.get("accepted_artifact_id") and isinstance(item.get("created_at"), (int, float))
+    ]
+    if len(dated) == len(matches):
+        newest = max(float(item["created_at"]) for item in dated)
+        latest = [item for item in dated if float(item["created_at"]) == newest]
+        if len(latest) == 1:
+            return latest[0]
+    return None
+
+
+def _translation_migration_validation_receipt(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    terminology_warnings = list(receipt.get("terminology_warnings") or [])
+    return {
+        "schema_version": MIGRATION_VERSION,
+        "source": True,
+        "language": True,
+        "terminology": not terminology_warnings,
+        "terminology_warnings": terminology_warnings,
+        "opaque_tokens": True,
+        "protected_names": True,
+        "reuse_status": str(receipt.get("status") or "hit"),
+    }
+
+
+def accepted_translation_projection_candidates(
+    store: AcceptedArtifactStore,
+    *,
+    source_hash: str | None = None,
+    language: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Recover the newest accepted translation for each preserved source range.
+
+    Artifact semantic hashes can evolve when projection contracts change. This
+    read-only bridge retains the accepted object and revalidates its body-only
+    projection through ``migrate_legacy_translations`` under the current source,
+    language, glossary, and protected-name contracts.
+    """
+    selected: dict[tuple[str, str, tuple[str, ...]], tuple[float, dict[str, Any]]] = {}
+    for record in store.iter_kind("translation"):
+        provenance = record.get("provenance")
+        if not isinstance(provenance, Mapping):
+            continue
+        checkpoint_text = str(provenance.get("checkpoint_dir") or "")
+        checkpoint = Path(checkpoint_text)
+        if not checkpoint.is_dir():
+            continue
+        metadata = _optional_object(checkpoint / "migration-metadata.json")
+        candidate_source_hash = str(metadata.get("source_hash") or "")
+        candidate_language = str(metadata.get("language") or "")
+        if not candidate_source_hash or not candidate_language:
+            continue
+        if source_hash is not None and candidate_source_hash != source_hash:
+            continue
+        if language is not None and candidate_language != language:
+            continue
+        segment_id = str(record.get("segment_id") or "")
+        chapter_id = str(provenance.get("chapter_id") or "")
+        ledger_text = str(provenance.get("ledger") or "")
+        if not chapter_id and ledger_text:
+            chapter_id = Path(ledger_text).parent.name
+        if not chapter_id and ".seg-" in segment_id:
+            chapter_id = segment_id.split(".seg-", 1)[0]
+        block_ids: list[str] = []
+        segmentation_paths = (
+            [checkpoint / "chapters" / chapter_id / "segmentation.json"]
+            if chapter_id else
+            sorted((checkpoint / "chapters").glob("*/segmentation.json"))
+        )
+        for segmentation_path in segmentation_paths:
+            owner = segmentation_path.parent.name
+            segmentation = _optional_object(segmentation_path)
+            for index, raw in enumerate(segmentation.get("segments") or [], 1):
+                if not isinstance(raw, Mapping):
+                    continue
+                raw_id = str(raw.get("segment_id") or "")
+                normalized_ids = {
+                    raw_id, f"{owner}.seg-{index:04d}", f"seg-{index:04d}",
+                }
+                if segment_id in normalized_ids:
+                    block_ids = [str(value) for value in raw.get("block_ids") or []]
+                    chapter_id = owner
+                    break
+            if block_ids:
+                break
+        if not block_ids:
+            continue
+        candidate = {
+            "block_ids": block_ids,
+            "source_hash": candidate_source_hash,
+            "language": candidate_language,
+            "translation": record.get("output"),
+            "accepted_artifact_id": str(record.get("artifact_id") or ""),
+            "created_at": record.get("created_at"),
+        }
+        key = (candidate_source_hash, candidate_language, tuple(block_ids))
+        created = float(record.get("created_at") or 0)
+        if key not in selected or created > selected[key][0]:
+            selected[key] = (created, candidate)
+    return {
+        f"accepted-{index:04d}": item[1]
+        for index, item in enumerate(
+            sorted(
+                selected.values(),
+                key=lambda pair: (
+                    pair[1]["source_hash"], pair[1]["language"],
+                    tuple(pair[1]["block_ids"]),
+                ),
+            ), 1
+        )
+    }
 
 
 def _validate_translation_candidate(
@@ -760,22 +1022,36 @@ def _validate_translation_candidate(
     ]
     if not isinstance(raw_blocks, list):
         return {"segment_id": segment_id, "accepted": False, "reason": "translation_blocks_missing"}
-    actual_ids = [str(item.get("block_id") or "") for item in raw_blocks if isinstance(item, Mapping)]
+    projected_raw_blocks = [
+        item for item in raw_blocks
+        if isinstance(item, Mapping)
+        and not (
+            str(item.get("block_id") or "") in blocks_by_id
+            and is_structural(blocks_by_id[str(item.get("block_id") or "")])
+        )
+    ]
+    dropped_structural_ids = [
+        str(item.get("block_id") or "") for item in raw_blocks
+        if isinstance(item, Mapping) and item not in projected_raw_blocks
+    ]
+    actual_ids = [str(item.get("block_id") or "") for item in projected_raw_blocks]
     expected_ids = [block_id(item) for item in expected]
-    if actual_ids != expected_ids or len(raw_blocks) != len(actual_ids):
+    if actual_ids != expected_ids or len(projected_raw_blocks) != len(actual_ids):
         return {"segment_id": segment_id, "accepted": False, "reason": "source_block_coverage_mismatch"}
-    for source, translated in zip(expected, raw_blocks):
+    terminology_warnings: list[str] = []
+    for source, translated in zip(expected, projected_raw_blocks):
         text = _translated_text(translated)
         if not text.strip():
             return {"segment_id": segment_id, "accepted": False, "reason": "empty_translation_block"}
         if _opaque_tokens_in_text(text) != opaque_inline_tokens(source):
             return {"segment_id": segment_id, "accepted": False, "reason": "opaque_token_mismatch"}
         source_text = str(translation_input_block(source).get("text") or "")
-        if _missing_terminology(source_text, text, glossary):
-            return {"segment_id": segment_id, "accepted": False, "reason": "terminology_mismatch"}
+        for term in _missing_terminology(source_text, text, glossary):
+            if term not in terminology_warnings:
+                terminology_warnings.append(term)
         if _missing_protected_names(source_text, text, protected_names):
             return {"segment_id": segment_id, "accepted": False, "reason": "protected_name_mismatch"}
-    normalized = {"blocks": [dict(item) for item in raw_blocks]}
+    normalized = {"blocks": [dict(item) for item in projected_raw_blocks]}
     input_sha = (
         segment_input_hash(segment) if segment_input_hash is not None else
         sha256_json({
@@ -786,12 +1062,24 @@ def _validate_translation_candidate(
             "glossary_sha256": sha256_json(glossary),
         })
     )
+    reuse_status = str(candidate.get("reuse_status") or "hit")
+    if terminology_warnings:
+        reuse_status = "warning_reuse"
     return {
         "segment_id": segment_id,
         "accepted": True,
-        "reason": "translation_revalidated",
+        "status": reuse_status,
+        "reason": (
+            "translation_revalidated" if reuse_status == "hit" else reuse_status
+        ),
         "translation": normalized,
         "input_sha256": input_sha,
+        "terminology_warnings": terminology_warnings,
+        "dropped_structural_block_ids": list(dict.fromkeys([
+            *[str(value) for value in candidate.get("dropped_structural_block_ids") or []],
+            *dropped_structural_ids,
+        ])),
+        "accepted_artifact_ids": list(candidate.get("accepted_artifact_ids") or []),
     }
 
 

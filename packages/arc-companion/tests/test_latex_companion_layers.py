@@ -305,6 +305,46 @@ def test_glossary_is_back_matter_after_references(tmp_path: Path) -> None:
     )
 
 
+def test_bibliography_reuses_translated_structural_heading_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "front_matter": {},
+        "blocks": [
+            {
+                "block_id": "refs-title", "kind": "heading",
+                "section_id": "references", "text": "Literatur",
+            },
+            {
+                "block_id": "ref", "kind": "bibliography",
+                "section_id": "references", "text": "Reference text.",
+            },
+        ],
+        "bibliography": [{"id": "ref", "label": "[1]", "text": "Reference text."}],
+        "equations": [], "figures": [], "tables": [], "assets": [],
+        "integrity": {"status": "complete"},
+    }
+
+    tex, manifest = render_companion_tex(
+        document,
+        [],
+        {},
+        output_dir=tmp_path,
+        source_language="de",
+        language="zh-CN",
+        title_translations={
+            "titles": [{"title_id": "block:refs-title", "text": "参考文献"}],
+        },
+    )
+
+    assert tex.count("Literatur") == 1
+    assert tex.count(r"\section*{Literatur") == 1
+    assert "参考文献" in tex
+    assert r"\section*{References}" not in tex
+    assert tex.count(r"\begin{thebibliography}{9999}") == 1
+    assert validate_tex_fidelity(tex, document, manifest) == []
+
+
 def test_same_language_render_ignores_passed_glossary_and_preserves_source_index(
     tmp_path: Path,
 ) -> None:
@@ -1098,8 +1138,10 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     rendered = escape_tex(glyphs)
 
     for glyph in glyphs.replace(" ", "").replace("\u200b", ""):
+        if glyph in "δνθσζταεϵβφπη":
+            continue
         assert glyph not in rendered
-    assert r"\delta" in rendered
+    assert "δνθσζτ αεϵβφπη" in rendered
     assert r"\int" in rendered
     assert r"\ell" in rendered
     assert r"{}^{n}" in rendered
@@ -1108,6 +1150,9 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     assert escape_tex("ℏ") == r"{\rmfamily\(\hbar\)}"
     assert r"\textsubscript{2}" in rendered
     assert r"\textsuperscript{{\rmfamily\(\prime\)}}" in rendered
+
+    assert escape_tex("Η ειδική θεωρία της σχετικότητας") == "Η ειδική θεωρία της σχετικότητας"
+    assert escape_tex("field ψ†γ⁰") == r"field {\rmfamily\(\psi\dagger\gamma{}^{0}\)}"
 
     glossary_math = _render_glossary({"entries": [{
         "source_term": "Dirac adjoint",
@@ -1163,8 +1208,14 @@ def test_chapter_opening_reserves_space_for_title_and_guide_body(tmp_path: Path)
         }],
         chapter_guides={"ch-1": {
             "main_content": "Guide opening text.",
-            "book_position": "Source pp. 16–17.",
-            "supplementary_reading": [{"title": "Further source", "reason": "Context"}],
+            "pedagogical_comparison": {
+                "text": "Textbooks reverse this order.",
+                "sources": [{"title": "Course notes", "url": "https://example.test/notes", "locator": "Chapter 2"}],
+            },
+            "historical_context": [{
+                "text": "The result was found historically.",
+                "sources": [{"title": "History", "url": "https://example.test/history", "locator": "p. 4"}],
+            }],
         }},
     )
 
@@ -1182,16 +1233,128 @@ def test_chapter_opening_reserves_space_for_title_and_guide_body(tmp_path: Path)
         "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{主要内容}"
         in tex
     )
-    assert (
-        "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{原文位置}"
-        in tex
+    assert "教材顺序比较" in tex and "历史背景" in tex
+    assert "https://example.test/notes" in tex
+    assert "https://example.test/history" in tex
+    assert "原文位置" not in tex and "补充阅读" not in tex
+
+
+def test_empty_chapter_guide_and_structural_only_segment_render_without_empty_layers(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "front_matter": {"title": "Unique Paper Title"},
+        "blocks": [
+            {"block_id": "paper-title", "kind": "heading", "text": "Unique Paper Title", "source_role": "front_matter_title"},
+            {"block_id": "chapter-title", "kind": "chapter", "text": "Only Title"},
+        ],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+
+    tex, manifest = render_companion_tex(
+        document,
+        [{
+            "segment_id": "s1", "block_ids": ["paper-title", "chapter-title"],
+            "augmentation_block_ids": [], "structural_only": True,
+        }],
+        {},
+        output_dir=tmp_path,
+        language="zh-CN",
+        chapters=[{"chapter_id": "ch-1", "block_ids": ["paper-title", "chapter-title"]}],
+        chapter_guides={"ch-1": {
+            "motivation": None, "main_content": None, "section_logic": None,
+            "prerequisites": None, "pedagogical_comparison": None,
+            "historical_context": [],
+        }},
     )
-    assert (
-        "\\Needspace{4\\baselineskip}\n\\medskip\\noindent\\textbf{补充阅读}"
-        in tex
+
+    assert tex.count("Only Title") == 2
+    assert tex.count("Unique Paper Title") == 1
+    assert "ARC-CHAPTER-GUIDE-BEGIN" not in tex
+    assert "ARC-TRANSLATION-BEGIN" not in tex
+    assert "ARC-COMPANION-BEGIN" not in tex
+    assert manifest["companion_layers"]["semantic_segment_ids"] == []
+    assert manifest["companion_layers"]["preservation_only_segment_ids"] == ["s1"]
+    assert manifest["companion_layers"]["expected_chapter_guide_ids"] == []
+    assert validate_tex_fidelity(tex, document, manifest) == []
+
+
+def test_pdf_renders_bilingual_titles_with_translated_navigation_and_no_title_companion(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "front_matter": {"title": "Die Relativitätstheorie"},
+        "blocks": [
+            {
+                "block_id": "paper-title", "kind": "heading",
+                "text": "Die Relativitätstheorie", "source_role": "front_matter_title",
+            },
+            {"block_id": "chapter-title", "kind": "chapter", "text": "Grundlagen"},
+        ],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    title_translations = {
+        "schema_version": "arc.companion.title-translations.v1",
+        "source_language": "de",
+        "target_language": "zh-CN",
+        "source_sha256": "0" * 64,
+        "titles": [
+            {"title_id": "document:title", "role": "document_title", "block_id": "paper-title", "text": "相对论"},
+            {"title_id": "block:chapter-title", "role": "chapter", "block_id": "chapter-title", "chapter_id": "ch-1", "text": "基础"},
+        ],
+    }
+
+    tex, manifest = render_companion_tex(
+        document,
+        [{
+            "segment_id": "s1", "block_ids": ["paper-title", "chapter-title"],
+            "augmentation_block_ids": [], "structural_only": True,
+        }],
+        {},
+        output_dir=tmp_path,
+        language="zh-CN",
+        source_language="de",
+        title_translations=title_translations,
+        chapters=[{
+            "chapter_id": "ch-1", "block_ids": ["paper-title", "chapter-title"],
+            "title_block_ids": ["chapter-title"],
+        }],
+        chapter_guides={},
     )
-    assert "原文位置" in tex
-    assert "全书位置" not in tex
+
+    assert "Die Relativitätstheorie" in tex and "相对论" in tex
+    assert r"\section*{Grundlagen\protect\\{\small 基础}}" in tex
+    assert r"\addcontentsline{toc}{section}{基础}" in tex
+    assert "ARC-COMPANION-BEGIN" not in tex
+    assert manifest["source_language"] == "de"
+    assert manifest["target_language"] == "zh-CN"
+    assert manifest["render_warnings"] == []
+    assert validate_tex_fidelity(tex, document, manifest) == []
+
+
+def test_pdf_manifest_warns_for_rtl_layout_without_rejecting_unicode(tmp_path: Path) -> None:
+    document = {
+        "blocks": [{"block_id": "b1", "kind": "heading", "text": "النسبية"}],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    tex, manifest = render_companion_tex(
+        document,
+        [{"segment_id": "s1", "block_ids": ["b1"], "augmentation_block_ids": [], "structural_only": True}],
+        {},
+        output_dir=tmp_path,
+        language="en",
+        source_language="ar",
+    )
+
+    assert "النسبية" in tex
+    assert manifest["render_warnings"] == [{
+        "code": "rtl_pdf_layout_not_guaranteed",
+        "languages": ["ar"],
+        "message": "PDF bidirectional layout is best-effort; use the HTML reader for authoritative RTL direction.",
+    }]
 
 
 @pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")

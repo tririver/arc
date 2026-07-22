@@ -11,7 +11,10 @@ from arc_companion.artifact_store import (
     ArtifactStoreError,
     canonical_sha256,
 )
-from arc_companion.migration import import_accepted_checkpoint_objects
+from arc_companion.migration import (
+    accepted_translation_projection_candidates,
+    import_accepted_checkpoint_objects,
+)
 from arc_companion.regeneration import (
     REGENERATABLE_LANES,
     RegenerationRequestError,
@@ -72,6 +75,64 @@ def test_object_store_accepts_only_hash_bound_accepted_output(tmp_path: Path) ->
     assert store.read("translation", record["artifact_id"])["output"] == output
     assert record["predecessor_accepted_chain_sha256"] == EMPTY_CHAIN
     assert record["provider_receipt"]["call_id"] == "call-1"
+
+
+def test_translation_projection_candidates_do_not_collide_across_source_or_language(
+    tmp_path: Path,
+) -> None:
+    store = AcceptedArtifactStore(tmp_path)
+    for index, (source_hash, language, text) in enumerate((
+        ("paper-a", "zh-CN", "译文 A"),
+        ("paper-b", "zh-CN", "译文 B"),
+        ("paper-a", "fr", "Traduction A"),
+    ), 1):
+        checkpoint = tmp_path / f"checkpoint-{index}"
+        chapter = checkpoint / "chapters" / "ch-0001"
+        chapter.mkdir(parents=True)
+        (checkpoint / "migration-metadata.json").write_text(json.dumps({
+            "source_hash": source_hash, "language": language,
+        }))
+        (chapter / "segmentation.json").write_text(json.dumps({
+            "segments": [{"segment_id": "seg-0001", "block_ids": ["h1", "b1"]}],
+        }))
+        output = {"blocks": [
+            {"block_id": "h1", "text": "Heading"},
+            {"block_id": "b1", "text": text},
+        ]}
+        block = _accepted_block(output, input_sha=canonical_sha256({"candidate": index}))
+        block["segment_id"] = "seg-0001"
+        block["accepted_chain_sha256"] = hashlib.sha256(json.dumps({
+            "predecessor": EMPTY_CHAIN,
+            "segment_id": block["segment_id"],
+            "input_sha256": block["input_sha256"],
+            "output_sha256": block["output_sha256"],
+            "generation": 1,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        store.put_accepted(
+            kind="translation", semantic_input_sha256=block["input_sha256"],
+            recipe_sha256=canonical_sha256({"recipe": index}),
+            contract_version="translation.v1", output=output, ledger_block=block,
+            provider_receipt={
+                "provider": "stub", "model": "test", "call_id": f"call-{index}",
+                "usage": {},
+            },
+            provenance={
+                "checkpoint_dir": str(checkpoint),
+                "ledger": str(chapter / "translation-ledger.json"),
+            },
+        )
+
+    all_candidates = accepted_translation_projection_candidates(store)
+    selected = accepted_translation_projection_candidates(
+        store, source_hash="paper-a", language="zh-CN",
+    )
+
+    assert len(all_candidates) == 3
+    assert len(selected) == 1
+    candidate = next(iter(selected.values()))
+    assert candidate["source_hash"] == "paper-a"
+    assert candidate["language"] == "zh-CN"
+    assert candidate["block_ids"] == ["h1", "b1"]
 
     submitted = {**block, "state": "submitted"}
     with pytest.raises(ArtifactStoreError, match="only an accepted"):
@@ -153,8 +214,15 @@ def test_lane_identity_excludes_runtime_and_render_options() -> None:
     first = lane_semantic_sha256("translation", {**shared, "workers": 1, "font_size": 10})
     second = lane_semantic_sha256("translation", {**shared, "workers": 24, "font_size": 14})
     changed = lane_semantic_sha256("translation", {**shared, "target_language": "Japanese"})
+    changed_navigation = lane_semantic_sha256("translation", {
+        **shared,
+        "guide": {"main": "changed"},
+        "static_context": {"paper": "changed"},
+        "predecessor_accepted_chain_sha256": "f" * 64,
+    })
 
     assert first == second
+    assert first == changed_navigation
     assert changed != first
     assert lane_recipe_sha256(
         "translation", prompt="p", model="m1", tier="high"

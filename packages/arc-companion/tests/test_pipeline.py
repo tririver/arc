@@ -3779,6 +3779,12 @@ class FakeLLM:
                 "brief_explanation": "物理系统的能量", "aliases": [],
                 "protected_names": [], "first_block_id": "b2",
             }]}
+        if label.startswith("title-translation-"):
+            payload = json.loads(prompt[prompt.index("{"):])
+            return {"titles": [
+                {"title_id": item["title_id"], "text": item["source_text"]}
+                for item in payload["titles"]
+            ]}
         if label.startswith("companion-translation-"):
             assert self.annotation_started.wait(timeout=5), "translation and commentary lanes did not overlap"
             return {"blocks": [
@@ -3909,7 +3915,7 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
         assert "ARC_CODEX_MCP_MODE" not in env
         assert "ARC_CLAUDE_MCP_MODE" not in env
         assert "FULL-PAPER NAVIGATION CONTEXT" in str(call["prompt"])
-        assert "Setup" in str(call["prompt"])
+        assert "Setup" not in str(call["prompt"])
     for call in fake.calls:
         if call in externally_enabled:
             continue
@@ -3950,7 +3956,7 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert "审校后的解释" in tex
     assert "解释 0002" in tex
     assert Path(data["output_pdf"]).is_file()
-    assert data["web_render_version"] == "arc.companion.web-render.v2"
+    assert data["web_render_version"] == "arc.companion.web-render.v4"
     assert Path(data["output_html"]).is_file()
     assert Path(data["reader_snapshot_path"]).is_file()
     assert Path(data["web_manifest_path"]).is_file()
@@ -5053,6 +5059,12 @@ def test_first_wave_uses_first_substantive_unit_and_preserves_leading_source(tmp
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
         calls.append((label, prompt))
+        if label.startswith("title-translation-"):
+            payload = json.loads(prompt[prompt.index("{"):])
+            return {"titles": [
+                {"title_id": item["title_id"], "text": item["source_text"]}
+                for item in payload["titles"]
+            ]}
         if label.startswith("companion-segmentation-w-"):
             return {"cut_after_ordinals": []}
         if label.startswith("companion-glossary-"):
@@ -5090,6 +5102,8 @@ def test_first_wave_uses_first_substantive_unit_and_preserves_leading_source(tmp
     assert result["data"]["preview_segment_count"] == 1
     assert not any(label.endswith("seg-0002") for label, _ in calls)
     for _label, prompt in calls:
+        if _label.startswith("title-translation-"):
+            continue
         assert "First resource" not in prompt
         assert "Second resource" not in prompt
         assert "Preface 3" not in prompt
@@ -5667,6 +5681,33 @@ def test_preview_completion_check_is_independent_of_current_worker_budget(tmp_pa
     assert _first_wave_preview_outputs_match(state)
 
 
+def test_completed_fast_path_requires_current_projection_guide_and_reader_versions(
+    tmp_path: Path,
+) -> None:
+    state: dict[str, object] = {
+        "final_render_version": pipeline_module.FINAL_RENDER_VERSION,
+        "chapter_projection_version": pipeline_module.CHAPTER_PROJECTION_VERSION,
+        "augmentation_projection_version": pipeline_module.AUGMENTATION_PROJECTION_VERSION,
+        "chapter_guide_version": pipeline_module.CHAPTER_GUIDE_VERSION,
+        "reader_final_checkpoint_version": pipeline_module.READER_FINAL_CHECKPOINT_VERSION,
+    }
+    for path_key, hash_key in (
+        ("output_tex", "output_tex_sha256"),
+        ("output_pdf", "output_pdf_sha256"),
+        ("source_manifest_path", "source_manifest_sha256"),
+        ("validation_path", "validation_sha256"),
+    ):
+        path = tmp_path / path_key
+        path.write_bytes(path_key.encode("utf-8"))
+        state[path_key] = str(path)
+        state[hash_key] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    assert pipeline_module._completion_outputs_match(state)
+    legacy = {**state, "augmentation_projection_version": "arc.companion.augmentation-projection.v1"}
+    assert not pipeline_module._completion_outputs_match(legacy)
+    assert all(path.is_file() for path in tmp_path.iterdir())
+
+
 def test_controller_only_runtime_keeps_internet_enabled_and_scrubs_polluted_parent_env(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -5898,6 +5939,11 @@ def test_full_paper_context_is_bounded_navigable_and_excludes_raw_html(tmp_path:
                 "block_id": "b8", "type": "text", "text": "late-time transfer context",
                 "preservation_html": "<span>DO_NOT_EXPOSE_PRESERVATION_HTML</span>",
             },
+            {"block_id": "b9", "type": "equation", "equation_id": "eq-nine"},
+        ],
+        "equations": [
+            *bundle.document.get("equations", []),
+            {"id": "eq-nine", "tex": "E^2=p^2c^2+m^2c^4", "number": "(9)"},
         ],
     }
     by_id = {item["block_id"]: item for item in document["blocks"]}
@@ -5909,8 +5955,14 @@ def test_full_paper_context_is_bounded_navigable_and_excludes_raw_html(tmp_path:
     context = _full_paper_context(document, segment, blocks_by_id=by_id, max_chars=4_000)
     serialized = json.dumps(context, ensure_ascii=False)
 
-    assert context["schema_version"] == "arc.companion.full-paper-context.v2"
-    assert any(item["title"] == "Distant physics" for item in context["section_navigation"])
+    assert context["schema_version"] == "arc.companion.full-paper-context.v3"
+    assert any(item["block_id"] == "b7" for item in context["section_navigation"])
+    equation = next(item for item in context["equation_navigation"] if item["block_id"] == "b9")
+    assert equation == {
+        "block_id": "b9", "number": "(9)", "location_block_id": "b7",
+        "formula": "E^2=p^2c^2+m^2c^4",
+    }
+    assert "Distant physics" not in serialized
     assert "late-time transfer context" in serialized
     assert "DO_NOT_EXPOSE_RAW_HTML" not in serialized
     assert "DO_NOT_EXPOSE_PRESERVATION_HTML" not in serialized

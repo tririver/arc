@@ -65,10 +65,17 @@ Useful flags:
   target have the same base language. This also disables bilingual glossary
   generation, reuse, migration, projection, prompt context, and output; a
   source Index remains source-only content.
+- `--source-language <BCP47-tag>`: pass the language established by the
+  beginning/middle/end source sampling. The CLI does not detect it.
 - `--stop-after-first-chapter`: schedule only the first substantive chapter.
 - `--recovery-policy auto|manual`: automatically recover eligible blocked
   translation/commentary lanes by default, or retain a supervised stop for an
   explicit recovery decision.
+- `--max-auto-replacements N`: allow at most `N` fresh replacement generations
+  for one blocked lane group; the default is `3` and the value is recovery
+  state, not content identity.
+- `--regenerate-segment LANE:SEGMENT_ID`: repeat to rebuild only a selected
+  translation or commentary segment while locally revalidating its suffix.
 - `--domain-id` or `--domain-manifest`: reuse one explicitly named domain;
   companion does not discover or build one.
 
@@ -85,7 +92,7 @@ Mixed or uncertain samples retain translation. The agent records
 `source_language`, `source_base_language`, `target_language`,
 `target_base_language`, `translation_mode`, and `translation_reason` in
 `context.json`, and passes `--skip-translation` only for a clear same-language
-decision.
+decision. Pass the canonical sampled source tag through `--source-language`.
 
 Inspect and validate without changing generation state:
 
@@ -109,9 +116,10 @@ does not repeat generation calls. `validate` checks both the PDF and web bundle.
 Routine accepted blocks automatically advance. With the default
 `--recovery-policy auto`, ARC first replays durable responses and attempts one
 native session reconciliation. When an eligible translation or commentary call
-cannot be safely reused, ARC automatically starts one replacement generation
-for the affected lane suffix. Possible duplicate charging is recorded in the
-recovery journal.
+cannot be safely reused, ARC automatically starts a replacement generation
+for the affected lane suffix, retrying with a fresh generation up to the
+configured limit. Possible duplicate charging is an audit warning in automatic
+mode and is recorded in the recovery journal.
 
 ```bash
 arc-companion resume --project-dir <dir> --json
@@ -126,8 +134,10 @@ previously used `--recovery-policy manual`. Explicit
 Explicit `restart-generation` remains available after automatic restart budget
 is exhausted and requires confirmation because an uncertain submitted call may
 be billed twice. Cancellation, authentication, quota, rate-limit, missing
-source, local I/O, and uncertain authoritative-identity errors are not hidden
-by automatic generation replacement; they remain in `needs_supervision`.
+source, local I/O, and invalid configuration errors are not hidden by automatic
+generation replacement; they remain in `needs_supervision`. Old native session,
+runtime, and idempotency identities are required only by strict `resume-native`,
+not by a fresh automatic replacement.
 
 ### Step 3: Use background review checkpoints
 
@@ -279,6 +289,13 @@ followed by commentary, with no translation layer. Styling, not visible
 controller labels, identifies layers: reader text must not contain `译文`,
 `伴读`, or `本段解释`; use `解释` when needed.
 
+Translated builds render the original document/Part/Chapter/section/References/
+Index title followed by its translation. PDF bookmarks and web navigation use
+the translated title first without creating a second navigation entry. Titles
+use a separate translation artifact and never enter commentary. Figure/table
+captions and cited-paper titles remain source-only. Skip mode makes no title
+translation call and renders each title once.
+
 When translation is enabled, place the PDF glossary after references and before
 the document end. In the single static `index.html`, place it once as the final
 `#glossary` section and add its link after chapter navigation. Lazy-mount a
@@ -291,8 +308,10 @@ keyboard focus shows the canonical `source ↔ target` pair as a plain-text,
 accessible tooltip. Do not split math, URLs, citation/link text, or KaTeX DOM.
 
 Source, guides, translations, commentary, and glossary use sans-serif text.
-CJK fallbacks are Noto Sans CJK SC, Source Han Sans SC/CN, then
-FandolHei-Regular. Mathematics and formula `\\text{}` remain LaTeX serif.
+Choose Noto/DejaVu fallbacks for common LTR scripts and SC/TC/JP/KR fonts for
+CJK according to the source and target tags. Mathematics and formula
+`\\text{}` remain LaTeX serif. HTML records per-layer language and direction;
+RTL PDF layout remains best-effort and produces an explicit warning.
 Invisible manifest or TeX markers validate hierarchy.
 
 Direct citations render with the source title linked to its URL and the locator

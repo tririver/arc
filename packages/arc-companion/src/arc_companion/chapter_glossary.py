@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .io import sha256_json, write_json
+from .language import contains_lexical_term
 
 SEGMENT_GLOSSARY_VERSION = "arc.companion.segment-glossary.v2"
 INDEX_GLOSSARY_VERSION = "arc.companion.index-glossary.v1"
@@ -187,32 +188,7 @@ def _fold(value: str) -> str:
 
 
 def _contains_term(source: str, term: str) -> bool:
-    if not term:
-        return False
-    # Only Latin-script letters and Unicode decimal digits participate in word
-    # boundaries.  CJK may remain adjacent, while e.g. ``résumé`` cannot match
-    # the plural ``résumés`` and an ASCII digit cannot match an adjacent Nd digit.
-    start = 0
-    while (offset := source.find(term, start)) >= 0:
-        before = source[offset - 1] if offset else ""
-        after_offset = offset + len(term)
-        after = source[after_offset] if after_offset < len(source) else ""
-        if (
-            (not _is_latin_or_decimal(term[0]) or not _is_latin_or_decimal(before))
-            and (not _is_latin_or_decimal(term[-1]) or not _is_latin_or_decimal(after))
-        ):
-            return True
-        start = offset + 1
-    return False
-
-
-def _is_latin_or_decimal(value: str) -> bool:
-    if not value:
-        return False
-    return unicodedata.category(value) == "Nd" or (
-        unicodedata.category(value).startswith("L")
-        and "LATIN" in unicodedata.name(value, "")
-    )
+    return contains_lexical_term(source, term)
 
 
 def _flatten_index(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:

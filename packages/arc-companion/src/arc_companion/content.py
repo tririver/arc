@@ -164,7 +164,7 @@ def reader_content_from_overrides(
     review_overlay_hashes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create the stable render input from the post-review reader boundary."""
-    return {
+    content = {
         "document": deepcopy(overrides.get("document")),
         "chapters": deepcopy(overrides.get("chapters") or []),
         "segments": deepcopy(overrides.get("segments") or []),
@@ -175,10 +175,18 @@ def reader_content_from_overrides(
         "metadata": deepcopy(overrides.get("metadata") or {}),
         "reader_evidence_by_segment": deepcopy(dict(reader_evidence_by_segment)),
         "language": str(overrides.get("language") or ""),
+        "source_language": str(overrides.get("source_language") or "und"),
         "translation_mode": str(overrides.get("translation_mode") or "enabled"),
         "accepted_ledger_chains": deepcopy(dict(accepted_ledger_chains or {})),
         "review_overlay_hashes": deepcopy(dict(review_overlay_hashes or {})),
     }
+    # Title translation was added after the original immutable-content
+    # contract.  Preserve read compatibility for callers that intentionally
+    # construct a legacy payload while making every new pipeline payload
+    # explicit.
+    if "title_translations" in overrides:
+        content["title_translations"] = deepcopy(overrides.get("title_translations"))
+    return content
 
 
 def checkpoint_receipts(checkpoint_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
@@ -258,6 +266,11 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
         raise ContentBundleError("reader evidence projection does not cover the segment set")
     if not isinstance(content.get("language"), str) or not content.get("language"):
         raise ContentBundleError("reviewed content language is missing")
+    if "source_language" in content and (
+        not isinstance(content.get("source_language"), str)
+        or not str(content.get("source_language") or "").strip()
+    ):
+        raise ContentBundleError("reviewed content source language is invalid")
     chapters = content.get("chapters")
     guides = content.get("chapter_guides")
     if not isinstance(chapters, list) or not all(isinstance(item, Mapping) for item in chapters):
@@ -271,6 +284,17 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
         raise ContentBundleError("reviewed content glossary is invalid")
     if not isinstance(content.get("metadata"), Mapping):
         raise ContentBundleError("reviewed content metadata is invalid")
+    if "title_translations" in content:
+        title_translations = content.get("title_translations")
+        if mode == "skipped":
+            if title_translations is not None:
+                raise ContentBundleError(
+                    "skip-translation content must store title translations as null"
+                )
+        else:
+            _validate_title_translation_content(
+                content, title_translations=title_translations,
+            )
     chains = content.get("accepted_ledger_chains")
     if not isinstance(chains, Mapping):
         raise ContentBundleError("accepted ledger chain receipts are invalid")
@@ -286,7 +310,7 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
         not _sha(value) for value in overlays.values()
     ):
         raise ContentBundleError("review overlay receipts are invalid")
-    return [
+    checks = [
         "source_document_present",
         "segment_ids_unique",
         "commentary_coverage_exact",
@@ -297,6 +321,49 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
         "accepted_chain_receipts_valid",
         "review_overlay_receipts_valid",
     ]
+    if "title_translations" in content:
+        checks.insert(-2, "title_translation_contract_valid")
+    return checks
+
+
+def _validate_title_translation_content(
+    content: Mapping[str, Any], *, title_translations: Any,
+) -> None:
+    if not isinstance(title_translations, Mapping):
+        raise ContentBundleError("reviewed title translations are missing")
+    titles = title_translations.get("titles")
+    if not isinstance(titles, list):
+        raise ContentBundleError("reviewed title translations are malformed")
+    try:
+        from .title_translation import collect_title_records
+
+        projection_document = {
+            **dict(content.get("document") or {}),
+            "metadata": dict(content.get("metadata") or {}),
+        }
+        records = collect_title_records(
+            projection_document,
+            list(content.get("chapters") or []),
+        )
+    except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+        raise ContentBundleError("reviewed title projection is invalid") from exc
+    expected = [str(item.get("title_id") or "") for item in records]
+    provided = [
+        str(item.get("title_id") or "")
+        for item in titles if isinstance(item, Mapping)
+    ]
+    if (
+        len(provided) != len(titles)
+        or provided != expected
+        or len(provided) != len(set(provided))
+        or any(
+            not isinstance(item.get("text"), str) or not item.get("text", "").strip()
+            for item in titles if isinstance(item, Mapping)
+        )
+    ):
+        raise ContentBundleError(
+            "reviewed title translations do not exactly cover the source title projection"
+        )
 
 
 def _digest(value: str) -> str:

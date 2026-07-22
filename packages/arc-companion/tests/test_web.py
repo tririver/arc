@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -116,13 +118,14 @@ def _project(tmp_path: Path, *, translation_state: str = "accepted") -> tuple[Pa
     write_json(
         chapter_dir / "chapter-guide.json",
         {
-            "schema_version": "arc.companion.chapter-guide.v2",
+            "schema_version": "arc.companion.chapter-guide.v3",
             "chapter_id": "ch-0001",
             "motivation": "Why $E$ matters.",
             "main_content": None,
             "section_logic": None,
-            "book_position": None,
             "prerequisites": None,
+            "pedagogical_comparison": None,
+            "historical_context": [],
             "supplementary_reading": [],
         },
     )
@@ -262,6 +265,43 @@ def test_math_runs_trim_all_supported_delimiters() -> None:
 
     assert [item["tex"] for item in math] == ["a+b", "c+d", "e+f", "g+h"]
     assert [item["display"] for item in math] == [False, True, False, True]
+
+
+def test_inline_separator_metadata_drives_projection_and_web_without_heuristics() -> None:
+    import arc_companion.web as web
+    from arc_companion.projection import translation_input_block
+
+    digest = "b" * 64
+    block = {
+        "block_id": "b1",
+        "kind": "paragraph",
+        "text": "plane ξ=0 be",
+        "inline_runs": [
+            {"kind": "text", "content": "plane"},
+            {
+                "kind": "math", "content": r"\xi=0", "tex": r"\xi=0",
+                "token_id": "b1.token-0002", "content_hash": digest,
+                "separator_before": " ",
+            },
+            {"kind": "text", "content": "be", "separator_before": " "},
+        ],
+    }
+
+    projected = translation_input_block(block)["text"]
+    assert projected == f"plane [[ARC_INLINE:b1.token-0002:{digest}]] be"
+    assert web._inline_runs(block) == [
+        {"type": "text", "text": "plane"},
+        {"type": "text", "text": " "},
+        {"type": "math", "tex": r"\xi=0", "display": False},
+        {"type": "text", "text": " "},
+        {"type": "text", "text": "be"},
+    ]
+
+    adjacent = {**block, "inline_runs": [
+        {key: value for key, value in run.items() if key != "separator_before"}
+        for run in block["inline_runs"]
+    ]}
+    assert " " not in translation_input_block(adjacent)["text"]
 
 
 def test_term_runs_are_bilingual_normalized_bounded_and_deterministic() -> None:
@@ -591,6 +631,256 @@ def test_web_assets_use_container_layout_lazy_mount_text_nodes_and_katex() -> No
     assert "#36586b" in css
     assert 'run.type === "term"' in javascript
     assert "KaTeX" in katex
+    assert 'font: 1rem/1.7 Inter' in css
+    assert "padding: 2.6rem 1rem 2rem;" in css
+    assert (
+        ".sidebar h2 { margin: 0 0 .75rem; font-size: 1rem; "
+        "color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }"
+    ) in css
+    assert """.sidebar a {
+  display: block;
+  padding: .42rem .55rem;
+  border-radius: .4rem;
+  color: #344250;
+  font-size: .85rem;
+  line-height: 1.35;
+  text-decoration: none;
+}""" in css
+    assert """.sidebar-toggle {
+  position: fixed;
+  z-index: 30;
+  top: .25rem;
+  left: .25rem;
+  min-width: 1.8rem;
+  height: 1.8rem;
+  margin: 0;
+  padding: 0 .35rem;
+  border: 1px solid #cbd3dc;
+  border-radius: .3rem;
+  background: rgba(255,255,255,.96);
+  color: #2b3b49;
+  font-size: .68rem;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(28,39,50,.1);
+}""" in css
+    assert (
+        ".guide-label, .annotation-label { display: block; margin-bottom: .15rem; "
+        "font-size: 1rem; font-weight: 700; color: #526474; letter-spacing: .03em; }"
+    ) in css
+    assert ".paper-header h1 { margin: 0; font-size: 1.35rem" in css
+    assert ".chapter > h2 { margin: 0 0 1.3rem; font-size: 1.20rem" in css
+    assert "font-size: 1.08rem" in css
+    assert 'toggle.textContent = toggleLabel' in javascript
+    assert 'toggle.setAttribute("aria-label", toggleLabel)' in javascript
+    assert 'toggle.setAttribute("title", toggleLabel)' in javascript
+    assert "segment.title" not in javascript
+    assert "bilingualHeading" in javascript
+    assert 'node.setAttribute("lang"' in javascript
+    assert 'node.setAttribute("dir"' in javascript
+    assert ".title-source, .title-translation" in css
+
+
+@pytest.mark.parametrize(("language", "open_label", "closed_label"), [
+    ("zh-CN", "收起侧栏", "展开侧栏"),
+    ("en", "Collapse sidebar", "Expand sidebar"),
+])
+def test_sidebar_toggle_updates_dom_accessibility_storage_and_mobile_navigation(
+    language: str, open_label: str, closed_label: str,
+) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is unavailable")
+    javascript = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "arc_companion" / "web_assets" / "reader.js"
+    ).read_text(encoding="utf-8")
+    harness = r'''
+class Classes {
+  constructor(value = "") { this.values = new Set(String(value).split(/\s+/).filter(Boolean)); }
+  contains(value) { return this.values.has(value); }
+  add(value) { this.values.add(value); }
+  remove(value) { this.values.delete(value); }
+  toggle(value, force) {
+    if (force === undefined) force = !this.values.has(value);
+    if (force) this.values.add(value); else this.values.delete(value);
+  }
+}
+class Node {
+  constructor(tag = "div", id = "") {
+    this.tagName = tag.toUpperCase(); this.id = id; this.children = []; this.dataset = {};
+    this.attributes = {}; this.listeners = {}; this.classList = new Classes(); this.textContent = "";
+  }
+  set className(value) { this._className = value; this.classList = new Classes(value); }
+  get className() { return this._className || ""; }
+  get childNodes() { return this.children; }
+  append(...values) { this.children.push(...values); }
+  replaceChildren(...values) { this.children = values; }
+  setAttribute(key, value) { this.attributes[key] = String(value); }
+  addEventListener(kind, fn) { this.listeners[kind] = fn; }
+  querySelectorAll() { return []; }
+  scrollIntoView() {}
+}
+const nodes = Object.fromEntries(["reader-app", "reader-main", "chapter-sidebar", "sidebar-toggle"].map(id => [id, new Node("div", id)]));
+nodes["reader-app"].classList.add("reader-shell");
+const store = new Map();
+global.localStorage = {getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value)};
+global.location = {hash: ""}; global.history = {state: null, replaceState() {}};
+global.requestAnimationFrame = fn => fn();
+global.document = {
+  getElementById: id => nodes[id] || null,
+  createElement: tag => new Node(tag),
+  createTextNode: text => ({textContent: String(text)})
+};
+global.window = {
+  __ARC_COMPANION_SNAPSHOT__: {language: "zh-CN", title: "T", paper_id: "p", chapters: [{chapter_id: "c1", title: "C", structural_only: true, segments: []}], appendices: [], glossary: [], coverage: {}},
+  matchMedia: () => ({matches: true})
+};
+'''
+    harness = harness.replace('language: "zh-CN"', f"language: {json.dumps(language)}")
+    assertions = r'''
+const app = nodes["reader-app"], toggle = nodes["sidebar-toggle"];
+if (toggle.textContent !== "收起侧栏" || toggle.attributes["aria-label"] !== "收起侧栏" || toggle.attributes.title !== "收起侧栏" || toggle.attributes["aria-expanded"] !== "true") process.exit(11);
+toggle.listeners.click();
+if (!app.classList.contains("sidebar-collapsed") || toggle.textContent !== "展开侧栏" || toggle.attributes["aria-expanded"] !== "false" || store.get("arc-reader-sidebar") !== "closed") process.exit(12);
+toggle.listeners.click();
+const find = (root, tag) => { for (const child of root.children) { if (child && child.tagName === tag) return child; if (child && child.children) { const found = find(child, tag); if (found) return found; } } return null; };
+const link = find(nodes["chapter-sidebar"], "A");
+link.listeners.click({preventDefault() {}});
+if (!app.classList.contains("sidebar-collapsed") || toggle.textContent !== "展开侧栏" || toggle.attributes.title !== "展开侧栏" || store.get("arc-reader-sidebar") !== "closed") process.exit(13);
+'''
+    assertions = assertions.replace("收起侧栏", open_label).replace("展开侧栏", closed_label)
+    result = subprocess.run(
+        [node, "-e", harness + "\n" + javascript + "\n" + assertions],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_snapshot_hides_formal_chapter_heading_but_keeps_lower_headings(tmp_path: Path) -> None:
+    project, checkpoint, _segment_id = _project(tmp_path)
+    envelope = read_json(checkpoint / "document.json")
+    envelope["document"]["blocks"] = [
+        {"block_id": "paper-title", "type": "heading", "text": "A Safe Reader", "source_role": "front_matter_title"},
+        {"block_id": "chapter-title", "type": "chapter", "text": "Foundations"},
+        {"block_id": "section-title", "type": "section", "text": "First section"},
+        *envelope["document"]["blocks"],
+    ]
+    write_json(checkpoint / "document.json", envelope)
+    chapters = read_json(checkpoint / "chapters.json")
+    chapter = chapters["chapters"][0]
+    chapter["title_block_ids"] = ["chapter-title"]
+    chapter["structural_block_ids"] = ["chapter-title", "section-title"]
+    chapter["content_block_ids"] = ["b1", "b2"]
+    chapter["block_ids"] = ["paper-title", "chapter-title", "section-title", "b1", "b2"]
+    write_json(checkpoint / "chapters.json", chapters)
+    segmentation = read_json(checkpoint / "chapters" / "ch-0001" / "segmentation.json")
+    segmentation["segments"][0]["block_ids"] = ["paper-title", "chapter-title", "section-title", "b1"]
+    write_json(checkpoint / "chapters" / "ch-0001" / "segmentation.json", segmentation)
+
+    snapshot = build_reader_snapshot(project)
+
+    source = snapshot["chapters"][0]["segments"][0]["source"]
+    assert [item["kind"] for item in source] == ["section", "paragraph"]
+    assert all(item.get("title") != "Foundations" for item in source)
+    assert all("A Safe Reader" not in str(item) for item in source)
+
+
+def test_snapshot_exposes_bilingual_titles_and_language_direction(tmp_path: Path) -> None:
+    project, checkpoint, _segment_id = _project(tmp_path)
+    envelope = read_json(checkpoint / "document.json")
+    envelope["document"]["front_matter"] = {
+        "title": "Die Relativitätstheorie",
+        "block_ids": {"title": ["paper-title"]},
+    }
+    envelope["document"]["blocks"] = [
+        {"block_id": "paper-title", "type": "heading", "text": "Die Relativitätstheorie", "source_role": "front_matter_title"},
+        {"block_id": "chapter-title", "type": "chapter", "text": "Grundlagen"},
+        {"block_id": "section-title", "type": "section", "text": "Kinematik"},
+        *envelope["document"]["blocks"],
+        {"block_id": "index-title", "type": "section", "text": "Register", "source_role": "index"},
+    ]
+    envelope["metadata"]["title"] = "Die Relativitätstheorie"
+    write_json(checkpoint / "document.json", envelope)
+    chapters = read_json(checkpoint / "chapters.json")
+    chapter = chapters["chapters"][0]
+    chapter.update({
+        "title": "Grundlagen",
+        "title_block_ids": ["chapter-title"],
+        "block_ids": ["paper-title", "chapter-title", "section-title", "b1", "b2"],
+    })
+    write_json(checkpoint / "chapters.json", chapters)
+    segmentation = read_json(checkpoint / "chapters" / "ch-0001" / "segmentation.json")
+    segmentation["segments"][0]["block_ids"] = ["paper-title", "chapter-title", "section-title", "b1"]
+    write_json(checkpoint / "chapters" / "ch-0001" / "segmentation.json", segmentation)
+    title_translations = {
+        "schema_version": "arc.companion.title-translations.v1",
+        "source_language": "de", "target_language": "zh-CN", "source_sha256": "0" * 64,
+        "titles": [
+            {"title_id": "document:title", "role": "document_title", "block_id": "paper-title", "text": "相对论"},
+            {"title_id": "block:chapter-title", "role": "chapter", "block_id": "chapter-title", "chapter_id": "ch-0001", "text": "基础"},
+            {"title_id": "block:section-title", "role": "section", "block_id": "section-title", "chapter_id": "ch-0001", "text": "运动学"},
+            {"title_id": "block:index-title", "role": "index", "block_id": "index-title", "text": "索引"},
+        ],
+    }
+
+    snapshot = build_reader_snapshot(project, final_overrides={
+        "source_language": "de-DE",
+        "language": "zh_cn",
+        "title_translations": title_translations,
+    })
+
+    assert snapshot["title"] == "相对论"
+    assert snapshot["source_title"] == "Die Relativitätstheorie"
+    assert snapshot["translated_title"] == "相对论"
+    assert snapshot["source_language"] == "de-DE"
+    assert snapshot["language"] == "zh-CN"
+    assert snapshot["source_direction"] == "ltr"
+    assert snapshot["direction"] == "ltr"
+    rendered_chapter = snapshot["chapters"][0]
+    assert rendered_chapter["title"] == "基础"
+    assert rendered_chapter["source_title"] == "Grundlagen"
+    section = rendered_chapter["segments"][0]["source"][0]
+    assert section["source_title"] == "Kinematik"
+    assert section["translated_title"] == "运动学"
+    assert section["language"] == "de-DE"
+    assert snapshot["appendices"][-1] == {
+        "appendix_id": "source-heading-index-title",
+        "kind": "source_only_structural_heading",
+        "title": "索引",
+        "source_title": "Register",
+        "translated_title": "索引",
+        "source": [],
+    }
+
+
+def test_index_html_uses_target_language_and_direction() -> None:
+    import arc_companion.web as web
+
+    html = web._index_html(
+        data_script="data/snapshot.js", asset_root="assets/hash",
+        title="النسبية", language="ar",
+    )
+    assert '<html lang="ar" dir="rtl">' in html
+    assert "<title>النسبية</title>" in html
+
+
+def test_guide_view_omits_empty_guides_but_keeps_supplementary_reading() -> None:
+    import arc_companion.web as web
+
+    assert web._guide_view({
+        "motivation": None, "main_content": None, "section_logic": None,
+        "prerequisites": None, "pedagogical_comparison": None,
+        "historical_context": [], "supplementary_reading": [],
+    }) == []
+    view = web._guide_view({
+        "supplementary_reading": [{"title": "Text", "reason": "A useful derivation"}],
+    })
+    assert view == [{
+        "kind": "supplementary_reading",
+        "runs": [{"type": "text", "text": "Text: A useful derivation"}],
+    }]
 
 
 def test_svg_sanitizer_removes_active_and_external_content() -> None:

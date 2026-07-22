@@ -8,11 +8,13 @@ from typing import Any, Callable
 
 from .io import read_json, sha256_json, write_json
 from .prompts import CUT_SCHEMA, segmentation_prompt
-from .projection import annotation_input_block, is_translatable, translation_input_block
+from .projection import (
+    annotation_input_block, is_structural, is_translatable, translation_input_block,
+)
 from .source import block_id
 
 
-SEGMENTATION_VERSION = "arc.companion.segmentation.v5"
+SEGMENTATION_VERSION = "arc.companion.segmentation.v6"
 WINDOW_MAX_BLOCKS = 100
 WINDOW_MAX_PROJECTED_CHARS = 30_000
 SEGMENT_HARD_MAX_BLOCKS = 24
@@ -160,12 +162,17 @@ def construct_segments_from_cuts(
         if not selected:
             raise SegmentationError(f"cut after ordinal {end} creates an empty segment")
         selected_inventory = inventory[start - 1:end]
+        augmentation_ids = [
+            block_id(block) for block in selected if not is_structural(block)
+        ]
         segments.append({
             "segment_id": f"seg-{index:04d}",
             "title": _segment_title(selected_inventory, start=start, end=end),
             "start_block_id": block_id(selected[0]),
             "end_block_id": block_id(selected[-1]),
             "block_ids": [block_id(block) for block in selected],
+            "augmentation_block_ids": augmentation_ids,
+            "structural_only": not augmentation_ids,
         })
         start = end + 1
     validate_exact_coverage(segments, blocks)
@@ -613,7 +620,8 @@ def _oversized_segments(
         end = positions[str(segment["end_block_id"])]
         selected = blocks[start - 1:end]
         annotation_projection = [
-            annotation_input_block(block, document) for block in selected
+            annotation_input_block(block, document)
+            for block in selected if not is_structural(block)
         ]
         translation_projection = [
             translation_input_block(block) for block in selected if is_translatable(block)
