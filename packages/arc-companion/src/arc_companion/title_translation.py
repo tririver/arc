@@ -234,7 +234,7 @@ def validate_title_translations(
     *,
     protected_names: Sequence[str] = (),
 ) -> dict[str, list[dict[str, str]]]:
-    """Fail closed on identity, coverage, token, numbering, and name changes."""
+    """Validate title identity and restore only an entirely omitted source prefix."""
     normalized = normalize_title_translation_response(response)
     titles = normalized["titles"]
     expected_ids = [str(record.get("title_id") or "") for record in records]
@@ -254,9 +254,13 @@ def validate_title_translations(
             raise TitleTranslationError("source and translated titles must be non-empty")
         expected_prefix = str(record.get("number_prefix") or _number_prefix(source_text))
         if expected_prefix and not target_text.startswith(expected_prefix):
-            raise TitleTranslationError(
-                f"translated title {translated['title_id']!r} changed its number prefix"
-            )
+            actual_prefix = _number_prefix(target_text)
+            if actual_prefix:
+                raise TitleTranslationError(
+                    f"translated title {translated['title_id']!r} changed its number prefix"
+                )
+            target_text = expected_prefix + target_text
+            translated["text"] = target_text
         expected_tokens = Counter(
             str(value) for value in record.get("opaque_tokens") or _opaque_tokens(source_text)
         )
@@ -312,14 +316,25 @@ def _document_title_record(
     owned_ids = explicit_ids | role_ids
     owned_blocks = [block for block in blocks if block_id(block) in owned_ids]
 
+    # A front-matter role identifies ownership, not necessarily the precise
+    # text projection.  In particular, older parser outputs could propagate a
+    # title role across every block in the title heading's section.  Prefer
+    # structural title blocks when they exist; for prose-only front matter,
+    # use the canonical title to select the matching block(s).  Keep all owned
+    # ids reserved so contaminated prose is not projected again as a heading.
+    front_title = str(front.get("title") or "").strip()
+    projected_blocks = _document_title_blocks(owned_blocks, front_title=front_title)
+
     source_text = ""
     opaque_tokens: list[str] = []
-    if owned_blocks:
+    if projected_blocks:
         source_text = "\n".join(
-            value for value in (_projected_text(block).strip() for block in owned_blocks) if value
+            value
+            for value in (_projected_text(block).strip() for block in projected_blocks)
+            if value
         )
         opaque_tokens = [
-            token for block in owned_blocks for token in opaque_inline_tokens(block)
+            token for block in projected_blocks for token in opaque_inline_tokens(block)
         ]
     if not source_text:
         metadata = document.get("metadata")
@@ -338,9 +353,31 @@ def _document_title_record(
         role="document",
         block_id_value=None,
         chapter_id=None,
-        source_block_ids=[block_id(block) for block in owned_blocks],
+        source_block_ids=[block_id(block) for block in projected_blocks],
         opaque_tokens=opaque_tokens,
     ), owned_ids
+
+
+def _document_title_blocks(
+    owned_blocks: Sequence[dict[str, Any]], *, front_title: str
+) -> list[dict[str, Any]]:
+    structural = [block for block in owned_blocks if _is_structural_title(block)]
+    if structural:
+        return structural
+    if not front_title:
+        return list(owned_blocks)
+
+    comparable = _comparable_title(front_title)
+    exact = [
+        block
+        for block in owned_blocks
+        if _comparable_title(_projected_text(block)) == comparable
+    ]
+    if exact:
+        return exact
+    if _comparable_title("\n".join(_projected_text(block) for block in owned_blocks)) == comparable:
+        return list(owned_blocks)
+    return []
 
 
 def _record(

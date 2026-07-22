@@ -223,6 +223,28 @@ def test_semantic_front_matter_descendants_mark_combined_atomic_block() -> None:
     assert document["front_matter"]["block_ids"]["affiliations"] == ["creator-line"]
 
 
+def test_front_matter_title_role_does_not_propagate_to_its_section_body() -> None:
+    document = parse_source_input(
+        html_text="""
+        <article>
+          <section id="opening">
+            <h1>Canonical Title</h1>
+            <p id="author">By An Author</p>
+            <p id="intro">Maxwell appears only in the introduction.</p>
+          </section>
+          <section id="body"><h2>1 Body</h2><p>Text.</p></section>
+        </article>
+        """,
+        source_id="front-title-section",
+    )["document"]
+
+    by_id = {block["block_id"]: block for block in document["blocks"]}
+    assert document["front_matter"]["block_ids"]["title"] == ["block-000001"]
+    assert by_id["block-000001"]["source_role"] == "front_matter_title"
+    assert by_id["author"].get("source_role") is None
+    assert by_id["intro"].get("source_role") is None
+
+
 def test_inline_runs_separate_text_math_citations_and_links_with_stable_tokens():
     html = r"""
     <article class="ltx_document"><p id="p1">The

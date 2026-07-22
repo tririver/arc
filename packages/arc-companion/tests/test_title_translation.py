@@ -134,6 +134,67 @@ def test_document_title_falls_back_to_metadata_and_matching_chapter_heading_dedu
     assert records[1]["chapter_id"] == "ch-0001"
 
 
+def test_document_title_projection_ignores_nonstructural_blocks_with_stale_title_roles() -> None:
+    document = {
+        "front_matter": {
+            "title": "Canonical Title",
+            "block_ids": {"title": ["title", "author", "intro"]},
+        },
+        "blocks": [
+            {
+                "block_id": "title", "kind": "heading",
+                "text": "Canonical Title", "source_role": "front_matter_title",
+            },
+            {
+                "block_id": "author", "kind": "prose",
+                "text": "By An Author", "source_role": "front_matter_title",
+            },
+            {
+                "block_id": "intro", "kind": "prose",
+                "text": "Maxwell appears only in the introduction.",
+                "source_role": "front_matter_title",
+            },
+        ],
+    }
+
+    records = collect_title_records(document)
+
+    assert records == [{
+        "title_id": "document:title",
+        "source_text": "Canonical Title",
+        "role": "document",
+        "block_id": None,
+        "chapter_id": None,
+        "source_block_ids": ["title"],
+        "number_prefix": "",
+        "opaque_tokens": [],
+    }]
+
+
+def test_document_title_projection_matches_canonical_prose_title_without_body_contamination() -> None:
+    document = {
+        "front_matter": {
+            "title": "A Prose Title",
+            "block_ids": {"title": ["title", "intro"]},
+        },
+        "blocks": [
+            {
+                "block_id": "title", "kind": "prose",
+                "text": "A Prose Title", "source_role": "front_matter_title",
+            },
+            {
+                "block_id": "intro", "kind": "prose",
+                "text": "Body text.", "source_role": "front_matter_title",
+            },
+        ],
+    }
+
+    record = collect_title_records(document)[0]
+
+    assert record["source_text"] == "A Prose Title"
+    assert record["source_block_ids"] == ["title"]
+
+
 def test_title_projection_rejects_ambiguous_source_identity() -> None:
     document = {
         "blocks": [
@@ -273,7 +334,7 @@ def test_validation_fails_closed_on_coverage_order_and_empty_text(
 @pytest.mark.parametrize(
     ("text", "message"),
     [
-        ("新的 1 标题", "number prefix"),
+        ("2 新标题", "number prefix"),
         ("1 新标题", "opaque inline tokens"),
         ("1 新标题 [[ARC_INLINE:other:deadbeef]]", "opaque inline tokens"),
     ],
@@ -291,6 +352,22 @@ def test_validation_rejects_changed_prefix_or_opaque_tokens(text: str, message: 
             records,
             {"titles": [{"title_id": "block:h", "text": text}]},
         )
+
+
+def test_validation_restores_an_entirely_omitted_number_prefix() -> None:
+    records = [{
+        "title_id": "block:part",
+        "source_text": "II. ELECTRODYNAMICAL PART",
+        "number_prefix": "II. ",
+        "opaque_tokens": [],
+    }]
+
+    assert validate_title_translations(
+        records,
+        {"titles": [{"title_id": "block:part", "text": "电动力学部分"}]},
+    ) == {
+        "titles": [{"title_id": "block:part", "text": "II. 电动力学部分"}],
+    }
 
 
 def test_validation_rejects_translated_or_dropped_protected_name() -> None:
