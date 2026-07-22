@@ -97,9 +97,11 @@ def test_formatter_response_is_replayed_after_outer_checkpoint_crash(tmp_path: P
     class Provider:
         calls = 0
 
-        def generate_json_result(self, _prompt, *, schema=None, **_kwargs):
+        def generate_json_result(self, prompt, *, schema=None, **_kwargs):
             self.calls += 1
-            if isinstance(schema, dict) and "action" in schema.get("properties", {}):
+            if (
+                isinstance(schema, dict) and "action" in schema.get("properties", {})
+            ) or ('"action"' in prompt and '"formatted_output"' in prompt):
                 return LLMProviderResponse(
                     {
                         "action": "format",

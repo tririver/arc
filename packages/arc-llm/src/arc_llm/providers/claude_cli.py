@@ -68,13 +68,20 @@ class ClaudeCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
+        schema_transport: str = "auto",
         cancel_check=None,
         idle_timeout_seconds: float | None = None,
         progress_callback=None,
     ) -> LLMProviderResponse[dict[str, Any]]:
         schema = schema or {"type": "object"}
         stateful = session_policy == "stateful" and session is not None
-        mode = _json_schema_mode(self.env, model=model, output_recovery=output_recovery)
+        if schema_transport not in {"auto", "prompt"}:
+            raise LLMWorkerError("schema_transport must be auto or prompt")
+        mode = (
+            "prompt"
+            if schema_transport == "prompt"
+            else _json_schema_mode(self.env, model=model, output_recovery=output_recovery)
+        )
         cmd = [
             *_base_cmd(self.env, stateful=stateful),
             "--output-format",
@@ -322,8 +329,6 @@ def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict
         try:
             nested = json.loads(payload["result"])
         except json.JSONDecodeError as exc:
-            if output_recovery != "warn":
-                raise _submitted_output_error(f"Claude result field was not JSON: {exc}") from exc
             extracted, warnings = parse_json_object_relaxed(payload["result"])
             if isinstance(extracted, dict):
                 return extracted, structured_metadata(
@@ -332,6 +337,8 @@ def _extract_json(stdout: str, *, output_recovery: str = "strict") -> tuple[dict
                     raw_text=payload["result"],
                     strategy="extract_json",
                 )
+            if output_recovery != "warn":
+                raise _submitted_output_error(f"Claude result field was not JSON: {exc}") from exc
             return {}, structured_metadata(
                 severity="major",
                 warnings=["Claude result field was not JSON; using schema recovery.", *warnings],

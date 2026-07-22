@@ -13,10 +13,18 @@ from arc_llm.call_record import (
     ARC_LLM_CALL_RECORD_SCHEMA_VERSION,
     allow_arc_llm_call_record,
 )
-from arc_llm.json_schema import to_provider_json_schema
+from arc_llm.json_schema import (
+    STRICT_SCHEMA_PROMPT_FALLBACK_WARNING,
+    plan_provider_json_schema,
+    provider_uses_native_schema,
+    schema_has_open_object,
+    to_provider_json_schema,
+    with_canonical_json_schema_contract,
+)
 from arc_llm.providers.base import (
     LLMConfigurationError,
     LLMFailureCategory,
+    LLMSchemaError,
     LLMSubmissionState,
     LLMWorkerCancelled,
     LLMWorkerError,
@@ -171,6 +179,83 @@ def test_provider_schema_does_not_mutate_input_schema():
 
     assert schema == original
     assert provider_schema != schema
+
+
+def test_provider_schema_plan_falls_back_for_nested_open_object():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["payload"],
+        "properties": {
+            "payload": {
+                "type": "object",
+                "additionalProperties": {"type": "number"},
+            }
+        },
+    }
+
+    plan = plan_provider_json_schema(
+        schema, provider="codex-cli", uses_native_schema=True
+    )
+
+    assert schema_has_open_object(schema) is True
+    assert plan.prompt_fallback is True
+    assert plan.provider_schema is None
+    assert plan.checkpoint_schema == schema
+    assert plan.warnings == (STRICT_SCHEMA_PROMPT_FALLBACK_WARNING,)
+
+
+def test_provider_without_native_schema_preserves_open_object_semantics():
+    schema = {"type": "object", "additionalProperties": {"type": "string"}}
+
+    plan = plan_provider_json_schema(
+        schema, provider="kimi-code-cli", uses_native_schema=False
+    )
+
+    assert plan.prompt_fallback is False
+    assert plan.provider_schema == schema
+    assert plan.warnings == ()
+
+
+def test_claude_native_schema_selection_matches_provider_modes():
+    assert provider_uses_native_schema(
+        "claude-cli", supports_native_schema=True, env={}, output_recovery="strict"
+    ) is False
+    assert provider_uses_native_schema(
+        "claude-cli",
+        supports_native_schema=True,
+        env={"ARC_CLAUDE_JSON_SCHEMA_MODE": "provider"},
+        output_recovery="strict",
+    ) is True
+    assert provider_uses_native_schema(
+        "claude-cli",
+        supports_native_schema=True,
+        env={"ARC_CLAUDE_WARN_JSON_SCHEMA_MODE": "provider"},
+        output_recovery="warn",
+    ) is True
+
+
+def test_invalid_schema_fails_before_provider_or_artifact_creation(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        runner,
+        "select_provider",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider must not be selected")
+        ),
+    )
+    artifact_dir = tmp_path / "artifacts"
+
+    with pytest.raises(LLMSchemaError, match="JSON schema is invalid"):
+        run_json(
+            "prompt",
+            schema={"type": "not-a-json-schema-type"},
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            artifact_dir=artifact_dir,
+        )
+
+    assert artifact_dir.exists() is False
 
 
 def test_provider_schema_treats_properties_without_type_as_strict_object():
@@ -434,6 +519,33 @@ class CapturingSchemaResultProvider:
     ):
         self.schema = deepcopy(schema)
         return LLMProviderResponse({"ok": True})
+
+
+class PromptFallbackResultProvider:
+    name = "codex-cli"
+
+    def __init__(self, response):
+        self.response = response
+        self.prompt = None
+        self.schema = None
+        self.output_recovery = None
+
+    def generate_json_result(
+        self,
+        prompt,
+        *,
+        schema=None,
+        model=None,
+        session=None,
+        session_policy="stateless",
+        schema_cache_dir=None,
+        artifact_dir=None,
+        output_recovery="strict",
+    ):
+        self.prompt = prompt
+        self.schema = deepcopy(schema)
+        self.output_recovery = output_recovery
+        return self.response
 
 
 class FakeTextResultProvider:
@@ -714,11 +826,15 @@ def test_run_json_uses_selected_provider_and_model(tmp_path, monkeypatch):
         process_chain=[],
     )
 
-    assert result["prompt"] == ensure_runtime_progress_contract("prompt")
-    assert result["schema"] == {"type": "object", "additionalProperties": False}
+    expected_prompt = ensure_runtime_progress_contract(
+        with_canonical_json_schema_contract("prompt", {"type": "object"})
+    )
+    assert result["prompt"] == expected_prompt
+    assert result["schema"] is None
     assert result["model"] == "fast"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["provider_used"] == "codex-cli"
     assert result[ARC_LLM_CALL_RECORD_FIELD]["model_used"] == "fast"
+    assert STRICT_SCHEMA_PROMPT_FALLBACK_WARNING in result[ARC_LLM_CALL_RECORD_FIELD]["warnings"]
 
 
 def test_run_json_passes_provider_safe_schema_but_preserves_local_validation(monkeypatch):
@@ -749,6 +865,64 @@ def test_run_json_passes_provider_safe_schema_but_preserves_local_validation(mon
     assert provider.schema["properties"] == {"ok": {"type": "boolean"}}
     assert provider.schema["additionalProperties"] is False
     assert schema == original
+
+
+def test_run_json_open_object_uses_prompt_relaxed_parse_and_local_validation(monkeypatch):
+    provider = PromptFallbackResultProvider(
+        LLMProviderResponse(
+            {"dynamic": "value"},
+            raw_output='answer: {"dynamic":"value"}',
+            structured_output=structured_metadata(
+                severity="minor",
+                warnings=["extracted JSON object"],
+                raw_text='answer: {"dynamic":"value"}',
+                strategy="extract_json",
+            ),
+        )
+    )
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+    schema = {"type": "object", "additionalProperties": {"type": "string"}}
+
+    result = run_json(
+        "prompt",
+        schema=schema,
+        provider="codex-cli",
+        env={},
+        process_chain=[],
+        output_recovery="strict",
+    )
+
+    assert without_call_record(result) == {"dynamic": "value"}
+    assert provider.schema is None
+    assert provider.output_recovery == "warn"
+    assert '"additionalProperties":{"type":"string"}' in provider.prompt
+    assert STRICT_SCHEMA_PROMPT_FALLBACK_WARNING in result[ARC_LLM_CALL_RECORD_FIELD]["warnings"]
+
+
+def test_run_json_strict_prompt_fallback_rejects_synthesized_empty_object(monkeypatch):
+    provider = PromptFallbackResultProvider(
+        LLMProviderResponse(
+            {},
+            raw_output="plain text",
+            structured_output=structured_metadata(
+                severity="major",
+                warnings=["no JSON object"],
+                raw_text="plain text",
+                strategy="natural_language_fallback",
+            ),
+        )
+    )
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    with pytest.raises(LLMTaskError, match="did not contain a recoverable JSON object"):
+        run_json(
+            "prompt",
+            schema={"type": "object"},
+            provider="codex-cli",
+            env={},
+            process_chain=[],
+            output_recovery="strict",
+        )
 
 
 def test_run_json_recovery_warn_valid_json_is_unchanged(monkeypatch):
@@ -1048,6 +1222,56 @@ def test_kimi_config_warnings_propagate_to_call_record(monkeypatch):
     assert "kimi_code_cli.model_tier_unmapped" in warnings
 
 
+def test_kimi_prompt_schema_keeps_open_object_without_fallback_warning(monkeypatch):
+    provider = CapturingSchemaResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+    schema = {"type": "object", "additionalProperties": True}
+
+    result = run_json(
+        "prompt",
+        schema=schema,
+        provider="kimi-code-cli",
+        env={},
+        process_chain=[],
+    )
+
+    assert provider.schema == schema
+    assert STRICT_SCHEMA_PROMPT_FALLBACK_WARNING not in result[ARC_LLM_CALL_RECORD_FIELD]["warnings"]
+
+
+def test_claude_default_prompt_mode_keeps_open_schema_without_fallback_warning(monkeypatch):
+    provider = CapturingSchemaResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+    schema = {"type": "object", "additionalProperties": True}
+
+    result = run_json(
+        "prompt",
+        schema=schema,
+        provider="claude-cli",
+        env={},
+        process_chain=[],
+    )
+
+    assert provider.schema == schema
+    assert STRICT_SCHEMA_PROMPT_FALLBACK_WARNING not in result[ARC_LLM_CALL_RECORD_FIELD]["warnings"]
+
+
+def test_claude_native_mode_open_schema_uses_prompt_fallback(monkeypatch):
+    provider = CapturingSchemaResultProvider()
+    monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
+
+    result = run_json(
+        "prompt",
+        schema={"type": "object"},
+        provider="claude-cli",
+        env={"ARC_CLAUDE_JSON_SCHEMA_MODE": "provider"},
+        process_chain=[],
+    )
+
+    assert provider.schema is None
+    assert STRICT_SCHEMA_PROMPT_FALLBACK_WARNING in result[ARC_LLM_CALL_RECORD_FIELD]["warnings"]
+
+
 def test_non_retryable_worker_error_stops_after_first_attempt(monkeypatch):
     provider = NonRetryableProvider()
     monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: provider)
@@ -1138,7 +1362,10 @@ def test_run_json_records_provider_prompt_hash_when_prompt_is_rewritten(tmp_path
         idempotency_key="prompt-hash-call",
     )
 
-    expected = sha256_text(f"{ensure_runtime_progress_contract('prompt')}\nprovider contract")
+    transport_prompt = with_canonical_json_schema_contract("prompt", {"type": "object"})
+    expected = sha256_text(
+        f"{ensure_runtime_progress_contract(transport_prompt)}\nprovider contract"
+    )
     call = json.loads((tmp_path / "sessions" / "calls.jsonl").read_text(encoding="utf-8"))
 
     assert result[ARC_LLM_CALL_RECORD_FIELD]["prompt_sha256"] == expected

@@ -25,7 +25,13 @@ from .call_checkpoint import (
     record_validated,
 )
 from .host import HostDetection, select_llm_provider
-from .json_schema import to_provider_json_schema
+from .json_schema import (
+    ProviderJSONSchemaPlan,
+    plan_provider_json_schema,
+    provider_uses_native_schema,
+    validate_local_json_schema,
+    with_canonical_json_schema_contract,
+)
 from .model import reasoning_effort_for_model_tier, resolve_model_with_warnings
 from .paper_access_policy import (
     PAPER_ACCESS_POLICY_VERSION,
@@ -553,6 +559,25 @@ def run_json_result(
         process_chain=process_chain,
     )
     _raise_if_auto_resolved_manual(provider, configs)
+    try:
+        validate_local_json_schema(schema)
+        schema_plans = {
+            config.provider: plan_provider_json_schema(
+                schema,
+                provider=config.provider,
+                uses_native_schema=provider_uses_native_schema(
+                    config.provider,
+                    supports_native_schema=get_provider_spec(
+                        config.provider
+                    ).supports_native_schema,
+                    env=env,
+                    output_recovery=output_recovery,
+                ),
+            )
+            for config in configs
+        }
+    except ValueError as exc:
+        raise LLMSchemaError(str(exc)) from exc
     _validate_runtime_inputs_before_artifacts(
         configs, env=env, idle_timeout_seconds=idle_timeout_seconds
     )
@@ -583,6 +608,7 @@ def run_json_result(
             selected,
             prompt,
             schema=schema,
+            schema_plan=schema_plans[config.provider],
             model=config.model,
             validate_schema=validate_schema,
             output_recovery=output_recovery,
@@ -975,6 +1001,7 @@ def _generate_json(
     prompt: str,
     *,
     schema: dict[str, Any] | None,
+    schema_plan: ProviderJSONSchemaPlan,
     model: str | None,
     validate_schema: bool,
     output_recovery: str,
@@ -1010,10 +1037,15 @@ def _generate_json(
     )
     if session_policy == "stateful" and not hasattr(selected, "generate_json_result"):
         raise LLMTaskError(f"Provider {provider_used} does not support stateful sessions")
-    provider_schema = to_provider_json_schema(schema)
+    provider_schema = schema_plan.provider_schema
     prepared_checkpoint = None
+    transport_prompt = (
+        with_canonical_json_schema_contract(prompt, schema_plan.checkpoint_schema)
+        if schema_plan.prompt_fallback and schema_plan.checkpoint_schema is not None
+        else prompt
+    )
     effective_prompt = apply_runtime_progress_contract(
-        prompt, scope=progress_contract_scope, generation_bootstrap=True
+        transport_prompt, scope=progress_contract_scope, generation_bootstrap=True
     )
     generation: int | None = None
     progress = _progress_journal(
@@ -1042,7 +1074,7 @@ def _generate_json(
             path, identity = checkpoint_path(
                 artifact_dir,
                 prompt=prompt,
-                schema=provider_schema,
+                schema=schema_plan.checkpoint_schema,
                 provider=provider_used,
                 model=model,
                 call_label=call_label,
@@ -1071,11 +1103,13 @@ def _generate_json(
                 raise LLMTaskError(
                     "supervised native resume requires an existing provider session id"
                 )
-        provider_prompt = (
-            NATIVE_RESUME_RECONCILIATION_PROMPT
-            if supervised_native_resume
-            else effective_prompt
-        )
+        provider_prompt = effective_prompt
+        if supervised_native_resume:
+            provider_prompt = NATIVE_RESUME_RECONCILIATION_PROMPT
+            if schema_plan.prompt_fallback and schema_plan.checkpoint_schema is not None:
+                provider_prompt = with_canonical_json_schema_contract(
+                    provider_prompt, schema_plan.checkpoint_schema
+                )
         def invoke() -> LLMProviderResponse[dict[str, Any]]:
             if hasattr(selected, "generate_json_result"):
                 kwargs = {
@@ -1087,7 +1121,14 @@ def _generate_json(
                     "artifact_dir": artifact_dir,
                 }
                 if _accepts_keyword(selected.generate_json_result, "output_recovery"):
-                    kwargs["output_recovery"] = output_recovery
+                    kwargs["output_recovery"] = (
+                        "warn" if schema_plan.prompt_fallback else output_recovery
+                    )
+                if (
+                    schema_plan.prompt_fallback
+                    and _accepts_keyword(selected.generate_json_result, "schema_transport")
+                ):
+                    kwargs["schema_transport"] = "prompt"
                 if _accepts_keyword(selected.generate_json_result, "idle_timeout_seconds"):
                     kwargs["idle_timeout_seconds"] = idle_timeout_seconds
                 if _accepts_keyword(selected.generate_json_result, "progress_callback"):
@@ -1139,7 +1180,7 @@ def _generate_json(
         ) as (session, turn_count):
             generation = session.generation
             effective_prompt = apply_runtime_progress_contract(
-                prompt,
+                transport_prompt,
                 scope=progress_contract_scope,
                 generation_bootstrap=turn_count == 0,
             )
@@ -1204,6 +1245,7 @@ def _generate_json(
                     progress_callback=progress,
                     cancel_check=cancel_check,
                     idempotency_key=idempotency_key,
+                    prompt_schema_fallback=schema_plan.prompt_fallback,
                 )
             except Exception:
                 record_turn(response.structured_output)
@@ -1232,6 +1274,7 @@ def _generate_json(
             progress_callback=progress,
             cancel_check=cancel_check,
             idempotency_key=idempotency_key,
+            prompt_schema_fallback=schema_plan.prompt_fallback,
         )
         native_session_id = response.native_session_id
         prompt_sha = response.prompt_sent_sha256 or sha256_text(effective_prompt)
@@ -1258,6 +1301,7 @@ def _generate_json(
             response=response,
         ),
         structured_output=structured_output,
+        warnings=schema_plan.warnings,
     )
 
 
@@ -1675,8 +1719,19 @@ def _recover_or_validate_json_output(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     idempotency_key: str | None = None,
+    prompt_schema_fallback: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     structured_output = response.structured_output
+    if (
+        prompt_schema_fallback
+        and output_recovery == "strict"
+        and isinstance(structured_output, Mapping)
+        and structured_output.get("recovery_strategy")
+        in {"natural_language_fallback", "schema_default"}
+    ):
+        raise LLMOutputValidationError(
+            "Prompt-schema fallback output did not contain a recoverable JSON object"
+        )
     provider_recovered = isinstance(structured_output, Mapping) and structured_output.get("mode") == "recovered"
     if not validate_schema:
         if isinstance(result, dict):

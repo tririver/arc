@@ -728,6 +728,33 @@ def test_claude_provider_mode_keeps_json_schema_for_deepseek(monkeypatch):
     assert captured["input"] == "prompt"
 
 
+def test_claude_prompt_transport_overrides_provider_schema_mode(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": {"dynamic": "value"}}), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider(
+        env={"ARC_CLAUDE_JSON_SCHEMA_MODE": "provider"}
+    ).generate_json_result(
+        "prompt with canonical schema",
+        schema=None,
+        output_recovery="warn",
+        schema_transport="prompt",
+    )
+
+    assert response.value == {"dynamic": "value"}
+    assert "--json-schema" not in captured["cmd"]
+    assert "JSON output contract" in captured["input"]
+    assert "prompt with canonical schema" in captured["input"]
+
+
 def test_claude_natural_language_result_recovered_in_warn_mode(monkeypatch):
     def fake_run(cmd, **kwargs):
         payload = {
@@ -893,6 +920,26 @@ def test_claude_strict_mode_raises_on_result_json_array(monkeypatch):
 
     with pytest.raises(LLMWorkerError, match="Claude result JSON was not an object"):
         ClaudeCliProvider().generate_json_result("prompt", schema={"type": "object"}, output_recovery="strict")
+
+
+def test_claude_strict_prompt_mode_relaxed_parser_extracts_json_object(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        payload = {
+            "type": "result",
+            "result": 'Here is the object:\n```json\n{"dynamic":"value"}\n```',
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    response = ClaudeCliProvider().generate_json_result(
+        "prompt",
+        schema={"type": "object", "additionalProperties": True},
+        output_recovery="strict",
+    )
+
+    assert response.value == {"dynamic": "value"}
+    assert response.structured_output["recovery_strategy"] == "extract_json"
 
 
 def test_claude_structured_output_retry_error_is_not_recovered_in_warn_mode(monkeypatch):

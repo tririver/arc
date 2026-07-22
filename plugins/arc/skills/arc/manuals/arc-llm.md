@@ -129,11 +129,15 @@ persistence, and any model tier that was not actually mapped. Kimi ACP does not
 provide token usage, so all fields in its usage object are null. Treat this as
 runtime audit data, not model-generated scientific content.
 
-ARC normalizes provider-facing JSON schemas to strict object schemas so they
-stay compatible with Codex structured output. Kimi has no native schema mode;
-ARC appends a canonical JSON Schema prompt contract, then applies relaxed JSON
-parsing, schema validation, and recovery. Do not ask workers to generate
-`arc_llm_call_record`; ARC attaches that audit field after provider output.
+ARC validates JSON Schemas locally before creating call artifacts. Closed
+object schemas use a provider's native strict transport when supported. If a
+schema contains an open object whose arbitrary-key semantics would be changed
+by strict normalization, ARC instead appends the canonical original schema to
+the prompt, applies relaxed JSON parsing, validates locally, and records
+`structured_output.open_object_prompt_fallback` in the call warnings. Kimi has
+no native schema mode and always uses its prompt contract without that fallback
+warning. Do not ask workers to generate `arc_llm_call_record`; ARC attaches
+that audit field after provider output.
 
 Direct calls are stateless by default. For a debugging session that should
 reuse host conversation state, pass all session fields explicitly:
