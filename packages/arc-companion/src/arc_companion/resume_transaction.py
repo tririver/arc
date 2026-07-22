@@ -277,7 +277,6 @@ def append_entries(
         for index, item in enumerate(current)
     }
     nonresumable_identities: set[tuple[str, str, str]] = set()
-    nonresumable_keys: set[str] = set()
     for raw in entries:
         entry = _canonical_entry(raw)
         identity = (
@@ -287,8 +286,6 @@ def append_entries(
         existing_index = identity_positions.get(identity)
         if str(entry.get("recovery_action") or "") == "operator-supervision":
             nonresumable_identities.add(identity)
-            if entry.get("idempotency_key"):
-                nonresumable_keys.add(str(entry["idempotency_key"]))
         if existing_index is None:
             current.append({**entry, "status": "pending"})
             identity_positions[identity] = len(current) - 1
@@ -301,9 +298,6 @@ def append_entries(
                 # Acceptance receipts are immutable audit facts.  Later
                 # discovery may not rewrite them or reopen the entry.
                 continue
-            prior_key = str(current[existing_index].get("idempotency_key") or "")
-            if identity in nonresumable_identities and prior_key:
-                nonresumable_keys.add(prior_key)
             current[existing_index] = {
                 **dict(current[existing_index]), **entry, "status": status,
             }
@@ -313,8 +307,7 @@ def append_entries(
     ])
     contexts = [
         context for context in contexts
-        if str(context.get("idempotency_key") or "") not in nonresumable_keys
-        and (
+        if (
             _canonical_path(context.get("ledger_path")),
             str(context.get("session_key") or ""),
             str(context.get("segment_id") or ""),
@@ -323,6 +316,84 @@ def append_entries(
     value.update({
         "entries": current,
         "native_resume_contexts": contexts,
+        "updated_at": _now(),
+    })
+    write_json(transaction_path(project_dir), value)
+    return value
+
+
+def suppress_native_resume_contexts(
+    project_dir: Path,
+    *,
+    idempotency_keys: set[str],
+    recovery_identities: set[tuple[str, str, str, int, str]] | None = None,
+    reason: str = "typed_idle_requires_fresh_generation",
+) -> dict[str, Any]:
+    """Suppress only exact five-field recovery identities.
+
+    The moved contexts remain immutable audit evidence, but callers that read
+    ``native_resume_contexts`` can no longer accidentally reconcile them.
+    Idempotency-key-only suppression is rejected because keys are not globally
+    unique controller authority.
+    """
+
+    value = load_transaction(project_dir)
+    if value is None:
+        raise ValueError("Resume transaction journal is missing")
+    keys = {str(item) for item in idempotency_keys if str(item)}
+    identities = set(recovery_identities or set())
+    if keys:
+        raise ValueError(
+            "native resume suppression requires complete recovery identities, not keys"
+        )
+    for identity in identities:
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != 5
+            or identity[0] != _canonical_path(identity[0])
+            or not all(str(identity[index]) for index in (0, 1, 2, 4))
+            or type(identity[3]) is not int
+            or identity[3] < 1
+        ):
+            raise ValueError("native resume suppression identity is incomplete")
+    active: list[dict[str, Any]] = []
+    suppressed = [
+        dict(item) for item in value.get("suppressed_native_resume_contexts") or []
+        if isinstance(item, Mapping)
+    ]
+    suppressed_identities = {
+        (
+            _canonical_path(item.get("ledger_path")),
+            str(item.get("session_key") or ""),
+            str(item.get("segment_id") or item.get("logical_unit") or ""),
+            int(item.get("generation") or 0),
+            str(item.get("idempotency_key") or ""),
+        )
+        for item in suppressed
+    }
+    changed = False
+    for raw in value.get("native_resume_contexts") or []:
+        context = dict(raw)
+        key = str(context.get("idempotency_key") or "")
+        identity = (
+            _canonical_path(context.get("ledger_path")),
+            str(context.get("session_key") or ""),
+            str(context.get("segment_id") or ""),
+            int(context.get("generation") or 0),
+            key,
+        )
+        if identity not in identities:
+            active.append(context)
+            continue
+        changed = True
+        if identity not in suppressed_identities:
+            suppressed.append({**context, "suppression_reason": reason})
+            suppressed_identities.add(identity)
+    if not changed:
+        return value
+    value.update({
+        "native_resume_contexts": active,
+        "suppressed_native_resume_contexts": suppressed,
         "updated_at": _now(),
     })
     write_json(transaction_path(project_dir), value)
@@ -625,15 +696,42 @@ def _canonical_entry(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def _dedupe_contexts(values: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
-    positions: dict[str, int] = {}
+    positions: dict[tuple[str, str, str, int, str], int] = {}
+    partial_positions: dict[str, int] = {}
     for raw in values:
         context = dict(raw)
-        key = str(context.get("idempotency_key") or "")
-        if key and key in positions:
-            output[positions[key]] = {**output[positions[key]], **context}
+        identity = (
+            _canonical_path(context.get("ledger_path")),
+            str(context.get("session_key") or ""),
+            str(context.get("segment_id") or context.get("logical_unit") or ""),
+            int(context.get("generation") or 0),
+            str(context.get("idempotency_key") or ""),
+        )
+        if identity in positions:
+            output[positions[identity]] = {**output[positions[identity]], **context}
             continue
-        if key:
-            positions[key] = len(output)
+        complete = bool(
+            identity[0] and identity[1] and identity[2]
+            and identity[3] > 0 and identity[4]
+        )
+        partial_index = partial_positions.get(identity[4]) if identity[4] else None
+        if not complete and partial_index is not None:
+            previous = output[partial_index]
+            compatible = all(
+                not previous.get(field)
+                or not context.get(field)
+                or previous.get(field) == context.get(field)
+                for field in (
+                    "ledger_path", "session_key", "segment_id", "logical_unit",
+                    "generation",
+                )
+            )
+            if compatible:
+                output[partial_index] = {**previous, **context}
+                continue
+        positions[identity] = len(output)
+        if not complete and identity[4]:
+            partial_positions[identity[4]] = len(output)
         output.append(context)
     return output
 
@@ -643,24 +741,18 @@ def _compact(value: Mapping[str, Any]) -> dict[str, Any]:
     rank = {state: index for index, state in enumerate(ENTRY_STATES)}
     entries: list[dict[str, Any]] = []
     identity_positions: dict[tuple[str, str, str], int] = {}
-    key_positions: dict[str, int] = {}
     for raw in value.get("entries") or []:
         entry = _canonical_entry(raw)
-        key = str(entry.get("idempotency_key") or "")
         identity = (
             str(entry.get("ledger_path") or ""),
             str(entry.get("session_key") or ""),
             str(entry.get("segment_id") or ""),
         )
-        index = key_positions.get(key) if key else None
-        if index is None:
-            index = identity_positions.get(identity)
+        index = identity_positions.get(identity)
         if index is None:
             index = len(entries)
             entries.append(entry)
             identity_positions[identity] = index
-            if key:
-                key_positions[key] = index
             continue
         existing = entries[index]
         existing_rank = rank.get(str(existing.get("status") or "pending"), 0)
@@ -687,8 +779,6 @@ def _compact(value: Mapping[str, Any]) -> dict[str, Any]:
                     merged.pop(field, None)
         entries[index] = merged
         identity_positions[identity] = index
-        if key:
-            key_positions[key] = index
     action = str(value.get("action") or "resume-native")
     policy = _policy(action, value.get("policy"))
     history = list(value.get("action_history") or [])
@@ -705,6 +795,14 @@ def _compact(value: Mapping[str, Any]) -> dict[str, Any]:
         "entries": entries,
         "native_resume_contexts": _dedupe_contexts(
             list(value.get("native_resume_contexts") or [])
+        ),
+        **(
+            {
+                "suppressed_native_resume_contexts": _dedupe_contexts(
+                    list(value.get("suppressed_native_resume_contexts") or [])
+                )
+            }
+            if "suppressed_native_resume_contexts" in value else {}
         ),
         "replacements": [dict(item) for item in value.get("replacements") or []],
         "restart_budgets": [dict(item) for item in value.get("restart_budgets") or []],

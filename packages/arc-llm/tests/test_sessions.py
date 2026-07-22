@@ -135,6 +135,55 @@ def test_session_manager_rejects_runtime_mismatch(tmp_path):
         manager.get_or_create(key="k", provider="codex-cli", model="m1", runtime_fingerprint="fp-2")
 
 
+def test_locked_turn_creates_requested_initial_generation_and_requires_exact_match(
+    tmp_path,
+) -> None:
+    manager = LLMSessionManager(tmp_path / "sessions")
+
+    with manager.locked_turn(
+        key="k",
+        provider="codex-cli",
+        model="m",
+        runtime_fingerprint="fp",
+        required_generation=4,
+        initial_generation=4,
+    ) as (created, turn_count):
+        assert created.generation == 4
+        assert created.provider == "codex-cli"
+        assert created.model == "m"
+        assert turn_count == 0
+
+    with pytest.raises(ValueError, match="expected 3, found 4"):
+        with manager.locked_turn(
+            key="k",
+            provider="codex-cli",
+            model="m",
+            runtime_fingerprint="fp",
+            required_generation=3,
+            initial_generation=3,
+        ):
+            pass
+
+
+def test_locked_turn_rejects_conflicting_required_and_initial_generations(
+    tmp_path,
+) -> None:
+    manager = LLMSessionManager(tmp_path / "sessions")
+
+    with pytest.raises(ValueError, match="must match"):
+        with manager.locked_turn(
+            key="k",
+            provider="codex-cli",
+            model="m",
+            runtime_fingerprint="fp",
+            required_generation=3,
+            initial_generation=4,
+        ):
+            pass
+
+    assert manager.get_existing("k") is None
+
+
 @pytest.mark.parametrize("durable_state", ["started", "native", "turn"])
 def test_proven_legacy_fingerprint_migrates_started_generation_in_place(
     tmp_path, durable_state: str,

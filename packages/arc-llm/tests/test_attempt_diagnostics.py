@@ -24,7 +24,11 @@ from arc_llm.attempt_diagnostics import (
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_llm.providers.activity import ActivityTracker
 from arc_llm.host import HostDetection
-from arc_llm.providers.base import LLMSubmissionState, LLMWorkerTimeout
+from arc_llm.providers.base import (
+    LLMSubmissionState,
+    LLMWorkerError,
+    LLMWorkerTimeout,
+)
 from arc_llm.providers.lifecycle import run_streaming_process_group
 from arc_llm.runner import LLMConfig, LLMTaskError, run_json
 
@@ -39,6 +43,113 @@ def _read_stream(attempt_dir: Path, receipt: dict[str, object]) -> str:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _checkpoint_binding(tmp_path: Path) -> dict[str, object]:
+    digest = "a" * 64
+    return {
+        "schema_version": "arc.llm.checkpoint_recomputation_binding.v1",
+        "checkpoint_path": str(
+            (tmp_path / "call-checkpoints" / "idempotency.json").resolve()
+        ),
+        "checkpoint_identity": "checkpoint-identity",
+        "logical_identity": {
+            "provider": "codex-cli",
+            "model": "model",
+            "session_key": "chapter:translation",
+            "generation": 7,
+            "idempotency_key": "segment-9",
+        },
+        "request_digest": digest,
+        "request_recipe_sha256": "b" * 64,
+        "idempotency_key": "segment-9",
+        "session_key": "chapter:translation",
+        "generation": 7,
+        "prompt_sha256": "c" * 64,
+        "schema_sha256": "d" * 64,
+        "call_label_sha256": "e" * 64,
+        "initial_native_authorization": {
+            "control_address": str((tmp_path / "control-ledger.json").resolve()),
+            "session_key": "chapter:translation",
+            "logical_unit": "segment-9",
+            "generation": 7,
+            "idempotency_key": "segment-9",
+        },
+        "native_resume_authorization": {
+            "control_address": str((tmp_path / "control-ledger.json").resolve()),
+            "session_key": "chapter:translation",
+            "logical_unit": "segment-9",
+            "generation": 7,
+            "idempotency_key": "segment-9",
+        },
+    }
+
+
+def test_attempt_record_binds_exact_checkpoint_and_immutable_sources(
+    tmp_path: Path,
+) -> None:
+    diagnostics = AttemptDiagnostics(
+        tmp_path, provider="codex-cli", model="model", fallback_index=0,
+        attempt=1, call_label="segment-9", env={},
+    )
+    binding = _checkpoint_binding(tmp_path)
+    diagnostics.bind_checkpoint(binding)
+    # A caller cannot mutate the already-bound association by retaining the
+    # original nested mapping.
+    binding["logical_identity"]["generation"] = 999  # type: ignore[index]
+    diagnostics.capture_stdout("immutable provider output\n")
+    diagnostics.record_candidate({"answer": 42}, source="provider")
+    reference = diagnostics.finalize(outcome="success")
+    record = json.loads((tmp_path / reference.path).read_text())
+
+    assert record["checkpoint_path"] == "call-checkpoints/idempotency.json"
+    assert record["checkpoint_identity"] == "checkpoint-identity"
+    assert record["generation"] == 7
+    assert record["prompt_sha256"] == "c" * 64
+    assert record["schema_sha256"] == "d" * 64
+    assert record["call_label_sha256"] == "e" * 64
+    assert record["checkpoint_binding"]["logical_identity"]["generation"] == 7
+    assert record["checkpoint_binding"]["native_resume_authorization"] == {
+        "control_address": str((tmp_path / "control-ledger.json").resolve()),
+        "session_key": "chapter:translation",
+        "logical_unit": "segment-9",
+        "generation": 7,
+        "idempotency_key": "segment-9",
+    }
+    immutable = record["immutable_source"]
+    encoded = json.dumps(
+        immutable["manifest"], ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    assert hashlib.sha256(encoded).hexdigest() == immutable["manifest_sha256"]
+    assert immutable["manifest"]["streams"]["stdout"]["sha256"] == _sha256(
+        (tmp_path / reference.path).parent / "stdout.txt"
+    )
+
+
+def test_attempt_checkpoint_binding_rejects_relabel_or_outside_path(
+    tmp_path: Path,
+) -> None:
+    diagnostics = AttemptDiagnostics(
+        tmp_path, provider="codex-cli", model=None, fallback_index=0,
+        attempt=1, call_label="binding", env={},
+    )
+    binding = _checkpoint_binding(tmp_path)
+    diagnostics.bind_checkpoint(binding)
+    diagnostics.bind_checkpoint(binding)
+    changed = deepcopy(binding)
+    changed["prompt_sha256"] = "f" * 64
+    with pytest.raises(AttemptDiagnosticsError, match="binding changed"):
+        diagnostics.bind_checkpoint(changed)
+
+    other = AttemptDiagnostics(
+        tmp_path, provider="codex-cli", model=None, fallback_index=0,
+        attempt=2, call_label="outside", env={},
+    )
+    outside = _checkpoint_binding(tmp_path)
+    outside["checkpoint_path"] = str((tmp_path.parent / "foreign.json").resolve())
+    with pytest.raises(AttemptDiagnosticsError, match="outside"):
+        other.bind_checkpoint(outside)
 
 
 def test_attempt_record_redacts_bounds_compresses_and_finalizes_once(tmp_path: Path) -> None:
@@ -178,6 +289,55 @@ def test_retry_and_fallback_attempts_each_keep_an_independent_record(
         "error",
         "success",
     ]
+
+
+def test_terminal_retry_error_carries_all_ordered_immutable_attempt_refs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    config = LLMConfig(
+        provider="codex-cli", model=None,
+        host=HostDetection(host="test", confidence=1, signals=[]), signals=[],
+    )
+    first = LLMWorkerError("transient", retryable=True)
+    terminal = LLMWorkerError("terminal", retryable=False)
+    errors = iter((first, terminal))
+    monkeypatch.setattr(
+        runner_module, "select_provider", lambda provider, **_kwargs: provider,
+    )
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(LLMTaskError) as caught:
+        runner_module._run_with_retries(  # noqa: SLF001
+            [config],
+            provider_requested="codex-cli",
+            model_requested=None,
+            model_tier_requested=None,
+            attach_call_record=False,
+            env={},
+            process_chain=[],
+            max_attempts=2,
+            artifact_dir=tmp_path,
+            diagnostic_call_label="terminal-retry",
+            call=lambda *_args: (_ for _ in ()).throw(next(errors)),
+        )
+
+    refs = caught.value.attempt_diagnostic_refs
+    assert isinstance(refs, tuple)
+    assert len(refs) == 2
+    assert caught.value.diagnostic_ref == refs[-1]
+    assert caught.value.__cause__ is terminal
+    assert terminal.attempt_diagnostic_refs == refs
+    assert terminal.diagnostic_ref == refs[-1]
+    assert len(first.attempt_diagnostic_refs) == 1
+    records = []
+    for index, ref in enumerate(refs, 1):
+        path = tmp_path / ref["path"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == ref["sha256"]
+        record = json.loads(path.read_text())
+        records.append(record)
+        assert record["attempt"] == index
+        assert record["outcome"] == "error"
+    assert [record["fallback_index"] for record in records] == [0, 0]
 
 
 def test_identity_fields_and_oversized_timeline_details_are_sanitized_and_bounded(

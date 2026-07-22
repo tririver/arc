@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+import signal
+import stat
 import time
 
 import pytest
@@ -12,8 +15,10 @@ from arc_llm.call_checkpoint import (
     LLMCallNeedsSupervision,
     LLMCallRetryDeferred,
     LLMCallRetryExhausted,
+    checkpoint_recomputation_binding,
     checkpoint_path,
     prepare_call,
+    promote_recovered_response,
     record_failure,
     record_response,
     record_submitted,
@@ -39,6 +44,34 @@ def _identity(tmp_path: Path) -> tuple[Path, str]:
         provider="codex-cli",
         model="model",
         call_label="round/worker",
+    )
+
+
+def _stateful_identity(
+    tmp_path: Path, *, prompt: str = "prompt", model: str = "model",
+) -> tuple[Path, str]:
+    return checkpoint_path(
+        tmp_path,
+        prompt=prompt,
+        schema={"type": "object"},
+        provider="codex-cli",
+        model=model,
+        call_label="round/worker",
+        session_policy="stateful",
+        session_key="ch:translation",
+        idempotency_key="logical-turn",
+        generation=1,
+        initial_native_authorization=_resume_authorization(tmp_path),
+    )
+
+
+def _resume_authorization(tmp_path: Path) -> tuple[str, str, str, int, str]:
+    return (
+        str((tmp_path / "control-ledger.json").resolve()),
+        "ch:translation",
+        "segment-1",
+        1,
+        "logical-turn",
     )
 
 
@@ -133,12 +166,158 @@ def test_v5_malformed_candidate_material_fails_as_checkpoint_error(tmp_path: Pat
 
 
 def test_checkpoint_atomic_replace_fsyncs_parent_directory(tmp_path: Path, monkeypatch) -> None:
-    calls = []
-    monkeypatch.setattr(checkpoint_module, "_fsync_directory", lambda path: calls.append(path))
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        calls.append(os.fstat(descriptor).st_mode)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(checkpoint_module.os, "fsync", record_fsync)
     path, identity = _identity(tmp_path)
     prepared = prepare_call(path, identity=identity)
-    assert calls == [path.parent]
+    assert any(stat.S_ISDIR(mode) for mode in calls)
     prepared.release_lock()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_preexisting_checkpoint_lock_symlink_is_rejected_without_target_mutation(
+    tmp_path: Path,
+) -> None:
+    path, identity = _identity(tmp_path)
+    path.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-preexisting-lock"
+    outside.write_bytes(b"outside preexisting lock sentinel\n")
+    outside_before = outside.read_bytes()
+    path.with_name(path.name + ".lock").symlink_to(outside)
+
+    with pytest.raises(LLMCallCheckpointError, match="Could not lock"):
+        prepare_call(path, identity=identity)
+
+    assert outside.read_bytes() == outside_before
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_checkpoint_parent_swap_never_writes_external_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, identity = _identity(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    outside = external / path.name
+    outside.write_bytes(b"outside checkpoint sentinel\n")
+    outside_before = outside.read_bytes()
+    moved = tmp_path / "saved-call-checkpoints"
+
+    def swap_parent(_path: Path) -> None:
+        path.parent.rename(moved)
+        path.parent.symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(checkpoint_module, "_before_checkpoint_replace", swap_parent)
+
+    with pytest.raises(LLMCallCheckpointError):
+        prepare_call(path, identity=identity)
+
+    assert outside.read_bytes() == outside_before
+    assert not (moved / path.name).exists()
+
+
+def test_checkpoint_leaf_swap_never_overwrites_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    prepared.release_lock()
+    stale = b"stale checkpoint replacement\n"
+
+    def swap_leaf(_path: Path) -> None:
+        path.unlink()
+        path.write_bytes(stale)
+
+    monkeypatch.setattr(checkpoint_module, "_before_checkpoint_replace", swap_leaf)
+
+    with pytest.raises(LLMCallCheckpointError, match="address changed"):
+        prepare_call(path, identity=identity, now=101)
+
+    assert path.read_bytes() == stale
+
+
+def test_checkpoint_exchange_rolls_back_late_regular_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity)
+    sentinel = b"late checkpoint replacement\n"
+
+    def swap_at_exchange(_path: Path) -> None:
+        path.unlink()
+        path.write_bytes(sentinel)
+
+    monkeypatch.setattr(
+        checkpoint_module, "_before_checkpoint_exchange", swap_at_exchange,
+    )
+    try:
+        with pytest.raises(LLMCallCheckpointError, match="final publication window"):
+            record_submitted(prepared)
+    finally:
+        prepared.release_lock()
+    assert path.read_bytes() == sentinel
+
+
+def test_existing_checkpoint_update_fails_closed_without_atomic_exchange(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity)
+    before = path.read_bytes()
+    monkeypatch.setattr(
+        checkpoint_module, "_checkpoint_rename_exchange", lambda *_args: False,
+    )
+    try:
+        with pytest.raises(LLMCallCheckpointError, match="unsupported"):
+            record_submitted(prepared)
+    finally:
+        prepared.release_lock()
+    assert path.read_bytes() == before
+
+
+def test_initial_checkpoint_hardlink_never_overwrites_late_appearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, identity = _identity(tmp_path)
+    sentinel = b"late initial checkpoint replacement\n"
+
+    def appear_at_exchange(_path: Path) -> None:
+        path.write_bytes(sentinel)
+
+    monkeypatch.setattr(
+        checkpoint_module, "_before_checkpoint_exchange", appear_at_exchange,
+    )
+    with pytest.raises(LLMCallCheckpointError, match="appeared"):
+        prepare_call(path, identity=identity)
+    assert path.read_bytes() == sentinel
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_checkpoint_lock_swap_never_writes_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, identity = _identity(tmp_path)
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"outside lock sentinel\n")
+    outside_before = outside.read_bytes()
+    lock_path = path.with_name(path.name + ".lock")
+
+    def swap_lock(_path: Path) -> None:
+        lock_path.unlink()
+        lock_path.symlink_to(outside)
+
+    monkeypatch.setattr(checkpoint_module, "_before_checkpoint_replace", swap_lock)
+
+    with pytest.raises(LLMCallCheckpointError, match="lock address changed"):
+        prepare_call(path, identity=identity)
+
+    assert outside.read_bytes() == outside_before
 
 
 def test_formatter_response_is_replayed_after_outer_checkpoint_crash(tmp_path: Path, monkeypatch) -> None:
@@ -345,6 +524,7 @@ def test_v3_changed_request_requires_validated_legacy_logical_identity(tmp_path:
         provider="codex-cli", model="m", call_label="turn",
         session_policy="stateful", session_key="ch:translation",
         idempotency_key="logical-turn", generation=1,
+        initial_native_authorization=_resume_authorization(tmp_path),
     )
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({
@@ -357,15 +537,18 @@ def test_v3_changed_request_requires_validated_legacy_logical_identity(tmp_path:
         provider="codex-cli", model="m", call_label="turn",
         session_policy="stateful", session_key="ch:translation",
         idempotency_key="logical-turn", generation=1,
+        initial_native_authorization=_resume_authorization(tmp_path),
     )
 
-    with pytest.raises(LLMCallCheckpointError, match="identity mismatch"):
+    with pytest.raises(LLMCallCheckpointError, match="initial authorization"):
         prepare_call(
-            path, identity=rebuilt, supervised_native_resume=True,
+            path, identity=rebuilt,
+            supervised_native_resume=_resume_authorization(tmp_path),
             native_session_available=True,
         )
     resumed = prepare_call(
-        path, identity=rebuilt, supervised_native_resume=True,
+        path, identity=rebuilt,
+        supervised_native_resume=_resume_authorization(tmp_path),
         native_session_available=True,
         validated_legacy_logical_identity=rebuilt.logical_identity,
     )
@@ -400,7 +583,8 @@ def test_interrupted_submitted_call_records_recovery_metadata(
 
 
 def test_resumable_submitted_checkpoint_requires_explicit_native_resume(tmp_path: Path) -> None:
-    path, identity = _identity(tmp_path)
+    path, identity = _stateful_identity(tmp_path)
+    authorization = _resume_authorization(tmp_path)
     prepared = prepare_call(path, identity=identity, now=100)
     record_failure(
         prepared,
@@ -414,14 +598,14 @@ def test_resumable_submitted_checkpoint_requires_explicit_native_resume(tmp_path
             path,
             identity=identity,
             now=102,
-            supervised_native_resume=True,
+            supervised_native_resume=authorization,
         )
 
     resumed = prepare_call(
         path,
         identity=identity,
         now=103,
-        supervised_native_resume=True,
+        supervised_native_resume=authorization,
         native_session_available=True,
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -436,16 +620,16 @@ def test_resumable_submitted_checkpoint_requires_explicit_native_resume(tmp_path
 def test_supervised_native_resume_preserves_submitted_identity_when_prompt_changes(
     tmp_path: Path,
 ) -> None:
-    path, original_identity = _identity(tmp_path)
+    path, original_identity = _stateful_identity(tmp_path)
+    authorization = _resume_authorization(tmp_path)
     prepared = prepare_call(path, identity=original_identity, now=100)
     record_failure(
         prepared,
         LLMWorkerTimeout("idle", submission_state=LLMSubmissionState.SUBMITTED),
     )
 
-    _new_path, rebuilt_identity = checkpoint_path(
-        tmp_path, prompt="rebuilt stateful stream", schema={"type": "object"},
-        provider="codex-cli", model="model", call_label="round/worker",
+    _new_path, rebuilt_identity = _stateful_identity(
+        tmp_path, prompt="rebuilt stateful stream"
     )
     with pytest.raises(LLMCallCheckpointError, match="identity mismatch"):
         prepare_call(path, identity=rebuilt_identity, now=101)
@@ -454,7 +638,7 @@ def test_supervised_native_resume_preserves_submitted_identity_when_prompt_chang
             path,
             identity=rebuilt_identity,
             now=102,
-            supervised_native_resume=True,
+            supervised_native_resume=authorization,
             native_session_available=False,
         )
 
@@ -462,7 +646,7 @@ def test_supervised_native_resume_preserves_submitted_identity_when_prompt_chang
         path,
         identity=rebuilt_identity,
         now=103,
-        supervised_native_resume=True,
+        supervised_native_resume=authorization,
         native_session_available=True,
     )
 
@@ -474,16 +658,164 @@ def test_supervised_native_resume_preserves_submitted_identity_when_prompt_chang
     resumed.release_lock()
 
 
+def test_recomputation_binding_retains_exact_recipe_and_full_authorization(
+    tmp_path: Path,
+) -> None:
+    path, identity = _stateful_identity(tmp_path)
+    authorization = _resume_authorization(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    record_failure(
+        prepared,
+        LLMWorkerTimeout("idle", submission_state=LLMSubmissionState.SUBMITTED),
+    )
+    resumed = prepare_call(
+        path,
+        identity=identity,
+        now=101,
+        supervised_native_resume=authorization,
+        native_session_available=True,
+    )
+
+    binding = resumed.recomputation_binding
+    resumed.release_lock()
+    assert checkpoint_recomputation_binding(path) == binding
+    assert binding["checkpoint_path"] == str(path.resolve())
+    assert binding["checkpoint_identity"] == str(identity)
+    assert binding["logical_identity"]["control_address"] == authorization[0]
+    assert binding["logical_identity"]["logical_unit"] == authorization[2]
+    assert binding["idempotency_key"] == "logical-turn"
+    assert binding["session_key"] == "ch:translation"
+    assert binding["generation"] == 1
+    assert binding["prompt_sha256"] == identity.request_recipe["prompt_sha256"]
+    assert binding["schema_sha256"] == identity.request_recipe["schema_sha256"]
+    assert binding["call_label_sha256"] == checkpoint_module.sha256_text(
+        identity.request_recipe["call_label"]
+    )
+    assert binding["native_resume_authorization"] == {
+        "control_address": authorization[0],
+        "session_key": authorization[1],
+        "logical_unit": authorization[2],
+        "generation": authorization[3],
+        "idempotency_key": authorization[4],
+    }
+    assert binding["initial_native_authorization"] == binding[
+        "native_resume_authorization"
+    ]
+
+
+def test_recovered_promotion_rejects_changed_recomputation_binding_before_reading_receipt(
+    tmp_path: Path,
+) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    record_submitted(prepared)
+    binding = prepared.recomputation_binding
+    prepared.release_lock()
+    changed = dict(binding)
+    changed["prompt_sha256"] = "f" * 64
+
+    with pytest.raises(LLMCallCheckpointError, match="recomputation binding mismatch"):
+        promote_recovered_response(
+            path,
+            LLMProviderResponse({"ok": True}),
+            expected_logical_identity=identity.logical_identity,
+            expected_schema_sha256=identity.request_recipe["schema_sha256"],
+            selection_receipt_path=f"{path.stem}.candidate-selection.json",
+            selection_receipt_sha256="0" * 64,
+            expected_recomputation_binding=changed,
+        )
+
+
 def test_supervised_resume_never_rebinds_unsubmitted_identity(tmp_path: Path) -> None:
-    path, original_identity = _identity(tmp_path)
+    path, original_identity = _stateful_identity(tmp_path)
     prepared = prepare_call(path, identity=original_identity, now=100)
     prepared.release_lock()
 
-    with pytest.raises(LLMCallCheckpointError, match="identity mismatch"):
+    with pytest.raises(LLMCallCheckpointError, match="structured call identity"):
         prepare_call(
             path,
             identity="rebuilt-prompt",
             now=101,
-            supervised_native_resume=True,
+            supervised_native_resume=_resume_authorization(tmp_path),
             native_session_available=True,
         )
+
+    with pytest.raises(LLMCallCheckpointError, match="unsubmitted checkpoint"):
+        prepare_call(
+            path,
+            identity=original_identity,
+            now=102,
+            supervised_native_resume=_resume_authorization(tmp_path),
+            native_session_available=True,
+        )
+
+
+@pytest.mark.parametrize("field_index", range(5))
+def test_persisted_native_resume_authorization_rejects_each_field_mismatch(
+    tmp_path: Path, field_index: int,
+) -> None:
+    path, identity = _stateful_identity(tmp_path)
+    prepared = prepare_call(path, identity=identity, now=100)
+    record_failure(
+        prepared,
+        LLMWorkerTimeout("idle", submission_state=LLMSubmissionState.SUBMITTED),
+    )
+    authorization = _resume_authorization(tmp_path)
+    resumed = prepare_call(
+        path,
+        identity=identity,
+        now=101,
+        supervised_native_resume=authorization,
+        native_session_available=True,
+    )
+    resumed.release_lock()
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["native_resume_authorization"] == {
+        "control_address": authorization[0],
+        "session_key": authorization[1],
+        "logical_unit": authorization[2],
+        "generation": authorization[3],
+        "idempotency_key": authorization[4],
+    }
+    mismatched = list(authorization)
+    replacements = (
+        str((tmp_path / "other-ledger.json").resolve()),
+        "other:translation",
+        "segment-2",
+        2,
+        "other-turn",
+    )
+    mismatched[field_index] = replacements[field_index]
+
+    with pytest.raises(LLMCallCheckpointError, match="authorization"):
+        prepare_call(
+            path,
+            identity=identity,
+            now=102,
+            supervised_native_resume=tuple(mismatched),
+            native_session_available=True,
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX process crash")
+def test_real_process_crash_checkpoint_stage_is_cleaned_on_next_lock(
+    tmp_path: Path,
+) -> None:
+    path, identity = _identity(tmp_path)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child is intentionally SIGKILLed
+        checkpoint_module._before_checkpoint_replace = (
+            lambda _path: os.kill(os.getpid(), signal.SIGKILL)
+        )
+        prepare_call(path, identity=identity, now=100)
+        os._exit(99)
+    _finished, status = os.waitpid(pid, 0)
+    assert os.WIFSIGNALED(status)
+    assert os.WTERMSIG(status) == signal.SIGKILL
+    assert list(path.parent.glob(f".{path.name}.arc-stage-*"))
+
+    prepared = prepare_call(path, identity=identity, now=101)
+    assert prepared.attempt == 1
+    prepared.release_lock()
+    assert path.is_file()
+    assert not list(path.parent.glob(f".{path.name}.arc-stage-*"))

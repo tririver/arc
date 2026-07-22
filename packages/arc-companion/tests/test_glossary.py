@@ -58,7 +58,7 @@ def _prompt_candidates(prompt: str) -> list[dict]:
 def test_glossary_is_consolidated_ordered_and_resumable(tmp_path: Path) -> None:
     calls: list[str] = []
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         calls.append(call_label)
         if "consolidation" in call_label:
             return {"entries": [{
@@ -96,7 +96,7 @@ def test_direct_glossary_consolidation_cache_survives_missing_final_envelope(
 ) -> None:
     calls: list[str] = []
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         calls.append(call_label)
         return {"entries": [{
             "source_term": "Feynman diagram",
@@ -141,7 +141,7 @@ def test_glossary_refuses_no_progress_hierarchy_before_model_calls(tmp_path: Pat
             checkpoint_dir=tmp_path,
             workers=2,
             force=False,
-            call_model=lambda *args: calls.append("llm") or {"entries": []},
+            call_model=lambda *args, **_recovery: calls.append("llm") or {"entries": []},
         )
 
     assert calls == []
@@ -152,7 +152,7 @@ def test_glossary_hierarchically_consolidates_155_windows_with_bounded_nodes(
 ) -> None:
     calls: list[tuple[str, int, int]] = []
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         if call_label.startswith("companion-glossary-window-"):
             index = int(call_label.rsplit("-", maxsplit=1)[1])
             return {"entries": _window_entries(index)}
@@ -199,7 +199,7 @@ def test_glossary_batches_long_cjk_entries_by_complete_prompt_utf8_bytes(
 ) -> None:
     calls: list[tuple[str, int]] = []
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         if call_label.startswith("companion-glossary-window-"):
             index = int(call_label.rsplit("-", maxsplit=1)[1])
             entries = _window_entries(index)
@@ -233,7 +233,7 @@ def test_glossary_rejects_single_essential_entry_above_prompt_hard_cap(
 ) -> None:
     consolidation_calls: list[str] = []
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         if call_label.startswith("companion-glossary-window-"):
             index = int(call_label.rsplit("-", maxsplit=1)[1])
             if index == 1:
@@ -263,7 +263,7 @@ def test_glossary_resumes_only_missing_hierarchical_consolidation_node(
 ) -> None:
     first_calls: list[str] = []
 
-    def interrupted_model(prompt, schema, artifact_dir, call_label):
+    def interrupted_model(prompt, schema, artifact_dir, call_label, **_recovery):
         first_calls.append(call_label)
         if call_label.startswith("companion-glossary-window-"):
             index = int(call_label.rsplit("-", maxsplit=1)[1])
@@ -286,7 +286,7 @@ def test_glossary_resumes_only_missing_hierarchical_consolidation_node(
     assert "companion-glossary-consolidation-l0001-n0002" in first_calls
     resume_calls: list[str] = []
 
-    def resumed_model(prompt, schema, artifact_dir, call_label):
+    def resumed_model(prompt, schema, artifact_dir, call_label, **_recovery):
         resume_calls.append(call_label)
         candidates = _prompt_candidates(prompt)
         return {"entries": [
@@ -307,7 +307,7 @@ def test_parallel_glossary_consolidation_fails_closed_without_caching_empty_node
 ) -> None:
     failed_label = "companion-glossary-consolidation-l0001-n0002"
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         if call_label.startswith("companion-glossary-window-"):
             index = int(call_label.rsplit("-", maxsplit=1)[1])
             return {"entries": _window_entries(index)}
@@ -337,7 +337,7 @@ def test_parallel_glossary_consolidation_fails_closed_without_caching_empty_node
 
 
 def test_glossary_restores_translated_personal_name_and_keeps_strict_validation(tmp_path: Path) -> None:
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         return {"entries": [{
             "source_term": "Feynman diagram",
             "target_term": "费曼图",
@@ -368,7 +368,7 @@ def test_glossary_restores_poisson_without_replacing_standard_translation(tmp_pa
         "text": "The Poisson bracket structure controls the classical algebra.",
     }]}
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         return {"entries": [{
             "source_term": "Poisson bracket structure",
             "target_term": "泊松括号结构",
@@ -389,7 +389,7 @@ def test_glossary_restores_poisson_without_replacing_standard_translation(tmp_pa
 
 
 def test_glossary_does_not_repeat_protected_name_already_in_target(tmp_path: Path) -> None:
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         return {"entries": [{
             "source_term": "Feynman diagram",
             "target_term": "Feynman 图",
@@ -415,7 +415,7 @@ def test_glossary_protected_name_repair_uses_complete_lexical_boundaries(tmp_pat
         "text": "A Poissonian point process is used.",
     }]}
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         return {"entries": [{
             "source_term": "Poissonian point process",
             "target_term": "泊松点过程",
@@ -444,7 +444,7 @@ def test_glossary_version_invalidates_pre_repair_final_cache(tmp_path: Path) -> 
     (tmp_path / "glossary.json").write_text(json.dumps(stale), encoding="utf-8")
     calls: list[str] = []
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         calls.append(call_label)
         return {"entries": []}
 
@@ -465,7 +465,7 @@ def test_glossary_protected_name_matching_uses_complete_lexical_boundaries(tmp_p
         }]
     }
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         return {"entries": [{
             "source_term": "Non-Gaussianities",
             "target_term": "非高斯性",
@@ -497,7 +497,7 @@ def test_glossary_receives_terms_beyond_segmentation_preview_limit(tmp_path: Pat
         }]
     }
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         if "window" in call_label:
             assert late_term in prompt
             assert "SHOULD_NOT_REACH_GLOSSARY" not in prompt
@@ -538,7 +538,7 @@ def test_glossary_deterministically_enforces_entry_cap(tmp_path: Path, page_coun
         "first_block_id": "b2",
     } for index in range(250)]
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         assert "Do not fill a quota" in prompt
         assert "broad field" in prompt or "broad fields" in prompt
         return {"entries": entries}
@@ -560,7 +560,7 @@ def test_glossary_does_not_pad_to_page_limit(tmp_path: Path) -> None:
     }
     result = generate_glossary(
         _document(), language="zh-CN", protected_names=[], checkpoint_dir=tmp_path,
-        workers=2, force=False, call_model=lambda *args: {"entries": [entry]}, page_count=100,
+        workers=2, force=False, call_model=lambda *args, **_recovery: {"entries": [entry]}, page_count=100,
     )
     assert len(result["entries"]) == 1
 
@@ -574,7 +574,7 @@ def test_non_english_glossary_requires_exact_source_terms_and_preserves_unicode_
         "text": "Le théorème de 南部 contrôle cette limite.",
     }]}
 
-    def call_model(prompt, schema, artifact_dir, call_label):
+    def call_model(prompt, schema, artifact_dir, call_label, **_recovery):
         if "window" in call_label:
             assert "source-language term exactly as it appears" in prompt
         assert "preserve each name exactly in its source spelling" in prompt

@@ -56,7 +56,7 @@ def _getters(*, body: str = "SECRET SECTION BODY", source_id: str = "book-cache"
     return parsed, toc
 
 
-def _resolved(_prompt, _schema, _path, _label):
+def _resolved(_prompt, _schema, _path, _label, **_recovery):
     return {
         "guidance": "Use the reference chapter's established Chinese terminology.",
         "resolution_status": "resolved",
@@ -91,7 +91,7 @@ def _build(tmp_path, call_model=_resolved, **overrides):
 def test_one_model_call_is_reused_and_reference_hash_changes_identity(tmp_path):
     calls = []
 
-    def model(*args):
+    def model(*args, **_recovery):
         calls.append(args)
         return _resolved(*args)
 
@@ -142,7 +142,7 @@ def test_invalid_cache_id_stops_before_model(tmp_path):
     ],
 )
 def test_invalid_model_reference_source_or_locator_is_rejected(tmp_path, field, value, message):
-    def invalid(*_args):
+    def invalid(*_args, **_recovery):
         result = _resolved(*_args)
         result["reference_targets"][0][field] = value
         return result
@@ -155,7 +155,7 @@ def test_invalid_model_reference_source_or_locator_is_rejected(tmp_path, field, 
 def test_ambiguous_resolution_is_persisted_then_stops_without_second_call(tmp_path):
     calls = []
 
-    def ambiguous(*_args):
+    def ambiguous(*_args, **_recovery):
         calls.append(1)
         return {
             "guidance": "The requested chapter is not uniquely identifiable.",
@@ -211,7 +211,7 @@ def test_all_workers_receive_identical_payload_and_strict_read_only_policy(tmp_p
 
 
 def test_oversized_guidance_is_rejected(tmp_path):
-    def oversized(*_args):
+    def oversized(*_args, **_recovery):
         result = _resolved(*_args)
         result["guidance"] = "术" * 8001
         return result
@@ -223,7 +223,7 @@ def test_oversized_guidance_is_rejected(tmp_path):
 def test_generation_prompt_contains_only_sanitized_metadata_and_compact_toc(tmp_path):
     observed = {}
 
-    def inspect(prompt, schema, _path, _label):
+    def inspect(prompt, schema, _path, _label, **_recovery):
         observed["prompt"] = prompt
         observed["schema"] = schema
         return _resolved(prompt, schema, _path, _label)
@@ -308,7 +308,7 @@ def test_more_than_twelve_targets_use_lane_catalog_and_digest_bound_pages(tmp_pa
             for index in range(count)
         ]}
 
-    def model(_prompt, schema, _path, _label):
+    def model(_prompt, schema, _path, _label, **_recovery):
         assert "maxItems" not in schema["properties"]["reference_targets"]
         return {
             "guidance": "Use the authorized translation chapters only for terminology.",
@@ -398,7 +398,7 @@ def test_valid_v1_artifact_migrates_without_model_call(tmp_path):
     legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
 
     migrated = _build(
-        tmp_path, lambda *_args: pytest.fail("valid v1 migration must not call the model")
+        tmp_path, lambda *_args, **_recovery: pytest.fail("valid v1 migration must not call the model")
     )
     assert migrated["schema_version"] == INTENT_GUIDANCE_VERSION
     assert migrated["output_sha256"] == legacy["output_sha256"]

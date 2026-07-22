@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,84 @@ def _one_blocker_project(
         },
     )
     return project, translation, manager, logical_key
+
+
+def test_recovery_trigger_requires_typed_terminal_progress(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    key = "ch-0001:translation:s2:generation-1"
+    call_path = (
+        checkpoint / "llm" / "call-checkpoints"
+        / f"idempotency-{hashlib.sha256(key.encode()).hexdigest()}.json"
+    )
+    progress = call_path.parent.parent / "progress.jsonl"
+    call_path.parent.mkdir(parents=True)
+    entry = {
+        "session_key": "ch-0001:translation",
+        "segment_id": "s2",
+        "idempotency_key": key,
+        "initial_generation": 1,
+        "recovery_context": {
+            "checkpoint_path": str(call_path),
+            "failure_category": "timeout",
+            "logical_unit": "s2",
+        },
+    }
+    checkpoint_identity = "checkpoint-identity-1"
+    call_path.write_text(json.dumps({
+        "identity": checkpoint_identity,
+        "state": "failed", "resumable": True,
+        "progress_journal": str(progress),
+        "logical_identity": {
+            "idempotency_key": key,
+            "session_key": "ch-0001:translation",
+            "generation": 1,
+        },
+        "request_recipe": {},
+    }))
+    progress.write_text(json.dumps({
+        "event": "provider_progress", "idempotency_key": key,
+        "session_key": "ch-0001:translation", "generation": 1,
+        "checkpoint_identity": checkpoint_identity,
+    }) + "\n")
+
+    assert pipeline._recovery_trigger(entry, checkpoint) is None
+
+    with progress.open("a") as handle:
+        handle.write(json.dumps({
+            "event": "idle_timeout", "idempotency_key": key,
+            "session_key": "ch-0001:translation", "generation": 1,
+            "checkpoint_identity": checkpoint_identity,
+        }) + "\n")
+
+    assert pipeline._recovery_trigger(entry, checkpoint) == "idle_timeout"
+
+    entry["recovery_context"]["native_session_id"] = "native-a"
+    assert pipeline._recovery_trigger(entry, checkpoint) is None
+    with progress.open("a") as handle:
+        handle.write(json.dumps({
+            "event": "idle_timeout", "idempotency_key": key,
+            "session_key": "ch-0001:translation", "generation": 1,
+            "checkpoint_identity": checkpoint_identity,
+            "native_session_id": "native-b",
+        }) + "\n")
+    assert pipeline._recovery_trigger(entry, checkpoint) is None
+    with progress.open("a") as handle:
+        handle.write(json.dumps({
+            "event": "idle_timeout", "idempotency_key": key,
+            "session_key": "ch-0001:translation", "generation": 1,
+            "checkpoint_identity": checkpoint_identity,
+            "native_session_id": "native-a",
+        }) + "\n")
+    assert pipeline._recovery_trigger(entry, checkpoint) == "idle_timeout"
+
+    entry["recovery_context"].pop("native_session_id")
+    progress.write_text(json.dumps({
+        "event": "idle_timeout", "idempotency_key": key,
+        "session_key": "ch-0001:translation", "generation": 1,
+        "checkpoint_identity": checkpoint_identity,
+        "native_session_id": "native-b",
+    }) + "\n")
+    assert pipeline._recovery_trigger(entry, checkpoint) is None
 
 
 @pytest.mark.parametrize(
@@ -296,6 +375,124 @@ def test_auto_groups_same_lane_blockers_at_earliest_suffix_and_rotates_once(
     assert commentary.read_bytes() == commentary_before
 
 
+def test_typed_idle_restarts_at_first_nonaccepted_block_not_timeout_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _checkpoint, translation, _commentary, manager = _project(tmp_path)
+    key = "ch-0001:translation:s2:generation-1"
+    mark_needs_supervision(
+        translation,
+        segment_id="s2",
+        reason="second block became idle",
+        recovery_context={
+            "idempotency_key": key,
+            "submission_state": "submitted",
+            "resumable": True,
+            "native_session_id": "native-1",
+            "generation": 1, "logical_unit": "s2",
+            "latest_progress": {
+                "event": "idle_timeout", "idempotency_key": key,
+                "session_key": "ch-0001:translation", "generation": 1,
+            },
+        },
+    )
+    calls: list[tuple[int, tuple[str, ...]]] = []
+
+    def continuation(options):
+        calls.append((manager.get_existing("ch-0001:translation").generation,
+                      options.supervised_native_resume_keys))
+        _accept_generation_suffix(translation, 2)
+        return {"ok": True, "status": "complete"}
+
+    monkeypatch.setattr(pipeline, "build_companion", continuation)
+
+    result = pipeline.resume_companion(project)
+
+    assert result["ok"] is True
+    assert calls == [(2, ())]
+    ledger = json.loads(translation.read_text())
+    assert [item["generation"] for item in ledger["blocks"]] == [2, 2, 2]
+    journal = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    replacement = journal["replacements"][0]
+    assert replacement["segment_id"] == "s2"
+    assert replacement["abandoned_logical_key"] == key
+    assert replacement["suffix_start_segment_id"] == "s1"
+    assert replacement["suffix_segment_ids"] == ["s1", "s2", "s3"]
+    assert journal["entries"][0]["fresh_task_start_segment_id"] == "s1"
+
+
+def test_typed_idle_fresh_rotation_preserves_other_native_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _checkpoint, translation, commentary, manager = _project(
+        tmp_path, translation_segments=("s1",), commentary_segments=("s1",),
+    )
+    translation_key = "ch-0001:translation:s1:generation-1"
+    commentary_key = "ch-0001:companion:s1:generation-1"
+    manager.update_native_session_id("ch-0001:companion", "native-commentary")
+    mark_needs_supervision(
+        translation, segment_id="s1", reason="typed idle",
+        recovery_context={
+            "idempotency_key": translation_key,
+            "submission_state": "submitted", "resumable": True,
+            "generation": 1, "logical_unit": "s1",
+            "latest_progress": {
+                "event": "idle_timeout", "idempotency_key": translation_key,
+                "session_key": "ch-0001:translation", "generation": 1,
+            },
+        },
+    )
+    mark_needs_supervision(
+        commentary, segment_id="s1", reason="ordinary resumable transport",
+        recovery_context={
+            "idempotency_key": commentary_key,
+            "submission_state": "submitted", "resumable": True,
+        },
+    )
+
+    def validate_context(**kwargs):
+        ledger = kwargs["ledger"]
+        assert ledger["lane"] == "companion"
+        return {
+            "session_key": "ch-0001:companion",
+            "segment_id": "s1",
+            "ledger_path": str(kwargs["ledger_path"]),
+            "idempotency_key": commentary_key,
+            "provider": "codex-cli", "model": "test-model",
+            "runtime_fingerprint": "runtime", "generation": 1,
+            "native_session_id_to_restore": None,
+        }
+
+    calls: list[tuple[int, int, tuple[str, ...]]] = []
+
+    def continuation(options):
+        calls.append((
+            manager.get_existing("ch-0001:translation").generation,
+            manager.get_existing("ch-0001:companion").generation,
+            options.supervised_native_resume_keys,
+        ))
+        if options.supervised_native_resume_keys:
+            _accept_generation_suffix(commentary, 1)
+            return {"ok": False, "status": "needs_supervision"}
+        _accept_generation_suffix(translation, 2)
+        return {"ok": True, "status": "complete"}
+
+    monkeypatch.setattr(pipeline, "_validate_native_resume_context", validate_context)
+    monkeypatch.setattr(pipeline, "build_companion", continuation)
+
+    result = pipeline.resume_companion(project)
+
+    assert result["ok"] is True
+    assert calls == [
+        (1, 1, (commentary_key,)),
+        (2, 1, ()),
+    ]
+    assert json.loads(commentary.read_text())["generation"] == 1
+    assert json.loads(translation.read_text())["generation"] == 2
+
+
 def test_failed_replacement_uses_three_generations_before_exhaustion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -340,7 +537,13 @@ def test_failed_replacement_uses_three_generations_before_exhaustion(
     assert all(item["status"] == "failed" for item in journal["replacements"])
 
 
-@pytest.mark.parametrize("category", ("cancelled", "authentication", "rate_limit"))
+@pytest.mark.parametrize(
+    "category",
+    (
+        "cancelled", "authentication", "quota", "permission", "rate_limit",
+        "local_io", "invalid_request",
+    ),
+)
 def test_auto_does_not_rotate_excluded_failure_categories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, category: str,
 ) -> None:
@@ -684,3 +887,38 @@ def test_inline_build_source_preflight_runs_before_generation_rotation(
     )
     assert journal["restart_budgets"] == []
     assert journal["replacements"] == []
+
+
+def test_auto_repair_finalization_ignores_unindexed_marker_and_checkpoint(
+    tmp_path: Path,
+) -> None:
+    _project_dir, checkpoint, _translation, _commentary, _manager = _project(
+        tmp_path, translation_segments=("s1",), commentary_segments=("s1",),
+    )
+    pipeline.write_json(checkpoint / "document.json", {
+        "paper_id": "local:unindexed-repair",
+        "document": {
+            "blocks": [{"block_id": "body-1", "type": "text", "text": "source"}],
+            "equations": [], "figures": [], "tables": [], "bibliography": [],
+        },
+    })
+    marker = pipeline._translation_token_attempt_path(checkpoint, "s1", 1)
+    pipeline.write_json(marker, {
+        "schema_version": "arc.companion.translation-token-attempt.v2",
+        "status": "response_received",
+        "segment_id": "s1",
+        "generation": 1,
+        "block_ids": ["body-1"],
+        "raw_response": {"repairs": []},
+    })
+    rogue_checkpoint = (
+        checkpoint / "llm" / "translations" / "generation-0001" / "s1"
+        / marker.stem / "retry-offset-1" / "call-checkpoints" / "rogue.json"
+    )
+    pipeline.write_json(rogue_checkpoint, {
+        "state": "validated",
+        "submission_state": "submitted",
+        "logical_identity": {"idempotency_key": "rogue"},
+    })
+
+    assert pipeline._finalize_paid_translation_repairs(checkpoint) == []

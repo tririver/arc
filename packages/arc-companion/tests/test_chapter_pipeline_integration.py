@@ -18,11 +18,22 @@ from arc_companion.artifact_store import (
 )
 from arc_companion.chapter_scheduler import run_chapter_pipeline
 from arc_companion.ledger import initialize_lane_ledger, mark_needs_supervision
+from arc_companion.ledger_registry import (
+    mutate_registered_lane_ledger,
+    read_registered_lane_ledger,
+)
 from arc_companion.pipeline import BuildOptions, build_companion
 from arc_companion.source import SourceBundle
 from arc_companion.io import sha256_json
 from arc_companion.reuse import lane_recipe_sha256
-from arc_llm.call_checkpoint import checkpoint_path, prepare_call, record_submitted
+from arc_llm.attempt_diagnostics import AttemptDiagnostics
+from arc_llm.call_checkpoint import (
+    checkpoint_path,
+    prepare_call,
+    record_failure,
+    record_submitted,
+)
+from arc_llm.providers.base import LLMSubmissionState, LLMWorkerTimeout
 from arc_llm.progress_journal import ProgressJournal
 from arc_llm.recovery_context import read_recovery_context
 from arc_llm.sessions import LLMSessionManager
@@ -420,7 +431,8 @@ def test_structural_only_chapter_uses_local_receipts_without_provider_calls(
     )
 
     assert result["ok"], result
-    assert calls == ["title-translation-0001"]
+    assert len(calls) == 1
+    assert calls[0].startswith("title-translation-")
     checkpoint = Path(result["data"]["checkpoint_dir"])
     chapters = json.loads((checkpoint / "chapters.json").read_text())
     assert chapters["chapters"][0]["content_block_ids"] == []
@@ -1161,8 +1173,20 @@ def test_chaptered_build_projects_accepted_store_translation_without_legacy_opti
         },
         provenance={"checkpoint_dir": str(old_checkpoint), "chapter_id": "ch-0001"},
     )
-    old_guide_ledger["blocks"][0]["validation_receipt"]["recipe_sha256"] = "0" * 64
-    guide_ledger_path.write_text(json.dumps(old_guide_ledger))
+    _registered_guide, registered_digest = read_registered_lane_ledger(
+        checkpoint, guide_ledger_path,
+    )
+
+    def invalidate_guide_recipe(ledger):
+        ledger["blocks"][0]["validation_receipt"]["recipe_sha256"] = "0" * 64
+        return ledger
+
+    mutate_registered_lane_ledger(
+        checkpoint,
+        guide_ledger_path,
+        expected_sha256=registered_digest,
+        mutate=invalidate_guide_recipe,
+    )
     active_state = json.loads((project / "state.json").read_text())
     active_state["status"] = "active"
     (project / "state.json").write_text(json.dumps(active_state))
@@ -1213,7 +1237,7 @@ def test_chaptered_build_projects_accepted_store_translation_without_legacy_opti
         pdf_validator=lambda path: {"bytes": path.stat().st_size},
     )
 
-    assert regenerated["status"] in {"first_chapter_ready", "complete"}
+    assert regenerated.get("status") in {"first_chapter_ready", "complete"}, regenerated
     translation_calls = [
         label for label in labels if label.startswith("companion-translation-")
     ]
@@ -1521,10 +1545,18 @@ def test_reconstructs_cleared_unresolved_authorization_from_durable_state(
     manager.update_native_session_id(fixture["session_key"], "native-progress")
     pipeline.clear_needs_supervision(fixture["ledger_path"])
 
-    recovered = pipeline._reconstruct_unresolved_native_resume_contexts(
+    automatic = pipeline._reconstruct_unresolved_native_resume_contexts(
         fixture["checkpoint"], session_manager=manager, excluded_keys=set(),
     )
+    recovered = pipeline._reconstruct_unresolved_native_resume_contexts(
+        fixture["checkpoint"], session_manager=manager,
+        # Bare keys are intentionally insufficient for exclusion; only the
+        # exact five-field recovery identity may deduplicate this call.
+        excluded_keys={fixture["logical_key"]},
+        allow_explicit_legacy=True,
+    )
 
+    assert automatic == []
     assert recovered == [{
         "session_key": fixture["session_key"],
         "idempotency_key": fixture["logical_key"],
@@ -1838,6 +1870,13 @@ def test_resume_native_applies_many_supervised_ledgers_idempotently(
             ledger_path, chapter_id=chapter_id, lane="translation",
             segment_ids=[segment_id],
         )
+        pipeline._guarded_mark_transport_state(
+            ledger_path,
+            checkpoint_dir=checkpoint,
+            session_key=session_key,
+            logical_unit=segment_id,
+            idempotency_key=logical_key,
+        )
         mark_needs_supervision(
             ledger_path,
             segment_id=segment_id,
@@ -1881,7 +1920,18 @@ def test_resume_native_applies_many_supervised_ledgers_idempotently(
         for path in (checkpoint / "chapters").glob("*/translation-ledger.json"):
             ledger = json.loads(path.read_text())
             segment_id = ledger["needs_supervision"]["segment_id"]
-            pipeline.mark_response_received(path, segment_id=segment_id)
+            session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+            logical_key = str(
+                ledger["needs_supervision"]["recovery_context"]["idempotency_key"]
+            )
+            pipeline._guarded_mark_transport_state(
+                path,
+                checkpoint_dir=checkpoint,
+                session_key=session_key,
+                logical_unit=segment_id,
+                idempotency_key=logical_key,
+                response_received=True,
+            )
             pipeline.advance_block(path, segment_id=segment_id, state="schema_valid")
             pipeline.advance_block(path, segment_id=segment_id, state="invariant_valid")
             pipeline.advance_block(
@@ -1996,12 +2046,76 @@ def test_stateful_lane_timeout_uses_auto_budget_and_stops_other_paid_lane(
         label = str(kwargs["call_label"])
         paid.append(label)
         if label.startswith("companion-guide"):
+            kwargs["session_manager"].get_or_create(
+                key=kwargs["session_key"], provider="codex-cli",
+                model="test-model", runtime_fingerprint="runtime",
+            )
             return SimpleNamespace(value={
                 "motivation": None, "main_content": "One", "section_logic": None,
                 "prerequisites": None, "pedagogical_comparison": None,
                 "historical_context": [], "supplementary_reading": [],
             }, logical_receipt={"idempotency_key": kwargs["idempotency_key"]})
-        raise TimeoutError("unknown submitted call")
+        artifact_dir = Path(kwargs["artifact_dir"])
+        session = kwargs["session_manager"].get_existing(kwargs["session_key"])
+        if session is None:
+            session = kwargs["session_manager"].get_or_create(
+                key=kwargs["session_key"], provider="codex-cli",
+                model="test-model", runtime_fingerprint="runtime",
+            )
+        call_path, identity = checkpoint_path(
+            artifact_dir,
+            prompt=_prompt,
+            schema=kwargs["schema"],
+            provider=session.provider,
+            model=session.model,
+            call_label=label,
+            session_policy="stateful",
+            session_key=session.key,
+            runtime_fingerprint=session.runtime_fingerprint,
+            idempotency_key=kwargs["idempotency_key"],
+            generation=session.generation,
+            progress_contract_scope="session",
+            initial_native_authorization=kwargs["initial_native_authorization"],
+        )
+        prepared = prepare_call(call_path, identity=identity)
+        record_submitted(prepared)
+        timeout = LLMWorkerTimeout(
+            "typed idle timeout",
+            submission_state=LLMSubmissionState.SUBMITTED,
+        )
+        record_failure(prepared, timeout)
+        diagnostics = AttemptDiagnostics(
+            artifact_dir,
+            provider=session.provider,
+            model=session.model,
+            fallback_index=0,
+            attempt=1,
+            call_label=label,
+            env={},
+        )
+        diagnostics.bind_checkpoint_identity(identity)
+        diagnostics.mark_submitted()
+        attempt_ref = diagnostics.finalize(outcome="timeout", error=timeout)
+        timeout.attempt_diagnostic_refs = ({
+            "path": attempt_ref.path,
+            "sha256": attempt_ref.sha256,
+        },)
+        journal = ProgressJournal(
+            artifact_dir=artifact_dir,
+            call_label=label,
+            provider=session.provider,
+            callback=kwargs.get("progress_callback"),
+            identity={
+                "idempotency_key": kwargs["idempotency_key"],
+                "session_key": session.key,
+                "generation": session.generation,
+                "runtime_fingerprint": session.runtime_fingerprint,
+                "checkpoint_identity": str(identity),
+            },
+        )
+        journal({"event": "submitted"})
+        journal({"event": "idle_timeout", "idle_seconds": 1.0})
+        raise timeout
 
     project = tmp_path / "supervised"
     result = build_companion(
@@ -2020,9 +2134,159 @@ def test_stateful_lane_timeout_uses_auto_budget_and_stops_other_paid_lane(
     assert len(supervised) == 1
     context = supervised[0]["needs_supervision"]["recovery_context"]
     assert context["idempotency_key"].endswith("generation-4")
-    assert context["submission_state"] is None
+    assert context["submission_state"] == "submitted"
     assert state["recovery_options"]["paper_id"] == "local:one"
     journal = json.loads(
         (project / ".arc-companion" / "resume-transaction.json").read_text()
     )
     assert journal["restart_budgets"][0]["attempts_used"] == 3
+
+
+def test_production_callback_loss_reconstructs_then_runs_one_fresh_task(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real build/recovery controller without replacing its continuation."""
+
+    blocks = [
+        {"block_id": "c1", "type": "section", "title": "One"},
+        {"block_id": "p1", "type": "text", "text": "A conserved quantity."},
+    ]
+    document = {
+        "schema_version": "arc.paper.document.v2", "front_matter": {},
+        "blocks": blocks, "equations": [], "figures": [], "tables": [],
+        "assets": [], "links": [], "bibliography": [],
+        "integrity": {"status": "complete", "document_hash": "callback-loss"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:callback-loss", document=document,
+        parsed={
+            "paper_id": "local:callback-loss", "document": document,
+            "structure": {"document_kind": "book", "chapters": [{
+                "title": "One", "block_ids": ["c1", "p1"],
+            }]},
+        },
+        metadata={"title": "One"}, references=[], citers=[],
+    )
+    translation_generations: list[int] = []
+    supervised_authorizations: list[object] = []
+
+    def llm(_prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        if label.startswith("title-translation-"):
+            return _title_response(_prompt)
+        if label.startswith("companion-glossary"):
+            return {"entries": []}
+        if label.startswith("companion-segmentation"):
+            return {"cut_after_ordinals": []}
+        if label == "companion-final-review":
+            return {"issues": [], "patches": []}
+        raise AssertionError(label)
+
+    def result_llm(_prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        manager = kwargs["session_manager"]
+        session = manager.get_existing(kwargs["session_key"])
+        if session is None:
+            session = manager.get_or_create(
+                key=kwargs["session_key"], provider="fake-provider",
+                model="test-model", runtime_fingerprint="runtime",
+            )
+        supervised_authorizations.append(kwargs.get("supervised_native_resume"))
+        if label.startswith("companion-guide"):
+            return SimpleNamespace(value={
+                "motivation": None, "main_content": "One", "section_logic": None,
+                "prerequisites": None, "pedagogical_comparison": None,
+                "historical_context": [], "supplementary_reading": [],
+            }, logical_receipt={"idempotency_key": kwargs["idempotency_key"]})
+        if label.startswith("companion-annotation"):
+            kwargs["progress_callback"]({"event": "submitted"})
+            return SimpleNamespace(value={
+                "explanation": "Commentary.", "commentary": "",
+                "prior_work": [], "later_work": [], "context_claims": [],
+                "evidence_ids": [], "key_points": [], "source_notes": [],
+                "evidence_requests": [],
+            }, logical_receipt={"idempotency_key": kwargs["idempotency_key"]})
+        assert label.startswith("companion-translation")
+        translation_generations.append(session.generation)
+        if session.generation > 1:
+            kwargs["progress_callback"]({"event": "submitted"})
+            return SimpleNamespace(
+                value={"blocks": [{"block_id": "p1", "text": "守恒量。"}]},
+                logical_receipt={"idempotency_key": kwargs["idempotency_key"]},
+            )
+
+        artifact_dir = Path(kwargs["artifact_dir"])
+        call_path, identity = checkpoint_path(
+            artifact_dir,
+            prompt=_prompt,
+            schema=kwargs["schema"],
+            provider=session.provider,
+            model=session.model,
+            call_label=label,
+            session_policy="stateful",
+            session_key=session.key,
+            runtime_fingerprint=session.runtime_fingerprint,
+            idempotency_key=kwargs["idempotency_key"],
+            generation=session.generation,
+            progress_contract_scope="session",
+            initial_native_authorization=kwargs["initial_native_authorization"],
+        )
+        prepared = prepare_call(call_path, identity=identity)
+        record_submitted(prepared)
+        timeout = LLMWorkerTimeout(
+            "typed idle callback loss",
+            submission_state=LLMSubmissionState.SUBMITTED,
+        )
+        record_failure(prepared, timeout)
+        diagnostics = AttemptDiagnostics(
+            artifact_dir, provider=session.provider, model=session.model,
+            fallback_index=0, attempt=1, call_label=label, env={},
+        )
+        diagnostics.bind_checkpoint_identity(identity)
+        diagnostics.mark_submitted()
+        attempt_ref = diagnostics.finalize(outcome="timeout", error=timeout)
+        timeout.attempt_diagnostic_refs = ({
+            "path": attempt_ref.path, "sha256": attempt_ref.sha256,
+        },)
+        journal = ProgressJournal(
+            artifact_dir=artifact_dir, call_label=label, provider=session.provider,
+            callback=kwargs.get("progress_callback"),
+            identity={
+                "idempotency_key": kwargs["idempotency_key"],
+                "session_key": session.key, "generation": session.generation,
+                "runtime_fingerprint": session.runtime_fingerprint,
+                "checkpoint_identity": str(identity),
+            },
+        )
+        journal({"event": "submitted"})
+        journal({"event": "idle_timeout", "idle_seconds": 1.0})
+        raise timeout
+
+    project = tmp_path / "callback-loss"
+    result = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id, project_dir=project, workers=1,
+            stop_after_first_chapter=True,
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm,
+        result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result.get("status") in {"first_chapter_ready", "complete"}, result
+    assert translation_generations == [1, 2]
+    assert all(value is None for value in supervised_authorizations)
+    state = json.loads((project / "state.json").read_text())
+    checkpoint = Path(state["checkpoint_dir"])
+    ledger = json.loads(
+        (checkpoint / "chapters" / "ch-0001" / "translation-ledger.json").read_text()
+    )
+    block = ledger["blocks"][0]
+    assert ledger["generation"] == 2
+    assert block["generation"] == 2 and block["state"] == "accepted"
+    transaction = json.loads(
+        (project / ".arc-companion" / "resume-transaction.json").read_text()
+    )
+    assert transaction["entries"][0]["reconstructed_from_durable_state"] is True

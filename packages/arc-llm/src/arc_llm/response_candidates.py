@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import json
 import os
-import uuid
+import stat
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -33,7 +36,13 @@ _KNOWN_SOURCES = {
     "claude.terminal_structured_output",
     "kimi.session_prompt_message",
     "generic.provider_value",
+    "recovery.response_candidate_stream",
 }
+_SELECTION_THREAD_LOCK = threading.Lock()
+
+
+def _selection_write_fault(_cutpoint: str) -> None:
+    """Test-only crash hook for immutable receipt publication."""
 
 
 class LLMResponseCandidateConflict(LLMWorkerError):
@@ -228,19 +237,18 @@ def persist_selection_receipt(
             "Response candidate receipt exceeds its byte limit", replayed=replayed
         )
     try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        published = _atomic_publish_exclusive(path, encoded)
-    except OSError as exc:
+        with _secure_selection_parent(path, create=True) as (directory_fd, name, binding):
+            published, persisted = _atomic_publish_exclusive_at(
+                directory_fd, name, encoded, binding=binding,
+            )
+    except (OSError, ValueError) as exc:
         raise LLMResponseCandidateReceiptError(
             f"Could not create response candidate receipt {path}: {exc}",
             replayed=replayed,
         ) from exc
     if not published:
         try:
-            existing = path.read_bytes()
-            if len(existing) > MAX_SELECTION_RECEIPT_BYTES:
-                raise ValueError("receipt exceeds byte limit")
-            existing_value = _loads_receipt_strict(existing)
+            existing_value = _loads_receipt_strict(persisted)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise LLMResponseCandidateReceiptError(
                 f"Could not read response candidate receipt {path}: {exc}",
@@ -251,32 +259,382 @@ def persist_selection_receipt(
                 f"Response candidate receipt changed or is incompatible: {path}",
                 replayed=replayed,
             )
-        persisted = existing
-    else:
-        persisted = encoded
     return path.name, hashlib.sha256(persisted).hexdigest()
 
 
 def _atomic_publish_exclusive(path: Path, payload: bytes) -> bool:
-    """Publish a fully fsynced inode without exposing a partial final path."""
+    """Compatibility wrapper around the held-dirfd immutable publisher."""
 
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with _secure_selection_parent(path, create=True) as (directory_fd, name, binding):
+        published, _persisted = _atomic_publish_exclusive_at(
+            directory_fd, name, payload, binding=binding,
+        )
+        return published
+
+
+@dataclass(frozen=True)
+class _ParentBinding:
+    absolute: Path
+    identity: tuple[int, int]
+    lock_fd: int
+    lock_identity: tuple[int, int]
+
+
+def _directory_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_absolute_directory(path: Path, *, create: bool) -> int:
+    absolute = path.absolute()
+    if not absolute.is_absolute():
+        raise ValueError("selection receipt parent must be absolute")
+    descriptor = os.open(absolute.anchor, _directory_flags())
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
-            return False
-        _fsync_directory(path.parent)
-        return True
+        for part in absolute.parts[1:]:
+            if part in {"", ".", ".."}:
+                raise ValueError("selection receipt parent is unsafe")
+            try:
+                child = os.open(part, _directory_flags(), dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                os.fsync(descriptor)
+                child = os.open(part, _directory_flags(), dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_parent_address(binding: _ParentBinding, directory_fd: int) -> None:
+    held = os.fstat(directory_fd)
+    if (held.st_dev, held.st_ino) != binding.identity:
+        raise ValueError("selection receipt parent binding changed")
+    current_fd = _open_absolute_directory(binding.absolute, create=False)
+    try:
+        current = os.fstat(current_fd)
+        if (current.st_dev, current.st_ino) != binding.identity:
+            raise ValueError("selection receipt parent address changed")
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(current_fd)
+    named = os.stat(".candidate-selection.lock", dir_fd=directory_fd, follow_symlinks=False)
+    lock_stat = os.fstat(binding.lock_fd)
+    if (
+        not stat.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+        or (named.st_dev, named.st_ino) != binding.lock_identity
+        or (lock_stat.st_dev, lock_stat.st_ino) != binding.lock_identity
+    ):
+        raise ValueError("selection receipt lock binding changed")
+
+
+@contextmanager
+def _secure_selection_parent(
+    path: Path, *, create: bool,
+) -> Any:
+    absolute = path.absolute()
+    if absolute.name != path.name or not absolute.name.endswith(".candidate-selection.json"):
+        raise ValueError("selection receipt address is invalid")
+    with _SELECTION_THREAD_LOCK:
+        directory_fd = _open_absolute_directory(absolute.parent, create=create)
+        lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        lock_fd = os.open(
+            ".candidate-selection.lock", lock_flags, 0o600, dir_fd=directory_fd,
+        )
+        try:
+            if os.name == "nt":  # pragma: no cover
+                import msvcrt
+                msvcrt.locking(lock_fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            parent_stat = os.fstat(directory_fd)
+            lock_stat = os.fstat(lock_fd)
+            binding = _ParentBinding(
+                absolute=absolute.parent,
+                identity=(parent_stat.st_dev, parent_stat.st_ino),
+                lock_fd=lock_fd,
+                lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
+            )
+            _verify_parent_address(binding, directory_fd)
+            try:
+                yield directory_fd, absolute.name, binding
+                _verify_parent_address(binding, directory_fd)
+            finally:
+                try:
+                    _verify_parent_address(binding, directory_fd)
+                finally:
+                    if os.name == "nt":  # pragma: no cover
+                        import msvcrt
+                        os.lseek(lock_fd, 0, os.SEEK_SET)
+                        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+            os.close(directory_fd)
+
+
+def _read_receipt_at(directory_fd: int, name: str, *, allow_two_links: bool) -> bytes | None:
+    try:
+        leaf = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    allowed = {1, 2} if allow_two_links else {1}
+    if not stat.S_ISREG(leaf.st_mode) or leaf.st_nlink not in allowed:
+        raise ValueError("selection receipt leaf is unsafe")
+    descriptor = os.open(
+        name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = MAX_SELECTION_RECEIPT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if len(raw) > MAX_SELECTION_RECEIPT_BYTES:
+            raise ValueError("selection receipt exceeds byte limit")
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or after.st_size != len(raw)
+        ):
+            raise ValueError("selection receipt changed while reading")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_publish_exclusive_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    binding: _ParentBinding,
+) -> tuple[bool, bytes]:
+    stage = f".{name}.{hashlib.sha256(payload).hexdigest()[:24]}.staged"
+    try:
+        return _atomic_publish_exclusive_at_inner(
+            directory_fd, name, payload, binding=binding,
+        )
+    except BaseException:
+        # Cleanup is limited to this payload's exact deterministic stage. The
+        # held directory fd remains safe even if its pathname was renamed.
+        try:
+            _verify_parent_address(binding, directory_fd)
+            stage_stat = os.stat(stage, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISLNK(stage_stat.st_mode):
+                os.unlink(stage, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            else:
+                staged = _read_receipt_at(directory_fd, stage, allow_two_links=True)
+                try:
+                    final = _read_receipt_at(
+                        directory_fd, name, allow_two_links=True,
+                    )
+                except ValueError:
+                    final = None
+                    _selection_exchange_at(directory_fd, stage, name)
+                    restored = _read_receipt_at(
+                        directory_fd, name, allow_two_links=False,
+                    )
+                    if restored != payload:
+                        raise ValueError("selection receipt rollback binding changed")
+                    os.unlink(name, dir_fd=directory_fd)
+                    _unlink_exact_selection_stage(directory_fd, stage)
+                    os.fsync(directory_fd)
+                    raise
+                stage_value = os.stat(
+                    stage, dir_fd=directory_fd, follow_symlinks=False,
+                )
+                final_value = (
+                    os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if final is not None else None
+                )
+                if (
+                    final is not None
+                    and final_value is not None
+                    and (stage_value.st_dev, stage_value.st_ino)
+                    != (final_value.st_dev, final_value.st_ino)
+                ):
+                    _selection_exchange_at(directory_fd, stage, name)
+                    restored = _read_receipt_at(
+                        directory_fd, name, allow_two_links=False,
+                    )
+                    if restored != payload:
+                        raise ValueError("selection receipt rollback binding changed")
+                    os.unlink(name, dir_fd=directory_fd)
+                    _unlink_exact_selection_stage(directory_fd, stage)
+                    os.fsync(directory_fd)
+                    raise ValueError("selection receipt publication was rolled back")
+                if staged is not None and (
+                    final is None
+                    or (
+                        final == staged
+                        and final_value is not None
+                        and (stage_value.st_dev, stage_value.st_ino)
+                        == (final_value.st_dev, final_value.st_ino)
+                    )
+                ):
+                    os.unlink(stage, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+        raise
+
+
+def _selection_exchange_at(directory_fd: int, left: str, right: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:  # pragma: no cover - non-Linux fail-closed path
+        raise ValueError("atomic selection receipt exchange is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        directory_fd, os.fsencode(left), directory_fd, os.fsencode(right), 2,
+    ) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), f"{left}<->{right}")
+
+
+def _unlink_exact_selection_stage(directory_fd: int, name: str) -> None:
+    value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if not (stat.S_ISLNK(value.st_mode) or stat.S_ISREG(value.st_mode)):
+        raise ValueError("selection receipt rollback stage is unsafe")
+    os.unlink(name, dir_fd=directory_fd)
+
+
+def _atomic_publish_exclusive_at_inner(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    binding: _ParentBinding,
+) -> tuple[bool, bytes]:
+    """Crash-recoverable immutable no-clobber publication under a named lock."""
+
+    if len(payload) > MAX_SELECTION_RECEIPT_BYTES:
+        raise ValueError("selection receipt exceeds byte limit")
+    digest = hashlib.sha256(payload).hexdigest()
+    stage = f".{name}.{digest[:24]}.staged"
+    _verify_parent_address(binding, directory_fd)
+    _reconcile_selection_stage(directory_fd, name, stage, payload, binding)
+    existing = _read_receipt_at(directory_fd, name, allow_two_links=True)
+    if existing is not None:
+        return False, existing
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(stage, flags, 0o400, dir_fd=directory_fd)
+    except FileExistsError:
+        _reconcile_selection_stage(directory_fd, name, stage, payload, binding)
+        descriptor = -1
+    if descriptor >= 0:
+        created = os.fstat(descriptor)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                _selection_write_fault("stage:after_write")
+                os.fsync(handle.fileno())
+                _selection_write_fault("stage:after_fsync")
+            os.fsync(directory_fd)
+        except BaseException:
+            try:
+                _verify_parent_address(binding, directory_fd)
+                current = os.stat(stage, dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                    os.unlink(stage, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        current_stage = os.stat(stage, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current_stage.st_mode)
+            or current_stage.st_nlink != 1
+            or (current_stage.st_dev, current_stage.st_ino)
+            != (created.st_dev, created.st_ino)
+        ):
+            raise ValueError("selection receipt staging leaf binding changed")
+    _verify_parent_address(binding, directory_fd)
+    existing = _read_receipt_at(directory_fd, name, allow_two_links=True)
+    if existing is not None:
+        _reconcile_selection_stage(directory_fd, name, stage, payload, binding)
+        return False, existing
+    try:
+        os.link(
+            stage,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        published = True
+    except FileExistsError:
+        published = False
+    except BaseException:
+        if _read_receipt_at(directory_fd, name, allow_two_links=True) is None:
+            try:
+                os.unlink(stage, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except FileNotFoundError:
+                pass
+        raise
+    _selection_write_fault("publish:after_link")
+    os.fsync(directory_fd)
+    _selection_write_fault("publish:after_fsync")
+    _reconcile_selection_stage(directory_fd, name, stage, payload, binding)
+    _verify_parent_address(binding, directory_fd)
+    persisted = _read_receipt_at(directory_fd, name, allow_two_links=False)
+    if persisted is None:
+        raise ValueError("selection receipt publication disappeared")
+    return published, persisted
+
+
+def _reconcile_selection_stage(
+    directory_fd: int,
+    name: str,
+    stage: str,
+    payload: bytes,
+    binding: _ParentBinding,
+) -> None:
+    staged = _read_receipt_at(directory_fd, stage, allow_two_links=True)
+    if staged is None:
+        return
+    stage_stat = os.stat(stage, dir_fd=directory_fd, follow_symlinks=False)
+    final = _read_receipt_at(directory_fd, name, allow_two_links=True)
+    if staged != payload:
+        if final is None and stage_stat.st_nlink == 1:
+            _verify_parent_address(binding, directory_fd)
+            os.unlink(stage, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            return
+        raise ValueError("selection receipt staging collision")
+    if final is not None:
+        final_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if final != payload or (stage_stat.st_dev, stage_stat.st_ino) != (
+            final_stat.st_dev, final_stat.st_ino,
+        ):
+            raise ValueError("selection receipt publication collision")
+        _verify_parent_address(binding, directory_fd)
+        os.unlink(stage, dir_fd=directory_fd)
+        os.fsync(directory_fd)
 
 
 def material_from_codex(

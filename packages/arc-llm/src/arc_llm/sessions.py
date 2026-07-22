@@ -366,6 +366,8 @@ class LLMSessionManager:
         runtime_fingerprint: str,
         name: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        required_generation: int | None = None,
+        initial_generation: int | None = None,
     ) -> Iterator[tuple[LLMSessionRef, int]]:
         with self.lock(key):
             with self._sessions_store_lock():
@@ -378,6 +380,8 @@ class LLMSessionManager:
                         runtime_fingerprint=runtime_fingerprint,
                         name=name,
                         metadata=metadata,
+                        required_generation=required_generation,
+                        initial_generation=initial_generation,
                     )
                     ref = self._mark_generation_started_locked(ref)
             yield ref, self.turn_count(key, generation=ref.generation)
@@ -394,9 +398,37 @@ class LLMSessionManager:
         runtime_fingerprint: str,
         name: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        required_generation: int | None = None,
+        initial_generation: int | None = None,
     ) -> LLMSessionRef:
+        for label, generation in (
+            ("required_generation", required_generation),
+            ("initial_generation", initial_generation),
+        ):
+            if generation is not None and (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+            ):
+                raise ValueError(f"{label} must be a positive integer")
+        if (
+            required_generation is not None
+            and initial_generation is not None
+            and required_generation != initial_generation
+        ):
+            raise ValueError(
+                "required_generation and initial_generation must match"
+            )
         existing = self._sessions.get(key)
         if existing is not None:
+            if (
+                required_generation is not None
+                and existing.generation != required_generation
+            ):
+                raise ValueError(
+                    f"session generation changed for {key}: expected "
+                    f"{required_generation}, found {existing.generation}"
+                )
             if existing.provider != provider or existing.model != model:
                 raise ValueError(f"session provider/model changed for {key}")
             if existing.runtime_fingerprint != runtime_fingerprint:
@@ -422,6 +454,7 @@ class LLMSessionManager:
             runtime_fingerprint=runtime_fingerprint,
             name=name,
             metadata=dict(metadata or {}),
+            generation=initial_generation or 1,
         )
         self._sessions[key] = ref
         self._write_sessions()

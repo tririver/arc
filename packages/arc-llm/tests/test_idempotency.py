@@ -30,6 +30,8 @@ class CountingProvider:
 
 
 def _kwargs(tmp_path, manager, key="logical-1"):
+    existing = manager.get_existing("chapter/translation")
+    generation = existing.generation if existing is not None else 1
     return {
         "schema": {"type": "object", "required": ["ok"]},
         "provider": "codex-cli",
@@ -43,7 +45,24 @@ def _kwargs(tmp_path, manager, key="logical-1"):
         "call_label": key,
         "idempotency_key": key,
         "progress_contract_scope": "session",
+        "initial_native_authorization": (
+            str((tmp_path / "control-ledger.json").resolve()),
+            "chapter/translation",
+            "segment-1",
+            generation,
+            key,
+        ),
     }
+
+
+def _resume_authorization(tmp_path, key="logical-1"):
+    return (
+        str((tmp_path / "control-ledger.json").resolve()),
+        "chapter/translation",
+        "segment-1",
+        1,
+        key,
+    )
 
 
 def test_stateful_idempotency_replays_after_record_turn_crash(tmp_path, monkeypatch):
@@ -213,11 +232,19 @@ def test_submitted_timeout_only_explicitly_resumes_native_session(tmp_path, monk
             self.calls += 1
             self.prompts.append(prompt)
             assert kwargs["session"].native_session_id == "native-existing"
+            assert tuple(kwargs["initial_native_authorization"]) == (
+                str((tmp_path / "control-ledger.json").resolve()),
+                "chapter/translation", "segment-1", 1, "supervised-turn",
+            )
             if self.calls == 1:
+                assert "supervised_native_resume" not in kwargs
                 raise LLMWorkerTimeout(
                     "lost response",
                     submission_state=LLMSubmissionState.SUBMITTED,
                 )
+            assert tuple(kwargs["supervised_native_resume"]) == _resume_authorization(
+                tmp_path, "supervised-turn"
+            )
             return LLMProviderResponse(
                 {"ok": True},
                 usage=LLMUsage(input_tokens=2, output_tokens=1),
@@ -248,15 +275,158 @@ def test_submitted_timeout_only_explicitly_resumes_native_session(tmp_path, monk
     assert provider.calls == 1
 
     outcome = run_json_result(
-        "rebuilt stateful stream", **kwargs, supervised_native_resume=True,
+        "rebuilt stateful stream",
+        **kwargs,
+        supervised_native_resume=_resume_authorization(tmp_path, "supervised-turn"),
     )
     assert outcome.value == {"ok": True}
     assert provider.calls == 2
     assert "Supervised native-session recovery" in provider.prompts[-1]
     assert "original paid request" not in provider.prompts[-1]
+    attempt_record = json.loads(
+        (
+            (tmp_path / "artifacts")
+            / outcome.call_record["attempts"][0]["diagnostic_path"]
+        ).read_text()
+    )
+    assert attempt_record["checkpoint_binding"]["native_resume_authorization"] == {
+        "control_address": str((tmp_path / "control-ledger.json").resolve()),
+        "session_key": "chapter/translation",
+        "logical_unit": "segment-1",
+        "generation": 1,
+        "idempotency_key": "supervised-turn",
+    }
 
     replay = run_json_result(
-        "rebuilt stateful stream", **kwargs, supervised_native_resume=True,
+        "rebuilt stateful stream",
+        **kwargs,
+        supervised_native_resume=_resume_authorization(tmp_path, "supervised-turn"),
     )
     assert replay.logical_receipt["replayed"] is True
     assert provider.calls == 2
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        True,
+        ("/tmp/control", "chapter/translation", "segment-1", 1),
+    ],
+)
+@pytest.mark.parametrize("entrypoint", [run_json_result, runner.run_text_result])
+def test_public_resume_refuses_boolean_or_partial_authorization(
+    tmp_path, monkeypatch, authorization, entrypoint,
+):
+    provider = CountingProvider()
+    manager = LLMSessionManager(tmp_path / "sessions")
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: provider)
+
+    kwargs = _kwargs(tmp_path, manager)
+    if entrypoint is runner.run_text_result:
+        kwargs.pop("schema")
+    with pytest.raises(ValueError, match="complete five-field authorization"):
+        entrypoint(
+            "must not run", **kwargs, supervised_native_resume=authorization,
+        )
+
+    assert provider.calls == 0
+
+
+def test_public_resume_refuses_full_tuple_that_differs_from_initial_authorization(
+    tmp_path, monkeypatch,
+):
+    provider = CountingProvider()
+    manager = LLMSessionManager(tmp_path / "sessions")
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: provider)
+    kwargs = _kwargs(tmp_path, manager, "exact-turn")
+    changed = list(kwargs["initial_native_authorization"])
+    changed[2] = "different-logical-unit"
+
+    with pytest.raises(ValueError, match="exact complete initial"):
+        run_json_result(
+            "must not run", **kwargs, supervised_native_resume=tuple(changed),
+        )
+    assert provider.calls == 0
+
+
+def test_text_provider_receives_complete_initial_authorization_contract(
+    tmp_path, monkeypatch,
+):
+    captured = []
+
+    class TextProvider:
+        def generate_text_result(self, prompt, **kwargs):
+            captured.append(kwargs["initial_native_authorization"])
+            return LLMProviderResponse("ok", native_session_id="native-text")
+
+    manager = LLMSessionManager(tmp_path / "sessions")
+    monkeypatch.setattr(
+        runner, "select_provider", lambda *_args, **_kwargs: TextProvider(),
+    )
+    kwargs = _kwargs(tmp_path, manager, "text-turn")
+    kwargs.pop("schema")
+    outcome = runner.run_text_result("text", **kwargs)
+
+    assert outcome.value == "ok"
+    assert tuple(captured[0]) == (
+        str((tmp_path / "control-ledger.json").resolve()),
+        "chapter/translation", "segment-1", 1, "text-turn",
+    )
+
+
+def test_stateful_runner_creates_missing_session_at_authorized_generation(
+    tmp_path, monkeypatch,
+) -> None:
+    seen_generations: list[int] = []
+
+    class GenerationProvider(CountingProvider):
+        def generate_json_result(self, prompt, **kwargs):
+            seen_generations.append(kwargs["session"].generation)
+            return super().generate_json_result(prompt, **kwargs)
+
+    provider = GenerationProvider()
+    manager = LLMSessionManager(tmp_path / "sessions")
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: provider)
+    kwargs = _kwargs(tmp_path, manager, "generation-4")
+    authorization = list(kwargs["initial_native_authorization"])
+    authorization[3] = 4
+    kwargs["initial_native_authorization"] = tuple(authorization)
+
+    outcome = run_json_result("fresh generation", **kwargs)
+
+    assert outcome.generation == 4
+    assert seen_generations == [4]
+    created = manager.get_existing("chapter/translation")
+    assert created is not None
+    assert created.generation == 4
+    assert created.provider == "codex-cli"
+    assert created.model == "m"
+
+
+def test_stateful_runner_fails_closed_on_authorized_generation_mismatch(
+    tmp_path, monkeypatch,
+) -> None:
+    provider = CountingProvider()
+    manager = LLMSessionManager(tmp_path / "sessions")
+    runtime_fp = runner._runtime_fp(
+        provider_used="codex-cli", model="m", model_tier=None,
+        env={}, process_chain=[],
+    )
+    manager.get_or_create(
+        key="chapter/translation", provider="codex-cli", model="m",
+        runtime_fingerprint=runtime_fp,
+    )
+    manager.rotate("chapter/translation", reason="generation 2")
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: provider)
+    kwargs = _kwargs(tmp_path, manager, "requires-generation-3")
+    authorization = list(kwargs["initial_native_authorization"])
+    authorization[3] = 3
+    kwargs["initial_native_authorization"] = tuple(authorization)
+
+    with pytest.raises(runner.LLMTaskError) as exc_info:
+        run_json_result("must not submit", **kwargs)
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert "expected 3, found 2" in str(exc_info.value.__cause__)
+    assert provider.calls == 0
+    assert manager.get_existing("chapter/translation").generation == 2

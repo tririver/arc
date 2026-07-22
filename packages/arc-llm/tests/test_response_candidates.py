@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import multiprocessing
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -441,11 +443,156 @@ def test_receipt_publish_is_concurrent_and_ignores_stale_partial_temp(tmp_path):
 
 def test_receipt_publish_failure_never_exposes_final_or_partial_temp(tmp_path, monkeypatch):
     path = tmp_path / "call.candidate-selection.json"
-    monkeypatch.setattr(candidate_module.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("crash")))
+    monkeypatch.setattr(
+        candidate_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("crash")),
+    )
     with pytest.raises(OSError, match="crash"):
         candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
     assert not path.exists()
     assert not list(tmp_path.glob(".*.tmp"))
+    assert not list(tmp_path.glob(".*.staged"))
+
+
+@pytest.mark.parametrize("cutpoint", ["stage:after_fsync", "publish:after_link"])
+def test_receipt_baseexception_cut_reconciles_exact_stage(
+    tmp_path, monkeypatch, cutpoint,
+):
+    class SimulatedKill(BaseException):
+        pass
+
+    path = tmp_path / "call.candidate-selection.json"
+    fired = False
+
+    def crash(point):
+        nonlocal fired
+        if point == cutpoint and not fired:
+            fired = True
+            raise SimulatedKill(point)
+
+    monkeypatch.setattr(candidate_module, "_selection_write_fault", crash)
+    with pytest.raises(SimulatedKill):
+        candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    monkeypatch.setattr(candidate_module, "_selection_write_fault", lambda _point: None)
+    candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    assert path.read_bytes() == b'{"complete":true}\n'
+    assert path.stat().st_nlink == 1
+    assert not list(tmp_path.glob(".*.staged"))
+
+
+def test_receipt_parent_rename_recreate_fails_without_split_publication(
+    tmp_path, monkeypatch,
+):
+    parent = tmp_path / "call-checkpoints"
+    parent.mkdir()
+    moved = tmp_path / "moved-call-checkpoints"
+    path = parent / "call.candidate-selection.json"
+
+    def swap(point):
+        if point == "stage:after_fsync":
+            parent.rename(moved)
+            parent.mkdir()
+
+    monkeypatch.setattr(candidate_module, "_selection_write_fault", swap)
+    with pytest.raises(ValueError, match="parent address changed"):
+        candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    assert not path.exists()
+    assert not (moved / path.name).exists()
+    # Once the pathname is rebound, fail closed instead of mutating the old,
+    # no-longer-addressable inode. The sole orphan is full and content-bound.
+    stages = list(moved.glob(".*.staged"))
+    assert len(stages) == 1
+    assert stages[0].read_bytes() == b'{"complete":true}\n'
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_receipt_parent_symlink_never_writes_external_directory(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    parent = tmp_path / "call-checkpoints"
+    parent.symlink_to(external, target_is_directory=True)
+    path = parent / "call.candidate-selection.json"
+    with pytest.raises(OSError):
+        candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    assert list(external.iterdir()) == []
+
+
+def test_receipt_lock_replacement_fails_before_publication(tmp_path, monkeypatch):
+    path = tmp_path / "call.candidate-selection.json"
+
+    def replace_lock(point):
+        if point == "stage:after_fsync":
+            lock = tmp_path / ".candidate-selection.lock"
+            lock.unlink()
+            lock.write_bytes(b"replacement")
+
+    monkeypatch.setattr(candidate_module, "_selection_write_fault", replace_lock)
+    with pytest.raises(ValueError, match="lock binding changed"):
+        candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    assert not path.exists()
+    monkeypatch.setattr(candidate_module, "_selection_write_fault", lambda _point: None)
+    candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    assert not list(tmp_path.glob(".*.staged"))
+
+
+def test_receipt_staging_leaf_swap_fails_without_touching_target(tmp_path, monkeypatch):
+    path = tmp_path / "call.candidate-selection.json"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"untouched")
+
+    def swap(point):
+        if point == "stage:after_write":
+            stage = next(tmp_path.glob(".*.staged"))
+            stage.rename(stage.with_suffix(".orphan"))
+            stage.symlink_to(victim)
+
+    monkeypatch.setattr(candidate_module, "_selection_write_fault", swap)
+    with pytest.raises(ValueError, match="staging leaf binding changed"):
+        candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    assert victim.read_bytes() == b"untouched"
+    assert not path.exists()
+
+
+def test_receipt_final_swap_uses_exchange_rollback(tmp_path, monkeypatch):
+    path = tmp_path / "call.candidate-selection.json"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"untouched")
+
+    def swap(point):
+        if point == "publish:after_link":
+            path.unlink()
+            path.symlink_to(victim)
+
+    monkeypatch.setattr(candidate_module, "_selection_write_fault", swap)
+    with pytest.raises(ValueError):
+        candidate_module._atomic_publish_exclusive(path, b'{"complete":true}\n')
+    assert victim.read_bytes() == b"untouched"
+    assert not path.exists()
+    assert not list(tmp_path.glob(".*.staged"))
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="fork unavailable")
+def test_receipt_subprocess_cut_after_publish_repairs_link_count(tmp_path):
+    path = tmp_path / "call.candidate-selection.json"
+    payload = b'{"complete":true}\n'
+
+    def child() -> None:
+        candidate_module._selection_write_fault = (
+            lambda point: os._exit(73) if point == "publish:after_link" else None
+        )
+        candidate_module._atomic_publish_exclusive(path, payload)
+
+    process = multiprocessing.get_context("fork").Process(target=child)
+    process.start()
+    process.join(10)
+    assert process.exitcode == 73
+    assert path.read_bytes() == payload
+    assert path.stat().st_nlink == 2
+
+    candidate_module._atomic_publish_exclusive(path, payload)
+    assert path.stat().st_nlink == 1
+    assert not list(tmp_path.glob(".*.staged"))
 
 
 def test_receipt_metadata_is_sanitized_and_bounded():
@@ -694,6 +841,7 @@ def test_conflict_checkpoint_replays_without_provider_and_remains_response_recei
     receipt_path = next(
         (tmp_path / "call-checkpoints").glob("*.candidate-selection.json")
     )
+    receipt_path.chmod(0o600)
     receipt_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(LLMResponseCandidateReceiptError) as tampered:
         run_json_result("prompt", **kwargs)

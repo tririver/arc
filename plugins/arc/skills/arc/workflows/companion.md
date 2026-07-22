@@ -238,11 +238,28 @@ suffix, and starts a new generation.
 
 ### Step 5: Recover eligible blocked lanes
 
-The default `--recovery-policy auto` drains submitted work, replays durable
-responses, and attempts native session reconciliation before starting at most
-three replacement generations by default for an eligible blocked translation
-or commentary lane suffix. `--max-auto-replacements N` changes that recovery
-budget without changing content fingerprints. Inspect recovery state without mutation:
+The default `--recovery-policy auto` first replays durable response candidates
+through normal candidate selection, JSON normalization, and the exact call-site
+business validator, accepting only candidates that pass. The owning handler
+must durably accept its exact control before returning; a final sweep cannot
+substitute for that handoff. A reconstructed failed raw response remains
+`pending business validation and application`: schema validity does not accept
+the block and does not invoke a repair or alternate handler. Before any
+transition, validate the receipt against the current registered ledger and use
+the returned ledger digest as the compare-and-swap precondition; re-read the
+digest after each transition. A callback or receipt from an older generation
+must never advance the current generation. ARC correlates an
+indexed receipt, call, and native-resume authorization only when canonical
+ledger path, session key, logical unit, generation, and idempotency key all
+match; any durable native-session ID must match too. Partial tuples remain
+supervised. After these gates, a durably typed `idle_timeout` with no complete response
+suppresses all old-session reconciliation, preserves the accepted prefix, and
+submits the original first-unaccepted task in one fresh generation.
+Other eligible failures retain native-first recovery. ARC starts at most three
+replacement generations by default and only for structurally owned,
+side-effect-free recovery units.
+`--max-auto-replacements N` changes that recovery budget without changing
+content fingerprints. Inspect recovery state without mutation:
 
 ```bash
 arc-companion status --project-dir <project-dir> --json
@@ -258,14 +275,23 @@ arc-companion resume --project-dir <project-dir> --action restart-generation \
   --confirm-possible-duplicate-charge --json
 ```
 
-Explicit native recovery must not upgrade automatically. Use explicit restart
+Explicit native recovery requires the same complete identity tuple and must not
+upgrade automatically. Use explicit restart
 only after accepting that an uncertain submitted call may be billed twice.
+`resume-native` keeps strict old-session behavior even after an idle timeout;
+auto does not claim exactly-once execution for an ambiguous submitted call.
 Cancellation, authentication, quota, rate-limit, missing-source, local-I/O, and
 invalid-configuration failures remain supervised rather than being masked by
 replacement. Possible duplicate charging remains an audit warning under auto;
 strict native identity checks apply only to `resume-native`. The ledger must
 retain call IDs, hashes, accepted-chain predecessor,
 session and generation, native ID, usage, and validation receipt.
+
+Status joins calls, controls, and transaction entries only through that exact
+five-field identity, exposes separate bounded control/logical projections, and
+redacts/bounds action-history reason, error, and message fields. Never include
+prompt text, response bodies, credentials, or arbitrary configuration values in
+observability output.
 
 For background builds, forward provider progress plus `chapter_prepared`,
 `block_accepted`, `chapter_complete`, and `needs_supervision` to

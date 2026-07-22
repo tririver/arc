@@ -41,6 +41,24 @@ SCHEMA = {
 }
 
 
+def _record_guarded_test_response(
+    checkpoint: Path, ledger_path: Path, segment_id: str,
+) -> None:
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    generation = int(ledger.get("generation") or 1)
+    session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+    pipeline_module._guarded_mark_transport_state(
+        ledger_path,
+        checkpoint_dir=checkpoint,
+        session_key=session_key,
+        logical_unit=segment_id,
+        idempotency_key=(
+            f"{session_key}:{segment_id}:test-response:generation-{generation}"
+        ),
+        response_received=True,
+    )
+
+
 def _normalize(value, expected=("a", "b"), *, invariant=lambda value: True):
     return normalize_complete_response(
         value,
@@ -578,7 +596,9 @@ def test_persisted_token_draft_provenance_ids_cannot_be_reinterpreted(
         pipeline_module._repair_translation_token_placement(**arguments)
 
 
-def test_paid_repair_finalizer_projects_complete_extra_response(tmp_path: Path) -> None:
+def test_paid_repair_finalizer_rejects_unindexed_complete_extra_response(
+    tmp_path: Path,
+) -> None:
     checkpoint = tmp_path / "checkpoint"
     block = _barthes_626_block()
     pipeline_module.write_json(
@@ -592,8 +612,7 @@ def test_paid_repair_finalizer_projects_complete_extra_response(tmp_path: Path) 
         lane="translation",
         segment_ids=["seg-ch38"],
     )
-    pipeline_module.mark_submitted(ledger_path, segment_id="seg-ch38")
-    pipeline_module.mark_response_received(ledger_path, segment_id="seg-ch38")
+    _record_guarded_test_response(checkpoint, ledger_path, "seg-ch38")
     draft_path = pipeline_module._translation_draft_path(checkpoint, "seg-ch38")
     pipeline_module.write_json(draft_path, {
         "schema_version": "arc.companion.translation-primary-draft.v1",
@@ -630,14 +649,10 @@ def test_paid_repair_finalizer_projects_complete_extra_response(tmp_path: Path) 
 
     entries = pipeline_module._finalize_paid_translation_repairs(checkpoint)
 
-    assert len(entries) == 1
-    assert entries[0]["recovery_action"] == "deterministic-replay"
-    assert entries[0]["blocking_reason"] == ""
+    assert entries == []
     assert json.loads(marker.read_text(encoding="utf-8"))["raw_response"] == raw_response
     receipt_path = attempt_dir / "response-normalization.json"
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert receipt["decision"] == "accepted"
-    assert receipt["discarded_ids"] == ["md-line-621"]
+    assert not receipt_path.exists()
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert ledger["needs_supervision"] is None
 
@@ -833,8 +848,9 @@ def test_persisted_coverage_failures_are_supervised_without_llm(
         lane="translation",
         segment_ids=[segment["segment_id"]],
     )
-    pipeline_module.mark_submitted(ledger_path, segment_id=segment["segment_id"])
-    pipeline_module.mark_response_received(ledger_path, segment_id=segment["segment_id"])
+    _record_guarded_test_response(
+        checkpoint, ledger_path, segment["segment_id"],
+    )
     assert pipeline_module._mark_translation_repair_supervision(
         ledger_path, segment_id=segment["segment_id"], exc=raised.value,
     )

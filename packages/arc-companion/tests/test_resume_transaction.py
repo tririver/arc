@@ -11,7 +11,8 @@ from arc_companion.resume_transaction import (
     claim_automatic_restart, ensure_auto_transaction,
     load_transaction,
     mark_entry,
-    mark_replacement, plan_replacement, update_replacement,
+    mark_replacement, plan_replacement, suppress_native_resume_contexts,
+    update_replacement,
 )
 from arc_companion.io import write_json
 
@@ -191,3 +192,122 @@ def test_manual_override_atomically_replans_every_unresolved_entry(tmp_path) -> 
         for entry in restarted["entries"]
     ] == [(2, 3), (4, 5)]
     assert all(entry["manual_restart_after_auto"] for entry in restarted["entries"])
+
+
+def test_fresh_idle_audit_fields_and_unknown_fields_survive_compaction(tmp_path) -> None:
+    entry = {
+        **_entry(tmp_path),
+        "recovery_trigger": "idle_timeout",
+        "complete_response_scan": {
+            "complete": False,
+            "source": "no_complete_response",
+            "validation_status": "none",
+        },
+        "automatic_native_resume_suppressed": True,
+        "fresh_generation_required": True,
+        "fresh_task_start_segment_id": "s1",
+        "future_field": {"kept": True},
+    }
+    begin_transaction(
+        tmp_path, action="auto", policy="auto", recovery_options={},
+        entries=[entry, {**entry, "blocking_reason": "duplicate legacy row"}],
+    )
+
+    loaded = load_transaction(tmp_path)
+
+    assert len(loaded["entries"]) == 1
+    compacted = loaded["entries"][0]
+    for field in (
+        "recovery_trigger", "complete_response_scan",
+        "automatic_native_resume_suppressed", "fresh_generation_required",
+        "fresh_task_start_segment_id", "future_field",
+    ):
+        assert compacted[field] == entry[field]
+
+
+def test_v1_migration_preserves_future_entry_fields(tmp_path) -> None:
+    path = tmp_path / ".arc-companion" / "resume-transaction.json"
+    write_json(path, {
+        "schema_version": "arc.companion.resume-transaction.v1",
+        "action": "resume-native",
+        "status": "applying",
+        "entries": [{**_entry(tmp_path), "future_field": "preserved"}],
+    })
+
+    loaded = load_transaction(tmp_path)
+
+    assert loaded["schema_version"] == "arc.companion.resume-transaction.v3"
+    assert loaded["entries"][0]["future_field"] == "preserved"
+
+
+def test_key_only_native_suppression_is_rejected_without_mutating_inventory(tmp_path) -> None:
+    begin_transaction(
+        tmp_path, action="auto", policy="auto", recovery_options={},
+        entries=[_entry(tmp_path)],
+        native_resume_contexts=[{
+            "idempotency_key": "generation-1-key",
+            "session_key": "ch-0001:translation",
+            "native_session_id_to_restore": "native-old",
+        }],
+    )
+
+    with pytest.raises(ValueError, match="complete recovery identities"):
+        suppress_native_resume_contexts(
+            tmp_path, idempotency_keys={"generation-1-key"},
+        )
+
+    loaded = load_transaction(tmp_path)
+    assert loaded["native_resume_contexts"] == [{
+        "idempotency_key": "generation-1-key",
+        "session_key": "ch-0001:translation",
+        "native_session_id_to_restore": "native-old",
+    }]
+    assert loaded.get("suppressed_native_resume_contexts") in (None, [])
+
+
+def test_same_key_native_contexts_keep_full_identity_and_suppress_exact_tuple(
+    tmp_path,
+) -> None:
+    key = "shared-provider-key"
+    first = {
+        "ledger_path": str(tmp_path / "a-ledger.json"),
+        "session_key": "ch-a:translation",
+        "segment_id": "a-1",
+        "generation": 1,
+        "idempotency_key": key,
+    }
+    second = {
+        "ledger_path": str(tmp_path / "b-ledger.json"),
+        "session_key": "ch-b:companion",
+        "segment_id": "b-1",
+        "generation": 2,
+        "idempotency_key": key,
+    }
+    begin_transaction(
+        tmp_path,
+        action="auto",
+        policy="auto",
+        recovery_options={},
+        entries=[
+            {**first, "initial_generation": 1},
+            {**second, "initial_generation": 2},
+        ],
+        native_resume_contexts=[first, second],
+    )
+
+    loaded = load_transaction(tmp_path)
+    assert loaded["native_resume_contexts"] == [first, second]
+    assert len(loaded["entries"]) == 2
+
+    suppressed = suppress_native_resume_contexts(
+        tmp_path,
+        idempotency_keys=set(),
+        recovery_identities={(str((tmp_path / "a-ledger.json").resolve()),
+                              "ch-a:translation", "a-1", 1, key)},
+    )
+
+    assert suppressed["native_resume_contexts"] == [second]
+    assert suppressed["suppressed_native_resume_contexts"] == [{
+        **first,
+        "suppression_reason": "typed_idle_requires_fresh_generation",
+    }]

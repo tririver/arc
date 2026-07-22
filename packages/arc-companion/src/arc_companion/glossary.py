@@ -9,6 +9,11 @@ from .language import base_language, contains_lexical_term
 from .prompts import GLOSSARY_SCHEMA, glossary_consolidation_prompt, glossary_prompt
 from .segmentation import build_block_inventory, build_segmentation_windows
 from .source import block_id
+from .recovery_units import (
+    call_model_with_recovery_descriptor,
+    require_control_acceptance,
+    submission_descriptor,
+)
 
 
 GLOSSARY_VERSION = "arc.companion.glossary.v7"
@@ -41,6 +46,7 @@ def generate_glossary(
     page_count: int | None = None,
     source_language: str | None = None,
     intent_guidance_identity: dict[str, Any] | None = None,
+    accept_recovery: Callable[[Path, str, str], int] | None = None,
 ) -> dict[str, Any]:
     prompt_source_language = (
         source_language if source_language and base_language(source_language) != "en" else None
@@ -119,7 +125,9 @@ def generate_glossary(
                         "result": cached_result,
                     })
                 return index, cached_result
-        result = call_model(
+        logical_unit = f"glossary-window-{index:04d}"
+        result = call_model_with_recovery_descriptor(
+            call_model,
             glossary_prompt(
                 selected,
                 language=language,
@@ -130,12 +138,43 @@ def generate_glossary(
             GLOSSARY_SCHEMA,
             checkpoint_dir / "llm" / "glossary" / f"window-{index:04d}",
             f"companion-glossary-window-{index:04d}",
+            submission_descriptor(
+                unit="glossary",
+                logical_unit=logical_unit,
+                checkpoint_dir=checkpoint_dir,
+                artifact_root=(
+                    checkpoint_dir / "llm" / "glossary" / f"window-{index:04d}"
+                ),
+                acceptance_checkpoint=path,
+                input_sha256=input_hash,
+                ordered_siblings=[logical_unit],
+                suffix=[logical_unit],
+            ),
         )
         value = {"entries": _normalize_entries(
             result.get("entries") or [], blocks,
             require_exact_source=bool(prompt_source_language),
         )}
-        write_json(path, {"input_sha256": input_hash, "result": value})
+        write_json(path, {
+            "input_sha256": input_hash,
+            "result": value,
+            "business_validation": {
+                "kind": "window",
+                "blocks": _acceptance_validation_blocks(
+                    value["entries"], selected,
+                ),
+                "language": language,
+                "protected_names": protected_names,
+                "require_exact_source": bool(prompt_source_language),
+                "entry_limit": entry_limit,
+            },
+        })
+        require_control_acceptance(
+            accept_recovery,
+            checkpoint_dir=checkpoint_dir,
+            unit="glossary",
+            logical_unit=logical_unit,
+        )
         return index, value
 
     candidates: dict[int, dict[str, Any]] = {}
@@ -157,6 +196,7 @@ def generate_glossary(
         force=force,
         call_model=call_model,
         source_language=prompt_source_language,
+        accept_recovery=accept_recovery,
     )
     entries = _normalize_entries(
         consolidated.get("entries") or [], blocks,
@@ -191,6 +231,7 @@ def _consolidate_candidates(
     workers: int,
     force: bool,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+    accept_recovery: Callable[[Path, str, str], int] | None = None,
 ) -> dict[str, Any]:
     """Merge window glossaries without constructing one unbounded model prompt."""
     entries = [
@@ -226,6 +267,8 @@ def _consolidate_candidates(
             stage="final",
             force=force,
             call_model=call_model,
+            recovery_checkpoint_dir=checkpoint_dir,
+            accept_recovery=accept_recovery,
         )
 
     level = 1
@@ -260,6 +303,8 @@ def _consolidate_candidates(
                 stage="final",
                 force=force,
                 call_model=call_model,
+                recovery_checkpoint_dir=checkpoint_dir,
+                accept_recovery=accept_recovery,
             )
 
         batches = _consolidation_batches(
@@ -302,6 +347,8 @@ def _consolidate_candidates(
                 stage="intermediate",
                 force=force,
                 call_model=call_model,
+                recovery_checkpoint_dir=checkpoint_dir,
+                accept_recovery=accept_recovery,
             )
 
         merged: dict[int, dict[str, Any]] = {}
@@ -339,6 +386,8 @@ def _consolidate_node(
     stage: str,
     force: bool,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+    recovery_checkpoint_dir: Path,
+    accept_recovery: Callable[[Path, str, str], int] | None = None,
 ) -> dict[str, Any]:
     input_entry_count = sum(
         1
@@ -394,11 +443,26 @@ def _consolidate_node(
             f"glossary consolidation node {call_label} requires a {prompt_bytes}-byte "
             f"prompt, exceeding the strict {CONSOLIDATION_PROMPT_MAX_BYTES}-byte limit"
         )
-    result = call_model(
+    logical_unit = call_label
+    acceptance_path = cache_path or (
+        recovery_checkpoint_dir / "glossary-consolidation" / "final.json"
+    )
+    result = call_model_with_recovery_descriptor(
+        call_model,
         prompt,
         GLOSSARY_SCHEMA,
         artifact_dir,
         call_label,
+        submission_descriptor(
+            unit="glossary-consolidation",
+            logical_unit=logical_unit,
+            checkpoint_dir=recovery_checkpoint_dir,
+            artifact_root=artifact_dir,
+            acceptance_checkpoint=acceptance_path,
+            input_sha256=cache_key,
+            ordered_siblings=[logical_unit],
+            suffix=[logical_unit],
+        ),
     )
     entries = _normalize_entries(
         result.get("entries") or [], blocks,
@@ -413,8 +477,25 @@ def _consolidate_node(
             f"for {input_entry_count} non-empty input entries"
         )
     value = {"entries": entries}
-    if cache_path is not None:
-        write_json(cache_path, {"input_sha256": cache_key, "result": value})
+    write_json(acceptance_path, {
+        "input_sha256": cache_key,
+        "result": value,
+        "business_validation": {
+            "kind": "consolidation",
+            "blocks": _acceptance_validation_blocks(entries, blocks),
+            "language": language,
+            "protected_names": protected_names,
+            "require_exact_source": bool(source_language),
+            "entry_limit": output_limit,
+            "input_entry_count": input_entry_count,
+        },
+    })
+    require_control_acceptance(
+        accept_recovery,
+        checkpoint_dir=recovery_checkpoint_dir,
+        unit="glossary-consolidation",
+        logical_unit=logical_unit,
+    )
     return value
 
 
@@ -632,6 +713,73 @@ def _normalize_entries(
         })
     normalized.sort(key=lambda item: (int(item.pop("_position")), item["source_term"].casefold()))
     return normalized
+
+
+def validate_glossary_acceptance_checkpoint(value: Any) -> bool:
+    """Re-run the complete deterministic glossary application invariants."""
+
+    if not isinstance(value, dict):
+        return False
+    result = value.get("result")
+    validation = value.get("business_validation")
+    if not isinstance(result, dict) or not isinstance(validation, dict):
+        return False
+    entries = result.get("entries")
+    blocks = validation.get("blocks")
+    protected_names = validation.get("protected_names")
+    limit = validation.get("entry_limit")
+    if (
+        not isinstance(entries, list)
+        or not isinstance(blocks, list)
+        or not all(isinstance(item, dict) for item in blocks)
+        or not isinstance(protected_names, list)
+        or not all(isinstance(item, str) for item in protected_names)
+        or isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 1
+        or validation.get("kind") not in {"window", "consolidation"}
+    ):
+        return False
+    try:
+        normalized = _normalize_entries(
+            entries,
+            blocks,
+            require_exact_source=bool(validation.get("require_exact_source")),
+        )
+        normalized = _deduplicate(normalized)[:limit]
+        _restore_protected_names(
+            normalized,
+            protected_names,
+            language=str(validation.get("language") or ""),
+        )
+        _validate_protected_names(normalized, protected_names)
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return False
+    if normalized != entries:
+        return False
+    input_count = validation.get("input_entry_count")
+    if validation.get("kind") == "consolidation" and (
+        isinstance(input_count, bool)
+        or not isinstance(input_count, int)
+        or input_count < 0
+        or (input_count > 0 and not entries)
+    ):
+        return False
+    return True
+
+
+def _acceptance_validation_blocks(
+    entries: list[dict[str, Any]],
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only source records needed to deterministically replay the result."""
+
+    needed = {
+        str(item.get("first_block_id") or "")
+        for item in entries
+        if isinstance(item, dict) and item.get("first_block_id")
+    }
+    return [dict(block) for block in blocks if block_id(block) in needed]
 
 
 def _deduplicate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:

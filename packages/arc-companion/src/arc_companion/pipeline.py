@@ -28,7 +28,11 @@ from .content import (
 )
 from .chapters import CHAPTERS_VERSION, build_chapters
 from .artifact_store import AcceptedArtifactStore, artifact_id_for, canonical_sha256
-from .chapter_glossary import generate_index_glossary, project_segment_glossary
+from .chapter_glossary import (
+    INDEX_GLOSSARY_BATCH_VERSION,
+    generate_index_glossary,
+    project_segment_glossary,
+)
 from .chapter_guide import (
     CHAPTER_GUIDE_VERSION,
     chapter_guide_artifact_valid,
@@ -36,18 +40,45 @@ from .chapter_guide import (
 )
 from .chapter_scheduler import run_chapter_pipeline
 from .ledger import (
+    LaneLedgerError,
     accept_deferred_block,
     accept_controller_skipped_block,
     accept_reused_block,
     advance_block,
     clear_needs_supervision,
+    initialize_control_ledger,
     initialize_lane_ledger,
     invalidate_suffix,
+    lane_transition_guard,
     mark_needs_supervision,
     mark_response_received,
     mark_submitted,
 )
+from .ledger_registry import (
+    LaneLedgerRegistryError,
+    lane_ledger_is_registered,
+    legacy_lane_ledger_paths,
+    read_registered_lane_ledger,
+    registered_lane_ledger_paths,
+)
 from .progress import CompanionProgress
+from .recovery_units import (
+    call_model_with_recovery_descriptor,
+    recovery_unit_for_ledger,
+    submission_descriptor,
+    pipeline_lane_binding,
+)
+from .recovery_responses import (
+    RecoveryResponseError,
+    discover_submission_receipts,
+    explicit_attempt_references,
+    recover_complete_ledger_response,
+    seal_submission_attempts,
+    submission_receipt_reference,
+    validate_ledger_submission_reference,
+    write_ledger_submission_receipt,
+    resolve_recovery_path,
+)
 from .migration import (
     MIGRATION_VERSION,
     NEVER_MIGRATED_ARTIFACTS,
@@ -59,7 +90,12 @@ from .migration import (
     migrate_legacy_translations,
     read_legacy_checkpoint,
 )
-from .glossary import GLOSSARY_VERSION, generate_glossary, glossary_entry_limit
+from .glossary import (
+    GLOSSARY_VERSION,
+    generate_glossary,
+    glossary_entry_limit,
+    validate_glossary_acceptance_checkpoint,
+)
 from .domain import load_domain_context
 from .evidence import (
     arc_cache_descriptor,
@@ -123,6 +159,7 @@ from .response_normalization import (
     ResponseNormalizationError,
     normalize_complete_response_with_receipt,
 )
+from .secure_io import SecureReadError, read_bounded_file, read_bounded_json
 from .reuse import REUSE_PLAN_VERSION, lane_recipe_sha256, lane_semantic_sha256
 from .results import err, ok
 from .run_lock import BuildInProgressError, ProjectBuildLock
@@ -132,6 +169,7 @@ from .segmentation import (
     SegmentationError,
     construct_segments_from_cuts,
     segment_document,
+    validate_segmentation_acceptance_checkpoint,
     validate_exact_coverage,
 )
 from .source import SourceBundle, SourceError, block_id, load_source_bundle
@@ -144,6 +182,7 @@ from .title_translation import (
     collect_title_records,
     merge_title_translation_chunks,
     title_translation_prompt,
+    validate_title_translations,
 )
 from .stateful_pipeline import (
     ContextRolloverBudget,
@@ -341,7 +380,9 @@ class BuildOptions:
     regenerate_segments: tuple[str, ...] = ()
     confirm_expensive_regeneration: bool = False
     regenerate_commentary: bool = False
-    supervised_native_resume_keys: tuple[str, ...] = ()
+    supervised_native_resume_identities: tuple[
+        tuple[str, str, str, int, str], ...
+    ] = ()
     legacy_checkpoint: Path | None = None
 
     def __post_init__(self) -> None:
@@ -395,16 +436,41 @@ class BuildOptions:
         object.__setattr__(
             self, "user_intent", str(self.user_intent or "").strip() or None,
         )
-        normalized_resume_keys = tuple(
-            dict.fromkeys(
-                str(value).strip()
-                for value in self.supervised_native_resume_keys
-                if str(value).strip()
+        normalized_resume_identities: list[tuple[str, str, str, int, str]] = []
+        for raw in self.supervised_native_resume_identities:
+            if not isinstance(raw, (tuple, list)) or len(raw) != 5:
+                raise ValueError("supervised native resume identity must be a 5-tuple")
+            ledger_path, session_key, logical_unit, generation, idempotency_key = raw
+            try:
+                normalized_generation = int(generation)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("supervised native resume generation is invalid") from exc
+            identity = (
+                str(Path(str(ledger_path)).expanduser().resolve(strict=False)),
+                str(session_key).strip(),
+                str(logical_unit).strip(),
+                normalized_generation,
+                str(idempotency_key).strip(),
             )
+            if (
+                not all(identity[index] for index in (0, 1, 2, 4))
+                or normalized_generation < 1
+            ):
+                raise ValueError(
+                    "supervised native resume identities must be complete"
+                )
+            # Durable discovery can encounter the same authorization through
+            # both a migrated transaction and a reconstructed receipt.  Fold
+            # only an exact normalized five-field duplicate; a shared logical
+            # key with any different ownership field remains distinct.
+            if identity in normalized_resume_identities:
+                continue
+            normalized_resume_identities.append(identity)
+        object.__setattr__(
+            self,
+            "supervised_native_resume_identities",
+            tuple(normalized_resume_identities),
         )
-        if len(normalized_resume_keys) != len(self.supervised_native_resume_keys):
-            raise ValueError("supervised_native_resume_keys must be non-empty and unique")
-        object.__setattr__(self, "supervised_native_resume_keys", normalized_resume_keys)
         if self.legacy_checkpoint is not None:
             legacy_checkpoint = self.legacy_checkpoint.expanduser().resolve()
             if not legacy_checkpoint.exists():
@@ -412,6 +478,14 @@ class BuildOptions:
             if not (legacy_checkpoint.is_file() or legacy_checkpoint.is_dir()):
                 raise ValueError("legacy_checkpoint must be a file or directory")
             object.__setattr__(self, "legacy_checkpoint", legacy_checkpoint)
+
+    @property
+    def supervised_native_resume_keys(self) -> tuple[str, ...]:
+        """Compatibility/audit projection; provider routing never uses this."""
+
+        return tuple(dict.fromkeys(
+            identity[4] for identity in self.supervised_native_resume_identities
+        ))
 
 
 def build_companion(
@@ -522,6 +596,17 @@ def _build_companion_unlocked(
         )
         generation_document = _generation_document(bundle.document)
         diagnostics = bundle.diagnostics
+        def register_bootstrap_recovery_root(root: Path) -> None:
+            nonlocal checkpoint_dir
+            checkpoint_dir = root.resolve(strict=False)
+            _state(
+                state_path,
+                status="building_intent_guidance",
+                paper_id=options.paper_id,
+                checkpoint_dir=str(checkpoint_dir),
+                recovery_options=_recovery_options(options),
+            )
+
         intent_guidance = build_intent_guidance(
             options.user_intent,
             source_language=str(options.source_language or "und"),
@@ -536,11 +621,14 @@ def _build_companion_unlocked(
             ),
             context_paper_ids=options.context_paper_ids,
             project_dir=project_dir,
-            call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
+            call_model=lambda prompt, schema, artifact_dir, call_label, recovery_descriptor=None: _llm_call(
                 llm, prompt, schema, options=options, artifact_dir=artifact_dir,
                 call_label=call_label, model_tier=INTENT_GUIDANCE_TIER,
                 force_offline=True, disable_paper_cli=True,
+                recovery_descriptor=recovery_descriptor,
             ),
+            accept_recovery=_accept_registered_pipeline_control,
+            register_recovery_root=register_bootstrap_recovery_root,
         )
         intent_guidance_identity = _intent_guidance_identity(intent_guidance)
         # Legacy context papers retain their prior bounded-body behavior only
@@ -764,10 +852,12 @@ def _build_companion_unlocked(
                 checkpoint_dir=checkpoint_dir,
                 workers=options.workers,
                 force=options.force,
-                call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
+                call_model=lambda prompt, schema, artifact_dir, call_label, recovery_descriptor=None: _llm_call(
                     llm, prompt, schema, options=options, artifact_dir=artifact_dir,
                     call_label=call_label, model_tier=SEGMENTATION_TIER,
+                    recovery_descriptor=recovery_descriptor,
                 ),
+                accept_recovery=_accept_registered_pipeline_control,
             )
 
         def glossary_task() -> dict[str, Any]:
@@ -787,14 +877,16 @@ def _build_companion_unlocked(
                 force=options.force,
                 page_count=_page_count(bundle),
                 intent_guidance_identity=intent_guidance_identity,
-                call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
+                call_model=lambda prompt, schema, artifact_dir, call_label, recovery_descriptor=None: _llm_call(
                     llm, _guided_prompt(prompt, intent_guidance, lane="glossary"), schema,
                     options=options, artifact_dir=artifact_dir,
                     call_label=call_label, model_tier=GLOSSARY_TIER,
                     paper_access_policy=_guidance_policy(intent_guidance, lane="glossary"),
                     intent_guidance=intent_guidance,
                     intent_guidance_lane="glossary",
+                    recovery_descriptor=recovery_descriptor,
                 ),
+                accept_recovery=_accept_registered_pipeline_control,
             )
 
         # Segmentation is the structural preflight for every downstream lane.
@@ -820,7 +912,7 @@ def _build_companion_unlocked(
             protected_names=protected_names,
             checkpoint_dir=checkpoint_dir,
             intent_guidance_identity=intent_guidance_identity,
-            call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
+            call_model=lambda prompt, schema, artifact_dir, call_label, recovery_descriptor=None: _llm_call(
                 llm,
                 _guided_prompt(prompt, intent_guidance, lane="title_translation"),
                 schema, options=options,
@@ -831,6 +923,7 @@ def _build_companion_unlocked(
                 ),
                 intent_guidance=intent_guidance,
                 intent_guidance_lane="title_translation",
+                recovery_descriptor=recovery_descriptor,
             ),
         )
 
@@ -1149,6 +1242,8 @@ def _build_companion_unlocked(
             _read_optional_json(state_path)
         )
 
+        _accept_completed_pipeline_controls(checkpoint_dir)
+
         final_state = _state(
             state_path,
             status="complete",
@@ -1260,6 +1355,10 @@ def _build_chaptered_companion(
     )
     chapters_pack = build_chapters(document, structure=structure)
     write_json(checkpoint_dir / "chapters.json", chapters_pack)
+    chapter_segments_ready = {
+        str(item["chapter_id"]): threading.Event()
+        for item in chapters_pack["chapters"]
+    }
     migration_lock = threading.RLock()
     legacy = (
         read_legacy_checkpoint(options.legacy_checkpoint)
@@ -1464,7 +1563,7 @@ def _build_chaptered_companion(
 
     def model(
         prompt, schema, artifact_dir, call_label, tier, *, guided=False,
-        prefix_guidance=True, guidance_lane=None,
+        prefix_guidance=True, guidance_lane=None, recovery_descriptor=None,
     ):
         with submission_limiter.permit():
             return _llm_call(llm, _guided_prompt(
@@ -1480,7 +1579,8 @@ def _build_chaptered_companion(
                                  ) if guided else None
                              ),
                              intent_guidance=intent_guidance if guided else None,
-                             intent_guidance_lane=guidance_lane if guided else None)
+                             intent_guidance_lane=guidance_lane if guided else None,
+                             recovery_descriptor=recovery_descriptor)
 
     glossary_input_hash = ""
     glossary_recipe_hash = ""
@@ -1518,7 +1618,7 @@ def _build_chaptered_companion(
                     continue
                 old_checkpoint = Path(str(provenance.get("checkpoint_dir") or ""))
                 old_metadata = _read_checkpoint_json(
-                    old_checkpoint / "migration-metadata.json"
+                    old_checkpoint / "migration-metadata.json", root=old_checkpoint,
                 )
                 if not isinstance(old_metadata, dict):
                     continue
@@ -1556,10 +1656,11 @@ def _build_chaptered_companion(
             index_entries, language=options.annotation_language,
             checkpoint_dir=checkpoint_dir, force="glossary" in regeneration,
             intent_guidance_identity=guidance_identity,
-            call_model=lambda p, s, a, l: model(
+            call_model=lambda p, s, a, l, recovery_descriptor=None: model(
                 p, s, a, l, GLOSSARY_TIER, guided=True,
-                guidance_lane="glossary",
+                guidance_lane="glossary", recovery_descriptor=recovery_descriptor,
             ),
+            accept_recovery=_accept_registered_pipeline_control,
         )
     else:
         glossary_document = _augmentation_document(document)
@@ -1576,10 +1677,11 @@ def _build_chaptered_companion(
                 workers=options.workers, force="glossary" in regeneration,
                 page_count=_page_count(bundle),
                 intent_guidance_identity=guidance_identity,
-                call_model=lambda p, s, a, l: model(
+                call_model=lambda p, s, a, l, recovery_descriptor=None: model(
                     p, s, a, l, GLOSSARY_TIER, guided=True,
-                    guidance_lane="glossary",
+                    guidance_lane="glossary", recovery_descriptor=recovery_descriptor,
                 ),
+                accept_recovery=_accept_registered_pipeline_control,
             )
         )
     if (
@@ -1610,9 +1712,10 @@ def _build_chaptered_companion(
         checkpoint_dir=checkpoint_dir,
         artifact_store=artifact_store,
         intent_guidance_identity=guidance_identity,
-        call_model=lambda prompt, schema, artifact_dir, call_label: model(
+        call_model=lambda prompt, schema, artifact_dir, call_label, recovery_descriptor=None: model(
             prompt, schema, artifact_dir, call_label, TITLE_TRANSLATION_TIER,
             guided=True, guidance_lane="title_translation",
+            recovery_descriptor=recovery_descriptor,
         ),
     )
     blocks_by_id = {block_id(item): item for item in document.get("blocks") or []}
@@ -1736,7 +1839,11 @@ def _build_chaptered_companion(
             raw = segment_document(
                 chapter_document, checkpoint_dir=checkpoint_dir / "chapters" / chapter_id,
                 workers=options.workers, force="segmentation" in regeneration,
-                call_model=lambda p, s, a, l: model(p, s, a, l, SEGMENTATION_TIER),
+                call_model=lambda p, s, a, l, recovery_descriptor=None: model(
+                    p, s, a, l, SEGMENTATION_TIER,
+                    recovery_descriptor=recovery_descriptor,
+                ),
+                accept_recovery=_accept_registered_pipeline_control,
                 seed_cuts=(
                     list(cut_migration.get("reused", {}).get(chapter_id) or [])
                     if chapter_id in cut_migration.get("reused", {}) else None
@@ -1810,7 +1917,8 @@ def _build_chaptered_companion(
                         )
                         payload = _read_checkpoint_json(
                             artifact_dir
-                            / f"{_segment_checkpoint_name(old_segment_id)}.json"
+                            / f"{_segment_checkpoint_name(old_segment_id)}.json",
+                            root=checkpoint_dir,
                         )
                         payload_key = (
                             "translation" if requested_lane == "translation"
@@ -1909,8 +2017,16 @@ def _build_chaptered_companion(
                     )
             if session_manager is not None:
                 session_key = f"{chapter_id}:{ledger_lane}"
-                if session_manager.get_existing(session_key) is not None:
-                    session_manager.rotate(session_key, reason=f"explicit-{requested_lane}-regeneration")
+                ref = session_manager.get_existing(session_key)
+                while ref is not None and ref.generation < generation:
+                    ref = session_manager.rotate(
+                        session_key,
+                        reason=f"explicit-{requested_lane}-regeneration",
+                    )
+                if ref is not None and ref.generation != generation:
+                    raise StatefulSessionError(
+                        f"{session_key} generation changed outside explicit regeneration"
+                    )
         with reader_data_lock:
             reader_segments.update({str(item["segment_id"]): dict(item) for item in segments})
             reader_segment_count = len(reader_segments)
@@ -1968,6 +2084,7 @@ def _build_chaptered_companion(
                     translation_migration.get("receipts") or []
                 )
                 write_json(checkpoint_dir / "legacy-migration.json", migration_report)
+        chapter_segments_ready[chapter_id].set()
         return segments
 
     def prepare_guide(chapter):
@@ -2080,6 +2197,38 @@ def _build_chaptered_companion(
                     session_key = f"{chapter_id}:guide"
                     if session_manager.get_existing(session_key) is not None:
                         session_manager.rotate(session_key, reason="explicit-guide-regeneration")
+            if guide_ledger["blocks"][0]["state"] == "accepted":
+                accepted_block = guide_ledger["blocks"][0]
+                accepted_path = (
+                    checkpoint_dir / "chapters" / chapter_id / "chapter-guide.json"
+                )
+                accepted_guide = _read_checkpoint_json(
+                    accepted_path, root=checkpoint_dir,
+                )
+                if (
+                    isinstance(accepted_guide, Mapping)
+                    and sha256_json(accepted_guide)
+                    == accepted_block.get("output_sha256")
+                    and chapter_guide_artifact_valid(
+                        accepted_guide,
+                        evidence=evidence,
+                        allow_internet=options.allow_internet,
+                    )
+                ):
+                    guide = dict(accepted_guide)
+                    mark_plan_lane(
+                        "guide", chapter_id=chapter_id,
+                        artifact={"reuse_status": "hit"},
+                        reason=(
+                            "accepted guide checkpoint passed current local validation"
+                        ),
+                    )
+                    with reader_data_lock:
+                        reader_guides[chapter_id] = dict(guide)
+                    return guide
+                raise RuntimeError(
+                    "accepted guide checkpoint is missing or fails local validation"
+                )
             if guide_ledger["blocks"][0]["state"] == "prepared" and "guide" not in regeneration:
                 guide_object = artifact_store.find(
                     kind="guide", semantic_input_sha256=guide_input_hash,
@@ -2122,6 +2271,7 @@ def _build_chaptered_companion(
         guide_receipt: dict[str, Any] = {}
         guide_provider_receipt: dict[str, Any] = {}
         last_guide_call: dict[str, str] = {}
+        last_guide_submission_receipt: Path | None = None
         guide_policy = _guidance_policy(intent_guidance, lane="guide")
         guide_structured_policy = bool(
             guide_policy is not None
@@ -2133,10 +2283,42 @@ def _build_chaptered_companion(
                 return model(
                     prompt, schema, artifact_dir, call_label, ANNOTATION_TIER,
                     guided=True, prefix_guidance=False, guidance_lane="guide",
+                    recovery_descriptor=submission_descriptor(
+                        unit="guide",
+                        logical_unit=guide_segment_id,
+                        checkpoint_dir=checkpoint_dir,
+                        artifact_root=artifact_dir,
+                        acceptance_checkpoint=(
+                            checkpoint_dir / "chapters" / chapter_id
+                            / "chapter-guide.json"
+                        ),
+                        input_sha256=guide_input_hash,
+                        ordered_siblings=[guide_segment_id],
+                        suffix=[guide_segment_id],
+                    ),
                 )
             session_key = f"{chapter_id}:guide"
             existing_session = session_manager.get_existing(session_key)
-            generation = existing_session.generation if existing_session else 1
+            registered_guide, _registered_guide_digest = read_registered_lane_ledger(
+                checkpoint_dir, guide_ledger_path,
+            )
+            registered_guide_block = next(
+                item for item in registered_guide.get("blocks") or []
+                if item.get("segment_id") == guide_segment_id
+            )
+            generation = int(
+                registered_guide_block.get("generation")
+                or registered_guide.get("generation")
+                or 1
+            )
+            while existing_session is not None and existing_session.generation < generation:
+                existing_session = session_manager.rotate(
+                    session_key, reason="align guide ledger generation",
+                )
+            if existing_session is not None and existing_session.generation != generation:
+                raise StatefulSessionError(
+                    f"{session_key} generation changed outside guide control"
+                )
             idempotency_key = f"{chapter_id}:guide:{call_label}:generation-{generation}"
             current_idempotency_key = idempotency_key
             last_guide_call.update({
@@ -2146,7 +2328,7 @@ def _build_chaptered_companion(
             def invoke(
                 active_prompt: str, active_schema: dict[str, Any], evidence_round: int,
             ) -> Any:
-                nonlocal current_idempotency_key
+                nonlocal current_idempotency_key, last_guide_submission_receipt
                 round_suffix = "" if evidence_round == 0 else f":evidence-{evidence_round:02d}"
                 current_idempotency_key = idempotency_key + round_suffix
                 active_label = (
@@ -2162,6 +2344,31 @@ def _build_chaptered_companion(
                     "idempotency_key": current_idempotency_key,
                     "artifact_dir": str(active_artifact_dir),
                 })
+                last_guide_submission_receipt = write_ledger_submission_receipt(
+                    checkpoint_dir=checkpoint_dir,
+                    artifact_dir=active_artifact_dir,
+                    ledger_path=guide_ledger_path,
+                    session_key=session_key,
+                    logical_unit=guide_segment_id,
+                    generation=generation,
+                    idempotency_key=current_idempotency_key,
+                    schema=active_schema,
+                    prompt=active_prompt,
+                    recovery_unit="guide",
+                    input_sha256=guide_input_hash,
+                    ordered_siblings=[guide_segment_id],
+                    suffix=[guide_segment_id],
+                    validator="chapter-guide-schema+invariants.v1",
+                    application="normal-guide-pipeline-replay.v1",
+                )
+                native_resume_authorization = _supervised_native_resume_authorized(
+                    options,
+                    ledger_path=guide_ledger_path,
+                    session_key=session_key,
+                    logical_unit=guide_segment_id,
+                    generation=generation,
+                    idempotency_key=current_idempotency_key,
+                )
                 with submission_limiter.permit():
                     return result_llm(
                         active_prompt, schema=active_schema,
@@ -2183,9 +2390,14 @@ def _build_chaptered_companion(
                         session_key=session_key,
                         idempotency_key=current_idempotency_key,
                         progress_contract_scope="session",
-                        supervised_native_resume=(
-                            current_idempotency_key in options.supervised_native_resume_keys
+                        initial_native_authorization=(
+                            str(guide_ledger_path.resolve(strict=False)),
+                            session_key,
+                            guide_segment_id,
+                            generation,
+                            current_idempotency_key,
                         ),
+                        supervised_native_resume=native_resume_authorization,
                         validated_legacy_logical_identity=(
                             {
                                 "provider": current_session.provider,
@@ -2194,8 +2406,9 @@ def _build_chaptered_companion(
                                 "generation": generation,
                                 "idempotency_key": current_idempotency_key,
                             }
-                            if current_idempotency_key in options.supervised_native_resume_keys
-                            and current_session is not None else None
+                            if native_resume_authorization is not None
+                            and current_session is not None
+                            else None
                         ),
                         validated_legacy_runtime_identity=(
                             {
@@ -2206,13 +2419,18 @@ def _build_chaptered_companion(
                                 "native_session_id": current_session.native_session_id,
                                 "recorded_fp": current_session.runtime_fingerprint,
                             }
-                            if current_idempotency_key in options.supervised_native_resume_keys
-                            and current_session is not None else None
+                            if native_resume_authorization is not None
+                            and current_session is not None
+                            else None
                         ),
                         cancel_check=cancel_inflight_check,
                         progress_callback=lambda event: (
-                            mark_submitted(
-                                guide_ledger_path, segment_id=guide_segment_id
+                            _guarded_mark_transport_state(
+                                guide_ledger_path,
+                                checkpoint_dir=checkpoint_dir,
+                                session_key=session_key,
+                                logical_unit=guide_segment_id,
+                                idempotency_key=idempotency_key,
                             )
                             if event.get("event") == "submitted"
                             else None,
@@ -2239,9 +2457,31 @@ def _build_chaptered_companion(
                         idempotency_key=current_idempotency_key,
                         session_manager=session_manager, session_key=session_key,
                     )
+                    recovery_context = _recovery_context_json(
+                        recovery, logical_unit=guide_segment_id,
+                    )
+                    if last_guide_submission_receipt is not None:
+                        try:
+                            seal_submission_attempts(
+                                last_guide_submission_receipt,
+                                checkpoint_dir=checkpoint_dir,
+                                attempt_references=explicit_attempt_references(
+                                    exc,
+                                    checkpoint_dir=checkpoint_dir,
+                                    artifact_dir=Path(last_guide_call["artifact_dir"]),
+                                ),
+                            )
+                            recovery_context["submission_receipt"] = (
+                                submission_receipt_reference(
+                                    last_guide_submission_receipt,
+                                    checkpoint_dir=checkpoint_dir,
+                                )
+                            )
+                        except RecoveryResponseError as receipt_exc:
+                            recovery_context["submission_receipt_error"] = str(receipt_exc)
                     mark_needs_supervision(
                         guide_ledger_path, segment_id=guide_segment_id, reason=str(exc),
-                        recovery_context=_recovery_context_json(recovery),
+                        recovery_context=recovery_context,
                     )
                     supervision_event.set()
                 raise
@@ -2255,9 +2495,13 @@ def _build_chaptered_companion(
                 "call_id": str(guide_receipt.get("idempotency_key") or guide_receipt.get("call_id") or call_label),
                 "usage": dict(usage_json) if isinstance(usage_json, dict) else {},
             })
-            mark_submitted(guide_ledger_path, segment_id=guide_segment_id)
-            mark_response_received(
-                guide_ledger_path, segment_id=guide_segment_id
+            _guarded_mark_transport_state(
+                guide_ledger_path,
+                checkpoint_dir=checkpoint_dir,
+                session_key=session_key,
+                logical_unit=guide_segment_id,
+                idempotency_key=idempotency_key,
+                response_received=True,
             )
             return final_value
         try:
@@ -2287,6 +2531,12 @@ def _build_chaptered_companion(
             )
             supervision_event.set()
             raise
+        if result_llm is None and _pipeline_control_receipt_exists(
+            checkpoint_dir, "guide", guide_segment_id,
+        ):
+            _accept_registered_pipeline_control(
+                checkpoint_dir, "guide", guide_segment_id,
+            )
         if result_llm is not None and guide_ledger is not None:
             current = initialize_lane_ledger(
                 guide_ledger_path, chapter_id=chapter_id, lane="guide",
@@ -2511,7 +2761,13 @@ def _build_chaptered_companion(
             return stream
 
     def run_lane(prepared, segment, lane):
+        lane_binding = pipeline_lane_binding(str(lane))
         chapter_id, segment_id = prepared.chapter["chapter_id"], segment["segment_id"]
+        # The scheduler may expose prepared segment objects while the chapter
+        # preparation worker is still committing explicit invalidations.  A
+        # paid lane must not snapshot its generation until that transaction is
+        # complete.
+        chapter_segments_ready[str(chapter_id)].wait()
         with prepared_report_lock:
             if chapter_id not in prepared_reported:
                 progress.safe_boundary("chapter_prepared", chapter_id=chapter_id,
@@ -3053,6 +3309,7 @@ def _build_chaptered_companion(
                 ),
             )
         lane_llm = llm
+        transport_control: dict[str, str | None] = {"idempotency_key": None}
         if result_llm is not None and session_manager is not None:
             stream = lane_stream(prepared, lane, block_generation)
             guidance_lane = "translation" if lane == "translation" else "commentary"
@@ -3062,14 +3319,37 @@ def _build_chaptered_companion(
                 and _accepts_explicit_keyword(result_llm, "paper_access_policy")
             )
             def lane_llm(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                nonlocal block_generation, ledger, stream
                 call_label = str(kwargs.get("call_label") or segment_id)
                 artifact_dir = Path(kwargs["artifact_dir"])
                 session_key = f"{chapter_id}:{lane}"
+                # Chapter preparation and lane scheduling may overlap.  Bind
+                # the paid call to the current registered generation at the
+                # final controller boundary, never to a stale pre-invalidation
+                # snapshot captured while the chapter was being prepared.
+                current_ledger, _current_digest = read_registered_lane_ledger(
+                    checkpoint_dir, path,
+                )
+                current_block = next(
+                    item for item in current_ledger.get("blocks") or []
+                    if item.get("segment_id") == segment_id
+                )
+                current_generation = int(
+                    current_block.get("generation")
+                    or current_ledger.get("generation")
+                    or 1
+                )
+                if current_generation != block_generation:
+                    ledger = current_ledger
+                    block_generation = current_generation
+                    stream = lane_stream(prepared, lane, block_generation)
                 if "repair" in call_label.casefold() or "correction" in call_label.casefold():
                     correction_budget.consume(f"{chapter_id}:{lane}:{segment_id}")
                 idempotency_key = (
                     f"{chapter_id}:{lane}:{call_label}:generation-{block_generation}"
                 )
+                if transport_control["idempotency_key"] is None:
+                    transport_control["idempotency_key"] = idempotency_key
                 correction = "repair" in call_label.casefold() or "correction" in call_label.casefold()
                 paper_context = _full_paper_context(
                     document, segment, blocks_by_id=blocks_by_id, options=options,
@@ -3113,12 +3393,14 @@ def _build_chaptered_companion(
                 base_schema = kwargs.get("schema") or {}
                 current_idempotency_key = idempotency_key
                 current_artifact_dir = artifact_dir
+                current_submission_receipt: Path | None = None
                 def invoke(
                     active_prompt: str,
                     active_schema: dict[str, Any],
                     evidence_round: int,
                 ) -> Any:
-                    nonlocal current_idempotency_key, current_artifact_dir
+                    nonlocal current_idempotency_key
+                    nonlocal current_artifact_dir, current_submission_receipt
                     round_suffix = (
                         "" if evidence_round == 0
                         else f":evidence-{evidence_round:02d}"
@@ -3133,6 +3415,41 @@ def _build_chaptered_companion(
                         else artifact_dir / f"evidence-round-{evidence_round:02d}"
                     )
                     current_artifact_dir = active_artifact_dir
+                    ordered_segment_ids = [
+                        str(item.get("segment_id") or "")
+                        for item in ledger.get("blocks") or []
+                    ]
+                    try:
+                        suffix_offset = ordered_segment_ids.index(segment_id)
+                    except ValueError:
+                        suffix_offset = len(ordered_segment_ids)
+                    current_submission_receipt = write_ledger_submission_receipt(
+                        checkpoint_dir=checkpoint_dir,
+                        artifact_dir=active_artifact_dir,
+                        ledger_path=path,
+                        session_key=session_key,
+                        logical_unit=segment_id,
+                        generation=block_generation,
+                        idempotency_key=current_idempotency_key,
+                        schema=active_schema,
+                        prompt=active_prompt,
+                        recovery_unit=lane_binding.recovery_unit,
+                        input_sha256=_segment_input_hash(
+                            segment, blocks_by_id, glossary=segment_glossary,
+                        ),
+                        ordered_siblings=ordered_segment_ids,
+                        suffix=ordered_segment_ids[suffix_offset:],
+                        validator=lane_binding.validator,
+                        application=lane_binding.application,
+                    )
+                    native_resume_authorization = _supervised_native_resume_authorized(
+                        options,
+                        ledger_path=path,
+                        session_key=session_key,
+                        logical_unit=segment_id,
+                        generation=block_generation,
+                        idempotency_key=current_idempotency_key,
+                    )
                     with submission_limiter.permit():
                         existing_session = session_manager.get_existing(session_key)
                         return result_llm(
@@ -3164,10 +3481,14 @@ def _build_chaptered_companion(
                             idempotency_key=current_idempotency_key,
                             progress_contract_scope="session",
                             schema_formatter_enabled=False,
-                            supervised_native_resume=(
-                                current_idempotency_key
-                                in options.supervised_native_resume_keys
+                            initial_native_authorization=(
+                                str(path.resolve(strict=False)),
+                                session_key,
+                                segment_id,
+                                block_generation,
+                                current_idempotency_key,
                             ),
+                            supervised_native_resume=native_resume_authorization,
                             validated_legacy_logical_identity=(
                                 {
                                     "provider": existing_session.provider,
@@ -3176,8 +3497,7 @@ def _build_chaptered_companion(
                                     "generation": block_generation,
                                     "idempotency_key": current_idempotency_key,
                                 }
-                                if current_idempotency_key
-                                in options.supervised_native_resume_keys
+                                if native_resume_authorization is not None
                                 and existing_session is not None else None
                             ),
                             validated_legacy_runtime_identity=(
@@ -3189,13 +3509,20 @@ def _build_chaptered_companion(
                                     "native_session_id": existing_session.native_session_id,
                                     "recorded_fp": existing_session.runtime_fingerprint,
                                 }
-                                if current_idempotency_key
-                                in options.supervised_native_resume_keys
+                                if native_resume_authorization is not None
                                 and existing_session is not None else None
                             ),
                             cancel_check=cancel_inflight_check,
                             progress_callback=lambda event: (
-                                mark_submitted(path, segment_id=segment_id)
+                                _guarded_mark_transport_state(
+                                    path,
+                                    checkpoint_dir=checkpoint_dir,
+                                    session_key=session_key,
+                                    logical_unit=segment_id,
+                                    idempotency_key=str(
+                                        transport_control["idempotency_key"]
+                                    ),
+                                )
                                 if event.get("event") == "submitted"
                                 else None,
                                 progress.provider_event(event),
@@ -3224,17 +3551,47 @@ def _build_chaptered_companion(
                             idempotency_key=current_idempotency_key,
                             session_manager=session_manager, session_key=session_key,
                         )
+                        recovery_context = _recovery_context_json(
+                            recovery, logical_unit=segment_id,
+                        )
+                        if current_submission_receipt is not None:
+                            try:
+                                seal_submission_attempts(
+                                    current_submission_receipt,
+                                    checkpoint_dir=checkpoint_dir,
+                                    attempt_references=explicit_attempt_references(
+                                        exc,
+                                        checkpoint_dir=checkpoint_dir,
+                                        artifact_dir=current_artifact_dir,
+                                    ),
+                                )
+                                recovery_context["submission_receipt"] = (
+                                    submission_receipt_reference(
+                                        current_submission_receipt,
+                                        checkpoint_dir=checkpoint_dir,
+                                    )
+                                )
+                            except RecoveryResponseError as receipt_exc:
+                                recovery_context["submission_receipt_error"] = str(
+                                    receipt_exc
+                                )
                         mark_needs_supervision(
                             path, segment_id=segment_id, reason=str(exc),
-                            recovery_context=_recovery_context_json(recovery),
+                            recovery_context=recovery_context,
                         )
                         supervision_event.set()
                     raise
                 logical_receipts[call_label] = dict(outcome.logical_receipt or {})
                 if not logical_receipts[call_label]:
                     raise RuntimeError(f"stateful call {call_label} returned no logical receipt")
-                mark_submitted(path, segment_id=segment_id)
-                mark_response_received(path, segment_id=segment_id)
+                _guarded_mark_transport_state(
+                    path,
+                    checkpoint_dir=checkpoint_dir,
+                    session_key=session_key,
+                    logical_unit=segment_id,
+                    idempotency_key=str(transport_control["idempotency_key"]),
+                    response_received=True,
+                )
                 usage = getattr(outcome, "usage", {})
                 usage_json = usage.to_json() if hasattr(usage, "to_json") else usage
                 logical = logical_receipts[call_label]
@@ -3280,6 +3637,10 @@ def _build_chaptered_companion(
                     stream=stream, budget=rollover_budgets[generation_key],
                 )
                 return final_value
+            # The stateful adapter writes the production receipt against the
+            # real chapter lane immediately before result_llm.  The generic
+            # stateless hook must not create a second receipt for that call.
+            setattr(lane_llm, "_arc_owns_recovery_receipt", True)
         try:
             if accepted_commentary_artifact is not None:
                 value = dict(accepted_commentary_artifact["output"])
@@ -3367,8 +3728,22 @@ def _build_chaptered_companion(
             # A successfully returned stateless call is itself a definitive
             # submission/response receipt; stateful calls normally crossed
             # these barriers earlier through provider progress.
-            mark_submitted(path, segment_id=segment_id)
-            mark_response_received(path, segment_id=segment_id)
+            chapter_call_label = (
+                f"companion-{'translation' if lane == 'translation' else 'annotation'}-"
+                f"{segment_id}"
+            )
+            chapter_control_key = str(
+                transport_control["idempotency_key"]
+                or f"{chapter_id}:{lane}:{chapter_call_label}:generation-{block_generation}"
+            )
+            _guarded_mark_transport_state(
+                path,
+                checkpoint_dir=checkpoint_dir,
+                session_key=f"{chapter_id}:{lane}",
+                logical_unit=segment_id,
+                idempotency_key=chapter_control_key,
+                response_received=True,
+            )
         accepted_ledger = None
         if newly_accepted:
             advance_block(path, segment_id=segment_id, state="schema_valid")
@@ -3680,6 +4055,10 @@ def _build_chaptered_companion(
         final_overrides=final_reader_overrides,
         strict=True,
     )
+    # Provider success is only response_received. Promote stateless controls
+    # after the owning business pipeline completed normalization, invariants,
+    # and durable application checkpoints.
+    _accept_completed_pipeline_controls(checkpoint_dir)
     managed_run_pdf = managed_run_root_pdf_path(
         _read_optional_json(state_path)
     )
@@ -3727,8 +4106,8 @@ def _supervised_lane_ledger_paths(checkpoint_dir: Path) -> list[Path]:
     paths: list[Path] = []
     for path in _all_lane_ledger_paths(checkpoint_dir):
         try:
-            ledger = read_json(path)
-        except (OSError, ValueError, json.JSONDecodeError):
+            ledger = _read_recovery_ledger(checkpoint_dir, path)
+        except (OSError, ValueError, json.JSONDecodeError, SecureReadError):
             continue
         if isinstance(ledger, dict) and ledger.get("needs_supervision"):
             paths.append(path)
@@ -3757,23 +4136,23 @@ def _active_supervision_entries(ledger: Mapping[str, Any]) -> list[dict[str, Any
     )
 
 
-def _all_lane_ledger_paths(checkpoint_dir: Path) -> list[Path]:
-    """Find production ledgers regardless of their chapter artifact layout."""
-    paths: list[Path] = []
-    for path in sorted(checkpoint_dir.rglob("*-ledger.json")):
-        try:
-            value = read_json(path)
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(value, dict):
-            continue
-        if (
-            value.get("schema_version") == "arc.companion.chapter-lane-ledger.v2"
-            and value.get("chapter_id")
-            and value.get("lane")
-        ):
-            paths.append(path)
-    return paths
+def _all_lane_ledger_paths(
+    checkpoint_dir: Path, *, include_explicit_legacy: bool = False,
+) -> list[Path]:
+    """Read the bounded ARC-owned ledger registry for automatic recovery.
+
+    The legacy scan is intentionally reachable only from explicit
+    ``resume-native`` call sites.  It must never define automatic ownership.
+    """
+
+    paths = registered_lane_ledger_paths(checkpoint_dir)
+    if include_explicit_legacy:
+        known = {str(path) for path in paths}
+        paths.extend(
+            path for path in legacy_lane_ledger_paths(checkpoint_dir)
+            if str(path) not in known
+        )
+    return sorted(paths)
 
 
 def _chapter_failure_requires_supervision(exc: BaseException) -> bool:
@@ -3895,14 +4274,18 @@ def _finalize_paid_translation_repairs(
     checkpoint_dir: Path,
 ) -> list[dict[str, Any]]:
     """Classify every unaccepted paid token repair without provider calls."""
-    document_payload = _read_checkpoint_json(checkpoint_dir / "document.json")
+    document_payload = _read_checkpoint_json(
+        checkpoint_dir / "document.json", root=checkpoint_dir,
+    )
     document = (
         document_payload.get("document")
         if isinstance(document_payload, dict) else None
     )
     if not isinstance(document, dict):
         return []
-    glossary = _read_checkpoint_json(checkpoint_dir / "glossary.json")
+    glossary = _read_checkpoint_json(
+        checkpoint_dir / "glossary.json", root=checkpoint_dir,
+    )
     protected_names = _protected_names(
         SourceBundle(
             paper_id=str(document_payload.get("paper_id") or "checkpoint"),
@@ -3916,7 +4299,7 @@ def _finalize_paid_translation_repairs(
     }
     ledgers: dict[str, tuple[Path, dict[str, Any], dict[str, Any]]] = {}
     for ledger_path in _all_lane_ledger_paths(checkpoint_dir):
-        ledger = read_json(ledger_path)
+        ledger = _read_recovery_ledger(checkpoint_dir, ledger_path)
         if ledger.get("lane") != "translation":
             continue
         for block in ledger.get("blocks") or []:
@@ -3924,15 +4307,89 @@ def _finalize_paid_translation_repairs(
                 ledgers[str(block.get("segment_id") or "")] = (
                     ledger_path, ledger, block,
                 )
+    repair_bindings: dict[tuple[str, str], dict[str, Any]] = {}
+    ambiguous_bindings: set[tuple[str, str]] = set()
+    for receipt_path, receipt in discover_submission_receipts(checkpoint_dir):
+        unit = str(receipt.get("recovery_unit") or "")
+        suffix = {
+            "translation-token-repair": ":token-repair",
+            "translation-coverage-repair": ":coverage-repair",
+        }.get(unit)
+        logical_unit = str(receipt.get("logical_unit") or "")
+        if suffix is None or not logical_unit.endswith(suffix) or not receipt.get("sealed"):
+            continue
+        segment_id = logical_unit[:-len(suffix)]
+        located = ledgers.get(segment_id)
+        if located is None:
+            continue
+        _chapter_path, chapter_ledger, chapter_block = located
+        generation = int(
+            chapter_block.get("generation")
+            or chapter_ledger.get("generation")
+            or 1
+        )
+        if int(receipt.get("generation") or 0) != generation:
+            continue
+        try:
+            control_path = resolve_recovery_path(
+                checkpoint_dir, receipt.get("ledger_path"),
+            )
+            reference = submission_receipt_reference(
+                receipt_path, checkpoint_dir=checkpoint_dir,
+            )
+            validated = _validate_pipeline_submission_reference(
+                reference,
+                checkpoint_dir=checkpoint_dir,
+                ledger_path=control_path,
+                session_key=str(receipt.get("session_key") or ""),
+                logical_unit=logical_unit,
+                generation=generation,
+                idempotency_key=str(receipt.get("idempotency_key") or ""),
+            )
+            call_checkpoint_path = resolve_recovery_path(
+                checkpoint_dir, validated.get("checkpoint_path"),
+            )
+            call_checkpoint = _read_recovery_json(
+                checkpoint_dir, call_checkpoint_path,
+            )
+        except (RecoveryResponseError, SecureReadError, TypeError, ValueError):
+            continue
+        if not isinstance(call_checkpoint, Mapping):
+            continue
+        key = (unit, segment_id)
+        if key in repair_bindings:
+            ambiguous_bindings.add(key)
+            repair_bindings.pop(key, None)
+            continue
+        if key not in ambiguous_bindings:
+            repair_bindings[key] = {
+                "receipt": validated,
+                "receipt_reference": reference,
+                "checkpoint_path": call_checkpoint_path,
+                "checkpoint": dict(call_checkpoint),
+            }
     entries: list[dict[str, Any]] = []
-    marker_dir = checkpoint_dir / "translation-token-offset-attempts"
-    for marker_path in sorted(marker_dir.rglob("*.json")) if marker_dir.is_dir() else []:
-        marker = _read_checkpoint_json(marker_path)
+    token_marker_paths = [
+        (segment_id, _translation_token_attempt_path(
+            checkpoint_dir,
+            segment_id,
+            int(binding["receipt"].get("generation") or 1),
+        ))
+        for (unit, segment_id), binding in repair_bindings.items()
+        if unit == "translation-token-repair"
+    ]
+    for segment_id, marker_path in sorted(token_marker_paths):
+        binding = repair_bindings[("translation-token-repair", segment_id)]
+        try:
+            marker = _read_recovery_json(checkpoint_dir, marker_path)
+        except SecureReadError:
+            continue
         if not isinstance(marker, dict) or marker.get("status") not in {
             "response_received", "validated",
         }:
             continue
-        segment_id = str(marker.get("segment_id") or "")
+        if str(marker.get("segment_id") or "") != segment_id:
+            continue
         try:
             marker_generation = _artifact_payload_generation(
                 marker, checkpoint_dir, "translation-token-offset-attempts",
@@ -3953,7 +4410,8 @@ def _finalize_paid_translation_repairs(
             _generation_segment_artifact_dir(
                 checkpoint_dir, "translation-drafts", segment_id,
                 marker_generation,
-            ) / marker_path.name
+            ) / marker_path.name,
+            root=checkpoint_dir,
         )
         source_ids = [str(value) for value in marker.get("block_ids") or []]
         raw_response = marker.get("raw_response")
@@ -3978,7 +4436,7 @@ def _finalize_paid_translation_repairs(
                     and str(item.get("block_id") or "") in blocks_by_id
                 ]
                 segmentation = _read_checkpoint_json(
-                    ledger_path.parent / "segmentation.json"
+                    ledger_path.parent / "segmentation.json", root=checkpoint_dir,
                 )
                 local_segment_id = segment_id.rsplit(".", 1)[-1]
                 segment_record = next((
@@ -4074,20 +4532,9 @@ def _finalize_paid_translation_repairs(
                 repaired = apply_and_validate_paid_response(projected_response)
             except (RuntimeError, StopIteration) as exc:
                 error = str(exc)
-        call_checkpoints = sorted(
-            (_generation_segment_artifact_dir(
-                checkpoint_dir, "llm/translations", segment_id,
-                marker_generation,
-            ) / marker_path.stem
-             / "retry-offset-1" / "call-checkpoints").glob("*.json")
-        )
-        call_checkpoint = next((
-            value for value in (
-                _read_checkpoint_json(path) for path in call_checkpoints
-            )
-            if isinstance(value, dict)
-            and value.get("submission_state") in {"submitted", "unknown"}
-        ), {})
+        call_checkpoint = binding["checkpoint"]
+        if call_checkpoint.get("submission_state") not in {"submitted", "unknown"}:
+            continue
         logical = dict(call_checkpoint.get("logical_identity") or {})
         context = {
             "submission_state": str(
@@ -4098,10 +4545,9 @@ def _finalize_paid_translation_repairs(
                 "operator-supervision" if error else "deterministic-replay"
             ),
             "repair_marker": str(marker_path),
-            "checkpoint_path": (
-                str(call_checkpoints[0]) if call_checkpoints else ""
-            ),
+            "checkpoint_path": str(binding["checkpoint_path"]),
             "idempotency_key": str(logical.get("idempotency_key") or ""),
+            "submission_receipt": dict(binding["receipt_reference"]),
             "blocked_reason": (
                 f"persisted_repair_response_failed_local_validation: {error}"
                 if error else "paid_repair_ready_for_deterministic_replay"
@@ -4117,10 +4563,18 @@ def _finalize_paid_translation_repairs(
             ),
         }
         if error:
-            mark_needs_supervision(
-                ledger_path, segment_id=segment_id,
-                reason=context["blocked_reason"], recovery_context=context,
-            )
+            try:
+                _current_ledger, current_digest = read_registered_lane_ledger(
+                    checkpoint_dir, ledger_path,
+                )
+                mark_needs_supervision(
+                    ledger_path, segment_id=segment_id,
+                    reason=context["blocked_reason"], recovery_context=context,
+                    expected_ledger_sha256=current_digest,
+                    checkpoint_dir=checkpoint_dir,
+                )
+            except (LaneLedgerError, LaneLedgerRegistryError):
+                continue
         entries.append({
             "ledger_path": str(ledger_path),
             "session_key": f"{ledger.get('chapter_id')}:{ledger.get('lane')}",
@@ -4130,6 +4584,74 @@ def _finalize_paid_translation_repairs(
             "target_generation": block_generation,
             "recovery_action": context["recovery_action"],
             "blocking_reason": context["blocked_reason"] if error else "",
+            "recovery_context": context,
+        })
+    coverage_marker_paths = [
+        (segment_id, _translation_coverage_attempt_path(
+            checkpoint_dir,
+            segment_id,
+            int(binding["receipt"].get("generation") or 1),
+        ))
+        for (unit, segment_id), binding in repair_bindings.items()
+        if unit == "translation-coverage-repair"
+    ]
+    for segment_id, marker_path in sorted(coverage_marker_paths):
+        binding = repair_bindings[("translation-coverage-repair", segment_id)]
+        try:
+            marker = _read_recovery_json(checkpoint_dir, marker_path)
+        except SecureReadError:
+            continue
+        if (
+            not isinstance(marker, Mapping)
+            or marker.get("status") not in {"response_received", "validated"}
+            or not isinstance(marker.get("raw_response"), Mapping)
+        ):
+            continue
+        if str(marker.get("segment_id") or "") != segment_id:
+            continue
+        located = ledgers.get(segment_id)
+        if located is None:
+            continue
+        ledger_path, ledger, ledger_block = located
+        block_generation = int(
+            ledger_block.get("generation") or ledger.get("generation") or 1
+        )
+        try:
+            marker_generation = _artifact_payload_generation(
+                marker,
+                checkpoint_dir,
+                "translation-coverage-attempts",
+                segment_id,
+            )
+        except (TypeError, ValueError):
+            continue
+        if marker_generation != block_generation:
+            continue
+        call_checkpoint = binding["checkpoint"]
+        if call_checkpoint.get("submission_state") not in {"submitted", "unknown"}:
+            continue
+        logical = dict(call_checkpoint.get("logical_identity") or {})
+        context = {
+            "submission_state": str(
+                call_checkpoint.get("submission_state") or "submitted"
+            ),
+            "resumable": False,
+            "recovery_action": "deterministic-replay",
+            "repair_marker": str(marker_path),
+            "checkpoint_path": str(binding["checkpoint_path"]),
+            "idempotency_key": str(logical.get("idempotency_key") or ""),
+            "submission_receipt": dict(binding["receipt_reference"]),
+            "blocked_reason": "paid_coverage_repair_ready_for_normal_validation",
+        }
+        entries.append({
+            "ledger_path": str(ledger_path),
+            "session_key": f"{ledger.get('chapter_id')}:{ledger.get('lane')}",
+            "segment_id": segment_id,
+            "idempotency_key": context["idempotency_key"],
+            "initial_generation": block_generation,
+            "target_generation": block_generation,
+            "recovery_action": "deterministic-replay",
+            "blocking_reason": "",
             "recovery_context": context,
         })
     return entries
@@ -4257,21 +4779,35 @@ def _resume_companion_unlocked(
                 )
             except (ImportError, ValueError) as exc:
                 return err("resume_transaction_invalid", str(exc))
-        ledger_paths = {
+        transaction_ledger_paths = {
             Path(str(item["ledger_path"])).resolve(strict=False)
             for item in transaction.get("entries") or []
             if item.get("ledger_path")
         }
+        if action == "auto" and any(
+            not lane_ledger_is_registered(checkpoint_dir, path)
+            for path in transaction_ledger_paths
+        ):
+            return err(
+                "automatic_recovery_ledger_unregistered",
+                "Automatic recovery transaction contains a ledger outside the active control index",
+                provider_calls=0,
+            )
+        ledger_paths = set(transaction_ledger_paths)
         # A continuation may itself be interrupted after another provider call
         # crossed the barrier. Discover it on every retry instead of freezing
         # the transaction's initial inventory.
         ledger_paths.update(
-            path.resolve(strict=False) for path in _all_lane_ledger_paths(checkpoint_dir)
+            path.resolve(strict=False) for path in _all_lane_ledger_paths(
+                checkpoint_dir, include_explicit_legacy=(action == "resume-native"),
+            )
         )
     else:
         transaction = None
         ledger_paths = {
-            path.resolve(strict=False) for path in _all_lane_ledger_paths(checkpoint_dir)
+            path.resolve(strict=False) for path in _all_lane_ledger_paths(
+                checkpoint_dir, include_explicit_legacy=(action == "resume-native"),
+            )
         }
     if transaction is not None:
         _backfill_legacy_generation_owners(checkpoint_dir, transaction)
@@ -4281,9 +4817,14 @@ def _resume_companion_unlocked(
         for item in (transaction or {}).get("entries") or []
     }
     for path in sorted(ledger_paths):
-        if not path.is_file():
+        try:
+            ledger = _read_recovery_ledger(
+                checkpoint_dir,
+                path,
+                allow_explicit_legacy=(action == "resume-native"),
+            )
+        except SecureReadError:
             continue
-        ledger = read_json(path)
         if ledger.get("needs_supervision") or str(path) in transaction_paths:
             supervised_ledgers.append((path, ledger))
     saved = (
@@ -4298,6 +4839,71 @@ def _resume_companion_unlocked(
 
     from arc_llm.sessions import LLMSessionManager
     manager = LLMSessionManager(checkpoint_dir / "sessions")
+    fresh_required_keys: set[str] = set()
+    fresh_required_identities: set[tuple[str, str, str, int, str]] = set()
+    durable_reconstruction_identities: set[
+        tuple[str, str, str, int, str]
+    ] = set()
+    durable_replay_keys: set[str] = set()
+    durable_replay_identities: set[tuple[str, str, str, int, str]] = set()
+    if action == "auto":
+        audit_candidates: list[dict[str, Any]] = [
+            dict(item) for item in (transaction or {}).get("entries") or []
+            if isinstance(item, Mapping)
+        ]
+        for ledger_path, ledger in supervised_ledgers:
+            for supervision in _active_supervision_entries(ledger):
+                context = dict(supervision.get("recovery_context") or {})
+                audit_candidates.append({
+                    "ledger_path": str(ledger_path),
+                    "session_key": f"{ledger.get('chapter_id')}:{ledger.get('lane')}",
+                    "segment_id": str(supervision.get("segment_id") or ""),
+                    "idempotency_key": str(context.get("idempotency_key") or ""),
+                    "initial_generation": int(ledger.get("generation") or 0),
+                    "recovery_context": context,
+                })
+        for candidate in audit_candidates:
+            if _entry_recovery_address_blocker(candidate, checkpoint_dir) is not None:
+                continue
+            try:
+                _promote_entry_raw_response(candidate, checkpoint_dir)
+            except BaseException as exc:
+                from arc_llm import LLMWorkerError
+
+                if isinstance(exc, (RecoveryResponseError, LLMWorkerError)):
+                    return err(
+                        "recovery_candidate_invalid",
+                        str(exc),
+                        provider_calls=0,
+                        automatic_generation_restart=False,
+                    )
+                raise
+            audit = _fresh_auto_recovery_audit(candidate, checkpoint_dir)
+            key = str(candidate.get("idempotency_key") or "")
+            identity = (
+                str(Path(str(candidate.get("ledger_path") or "")).resolve(strict=False)),
+                str(candidate.get("session_key") or ""),
+                str(candidate.get("segment_id") or ""),
+                int(
+                    candidate.get("initial_generation")
+                    or (candidate.get("recovery_context") or {}).get("generation")
+                    or 0
+                ),
+                key,
+            )
+            if audit["fresh_generation_required"]:
+                if key:
+                    fresh_required_keys.add(key)
+                fresh_required_identities.add(identity)
+                checkpoint_path, checkpoint = _entry_call_checkpoint(
+                    candidate, checkpoint_dir,
+                )
+                if checkpoint_path is not None and checkpoint is not None:
+                    durable_reconstruction_identities.add(identity)
+            elif bool(audit["complete_response_scan"]["complete"]):
+                if key:
+                    durable_replay_keys.add(key)
+                durable_replay_identities.add(identity)
     native_resume_contexts: list[dict[str, Any]] = []
     for raw_context in (
         transaction.get("native_resume_contexts") or [] if transaction else []
@@ -4307,17 +4913,29 @@ def _resume_companion_unlocked(
         ref = manager.get_existing(session_key) if session_key else None
         ledger_path = Path(str(context.get("ledger_path") or ""))
         ledger_generation = None
-        if ledger_path.is_file():
-            ledger_generation = int(read_json(ledger_path).get("generation") or 0)
+        try:
+            ledger_generation = int(
+                _read_recovery_ledger(
+                    checkpoint_dir,
+                    ledger_path,
+                    allow_explicit_legacy=(action == "resume-native"),
+                ).get("generation") or 0
+            )
+        except SecureReadError:
+            ledger_generation = None
         if (
             ref is not None
             and int(context.get("generation") or 0) == ref.generation
             and (ledger_generation is None or ledger_generation == ref.generation)
+            and _native_context_recovery_identity(context) not in (
+                fresh_required_identities | durable_replay_identities
+            )
         ):
             native_resume_contexts.append(context)
-    native_resume_keys: list[str] = [
-        str(item["idempotency_key"]) for item in native_resume_contexts
+    native_resume_identities: list[tuple[str, str, str, int, str]] = [
+        _native_context_recovery_identity(item) for item in native_resume_contexts
     ]
+    reconstructed_fresh_entries: list[dict[str, Any]] = []
     blocked_native_entries: dict[tuple[str, str, str], dict[str, Any]] = {}
     if native_mode:
         for ledger_path, ledger in supervised_ledgers:
@@ -4325,11 +4943,27 @@ def _resume_companion_unlocked(
                 context = dict(supervision.get("recovery_context") or {})
                 session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
                 segment_id = str(supervision.get("segment_id") or "")
-                identity = (str(ledger_path.resolve(strict=False)), session_key, segment_id)
-                if str(context.get("idempotency_key") or "") in native_resume_keys:
+                entry_identity = (
+                    str(ledger_path.resolve(strict=False)), session_key, segment_id,
+                )
+                context_key = str(context.get("idempotency_key") or "")
+                recovery_identity = (
+                    str(ledger_path.resolve(strict=False)), session_key, segment_id,
+                    int(ledger.get("generation") or 0),
+                    context_key,
+                )
+                if action == "auto" and (
+                    recovery_identity in fresh_required_identities
+                    or recovery_identity in durable_replay_identities
+                ):
+                    continue
+                if recovery_identity in {
+                    _native_context_recovery_identity(item)
+                    for item in native_resume_contexts
+                }:
                     continue
                 if not context.get("idempotency_key"):
-                    blocked_native_entries[identity] = {
+                    blocked_native_entries[entry_identity] = {
                         "blocking_code": "native_resume_idempotency_key_missing",
                         "blocking_reason": (
                             f"The supervised call for {session_key} has no logical call key"
@@ -4340,7 +4974,7 @@ def _resume_companion_unlocked(
                 if not context.get("resumable") or not (
                     context.get("native_session_id") or manager.has_native_session(session_key)
                 ):
-                    blocked_native_entries[identity] = {
+                    blocked_native_entries[entry_identity] = {
                         "blocking_code": "native_session_not_resumable",
                         "blocking_reason": (
                             f"The supervised call for {session_key} has no resumable native session"
@@ -4355,24 +4989,49 @@ def _resume_companion_unlocked(
                         ledger=ledger,
                         session_manager=manager,
                         supervision=supervision,
+                        allow_explicit_legacy=(action == "resume-native"),
                     )
                 except ValueError as exc:
-                    blocked_native_entries[identity] = {
+                    blocked_native_entries[entry_identity] = {
                         "blocking_code": "native_resume_context_invalid",
                         "blocking_reason": str(exc),
                         "recovery_context": context,
                     }
                     continue
                 native_resume_contexts.append(validated)
-                native_resume_keys.append(validated["idempotency_key"])
+                native_resume_identities.append(
+                    _native_context_recovery_identity(validated)
+                )
         reconstructed = _reconstruct_unresolved_native_resume_contexts(
             checkpoint_dir,
             session_manager=manager,
-            excluded_keys=set(native_resume_keys),
+            excluded_keys=set(),
+            excluded_identities={
+                *{
+                    _native_context_recovery_identity(item)
+                    for item in native_resume_contexts
+                },
+                *fresh_required_identities,
+                *durable_replay_identities,
+            },
+            suppress_typed_idle=(action == "auto"),
+            fresh_required_entries=reconstructed_fresh_entries,
+            allow_explicit_legacy=(action == "resume-native"),
         )
+        for item in reconstructed_fresh_entries:
+            key = str(item.get("idempotency_key") or "")
+            if key:
+                fresh_required_keys.add(key)
+            fresh_required_identities.add((
+                str(Path(str(item.get("ledger_path") or "")).resolve(strict=False)),
+                str(item.get("session_key") or ""),
+                str(item.get("segment_id") or ""),
+                int(item.get("initial_generation") or 0),
+                key,
+            ))
         native_resume_contexts.extend(reconstructed)
-        native_resume_keys.extend(
-            str(item["idempotency_key"]) for item in reconstructed
+        native_resume_identities.extend(
+            _native_context_recovery_identity(item) for item in reconstructed
         )
     entries = []
     existing_entry_identities = {
@@ -4414,9 +5073,51 @@ def _resume_companion_unlocked(
                 ),
                 "supervision_reason": str(supervision.get("reason") or ""),
             }
+            if action == "auto":
+                entry.update(_fresh_auto_recovery_audit(entry, checkpoint_dir))
+                recovery_identity = (
+                    identity[0], identity[1], identity[2], generation,
+                    str(entry.get("idempotency_key") or ""),
+                )
+                if recovery_identity in durable_reconstruction_identities:
+                    entry["reconstructed_from_durable_state"] = True
             entry.update(blocked_native_entries.get(identity) or {})
             entries.append(entry)
             existing_entry_identities.add(identity)
+    pending_entry_positions = {
+        (
+            str(Path(str(item.get("ledger_path") or "")).resolve(strict=False)),
+            str(item.get("session_key") or ""),
+            str(item.get("segment_id") or ""),
+        ): index
+        for index, item in enumerate(entries)
+    }
+    for reconstructed_entry in reconstructed_fresh_entries:
+        identity = (
+            str(Path(str(reconstructed_entry.get("ledger_path") or "")).resolve(strict=False)),
+            str(reconstructed_entry.get("session_key") or ""),
+            str(reconstructed_entry.get("segment_id") or ""),
+        )
+        if not all(identity):
+            continue
+        existing_position = pending_entry_positions.get(identity)
+        if existing_position is not None:
+            # Durable reconstruction may discover the exact same supervised
+            # task that was seeded from the ledger a few lines above.  Merge
+            # its stronger audit facts into that authorization entry instead
+            # of either duplicating the task or dropping the reconstruction
+            # evidence.
+            entries[existing_position] = {
+                **entries[existing_position],
+                **dict(reconstructed_entry),
+            }
+        else:
+            # Keep this enrichment even when the identity already exists in a
+            # prior transaction.  append_entries() performs an idempotent
+            # identity merge while preserving resolved transaction status.
+            entries.append(dict(reconstructed_entry))
+            pending_entry_positions[identity] = len(entries) - 1
+        existing_entry_identities.add(identity)
     if native_mode:
         for context in native_resume_contexts:
             ledger_path = str(
@@ -4470,6 +5171,88 @@ def _resume_companion_unlocked(
             )
         except ValueError as exc:
             return err("resume_transaction_invalid", str(exc))
+    if action == "auto":
+        for index, raw in enumerate(transaction.get("entries") or []):
+            entry = dict(raw)
+            audit_entry = _entry_with_current_supervision(
+                entry, checkpoint_dir=checkpoint_dir,
+            )
+            audit = _fresh_auto_recovery_audit(audit_entry, checkpoint_dir)
+            if audit["fresh_generation_required"]:
+                audit["fresh_task_start_segment_id"] = _first_nonaccepted_segment_id(
+                    entry, checkpoint_dir=checkpoint_dir,
+                )
+            else:
+                audit["fresh_task_start_segment_id"] = None
+            if audit["complete_response_scan"].get("source") == "accepted_lane_block":
+                ledger_value = _read_recovery_ledger(
+                    checkpoint_dir, Path(str(entry.get("ledger_path") or "")),
+                )
+                accepted_block = next(
+                    item for item in ledger_value.get("blocks") or []
+                    if isinstance(item, Mapping)
+                    and str(item.get("segment_id") or "")
+                    == str(entry.get("segment_id") or "")
+                )
+                transaction = mark_entry(
+                    project_dir, index, status="resolved", **audit,
+                    accepted_chain_sha256=str(
+                        accepted_block.get("accepted_chain_sha256") or ""
+                    ),
+                    output_sha256=str(accepted_block.get("output_sha256") or ""),
+                )
+                continue
+            transaction = mark_entry(
+                project_dir,
+                index,
+                status=str(entry.get("status") or "pending"),
+                **audit,
+            )
+        fresh_required_keys.update(
+            str(item.get("idempotency_key") or "")
+            for item in transaction.get("entries") or []
+            if item.get("fresh_generation_required")
+            and item.get("idempotency_key")
+        )
+        durable_replay_keys.update(
+            str(item.get("idempotency_key") or "")
+            for item in transaction.get("entries") or []
+            if item.get("durable_replay_required")
+            and item.get("idempotency_key")
+        )
+        fresh_required_identities.update(
+            _native_context_recovery_identity(item)
+            for item in transaction.get("entries") or []
+            if item.get("fresh_generation_required")
+        )
+        durable_replay_identities.update(
+            _native_context_recovery_identity(item)
+            for item in transaction.get("entries") or []
+            if item.get("durable_replay_required")
+        )
+        native_excluded_identities = (
+            fresh_required_identities | durable_replay_identities
+        )
+        native_resume_contexts = [
+            item for item in native_resume_contexts
+            if _native_context_recovery_identity(item) not in native_excluded_identities
+        ]
+        native_resume_identities = [
+            _native_context_recovery_identity(item) for item in native_resume_contexts
+        ]
+        if native_excluded_identities:
+            from .resume_transaction import suppress_native_resume_contexts
+
+            transaction = suppress_native_resume_contexts(
+                project_dir, idempotency_keys=set(),
+                recovery_identities=native_excluded_identities,
+                reason="automatic_recovery_uses_no_old_native_session",
+            )
+        if any(
+            _native_context_recovery_identity(item) in native_excluded_identities
+            for item in native_resume_contexts
+        ):
+            raise RuntimeError("fresh idle recovery leaked into native reconciliation")
     resumed: list[dict[str, Any]] = []
     reconcilable_native_entries = 0
     manual_restart_groups: dict[str, dict[str, Any]] = {}
@@ -4479,9 +5262,14 @@ def _resume_companion_unlocked(
                 continue
             session_key = str(raw.get("session_key") or "")
             path = Path(str(raw.get("ledger_path") or ""))
-            if not session_key or not path.is_file():
+            if not session_key:
                 continue
-            ledger = read_json(path)
+            try:
+                ledger = _read_recovery_ledger(
+                    checkpoint_dir, path, allow_explicit_legacy=True,
+                )
+            except SecureReadError:
+                continue
             ordered_ids = [
                 str(item.get("segment_id") or "")
                 for item in ledger.get("blocks") or []
@@ -4500,7 +5288,10 @@ def _resume_companion_unlocked(
                 manual_restart_groups[session_key] = candidate
     for index, entry in enumerate(transaction.get("entries") or []):
         path = Path(str(entry["ledger_path"]))
-        ledger = read_json(path)
+        ledger = _read_recovery_ledger(
+            checkpoint_dir, path,
+            allow_explicit_legacy=(action == "resume-native"),
+        )
         segment_id = str(entry.get("segment_id") or "")
         session_key = str(entry["session_key"])
         if entry.get("status") == "resolved":
@@ -4508,6 +5299,17 @@ def _resume_companion_unlocked(
             continue
         if native_mode:
             recovery_action = str(entry.get("recovery_action") or "")
+            if action == "auto" and entry.get("fresh_generation_required"):
+                continue
+            if action == "auto" and entry.get("durable_replay_required"):
+                reconcilable_native_entries += 1
+                if entry.get("status") in {"pending", "authorized"}:
+                    mark_entry(
+                        project_dir, index, status="reconciling",
+                        recovery_action="durable-business-replay",
+                    )
+                resumed.append(dict(entry))
+                continue
             if recovery_action == "deterministic-replay":
                 reconcilable_native_entries += 1
                 if entry.get("status") in {"pending", "authorized"}:
@@ -4523,11 +5325,27 @@ def _resume_companion_unlocked(
                 # native reconciliation or a normal resend.
                 continue
             entry_key = str(entry.get("idempotency_key") or "")
+            entry_recovery_identity = _native_context_recovery_identity(entry)
             validated = next((
                 item for item in native_resume_contexts
-                if (entry_key and item["idempotency_key"] == entry_key)
-                or (not entry_key and item["session_key"] == session_key)
+                if _native_context_recovery_identity(item) == entry_recovery_identity
             ), None)
+            if (
+                validated is None
+                and not entry_key
+                and transaction.get("migrated_from")
+                in {"arc.companion.resume-transaction.v1", "arc.companion.resume-transaction.v2"}
+            ):
+                legacy_matches = [
+                    item for item in native_resume_contexts
+                    if str(item.get("session_key") or "") == session_key
+                    and str(item.get("logical_unit") or item.get("segment_id") or "")
+                    == segment_id
+                    and str(Path(str(item.get("ledger_path") or "")).resolve(strict=False))
+                    == str(path.resolve(strict=False))
+                ]
+                if len(legacy_matches) == 1:
+                    validated = legacy_matches[0]
             if validated is None:
                 identity = (str(path.resolve(strict=False)), session_key, segment_id)
                 blocked = blocked_native_entries.get(identity) or {}
@@ -4643,7 +5461,11 @@ def _resume_companion_unlocked(
     if native_mode:
         options = replace(
             options,
-            supervised_native_resume_keys=tuple(native_resume_keys),
+            supervised_native_resume_identities=tuple(
+                identity
+                for identity in dict.fromkeys(native_resume_identities)
+                if _native_recovery_identity_complete(identity)
+            ),
         )
     # Production continuation must not release and reacquire the project lock:
     # that would expose partially coordinated session/ledger mutations. Tests
@@ -4668,6 +5490,8 @@ def _resume_companion_unlocked(
             "errors": [],
             "meta": {},
         }
+    if action == "auto":
+        _accept_completed_pipeline_controls(checkpoint_dir)
     if native_mode:
         # Calls submitted by the continuation can finish after an earlier
         # source-order block has failed.  Classify their paid repair responses
@@ -4686,8 +5510,13 @@ def _resume_companion_unlocked(
         }
         discovered_entries: list[dict[str, Any]] = []
         discovered_contexts: list[dict[str, Any]] = []
-        for path in _all_lane_ledger_paths(checkpoint_dir):
-            ledger = read_json(path)
+        for path in _all_lane_ledger_paths(
+            checkpoint_dir, include_explicit_legacy=(action == "resume-native"),
+        ):
+            ledger = _read_recovery_ledger(
+                checkpoint_dir, path,
+                allow_explicit_legacy=(action == "resume-native"),
+            )
             session_key = f"{ledger.get('chapter_id')}:{ledger.get('lane')}"
             for supervision in _active_supervision_entries(ledger):
                 segment_id = str(supervision.get("segment_id") or "")
@@ -4719,6 +5548,7 @@ def _resume_companion_unlocked(
                             ledger_path=path,
                             ledger=ledger,
                             session_manager=manager,
+                            allow_explicit_legacy=(action == "resume-native"),
                         ))
                     except ValueError as exc:
                         entry["blocking_reason"] = str(exc)
@@ -4737,9 +5567,20 @@ def _resume_companion_unlocked(
             if entry.get("status") == "resolved":
                 continue
             path = Path(str(entry["ledger_path"]))
-            if not path.is_file():
-                continue
-            ledger = read_json(path)
+            try:
+                ledger, ledger_digest = read_registered_lane_ledger(
+                    checkpoint_dir, path,
+                )
+            except LaneLedgerRegistryError:
+                if action != "resume-native":
+                    continue
+                try:
+                    ledger = _read_recovery_ledger(
+                        checkpoint_dir, path, allow_explicit_legacy=True,
+                    )
+                except SecureReadError:
+                    continue
+                ledger_digest = None
             block = next((
                 item for item in ledger.get("blocks") or []
                 if str(item.get("segment_id") or "") == str(entry.get("segment_id") or "")
@@ -4748,7 +5589,13 @@ def _resume_companion_unlocked(
                 if str(
                     (ledger.get("needs_supervision") or {}).get("segment_id") or ""
                 ) == str(entry.get("segment_id") or ""):
-                    clear_needs_supervision(path)
+                    clear_needs_supervision(
+                        path,
+                        expected_ledger_sha256=ledger_digest,
+                        checkpoint_dir=(
+                            checkpoint_dir if ledger_digest is not None else None
+                        ),
+                    )
                 mark_entry(
                     project_dir, index, status="resolved",
                     accepted_chain_sha256=str(
@@ -4763,7 +5610,9 @@ def _resume_companion_unlocked(
             if str(item.get("status") or "") not in {"accepted"}
         ]
         prior_exhausted = _finalize_automatic_generation_restarts(
-            project_dir, replacements=prior_replacements,
+            project_dir,
+            checkpoint_dir=checkpoint_dir,
+            replacements=prior_replacements,
         )
         if prior_exhausted is not None:
             mark_transaction(project_dir, "continuation_failed")
@@ -4778,7 +5627,7 @@ def _resume_companion_unlocked(
             and (not isinstance(result, dict) or not result.get("ok"))
         ):
             result = _continue_supervised_build(
-                replace(options, supervised_native_resume_keys=()),
+                replace(options, supervised_native_resume_identities=()),
                 cancel_check=cancel_check,
                 continuation=continuation,
             )
@@ -4808,12 +5657,15 @@ def _resume_companion_unlocked(
             return restart["error"]
         replacements = list(restart.get("replacements") or [])
         if replacements:
-            options = replace(options, supervised_native_resume_keys=())
+            options = replace(options, supervised_native_resume_identities=())
             result = _continue_supervised_build(
                 options, cancel_check=cancel_check, continuation=continuation,
             )
+            _accept_completed_pipeline_controls(checkpoint_dir)
             exhausted = _finalize_automatic_generation_restarts(
-                project_dir, replacements=replacements,
+                project_dir,
+                checkpoint_dir=checkpoint_dir,
+                replacements=replacements,
             )
             if exhausted is not None:
                 mark_transaction(project_dir, "continuation_failed")
@@ -4851,13 +5703,723 @@ _AUTO_RESTART_EXCLUDED_CATEGORIES = {
     "authentication", "quota", "permission", "rate_limit", "cancelled",
     "local_io", "invalid_request",
 }
-def _automatic_restart_blocker(entry: Mapping[str, Any]) -> str | None:
+
+_MAX_RECOVERY_CONTROL_BYTES = 16 * 1024 * 1024
+
+
+def _read_recovery_json(
+    checkpoint_dir: Path,
+    path: Path,
+    *,
+    suffixes: tuple[str, ...] = (".json",),
+) -> Any:
+    """Read one exact recovery control through the shared no-follow reader."""
+
+    root = checkpoint_dir.resolve(strict=False)
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as exc:
+        raise SecureReadError("recovery control escapes its checkpoint") from exc
+    return read_bounded_json(
+        root,
+        relative,
+        max_bytes=_MAX_RECOVERY_CONTROL_BYTES,
+        suffixes=suffixes,
+    )
+
+
+def _read_recovery_ledger(
+    checkpoint_dir: Path,
+    path: Path,
+    *,
+    allow_explicit_legacy: bool = False,
+) -> dict[str, Any]:
+    """Read a hash-bound registered ledger, except in explicit legacy mode."""
+
+    root = checkpoint_dir.resolve(strict=False)
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    if not allow_explicit_legacy:
+        try:
+            value, _digest = read_registered_lane_ledger(root, lexical)
+        except LaneLedgerRegistryError as exc:
+            raise SecureReadError("recovery ledger is not registered or changed") from exc
+        return value
+    value = _read_recovery_json(root, lexical)
+    if not isinstance(value, dict):
+        raise SecureReadError("recovery ledger is not a JSON object")
+    return value
+
+
+def _entry_call_checkpoint(
+    entry: Mapping[str, Any], checkpoint_dir: Path, *,
+    allow_explicit_legacy: bool = False,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """Resolve one call checkpoint without trusting an arbitrary saved path."""
+
+    root = checkpoint_dir.resolve(strict=False)
+    context = entry.get("recovery_context")
+    context = context if isinstance(context, Mapping) else {}
+    key = str(entry.get("idempotency_key") or context.get("idempotency_key") or "")
+    expected_name = (
+        f"idempotency-{hashlib.sha256(key.encode('utf-8')).hexdigest()}.json"
+        if key else ""
+    )
+    saved = str(context.get("checkpoint_path") or "")
+    if saved:
+        raw_saved_path = Path(saved).expanduser()
+        saved_path = raw_saved_path.resolve(strict=False)
+        try:
+            relative = saved_path.relative_to(root)
+        except ValueError:
+            return None, None
+        if not raw_saved_path.is_absolute() or raw_saved_path != saved_path:
+            return None, None
+        if (
+            saved_path.parent.name == "call-checkpoints"
+            and (not expected_name or saved_path.name == expected_name)
+        ):
+            try:
+                value = _read_recovery_json(root, root / relative)
+            except SecureReadError:
+                return None, None
+            if (
+                isinstance(value, dict)
+                and _checkpoint_matches_recovery_entry(value, entry, context)
+                and _stateless_checkpoint_receipt_valid(
+                    entry, context, checkpoint_dir=root,
+                    checkpoint_path=saved_path, checkpoint=value,
+                )
+            ):
+                return saved_path, value
+            return None, None
+        return None, None
+    if not allow_explicit_legacy:
+        return None, None
+    candidates: list[Path] = []
+    if expected_name:
+        candidates.extend(path.resolve(strict=False) for path in root.rglob(expected_name))
+    unique: dict[str, Path] = {str(path): path for path in candidates}
+    valid: list[Path] = []
+    for path in unique.values():
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        if path.parent.name != "call-checkpoints":
+            continue
+        if expected_name and path.name != expected_name:
+            continue
+        valid.append(path)
+    if len(valid) != 1:
+        return None, None
+    try:
+        value = _read_recovery_json(root, valid[0])
+    except SecureReadError:
+        return None, None
+    if (
+        isinstance(value, dict)
+        and _checkpoint_matches_recovery_entry(value, entry, context)
+        and _stateless_checkpoint_receipt_valid(
+            entry, context, checkpoint_dir=root,
+            checkpoint_path=valid[0], checkpoint=value,
+        )
+    ):
+        return valid[0], value
+    return None, None
+
+
+def _checkpoint_matches_recovery_entry(
+    checkpoint: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> bool:
+    logical = checkpoint.get("logical_identity")
+    recipe = checkpoint.get("request_recipe")
+    if not isinstance(logical, Mapping) or not isinstance(recipe, Mapping):
+        return False
+    generation = int(
+        entry.get("initial_generation") or context.get("generation") or 0
+    )
+    stateless_control = bool(
+        context.get("stateless_control") is True
+        and logical.get("session_key") is None
+        and logical.get("generation") is None
+    )
+    return bool(
+        logical.get("idempotency_key")
+        == str(entry.get("idempotency_key") or context.get("idempotency_key") or "")
+        and (
+            stateless_control
+            or logical.get("session_key")
+            == str(entry.get("session_key") or context.get("session_key") or "")
+        )
+        and (stateless_control or logical.get("generation") == generation)
+        and (
+            not context.get("provider")
+            or logical.get("provider") == context.get("provider")
+        )
+        and (
+            context.get("model") is None
+            or logical.get("model") == context.get("model")
+        )
+        and (
+            not context.get("runtime_fingerprint")
+            or recipe.get("runtime_fingerprint") == context.get("runtime_fingerprint")
+        )
+    )
+
+
+def _stateless_checkpoint_receipt_valid(
+    entry: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path,
+    checkpoint_path: Path,
+    checkpoint: Mapping[str, Any],
+) -> bool:
+    logical = checkpoint.get("logical_identity")
+    if not isinstance(logical, Mapping) or not (
+        logical.get("session_key") is None and logical.get("generation") is None
+    ):
+        return True
+    if context.get("stateless_control") is not True:
+        return False
+    reference = context.get("submission_receipt")
+    if not isinstance(reference, Mapping):
+        return False
+    ledger_path = Path(str(entry.get("ledger_path") or ""))
+    try:
+        receipt = _validate_pipeline_submission_reference(
+            reference,
+            checkpoint_dir=checkpoint_dir,
+            ledger_path=ledger_path,
+            session_key=str(entry.get("session_key") or context.get("session_key") or ""),
+            logical_unit=str(entry.get("segment_id") or context.get("logical_unit") or ""),
+            generation=int(
+                entry.get("initial_generation") or context.get("generation") or 0
+            ),
+            idempotency_key=str(
+                entry.get("idempotency_key") or context.get("idempotency_key") or ""
+            ),
+        )
+        receipt_checkpoint = resolve_recovery_path(
+            checkpoint_dir, receipt.get("checkpoint_path"),
+        )
+    except (
+        RecoveryResponseError, OSError, TypeError, ValueError,
+        json.JSONDecodeError, SecureReadError,
+    ):
+        return False
+    return bool(
+        receipt_checkpoint == checkpoint_path.resolve(strict=False)
+        and receipt.get("checkpoint_identity") == checkpoint.get("identity")
+    )
+
+
+def _validate_recovery_ledger_address(
+    *,
+    checkpoint_dir: Path,
+    ledger_path: Path,
+    ledger: Mapping[str, Any],
+    session_key: str,
+    segment_id: str,
+    generation: int | None = None,
+    allow_explicit_legacy: bool = False,
+) -> str | None:
+    """Return a stable blocker for any non-canonical recovery control path."""
+
+    root = checkpoint_dir.resolve(strict=False)
+    raw = ledger_path.expanduser()
+    resolved = raw.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        return "recovery lane ledger is outside the active checkpoint"
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return "recovery lane ledger address contains a symlink"
+    if not raw.is_absolute() or raw != resolved or not resolved.is_file():
+        return "recovery lane ledger address is not a canonical regular file"
+    registered = lane_ledger_is_registered(root, resolved)
+    if not registered:
+        legacy = {
+            path.resolve(strict=False)
+            for path in _all_lane_ledger_paths(root, include_explicit_legacy=True)
+        } if allow_explicit_legacy else set()
+        if resolved not in legacy:
+            return "recovery lane ledger is not registered in the active control index"
+    if ledger.get("schema_version") != "arc.companion.chapter-lane-ledger.v2":
+        return "recovery lane ledger schema is unsupported"
+    expected_session = f"{ledger.get('chapter_id')}:{ledger.get('lane')}"
+    if not session_key or expected_session != session_key:
+        return "recovery lane session identity does not match its ledger"
+    matches = [
+        item for item in ledger.get("blocks") or []
+        if isinstance(item, Mapping)
+        and str(item.get("segment_id") or "") == segment_id
+    ]
+    if len(matches) != 1:
+        return "recovery logical unit is absent or ambiguous"
+    ledger_generation = int(ledger.get("generation") or 0)
+    block_generation = int(matches[0].get("generation") or 0)
+    if ledger_generation < 1 or block_generation != ledger_generation:
+        return "recovery logical unit generation does not match its ledger"
+    if generation is not None and int(generation) != ledger_generation:
+        return "recovery entry generation does not match its ledger"
+    return None
+
+
+def _entry_recovery_address_blocker(
+    entry: Mapping[str, Any], checkpoint_dir: Path,
+) -> str | None:
+    path = Path(str(entry.get("ledger_path") or ""))
+    try:
+        ledger = _read_recovery_ledger(checkpoint_dir, path)
+    except (OSError, ValueError, json.JSONDecodeError, SecureReadError):
+        return "recovery lane ledger cannot be read"
+    generation_value = entry.get("initial_generation")
+    try:
+        generation = int(generation_value) if generation_value is not None else None
+    except (TypeError, ValueError):
+        return "recovery entry generation is invalid"
+    return _validate_recovery_ledger_address(
+        checkpoint_dir=checkpoint_dir,
+        ledger_path=path,
+        ledger=ledger,
+        session_key=str(entry.get("session_key") or ""),
+        segment_id=str(entry.get("segment_id") or ""),
+        generation=generation,
+    )
+
+
+def _last_call_progress_event(
+    path: Path,
+    *,
+    checkpoint_dir: Path,
+    idempotency_key: str,
+    session_key: str | None,
+    generation: int | None,
+    checkpoint_identity: str,
+    native_session_id: str | None,
+) -> dict[str, Any] | None:
+    try:
+        root = checkpoint_dir.resolve(strict=False)
+        lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+        relative = lexical.relative_to(root)
+        raw = read_bounded_file(
+            root,
+            relative,
+            max_bytes=_MAX_RECOVERY_CONTROL_BYTES,
+            suffixes=(".jsonl",),
+        )
+        lines = raw.decode("utf-8").splitlines()
+    except (OSError, UnicodeError, ValueError, SecureReadError):
+        return None
+    for line in reversed(lines):
+        try:
+            value = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if value.get("idempotency_key") != idempotency_key:
+            continue
+        if value.get("session_key") != session_key:
+            continue
+        if value.get("generation") != generation:
+            continue
+        if value.get("checkpoint_identity") != checkpoint_identity:
+            continue
+        if str(value.get("native_session_id") or "") != str(native_session_id or ""):
+            continue
+        return value
+    return None
+
+
+def _recovery_trigger(entry: Mapping[str, Any], checkpoint_dir: Path) -> str | None:
+    """Return a durable typed recovery trigger; never parse human reason text."""
+
+    context = entry.get("recovery_context")
+    context = context if isinstance(context, Mapping) else {}
+    logical_unit = str(entry.get("segment_id") or "")
+    if not logical_unit or context.get("logical_unit") != logical_unit:
+        return None
+    checkpoint_path, checkpoint = _entry_call_checkpoint(entry, checkpoint_dir)
+    if checkpoint_path is None or checkpoint is None:
+        return None
+    checkpoint_identity = str(checkpoint.get("identity") or "")
+    if not checkpoint_identity:
+        return None
+    response = checkpoint.get("response")
+    checkpoint_native_id = (
+        str(response.get("native_session_id") or "")
+        if isinstance(response, Mapping) else ""
+    )
+    context_native_id = str(context.get("native_session_id") or "")
+    if checkpoint_native_id and context_native_id and checkpoint_native_id != context_native_id:
+        return None
+    expected_native_id = context_native_id or checkpoint_native_id or None
+    logical = checkpoint.get("logical_identity")
+    logical = logical if isinstance(logical, Mapping) else {}
+    stateless_control = bool(
+        context.get("stateless_control") is True
+        and logical.get("session_key") is None
+        and logical.get("generation") is None
+    )
+    latest = context.get("latest_progress")
+    if isinstance(latest, Mapping) and latest.get("event") == "idle_timeout":
+        key = str(
+            entry.get("idempotency_key") or context.get("idempotency_key") or ""
+        )
+        session_key = (
+            None if stateless_control
+            else str(entry.get("session_key") or context.get("session_key") or "")
+        )
+        generation_value = (
+            None if stateless_control
+            else context.get("generation")
+            if context.get("generation") is not None
+            else entry.get("initial_generation")
+        )
+        try:
+            generation = None if generation_value is None else int(generation_value)
+        except (TypeError, ValueError):
+            generation = None
+        if (
+            key
+            and logical_unit
+            and (stateless_control or bool(session_key) and bool(generation and generation > 0))
+            and context.get("logical_unit") == logical_unit
+            and latest.get("idempotency_key") == key
+            and latest.get("session_key") == session_key
+            and latest.get("generation") == generation
+            and latest.get("checkpoint_identity") == checkpoint_identity
+            and str(latest.get("native_session_id") or "")
+            == str(expected_native_id or "")
+        ):
+            return "idle_timeout"
+    progress_value = str(checkpoint.get("progress_journal") or "")
+    progress_path = (
+        Path(progress_value).expanduser().resolve(strict=False)
+        if progress_value else checkpoint_path.parent.parent / "progress.jsonl"
+    )
+    try:
+        progress_path.relative_to(checkpoint_dir.resolve(strict=False))
+    except ValueError:
+        return None
+    key = str(
+        logical.get("idempotency_key")
+        or entry.get("idempotency_key")
+        or context.get("idempotency_key")
+        or ""
+    )
+    generation_value = logical.get("generation")
+    try:
+        generation = int(generation_value) if generation_value is not None else None
+    except (TypeError, ValueError):
+        return None
+    terminal = _last_call_progress_event(
+        progress_path,
+        checkpoint_dir=checkpoint_dir,
+        idempotency_key=key,
+        session_key=(
+            None if stateless_control
+            else str(logical.get("session_key") or entry.get("session_key") or "")
+        ),
+        generation=generation,
+        checkpoint_identity=checkpoint_identity,
+        native_session_id=expected_native_id,
+    )
+    return "idle_timeout" if terminal and terminal.get("event") == "idle_timeout" else None
+
+
+def _complete_response_scan(
+    entry: Mapping[str, Any], checkpoint_dir: Path,
+) -> dict[str, Any]:
+    """Describe complete durable work without interpreting partial provider output."""
+
+    ledger_path = Path(str(entry.get("ledger_path") or ""))
+    segment_id = str(entry.get("segment_id") or "")
+    try:
+        ledger = _read_recovery_ledger(checkpoint_dir, ledger_path)
+        block = next((
+            item for item in ledger.get("blocks") or []
+            if isinstance(item, Mapping)
+            and str(item.get("segment_id") or "") == segment_id
+        ), None)
+        if isinstance(block, Mapping) and block.get("state") == "accepted":
+            return {
+                "complete": True,
+                "source": "accepted_lane_block",
+                "validation_status": "accepted",
+            }
+    except (OSError, ValueError, json.JSONDecodeError, SecureReadError):
+        pass
+    _path, checkpoint = _entry_call_checkpoint(entry, checkpoint_dir)
+    if isinstance(checkpoint, Mapping):
+        response = checkpoint.get("response")
+        value = response.get("value") if isinstance(response, Mapping) else None
+        if (
+            checkpoint.get("state") in {"response_received", "validated"}
+            and isinstance(value, Mapping)
+        ):
+            return {
+                "complete": True,
+                "source": f"call_checkpoint_{checkpoint.get('state')}",
+                "validation_status": "pending_normal_validation",
+            }
+    context = entry.get("recovery_context")
+    context = context if isinstance(context, Mapping) else {}
+    if str(entry.get("recovery_action") or context.get("recovery_action") or "") == "deterministic-replay":
+        return {
+            "complete": True,
+            "source": "deterministic_replay_receipt",
+            "validation_status": "pending_normal_validation",
+        }
+    return {
+        "complete": False,
+        "source": "no_complete_response",
+        "validation_status": "none",
+    }
+
+
+def _native_context_recovery_identity(
+    value: Mapping[str, Any],
+) -> tuple[str, str, str, int, str]:
+    context = value.get("recovery_context")
+    context = context if isinstance(context, Mapping) else {}
+    generation_value = (
+        value.get("generation")
+        or value.get("initial_generation")
+        or context.get("generation")
+        or 0
+    )
+    return (
+        str(Path(str(value.get("ledger_path") or "")).resolve(strict=False)),
+        str(value.get("session_key") or context.get("session_key") or ""),
+        str(value.get("segment_id") or context.get("logical_unit") or ""),
+        int(generation_value),
+        str(value.get("idempotency_key") or context.get("idempotency_key") or ""),
+    )
+
+
+def _supervised_native_resume_authorized(
+    options: BuildOptions,
+    *,
+    ledger_path: Path,
+    session_key: str,
+    logical_unit: str,
+    generation: int,
+    idempotency_key: str,
+) -> tuple[str, str, str, int, str] | None:
+    identity = (
+        str(ledger_path.expanduser().resolve(strict=False)),
+        str(session_key),
+        str(logical_unit),
+        int(generation),
+        str(idempotency_key),
+    )
+    return identity if identity in options.supervised_native_resume_identities else None
+
+
+def _native_recovery_identity_complete(
+    identity: tuple[str, str, str, int, str],
+) -> bool:
+    return bool(
+        identity[0] and identity[1] and identity[2]
+        and identity[3] > 0 and identity[4]
+    )
+
+
+def _validate_pipeline_submission_reference(
+    reference: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path,
+    ledger_path: Path,
+    session_key: str,
+    logical_unit: str,
+    generation: int,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Validate one receipt against its exact current five-field control."""
+
+    receipt_identity = str(reference.get("identity_sha256") or "")
+    return validate_ledger_submission_reference(
+        reference,
+        checkpoint_dir=checkpoint_dir,
+        expected_recovery_identity=(
+            str(ledger_path.expanduser().resolve(strict=False)),
+            session_key,
+            logical_unit,
+            generation,
+            idempotency_key,
+        ),
+        expected_receipt_identity_sha256=receipt_identity,
+    )
+
+
+def _promote_entry_raw_response(
+    entry: Mapping[str, Any], checkpoint_dir: Path,
+) -> dict[str, Any] | None:
+    """Promote only an exact, sealed production submission for business replay."""
+
+    context = entry.get("recovery_context")
+    context = context if isinstance(context, Mapping) else {}
+    reference = context.get("submission_receipt")
+    if not isinstance(reference, Mapping):
+        return None
+    return recover_complete_ledger_response(
+        reference,
+        checkpoint_dir=checkpoint_dir,
+        ledger_path=Path(str(entry.get("ledger_path") or "")),
+        session_key=str(entry.get("session_key") or ""),
+        logical_unit=str(entry.get("segment_id") or ""),
+        generation=int(
+            entry.get("initial_generation")
+            or context.get("generation")
+            or 0
+        ),
+        idempotency_key=str(
+            entry.get("idempotency_key") or context.get("idempotency_key") or ""
+        ),
+        expected_receipt_identity_sha256=str(
+            reference.get("identity_sha256") or ""
+        ),
+    )
+
+
+def _first_nonaccepted_segment_id(
+    entry: Mapping[str, Any], *, checkpoint_dir: Path,
+) -> str:
+    path = Path(str(entry.get("ledger_path") or ""))
+    try:
+        ledger = _read_recovery_ledger(checkpoint_dir, path)
+        for block in ledger.get("blocks") or []:
+            if isinstance(block, Mapping) and block.get("state") != "accepted":
+                return str(block.get("segment_id") or "")
+    except SecureReadError:
+        pass
+    return str(entry.get("segment_id") or "")
+
+
+def _entry_with_current_supervision(
+    entry: Mapping[str, Any], *, checkpoint_dir: Path,
+) -> dict[str, Any]:
+    """Enrich an older transaction entry from its same-unit durable marker."""
+
+    enriched = dict(entry)
+    path = Path(str(entry.get("ledger_path") or ""))
+    try:
+        ledger = _read_recovery_ledger(checkpoint_dir, path)
+    except SecureReadError:
+        return enriched
+    segment_id = str(entry.get("segment_id") or "")
+    marker = next((
+        item for item in _active_supervision_entries(ledger)
+        if str(item.get("segment_id") or "") == segment_id
+    ), None)
+    if not isinstance(marker, Mapping):
+        return enriched
+    context = marker.get("recovery_context")
+    if not isinstance(context, Mapping):
+        return enriched
+    prior = enriched.get("recovery_context")
+    prior = prior if isinstance(prior, Mapping) else {}
+    enriched["recovery_context"] = {**dict(prior), **dict(context)}
+    if not enriched.get("idempotency_key"):
+        enriched["idempotency_key"] = str(context.get("idempotency_key") or "")
+    return enriched
+
+
+def _fresh_auto_recovery_audit(
+    entry: Mapping[str, Any], checkpoint_dir: Path,
+) -> dict[str, Any]:
+    trigger = _recovery_trigger(entry, checkpoint_dir)
+    scan = _complete_response_scan(entry, checkpoint_dir)
+    required = trigger == "idle_timeout" and not bool(scan["complete"])
+    return {
+        "recovery_trigger": trigger,
+        "complete_response_scan": scan,
+        "durable_replay_required": bool(scan["complete"]),
+        "automatic_native_resume_suppressed": required,
+        "fresh_generation_required": required,
+    }
+
+
+def _automatic_restart_blocker(
+    entry: Mapping[str, Any], ledger: Mapping[str, Any] | None = None,
+    checkpoint_dir: Path | None = None,
+) -> str | None:
     """Return why an unresolved entry must remain under operator control."""
 
     session_key = str(entry.get("session_key") or "")
     lane = session_key.rsplit(":", 1)[-1]
-    if lane not in {"translation", "companion"}:
-        return "automatic recovery only replaces translation and companion lanes"
+    spec = recovery_unit_for_ledger(lane)
+    if spec is None:
+        return "automatic replacement lacks a registered recovery-unit handler"
+    elif not isinstance(ledger, Mapping):
+        return "automatic replacement lane ledger is unavailable"
+    else:
+        if checkpoint_dir is None:
+            return "automatic replacement active checkpoint is unavailable"
+        allowed_generations = {
+            int(value) for value in (
+                entry.get("initial_generation"), entry.get("target_generation"),
+            ) if value is not None
+        }
+        ledger_generation = int(ledger.get("generation") or 0)
+        if allowed_generations and ledger_generation not in allowed_generations:
+            return "recovery entry generation does not match its ledger"
+        address_blocker = _validate_recovery_ledger_address(
+            checkpoint_dir=checkpoint_dir,
+            ledger_path=Path(str(entry.get("ledger_path") or "")),
+            ledger=ledger,
+            session_key=session_key,
+            segment_id=str(entry.get("segment_id") or ""),
+            generation=ledger_generation,
+        )
+        if address_blocker is not None:
+            return address_blocker
+        if ledger.get("schema_version") != "arc.companion.chapter-lane-ledger.v2":
+            return "automatic replacement lane ledger schema is unsupported"
+        if str(ledger.get("lane") or "") != lane:
+            return "automatic replacement lane identity does not match its ledger"
+        chapter_id = session_key.rsplit(":", 1)[0]
+        if str(ledger.get("chapter_id") or "") != chapter_id:
+            return "automatic replacement chapter identity does not match its ledger"
+        segment_id = str(entry.get("segment_id") or "")
+        matches = [
+            item for item in ledger.get("blocks") or []
+            if isinstance(item, Mapping)
+            and str(item.get("segment_id") or "") == segment_id
+        ]
+        if len(matches) != 1:
+            return "automatic replacement logical unit is absent or ambiguous"
+        if entry.get("fresh_generation_required"):
+            context = entry.get("recovery_context")
+            context = context if isinstance(context, Mapping) else {}
+            reference = context.get("submission_receipt")
+            if not isinstance(reference, Mapping):
+                return "typed idle replacement lacks an exact production submission receipt"
+            try:
+                _validate_pipeline_submission_reference(
+                    reference,
+                    checkpoint_dir=checkpoint_dir,
+                    ledger_path=Path(str(entry.get("ledger_path") or "")),
+                    session_key=session_key,
+                    logical_unit=segment_id,
+                    generation=ledger_generation,
+                    idempotency_key=str(
+                        entry.get("idempotency_key")
+                        or context.get("idempotency_key")
+                        or ""
+                    ),
+                )
+            except RecoveryResponseError as exc:
+                return str(exc)
     context = entry.get("recovery_context")
     context = context if isinstance(context, dict) else {}
     category = str(context.get("failure_category") or "").casefold()
@@ -4894,17 +6456,20 @@ def _prepare_automatic_generation_restarts(
     if transaction is None:
         return {"replacements": []}
     _backfill_legacy_generation_owners(checkpoint_dir, transaction)
-    pending: list[tuple[int, dict[str, Any], Path, dict[str, Any]]] = []
+    pending: list[tuple[int, dict[str, Any], Path, dict[str, Any], str]] = []
     blockers: list[str] = []
     for index, raw in enumerate(transaction.get("entries") or []):
         entry = dict(raw)
         if entry.get("status") == "resolved":
             continue
         path = Path(str(entry.get("ledger_path") or ""))
-        if not path.is_file():
-            blockers.append(f"lane ledger is missing: {path}")
+        try:
+            ledger, ledger_digest = read_registered_lane_ledger(
+                checkpoint_dir, path,
+            )
+        except LaneLedgerRegistryError:
+            blockers.append(f"lane ledger is unregistered or changed: {path}")
             continue
-        ledger = read_json(path)
         segment_id = str(entry.get("segment_id") or "")
         block = next((
             item for item in ledger.get("blocks") or []
@@ -4917,14 +6482,16 @@ def _prepare_automatic_generation_restarts(
                 output_sha256=str(block.get("output_sha256") or ""),
             )
             continue
-        reason = _automatic_restart_blocker(entry)
+        reason = _automatic_restart_blocker(entry, ledger, checkpoint_dir)
         if reason is not None:
             blockers.append(reason)
             continue
-        pending.append((index, entry, path, ledger))
+        pending.append((index, entry, path, ledger, ledger_digest))
     if blockers:
         return {"replacements": [], "blocked_reasons": blockers}
-    groups: dict[str, list[tuple[int, dict[str, Any], Path, dict[str, Any]]]] = {}
+    groups: dict[
+        str, list[tuple[int, dict[str, Any], Path, dict[str, Any], str]]
+    ] = {}
     for item in pending:
         groups.setdefault(str(item[1].get("session_key") or ""), []).append(item)
     replacements: list[dict[str, Any]] = []
@@ -4940,7 +6507,20 @@ def _prepare_automatic_generation_restarts(
             items, key=lambda item: positions.get(str(item[1].get("segment_id") or ""), len(ordered_ids))
         )
         earliest_id = str(earliest[1].get("segment_id") or "")
-        group_id = f"{session_key}:{earliest_id}"
+        restart_id = next((
+            str(block.get("segment_id") or "")
+            for block in ledger.get("blocks") or []
+            if isinstance(block, Mapping) and block.get("state") != "accepted"
+        ), earliest_id)
+        if restart_id not in positions:
+            return {
+                "replacements": replacements,
+                "error": err(
+                    "resume_transaction_logical_unit_invalid",
+                    f"Lane {session_key} has no structurally owned restart unit",
+                ),
+            }
+        group_id = f"{session_key}:{restart_id}"
         active_record = next((
             dict(item) for item in reversed(transaction.get("replacements") or [])
             if str(item.get("group_id") or "") == group_id
@@ -4979,22 +6559,16 @@ def _prepare_automatic_generation_restarts(
             ledger.get("generation") if reconstructed_inflight else
             source_generation + 1
         )
-        suffix_ids = ordered_ids[positions[earliest_id]:]
+        suffix_ids = ordered_ids[positions[restart_id]:]
         ref = session_manager.get_existing(session_key)
-        if ref is None:
-            recovery_options = transaction.get("recovery_options") or {}
-            ref = session_manager.get_or_create(
-                key=session_key,
-                provider=str(recovery_options.get("provider") or "auto"),
-                model=recovery_options.get("model"),
-                runtime_fingerprint="fresh-replacement-runtime-pending",
-                metadata={"fresh_replacement_bootstrap": True},
-            )
-        while ref.generation < source_generation:
+        while ref is not None and ref.generation < source_generation:
             ref = session_manager.rotate(
                 session_key, reason="align fresh automatic replacement generation",
             )
-        if ref.generation not in {source_generation, target_generation}:
+        if (
+            ref is not None
+            and ref.generation not in {source_generation, target_generation}
+        ):
             return {
                 "replacements": replacements,
                 "error": err(
@@ -5016,9 +6590,11 @@ def _prepare_automatic_generation_restarts(
                     ledger_path=path,
                     source_generation=source_generation,
                     target_generation=target_generation,
+                    suffix_start_segment_id=restart_id,
                     suffix_segment_ids=suffix_ids,
                     trigger_code=str(
-                        earliest[1].get("blocking_code")
+                        earliest[1].get("recovery_trigger")
+                        or earliest[1].get("blocking_code")
                         or earliest_context.get("blocked_reason")
                         or "generation_restart_required"
                     ),
@@ -5039,11 +6615,19 @@ def _prepare_automatic_generation_restarts(
                     max_auto_replacements=max_auto_replacements,
                 )
             group_records.append(record)
-            for index, entry, _entry_path, _entry_ledger in items:
+            for index, entry, _entry_path, _entry_ledger, _entry_digest in items:
                 mark_entry(
                     project_dir, index,
                     status=str(entry.get("status") or "pending"),
                     recovery_action="generation_restart_required",
+                    recovery_trigger=entry.get("recovery_trigger"),
+                    automatic_native_resume_suppressed=bool(
+                        entry.get("automatic_native_resume_suppressed")
+                    ),
+                    fresh_generation_required=bool(
+                        entry.get("fresh_generation_required")
+                    ),
+                    fresh_task_start_segment_id=restart_id,
                     target_generation=target_generation,
                     replacement_id=record["replacement_id"],
                     replacement_group_id=record["group_id"],
@@ -5063,11 +6647,11 @@ def _prepare_automatic_generation_restarts(
             segment_ids=suffix_ids,
             generation=source_generation,
         )
-        if ref.generation == source_generation:
+        if ref is not None and ref.generation == source_generation:
             ref = session_manager.rotate(
                 session_key, reason="automatic generation restart",
             )
-        if ref.generation != target_generation:
+        if ref is not None and ref.generation != target_generation:
             return {
                 "replacements": replacements,
                 "error": err(
@@ -5079,13 +6663,37 @@ def _prepare_automatic_generation_restarts(
             if str(record.get("status") or "claimed") == "claimed":
                 record = mark_replacement(
                     project_dir, record["replacement_id"], status="rotated",
-                    rotated_generation=ref.generation,
+                    rotated_generation=target_generation,
                 )
-        current = read_json(path)
-        if int(current.get("generation") or 0) == source_generation:
-            current = invalidate_suffix(
-                path, from_segment_id=earliest_id, generation=target_generation,
+        try:
+            current, current_digest = read_registered_lane_ledger(
+                checkpoint_dir, path,
             )
+        except LaneLedgerRegistryError:
+            return {
+                "replacements": replacements,
+                "error": err(
+                    "resume_transaction_generation_mismatch",
+                    f"Lane ledger {path} changed outside automatic recovery",
+                ),
+            }
+        if int(current.get("generation") or 0) == source_generation:
+            try:
+                current = invalidate_suffix(
+                    path,
+                    from_segment_id=restart_id,
+                    generation=target_generation,
+                    expected_ledger_sha256=current_digest,
+                    checkpoint_dir=checkpoint_dir,
+                )
+            except LaneLedgerError as exc:
+                return {
+                    "replacements": replacements,
+                    "error": err(
+                        "resume_transaction_generation_mismatch",
+                        f"Lane ledger {path} changed outside automatic recovery: {exc}",
+                    ),
+                }
         if int(current.get("generation") or 0) != target_generation:
             return {
                 "replacements": replacements,
@@ -5098,7 +6706,7 @@ def _prepare_automatic_generation_restarts(
             if str(record.get("status") or "claimed") in {"claimed", "rotated"}:
                 updated = mark_replacement(
                     project_dir, record["replacement_id"], status="suffix_invalidated",
-                    suffix_start_segment_id=earliest_id,
+                    suffix_start_segment_id=restart_id,
                     suffix_segment_ids=suffix_ids,
                 )
             else:
@@ -5110,6 +6718,7 @@ def _prepare_automatic_generation_restarts(
 def _finalize_automatic_generation_restarts(
     project_dir: Path,
     *,
+    checkpoint_dir: Path,
     replacements: list[Mapping[str, Any]],
 ) -> dict[str, Any] | None:
     """Resolve originals only after their replacement-generation blocks are accepted."""
@@ -5132,9 +6741,10 @@ def _finalize_automatic_generation_restarts(
         if not located:
             continue
         path = Path(str(raw.get("ledger_path") or located[0][1].get("ledger_path") or ""))
-        if not path.is_file():
+        try:
+            ledger = _read_recovery_ledger(checkpoint_dir, path)
+        except SecureReadError:
             continue
-        ledger = read_json(path)
         replacement_segment_id = str(
             raw.get("segment_id") or located[0][1].get("segment_id") or ""
         )
@@ -5254,8 +6864,12 @@ def _load_recovery_source_bundle(
         checkpoint_dir = _checkpoint_dir_from_recovery_state(
             options.project_dir.resolve(), state,
         )
-        payload = _read_checkpoint_json(checkpoint_dir / "document.json")
-        evidence = _read_checkpoint_json(checkpoint_dir / "evidence.json")
+        payload = _read_checkpoint_json(
+            checkpoint_dir / "document.json", root=checkpoint_dir,
+        )
+        evidence = _read_checkpoint_json(
+            checkpoint_dir / "evidence.json", root=checkpoint_dir,
+        )
         if not (
             isinstance(payload, dict)
             and str(payload.get("paper_id") or "") == paper_id
@@ -5311,11 +6925,11 @@ def _load_recovery_source_bundle(
                 "does not match the authoritative build fingerprint"
             ) from original_error
         receipt = _read_checkpoint_json(
-            checkpoint_dir / "source-snapshot-receipt.json"
+            checkpoint_dir / "source-snapshot-receipt.json", root=checkpoint_dir,
         )
         if receipt is not None:
             domain_context = _read_checkpoint_json(
-                checkpoint_dir / "domain-context.json"
+                checkpoint_dir / "domain-context.json", root=checkpoint_dir,
             )
             if not (
                 isinstance(receipt, dict)
@@ -5364,7 +6978,8 @@ def _checkpoint_dir_from_recovery_state(
         if candidate.is_dir():
             return candidate
     transaction = _read_checkpoint_json(
-        project_dir / ".arc-companion" / "resume-transaction.json"
+        project_dir / ".arc-companion" / "resume-transaction.json",
+        root=project_dir,
     )
     if isinstance(transaction, dict):
         for entry in transaction.get("entries") or []:
@@ -5391,7 +7006,24 @@ def _validate_native_resume_context(
     ledger: dict[str, Any],
     session_manager: Any,
     supervision: Mapping[str, Any] | None = None,
+    allow_explicit_legacy: bool = False,
 ) -> dict[str, Any]:
+    address_blocker = _validate_recovery_ledger_address(
+        checkpoint_dir=checkpoint_dir,
+        ledger_path=ledger_path,
+        ledger=ledger,
+        session_key=f"{ledger.get('chapter_id')}:{ledger.get('lane')}",
+        segment_id=str(
+            (supervision if supervision is not None else ledger.get("needs_supervision") or {}).get(
+                "segment_id"
+            )
+            or ""
+        ),
+        generation=int(ledger.get("generation") or 0),
+        allow_explicit_legacy=allow_explicit_legacy,
+    )
+    if address_blocker is not None:
+        raise ValueError(address_blocker)
     active_supervision = dict(
         supervision if supervision is not None else ledger.get("needs_supervision") or {}
     )
@@ -5502,15 +7134,202 @@ def _reconstruct_unresolved_native_resume_contexts(
     *,
     session_manager: Any,
     excluded_keys: set[str],
+    excluded_identities: set[tuple[str, str, str, int, str]] | None = None,
+    suppress_typed_idle: bool = False,
+    fresh_required_entries: list[dict[str, Any]] | None = None,
+    allow_explicit_legacy: bool = False,
 ) -> list[dict[str, Any]]:
     """Recover submitted calls even when the lane callback never ran."""
     from arc_llm import read_recovery_context
 
+    # Retained as a private-call compatibility parameter only.  A bare
+    # idempotency key is not an ownership identity and must never suppress a
+    # different ledger/session/logical-unit/generation tuple.
+    del excluded_keys
     recovered: list[dict[str, Any]] = []
-    progress_paths = sorted(checkpoint_dir.rglob("progress.jsonl"))
+    excluded_identities = set(excluded_identities or set())
+    receipt_bindings: list[dict[str, Any]] = []
+    for receipt_path, receipt in discover_submission_receipts(checkpoint_dir):
+        if receipt.get("sealed") is not True:
+            continue
+        artifact = (
+            checkpoint_dir.resolve(strict=False)
+            / str(receipt.get("artifact_dir") or "")
+        ).resolve(strict=False)
+        receipt_bindings.append({
+            **receipt,
+            "resolved_artifact_dir": str(artifact),
+            "resolved_ledger_path": str((
+                checkpoint_dir.resolve(strict=False)
+                / str(receipt.get("ledger_path") or "")
+            ).resolve(strict=False)),
+            "receipt_path": str(receipt_path),
+            "receipt_reference": submission_receipt_reference(
+                receipt_path, checkpoint_dir=checkpoint_dir,
+            ),
+        })
+    registered_ledgers = {
+        str(path.resolve(strict=False))
+        for path in _all_lane_ledger_paths(
+            checkpoint_dir, include_explicit_legacy=allow_explicit_legacy,
+        )
+    }
+    # Stateless pipeline controls have no native session record.  Their sealed
+    # receipt is the sole durable ownership proof after a callback crash.
+    for binding in receipt_bindings:
+        if binding.get("checkpoint_session_key") is not None:
+            continue
+        ledger_path = Path(str(binding.get("resolved_ledger_path") or ""))
+        if str(ledger_path.resolve(strict=False)) not in registered_ledgers:
+            continue
+        try:
+            if allow_explicit_legacy:
+                ledger = _read_recovery_ledger(
+                    checkpoint_dir, ledger_path, allow_explicit_legacy=True,
+                )
+                ledger_digest = None
+            else:
+                ledger, ledger_digest = read_registered_lane_ledger(
+                    checkpoint_dir, ledger_path,
+                )
+        except (
+            OSError, ValueError, json.JSONDecodeError, SecureReadError,
+            LaneLedgerRegistryError,
+        ):
+            continue
+        logical_unit = str(binding.get("logical_unit") or "")
+        session_key = str(binding.get("session_key") or "")
+        generation = int(binding.get("generation") or 0)
+        key = str(binding.get("idempotency_key") or "")
+        if not logical_unit or not session_key or generation < 1 or not key:
+            continue
+        unresolved_ids = {
+            str(item.get("segment_id") or "")
+            for item in ledger.get("blocks") or []
+            if isinstance(item, Mapping) and item.get("state") != "accepted"
+        }
+        if logical_unit not in unresolved_ids:
+            continue
+        try:
+            _validate_pipeline_submission_reference(
+                binding["receipt_reference"],
+                checkpoint_dir=checkpoint_dir,
+                ledger_path=ledger_path,
+                session_key=session_key,
+                logical_unit=logical_unit,
+                generation=generation,
+                idempotency_key=key,
+            )
+            artifact_dir = Path(str(binding["resolved_artifact_dir"]))
+            checkpoint_path = resolve_recovery_path(
+                checkpoint_dir, binding.get("checkpoint_path"),
+            )
+        except (RecoveryResponseError, OSError, ValueError):
+            continue
+        try:
+            checkpoint = _read_recovery_json(checkpoint_dir, checkpoint_path)
+        except SecureReadError:
+            continue
+        logical = checkpoint.get("logical_identity") if isinstance(checkpoint, Mapping) else None
+        recipe = checkpoint.get("request_recipe") if isinstance(checkpoint, Mapping) else None
+        if (
+            not isinstance(checkpoint, Mapping)
+            or not isinstance(logical, Mapping)
+            or not isinstance(recipe, Mapping)
+            or logical.get("session_key") is not None
+            or logical.get("generation") is not None
+            or logical.get("idempotency_key") != key
+            or checkpoint.get("state") not in {"submitted", "resuming", "failed"}
+            or checkpoint.get("submission_state") not in {"submitted", "unknown"}
+        ):
+            continue
+        fresh = read_recovery_context(artifact_dir, idempotency_key=key)
+        if (
+            fresh.checkpoint_path is None
+            or fresh.checkpoint_path.resolve(strict=False)
+            != checkpoint_path.resolve(strict=False)
+        ):
+            continue
+        recovery_context = _recovery_context_json(
+            fresh, logical_unit=logical_unit,
+        )
+        recovery_context.update({
+            "submission_receipt": dict(binding["receipt_reference"]),
+            "recovery_unit": str(binding.get("recovery_unit") or ""),
+            "session_key": session_key,
+            "generation": generation,
+            "provider": logical.get("provider"),
+            "model": logical.get("model"),
+            "runtime_fingerprint": recipe.get("runtime_fingerprint"),
+            "stateless_control": True,
+        })
+        candidate_entry = {
+            "ledger_path": str(ledger_path),
+            "session_key": session_key,
+            "segment_id": logical_unit,
+            "idempotency_key": key,
+            "initial_generation": generation,
+            "target_generation": generation + 1,
+            "recovery_context": recovery_context,
+            "reconstructed_from_durable_state": True,
+        }
+        recovery_identity = _native_context_recovery_identity(candidate_entry)
+        if recovery_identity in excluded_identities:
+            continue
+        audit = _fresh_auto_recovery_audit(candidate_entry, checkpoint_dir)
+        if suppress_typed_idle and audit["fresh_generation_required"]:
+            candidate_entry.update(audit)
+            candidate_entry["fresh_task_start_segment_id"] = next((
+                str(item.get("segment_id") or "")
+                for item in ledger.get("blocks") or []
+                if isinstance(item, Mapping) and item.get("state") != "accepted"
+            ), logical_unit)
+            mark_needs_supervision(
+                ledger_path,
+                segment_id=logical_unit,
+                reason="typed idle timeout requires a fresh generation",
+                recovery_context=recovery_context,
+                expected_ledger_sha256=ledger_digest,
+                checkpoint_dir=checkpoint_dir if ledger_digest is not None else None,
+            )
+            if fresh_required_entries is not None:
+                fresh_required_entries.append(candidate_entry)
+        else:
+            mark_needs_supervision(
+                ledger_path,
+                segment_id=logical_unit,
+                reason="submitted stateless call discovered before control progress was persisted",
+                recovery_context=recovery_context,
+                expected_ledger_sha256=ledger_digest,
+                checkpoint_dir=checkpoint_dir if ledger_digest is not None else None,
+            )
+        excluded_identities.add(recovery_identity)
+    progress_paths = (
+        sorted(checkpoint_dir.rglob("progress.jsonl"))
+        if allow_explicit_legacy else []
+    )
     durable_checkpoints: list[tuple[Path, dict[str, Any]]] = []
-    for path in sorted(checkpoint_dir.rglob("call-checkpoints/*.json")):
-        checkpoint = _read_checkpoint_json(path)
+    if allow_explicit_legacy:
+        checkpoint_paths = sorted(checkpoint_dir.rglob("call-checkpoints/*.json"))
+    else:
+        checkpoint_paths = []
+        seen_checkpoint_paths: set[str] = set()
+        for binding in receipt_bindings:
+            try:
+                path = resolve_recovery_path(
+                    checkpoint_dir, binding.get("checkpoint_path"),
+                )
+            except RecoveryResponseError:
+                continue
+            address = str(path)
+            if address not in seen_checkpoint_paths:
+                seen_checkpoint_paths.add(address)
+                checkpoint_paths.append(path)
+    for path in checkpoint_paths:
+        try:
+            checkpoint = _read_recovery_json(checkpoint_dir, path)
+        except SecureReadError:
+            continue
         if not isinstance(checkpoint, dict):
             continue
         state = checkpoint.get("state")
@@ -5522,8 +7341,17 @@ def _reconstruct_unresolved_native_resume_contexts(
             and checkpoint.get("submission_state") in {"submitted", "unknown"}
         ):
             durable_checkpoints.append((path, checkpoint))
-    for ledger_path in _all_lane_ledger_paths(checkpoint_dir):
-        ledger = read_json(ledger_path)
+    for ledger_path in _all_lane_ledger_paths(
+        checkpoint_dir, include_explicit_legacy=allow_explicit_legacy,
+    ):
+        try:
+            ledger = _read_recovery_ledger(
+                checkpoint_dir,
+                ledger_path,
+                allow_explicit_legacy=allow_explicit_legacy,
+            )
+        except SecureReadError:
+            continue
         unresolved_ids = {
             str(item.get("segment_id") or "")
             for item in ledger.get("blocks") or []
@@ -5538,7 +7366,43 @@ def _reconstruct_unresolved_native_resume_contexts(
         generation = int(ledger.get("generation") or 0)
         if generation != ref.generation:
             continue
-        candidates: dict[str, tuple[Path, dict[str, Any]]] = {}
+        # Candidate ownership is the complete recovery identity, never merely
+        # an idempotency key.  A reused key in another lane/logical unit must
+        # remain independently auditable, while two artifact addresses for the
+        # exact same identity are ambiguous and therefore fail closed below.
+        candidates: dict[
+            tuple[str, str, str, int, str],
+            dict[str, tuple[Path, dict[str, Any]]],
+        ] = {}
+
+        def add_candidate(
+            artifact_dir: Path, key: str, event: Mapping[str, Any],
+        ) -> None:
+            matching_units = {
+                str(item.get("logical_unit") or "")
+                for item in receipt_bindings
+                if item.get("resolved_artifact_dir")
+                == str(artifact_dir.resolve(strict=False))
+                and item.get("resolved_ledger_path")
+                == str(ledger_path.resolve(strict=False))
+                and item.get("session_key") == session_key
+                and int(item.get("generation") or 0) == generation
+                and item.get("idempotency_key") == key
+                and str(item.get("logical_unit") or "") in unresolved_ids
+            }
+            if not matching_units:
+                if not allow_explicit_legacy:
+                    return
+                matching_units = {""}
+            artifact_address = str(artifact_dir.resolve(strict=False))
+            for logical_unit in matching_units:
+                identity = (
+                    str(ledger_path.resolve(strict=False)), session_key,
+                    logical_unit, generation, key,
+                )
+                candidates.setdefault(identity, {})[artifact_address] = (
+                    artifact_dir, dict(event),
+                )
         for checkpoint_path, checkpoint in durable_checkpoints:
             logical = checkpoint.get("logical_identity")
             recipe = checkpoint.get("request_recipe")
@@ -5551,10 +7415,10 @@ def _reconstruct_unresolved_native_resume_contexts(
                 or logical.get("provider") != ref.provider
                 or logical.get("model") != ref.model
                 or not key
-                or key in excluded_keys
             ):
                 continue
-            candidates[key] = (checkpoint_path.parent.parent, {
+            artifact_dir = checkpoint_path.parent.parent
+            add_candidate(artifact_dir, key, {
                 "session_key": session_key,
                 "idempotency_key": key,
                 "generation": generation,
@@ -5567,8 +7431,17 @@ def _reconstruct_unresolved_native_resume_contexts(
             })
         for progress_path in progress_paths:
             try:
-                lines = progress_path.read_text(encoding="utf-8").splitlines()
-            except OSError:
+                relative = progress_path.resolve(strict=False).relative_to(
+                    checkpoint_dir.resolve(strict=False)
+                )
+                raw_progress = read_bounded_file(
+                    checkpoint_dir.resolve(strict=False),
+                    relative,
+                    max_bytes=_MAX_RECOVERY_CONTROL_BYTES,
+                    suffixes=(".jsonl",),
+                )
+                lines = raw_progress.decode("utf-8").splitlines()
+            except (OSError, UnicodeError, ValueError, SecureReadError):
                 continue
             for line in lines:
                 try:
@@ -5580,17 +7453,27 @@ def _reconstruct_unresolved_native_resume_contexts(
                 key = str(event.get("idempotency_key") or "")
                 if (
                     not key
-                    or key in excluded_keys
                     or event.get("generation") != generation
                 ):
                     continue
-                candidates[key] = (progress_path.parent, event)
-        for key, (artifact_dir, event) in sorted(candidates.items()):
+                artifact_dir = progress_path.parent
+                add_candidate(artifact_dir, key, event)
+        for candidate_identity, artifact_candidates in sorted(candidates.items()):
+            if len(artifact_candidates) != 1:
+                continue
+            (_artifact_address, (artifact_dir, event)), = artifact_candidates.items()
+            (
+                _candidate_ledger, _candidate_session, logical_hint,
+                _candidate_generation, key,
+            ) = candidate_identity
             checkpoint_path = (
                 artifact_dir / "call-checkpoints"
                 / f"idempotency-{hashlib.sha256(key.encode('utf-8')).hexdigest()}.json"
             )
-            checkpoint = _read_checkpoint_json(checkpoint_path)
+            try:
+                checkpoint = _read_recovery_json(checkpoint_dir, checkpoint_path)
+            except SecureReadError:
+                continue
             if not isinstance(checkpoint, dict):
                 continue
             state = checkpoint.get("state")
@@ -5608,15 +7491,74 @@ def _reconstruct_unresolved_native_resume_contexts(
                 )
             ):
                 continue
-            matching_ids = [
-                segment_id for segment_id in unresolved_ids
-                if segment_id and segment_id in key
+            matching_bindings = [
+                item for item in receipt_bindings
+                if item.get("resolved_artifact_dir")
+                == str(artifact_dir.resolve(strict=False))
+                and item.get("resolved_ledger_path")
+                == str(ledger_path.resolve(strict=False))
+                and item.get("session_key") == session_key
+                and int(item.get("generation") or 0) == generation
+                and item.get("idempotency_key") == key
+                and str(item.get("logical_unit") or "") in unresolved_ids
+                and (
+                    not logical_hint
+                    or str(item.get("logical_unit") or "") == logical_hint
+                )
             ]
-            if len(matching_ids) == 1:
-                segment_id = matching_ids[0]
-            elif len(unresolved_ids) == 1:
-                segment_id = next(iter(unresolved_ids))
+            if len(matching_bindings) > 1:
+                continue
+            binding = matching_bindings[0] if matching_bindings else None
+            if binding is not None:
+                expected_ledger = (
+                    checkpoint_dir.resolve(strict=False)
+                    / str(binding.get("ledger_path") or "")
+                ).resolve(strict=False)
+                segment_id = str(binding.get("logical_unit") or "")
+                if (
+                    expected_ledger != ledger_path.resolve(strict=False)
+                    or segment_id not in unresolved_ids
+                ):
+                    continue
+                try:
+                    _validate_pipeline_submission_reference(
+                        binding["receipt_reference"],
+                        checkpoint_dir=checkpoint_dir,
+                        ledger_path=ledger_path,
+                        session_key=session_key,
+                        logical_unit=segment_id,
+                        generation=generation,
+                        idempotency_key=key,
+                    )
+                except RecoveryResponseError:
+                    continue
             else:
+                # Legacy records may still be offered for explicit native
+                # reconciliation, but automatic typed-idle replacement needs
+                # an exact production binding and never infers ownership from
+                # a call-label substring.
+                if not allow_explicit_legacy:
+                    continue
+                if logical_hint and logical_hint in unresolved_ids:
+                    segment_id = logical_hint
+                elif len(unresolved_ids) == 1:
+                    segment_id = next(iter(unresolved_ids))
+                else:
+                    matching_ids = [
+                        candidate_id for candidate_id in unresolved_ids
+                        if candidate_id and candidate_id in key
+                    ]
+                    if len(matching_ids) != 1:
+                        continue
+                    segment_id = matching_ids[0]
+            recovery_identity = (
+                str(ledger_path.resolve(strict=False)),
+                session_key,
+                segment_id,
+                generation,
+                key,
+            )
+            if recovery_identity in excluded_identities:
                 continue
             fresh = read_recovery_context(
                 artifact_dir,
@@ -5634,13 +7576,72 @@ def _reconstruct_unresolved_native_resume_contexts(
                 or fresh.runtime_fingerprint != ref.runtime_fingerprint
             ):
                 continue
-            current_ledger = read_json(ledger_path)
+            try:
+                if allow_explicit_legacy:
+                    current_ledger = _read_recovery_ledger(
+                        checkpoint_dir, ledger_path, allow_explicit_legacy=True,
+                    )
+                    current_ledger_digest = None
+                else:
+                    current_ledger, current_ledger_digest = (
+                        read_registered_lane_ledger(checkpoint_dir, ledger_path)
+                    )
+            except (SecureReadError, LaneLedgerRegistryError):
+                continue
+            recovery_context = _recovery_context_json(
+                fresh, logical_unit=segment_id,
+            )
+            if binding is not None:
+                recovery_context.update({
+                    "submission_receipt": dict(binding["receipt_reference"]),
+                    "recovery_unit": str(binding.get("recovery_unit") or ""),
+                    "session_key": session_key,
+                    "generation": generation,
+                })
+            candidate_entry = {
+                "ledger_path": str(ledger_path),
+                "session_key": session_key,
+                "segment_id": segment_id,
+                "idempotency_key": key,
+                "initial_generation": generation,
+                "target_generation": generation + 1,
+                "recovery_context": recovery_context,
+                "reconstructed_from_durable_state": True,
+            }
+            audit = _fresh_auto_recovery_audit(candidate_entry, checkpoint_dir)
+            if suppress_typed_idle and audit["fresh_generation_required"]:
+                if binding is None:
+                    continue
+                candidate_entry.update(audit)
+                candidate_entry["fresh_task_start_segment_id"] = next((
+                    str(item.get("segment_id") or "")
+                    for item in current_ledger.get("blocks") or []
+                    if isinstance(item, Mapping) and item.get("state") != "accepted"
+                ), segment_id)
+                mark_needs_supervision(
+                    ledger_path,
+                    segment_id=segment_id,
+                    reason="typed idle timeout requires a fresh generation",
+                    recovery_context=recovery_context,
+                    expected_ledger_sha256=current_ledger_digest,
+                    checkpoint_dir=(
+                        checkpoint_dir if current_ledger_digest is not None else None
+                    ),
+                )
+                if fresh_required_entries is not None:
+                    fresh_required_entries.append(candidate_entry)
+                excluded_identities.add(recovery_identity)
+                continue
             if not current_ledger.get("needs_supervision"):
                 mark_needs_supervision(
                     ledger_path,
                     segment_id=segment_id,
                     reason="submitted call discovered before lane progress was persisted",
-                    recovery_context=_recovery_context_json(fresh),
+                    recovery_context=recovery_context,
+                    expected_ledger_sha256=current_ledger_digest,
+                    checkpoint_dir=(
+                        checkpoint_dir if current_ledger_digest is not None else None
+                    ),
                 )
             recovered.append({
                 "session_key": session_key,
@@ -5654,7 +7655,7 @@ def _reconstruct_unresolved_native_resume_contexts(
                 "segment_id": segment_id,
                 "reconstructed_from_durable_state": True,
             })
-            excluded_keys.add(key)
+            excluded_identities.add(recovery_identity)
     return recovered
 
 
@@ -5675,9 +7676,14 @@ def _restore_native_session_id(session_manager: Any, validated: dict[str, Any], 
             session_manager.update_native_session_id(session_key, native_id)
 
 
-def _recovery_context_json(context: Any) -> dict[str, Any]:
+def _recovery_context_json(
+    context: Any, *, logical_unit: str | None = None,
+) -> dict[str, Any]:
     checkpoint = (
-        _read_checkpoint_json(context.checkpoint_path)
+        _read_checkpoint_json(
+            context.checkpoint_path,
+            root=Path(context.checkpoint_path).parent.parent,
+        )
         if context.checkpoint_path else None
     )
     return {
@@ -5698,6 +7704,7 @@ def _recovery_context_json(context: Any) -> dict[str, Any]:
             str(checkpoint.get("failure_category") or "")
             if isinstance(checkpoint, dict) else ""
         ),
+        **({"logical_unit": logical_unit} if logical_unit else {}),
     }
 
 
@@ -6485,6 +8492,25 @@ def _generate_annotations(
         paper_context = _full_paper_context(
             bundle.document, segment, blocks_by_id=by_id, options=options
         )
+        segment_id = str(segment["segment_id"])
+        ordered_units = [str(item["segment_id"]) for item in pending]
+        acceptance_path = (
+            _generation_segment_artifact_dir(
+                checkpoint_dir, "annotations", segment_id, generation,
+            )
+            / f"{_segment_checkpoint_name(segment_id)}.json"
+        )
+        annotation_input_sha256 = _annotation_checkpoint_input_sha256(
+            segment,
+            bundle=bundle,
+            blocks_by_id=by_id,
+            options=options,
+            segment_glossary=segment_glossary,
+            segment_evidence=segment_evidence,
+            protected_names=protected_names,
+            domain_context=domain_context,
+            intent_guidance=intent_guidance,
+        )
         value = _llm_call(
             llm,
             _guided_prompt(_bounded_annotation_prompt(
@@ -6514,6 +8540,20 @@ def _generate_annotations(
             paper_access_policy=_guidance_policy(intent_guidance, lane="commentary"),
             intent_guidance=intent_guidance,
             intent_guidance_lane="commentary",
+            recovery_descriptor=submission_descriptor(
+                unit="annotation",
+                logical_unit=segment_id,
+                checkpoint_dir=checkpoint_dir,
+                artifact_root=(
+                    _generation_segment_artifact_dir(
+                        checkpoint_dir, "llm/annotations", segment_id, generation,
+                    ) / _segment_checkpoint_name(segment_id)
+                ),
+                acceptance_checkpoint=acceptance_path,
+                input_sha256=annotation_input_sha256,
+                ordered_siblings=ordered_units,
+                suffix=ordered_units[ordered_units.index(segment_id):],
+            ),
         )
         normalized = _validate_direct_annotation_sources(
             value,
@@ -6556,11 +8596,73 @@ def _generate_annotations(
                         intent_guidance=intent_guidance,
                     ),
                 )
+                if _pipeline_control_receipt_exists(
+                    checkpoint_dir, "annotation", str(segment_id),
+                ):
+                    _accept_registered_pipeline_control(
+                        checkpoint_dir, "annotation", str(segment_id),
+                    )
                 if accepted_callback is not None:
                     accepted_callback("annotation", str(segment_id), value)
         if failures:
             raise CompanionLaneError("annotation", failures)
     return {segment["segment_id"]: output[segment["segment_id"]] for segment in segments}
+
+
+def _bind_translation_repair_acceptance(
+    checkpoint_dir: Path,
+    *,
+    segment_id: str,
+    generation: int,
+    input_sha256: str,
+    translation_checkpoint: Path,
+    provenance: Mapping[str, Any],
+) -> None:
+    """Bind each validated paid repair to the final business checkpoint."""
+
+    final_reference = {
+        "path": translation_checkpoint.resolve().relative_to(
+            checkpoint_dir.resolve()
+        ).as_posix(),
+        "sha256": sha256_file(translation_checkpoint),
+    }
+    repairs = [
+        item for item in provenance.get("repairs") or []
+        if isinstance(item, Mapping)
+    ]
+    units = (
+        (
+            "token-placement",
+            "translation-token-repair",
+            f"{segment_id}:token-repair",
+            _translation_token_attempt_path(checkpoint_dir, segment_id, generation),
+        ),
+        (
+            "coverage",
+            "translation-coverage-repair",
+            f"{segment_id}:coverage-repair",
+            _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation),
+        ),
+    )
+    for kind, _unit, logical_unit, marker_path in units:
+        if not any(item.get("kind") == kind for item in repairs):
+            continue
+        marker = _read_checkpoint_json(marker_path, root=checkpoint_dir)
+        if (
+            not isinstance(marker, Mapping)
+            or marker.get("status") != "validated"
+            or marker.get("segment_id") != segment_id
+            or int(marker.get("generation") or 0) != generation
+            or marker.get("input_sha256") != input_sha256
+        ):
+            raise RuntimeError(f"validated {kind} repair marker is missing")
+        write_json(marker_path, {
+            **dict(marker),
+            "final_translation_checkpoint": final_reference,
+        })
+        _accept_registered_pipeline_control(
+            checkpoint_dir, _unit, logical_unit,
+        )
 
 
 def _validate_direct_annotation_sources(
@@ -6762,7 +8864,9 @@ def _legacy_generation_owners_path(checkpoint_dir: Path) -> Path:
 def _legacy_generation_owner(
     checkpoint_dir: Path, artifact_name: str, segment_id: str,
 ) -> int | None:
-    value = _read_checkpoint_json(_legacy_generation_owners_path(checkpoint_dir))
+    value = _read_checkpoint_json(
+        _legacy_generation_owners_path(checkpoint_dir), root=checkpoint_dir,
+    )
     if not isinstance(value, dict):
         return None
     owners = value.get("owners")
@@ -6803,7 +8907,7 @@ def _record_legacy_generation_owners(
     """Bind generationless artifacts before rotating their lane generation."""
 
     path = _legacy_generation_owners_path(checkpoint_dir)
-    current = _read_checkpoint_json(path)
+    current = _read_checkpoint_json(path, root=checkpoint_dir)
     value = dict(current) if isinstance(current, dict) else {}
     owners = {
         str(kind): dict(items)
@@ -6901,7 +9005,7 @@ def _matching_translation_coverage_attempt(
     generation: int = 1,
 ) -> dict[str, Any] | None:
     path = _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation)
-    value = _read_checkpoint_json(path)
+    value = _read_checkpoint_json(path, root=checkpoint_dir)
     if (
         isinstance(value, dict)
         and value.get("schema_version") == TRANSLATION_COVERAGE_ATTEMPT_SCHEMA_VERSION
@@ -6924,7 +9028,8 @@ def _matching_legacy_translation_coverage_attempt(
 ) -> dict[str, Any] | None:
     """Return the v1 marker whose response could not be persisted for replay."""
     value = _read_checkpoint_json(
-        _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation)
+        _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation),
+        root=checkpoint_dir,
     )
     if (
         isinstance(value, dict)
@@ -7100,11 +9205,12 @@ def _legacy_translation_token_attempt_path(
     )
 
 
-def _read_checkpoint_json(path: Path) -> Any | None:
-    """Read a checkpoint without letting a torn/corrupt file trigger fresh model work."""
+def _read_checkpoint_json(path: Path, *, root: Path) -> Any | None:
+    """Read one root-bound checkpoint without following mutable addresses."""
+
     try:
-        return read_json(path) if path.is_file() else None
-    except (OSError, ValueError, TypeError):
+        return _read_recovery_json(root, path)
+    except (SecureReadError, OSError, ValueError, TypeError):
         return None
 
 
@@ -7113,7 +9219,7 @@ def _matching_translation_token_attempt(
     generation: int = 1,
 ) -> dict[str, Any] | None:
     path = _translation_token_attempt_path(checkpoint_dir, segment_id, generation)
-    value = _read_checkpoint_json(path)
+    value = _read_checkpoint_json(path, root=checkpoint_dir)
     if (
         isinstance(value, dict)
         and value.get("schema_version") == "arc.companion.translation-token-attempt.v2"
@@ -7134,7 +9240,8 @@ def _matching_superseded_translation_text_attempt(
 ) -> dict[str, Any] | None:
     """Return a same-input legacy text repair for audit and low-rerun guards."""
     value = _read_checkpoint_json(
-        _legacy_translation_token_attempt_path(checkpoint_dir, segment_id, generation)
+        _legacy_translation_token_attempt_path(checkpoint_dir, segment_id, generation),
+        root=checkpoint_dir,
     )
     if (
         isinstance(value, dict)
@@ -7163,7 +9270,7 @@ def _guard_translation_token_attempt_before_primary(
             checkpoint_dir, segment_id, input_sha256,
             generation,
         )
-    value = _read_checkpoint_json(path)
+    value = _read_checkpoint_json(path, root=checkpoint_dir)
     if not isinstance(value, dict):
         raise RuntimeError(
             f"translation token repair marker is unreadable for {segment_id}; "
@@ -7209,7 +9316,7 @@ def _matching_translation_token_repair_draft(
     path = _translation_token_repair_draft_path(
         checkpoint_dir, segment_id, generation,
     )
-    value = _read_checkpoint_json(path)
+    value = _read_checkpoint_json(path, root=checkpoint_dir)
     if (
         isinstance(value, dict)
         and value.get("schema_version") == "arc.companion.translation-token-repair-draft.v1"
@@ -7377,13 +9484,36 @@ def _repair_call_crossed_submission_barrier(artifact_dir: Path) -> bool:
     if not paths:
         return False
     for path in paths:
-        checkpoint = _read_checkpoint_json(path)
+        checkpoint = _read_checkpoint_json(path, root=artifact_dir)
         if (
             not isinstance(checkpoint, dict)
             or checkpoint.get("submission_state") != "not_submitted"
         ):
             return True
     return False
+
+
+def _completed_repair_checkpoint_response(
+    artifact_dir: Path,
+) -> dict[str, Any] | None:
+    """Return one exact promoted repair response without invoking a provider."""
+
+    checkpoint_root = artifact_dir / "call-checkpoints"
+    paths = sorted(checkpoint_root.glob("*.json")) if checkpoint_root.is_dir() else []
+    if len(paths) > 1:
+        raise RuntimeError("repair artifact contains ambiguous call checkpoints")
+    if not paths:
+        return None
+    checkpoint = _read_checkpoint_json(paths[0], root=artifact_dir)
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError("repair call checkpoint is unreadable")
+    if checkpoint.get("state") not in {"response_received", "validated"}:
+        return None
+    response = checkpoint.get("response")
+    value = response.get("value") if isinstance(response, Mapping) else None
+    if not isinstance(value, Mapping):
+        raise RuntimeError("completed repair checkpoint has no object response")
+    return dict(value)
 
 
 def _repair_translation_token_placement(
@@ -7504,7 +9634,8 @@ def _repair_translation_token_placement(
                     "repair_provenance": persisted_provenance,
                 })
             prior_marker = _read_checkpoint_json(
-                _translation_token_attempt_path(checkpoint_dir, segment_id, generation)
+                _translation_token_attempt_path(checkpoint_dir, segment_id, generation),
+                root=checkpoint_dir,
             )
             _write_validated_translation_token_marker(
                 checkpoint_dir,
@@ -7520,7 +9651,7 @@ def _repair_translation_token_placement(
                 prior_marker=prior_marker if isinstance(prior_marker, dict) else None,
             )
             return repaired, persisted_provenance
-    raw_attempt = _read_checkpoint_json(attempt_path)
+    raw_attempt = _read_checkpoint_json(attempt_path, root=checkpoint_dir)
     if attempt_path.is_file() and raw_attempt is None:
         raise RuntimeError(
             f"translation token repair marker is corrupt for {segment_id}; "
@@ -7538,7 +9669,9 @@ def _repair_translation_token_placement(
             f"translation token repair draft is invalid for {segment_id} and has no "
             "validated raw response; refusing a new model call"
         )
-    raw_repair_draft = _read_checkpoint_json(repair_draft_path)
+    raw_repair_draft = _read_checkpoint_json(
+        repair_draft_path, root=checkpoint_dir,
+    )
     if (
         repair_draft_path.is_file()
         and (
@@ -7613,7 +9746,12 @@ def _repair_translation_token_placement(
             value = raw_response
             response_was_persisted = True
         elif status == "started":
-            if _repair_call_crossed_submission_barrier(
+            value = _completed_repair_checkpoint_response(
+                artifact_dir / "retry-offset-1"
+            )
+            if value is not None:
+                response_was_persisted = True
+            elif _repair_call_crossed_submission_barrier(
                 artifact_dir / "retry-offset-1"
             ):
                 raise RuntimeError(
@@ -7623,7 +9761,8 @@ def _repair_translation_token_placement(
             # The provider call checkpoint is durable before submission. Its
             # absence (or explicit not-submitted state) proves that local
             # preflight did not consume the bounded repair turn.
-            attempt = None
+            else:
+                attempt = None
         else:
             raise RuntimeError(
                 f"translation token repair marker has invalid status {status!r} for {segment_id}"
@@ -7651,6 +9790,20 @@ def _repair_translation_token_placement(
             call_label=f"companion-translation-{segment_id}-retry-offset-1",
             model_tier=TRANSLATION_RETRY_TIER,
             force_offline=True,
+            recovery_descriptor=submission_descriptor(
+                unit="translation-token-repair",
+                logical_unit=f"{segment_id}:token-repair",
+                checkpoint_dir=checkpoint_dir,
+                artifact_root=artifact_dir / "retry-offset-1",
+                acceptance_checkpoint=(
+                    _generation_segment_artifact_dir(
+                        checkpoint_dir, "translations", segment_id, generation,
+                    ) / f"{_segment_checkpoint_name(segment_id)}.json"
+                ),
+                input_sha256=input_sha256,
+                ordered_siblings=[f"{segment_id}:token-repair"],
+                suffix=[f"{segment_id}:token-repair"],
+            ),
         )
         write_json(attempt_path, {
             **marker_base,
@@ -7809,7 +9962,7 @@ def _generate_translations(
         )
         input_hashes[str(segment["segment_id"])] = expected_hash
         if path.is_file() and not force_generation:
-            checkpoint = _read_checkpoint_json(path)
+            checkpoint = _read_checkpoint_json(path, root=checkpoint_dir)
             if (
                 isinstance(checkpoint, dict)
                 and checkpoint.get("segment_id") == segment["segment_id"]
@@ -7856,7 +10009,7 @@ def _generate_translations(
             ) / _segment_checkpoint_name(segment_id)
         )
         draft_path = _translation_draft_path(checkpoint_dir, segment_id, generation)
-        draft = _read_checkpoint_json(draft_path)
+        draft = _read_checkpoint_json(draft_path, root=checkpoint_dir)
         attempt = _matching_translation_coverage_attempt(
             checkpoint_dir, segment_id, input_hashes[segment_id], generation
         )
@@ -7864,7 +10017,8 @@ def _generate_translations(
             checkpoint_dir, segment_id, input_hashes[segment_id], generation
         )
         raw_coverage_attempt = _read_checkpoint_json(
-            _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation)
+            _translation_coverage_attempt_path(checkpoint_dir, segment_id, generation),
+            root=checkpoint_dir,
         )
         if (
             _translation_coverage_attempt_path(
@@ -7972,6 +10126,28 @@ def _generate_translations(
                     paper_access_policy=_guidance_policy(intent_guidance, lane="translation"),
                     intent_guidance=intent_guidance,
                     intent_guidance_lane="translation",
+                    recovery_descriptor=submission_descriptor(
+                        unit="translation",
+                        logical_unit=segment_id,
+                        checkpoint_dir=checkpoint_dir,
+                        artifact_root=artifact_dir,
+                        acceptance_checkpoint=(
+                            _generation_segment_artifact_dir(
+                                checkpoint_dir, "translations", segment_id, generation,
+                            ) / f"{_segment_checkpoint_name(segment_id)}.json"
+                        ),
+                        input_sha256=input_hashes[segment_id],
+                        ordered_siblings=[
+                            str(item["segment_id"]) for item in pending
+                        ],
+                        suffix=[
+                            str(item["segment_id"])
+                            for item in pending[
+                                [str(value["segment_id"]) for value in pending]
+                                .index(segment_id):
+                            ]
+                        ],
+                    ),
                 )
                 draft = _translation_primary_draft_payload(
                     segment,
@@ -8080,7 +10256,12 @@ def _generate_translations(
                         coverage_response = raw_response
                         coverage_response_was_persisted = True
                     elif status == "started":
-                        if _repair_call_crossed_submission_barrier(
+                        coverage_response = _completed_repair_checkpoint_response(
+                            artifact_dir / "coverage-repair-1"
+                        )
+                        if coverage_response is not None:
+                            coverage_response_was_persisted = True
+                        elif _repair_call_crossed_submission_barrier(
                             artifact_dir / "coverage-repair-1"
                         ):
                             raise RuntimeError(
@@ -8089,7 +10270,8 @@ def _generate_translations(
                             )
                         # A local crash before a durable provider submission is
                         # safe to heal without consuming the bounded repair.
-                        attempt = None
+                        else:
+                            attempt = None
                     else:
                         raise RuntimeError(
                             "translation coverage repair marker has invalid status "
@@ -8124,6 +10306,23 @@ def _generate_translations(
                             call_label=f"companion-translation-{segment_id}-coverage-repair-1",
                             model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
                             force_offline=True,
+                            recovery_descriptor=submission_descriptor(
+                                unit="translation-coverage-repair",
+                                logical_unit=f"{segment_id}:coverage-repair",
+                                checkpoint_dir=checkpoint_dir,
+                                artifact_root=artifact_dir / "coverage-repair-1",
+                                acceptance_checkpoint=(
+                                    _generation_segment_artifact_dir(
+                                        checkpoint_dir, "translations", segment_id,
+                                        generation,
+                                    ) / f"{_segment_checkpoint_name(segment_id)}.json"
+                                ),
+                                input_sha256=input_hashes[segment_id],
+                                ordered_siblings=[
+                                    f"{segment_id}:coverage-repair"
+                                ],
+                                suffix=[f"{segment_id}:coverage-repair"],
+                            ),
                         )
                     except CompanionLLMCircuitOpen:
                         # The shared limiter rejected this queued call before it
@@ -8325,10 +10524,13 @@ def _generate_translations(
             else:
                 output[segment_id] = value
                 segment = next(item for item in segments if item["segment_id"] == segment_id)
-                write_json(
+                translation_checkpoint_path = (
                     _generation_segment_artifact_dir(
                         checkpoint_dir, "translations", segment_id, generation,
-                    ) / f"{_segment_checkpoint_name(segment_id)}.json",
+                    ) / f"{_segment_checkpoint_name(segment_id)}.json"
+                )
+                write_json(
+                    translation_checkpoint_path,
                     {
                         "schema_version": "arc.companion.translation-checkpoint.v2",
                         "segment_id": segment_id,
@@ -8355,6 +10557,20 @@ def _generate_translations(
                         "translation": value,
                     },
                 )
+                _bind_translation_repair_acceptance(
+                    checkpoint_dir,
+                    segment_id=str(segment_id),
+                    generation=generation,
+                    input_sha256=input_hashes[str(segment_id)],
+                    translation_checkpoint=translation_checkpoint_path,
+                    provenance=provenance,
+                )
+                if _pipeline_control_receipt_exists(
+                    checkpoint_dir, "translation", str(segment_id),
+                ):
+                    _accept_registered_pipeline_control(
+                        checkpoint_dir, "translation", str(segment_id),
+                    )
                 if accepted_callback is not None:
                     accepted_callback("translation", str(segment_id), value)
         if failures:
@@ -8517,6 +10733,19 @@ def _review(
             label="section review",
         )
         chunks = [list(call["items"]) for call in section_calls]
+        section_logical_units = [
+            _stable_recovery_chunk_id(
+                "section-review",
+                [str(value) for value in call.get("segment_ids") or []],
+                payload={"prompt": call.get("prompt"), "items": call.get("items")},
+            )
+            for call in section_calls
+        ]
+        section_group_sha256 = sha256_json({
+            "unit": "section-review",
+            "segments": payload["segments"],
+            "language": options.annotation_language,
+        })
         # The final consolidation depends on section outputs, but its smallest
         # complete coverage projection does not. Validate that projection before
         # any parallel section call can incur cost.
@@ -8557,6 +10786,7 @@ def _review(
                 "schema": SECTION_REVIEW_SCHEMA,
                 "model_tier": REVIEW_TIER,
             })
+            logical_unit = section_logical_units[index]
             path = checkpoint_dir / "section-reviews" / f"{index:04d}.json"
             invalid_matching_checkpoint = False
             if path.is_file() and not force_review:
@@ -8584,6 +10814,11 @@ def _review(
                     if checkpoint_review != checkpoint.get("review"):
                         checkpoint = {**checkpoint, "review": checkpoint_review}
                         write_json(path, checkpoint)
+                    _accept_completed_pipeline_controls(
+                        checkpoint_dir,
+                        caller_validated_units=frozenset({"section-review"}),
+                        only_logical_unit=logical_unit,
+                    )
                     return checkpoint_review, "checkpoint-reuse", []
                 invalid_matching_checkpoint = bool(checkpoint_matches)
             value = (
@@ -8598,7 +10833,7 @@ def _review(
                     prompt,
                     SECTION_REVIEW_SCHEMA,
                     options=options,
-                    artifact_dir=checkpoint_dir / "llm" / "section-review" / str(index),
+                    artifact_dir=checkpoint_dir / "llm" / "section-review" / logical_unit,
                     call_label=f"companion-section-review-{index}",
                     model_tier=REVIEW_TIER,
                     paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
@@ -8608,6 +10843,19 @@ def _review(
                         rendered,
                         stage="section",
                         audit_sink=evidence_round_audits,
+                    ),
+                    recovery_descriptor=submission_descriptor(
+                        unit="section-review",
+                        logical_unit=logical_unit,
+                        checkpoint_dir=checkpoint_dir,
+                        artifact_root=(
+                            checkpoint_dir / "llm" / "section-review" / logical_unit
+                        ),
+                        acceptance_checkpoint=path,
+                        input_sha256=input_sha256,
+                        group_sha256=section_group_sha256,
+                        ordered_siblings=section_logical_units,
+                        suffix=section_logical_units[index:],
                     ),
                 )
             if isinstance(value, dict) and "reviewed_segment_ids" not in value:
@@ -8645,6 +10893,9 @@ def _review(
                 "evidence_prompt_budget_audits": evidence_round_audits,
                 "review": value,
             })
+            _accept_registered_pipeline_control(
+                checkpoint_dir, "section-review", logical_unit,
+            )
             return value, disposition, evidence_round_audits
 
         with ThreadPoolExecutor(max_workers=min(options.workers, len(section_calls))) as executor:
@@ -8716,6 +10967,12 @@ def _review(
         headroom_class="essential_final_headroom",
     )
     final_evidence_round_audits: list[dict[str, Any]] = []
+    final_review_input_sha256 = sha256_json({
+        "prompt": final_prompt,
+        "schema": REVIEW_SCHEMA,
+        "model_tier": REVIEW_TIER,
+    })
+    final_review_acceptance_path = checkpoint_dir / "final-review-accepted.json"
     review = _llm_call(
         llm,
         final_prompt,
@@ -8731,6 +10988,16 @@ def _review(
             final_rendered,
             stage="hierarchical-final" if hierarchical else "direct-final",
             audit_sink=final_evidence_round_audits,
+        ),
+        recovery_descriptor=submission_descriptor(
+            unit="final-review",
+            logical_unit="final-review",
+            checkpoint_dir=checkpoint_dir,
+            artifact_root=checkpoint_dir / "llm" / "final-review",
+            acceptance_checkpoint=final_review_acceptance_path,
+            input_sha256=final_review_input_sha256,
+            ordered_siblings=["final-review"],
+            suffix=["final-review"],
         ),
     )
     review = _normalize_sparse_review_patches(
@@ -8793,7 +11060,7 @@ def _review(
             language=options.annotation_language,
         )
         patched.add(segment_id)
-    return reviewed_translations, reviewed, {
+    final_review_audit = {
         "hierarchical": hierarchical,
         "section_findings": findings,
         "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
@@ -8812,6 +11079,18 @@ def _review(
             "historical_measurements_available": True,
         },
     }
+    write_json(final_review_acceptance_path, {
+        "schema_version": "arc.companion.final-review-acceptance.v1",
+        "input_sha256": final_review_input_sha256,
+        "response": review,
+        "reviewed_translation_sha256": sha256_json(reviewed_translations),
+        "reviewed_annotation_sha256": sha256_json(reviewed),
+        "audit": final_review_audit,
+    })
+    _accept_registered_pipeline_control(
+        checkpoint_dir, "final-review", "final-review",
+    )
+    return reviewed_translations, reviewed, final_review_audit
 
 
 def _review_commentary_only(
@@ -8902,6 +11181,19 @@ def _review_commentary_only(
         ]
     )
     payload_groups = [(list(call["items"]), {}) for call in commentary_calls]
+    commentary_logical_units = [
+        _stable_recovery_chunk_id(
+            "commentary-review",
+            [str(value) for value in call.get("segment_ids") or []],
+            payload={"prompt": call.get("prompt"), "items": call.get("items")},
+        )
+        for call in commentary_calls
+    ]
+    commentary_group_sha256 = sha256_json({
+        "unit": "commentary-review",
+        "segments": segment_payloads,
+        "language": options.annotation_language,
+    })
 
     recovered_reviews = (
         {} if options.force or not hierarchical
@@ -8921,6 +11213,7 @@ def _review_commentary_only(
             "schema": COMMENTARY_REVIEW_SCHEMA,
             "model_tier": REVIEW_TIER,
         })
+        logical_unit = commentary_logical_units[index]
         path = checkpoint_dir / "commentary-reviews" / f"{index:04d}.json"
         if path.is_file() and not options.force:
             checkpoint = read_json(path)
@@ -8933,6 +11226,11 @@ def _review_commentary_only(
                     checkpoint.get("review"), group
                 ) is None
             ):
+                _accept_completed_pipeline_controls(
+                    checkpoint_dir,
+                    caller_validated_units=frozenset({"commentary-review"}),
+                    only_logical_unit=logical_unit,
+                )
                 return checkpoint["review"], "checkpoint-reuse", []
         value = recovered_reviews.get(index)
         disposition = "recovered-reuse" if value is not None else "provider-call"
@@ -8942,7 +11240,7 @@ def _review_commentary_only(
                 prompt,
                 COMMENTARY_REVIEW_SCHEMA,
                 options=options,
-                artifact_dir=checkpoint_dir / "llm" / "commentary-review" / str(index),
+                artifact_dir=checkpoint_dir / "llm" / "commentary-review" / logical_unit,
                 call_label=f"companion-commentary-review-{index}",
                 model_tier=REVIEW_TIER,
                 paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
@@ -8952,6 +11250,19 @@ def _review_commentary_only(
                     rendered,
                     stage="commentary",
                     audit_sink=evidence_round_audits,
+                ),
+                recovery_descriptor=submission_descriptor(
+                    unit="commentary-review",
+                    logical_unit=logical_unit,
+                    checkpoint_dir=checkpoint_dir,
+                    artifact_root=(
+                        checkpoint_dir / "llm" / "commentary-review" / logical_unit
+                    ),
+                    acceptance_checkpoint=path,
+                    input_sha256=input_sha256,
+                    group_sha256=commentary_group_sha256,
+                    ordered_siblings=commentary_logical_units,
+                    suffix=commentary_logical_units[index:],
                 ),
             )
         validation_error = _commentary_review_validation_error(value, group)
@@ -8975,6 +11286,9 @@ def _review_commentary_only(
             "evidence_prompt_budget_audits": evidence_round_audits,
             "review": value,
         })
+        _accept_registered_pipeline_control(
+            checkpoint_dir, "commentary-review", logical_unit,
+        )
         return value, disposition, evidence_round_audits
 
     responses: list[dict[str, Any]] = []
@@ -9327,6 +11641,815 @@ def _complete_stateful_reference_evidence(
     raise AssertionError("unreachable stateful evidence loop")
 
 
+def _prepare_pipeline_recovery_control(
+    descriptor: Mapping[str, Any], *, artifact_dir: Path,
+) -> dict[str, Any]:
+    if descriptor.get("schema_version") != "arc.companion.recovery-call-descriptor.v1":
+        raise RecoveryResponseError("pipeline recovery descriptor schema is invalid")
+    unit = str(descriptor.get("unit") or "")
+    spec = recovery_unit_for_ledger(unit)
+    if (
+        spec is None
+        or descriptor.get("validator") != spec.validator
+        or descriptor.get("application") != spec.application
+        or descriptor.get("side_effect_policy") != spec.side_effect_policy
+        or descriptor.get("external_side_effects") is not False
+    ):
+        raise RecoveryResponseError("pipeline recovery descriptor handler is invalid")
+    root = Path(str(descriptor.get("checkpoint_dir") or "")).resolve(strict=False)
+    artifact_lexical = Path(str(descriptor.get("artifact_root") or ""))
+    acceptance_lexical = Path(str(descriptor.get("acceptance_checkpoint") or ""))
+    artifact_call_lexical = artifact_dir.absolute()
+    safe_candidates: list[Path] = []
+    for candidate in (artifact_lexical, acceptance_lexical, artifact_call_lexical):
+        try:
+            relative = candidate.relative_to(root)
+            safe_candidates.append(resolve_recovery_path(root, relative.as_posix()))
+        except (RecoveryResponseError, ValueError) as exc:
+            raise RecoveryResponseError(
+                "pipeline recovery descriptor escapes its active checkpoint"
+            ) from exc
+    artifact_root, acceptance, artifact_call = safe_candidates
+    if artifact_root != artifact_call:
+        raise RecoveryResponseError("pipeline recovery artifact identity changed")
+    logical_unit = str(descriptor.get("logical_unit") or "")
+    ordered = [str(item) for item in descriptor.get("ordered_siblings") or []]
+    suffix = [str(item) for item in descriptor.get("suffix") or []]
+    if (
+        not logical_unit
+        or logical_unit not in ordered
+        or suffix != ordered[ordered.index(logical_unit):]
+        or not re.fullmatch(r"[0-9a-f]{64}", str(descriptor.get("input_sha256") or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(descriptor.get("group_sha256") or ""))
+    ):
+        raise RecoveryResponseError("pipeline recovery logical ownership is invalid")
+    identity_sha = sha256_json({
+        key: descriptor.get(key) for key in (
+            "unit", "group_sha256", "validator", "application",
+        )
+    })
+    chapter_id = f"pipeline-{unit}-{identity_sha[:12]}"
+    ledger_path = (
+        root / "recovery-controls" / unit / f"{identity_sha[:16]}-ledger.json"
+    )
+    # Concurrent section/glossary/review handlers may bind distinct logical
+    # units to the same ordered control ledger.  Serialize the in-process
+    # read/rebind/register transaction; the project build lock excludes a
+    # second controller process.
+    with _RECOVERY_CONTROL_INITIALIZE_LOCK:
+        ledger = initialize_control_ledger(
+            ledger_path,
+            chapter_id=chapter_id,
+            lane=unit,
+            segment_ids=ordered,
+            checkpoint_dir=root,
+        )
+        target = next(
+            item for item in ledger.get("blocks") or []
+            if item.get("segment_id") == logical_unit
+        )
+        if target.get("state") in {"accepted", "response_received"}:
+            # Reaching this function means the normal business handler chose
+            # to submit a new paid call.  An accepted control, or an
+            # unsealed direct-adapter response that cannot be recovered,
+            # belongs to the prior immutable attempt, so rotate the owned
+            # suffix before the new receipt is created.  A sealed response is
+            # recoverable and must be handled instead of resubmitted.
+            if (
+                target.get("state") == "response_received"
+                and _pipeline_control_receipt_exists(root, unit, logical_unit)
+            ):
+                raise RecoveryResponseError(
+                    "recoverable response must be applied before resubmission"
+                )
+            ledger = invalidate_suffix(
+                ledger_path,
+                from_segment_id=logical_unit,
+                generation=int(ledger.get("generation") or 1) + 1,
+            )
+    generation = int(ledger.get("generation") or 1)
+    session_key = f"{chapter_id}:{unit}"
+    return {
+        **dict(descriptor),
+        "checkpoint_dir": str(root),
+        "ledger_path": str(ledger_path.resolve(strict=False)),
+        "acceptance_checkpoint": str(acceptance),
+        "session_key": session_key,
+        "generation": generation,
+        "idempotency_key": (
+            f"{session_key}:{logical_unit}:generation-{generation}"
+        ),
+        "ordered_siblings": ordered,
+        "suffix": suffix,
+    }
+
+
+_RECOVERY_CONTROL_INITIALIZE_LOCK = threading.RLock()
+
+
+def _guarded_mark_transport_state(
+    ledger_path: Path,
+    *,
+    checkpoint_dir: Path,
+    session_key: str,
+    logical_unit: str,
+    idempotency_key: str,
+    response_received: bool = False,
+) -> None:
+    """CAS one production transport transition against its exact five-tuple."""
+    try:
+        guard = lane_transition_guard(
+            ledger_path,
+            segment_id=logical_unit,
+            session_key=session_key,
+            idempotency_key=idempotency_key,
+            checkpoint_dir=checkpoint_dir,
+        )
+        mark_submitted(
+            ledger_path,
+            segment_id=logical_unit,
+            expected_generation=guard.expected_generation,
+            expected_ledger_sha256=guard.expected_ledger_sha256,
+            authorization=guard.authorization,
+            checkpoint_dir=checkpoint_dir,
+        )
+        if not response_received:
+            return
+        # The submitted transition changes the registered ledger digest.
+        # Acquire a fresh guard instead of reusing stale CAS material.
+        guard = lane_transition_guard(
+            ledger_path,
+            segment_id=logical_unit,
+            session_key=session_key,
+            idempotency_key=idempotency_key,
+            checkpoint_dir=checkpoint_dir,
+        )
+        mark_response_received(
+            ledger_path,
+            segment_id=logical_unit,
+            expected_generation=guard.expected_generation,
+            expected_ledger_sha256=guard.expected_ledger_sha256,
+            authorization=guard.authorization,
+            checkpoint_dir=checkpoint_dir,
+        )
+    except (LaneLedgerError, LaneLedgerRegistryError) as exc:
+        raise LaneLedgerError(
+            "transport state rejected for "
+            f"{ledger_path.name}:{logical_unit}:{idempotency_key}: {exc}"
+        ) from exc
+
+
+_CALLER_VALIDATED_RECOVERY_UNITS = frozenset({
+    "intent-guidance", "guide", "section-review", "final-review",
+    "commentary-review",
+})
+
+
+def _accept_completed_pipeline_controls(
+    checkpoint_dir: Path, *, caller_validated_units: frozenset[str] = frozenset(),
+    only_logical_unit: str | None = None,
+    only_recovery_unit: str | None = None,
+    strict: bool = False,
+) -> int:
+    """Accept only registered control units whose normal handler wrote its checkpoint."""
+
+    root = checkpoint_dir.resolve(strict=False)
+    accepted = 0
+    for receipt_path, receipt in discover_submission_receipts(root):
+        if not receipt.get("sealed"):
+            continue
+        unit = str(receipt.get("recovery_unit") or "")
+        if only_recovery_unit is not None and unit != only_recovery_unit:
+            continue
+        if unit in _CALLER_VALIDATED_RECOVERY_UNITS and unit not in caller_validated_units:
+            continue
+        if (
+            only_logical_unit is not None
+            and receipt.get("logical_unit") != only_logical_unit
+        ):
+            continue
+        spec = recovery_unit_for_ledger(unit)
+        if spec is None:
+            continue
+        try:
+            ledger_path = resolve_recovery_path(root, receipt.get("ledger_path"))
+            ledger_path.relative_to(root / "recovery-controls")
+        except (RecoveryResponseError, ValueError) as exc:
+            if strict:
+                raise RecoveryResponseError(
+                    f"{unit}:{receipt.get('logical_unit')} ledger ownership is invalid"
+                ) from exc
+            continue
+        logical_unit = str(receipt.get("logical_unit") or "")
+        try:
+            reference = submission_receipt_reference(
+                receipt_path, checkpoint_dir=root,
+            )
+            validated_receipt = _validate_pipeline_submission_reference(
+                reference,
+                checkpoint_dir=root,
+                ledger_path=ledger_path,
+                session_key=str(receipt.get("session_key") or ""),
+                logical_unit=logical_unit,
+                generation=int(receipt.get("generation") or 0),
+                idempotency_key=str(receipt.get("idempotency_key") or ""),
+            )
+            ledger, ledger_digest = read_registered_lane_ledger(root, ledger_path)
+            if ledger_digest != validated_receipt.get(
+                "current_registered_ledger_sha256"
+            ):
+                raise RecoveryResponseError(
+                    "registered ledger changed after receipt validation"
+                )
+            receipt = validated_receipt
+        except (LaneLedgerRegistryError, RecoveryResponseError) as exc:
+            if strict:
+                raise RecoveryResponseError(
+                    f"{unit}:{receipt.get('logical_unit')} ledger registry is invalid"
+                ) from exc
+            continue
+        block = next((
+            item for item in ledger.get("blocks") or []
+            if isinstance(item, Mapping)
+            and str(item.get("segment_id") or "") == logical_unit
+        ), None)
+        if not isinstance(block, Mapping) or block.get("state") == "accepted":
+            continue
+        if block.get("state") != "response_received":
+            continue
+        try:
+            acceptance_path = resolve_recovery_path(
+                root, receipt.get("acceptance_checkpoint"),
+            )
+            acceptance_path.relative_to(root)
+        except (RecoveryResponseError, ValueError) as exc:
+            if strict:
+                raise RecoveryResponseError(
+                    f"{unit}:{logical_unit} acceptance ownership is invalid"
+                ) from exc
+            continue
+        output_sha = _pipeline_acceptance_checkpoint_digest(
+            unit,
+            acceptance_path,
+            receipt,
+            checkpoint_dir=root,
+            require_business_validation=unit not in caller_validated_units,
+        )
+        if output_sha is None:
+            if strict:
+                raise RecoveryResponseError(
+                    f"{unit}:{logical_unit} business acceptance checkpoint is invalid"
+                )
+            continue
+        ordered_blocks = [
+            item for item in ledger.get("blocks") or []
+            if isinstance(item, Mapping)
+        ]
+        block_index = next(
+            index for index, item in enumerate(ordered_blocks)
+            if str(item.get("segment_id") or "") == logical_unit
+        )
+        if (
+            block_index
+            and ordered_blocks[block_index - 1].get("state") != "accepted"
+        ):
+            # A later concurrent response may be durable before its prefix.
+            # Keep it response_received until a subsequent ordered sweep.
+            continue
+        try:
+            for state in ("schema_valid", "invariant_valid"):
+                advance_block(
+                    ledger_path,
+                    segment_id=logical_unit,
+                    state=state,
+                    expected_ledger_sha256=ledger_digest,
+                    checkpoint_dir=root,
+                )
+                ledger, ledger_digest = read_registered_lane_ledger(
+                    root, ledger_path,
+                )
+            advance_block(
+                ledger_path,
+                segment_id=logical_unit,
+                state="accepted",
+                input_sha256=str(receipt.get("input_sha256") or ""),
+                output_sha256=output_sha,
+                receipt={
+                    "kind": "normal_pipeline_acceptance_replay",
+                    "validator": spec.validator,
+                    "application": spec.application,
+                    "recovery_identity": {
+                        "control_address": str(ledger_path.resolve(strict=False)),
+                        "session_key": str(receipt.get("session_key") or ""),
+                        "logical_unit": logical_unit,
+                        "generation": int(receipt.get("generation") or 0),
+                        "idempotency_key": str(
+                            receipt.get("idempotency_key") or ""
+                        ),
+                    },
+                    "submission_receipt_identity_sha256": str(
+                        reference.get("identity_sha256") or ""
+                    ),
+                },
+                expected_ledger_sha256=ledger_digest,
+                checkpoint_dir=root,
+            )
+            ledger, ledger_digest = read_registered_lane_ledger(root, ledger_path)
+            if ledger.get("needs_supervision"):
+                clear_needs_supervision(
+                    ledger_path,
+                    expected_ledger_sha256=ledger_digest,
+                    checkpoint_dir=root,
+                )
+        except (LaneLedgerError, LaneLedgerRegistryError) as exc:
+            if strict:
+                raise RecoveryResponseError(
+                    f"{unit}:{logical_unit} control acceptance failed"
+                ) from exc
+            continue
+        accepted += 1
+    return accepted
+
+
+def _pipeline_control_receipt_exists(
+    checkpoint_dir: Path,
+    unit: str,
+    logical_unit: str,
+) -> bool:
+    root = checkpoint_dir.resolve(strict=False)
+    for receipt_path, receipt in discover_submission_receipts(root):
+        if not (
+            receipt.get("sealed")
+            and receipt.get("recovery_unit") == unit
+            and receipt.get("logical_unit") == logical_unit
+        ):
+            continue
+        try:
+            ledger_path = resolve_recovery_path(root, receipt.get("ledger_path"))
+            _validate_pipeline_submission_reference(
+                submission_receipt_reference(receipt_path, checkpoint_dir=root),
+                checkpoint_dir=root,
+                ledger_path=ledger_path,
+                session_key=str(receipt.get("session_key") or ""),
+                logical_unit=logical_unit,
+                generation=int(receipt.get("generation") or 0),
+                idempotency_key=str(receipt.get("idempotency_key") or ""),
+            )
+        except (RecoveryResponseError, TypeError, ValueError):
+            continue
+        return True
+    return False
+
+
+def _accept_registered_pipeline_control(
+    checkpoint_dir: Path,
+    unit: str,
+    logical_unit: str,
+) -> int:
+    """Require acceptance when a sealed production submission is registered.
+
+    The package also supports direct callback adapters used by embedders and
+    tests. They receive the descriptor but may not implement ARC's durable
+    receipt protocol; in that case there is no control ledger to promote.
+    """
+
+    if not _pipeline_control_receipt_exists(checkpoint_dir, unit, logical_unit):
+        return 1
+    return _require_exact_pipeline_control_acceptance(
+        checkpoint_dir, unit, logical_unit,
+    )
+
+
+def _require_exact_pipeline_control_acceptance(
+    checkpoint_dir: Path,
+    unit: str,
+    logical_unit: str,
+) -> int:
+    """Accept and verify the one exact control owned by a completed handler."""
+
+    root = checkpoint_dir.resolve(strict=False)
+    with _RECOVERY_CONTROL_INITIALIZE_LOCK:
+        transitioned = _accept_completed_pipeline_controls(
+            root,
+            caller_validated_units=(
+                frozenset({unit}) if unit in _CALLER_VALIDATED_RECOVERY_UNITS
+                else frozenset()
+            ),
+            only_logical_unit=logical_unit,
+            only_recovery_unit=unit,
+            strict=True,
+        )
+    if transitioned > 1:
+        raise RecoveryResponseError(
+            f"{unit}:{logical_unit} matched more than one control acceptance"
+        )
+    verified_ledgers: set[Path] = set()
+    for receipt_path, receipt in discover_submission_receipts(root):
+        if (
+            not receipt.get("sealed")
+            or receipt.get("recovery_unit") != unit
+            or receipt.get("logical_unit") != logical_unit
+        ):
+            continue
+        try:
+            ledger_path = resolve_recovery_path(root, receipt.get("ledger_path"))
+            reference = submission_receipt_reference(
+                receipt_path, checkpoint_dir=root,
+            )
+            ledger, _digest = read_registered_lane_ledger(root, ledger_path)
+        except (RecoveryResponseError, LaneLedgerRegistryError, TypeError, ValueError):
+            continue
+        block = next((
+            item for item in ledger.get("blocks") or []
+            if isinstance(item, Mapping)
+            and item.get("segment_id") == logical_unit
+            and int(item.get("generation") or 0)
+            == int(receipt.get("generation") or 0)
+        ), None)
+        logical_receipt = (
+            block.get("logical_receipt") if isinstance(block, Mapping) else None
+        )
+        expected_identity = {
+            "control_address": str(ledger_path.resolve(strict=False)),
+            "session_key": str(receipt.get("session_key") or ""),
+            "logical_unit": logical_unit,
+            "generation": int(receipt.get("generation") or 0),
+            "idempotency_key": str(receipt.get("idempotency_key") or ""),
+        }
+        if (
+            isinstance(block, Mapping)
+            and block.get("state") == "accepted"
+            and isinstance(logical_receipt, Mapping)
+            and logical_receipt.get("recovery_identity") == expected_identity
+            and logical_receipt.get("submission_receipt_identity_sha256")
+            == reference.get("identity_sha256")
+        ):
+            verified_ledgers.add(ledger_path.resolve(strict=False))
+    if len(verified_ledgers) != 1:
+        raise RecoveryResponseError(
+            f"{unit}:{logical_unit} did not resolve to one accepted control ledger"
+        )
+    return 1
+
+
+def _pipeline_acceptance_checkpoint_valid(
+    unit: str,
+    path: Path,
+    receipt: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path | None = None,
+    _validated_value: Mapping[str, Any] | None = None,
+    _validated_raw: bytes | None = None,
+) -> bool:
+    value: Any = _validated_value
+    if value is None:
+        try:
+            value = read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+    if not isinstance(value, Mapping):
+        return False
+    input_sha = str(receipt.get("input_sha256") or "")
+    if unit == "segmentation":
+        return (
+            value.get("window_sha256") == input_sha
+            and isinstance(value.get("response"), Mapping)
+            and _recovery_candidate_matches_schema(value["response"], receipt)
+            and validate_segmentation_acceptance_checkpoint(dict(value))
+        )
+    if unit in {"glossary", "glossary-consolidation"}:
+        result = value.get("result")
+        return (
+            value.get("input_sha256") == input_sha
+            and isinstance(result, Mapping)
+            and isinstance(result.get("entries"), list)
+            and _recovery_candidate_matches_schema(result, receipt)
+            and validate_glossary_acceptance_checkpoint(dict(value))
+        )
+    if unit == "intent-guidance":
+        return (
+            value.get("schema_version") == "arc.companion.intent-guidance.v2"
+            and value.get("semantic_input_sha256") == input_sha
+            and isinstance(value.get("guidance"), str)
+            and value.get("resolution_status") in {"resolved", "ambiguous"}
+            and _recovery_candidate_matches_schema({
+                "guidance": value.get("guidance"),
+                "resolution_status": value.get("resolution_status"),
+                "reference_targets": value.get("reference_targets") or [],
+            }, receipt)
+        )
+    if unit == "annotation":
+        return (
+            value.get("schema_version") == ANNOTATION_CHECKPOINT_VERSION
+            and value.get("segment_id") == receipt.get("logical_unit")
+            and value.get("generation") == receipt.get("generation")
+            and value.get("input_sha256") == input_sha
+            and isinstance(value.get("annotation"), Mapping)
+            and _recovery_candidate_matches_schema(value["annotation"], receipt)
+        )
+    if unit == "translation":
+        segment_id = str(receipt.get("logical_unit") or "").split(":", 1)[0]
+        return (
+            value.get("schema_version") == "arc.companion.translation-checkpoint.v2"
+            and value.get("segment_id") == segment_id
+            and value.get("generation") == receipt.get("generation")
+            and value.get("input_sha256") == input_sha
+            and isinstance(value.get("translation"), Mapping)
+            and _recovery_candidate_matches_schema(value["translation"], receipt)
+        )
+    if unit in {
+        "translation-token-repair", "translation-coverage-repair",
+    }:
+        if checkpoint_dir is None:
+            return False
+        return _translation_repair_acceptance_valid(
+            unit,
+            value,
+            receipt,
+            checkpoint_dir=checkpoint_dir,
+            acceptance_path=path,
+            acceptance_raw=_validated_raw,
+        )
+    if unit == "glossary-index":
+        response = value.get("response")
+        expected_ids = [
+            str(item) for item in value.get("expected_entry_ids") or []
+        ]
+        batch_identity = {
+            "source_sha256": value.get("source_sha256"),
+            "language": value.get("language"),
+            "expected_entry_ids": expected_ids,
+            "prompt_sha256": value.get("prompt_sha256"),
+            "schema_sha256": value.get("schema_sha256"),
+        }
+        expected_logical_suffix = sha256_json(expected_ids)[:16]
+        return (
+            value.get("schema_version") == INDEX_GLOSSARY_BATCH_VERSION
+            and value.get("logical_unit") == receipt.get("logical_unit")
+            and str(value.get("logical_unit") or "").endswith(
+                f"-{expected_logical_suffix}"
+            )
+            and value.get("input_sha256") == input_sha
+            and sha256_json(batch_identity) == input_sha
+            and value.get("source_sha256") == receipt.get("group_sha256")
+            and isinstance(value.get("language"), str)
+            and bool(value.get("language"))
+            and value.get("prompt_sha256") == receipt.get("prompt_sha256")
+            and value.get("schema_sha256") == receipt.get("schema_sha256")
+            and bool(expected_ids)
+            and isinstance(response, Mapping)
+            and set(response) == {"entries"}
+            and all(
+                isinstance(item, Mapping)
+                and set(item) == {"entry_id", "target", "explanation"}
+                and isinstance(item.get("entry_id"), str)
+                and isinstance(item.get("target"), str)
+                and isinstance(item.get("explanation"), str)
+                for item in response.get("entries") or []
+            )
+            and [
+                str(item.get("entry_id") or "")
+                for item in response.get("entries") or []
+                if isinstance(item, Mapping)
+            ] == expected_ids
+            and len(response.get("entries") or []) == len(expected_ids)
+            and _recovery_candidate_matches_schema(response, receipt)
+        )
+    if unit == "title-translation":
+        response = value.get("response")
+        return (
+            value.get("schema_version")
+            == "arc.companion.title-translation-chunk.v1"
+            and value.get("logical_unit") == receipt.get("logical_unit")
+            and value.get("input_sha256") == input_sha
+            and isinstance(value.get("title_ids"), list)
+            and isinstance(response, Mapping)
+            and [
+                str(item.get("title_id") or "")
+                for item in response.get("titles") or []
+                if isinstance(item, Mapping)
+            ] == [str(item) for item in value.get("title_ids") or []]
+            and _recovery_candidate_matches_schema(response, receipt)
+        )
+    if unit == "section-review":
+        return (
+            value.get("schema_version") == SECTION_REVIEW_CHECKPOINT_VERSION
+            and value.get("input_sha256") == input_sha
+            and isinstance(value.get("reviewed_segment_ids"), list)
+            and isinstance(value.get("review"), Mapping)
+            and isinstance(value["review"].get("findings"), list)
+            and isinstance(value["review"].get("patches"), list)
+            and _recovery_candidate_matches_schema(value["review"], receipt)
+        )
+    if unit == "commentary-review":
+        return (
+            value.get("schema_version") == COMMENTARY_REVIEW_CHECKPOINT_VERSION
+            and value.get("input_sha256") == input_sha
+            and isinstance(value.get("reviewed_segment_ids"), list)
+            and isinstance(value.get("review"), Mapping)
+            and isinstance(value["review"].get("issues"), list)
+            and isinstance(value["review"].get("patches"), list)
+            and _recovery_candidate_matches_schema(value["review"], receipt)
+        )
+    if unit == "final-review":
+        return (
+            isinstance(value.get("section_findings"), list)
+            and isinstance(value.get("issues"), list)
+            and isinstance(value.get("reviewed_segment_ids"), list)
+        )
+    if unit == "guide":
+        return (
+            chapter_guide_artifact_valid(value)
+            and value.get("chapter_id")
+            == str(receipt.get("logical_unit") or "").split(":", 1)[0]
+        )
+    return False
+
+
+def _pipeline_acceptance_checkpoint_digest(
+    unit: str,
+    path: Path,
+    receipt: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path,
+    require_business_validation: bool,
+) -> str | None:
+    root = checkpoint_dir.resolve(strict=False)
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        relative = lexical.relative_to(root)
+        raw = read_bounded_file(
+            root,
+            relative,
+            max_bytes=_MAX_RECOVERY_CONTROL_BYTES,
+            suffixes=(".json",),
+        )
+        value = json.loads(raw)
+    except (
+        OSError, UnicodeError, ValueError, json.JSONDecodeError,
+        SecureReadError,
+    ):
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    if require_business_validation and not _pipeline_acceptance_checkpoint_valid(
+        unit,
+        lexical,
+        receipt,
+        checkpoint_dir=root,
+        _validated_value=value,
+        _validated_raw=raw,
+    ):
+        return None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _translation_repair_acceptance_valid(
+    unit: str,
+    checkpoint: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path,
+    acceptance_path: Path,
+    acceptance_raw: bytes | None = None,
+) -> bool:
+    logical_unit = str(receipt.get("logical_unit") or "")
+    suffix = ":token-repair" if unit == "translation-token-repair" else ":coverage-repair"
+    if not logical_unit.endswith(suffix):
+        return False
+    segment_id = logical_unit[: -len(suffix)]
+    generation = int(receipt.get("generation") or 0)
+    if (
+        checkpoint.get("schema_version") != "arc.companion.translation-checkpoint.v2"
+        or checkpoint.get("segment_id") != segment_id
+        or checkpoint.get("generation") != generation
+        or checkpoint.get("input_sha256") != receipt.get("input_sha256")
+        or not isinstance(checkpoint.get("translation"), Mapping)
+    ):
+        return False
+    if unit == "translation-token-repair":
+        marker_path = _translation_token_attempt_path(
+            checkpoint_dir, segment_id, generation,
+        )
+        expected_prompt = TRANSLATION_RETRY_PROMPT_VERSION
+        expected_schema = TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION
+        expected_kind = "token-placement"
+        expected_ids_field = "block_ids"
+    else:
+        marker_path = _translation_coverage_attempt_path(
+            checkpoint_dir, segment_id, generation,
+        )
+        expected_prompt = TRANSLATION_COVERAGE_REPAIR_PROMPT_VERSION
+        expected_schema = TRANSLATION_COVERAGE_REPAIR_SCHEMA_VERSION
+        expected_kind = "coverage"
+        expected_ids_field = "missing_block_ids"
+    try:
+        marker = _read_recovery_json(checkpoint_dir, marker_path)
+    except SecureReadError:
+        return False
+    if (
+        not isinstance(marker, Mapping)
+        or marker.get("status") != "validated"
+        or marker.get("segment_id") != segment_id
+        or int(marker.get("generation") or 0) != generation
+        or marker.get("input_sha256") != receipt.get("input_sha256")
+        or marker.get("prompt_version") != expected_prompt
+        or marker.get("response_schema_version") != expected_schema
+        or not isinstance(marker.get("raw_response"), Mapping)
+        or marker.get("validated_translation_sha256")
+        != sha256_json(checkpoint["translation"])
+    ):
+        return False
+    final_reference = marker.get("final_translation_checkpoint")
+    if not isinstance(final_reference, Mapping):
+        return False
+    try:
+        final_path = resolve_recovery_path(
+            checkpoint_dir, final_reference.get("path"),
+        )
+        root = checkpoint_dir.resolve(strict=False)
+        lexical_acceptance = Path(os.path.abspath(os.fspath(
+            acceptance_path.expanduser()
+        )))
+        if acceptance_raw is None:
+            acceptance_raw = read_bounded_file(
+                root,
+                lexical_acceptance.relative_to(root),
+                max_bytes=_MAX_RECOVERY_CONTROL_BYTES,
+                suffixes=(".json",),
+            )
+    except (RecoveryResponseError, SecureReadError, OSError, ValueError):
+        return False
+    if (
+        final_path != lexical_acceptance
+        or hashlib.sha256(acceptance_raw).hexdigest()
+        != final_reference.get("sha256")
+    ):
+        return False
+    repairs = (checkpoint.get("generation_provenance") or {}).get("repairs")
+    repair = next((
+        item for item in repairs or []
+        if isinstance(item, Mapping) and item.get("kind") == expected_kind
+    ), None)
+    expected_ids = [str(item) for item in marker.get(expected_ids_field) or []]
+    if (
+        not isinstance(repair, Mapping)
+        or not expected_ids
+        or [str(item) for item in repair.get("repaired_block_ids") or []]
+        != expected_ids
+        or repair.get("response_normalization") != marker.get("response_normalization")
+    ):
+        return False
+    normalization = marker.get("response_normalization")
+    if not isinstance(normalization, Mapping):
+        return False
+    try:
+        normalization_path = resolve_recovery_path(
+            checkpoint_dir, normalization.get("path"),
+        )
+        root = checkpoint_dir.resolve(strict=False)
+        raw = read_bounded_file(
+            root,
+            normalization_path.relative_to(root),
+            max_bytes=_MAX_RECOVERY_CONTROL_BYTES,
+            suffixes=(".json",),
+        )
+        normalized_receipt = json.loads(raw)
+    except (
+        RecoveryResponseError, SecureReadError, OSError, UnicodeError,
+        ValueError, json.JSONDecodeError,
+    ):
+        return False
+    return bool(
+        hashlib.sha256(raw).hexdigest() == normalization.get("sha256")
+        and isinstance(normalized_receipt, Mapping)
+        and normalized_receipt.get("schema_version")
+        == "arc.companion.response-normalization-receipt.v1"
+        and normalized_receipt.get("decision") == "accepted"
+        and normalized_receipt.get("validator_version")
+        == TRANSLATION_REPAIR_NORMALIZATION_VALIDATOR_VERSION
+        and normalized_receipt.get("expected_ids") == expected_ids
+        and normalized_receipt.get("original_response_sha256")
+        == sha256_json(marker["raw_response"])
+    )
+
+
+def _recovery_candidate_matches_schema(
+    candidate: Mapping[str, Any], receipt: Mapping[str, Any],
+) -> bool:
+    schema = receipt.get("schema")
+    if not isinstance(schema, Mapping):
+        return False
+    try:
+        from jsonschema.validators import validator_for
+
+        validator_type = validator_for(schema)
+        validator_type.check_schema(schema)
+        return not any(validator_type(schema).iter_errors(dict(candidate)))
+    except (TypeError, ValueError):
+        return False
+
+
 def _llm_call(
     llm: Callable[..., dict[str, Any]],
     prompt: str,
@@ -9343,6 +12466,7 @@ def _llm_call(
     intent_guidance: Mapping[str, Any] | None = None,
     intent_guidance_lane: str | None = None,
     review_prompt_context: Mapping[str, Any] | None = None,
+    recovery_descriptor: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     force_offline = force_offline or not allow_internet
     structured_policy = bool(
@@ -9362,6 +12486,14 @@ def _llm_call(
     )
     active_prompt = prompt
     active_schema = _intent_guidance_schema(schema, intent_guidance)
+    control: dict[str, Any] | None = None
+    if recovery_descriptor is not None and not bool(
+        getattr(llm, "_arc_owns_recovery_receipt", False)
+    ):
+        control = _prepare_pipeline_recovery_control(
+            recovery_descriptor,
+            artifact_dir=artifact_dir,
+        )
     for round_number in range(0, 4):
         active_label = (
             call_label if round_number == 0
@@ -9385,24 +12517,167 @@ def _llm_call(
         call_kwargs: dict[str, Any] = {}
         if structured_policy:
             call_kwargs["paper_access_policy"] = paper_access_policy
-        value = llm(
-            active_prompt,
-            schema=active_schema,
-            provider=options.provider,
-            model=options.model,
-            model_tier=None if options.model else model_tier,
-            env=runtime_env,
-            session_policy="stateless",
-            artifact_dir=(
-                artifact_dir if round_number == 0
-                else artifact_dir / f"evidence-round-{round_number:02d}"
-            ),
-            call_label=active_label,
-            idle_timeout_seconds=options.idle_timeout_seconds,
-            **call_kwargs,
+        base_artifact_dir = (
+            artifact_dir if round_number == 0
+            else artifact_dir / f"evidence-round-{round_number:02d}"
         )
+        active_artifact_dir = base_artifact_dir
+        idempotency_key = None
+        submission_receipt_path: Path | None = None
+        latest_progress: dict[str, Any] | None = None
+        if control is not None:
+            idempotency_key = str(control["idempotency_key"])
+            if round_number:
+                idempotency_key += f":evidence-{round_number:02d}"
+            try:
+                submission_receipt_path = write_ledger_submission_receipt(
+                    checkpoint_dir=Path(control["checkpoint_dir"]),
+                    artifact_dir=active_artifact_dir,
+                    ledger_path=Path(control["ledger_path"]),
+                    session_key=str(control["session_key"]),
+                    logical_unit=str(control["logical_unit"]),
+                    generation=int(control["generation"]),
+                    idempotency_key=idempotency_key,
+                    schema=active_schema,
+                    prompt=active_prompt,
+                    recovery_unit=str(control["unit"]),
+                    input_sha256=str(control["input_sha256"]),
+                    group_sha256=str(control["group_sha256"]),
+                    ordered_siblings=list(control["ordered_siblings"]),
+                    suffix=list(control["suffix"]),
+                    validator=str(control["validator"]),
+                    application=str(control["application"]),
+                    acceptance_checkpoint=Path(control["acceptance_checkpoint"]),
+                    stateful_checkpoint_identity=False,
+                )
+            except RecoveryResponseError as exc:
+                raise RecoveryResponseError(
+                    "pipeline recovery receipt rejected for "
+                    f"{control['unit']}:{control['logical_unit']}:"
+                    f"generation-{control['generation']}: {exc}"
+                ) from exc
+
+        def recovery_progress(event: Mapping[str, Any]) -> None:
+            nonlocal latest_progress
+            if control is None:
+                return
+            latest_progress = {
+                **dict(event),
+                "session_key": control["session_key"],
+                "generation": control["generation"],
+                "logical_unit": control["logical_unit"],
+            }
+            if event.get("event") == "submitted":
+                with _RECOVERY_CONTROL_INITIALIZE_LOCK:
+                    _guarded_mark_transport_state(
+                        Path(control["ledger_path"]),
+                        checkpoint_dir=Path(control["checkpoint_dir"]),
+                        session_key=str(control["session_key"]),
+                        logical_unit=str(control["logical_unit"]),
+                        idempotency_key=str(control["idempotency_key"]),
+                    )
+
+        try:
+            recovery_call_kwargs: dict[str, Any] = {}
+            if control is not None:
+                recovery_call_kwargs.update({
+                    "idempotency_key": idempotency_key,
+                    "progress_callback": recovery_progress,
+                })
+            value = llm(
+                active_prompt,
+                schema=active_schema,
+                provider=options.provider,
+                model=options.model,
+                model_tier=None if options.model else model_tier,
+                env=runtime_env,
+                session_policy="stateless",
+                artifact_dir=active_artifact_dir,
+                call_label=active_label,
+                idle_timeout_seconds=options.idle_timeout_seconds,
+                **call_kwargs,
+                **recovery_call_kwargs,
+            )
+        except BaseException as exc:
+            if (
+                control is not None
+                and not isinstance(exc, CompanionLLMCircuitOpen)
+                and _chapter_failure_requires_supervision(exc)
+            ):
+                from arc_llm import read_recovery_context
+
+                recovery = read_recovery_context(
+                    active_artifact_dir,
+                    idempotency_key=str(idempotency_key),
+                )
+                recovery_context = _recovery_context_json(
+                    recovery, logical_unit=str(control["logical_unit"]),
+                )
+                recovery_context.update({
+                    "session_key": control["session_key"],
+                    "generation": control["generation"],
+                    "recovery_unit": control["unit"],
+                    "stateless_control": True,
+                    "latest_progress": latest_progress,
+                })
+                if submission_receipt_path is not None:
+                    try:
+                        seal_submission_attempts(
+                            submission_receipt_path,
+                            checkpoint_dir=Path(control["checkpoint_dir"]),
+                            attempt_references=explicit_attempt_references(
+                                exc,
+                                checkpoint_dir=Path(control["checkpoint_dir"]),
+                                artifact_dir=active_artifact_dir,
+                            ),
+                        )
+                        recovery_context["submission_receipt"] = (
+                            submission_receipt_reference(
+                                submission_receipt_path,
+                                checkpoint_dir=Path(control["checkpoint_dir"]),
+                            )
+                        )
+                    except RecoveryResponseError as receipt_exc:
+                        recovery_context["submission_receipt_error"] = str(receipt_exc)
+                with _RECOVERY_CONTROL_INITIALIZE_LOCK:
+                    mark_needs_supervision(
+                        Path(control["ledger_path"]),
+                        segment_id=str(control["logical_unit"]),
+                        reason=str(exc),
+                        recovery_context=recovery_context,
+                    )
+            raise
+        if (
+            control is not None
+            and submission_receipt_path is not None
+            and (active_artifact_dir / "call-checkpoints").is_dir()
+        ):
+            seal_submission_attempts(
+                submission_receipt_path,
+                checkpoint_dir=Path(control["checkpoint_dir"]),
+                attempt_references=explicit_attempt_references(
+                    value,
+                    checkpoint_dir=Path(control["checkpoint_dir"]),
+                    artifact_dir=active_artifact_dir,
+                ),
+            )
         if intent_guidance is None:
-            return value
+            if control is not None:
+                with _RECOVERY_CONTROL_INITIALIZE_LOCK:
+                    _guarded_mark_transport_state(
+                        Path(control["ledger_path"]),
+                        checkpoint_dir=Path(control["checkpoint_dir"]),
+                        session_key=str(control["session_key"]),
+                        logical_unit=str(control["logical_unit"]),
+                        idempotency_key=str(control["idempotency_key"]),
+                        response_received=True,
+                    )
+            from arc_llm import ARC_LLM_CALL_RECORD_FIELD, strip_arc_llm_call_records
+
+            return (
+                strip_arc_llm_call_records(value)
+                if ARC_LLM_CALL_RECORD_FIELD in value else value
+            )
         from arc_llm import (
             evidence_requests_from_output,
             resolve_evidence_round,
@@ -9412,10 +12687,22 @@ def _llm_call(
             value, worker_id=call_label, role="companion-content-worker",
         )
         if not requests:
-            return {
+            if control is not None:
+                with _RECOVERY_CONTROL_INITIALIZE_LOCK:
+                    _guarded_mark_transport_state(
+                        Path(control["ledger_path"]),
+                        checkpoint_dir=Path(control["checkpoint_dir"]),
+                        session_key=str(control["session_key"]),
+                        logical_unit=str(control["logical_unit"]),
+                        idempotency_key=str(control["idempotency_key"]),
+                        response_received=True,
+                    )
+            from arc_llm import strip_arc_llm_call_records
+
+            return strip_arc_llm_call_records({
                 key: item for key, item in value.items()
                 if key != "arc_evidence_requests"
-            }
+            })
         if round_number >= 3:
             raise RuntimeError("companion reference evidence exceeded three controller rounds")
         resolver = lambda material, *, round_number: resolve_worker_evidence_requests(
@@ -9808,6 +13095,22 @@ def _store_validated_stateless_artifact(
     )
 
 
+def _stable_recovery_chunk_id(
+    unit: str,
+    member_ids: Sequence[str],
+    *,
+    payload: Any,
+) -> str:
+    """Address an independently submitted chunk by its exact stable content."""
+
+    digest = sha256_json({
+        "unit": unit,
+        "member_ids": [str(value) for value in member_ids],
+        "payload": payload,
+    })[:16]
+    return f"{unit}-{digest}"
+
+
 def _generate_title_translations(
     *,
     options: BuildOptions,
@@ -9883,8 +13186,14 @@ def _generate_title_translations(
         return output
 
     responses: list[dict[str, Any]] = []
-    artifact_dir = checkpoint_dir / "title-translation"
-    for index, chunk in enumerate(chunk_title_records(records), 1):
+    chunks = list(chunk_title_records(records))
+    title_units = [
+        _stable_recovery_chunk_id("title-translation", [
+            str(item.get("title_id") or "") for item in chunk
+        ], payload=chunk)
+        for chunk in chunks
+    ]
+    for index, chunk in enumerate(chunks, 1):
         prompt = title_translation_prompt(
             chunk,
             source_language=source_language,
@@ -9892,12 +13201,79 @@ def _generate_title_translations(
             glossary=title_glossary,
             protected_names=protected_names,
         )
-        responses.append(call_model(
-            prompt,
-            TITLE_TRANSLATION_SCHEMA,
-            artifact_dir,
-            f"title-translation-{index:04d}",
-        ))
+        logical_unit = title_units[index - 1]
+        artifact_dir = checkpoint_dir / "title-translation" / logical_unit
+        chunk_input_sha256 = sha256_json({
+            "records": chunk,
+            "prompt": prompt,
+            "schema": TITLE_TRANSLATION_SCHEMA,
+        })
+        chunk_checkpoint = (
+            checkpoint_dir / "title-translation-chunks" / f"{logical_unit}.json"
+        )
+        response: dict[str, Any] | None = None
+        if chunk_checkpoint.is_file() and "translation" not in options.regenerate_lanes:
+            candidate = _read_checkpoint_json(
+                chunk_checkpoint, root=checkpoint_dir,
+            )
+            if (
+                isinstance(candidate, Mapping)
+                and candidate.get("schema_version")
+                == "arc.companion.title-translation-chunk.v1"
+                and candidate.get("logical_unit") == logical_unit
+                and candidate.get("input_sha256") == chunk_input_sha256
+                and isinstance(candidate.get("response"), Mapping)
+            ):
+                try:
+                    response = validate_title_translations(
+                        chunk,
+                        candidate["response"],
+                        protected_names=protected_names,
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    response = None
+        descriptor = submission_descriptor(
+                unit="title-translation",
+                logical_unit=logical_unit,
+                checkpoint_dir=checkpoint_dir,
+                artifact_root=artifact_dir,
+                acceptance_checkpoint=chunk_checkpoint,
+                input_sha256=chunk_input_sha256,
+                group_sha256=semantic_input_sha256,
+                ordered_siblings=title_units,
+                suffix=title_units[index - 1:],
+            )
+        submitted = response is None
+        if submitted:
+            raw_response = call_model_with_recovery_descriptor(
+                call_model,
+                prompt,
+                TITLE_TRANSLATION_SCHEMA,
+                artifact_dir,
+                logical_unit,
+                descriptor,
+            )
+            response = validate_title_translations(
+                chunk, raw_response, protected_names=protected_names,
+            )
+            write_json(chunk_checkpoint, {
+                "schema_version": "arc.companion.title-translation-chunk.v1",
+                "logical_unit": logical_unit,
+                "input_sha256": chunk_input_sha256,
+                "title_ids": [str(item.get("title_id") or "") for item in chunk],
+                "response": response,
+            })
+        if submitted:
+            _accept_registered_pipeline_control(
+                checkpoint_dir, "title-translation", logical_unit,
+            )
+        else:
+            _accept_completed_pipeline_controls(
+                checkpoint_dir,
+                only_logical_unit=logical_unit,
+                only_recovery_unit="title-translation",
+            )
+        responses.append(response)
     merged = merge_title_translation_chunks(
         records, responses, protected_names=protected_names,
     )

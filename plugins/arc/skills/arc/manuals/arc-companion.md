@@ -137,12 +137,30 @@ JSON output and state record the delivery as `output_run_pdf` plus
 ### Step 2: Recover a blocked call
 
 Routine accepted blocks automatically advance. With the default
-`--recovery-policy auto`, ARC first replays durable responses and attempts one
-native session reconciliation. When an eligible translation or commentary call
-cannot be safely reused, ARC automatically starts a replacement generation
-for the affected lane suffix, retrying with a fresh generation up to the
-configured limit. Possible duplicate charging is an audit warning in automatic
-mode and is recorded in the recovery journal.
+`--recovery-policy auto`, ARC leaves accepted blocks unchanged and replays each
+durable response through normal candidate selection, JSON normalization, and
+the exact call-site business validation; only a response that passes that path
+advances to acceptance. The owning handler records that exact control
+acceptance immediately after its durable business checkpoint; finalization is
+not a deferred acceptance mechanism. Reconstructing a complete failed raw
+response promotes only the call checkpoint to `pending business validation and
+application`; schema shape alone never accepts the control block and no repair
+or alternate handler is called until normal business replay evaluates it. ARC
+validates every receipt against the current registered ledger snapshot and uses
+that snapshot's digest as the compare-and-swap precondition for each transition,
+so a delayed generation-N callback cannot advance generation N+1. ARC correlates recovery records only by the complete
+identity tuple: canonical ledger path, session key, logical unit, generation,
+and idempotency key. Partial or conflicting tuples remain supervised. When a
+native session is involved, its durable native-session ID must also match
+exactly. Only after those gates, a call whose durable terminal progress is
+specifically `idle_timeout` and has no complete response is never continued in
+its old native session. ARC starts the original unresolved task in a fresh generation,
+preserving the continuous accepted prefix and invalidating only the first
+unaccepted block and its suffix. Other eligible failures retain native-first
+recovery. Replacement requires an ARC-owned lane or side-effect-free submission
+receipt and is bounded by the configured limit. An uncertain submitted call may
+still be billed twice; the recovery journal records that audit warning rather
+than claiming exactly-once provider execution.
 
 ```bash
 arc-companion resume --project-dir <dir> --json
@@ -153,7 +171,9 @@ arc-companion resume --project-dir <dir> --action restart-generation \
 
 The default `auto` action selects automatic recovery, even for a build that
 previously used `--recovery-policy manual`. Explicit
-`resume-native` is strict and does not upgrade to a replacement generation.
+`resume-native` requires the same complete identity tuple, is strict, and does
+not upgrade to a replacement generation.
+It deliberately retains old-session semantics even for a typed idle timeout.
 Explicit `restart-generation` remains available after automatic restart budget
 is exhausted and requires confirmation because an uncertain submitted call may
 be billed twice. Cancellation, authentication, quota, rate-limit, missing
@@ -161,6 +181,12 @@ source, local I/O, and invalid configuration errors are not hidden by automatic
 generation replacement; they remain in `needs_supervision`. Old native session,
 runtime, and idempotency identities are required only by strict `resume-native`,
 not by a fresh automatic replacement.
+
+Status exposes separate bounded `control_identity` and `logical_identity`
+projections and joins them only through the complete tuple above. Action-history
+diagnostics are category/field projections with reason, error, and message text
+redacted and bounded; prompts, responses, credentials, and arbitrary config
+values are not status output.
 
 ### Step 3: Use background review checkpoints
 

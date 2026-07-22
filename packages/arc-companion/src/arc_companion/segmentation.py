@@ -11,6 +11,11 @@ from .prompts import CUT_SCHEMA, segmentation_prompt
 from .projection import (
     annotation_input_block, is_structural, is_translatable, translation_input_block,
 )
+from .recovery_units import (
+    call_model_with_recovery_descriptor,
+    require_control_acceptance,
+    submission_descriptor,
+)
 from .source import block_id
 
 
@@ -216,6 +221,7 @@ def segment_document(
     workers: int,
     force: bool,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+    accept_recovery: Callable[[Path, str, str], int] | None = None,
     seed_cuts: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Run bounded medium calls and return validated downstream segment records."""
@@ -310,9 +316,11 @@ def segment_document(
             checkpoint_path=path,
             attempts_dir=segmentation_dir / "attempts" / str(window["window_id"]),
             call_model=call_model,
+            recovery_checkpoint_dir=checkpoint_dir,
             label_prefix=f"companion-segmentation-{window['window_id']}",
             refinement=False,
             reuse_attempts=not force,
+            accept_recovery=accept_recovery,
         )
         return sorted(set(model_cuts + deterministic_end))
 
@@ -376,10 +384,12 @@ def segment_document(
                 checkpoint_path=checkpoint_path,
                 attempts_dir=attempts_dir,
                 call_model=call_model,
+                recovery_checkpoint_dir=checkpoint_dir,
                 label_prefix=f"companion-segmentation-refine-{round_number}-{item['segment_id']}",
                 refinement=True,
                 refinement_round=round_number,
                 reuse_attempts=not force,
+                accept_recovery=accept_recovery,
             )
             return item, result
 
@@ -453,10 +463,12 @@ def _call_for_cuts(
     checkpoint_path: Path,
     attempts_dir: Path,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+    recovery_checkpoint_dir: Path,
     label_prefix: str,
     refinement: bool,
     refinement_round: int | None = None,
     reuse_attempts: bool = True,
+    accept_recovery: Callable[[Path, str, str], int] | None = None,
 ) -> list[int]:
     last_error = "unknown validation failure"
     completed_attempts = 0
@@ -522,11 +534,23 @@ def _call_for_cuts(
         # Provider, transport, quota, and cancellation failures are owned by
         # arc-llm. They must escape immediately rather than being multiplied by
         # this semantic-correction loop.
-        response: Any = call_model(
+        logical_unit = f"{window['window_id']}:attempt-{attempt}"
+        response: Any = call_model_with_recovery_descriptor(
+            call_model,
             prompt,
             CUT_SCHEMA,
             attempts_dir / f"attempt-{attempt}" / "llm",
             f"{label_prefix}-attempt-{attempt}",
+            submission_descriptor(
+                unit="segmentation",
+                logical_unit=logical_unit,
+                checkpoint_dir=recovery_checkpoint_dir,
+                artifact_root=attempts_dir / f"attempt-{attempt}" / "llm",
+                acceptance_checkpoint=attempts_dir / f"attempt-{attempt}.json",
+                input_sha256=window_hash,
+                ordered_siblings=[logical_unit],
+                suffix=[logical_unit],
+            ),
         )
         try:
             if not isinstance(response, dict):
@@ -546,6 +570,10 @@ def _call_for_cuts(
                 "response": response,
                 "inventory_sha256": inventory_hash,
                 "window_sha256": window_hash,
+                "window": window,
+                "total_blocks": len(inventory),
+                "refinement": refinement,
+                "validated_cuts": cuts,
             })
             write_json(checkpoint_path, {
                 "schema_version": SEGMENTATION_VERSION,
@@ -553,6 +581,12 @@ def _call_for_cuts(
                 "window_sha256": window_hash,
                 "cuts": cuts,
             })
+            require_control_acceptance(
+                accept_recovery,
+                checkpoint_dir=recovery_checkpoint_dir,
+                unit="segmentation",
+                logical_unit=logical_unit,
+            )
             return cuts
         except (SegmentationError, KeyError, TypeError, ValueError) as exc:
             last_error = str(exc)
@@ -607,6 +641,35 @@ def _validate_window_cuts(
             f"{first}..{last_internal}; got {outside[:8]}"
         )
     return sorted(values)
+
+
+def validate_segmentation_acceptance_checkpoint(value: Any) -> bool:
+    """Re-run the semantic-window invariants recorded by a paid attempt."""
+
+    if not isinstance(value, dict) or value.get("accepted") is not True:
+        return False
+    response = value.get("response")
+    window = value.get("window")
+    total_blocks = value.get("total_blocks")
+    if (
+        not isinstance(response, dict)
+        or not isinstance(window, dict)
+        or isinstance(total_blocks, bool)
+        or not isinstance(total_blocks, int)
+        or total_blocks < 1
+        or value.get("window_sha256") != sha256_json(window)
+    ):
+        return False
+    try:
+        cuts = _validate_window_cuts(
+            response.get("cut_after_ordinals"), window, total_blocks,
+        )
+    except (SegmentationError, KeyError, TypeError, ValueError):
+        return False
+    return bool(
+        cuts == value.get("validated_cuts")
+        and (not value.get("refinement") or bool(cuts))
+    )
 
 
 def _oversized_segments(

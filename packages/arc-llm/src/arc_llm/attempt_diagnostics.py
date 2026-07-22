@@ -158,11 +158,16 @@ class _BoundedStream:
         self._tail = bytearray()
         self.observed_bytes = 0
         self.redacted_bytes = 0
+        self.lossless = True
 
     def append(self, text: object) -> None:
-        raw = str(text).encode("utf-8", errors="replace")
+        self.append_sanitized(text, self.redactor.text(text))
+
+    def append_sanitized(self, raw_text: object, sanitized_text: object) -> None:
+        raw = str(raw_text).encode("utf-8", errors="replace")
         self.observed_bytes += len(raw)
-        sanitized = self.redactor.text(text).encode("utf-8", errors="replace")
+        sanitized = str(sanitized_text).encode("utf-8", errors="replace")
+        self.lossless = self.lossless and raw == sanitized
         self.redacted_bytes += len(sanitized)
         remaining = self._head_limit - len(self._head)
         if remaining > 0:
@@ -253,6 +258,8 @@ class AttemptDiagnostics:
         self._candidate_count = 0
         self._candidate_dropped = 0
         self._native_session_id: str | None = None
+        self._checkpoint_identity: str | None = None
+        self._checkpoint_binding: dict[str, Any] | None = None
         self._submission_state = LLMSubmissionState.NOT_SUBMITTED
         self._started_at = _utc_now()
         self._started_monotonic = time.monotonic()
@@ -348,11 +355,14 @@ class AttemptDiagnostics:
         self._capture("stderr", text)
 
     def capture_raw_event(self, event: Mapping[str, Any]) -> None:
+        raw = json.dumps(dict(event), ensure_ascii=False, sort_keys=True, default=str) + "\n"
         sanitized = self.redactor.value(dict(event))
-        self._capture(
-            "raw_events",
-            json.dumps(sanitized, ensure_ascii=False, sort_keys=True, default=str) + "\n",
-        )
+        rendered = json.dumps(
+            sanitized, ensure_ascii=False, sort_keys=True, default=str,
+        ) + "\n"
+        with self._lock:
+            if self._finalized_ref is None:
+                self._streams["raw_events"].append_sanitized(raw, rendered)
 
     def record_native_session_id(self, native_session_id: str | None) -> None:
         if not native_session_id:
@@ -365,6 +375,141 @@ class AttemptDiagnostics:
                 return
             self._native_session_id = sanitized
         self.event("native_session_observed", native_session_id=sanitized)
+
+    def bind_checkpoint_identity(self, checkpoint_identity: str) -> None:
+        """Legacy identity-only fixture binding; production must use bind_checkpoint."""
+
+        value = str(checkpoint_identity or "")
+        if not value:
+            raise AttemptDiagnosticsError(
+                "Call checkpoint identity is empty",
+                submission_state=self._submission_state,
+            )
+        with self._lock:
+            if self._finalized_ref is not None:
+                raise AttemptDiagnosticsError(
+                    "Attempt diagnostics already finalized",
+                    submission_state=self._submission_state,
+                )
+            if self._checkpoint_identity not in {None, value}:
+                raise AttemptDiagnosticsError(
+                    "Attempt diagnostics checkpoint identity changed",
+                    submission_state=self._submission_state,
+                )
+            self._checkpoint_identity = value
+
+    def bind_checkpoint(self, binding: Mapping[str, Any]) -> None:
+        """Bind this attempt to one exact persisted checkpoint recipe and address."""
+
+        try:
+            detached = _canonical_object(binding, description="checkpoint binding")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding is not canonical JSON",
+                submission_state=self._submission_state,
+            ) from exc
+        if detached.get("schema_version") != "arc.llm.checkpoint_recomputation_binding.v1":
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding schema is invalid",
+                submission_state=self._submission_state,
+            )
+        checkpoint_identity = detached.get("checkpoint_identity")
+        checkpoint_path_value = detached.get("checkpoint_path")
+        if not isinstance(checkpoint_identity, str) or not checkpoint_identity:
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding identity is empty",
+                submission_state=self._submission_state,
+            )
+        if not isinstance(checkpoint_path_value, str) or not checkpoint_path_value:
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding path is empty",
+                submission_state=self._submission_state,
+            )
+        checkpoint_path = Path(checkpoint_path_value).expanduser().resolve(strict=False)
+        try:
+            relative_path = checkpoint_path.relative_to(self.artifact_dir).as_posix()
+        except ValueError as exc:
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding is outside the attempt artifact directory",
+                submission_state=self._submission_state,
+            ) from exc
+        if not relative_path or relative_path.startswith("../"):
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding path is invalid",
+                submission_state=self._submission_state,
+            )
+        for field in (
+            "request_digest",
+            "request_recipe_sha256",
+            "prompt_sha256",
+            "call_label_sha256",
+        ):
+            if not _is_sha256(detached.get(field)):
+                raise AttemptDiagnosticsError(
+                    f"Call checkpoint binding {field} is invalid",
+                    submission_state=self._submission_state,
+                )
+        schema_sha256 = detached.get("schema_sha256")
+        if schema_sha256 is not None and not _is_sha256(schema_sha256):
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding schema_sha256 is invalid",
+                submission_state=self._submission_state,
+            )
+        generation = detached.get("generation")
+        if generation is not None and (type(generation) is not int or generation < 1):
+            raise AttemptDiagnosticsError(
+                "Call checkpoint binding generation is invalid",
+                submission_state=self._submission_state,
+            )
+        for authorization_field in (
+            "initial_native_authorization", "native_resume_authorization",
+        ):
+            authorization = detached.get(authorization_field)
+            if authorization is None:
+                continue
+            if not isinstance(authorization, Mapping) or set(authorization) != {
+                "control_address", "session_key", "logical_unit", "generation",
+                "idempotency_key",
+            }:
+                raise AttemptDiagnosticsError(
+                    f"Call checkpoint binding {authorization_field} is incomplete",
+                    submission_state=self._submission_state,
+                )
+            if (
+                any(
+                    not isinstance(authorization.get(field), str)
+                    or not authorization.get(field)
+                    for field in (
+                        "control_address", "session_key", "logical_unit",
+                        "idempotency_key",
+                    )
+                )
+                or type(authorization.get("generation")) is not int
+                or int(authorization["generation"]) < 1
+            ):
+                raise AttemptDiagnosticsError(
+                    f"Call checkpoint binding {authorization_field} is invalid",
+                    submission_state=self._submission_state,
+                )
+        detached["checkpoint_path"] = relative_path
+        with self._lock:
+            if self._finalized_ref is not None:
+                raise AttemptDiagnosticsError(
+                    "Attempt diagnostics already finalized",
+                    submission_state=self._submission_state,
+                )
+            if self._checkpoint_binding is not None and self._checkpoint_binding != detached:
+                raise AttemptDiagnosticsError(
+                    "Attempt diagnostics checkpoint binding changed",
+                    submission_state=self._submission_state,
+                )
+            if self._checkpoint_identity not in {None, checkpoint_identity}:
+                raise AttemptDiagnosticsError(
+                    "Attempt diagnostics checkpoint identity changed",
+                    submission_state=self._submission_state,
+                )
+            self._checkpoint_identity = checkpoint_identity
+            self._checkpoint_binding = detached
 
     def record_candidate(
         self,
@@ -497,6 +642,36 @@ class AttemptDiagnostics:
                 "finished_at": _utc_now(),
                 "submission_state": self._submission_state.value,
                 "native_session_id": self._native_session_id,
+                "checkpoint_identity": self._checkpoint_identity,
+                "checkpoint_path": (
+                    self._checkpoint_binding.get("checkpoint_path")
+                    if self._checkpoint_binding is not None else None
+                ),
+                "checkpoint_binding": self._checkpoint_binding,
+                "idempotency_key": (
+                    self._checkpoint_binding.get("idempotency_key")
+                    if self._checkpoint_binding is not None else None
+                ),
+                "session_key": (
+                    self._checkpoint_binding.get("session_key")
+                    if self._checkpoint_binding is not None else None
+                ),
+                "generation": (
+                    self._checkpoint_binding.get("generation")
+                    if self._checkpoint_binding is not None else None
+                ),
+                "prompt_sha256": (
+                    self._checkpoint_binding.get("prompt_sha256")
+                    if self._checkpoint_binding is not None else None
+                ),
+                "schema_sha256": (
+                    self._checkpoint_binding.get("schema_sha256")
+                    if self._checkpoint_binding is not None else None
+                ),
+                "call_label_sha256": (
+                    self._checkpoint_binding.get("call_label_sha256")
+                    if self._checkpoint_binding is not None else None
+                ),
                 "outcome": _bounded_text(self.redactor.text(outcome), 64),
                 "error": error_payload,
                 "timeline": {
@@ -508,6 +683,22 @@ class AttemptDiagnostics:
                 "parsed_response_candidates": list(self._candidate_metadata),
                 "parsed_response_candidate_count": self._candidate_count,
                 "parsed_response_candidates_dropped": self._candidate_dropped,
+            }
+            source_manifest = {
+                "schema_version": "arc.llm.attempt_immutable_source.v1",
+                "checkpoint_binding_sha256": (
+                    _canonical_sha256(self._checkpoint_binding)
+                    if self._checkpoint_binding is not None else None
+                ),
+                "timeline": timeline,
+                "streams": streams,
+                "parsed_response_candidates": list(self._candidate_metadata),
+                "parsed_response_candidate_count": self._candidate_count,
+                "parsed_response_candidates_dropped": self._candidate_dropped,
+            }
+            payload["immutable_source"] = {
+                "manifest": source_manifest,
+                "manifest_sha256": _canonical_sha256(source_manifest),
             }
             record_path = self.path / "record.json"
             try:
@@ -557,6 +748,7 @@ class AttemptDiagnostics:
             "stored_bytes": len(payload),
             "truncated": stream.truncated,
             "compression": "gzip" if compressed else "none",
+            "lossless": stream.lossless,
         }
 
     def _make_read_only(self) -> None:
@@ -645,6 +837,29 @@ def _bounded_text(value: str, max_bytes: int) -> str:
     budget = max(0, max_bytes - len(suffix.encode("utf-8")))
     prefix = encoded[:budget].decode("utf-8", errors="ignore")
     return prefix + suffix
+
+
+def _canonical_object(value: Mapping[str, Any], *, description: str) -> dict[str, Any]:
+    encoded = json.dumps(
+        dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
+    decoded = json.loads(encoded)
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{description} is not an object")
+    return decoded
+
+
+def _canonical_sha256(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 def _exclusive_json_write(path: Path, payload: Mapping[str, Any]) -> None:

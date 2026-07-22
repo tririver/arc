@@ -9,6 +9,11 @@ import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .io import read_json, sha256_json, write_json, write_text
+from .recovery_units import (
+    call_model_with_recovery_descriptor,
+    require_control_acceptance,
+    submission_descriptor,
+)
 
 
 INTENT_GUIDANCE_VERSION = "arc.companion.intent-guidance.v2"
@@ -110,6 +115,8 @@ def build_intent_guidance(
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
     parsed_getter: Callable[..., dict[str, Any]] | None = None,
     toc_getter: Callable[[str], dict[str, Any]] | None = None,
+    accept_recovery: Callable[[Path, str, str], int] | None = None,
+    register_recovery_root: Callable[[Path], Any] | None = None,
     force: bool = False,
 ) -> dict[str, Any] | None:
     """Build or reuse the single global guidance artifact for semantic inputs.
@@ -147,6 +154,8 @@ def build_intent_guidance(
     user_intent_sha256 = hashlib.sha256(intent.encode("utf-8")).hexdigest()
     artifact_dir = project_dir / ".arc-companion" / "intent-guidance" / semantic_sha256
     artifact_path = artifact_dir / "artifact.json"
+    if register_recovery_root is not None:
+        register_recovery_root(artifact_dir)
     if artifact_path.is_file() and not force:
         try:
             cached = read_json(artifact_path)
@@ -174,7 +183,8 @@ def build_intent_guidance(
                     ),
                 )
                 write_json(artifact_path, cached)
-            return _require_resolved(cached)
+            resolved = _require_resolved(cached)
+            return resolved
     if not force:
         legacy_semantic_input = {
             **semantic_input,
@@ -214,11 +224,22 @@ def build_intent_guidance(
                 return _require_resolved(artifact)
 
     prompt = _guidance_prompt(semantic_input)
-    raw = call_model(
+    raw = call_model_with_recovery_descriptor(
+        call_model,
         prompt,
         INTENT_GUIDANCE_SCHEMA,
         artifact_dir / "llm",
         "companion-intent-guidance",
+        submission_descriptor(
+            unit="intent-guidance",
+            logical_unit="intent-guidance",
+            checkpoint_dir=artifact_dir,
+            artifact_root=artifact_dir / "llm",
+            acceptance_checkpoint=artifact_path,
+            input_sha256=semantic_sha256,
+            ordered_siblings=["intent-guidance"],
+            suffix=["intent-guidance"],
+        ),
     )
     normalized = _validate_model_result(raw, references=references)
     artifact = _build_artifact(
@@ -229,7 +250,14 @@ def build_intent_guidance(
         artifact_dir=artifact_dir,
     )
     write_json(artifact_path, artifact)
-    return _require_resolved(artifact)
+    require_control_acceptance(
+        accept_recovery,
+        checkpoint_dir=artifact_dir,
+        unit="intent-guidance",
+        logical_unit="intent-guidance",
+    )
+    resolved = _require_resolved(artifact)
+    return resolved
 
 
 def worker_guidance_payload(

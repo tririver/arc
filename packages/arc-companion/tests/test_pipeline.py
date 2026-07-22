@@ -45,6 +45,24 @@ from arc_companion.source import SourceBundle
 from arc_companion.run_lock import ProjectBuildLock
 
 
+def _record_guarded_test_response(
+    checkpoint: Path, ledger_path: Path, segment_id: str,
+) -> None:
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    generation = int(ledger.get("generation") or 1)
+    session_key = f"{ledger['chapter_id']}:{ledger['lane']}"
+    pipeline_module._guarded_mark_transport_state(
+        ledger_path,
+        checkpoint_dir=checkpoint,
+        session_key=session_key,
+        logical_unit=segment_id,
+        idempotency_key=(
+            f"{session_key}:{segment_id}:test-response:generation-{generation}"
+        ),
+        response_received=True,
+    )
+
+
 def _inline_run(kind: str, content: str, order: int, *, tex: str = "") -> dict[str, str | int]:
     digest = hashlib.sha256(f"{kind}:{content}".encode()).hexdigest()
     value: dict[str, str | int] = {
@@ -853,7 +871,7 @@ def test_wrapped_paid_repair_failure_is_persisted_on_lane_ledger(tmp_path: Path)
     )
 
 
-def test_paid_repair_finalizer_classifies_later_same_lane_responses(tmp_path: Path) -> None:
+def test_paid_repair_finalizer_ignores_unindexed_same_lane_responses(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint"
     blocks = []
     for index in range(1, 4):
@@ -875,8 +893,7 @@ def test_paid_repair_finalizer_classifies_later_same_lane_responses(tmp_path: Pa
     )
     # Source-order ledger progress stops at s1, while already-submitted worker
     # responses for s2/s3 can still land durably after that failure.
-    pipeline_module.mark_submitted(ledger_path, segment_id="s1")
-    pipeline_module.mark_response_received(ledger_path, segment_id="s1")
+    _record_guarded_test_response(checkpoint, ledger_path, "s1")
 
     for index, segment_id in enumerate(("s1", "s2", "s3"), start=1):
         key = f"repair-{index}"
@@ -916,17 +933,10 @@ def test_paid_repair_finalizer_classifies_later_same_lane_responses(tmp_path: Pa
 
     entries = pipeline_module._finalize_paid_translation_repairs(checkpoint)
 
-    assert {item["segment_id"] for item in entries} == {"s1", "s2", "s3"}
-    actions = {item["segment_id"]: item["recovery_action"] for item in entries}
-    assert actions == {
-        "s1": "operator-supervision", "s2": "operator-supervision",
-        "s3": "deterministic-replay",
-    }
+    assert entries == []
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert [item["segment_id"] for item in ledger["supervision_entries"]] == [
-        "s1", "s2",
-    ]
-    assert ledger["needs_supervision"]["segment_id"] == "s1"
+    assert not ledger.get("supervision_entries")
+    assert ledger["needs_supervision"] is None
 
 
 def test_paid_repair_finalizer_ignores_marker_from_abandoned_generation(
@@ -958,7 +968,9 @@ def test_paid_repair_finalizer_ignores_marker_from_abandoned_generation(
     assert ledger["needs_supervision"] is None
 
 
-def test_paid_repair_finalizer_runs_full_protected_name_validation(tmp_path: Path) -> None:
+def test_paid_repair_finalizer_does_not_trust_unindexed_protected_name_response(
+    tmp_path: Path,
+) -> None:
     checkpoint = tmp_path / "checkpoint"
     block = {
         "block_id": "body", "type": "text", "text": "Hertz value x.",
@@ -978,8 +990,7 @@ def test_paid_repair_finalizer_runs_full_protected_name_validation(tmp_path: Pat
     pipeline_module.initialize_lane_ledger(
         ledger_path, chapter_id="ch-1", lane="translation", segment_ids=["s1"],
     )
-    pipeline_module.mark_submitted(ledger_path, segment_id="s1")
-    pipeline_module.mark_response_received(ledger_path, segment_id="s1")
+    _record_guarded_test_response(checkpoint, ledger_path, "s1")
     key = "repair-name"
     pipeline_module.write_json(
         checkpoint / "translation-drafts" / f"{key}.json", {
@@ -1007,12 +1018,9 @@ def test_paid_repair_finalizer_runs_full_protected_name_validation(tmp_path: Pat
 
     entries = pipeline_module._finalize_paid_translation_repairs(checkpoint)
 
-    assert len(entries) == 1
-    assert entries[0]["recovery_action"] == "operator-supervision"
-    assert "Hertz" in entries[0]["blocking_reason"]
+    assert entries == []
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert ledger["needs_supervision"]["segment_id"] == "s1"
-    assert ledger["needs_supervision"]["recovery_context"]["resumable"] is False
+    assert ledger["needs_supervision"] is None
 
 
 def test_dynamic_paid_repair_discovery_enriches_existing_transaction_entry(
@@ -1364,7 +1372,7 @@ def test_v3_attempt_v2_marker_migrates_to_v5_offsets_without_low(tmp_path: Path)
     "marker_kind",
     [
         "unreadable", "malformed-current", "current-missing-schema",
-        "unknown-prompt", "legacy-v4",
+        "unknown-prompt", "legacy-v4", "symlink", "oversized",
     ],
 )
 def test_token_attempt_marker_fails_closed_before_low_model(
@@ -1407,6 +1415,17 @@ def test_token_attempt_marker_fails_closed_before_low_model(
     marker_path.parent.mkdir(parents=True)
     if marker_kind == "unreadable":
         marker_path.write_text("{broken", encoding="utf-8")
+    elif marker_kind == "symlink":
+        external = tmp_path / "external-token-marker.json"
+        external.write_text(json.dumps({
+            "schema_version": "arc.companion.translation-token-attempt.v2",
+            "prompt_version": pipeline_module.TRANSLATION_RETRY_PROMPT_VERSION,
+            "segment_id": segment["segment_id"], "input_sha256": input_sha256,
+            "status": "started",
+        }), encoding="utf-8")
+        marker_path.symlink_to(external)
+    elif marker_kind == "oversized":
+        marker_path.write_bytes(b"{" + b"x" * (16 * 1024 * 1024) + b"}")
     elif marker_kind == "malformed-current":
         marker_path.write_text(json.dumps({
             "schema_version": "arc.companion.translation-token-attempt.v2",

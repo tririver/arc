@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 import time
 import uuid
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 
 LANE_LEDGER_VERSION = "arc.companion.chapter-lane-ledger.v2"
@@ -24,6 +26,16 @@ class LaneLedgerError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class LaneTransitionGuard:
+    expected_generation: int
+    expected_ledger_sha256: str
+    authorization: tuple[str, str, str, int, str]
+
+
+_CONTROL_LEDGER_LOCK = threading.RLock()
+
+
 def initialize_lane_ledger(
     path: Path,
     *,
@@ -31,16 +43,27 @@ def initialize_lane_ledger(
     lane: str,
     segment_ids: list[str],
     generation: int = 1,
+    checkpoint_dir: Path | None = None,
 ) -> dict[str, Any]:
     if len(segment_ids) != len(set(segment_ids)) or not all(segment_ids):
         raise LaneLedgerError("segment ids must be non-empty and unique")
+    def validate_and_upgrade(current: dict[str, Any]) -> dict[str, Any]:
+        if current.get("schema_version") == "arc.companion.chapter-lane-ledger.v1":
+            current = _upgrade_v1(current)
+        _validate_identity(
+            current,
+            chapter_id=chapter_id,
+            lane=lane,
+            segment_ids=segment_ids,
+        )
+        return current
+
     if path.is_file():
         ledger = _read(path)
-        if ledger.get("schema_version") == "arc.companion.chapter-lane-ledger.v1":
-            ledger = _upgrade_v1(ledger)
-            _write(path, ledger)
-        _validate_identity(ledger, chapter_id=chapter_id, lane=lane, segment_ids=segment_ids)
-        return ledger
+        _register(path, ledger, checkpoint_dir=checkpoint_dir)
+        return _mutate(
+            path, validate_and_upgrade, checkpoint_dir=checkpoint_dir,
+        )
     ledger = {
         "schema_version": LANE_LEDGER_VERSION,
         "chapter_id": chapter_id,
@@ -59,7 +82,148 @@ def initialize_lane_ledger(
         "accepted_chain_sha256": _hash(""),
         "updated_at": time.time(),
     }
-    _write(path, ledger)
+    from .ledger_registry import LaneLedgerRegistryError
+
+    try:
+        _write(path, ledger, checkpoint_dir=checkpoint_dir)
+        return ledger
+    except (LaneLedgerError, LaneLedgerRegistryError):
+        # A concurrent create-only winner may have published after the absent
+        # check. Adopt its exact bytes and validate identity; never overwrite it.
+        if not path.is_file():
+            raise
+        current = _read(path)
+        _register(path, current, checkpoint_dir=checkpoint_dir)
+        return _mutate(
+            path, validate_and_upgrade, checkpoint_dir=checkpoint_dir,
+        )
+
+
+def initialize_control_ledger(
+    path: Path,
+    *,
+    chapter_id: str,
+    lane: str,
+    segment_ids: list[str],
+    checkpoint_dir: Path,
+) -> dict[str, Any]:
+    """Create or atomically reconcile one ordered synthetic control ledger.
+
+    An unchanged accepted prefix survives a changed chunk topology. The first
+    changed or nonaccepted block and its suffix move together to one new shared
+    generation, so no per-sibling ledger can pretend to own prefix semantics.
+    """
+
+    if len(segment_ids) != len(set(segment_ids)) or not all(segment_ids):
+        raise LaneLedgerError("control segment ids must be non-empty and unique")
+    with _CONTROL_LEDGER_LOCK:
+        if not path.is_file():
+            return initialize_lane_ledger(
+                path,
+                chapter_id=chapter_id,
+                lane=lane,
+                segment_ids=segment_ids,
+                checkpoint_dir=checkpoint_dir,
+            )
+        ledger = _read(path)
+        _register(path, ledger, checkpoint_dir=checkpoint_dir)
+        return _mutate(
+            path,
+            lambda current: _apply_control_reconciliation(
+                current,
+                chapter_id=chapter_id,
+                lane=lane,
+                segment_ids=segment_ids,
+            ),
+            checkpoint_dir=checkpoint_dir,
+        )
+
+
+def _apply_control_reconciliation(
+    ledger: dict[str, Any],
+    *,
+    chapter_id: str,
+    lane: str,
+    segment_ids: list[str],
+) -> dict[str, Any]:
+    if ledger.get("schema_version") == "arc.companion.chapter-lane-ledger.v1":
+        ledger = _upgrade_v1(ledger)
+    if (
+        ledger.get("schema_version") != LANE_LEDGER_VERSION
+        or ledger.get("chapter_id") != chapter_id
+        or ledger.get("lane") != lane
+    ):
+        raise LaneLedgerError("control ledger identity changed")
+    blocks = [dict(item) for item in ledger.get("blocks") or []]
+    old_ids = [str(item.get("segment_id") or "") for item in blocks]
+    if old_ids == segment_ids:
+        return ledger
+    prefix_length = 0
+    for old, new in zip(blocks, segment_ids):
+        if (
+            str(old.get("segment_id") or "") != new
+            or old.get("state") != "accepted"
+        ):
+            break
+        prefix_length += 1
+    if any(item.get("state") == "accepted" for item in blocks[prefix_length:]):
+        raise LaneLedgerError("control ledger contains a non-prefix acceptance")
+    generation = int(ledger.get("generation") or 1) + 1
+    predecessor = _hash("")
+    prefix: list[dict[str, Any]] = []
+    for item in blocks[:prefix_length]:
+        preserved = dict(item)
+        preserved["generation"] = generation
+        preserved["reconciled_from_generation"] = item.get("generation")
+        preserved["predecessor_accepted_chain_sha256"] = predecessor
+        preserved["accepted_chain_sha256"] = _hash(json.dumps({
+            "predecessor": predecessor,
+            "segment_id": preserved.get("segment_id"),
+            "input_sha256": preserved.get("input_sha256"),
+            "output_sha256": preserved.get("output_sha256"),
+            "generation": generation,
+        }, sort_keys=True, separators=(",", ":")))
+        predecessor = str(preserved["accepted_chain_sha256"])
+        prefix.append(preserved)
+    suffix = [{
+        "segment_id": value,
+        "state": "prepared",
+        "submission_state": "not_submitted",
+        "generation": generation,
+    } for value in segment_ids[prefix_length:]]
+    active = [
+        dict(item) for item in ledger.get("supervision_entries") or []
+        if isinstance(item, Mapping)
+    ]
+    if not active and isinstance(ledger.get("needs_supervision"), Mapping):
+        active = [dict(ledger["needs_supervision"])]
+    prefix_ids = set(segment_ids[:prefix_length])
+    now = time.time()
+    retained = [
+        item for item in active
+        if str(item.get("segment_id") or "") in prefix_ids
+    ]
+    archived = [{
+        **item,
+        "archived_at": now,
+        "archive_reason": "control_topology_suffix_invalidated",
+        "target_generation": generation,
+    } for item in active if item not in retained]
+    ledger.update({
+        "generation": generation,
+        "blocks": [*prefix, *suffix],
+        "accepted_chain_sha256": predecessor,
+        "supervision_entries": retained,
+        "needs_supervision": retained[0] if retained else None,
+        "supervision_history": [
+            *[
+                dict(item) for item in ledger.get("supervision_history") or []
+                if isinstance(item, Mapping)
+            ],
+            *archived,
+        ],
+        "updated_at": now,
+    })
     return ledger
 
 
@@ -72,10 +236,65 @@ def advance_block(
     input_sha256: str | None = None,
     output_sha256: str | None = None,
     validation_receipt: Mapping[str, Any] | None = None,
+    expected_ledger_sha256: str | None = None,
+    checkpoint_dir: Path | None = None,
+) -> dict[str, Any]:
+    if expected_ledger_sha256 is not None and checkpoint_dir is None:
+        raise LaneLedgerError("registered ledger mutation requires checkpoint_dir")
+    return _mutate(
+        path,
+        lambda ledger: _apply_block_advance(
+            ledger,
+            segment_id=segment_id,
+            state=state,
+            receipt=receipt,
+            input_sha256=input_sha256,
+            output_sha256=output_sha256,
+            validation_receipt=validation_receipt,
+        ),
+        checkpoint_dir=checkpoint_dir,
+        expected_ledger_sha256=expected_ledger_sha256,
+    )
+
+
+def _advance_block_unlocked(
+    path: Path,
+    *,
+    segment_id: str,
+    state: str,
+    receipt: Mapping[str, Any] | None = None,
+    input_sha256: str | None = None,
+    output_sha256: str | None = None,
+    validation_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if state not in BLOCK_STATES:
         raise LaneLedgerError(f"unsupported block state: {state}")
-    ledger = _read(path)
+    return _mutate(
+        path,
+        lambda ledger: _apply_block_advance(
+            ledger,
+            segment_id=segment_id,
+            state=state,
+            receipt=receipt,
+            input_sha256=input_sha256,
+            output_sha256=output_sha256,
+            validation_receipt=validation_receipt,
+        ),
+    )
+
+
+def _apply_block_advance(
+    ledger: dict[str, Any],
+    *,
+    segment_id: str,
+    state: str,
+    receipt: Mapping[str, Any] | None = None,
+    input_sha256: str | None = None,
+    output_sha256: str | None = None,
+    validation_receipt: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if state not in BLOCK_STATES:
+        raise LaneLedgerError(f"unsupported block state: {state}")
     index = _block_index(ledger, segment_id)
     block = dict(ledger["blocks"][index])
     current = str(block.get("state") or "prepared")
@@ -83,7 +302,11 @@ def advance_block(
         raise LaneLedgerError(f"cannot move {segment_id} backward from {current} to {state}")
     if BLOCK_STATES.index(state) > BLOCK_STATES.index(current) + 1:
         raise LaneLedgerError(f"cannot skip validation state for {segment_id}: {current} -> {state}")
-    if index and str(ledger["blocks"][index - 1].get("state")) != "accepted":
+    if (
+        state == "accepted"
+        and index
+        and str(ledger["blocks"][index - 1].get("state")) != "accepted"
+    ):
         raise LaneLedgerError(f"cannot advance {segment_id} before its predecessor is accepted")
     block["state"] = state
     if state == "prepared":
@@ -117,14 +340,36 @@ def advance_block(
         ledger["accepted_chain_sha256"] = block["accepted_chain_sha256"]
     ledger["blocks"][index] = block
     ledger["updated_at"] = time.time()
-    _write(path, ledger)
     return ledger
 
 
 def mark_needs_supervision(
-    path: Path, *, segment_id: str, reason: str, recovery_context: Mapping[str, Any]
+    path: Path, *, segment_id: str, reason: str, recovery_context: Mapping[str, Any],
+    expected_ledger_sha256: str | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> dict[str, Any]:
-    ledger = _read(path)
+    if expected_ledger_sha256 is not None and checkpoint_dir is None:
+        raise LaneLedgerError("registered ledger mutation requires checkpoint_dir")
+    return _mutate(
+        path,
+        lambda ledger: _apply_supervision_marker(
+            ledger,
+            segment_id=segment_id,
+            reason=reason,
+            recovery_context=recovery_context,
+        ),
+        checkpoint_dir=checkpoint_dir,
+        expected_ledger_sha256=expected_ledger_sha256,
+    )
+
+
+def _apply_supervision_marker(
+    ledger: dict[str, Any],
+    *,
+    segment_id: str,
+    reason: str,
+    recovery_context: Mapping[str, Any],
+) -> dict[str, Any]:
     index = _block_index(ledger, segment_id)
     block = dict(ledger["blocks"][index])
     submission_state = str(recovery_context.get("submission_state") or "unknown")
@@ -143,22 +388,39 @@ def mark_needs_supervision(
         raw_entries.append(dict(ledger["needs_supervision"]))
     entries = [
         dict(item) for item in raw_entries
-        if isinstance(item, Mapping) and str(item.get("segment_id") or "") != segment_id
+        if isinstance(item, Mapping)
+        and str(item.get("segment_id") or "") != segment_id
     ]
     entries.append(marker)
     ledger["supervision_entries"] = entries
-    # Preserve the earliest unresolved lane stop for legacy readers while the
-    # complete per-segment inventory remains available to recovery finalizers.
-    if not ledger.get("needs_supervision"):
+    primary = ledger.get("needs_supervision")
+    if (
+        not isinstance(primary, Mapping)
+        or str(primary.get("segment_id") or "") == segment_id
+    ):
         ledger["needs_supervision"] = marker
     ledger["updated_at"] = time.time()
-    _write(path, ledger)
     return ledger
 
 
-def clear_needs_supervision(path: Path) -> dict[str, Any]:
+def clear_needs_supervision(
+    path: Path,
+    *,
+    expected_ledger_sha256: str | None = None,
+    checkpoint_dir: Path | None = None,
+) -> dict[str, Any]:
     """Clear a supervised stop without changing the submitted block or generation."""
-    ledger = _read(path)
+    if expected_ledger_sha256 is not None and checkpoint_dir is None:
+        raise LaneLedgerError("registered ledger mutation requires checkpoint_dir")
+    return _mutate(
+        path,
+        _apply_clear_supervision,
+        checkpoint_dir=checkpoint_dir,
+        expected_ledger_sha256=expected_ledger_sha256,
+    )
+
+
+def _apply_clear_supervision(ledger: dict[str, Any]) -> dict[str, Any]:
     if not ledger.get("needs_supervision"):
         raise LaneLedgerError("lane ledger does not need supervision")
     current_segment = str(
@@ -172,7 +434,6 @@ def clear_needs_supervision(path: Path) -> dict[str, Any]:
     ledger["supervision_entries"] = entries
     ledger["needs_supervision"] = entries[0] if entries else None
     ledger["updated_at"] = time.time()
-    _write(path, ledger)
     return ledger
 
 
@@ -182,8 +443,31 @@ def invalidate_suffix(
     from_segment_id: str,
     generation: int,
     staged_outputs: Mapping[str, Mapping[str, Any]] | None = None,
+    expected_ledger_sha256: str | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> dict[str, Any]:
-    ledger = _read(path)
+    if expected_ledger_sha256 is not None and checkpoint_dir is None:
+        raise LaneLedgerError("registered ledger mutation requires checkpoint_dir")
+    return _mutate(
+        path,
+        lambda ledger: _apply_suffix_invalidation(
+            ledger,
+            from_segment_id=from_segment_id,
+            generation=generation,
+            staged_outputs=staged_outputs,
+        ),
+        checkpoint_dir=checkpoint_dir,
+        expected_ledger_sha256=expected_ledger_sha256,
+    )
+
+
+def _apply_suffix_invalidation(
+    ledger: dict[str, Any],
+    *,
+    from_segment_id: str,
+    generation: int,
+    staged_outputs: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     index = _block_index(ledger, from_segment_id)
     source_generation = int(ledger.get("generation") or 1)
     prefix = list(ledger["blocks"][:index])
@@ -267,7 +551,6 @@ def invalidate_suffix(
         str(prefix[-1].get("accepted_chain_sha256")) if prefix else _hash("")
     )
     ledger["updated_at"] = time.time()
-    _write(path, ledger)
     return ledger
 
 
@@ -290,8 +573,28 @@ def accept_reused_block(
     validation_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Accept a validated object-store hit without claiming provider submission."""
+    return _mutate(
+        path,
+        lambda ledger: _apply_reused_block(
+            ledger,
+            segment_id=segment_id,
+            input_sha256=input_sha256,
+            output_sha256=output_sha256,
+            artifact_id=artifact_id,
+            validation_receipt=validation_receipt,
+        ),
+    )
 
-    ledger = _read(path)
+
+def _apply_reused_block(
+    ledger: dict[str, Any],
+    *,
+    segment_id: str,
+    input_sha256: str,
+    output_sha256: str,
+    artifact_id: str,
+    validation_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
     index = _block_index(ledger, segment_id)
     block = dict(ledger["blocks"][index])
     if block.get("state") != "prepared" or block.get("submission_state") != "not_submitted":
@@ -322,7 +625,6 @@ def accept_reused_block(
     ledger["blocks"][index] = block
     ledger["accepted_chain_sha256"] = block["accepted_chain_sha256"]
     ledger["updated_at"] = time.time()
-    _write(path, ledger)
     return ledger
 
 
@@ -336,8 +638,28 @@ def accept_deferred_block(
     validation_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Accept a staged, locally revalidated hit after its predecessor arrives."""
+    return _mutate(
+        path,
+        lambda ledger: _apply_deferred_block(
+            ledger,
+            segment_id=segment_id,
+            input_sha256=input_sha256,
+            output_sha256=output_sha256,
+            logical_receipt=logical_receipt,
+            validation_receipt=validation_receipt,
+        ),
+    )
 
-    ledger = _read(path)
+
+def _apply_deferred_block(
+    ledger: dict[str, Any],
+    *,
+    segment_id: str,
+    input_sha256: str,
+    output_sha256: str,
+    logical_receipt: Mapping[str, Any],
+    validation_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
     index = _block_index(ledger, segment_id)
     block = dict(ledger["blocks"][index])
     if block.get("state") != "prepared" or block.get("submission_state") != "not_submitted":
@@ -373,7 +695,6 @@ def accept_deferred_block(
     ledger["blocks"][index] = block
     ledger["accepted_chain_sha256"] = block["accepted_chain_sha256"]
     ledger["updated_at"] = time.time()
-    _write(path, ledger)
     return ledger
 
 
@@ -386,7 +707,26 @@ def accept_controller_skipped_block(
     reason: str,
 ) -> dict[str, Any]:
     """Accept a deterministic no-provider lane item while retaining audit lineage."""
-    ledger = _read(path)
+    return _mutate(
+        path,
+        lambda ledger: _apply_controller_skipped_block(
+            ledger,
+            segment_id=segment_id,
+            input_sha256=input_sha256,
+            output_sha256=output_sha256,
+            reason=reason,
+        ),
+    )
+
+
+def _apply_controller_skipped_block(
+    ledger: dict[str, Any],
+    *,
+    segment_id: str,
+    input_sha256: str,
+    output_sha256: str,
+    reason: str,
+) -> dict[str, Any]:
     index = _block_index(ledger, segment_id)
     block = dict(ledger["blocks"][index])
     if block.get("state") != "prepared" or block.get("submission_state") != "not_submitted":
@@ -420,28 +760,247 @@ def accept_controller_skipped_block(
     ledger["blocks"][index] = block
     ledger["accepted_chain_sha256"] = block["accepted_chain_sha256"]
     ledger["updated_at"] = time.time()
-    _write(path, ledger)
     return ledger
 
 
-def mark_submitted(path: Path, *, segment_id: str) -> dict[str, Any]:
+def lane_transition_guard(
+    path: Path,
+    *,
+    segment_id: str,
+    session_key: str,
+    idempotency_key: str,
+    checkpoint_dir: Path | None = None,
+) -> LaneTransitionGuard:
+    """Snapshot exact inputs for one guarded production state transition."""
+
+    from .ledger_registry import read_registered_lane_ledger
+
+    ledger, digest = read_registered_lane_ledger(
+        checkpoint_dir or _checkpoint_root_for_owned_ledger(path), path,
+    )
+    block = ledger["blocks"][_block_index(ledger, segment_id)]
+    generation = int(block.get("generation") or 0)
+    if generation < 1 or generation != int(ledger.get("generation") or 0):
+        raise LaneLedgerError("lane transition generation is invalid")
+    authorization = _normalize_transition_authorization((
+        str(path.expanduser().resolve(strict=False)),
+        session_key,
+        segment_id,
+        generation,
+        idempotency_key,
+    ))
+    return LaneTransitionGuard(generation, digest, authorization)
+
+
+def mark_submitted(
+    path: Path,
+    *,
+    segment_id: str,
+    expected_generation: int | None = None,
+    expected_ledger_sha256: str | None = None,
+    authorization: tuple[Any, ...] | None = None,
+    checkpoint_dir: Path | None = None,
+) -> dict[str, Any]:
     """Advance only when the provider confirms crossing its submission barrier."""
 
-    ledger = _read(path)
-    block = ledger["blocks"][_block_index(ledger, segment_id)]
-    if block.get("state") == "prepared":
-        return advance_block(path, segment_id=segment_id, state="submitted")
-    return ledger
+    guard = _transition_guard_values(
+        path,
+        segment_id=segment_id,
+        expected_generation=expected_generation,
+        expected_ledger_sha256=expected_ledger_sha256,
+        authorization=authorization,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    def apply(ledger: dict[str, Any]) -> dict[str, Any]:
+        index = _block_index(ledger, segment_id)
+        block = ledger["blocks"][index]
+        _validate_transition_guard(
+            ledger, block, path=path, segment_id=segment_id, guard=guard,
+        )
+        if block.get("state") == "prepared":
+            updated = _apply_block_advance(
+                ledger, segment_id=segment_id, state="submitted",
+            )
+            if guard is not None:
+                submitted = dict(updated["blocks"][index])
+                submitted["submission_authorization"] = _authorization_json(
+                    guard.authorization
+                )
+                updated["blocks"][index] = submitted
+            return updated
+        if guard is not None and block.get("state") == "submitted":
+            _validate_stored_submission_authorization(block, guard.authorization)
+        return ledger
+
+    return _mutate(
+        path,
+        apply,
+        checkpoint_dir=checkpoint_dir,
+        expected_ledger_sha256=(
+            guard.expected_ledger_sha256 if guard is not None else None
+        ),
+    )
 
 
-def mark_response_received(path: Path, *, segment_id: str) -> dict[str, Any]:
+def mark_response_received(
+    path: Path,
+    *,
+    segment_id: str,
+    expected_generation: int | None = None,
+    expected_ledger_sha256: str | None = None,
+    authorization: tuple[Any, ...] | None = None,
+    checkpoint_dir: Path | None = None,
+) -> dict[str, Any]:
     """Record the first durable provider response for a logical lane item."""
 
-    ledger = _read(path)
-    block = ledger["blocks"][_block_index(ledger, segment_id)]
-    if block.get("state") == "submitted":
-        return advance_block(path, segment_id=segment_id, state="response_received")
-    return ledger
+    guard = _transition_guard_values(
+        path,
+        segment_id=segment_id,
+        expected_generation=expected_generation,
+        expected_ledger_sha256=expected_ledger_sha256,
+        authorization=authorization,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    def apply(ledger: dict[str, Any]) -> dict[str, Any]:
+        block = ledger["blocks"][_block_index(ledger, segment_id)]
+        _validate_transition_guard(
+            ledger, block, path=path, segment_id=segment_id, guard=guard,
+        )
+        if guard is not None:
+            _validate_stored_submission_authorization(block, guard.authorization)
+        if block.get("state") == "submitted":
+            return _apply_block_advance(
+                ledger, segment_id=segment_id, state="response_received",
+            )
+        return ledger
+
+    return _mutate(
+        path,
+        apply,
+        checkpoint_dir=checkpoint_dir,
+        expected_ledger_sha256=(
+            guard.expected_ledger_sha256 if guard is not None else None
+        ),
+    )
+
+
+def _checkpoint_root_for_owned_ledger(path: Path) -> Path:
+    from .ledger_registry import owned_lane_ledger_root
+
+    root = owned_lane_ledger_root(path)
+    if root is None:
+        raise LaneLedgerError("lane transition guard requires a production-owned ledger")
+    return root
+
+
+def _normalize_transition_authorization(
+    value: tuple[Any, ...] | None,
+) -> tuple[str, str, str, int, str]:
+    if isinstance(value, bool) or not isinstance(value, tuple) or len(value) != 5:
+        raise LaneLedgerError(
+            "lane transition authorization must be one complete five-field tuple"
+        )
+    control_address, session_key, logical_unit, generation, idempotency_key = value
+    if (
+        not isinstance(control_address, str)
+        or not isinstance(session_key, str)
+        or not isinstance(logical_unit, str)
+        or type(generation) is not int
+        or not isinstance(idempotency_key, str)
+        or not control_address
+        or not session_key
+        or not logical_unit
+        or generation < 1
+        or not idempotency_key
+    ):
+        raise LaneLedgerError("lane transition authorization fields are invalid")
+    canonical = str(Path(control_address).expanduser().resolve(strict=False))
+    if control_address != canonical:
+        raise LaneLedgerError("lane transition control address must be canonical")
+    return canonical, session_key, logical_unit, generation, idempotency_key
+
+
+def _transition_guard_values(
+    path: Path,
+    *,
+    segment_id: str,
+    expected_generation: int | None,
+    expected_ledger_sha256: str | None,
+    authorization: tuple[Any, ...] | None,
+    checkpoint_dir: Path | None,
+) -> LaneTransitionGuard | None:
+    from .ledger_registry import owned_lane_ledger_root
+
+    root = owned_lane_ledger_root(path, checkpoint_dir=checkpoint_dir)
+    supplied = (
+        expected_generation is not None
+        or expected_ledger_sha256 is not None
+        or authorization is not None
+    )
+    if root is None and not supplied:
+        return None
+    if (
+        expected_generation is None
+        or type(expected_generation) is not int
+        or expected_generation < 1
+        or not isinstance(expected_ledger_sha256, str)
+        or len(expected_ledger_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_ledger_sha256)
+        or authorization is None
+    ):
+        raise LaneLedgerError(
+            "production lane transition requires generation, digest, and complete authorization"
+        )
+    normalized = _normalize_transition_authorization(authorization)
+    if normalized[0] != str(path.expanduser().resolve(strict=False)):
+        raise LaneLedgerError("lane transition authorization names another control ledger")
+    if normalized[2] != segment_id or normalized[3] != expected_generation:
+        raise LaneLedgerError(
+            "lane transition authorization does not match logical unit/generation"
+        )
+    return LaneTransitionGuard(
+        expected_generation, expected_ledger_sha256, normalized,
+    )
+
+
+def _validate_transition_guard(
+    ledger: Mapping[str, Any],
+    block: Mapping[str, Any],
+    *,
+    path: Path,
+    segment_id: str,
+    guard: LaneTransitionGuard | None,
+) -> None:
+    del path, segment_id
+    if guard is None:
+        return
+    if (
+        ledger.get("generation") != guard.expected_generation
+        or block.get("generation") != guard.expected_generation
+    ):
+        raise LaneLedgerError("stale lane transition generation")
+
+
+def _authorization_json(
+    authorization: tuple[str, str, str, int, str],
+) -> dict[str, Any]:
+    return {
+        "control_address": authorization[0],
+        "session_key": authorization[1],
+        "logical_unit": authorization[2],
+        "generation": authorization[3],
+        "idempotency_key": authorization[4],
+    }
+
+
+def _validate_stored_submission_authorization(
+    block: Mapping[str, Any],
+    authorization: tuple[str, str, str, int, str],
+) -> None:
+    if block.get("submission_authorization") != _authorization_json(authorization):
+        raise LaneLedgerError("lane response authorization differs from submission")
 
 
 def _validate_identity(ledger: Mapping[str, Any], *, chapter_id: str, lane: str, segment_ids: list[str]) -> None:
@@ -484,7 +1043,45 @@ def _read(path: Path) -> dict[str, Any]:
     return value
 
 
-def _write(path: Path, value: Mapping[str, Any]) -> None:
+def _mutate(
+    path: Path,
+    apply: Callable[[dict[str, Any]], Mapping[str, Any]],
+    *,
+    checkpoint_dir: Path | None = None,
+    expected_ledger_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Apply one RMW operation to the latest cross-process-locked snapshot."""
+
+    from .ledger_registry import LaneLedgerRegistryError, mutate_lane_ledger
+
+    try:
+        updated = mutate_lane_ledger(
+            path,
+            checkpoint_dir=checkpoint_dir,
+            expected_sha256=expected_ledger_sha256,
+            mutate=apply,
+        )
+    except LaneLedgerRegistryError as exc:
+        raise LaneLedgerError("registered lane ledger changed before mutation") from exc
+    if updated is not None:
+        return updated
+    # Non-production fixtures retain their lightweight process-local path.
+    with _CONTROL_LEDGER_LOCK:
+        value = dict(apply(_read(path)))
+        _write(path, value)
+        return value
+
+
+def _write(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path | None = None,
+) -> None:
+    from .ledger_registry import create_lane_ledger
+
+    if create_lane_ledger(path, value, checkpoint_dir=checkpoint_dir):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -493,6 +1090,24 @@ def _write(path: Path, value: Mapping[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _register(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path | None = None,
+) -> None:
+    # Local fixtures outside ARC's owned checkpoint layouts intentionally do
+    # not acquire automatic-recovery ownership.
+    from .ledger_registry import register_lane_ledger
+
+    register_lane_ledger(path, value, checkpoint_dir=checkpoint_dir)
 
 
 def _hash(value: str) -> str:

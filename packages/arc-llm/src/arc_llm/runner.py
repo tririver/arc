@@ -24,7 +24,9 @@ from .attempt_diagnostics import (
 from .call_checkpoint import (
     LLMCallNeedsSupervision,
     LLMCallRetryExhausted,
+    SupervisedNativeResumeAuthorization,
     checkpoint_path,
+    normalize_supervised_native_resume_authorization,
     prepare_call,
     record_failure,
     record_response,
@@ -473,7 +475,12 @@ def run_json(
     cancel_check: Callable[[], bool] | None = None,
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
-    supervised_native_resume: bool = False,
+    supervised_native_resume: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
+    initial_native_authorization: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
     validated_legacy_logical_identity: Mapping[str, Any] | None = None,
     validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -507,6 +514,7 @@ def run_json(
         idempotency_key=idempotency_key,
         progress_contract_scope=progress_contract_scope,
         supervised_native_resume=supervised_native_resume,
+        initial_native_authorization=initial_native_authorization,
         validated_legacy_logical_identity=validated_legacy_logical_identity,
         validated_legacy_runtime_identity=validated_legacy_runtime_identity,
     )
@@ -541,10 +549,21 @@ def run_json_result(
     cancel_check: Callable[[], bool] | None = None,
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
-    supervised_native_resume: bool = False,
+    supervised_native_resume: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
+    initial_native_authorization: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
     validated_legacy_logical_identity: Mapping[str, Any] | None = None,
     validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> LLMCallOutcome:
+    supervised_native_resume = normalize_supervised_native_resume_authorization(
+        supervised_native_resume
+    )
+    initial_native_authorization = normalize_supervised_native_resume_authorization(
+        initial_native_authorization
+    )
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
     if output_recovery not in {"strict", "warn"}:
@@ -557,8 +576,25 @@ def run_json_result(
         raise ValueError("stateful run_json requires idempotency_key and artifact_dir")
     if idempotency_key and artifact_dir is None:
         raise ValueError("idempotency_key requires artifact_dir")
-    if supervised_native_resume and session_policy != "stateful":
-        raise ValueError("supervised_native_resume requires a stateful session")
+    if (
+        supervised_native_resume is not None
+        or initial_native_authorization is not None
+    ) and session_policy != "stateful":
+        raise ValueError("native authorization requires a stateful session")
+    if initial_native_authorization is not None and (
+        initial_native_authorization.session_key != session_key
+        or initial_native_authorization.idempotency_key != idempotency_key
+    ):
+        raise ValueError(
+            "initial_native_authorization does not match session_key/idempotency_key"
+        )
+    if supervised_native_resume is not None and (
+        initial_native_authorization is None
+        or supervised_native_resume != initial_native_authorization
+    ):
+        raise ValueError(
+            "supervised_native_resume requires the exact complete initial_native_authorization"
+        )
     env, session_metadata = _runtime_compatibility_policy(
         env,
         session_policy=session_policy,
@@ -668,6 +704,7 @@ def run_json_result(
             idempotency_key=idempotency_key,
             progress_contract_scope=progress_contract_scope,
             supervised_native_resume=supervised_native_resume,
+            initial_native_authorization=initial_native_authorization,
             validated_legacy_logical_identity=validated_legacy_logical_identity,
             validated_legacy_runtime_identity=validated_legacy_runtime_identity,
         ),
@@ -696,7 +733,12 @@ def run_text(
     cancel_check: Callable[[], bool] | None = None,
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
-    supervised_native_resume: bool = False,
+    supervised_native_resume: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
+    initial_native_authorization: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
     validated_legacy_logical_identity: Mapping[str, Any] | None = None,
     validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> str:
@@ -722,6 +764,7 @@ def run_text(
         idempotency_key=idempotency_key,
         progress_contract_scope=progress_contract_scope,
         supervised_native_resume=supervised_native_resume,
+        initial_native_authorization=initial_native_authorization,
         validated_legacy_logical_identity=validated_legacy_logical_identity,
         validated_legacy_runtime_identity=validated_legacy_runtime_identity,
     ).value
@@ -749,10 +792,21 @@ def run_text_result(
     cancel_check: Callable[[], bool] | None = None,
     idempotency_key: str | None = None,
     progress_contract_scope: str = "call",
-    supervised_native_resume: bool = False,
+    supervised_native_resume: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
+    initial_native_authorization: (
+        SupervisedNativeResumeAuthorization | tuple[Any, ...] | None
+    ) = None,
     validated_legacy_logical_identity: Mapping[str, Any] | None = None,
     validated_legacy_runtime_identity: Mapping[str, Any] | None = None,
 ) -> LLMCallOutcome:
+    supervised_native_resume = normalize_supervised_native_resume_authorization(
+        supervised_native_resume
+    )
+    initial_native_authorization = normalize_supervised_native_resume_authorization(
+        initial_native_authorization
+    )
     if session_policy not in {"stateless", "stateful"}:
         raise ValueError("session_policy must be stateless or stateful")
     if session_policy == "stateful" and (session_manager is None or not session_key):
@@ -763,8 +817,25 @@ def run_text_result(
         raise ValueError("stateful run_text requires idempotency_key and artifact_dir")
     if idempotency_key and artifact_dir is None:
         raise ValueError("idempotency_key requires artifact_dir")
-    if supervised_native_resume and session_policy != "stateful":
-        raise ValueError("supervised_native_resume requires a stateful session")
+    if (
+        supervised_native_resume is not None
+        or initial_native_authorization is not None
+    ) and session_policy != "stateful":
+        raise ValueError("native authorization requires a stateful session")
+    if initial_native_authorization is not None and (
+        initial_native_authorization.session_key != session_key
+        or initial_native_authorization.idempotency_key != idempotency_key
+    ):
+        raise ValueError(
+            "initial_native_authorization does not match session_key/idempotency_key"
+        )
+    if supervised_native_resume is not None and (
+        initial_native_authorization is None
+        or supervised_native_resume != initial_native_authorization
+    ):
+        raise ValueError(
+            "supervised_native_resume requires the exact complete initial_native_authorization"
+        )
     env, session_metadata = _runtime_compatibility_policy(
         env,
         session_policy=session_policy,
@@ -832,6 +903,7 @@ def run_text_result(
             idempotency_key=idempotency_key,
             progress_contract_scope=progress_contract_scope,
             supervised_native_resume=supervised_native_resume,
+            initial_native_authorization=initial_native_authorization,
             validated_legacy_logical_identity=validated_legacy_logical_identity,
             validated_legacy_runtime_identity=validated_legacy_runtime_identity,
         ),
@@ -897,33 +969,52 @@ def _run_with_retries(
     del progress_callback
     failures: list[LLMAttemptFailure] = []
     attempt_records: list[dict[str, Any]] = []
+    attempt_diagnostic_refs: list[dict[str, str]] = []
+    last_error: Exception | None = None
     for fallback_index, config in enumerate(configs):
-        _check_cancel(cancel_check)
-        provider_env = _env_with_tier_reasoning_default(env, config.provider, model_tier_requested)
-        diagnostic_env = os.environ if provider_env is None else provider_env
         try:
+            _check_cancel(cancel_check)
+        except BaseException as exc:
+            _attach_attempt_diagnostic_refs(exc, attempt_diagnostic_refs)
+            raise
+        try:
+            provider_env = _env_with_tier_reasoning_default(
+                env, config.provider, model_tier_requested
+            )
+            diagnostic_env = os.environ if provider_env is None else provider_env
             effective_idle_timeout_seconds = resolve_idle_timeout_seconds(
                 idle_timeout_seconds,
                 env=provider_env,
                 provider=config.provider,
             )
-        except (TypeError, ValueError) as exc:
-            raise LLMConfigurationError(str(exc)) from exc
-        selected = select_provider(config.provider, env=provider_env, process_chain=process_chain)
-        for attempt in range(1, max_attempts + 1):
-            diagnostics = (
-                AttemptDiagnostics(
-                    artifact_dir,
-                    provider=config.provider,
-                    model=config.model,
-                    fallback_index=fallback_index,
-                    attempt=attempt,
-                    call_label=diagnostic_call_label,
-                    env=diagnostic_env,
-                )
-                if artifact_dir is not None
-                else None
+            selected = select_provider(
+                config.provider, env=provider_env, process_chain=process_chain
             )
+        except BaseException as exc:
+            _attach_attempt_diagnostic_refs(exc, attempt_diagnostic_refs)
+            if isinstance(exc, (TypeError, ValueError)):
+                configured = LLMConfigurationError(str(exc))
+                _attach_attempt_diagnostic_refs(configured, attempt_diagnostic_refs)
+                raise configured from exc
+            raise
+        for attempt in range(1, max_attempts + 1):
+            try:
+                diagnostics = (
+                    AttemptDiagnostics(
+                        artifact_dir,
+                        provider=config.provider,
+                        model=config.model,
+                        fallback_index=fallback_index,
+                        attempt=attempt,
+                        call_label=diagnostic_call_label,
+                        env=diagnostic_env,
+                    )
+                    if artifact_dir is not None
+                    else None
+                )
+            except BaseException as exc:
+                _attach_attempt_diagnostic_refs(exc, attempt_diagnostic_refs)
+                raise
             diagnostic_ref: AttemptDiagnosticRef | None = None
             diagnostic_error: Exception | None = None
             try:
@@ -1042,8 +1133,15 @@ def _run_with_retries(
                                 "attempt diagnostics persistence failed: "
                                 + sanitize_diagnostic_text(diagnostic_exc, diagnostic_env)[:4096]
                             )
+                if diagnostic_ref is not None:
+                    _append_attempt_diagnostic_ref(
+                        attempt_diagnostic_refs, diagnostic_ref,
+                    )
+                _merge_exception_attempt_refs(attempt_diagnostic_refs, exc)
+                _attach_attempt_diagnostic_refs(exc, attempt_diagnostic_refs)
                 if not isinstance(exc, Exception):
                     raise
+                last_error = exc
                 failures.append(LLMAttemptFailure(provider=config.provider, attempt=attempt, error=str(exc)))
                 attempt_records.append(
                     _attempt_record(
@@ -1073,11 +1171,68 @@ def _run_with_retries(
                 if isinstance(exc, LLMOutputValidationError) or (
                     isinstance(exc, LLMWorkerError) and not exc.retryable
                 ):
-                    raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts)) from exc
+                    terminal = LLMTaskError(
+                        _failure_message(failures, max_attempts=max_attempts)
+                    )
+                    _attach_attempt_diagnostic_refs(
+                        terminal, attempt_diagnostic_refs,
+                    )
+                    raise terminal from exc
                 if _has_remaining_attempt(configs, fallback_index=fallback_index, attempt=attempt, max_attempts=max_attempts):
                     time.sleep(RETRY_INTERVAL_SECONDS)
-                    _check_cancel(cancel_check)
-    raise LLMTaskError(_failure_message(failures, max_attempts=max_attempts))
+                    try:
+                        _check_cancel(cancel_check)
+                    except BaseException as cancel_exc:
+                        _attach_attempt_diagnostic_refs(
+                            cancel_exc, attempt_diagnostic_refs,
+                        )
+                        raise
+    terminal = LLMTaskError(_failure_message(failures, max_attempts=max_attempts))
+    _attach_attempt_diagnostic_refs(terminal, attempt_diagnostic_refs)
+    if last_error is not None:
+        raise terminal from last_error
+    raise terminal
+
+
+def _append_attempt_diagnostic_ref(
+    refs: list[dict[str, str]], diagnostic_ref: AttemptDiagnosticRef,
+) -> None:
+    candidate = {"path": diagnostic_ref.path, "sha256": diagnostic_ref.sha256}
+    if candidate not in refs:
+        refs.append(candidate)
+
+
+def _merge_exception_attempt_refs(
+    refs: list[dict[str, str]], exc: BaseException,
+) -> None:
+    for raw in tuple(getattr(exc, "attempt_diagnostic_refs", ()) or ()):
+        if not isinstance(raw, Mapping):
+            continue
+        path = raw.get("path")
+        digest = raw.get("sha256")
+        if (
+            isinstance(path, str)
+            and path
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            candidate = {"path": path, "sha256": digest}
+            if candidate not in refs:
+                refs.append(candidate)
+
+
+def _attach_attempt_diagnostic_refs(
+    exc: BaseException, refs: Sequence[Mapping[str, str]],
+) -> None:
+    # A tuple of detached objects prevents a later retry from mutating the
+    # reference set already attached to an earlier terminating exception.
+    detached = tuple(
+        {"path": item["path"], "sha256": item["sha256"]} for item in refs
+    )
+    setattr(exc, "attempt_diagnostic_refs", detached)
+    # Compatibility for consumers that historically inspected only the most
+    # recent immutable diagnostic record.
+    setattr(exc, "diagnostic_ref", dict(detached[-1]) if detached else None)
 
 
 def _check_cancel(cancel_check: Callable[[], bool] | None) -> None:
@@ -1141,7 +1296,8 @@ def _generate_json(
     cancel_check: Callable[[], bool] | None,
     idempotency_key: str | None,
     progress_contract_scope: str,
-    supervised_native_resume: bool,
+    supervised_native_resume: SupervisedNativeResumeAuthorization | None,
+    initial_native_authorization: SupervisedNativeResumeAuthorization | None,
     validated_legacy_logical_identity: Mapping[str, Any] | None,
     validated_legacy_runtime_identity: Mapping[str, Any] | None,
 ) -> LLMCallOutcome:
@@ -1202,6 +1358,7 @@ def _generate_json(
                 idempotency_key=idempotency_key,
                 generation=session.generation if session is not None else None,
                 progress_contract_scope=progress_contract_scope,
+                initial_native_authorization=initial_native_authorization,
             )
             prepared_checkpoint = prepare_call(
                 path,
@@ -1212,6 +1369,12 @@ def _generate_json(
                 runtime_capabilities=_runtime_capabilities(env),
                 validated_legacy_logical_identity=validated_legacy_logical_identity,
             )
+            diagnostics = current_attempt_diagnostics()
+            if diagnostics is not None:
+                diagnostics.bind_checkpoint(
+                    prepared_checkpoint.recomputation_binding
+                )
+            progress.update_identity(checkpoint_identity=prepared_checkpoint.identity)
             if prepared_checkpoint.replay_response is not None:
                 selection = select_response_candidate(
                     prepared_checkpoint.replay_response,
@@ -1244,13 +1407,15 @@ def _generate_json(
                     raise selection.conflict
                 return replay_response
             progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
-            if supervised_native_resume and (session is None or not session.native_session_id):
+            if supervised_native_resume is not None and (
+                session is None or not session.native_session_id
+            ):
                 prepared_checkpoint.release_lock()
                 raise LLMTaskError(
                     "supervised native resume requires an existing provider session id"
                 )
         provider_prompt = effective_prompt
-        if supervised_native_resume:
+        if supervised_native_resume is not None:
             provider_prompt = NATIVE_RESUME_RECONCILIATION_PROMPT
             if schema_plan.prompt_fallback and schema_plan.checkpoint_schema is not None:
                 provider_prompt = with_canonical_json_schema_contract(
@@ -1283,6 +1448,25 @@ def _generate_json(
                     kwargs["progress_callback"] = progress
                 if _accepts_keyword(selected.generate_json_result, "cancel_check"):
                     kwargs["cancel_check"] = cancel_check
+                if (
+                    supervised_native_resume is not None
+                    and _accepts_keyword(
+                        selected.generate_json_result, "supervised_native_resume"
+                    )
+                ):
+                    # Never reduce controller authorization to a boolean at a
+                    # provider-capability boundary. Providers that opt in see
+                    # the exact, already-normalized five-field value.
+                    kwargs["supervised_native_resume"] = supervised_native_resume
+                if (
+                    initial_native_authorization is not None
+                    and _accepts_keyword(
+                        selected.generate_json_result, "initial_native_authorization"
+                    )
+                ):
+                    kwargs["initial_native_authorization"] = (
+                        initial_native_authorization
+                    )
                 return selected.generate_json_result(provider_prompt, **kwargs)
             return LLMProviderResponse(selected.generate_json(provider_prompt, schema=provider_schema, model=model))
 
@@ -1425,6 +1609,14 @@ def _generate_json(
             runtime_fingerprint=runtime_fp,
             name=session_name,
             metadata=session_metadata,
+            required_generation=(
+                initial_native_authorization.generation
+                if initial_native_authorization is not None else None
+            ),
+            initial_generation=(
+                initial_native_authorization.generation
+                if initial_native_authorization is not None else None
+            ),
         ) as (session, turn_count):
             generation = session.generation
             effective_prompt = apply_runtime_progress_contract(
@@ -1577,7 +1769,8 @@ def _generate_text(
     cancel_check: Callable[[], bool] | None,
     idempotency_key: str | None,
     progress_contract_scope: str,
-    supervised_native_resume: bool,
+    supervised_native_resume: SupervisedNativeResumeAuthorization | None,
+    initial_native_authorization: SupervisedNativeResumeAuthorization | None,
     validated_legacy_logical_identity: Mapping[str, Any] | None,
     validated_legacy_runtime_identity: Mapping[str, Any] | None,
 ) -> LLMCallOutcome:
@@ -1633,6 +1826,7 @@ def _generate_text(
                 idempotency_key=idempotency_key,
                 generation=session.generation if session is not None else None,
                 progress_contract_scope=progress_contract_scope,
+                initial_native_authorization=initial_native_authorization,
             )
             prepared_checkpoint = prepare_call(
                 path,
@@ -1643,17 +1837,25 @@ def _generate_text(
                 runtime_capabilities=_runtime_capabilities(env),
                 validated_legacy_logical_identity=validated_legacy_logical_identity,
             )
+            diagnostics = current_attempt_diagnostics()
+            if diagnostics is not None:
+                diagnostics.bind_checkpoint(
+                    prepared_checkpoint.recomputation_binding
+                )
+            progress.update_identity(checkpoint_identity=prepared_checkpoint.identity)
             if prepared_checkpoint.replay_response is not None:
                 return prepared_checkpoint.replay_response
             progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
-            if supervised_native_resume and (session is None or not session.native_session_id):
+            if supervised_native_resume is not None and (
+                session is None or not session.native_session_id
+            ):
                 prepared_checkpoint.release_lock()
                 raise LLMTaskError(
                     "supervised native resume requires an existing provider session id"
                 )
         provider_prompt = (
             NATIVE_RESUME_RECONCILIATION_PROMPT
-            if supervised_native_resume
+            if supervised_native_resume is not None
             else effective_prompt
         )
         def invoke() -> LLMProviderResponse[str]:
@@ -1670,6 +1872,22 @@ def _generate_text(
                     kwargs["progress_callback"] = progress
                 if _accepts_keyword(selected.generate_text_result, "cancel_check"):
                     kwargs["cancel_check"] = cancel_check
+                if (
+                    supervised_native_resume is not None
+                    and _accepts_keyword(
+                        selected.generate_text_result, "supervised_native_resume"
+                    )
+                ):
+                    kwargs["supervised_native_resume"] = supervised_native_resume
+                if (
+                    initial_native_authorization is not None
+                    and _accepts_keyword(
+                        selected.generate_text_result, "initial_native_authorization"
+                    )
+                ):
+                    kwargs["initial_native_authorization"] = (
+                        initial_native_authorization
+                    )
                 return selected.generate_text_result(provider_prompt, **kwargs)
             return LLMProviderResponse(selected.generate_text(provider_prompt, model=model))
 
@@ -1712,6 +1930,14 @@ def _generate_text(
             runtime_fingerprint=runtime_fp,
             name=session_name,
             metadata=session_metadata,
+            required_generation=(
+                initial_native_authorization.generation
+                if initial_native_authorization is not None else None
+            ),
+            initial_generation=(
+                initial_native_authorization.generation
+                if initial_native_authorization is not None else None
+            ),
         ) as (session, turn_count):
             generation = session.generation
             effective_prompt = apply_runtime_progress_contract(

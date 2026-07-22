@@ -362,6 +362,10 @@ class _AcpProcess:
     ) -> Any:
         request_id = self._next_id
         self._next_id += 1
+        if self.diagnostics is not None:
+            self.diagnostics.capture_raw_event({
+                "direction": "request", "id": request_id, "method": method,
+            })
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         if submission_barrier:
             self.activity.submitted()
@@ -480,30 +484,52 @@ class _AcpProcess:
     def _handle_reverse_request(self, event: dict[str, Any]) -> None:
         method = str(event.get("method") or "")
         if method == "session/request_permission":
-            self._send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": event["id"],
-                    "result": {"outcome": {"outcome": "cancelled"}},
-                }
+            self._send({
+                "jsonrpc": "2.0",
+                "id": event["id"],
+                "result": {"outcome": {"outcome": "cancelled"}},
+            })
+            self._record_reverse_response(
+                event, disposition="permission_cancelled",
             )
             return
         if method in {"fs/read_text_file", "fs/write_text_file"}:
-            self._send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": event["id"],
-                    "error": {"code": -32001, "message": "ARC denies ACP reverse filesystem access"},
-                }
-            )
-            return
-        self._send(
-            {
+            self._send({
                 "jsonrpc": "2.0",
                 "id": event["id"],
-                "error": {"code": -32601, "message": f"ARC does not implement reverse method {method}"},
-            }
+                "error": {
+                    "code": -32001,
+                    "message": "ARC denies ACP reverse filesystem access",
+                },
+            })
+            self._record_reverse_response(
+                event, disposition="filesystem_denied",
+            )
+            return
+        self._send({
+            "jsonrpc": "2.0",
+            "id": event["id"],
+            "error": {
+                "code": -32601,
+                "message": f"ARC does not implement reverse method {method}",
+            },
+        })
+        self._record_reverse_response(
+            event, disposition="method_not_implemented",
         )
+
+    def _record_reverse_response(
+        self, event: Mapping[str, Any], *, disposition: str,
+    ) -> None:
+        marker = {
+            "direction": "reverse_response",
+            "id": event.get("id"),
+            "method": str(event.get("method") or ""),
+            "disposition": disposition,
+        }
+        self.events.append(marker)
+        if self.diagnostics is not None:
+            self.diagnostics.capture_raw_event(marker)
 
     def _send(self, payload: dict[str, Any]) -> None:
         if self.process is None or self.process.stdin is None:

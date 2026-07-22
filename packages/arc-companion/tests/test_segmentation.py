@@ -82,7 +82,7 @@ def _mixed_610_document() -> dict:
 
 
 def _cut_model(cuts_by_window: dict[str, list[int]], calls: list[str] | None = None):
-    def call_model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def call_model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         if calls is not None:
             calls.append(call_label)
         for marker, cuts in cuts_by_window.items():
@@ -193,7 +193,7 @@ def test_portable_cut_schema_leaves_duplicate_rejection_to_companion_validation(
     assert "uniqueItems" not in cut_array_schema
     calls: list[str] = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         calls.append(call_label)
         assert "uniqueItems" not in schema["properties"]["cut_after_ordinals"]
         return {"cut_after_ordinals": [1, 1]}
@@ -237,7 +237,7 @@ def test_provider_failure_is_not_multiplied_by_semantic_validation_retries(
 ) -> None:
     calls: list[str] = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         calls.append(call_label)
         raise RuntimeError("provider quota exhausted")
 
@@ -253,6 +253,33 @@ def test_provider_failure_is_not_multiplied_by_semantic_validation_retries(
     assert calls == ["companion-segmentation-w-0001-attempt-1"]
     assert not list((tmp_path / "segmentation" / "attempts").rglob("attempt-*.json"))
     assert not (tmp_path / "segmentation.json").exists()
+
+
+def test_successful_handler_requires_immediate_exact_control_acceptance(
+    tmp_path: Path,
+) -> None:
+    accept_calls: list[tuple[Path, str, str]] = []
+
+    def model(*_args, **_kwargs):
+        return {"cut_after_ordinals": [1]}
+
+    def reject(root: Path, unit: str, logical_unit: str) -> int:
+        accept_calls.append((root, unit, logical_unit))
+        return 0
+
+    with pytest.raises(RuntimeError, match="one exact control acceptance"):
+        segment_document(
+            _document(["prose"] * 3),
+            checkpoint_dir=tmp_path,
+            workers=1,
+            force=False,
+            call_model=model,
+            accept_recovery=reject,
+        )
+
+    assert len(accept_calls) == 1
+    assert accept_calls[0][0] == tmp_path
+    assert accept_calls[0][1] == "segmentation"
 
 
 @pytest.mark.parametrize("cuts", [["2"], [True], [0], [-1], [5], [99]])
@@ -292,7 +319,7 @@ def test_full_610_block_document_segments_through_cut_only_windows(tmp_path: Pat
     windows = build_segmentation_windows(inventory)
     calls: list[tuple[str, list[int]]] = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         window = json.loads(prompt.split("WINDOW:\n", maxsplit=1)[1])
         first = int(window["start_ordinal"])
         end = int(window["end_ordinal"])
@@ -356,7 +383,7 @@ def test_oversized_interval_is_locally_refined(tmp_path: Path) -> None:
     document = _document(["prose"] * 30, section_size=100)
     calls = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         calls.append(call_label)
         return {"cut_after_ordinals": [15] if "refine" in call_label else []}
 
@@ -463,7 +490,7 @@ def test_large_non_html_semantic_fields_still_trigger_refinement_failure(
     original = deepcopy(document)
     calls: list[str] = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         calls.append(call_label)
         return {"cut_after_ordinals": []}
 
@@ -494,7 +521,7 @@ def test_refinement_fails_only_after_three_cut_adding_rounds(tmp_path: Path) -> 
     document = _document(["prose"] * 30, section_size=100)
     calls: list[str] = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         calls.append(call_label)
         if "refine" not in call_label:
             return {"cut_after_ordinals": []}
@@ -534,7 +561,7 @@ def test_invalid_refinement_responses_report_round_window_and_attempt(tmp_path: 
     document = _document(["prose"] * 30, section_size=100)
     calls: list[str] = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         calls.append(call_label)
         if "refine" not in call_label:
             return {"cut_after_ordinals": []}
@@ -582,7 +609,7 @@ def test_malformed_model_output_exhausts_three_attempts_without_publication(
     document = _document(["prose"] * 3)
     calls = []
 
-    def bad_model(prompt: str, schema: dict, artifact_dir: Path, call_label: str):
+    def bad_model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery):
         calls.append(call_label)
         return response
 
@@ -606,7 +633,7 @@ def test_retry_prompt_includes_prior_validation_error_and_same_inventory(tmp_pat
     document = _document(["prose"] * 3, section_size=10)
     prompts: list[str] = []
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         prompts.append(prompt)
         if len(prompts) == 1:
             return {"cut_after_ordinals": [99]}
@@ -635,7 +662,9 @@ def test_successful_refinement_checkpoint_is_reused_when_final_cache_is_absent(
     document = _document(["prose"] * 30, section_size=100)
     first_calls: list[str] = []
 
-    def first_model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def first_model(
+        prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery,
+    ) -> dict:
         first_calls.append(call_label)
         return {"cut_after_ordinals": [15] if "refine" in call_label else []}
 
@@ -671,7 +700,7 @@ def test_windows_execute_in_parallel(tmp_path: Path) -> None:
     threads: set[str] = set()
     lock = threading.Lock()
 
-    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str) -> dict:
+    def model(prompt: str, schema: dict, artifact_dir: Path, call_label: str, **_recovery) -> dict:
         with lock:
             threads.add(threading.current_thread().name)
         barrier.wait(timeout=5)

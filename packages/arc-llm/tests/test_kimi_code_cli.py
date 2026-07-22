@@ -371,7 +371,8 @@ def test_runner_does_not_recreate_session_after_batch_aborting_response(
 def test_reverse_permission_request_is_cancelled_without_claiming_sandbox(tmp_path):
     env = fake_env(tmp_path, scenario="reverse_permission")
 
-    assert KimiCodeCliProvider(env=env).generate_text("prompt") == "hello"
+    response = KimiCodeCliProvider(env=env).generate_text_result("prompt")
+    assert response.value == "hello"
 
     reverse = next(
         item
@@ -383,13 +384,20 @@ def test_reverse_permission_request_is_cancelled_without_claiming_sandbox(tmp_pa
         "id": "reverse-permission-1",
         "result": {"outcome": {"outcome": "cancelled"}},
     }
+    assert [event for event in response.raw_events if event.get("direction") == "reverse_response"] == [{
+        "direction": "reverse_response",
+        "id": "reverse-permission-1",
+        "method": "session/request_permission",
+        "disposition": "permission_cancelled",
+    }]
     assert "sandbox" not in EXPERIMENTAL_WARNING.lower()
 
 
 def test_reverse_filesystem_requests_receive_json_rpc_errors(tmp_path):
     env = fake_env(tmp_path, scenario="reverse_fs")
 
-    assert KimiCodeCliProvider(env=env).generate_text("prompt") == "hello"
+    response = KimiCodeCliProvider(env=env).generate_text_result("prompt")
+    assert response.value == "hello"
 
     reverse = {
         item["method"]: item["response"]
@@ -404,6 +412,14 @@ def test_reverse_filesystem_requests_receive_json_rpc_errors(tmp_path):
         "code": -32001,
         "message": "ARC denies ACP reverse filesystem access",
     }
+    assert [
+        (event["method"], event["disposition"])
+        for event in response.raw_events
+        if event.get("direction") == "reverse_response"
+    ] == [
+        ("fs/read_text_file", "filesystem_denied"),
+        ("fs/write_text_file", "filesystem_denied"),
+    ]
 
 
 @pytest.mark.parametrize(

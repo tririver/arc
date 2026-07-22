@@ -427,13 +427,71 @@ def test_concurrent_safe_boundaries_emit_one_review_sequence(tmp_path) -> None:
 
 def test_real_index_glossary_has_no_entry_cap_or_loss(tmp_path) -> None:
     index = [{"term": f"Term {number}", "pages": [number]} for number in range(205)]
-    def call_model(prompt, schema, artifact_dir, label):
+    descriptors = []
+    calls = []
+    def call_model(
+        prompt, schema, artifact_dir, label, *, recovery_descriptor=None,
+    ):
+        calls.append(label)
+        descriptors.append(recovery_descriptor)
         payload = json.loads(prompt.split("\n", 1)[1])
         return {"entries": [{"entry_id": item["entry_id"], "target": "译", "explanation": "释"} for item in payload]}
     result = generate_index_glossary(index, language="zh-CN", checkpoint_dir=tmp_path, force=False, call_model=call_model)
     assert result["entry_limit"] is None
     assert len(result["entries"]) == 205
     assert [item["source"] for item in result["entries"]] == [f"Term {number}" for number in range(205)]
+    assert len(calls) == 3
+    logical_units = [item["logical_unit"] for item in descriptors]
+    assert all(item["ordered_siblings"] == logical_units for item in descriptors)
+    assert [item["suffix"] for item in descriptors] == [
+        logical_units[index:] for index in range(3)
+    ]
+    assert len({item["group_sha256"] for item in descriptors}) == 1
+
+    # The aggregate is not the paid-call acceptance object.  Losing or
+    # corrupting it must rebuild exactly from the three business-bound batch
+    # checkpoints without repeating any provider call.
+    aggregate = tmp_path / "index-glossary.json"
+    aggregate.write_text('{"schema_version":"arc.companion.index-glossary.v1"}')
+    replayed = generate_index_glossary(
+        index,
+        language="zh-CN",
+        checkpoint_dir=tmp_path,
+        force=False,
+        call_model=lambda *_args, **_kwargs: pytest.fail("batch was rerun"),
+    )
+    assert replayed == result
+
+
+def test_index_glossary_rejects_malformed_batch_cache_only(tmp_path) -> None:
+    index = [{"term": f"Term {number}", "pages": [number]} for number in range(101)]
+    calls = []
+
+    def call_model(prompt, schema, artifact_dir, label, **_kwargs):
+        calls.append(label)
+        payload = json.loads(prompt.split("\n", 1)[1])
+        return {"entries": [
+            {"entry_id": item["entry_id"], "target": "译", "explanation": "释"}
+            for item in payload
+        ]}
+
+    generate_index_glossary(
+        index, language="zh-CN", checkpoint_dir=tmp_path,
+        force=False, call_model=call_model,
+    )
+    (tmp_path / "index-glossary.json").unlink()
+    first = sorted((tmp_path / "index-glossary-batches").glob("*.json"))[0]
+    corrupted = json.loads(first.read_text())
+    corrupted["response"]["entries"][0]["target"] = 7
+    first.write_text(json.dumps(corrupted))
+    calls.clear()
+
+    generate_index_glossary(
+        index, language="zh-CN", checkpoint_dir=tmp_path,
+        force=False, call_model=call_model,
+    )
+
+    assert calls == ["companion-index-glossary-0001"]
 
 
 def test_chapter_scheduler_keeps_lane_order_and_global_budget() -> None:
