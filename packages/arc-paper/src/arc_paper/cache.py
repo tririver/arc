@@ -156,6 +156,12 @@ def parsed_source_cache_path(source_id: str) -> Path:
     return cache_root() / "sources" / f"{safe_name}.json"
 
 
+def parsed_source_identity_cache_path(source_id: str) -> Path:
+    """Body-free parsed-source metadata/TOC sidecar."""
+    safe_name = paper_ids_safe_dir_name([source_id])
+    return cache_root() / "source-identities" / f"{safe_name}.json"
+
+
 def rich_document_cache_path(source_id: str, source_hash: str, rich_parser_version: int) -> Path:
     safe_name = paper_ids_safe_dir_name([source_id])
     return (

@@ -198,11 +198,13 @@ def test_cli_accepts_repeatable_context_paper_ids(tmp_path: Path, monkeypatch) -
         "build", "local:seed", "--project-dir", str(tmp_path),
         "--context-paper-id", "isbn:one",
         "--context-paper-id", "isbn:two",
+        "--user-intent", "Use chapter two terminology exactly.",
         "--json",
     ])
 
     assert code == 0
     assert captured["options"].context_paper_ids == ("isbn:one", "isbn:two")
+    assert captured["options"].user_intent == "Use chapter two terminology exactly."
 
 
 def test_build_options_reject_duplicate_or_self_context(tmp_path: Path) -> None:

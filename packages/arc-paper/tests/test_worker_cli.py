@@ -22,6 +22,8 @@ def _enable_paper_cli(monkeypatch):
         "ARC_PAPER_WORKER_SESSION_DIR",
         "ARC_PAPER_WORKER_SESSION_ID",
         "ARC_LLM_WORKER_CONTEXT",
+        "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
+        "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -87,6 +89,86 @@ def test_worker_delegates_safe_command_and_preserves_result(monkeypatch, capsys)
     monkeypatch.setattr(worker_cli.cli, "main", fake_main)
     assert worker_cli.main(["get-title", "0911.3380", "--json"]) == 0
     assert _output(capsys) == expected
+
+
+def test_restricted_read_policy_allows_only_authorized_cached_section(monkeypatch, capsys):
+    monkeypatch.setenv(
+        "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
+        json.dumps(["get-parsed-toc", "get-parsed-section", "artifact-read"]),
+    )
+    monkeypatch.setenv(
+        "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
+        json.dumps({"cached-book": {"sections": ["chapter-2"]}}),
+    )
+    seen = []
+
+    def fake_main(argv):
+        seen.append(argv)
+        print(json.dumps({"ok": True, "data": {}, "errors": [], "meta": {}}))
+        return 0
+
+    monkeypatch.setattr(worker_cli.cli, "main", fake_main)
+    assert worker_cli.main([
+        "get-parsed-section", "cached-book", "--section", "chapter-2", "--json",
+    ]) == 0
+    assert _output(capsys)["ok"] is True
+    assert seen
+
+    for argv, code in (
+        (["parse", "book.pdf", "--id", "cached-book"], "worker_operation_forbidden"),
+        (["get-parsed-section", "other", "--section", "chapter-2"], "worker_source_forbidden"),
+        (["get-parsed-section", "cached-book", "--section", "chapter-9"], "worker_section_forbidden"),
+    ):
+        assert worker_cli.main(argv) == 1
+        assert _output(capsys)["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    ("argv", "code"),
+    [
+        (
+            [
+                "get-parsed-section", "cached-book",
+                "--section", "chapter-2", "--section", "chapter-9",
+            ],
+            "worker_section_forbidden",
+        ),
+        (
+            ["get-parsed-section", "cached-book", "other-book", "--section", "chapter-2"],
+            "worker_source_forbidden",
+        ),
+        (
+            [
+                "get-parsed-section", "cached-book", "--source-id", "other-book",
+                "--section", "chapter-2",
+            ],
+            "worker_source_forbidden",
+        ),
+        (
+            [
+                "get-parsed-section", "cached-book", "--id=other-book",
+                "--section", "chapter-2",
+            ],
+            "worker_source_forbidden",
+        ),
+    ],
+)
+def test_restricted_read_policy_rejects_duplicate_or_conflicting_security_arguments(
+    monkeypatch, capsys, argv, code,
+):
+    monkeypatch.setenv(
+        "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON", json.dumps(["get-parsed-section"])
+    )
+    monkeypatch.setenv(
+        "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
+        json.dumps({"cached-book": {"sections": ["chapter-2"]}}),
+    )
+    monkeypatch.setattr(
+        worker_cli.cli, "main", lambda _argv: pytest.fail("ambiguous arguments must not dispatch")
+    )
+
+    assert worker_cli.main(argv) == 1
+    assert _output(capsys)["error"]["code"] == code
 
 
 def test_worker_defers_unclassified_command_to_canonical_cli(monkeypatch, capsys):

@@ -466,6 +466,42 @@ def test_get_parsed_source_reads_sources_cache(monkeypatch, tmp_path):
     assert result["data"]["paper_id"] == "lecture-9"
 
 
+def test_get_parsed_source_identity_excludes_body_and_reads_cached_metadata(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    write_json(
+        parsed_source_cache_path("lecture-9"),
+        {
+            "paper_id": "lecture-9", "parser_version": 7,
+            "source_hash": "document-hash", "toc": [{"id": "s1"}],
+            "sections": [{"section_id": "s1", "text": "SECRET BODY"}],
+            "equations": [{"id": "e1", "equation": "SECRET EQUATION"}],
+        },
+    )
+    metadata_path = service.CachePaths.for_paper("lecture-9").inspire_metadata
+    write_json(metadata_path, {"metadata": {"title": "Cached Book"}})
+    service._write_parsed_identity_cache(
+        {
+            "paper_id": "lecture-9", "parser_version": 7,
+            "source_hash": "document-hash", "toc": [{"id": "s1"}],
+        }
+    )
+
+    result = service.get_parsed_source_identity("lecture-9")
+    toc = service.get_parsed_source_compact_toc("lecture-9")
+
+    assert result["ok"] is True
+    assert result["data"] == {
+        "paper_id": "lecture-9",
+        "parser_version": 7,
+        "source_hash": "document-hash",
+        "document_hash": "document-hash",
+        "metadata": {"title": "Cached Book"},
+    }
+    assert toc["data"] == [{"id": "s1"}]
+
+
 def test_search_parsed_source_finds_equation(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
     write_json(

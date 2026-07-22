@@ -74,8 +74,16 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         help=(
-            "repeatable arc-paper ID loaded only from the local cache as bounded "
-            "explanatory context"
+            "repeatable authorized arc-paper cache ID; intent-guided runs expose "
+            "only metadata/TOC before exact on-demand section reads"
+        ),
+    )
+    build.add_argument(
+        "--user-intent",
+        default=None,
+        help=(
+            "exact frozen user intent used to generate one shared content-lane "
+            "guidance artifact"
         ),
     )
     build.add_argument("--force", action="store_true")
@@ -225,6 +233,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 inherit_host_tools=args.inherit_host_tools,
                 skip_translation=args.skip_translation,
                 context_paper_ids=tuple(args.context_paper_id),
+                user_intent=args.user_intent,
                 stop_after_first_chapter=args.stop_after_first_chapter,
                 document_kind=args.document_kind,
                 idle_timeout_seconds=args.idle_timeout_seconds,

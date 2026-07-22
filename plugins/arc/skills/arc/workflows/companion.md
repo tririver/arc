@@ -29,7 +29,8 @@ Never spend tokens merely because a generation recipe changed.
 
 Follow `rules/interaction.md`. Set `workflow` to `companion` and record the
 source identifier or path, annotation language, provider, workers, document
-kind, and cache policy in `<project-dir>/context.json`.
+kind, cache policy, and the user's exact `user_intent` in
+`<project-dir>/context.json`. Freeze that intent for recovery and resume.
 
 If no annotation language is given, print the following notice and continue
 with `zh-CN`:
@@ -88,6 +89,7 @@ arc-companion build <source-id> \
   --provider <provider> \
   --workers <workers> \
   --recovery-policy auto \
+  --user-intent '<exact context.json user_intent>' \
   --json
 ```
 
@@ -170,7 +172,17 @@ the legacy non-chaptered path. Omitting the flag preserves the two-lane default.
 
 The bootstrap turn contains fixed rules, a compact chapter descriptor, chapter
 guide, static whole-document navigation, capability instructions, and the
-first segment. Later turns contain only the current segment, its glossary
+first segment. When `user_intent` is nonempty, ARC first generates one shared
+global intent-guidance artifact from the intent plus authorized cached
+reference metadata and compact TOCs. Every content worker receives that same
+guidance in its bootstrap; segmentation, repairs, rendering, and validation do
+not. Workers may read only guidance-selected exact chapter locators through
+`arc-paper-worker get-parsed-toc`, `get-parsed-section`, and read-only artifact
+pagination. Hosts without a sandboxed shell use the controller evidence-request
+fallback. Reference text may guide terminology, idiom, and style, but the
+original source remains authoritative for facts, coverage, and structure.
+
+Later turns contain only the current segment, its glossary
 projection when translation is enabled, neighboring source anchors, bounded
 sources already available for that segment, cursor, source hash, and a short
 instruction. The model does not read project files. Every turn uses a stable

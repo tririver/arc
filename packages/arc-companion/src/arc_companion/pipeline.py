@@ -16,7 +16,7 @@ import threading
 import unicodedata
 import uuid
 from urllib.parse import urlparse
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from bs4 import BeautifulSoup
 from .context_sources import load_context_evidence
@@ -67,6 +67,13 @@ from .evidence import (
     validate_registry,
 )
 from .io import read_json, safe_name, sha256_file, sha256_json, write_json, write_text
+from .intent_guidance import (
+    build_intent_guidance,
+    worker_guidance_payload,
+    worker_guidance_prompt_prefix,
+    worker_policy_descriptor,
+    resolve_worker_evidence_requests,
+)
 from .language import base_language, contains_lexical_term, normalize_language_tag
 from .latex import LatexError, render_companion_tex, validate_tex_fidelity
 from .pdf import compile_latex, validate_pdf
@@ -161,6 +168,7 @@ TRANSLATION_PROTECTED_NAME_NORMALIZER_VERSION = (
 )
 TRANSLATION_TOKEN_REPAIR_VERSION = "arc.companion.translation-token-repair.v3"
 ANNOTATION_TIER = "high"
+INTENT_GUIDANCE_TIER = "high"
 ANNOTATION_PROMPT_MAX_BYTES = 60 * 1024
 ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
 ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
@@ -309,6 +317,7 @@ class BuildOptions:
     inherit_host_tools: bool = False
     skip_translation: bool = False
     context_paper_ids: tuple[str, ...] = ()
+    user_intent: str | None = None
     stop_after_first_chapter: bool = False
     document_kind: str = "auto"
     idle_timeout_seconds: float | None = None
@@ -369,6 +378,9 @@ class BuildOptions:
         if self.paper_id.strip() in normalized_context_ids:
             raise ValueError("the source paper cannot also be a context paper")
         object.__setattr__(self, "context_paper_ids", normalized_context_ids)
+        object.__setattr__(
+            self, "user_intent", str(self.user_intent or "").strip() or None,
+        )
         normalized_resume_keys = tuple(
             dict.fromkeys(
                 str(value).strip()
@@ -496,8 +508,33 @@ def _build_companion_unlocked(
         )
         generation_document = _generation_document(bundle.document)
         diagnostics = bundle.diagnostics
+        intent_guidance = build_intent_guidance(
+            options.user_intent,
+            source_language=str(options.source_language or "und"),
+            target_language=options.annotation_language,
+            document_type=(
+                options.document_kind
+                if options.document_kind != "auto"
+                else str(
+                    (bundle.parsed.get("structure") or {}).get("document_kind")
+                    or "article"
+                )
+            ),
+            context_paper_ids=options.context_paper_ids,
+            project_dir=project_dir,
+            call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
+                llm, prompt, schema, options=options, artifact_dir=artifact_dir,
+                call_label=call_label, model_tier=INTENT_GUIDANCE_TIER,
+                force_offline=True, disable_paper_cli=True,
+            ),
+        )
+        intent_guidance_identity = _intent_guidance_identity(intent_guidance)
+        # Legacy context papers retain their prior bounded-body behavior only
+        # when no user intent was supplied. Intent-guided runs expose metadata
+        # and compact TOCs to the guidance call, then read exact sections on demand.
         context_evidence = (
-            load_context_evidence(options.context_paper_ids) if options.context_paper_ids else []
+            load_context_evidence(options.context_paper_ids)
+            if options.context_paper_ids and intent_guidance is None else []
         )
         evidence = _evidence(bundle, context_evidence=context_evidence)
         domain_context = load_domain_context(
@@ -538,6 +575,7 @@ def _build_companion_unlocked(
             and previous_state.get("translation_mode") == (
                 "skipped" if options.skip_translation else "enabled"
             )
+            and previous_state.get("intent_guidance_identity") == intent_guidance_identity
             and _read_optional_json(checkpoint_dir / "evidence.json") == evidence
             and _read_optional_json(checkpoint_dir / "domain-context.json") == (domain_context or {})
             and _completion_outputs_match(previous_state)
@@ -578,13 +616,19 @@ def _build_companion_unlocked(
                             {
                                 "provider": options.provider,
                                 "allow_internet": options.allow_internet if lane == "commentary" else False,
-                                "inherit_host_tools": options.inherit_host_tools,
+                                "inherit_host_tools": (
+                                    options.inherit_host_tools
+                                    if intent_guidance is None else False
+                                ),
                             }
                             if lane in {"translation", "commentary"}
                             else {
                                 "provider": options.provider,
                                 "allow_internet": options.allow_internet,
-                                "inherit_host_tools": options.inherit_host_tools,
+                                "inherit_host_tools": (
+                                    options.inherit_host_tools
+                                    if intent_guidance is None else False
+                                ),
                             }
                             if lane == "guide"
                             else {"provider": options.provider, "allow_internet": False}
@@ -649,6 +693,7 @@ def _build_companion_unlocked(
             annotation_language=options.annotation_language,
             source_language=options.source_language,
             recovery_options=_recovery_options(options),
+            intent_guidance_identity=intent_guidance_identity,
             notice=notice,
             diagnostics=list(diagnostics),
         )
@@ -673,9 +718,12 @@ def _build_companion_unlocked(
                 fingerprint=fingerprint, notice=notice, diagnostics=diagnostics,
                 llm=llm, compiler=compiler, pdf_validator=pdf_validator,
                 result_llm=chapter_result_llm,
+                intent_guidance=intent_guidance,
                 cancel_check=cancel_check,
                 require_first_chapter_freeze=(
                     previous_state.get("status") == "first_chapter_ready"
+                    and previous_state.get("intent_guidance_identity")
+                    == intent_guidance_identity
                 ),
             )
         _state(
@@ -718,9 +766,14 @@ def _build_companion_unlocked(
                 workers=options.workers,
                 force=options.force,
                 page_count=_page_count(bundle),
+                intent_guidance_identity=intent_guidance_identity,
                 call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
-                    llm, prompt, schema, options=options, artifact_dir=artifact_dir,
+                    llm, _guided_prompt(prompt, intent_guidance), schema,
+                    options=options, artifact_dir=artifact_dir,
                     call_label=call_label, model_tier=GLOSSARY_TIER,
+                    paper_access_policy=_guidance_policy(intent_guidance, lane="glossary"),
+                    intent_guidance=intent_guidance,
+                    intent_guidance_lane="glossary",
                 ),
             )
 
@@ -746,10 +799,16 @@ def _build_companion_unlocked(
             glossary=glossary,
             protected_names=protected_names,
             checkpoint_dir=checkpoint_dir,
+            intent_guidance_identity=intent_guidance_identity,
             call_model=lambda prompt, schema, artifact_dir, call_label: _llm_call(
-                llm, prompt, schema, options=options,
+                llm, _guided_prompt(prompt, intent_guidance), schema, options=options,
                 artifact_dir=artifact_dir, call_label=call_label,
                 model_tier=TITLE_TRANSLATION_TIER,
+                paper_access_policy=_guidance_policy(
+                    intent_guidance, lane="title_translation",
+                ),
+                intent_guidance=intent_guidance,
+                intent_guidance_lane="title_translation",
             ),
         )
 
@@ -813,6 +872,7 @@ def _build_companion_unlocked(
             checkpoint_dir=checkpoint_dir,
             llm=llm,
             accepted_callback=publish_accepted_reader,
+            intent_guidance=intent_guidance,
         )
         translations = first_wave_results["translation"]
         raw_annotations = first_wave_results["annotation"]
@@ -885,6 +945,7 @@ def _build_companion_unlocked(
                 checkpoint_dir=checkpoint_dir,
                 llm=llm,
                 accepted_callback=publish_accepted_reader,
+                intent_guidance=intent_guidance,
             )
             translations = {**translations, **remaining_results["translation"]}
             raw_annotations = {**raw_annotations, **remaining_results["annotation"]}
@@ -895,8 +956,12 @@ def _build_companion_unlocked(
         })
         _state(state_path, status="reviewing", paper_id=bundle.paper_id, fingerprint=fingerprint, notice=notice,
                segment_count=len(expanded))
-        reviewed_path = checkpoint_dir / "annotations.reviewed.v5.json"
-        review_path = checkpoint_dir / "review.v5.json"
+        review_identity_suffix = (
+            "" if intent_guidance_identity is None
+            else f".{str(intent_guidance_identity['output_sha256'])[:16]}"
+        )
+        reviewed_path = checkpoint_dir / f"annotations.reviewed.v5{review_identity_suffix}.json"
+        review_path = checkpoint_dir / f"review.v5{review_identity_suffix}.json"
         if (
             reviewed_path.is_file()
             and review_path.is_file()
@@ -984,6 +1049,7 @@ def _build_companion_unlocked(
                 options=options,
                 llm=llm,
                 checkpoint_dir=checkpoint_dir,
+                intent_guidance=intent_guidance,
             )
             reviewed_payload = {
                 "schema_version": REVIEW_VERSION,
@@ -1135,6 +1201,7 @@ def _build_chaptered_companion(
     llm: Callable[..., dict[str, Any]], compiler: Callable[[Path, Path], None],
     pdf_validator: Callable[[Path], dict[str, object]],
     result_llm: Callable[..., Any] | None = None,
+    intent_guidance: Mapping[str, Any] | None = None,
     require_first_chapter_freeze: bool = False,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -1145,6 +1212,8 @@ def _build_chaptered_companion(
     targeted_seen: set[str] = set()
     targeted_lock = threading.Lock()
     artifact_store = AcceptedArtifactStore(options.project_dir.resolve())
+    guidance_identity = _intent_guidance_identity(intent_guidance)
+    guidance_policy = _guidance_policy(intent_guidance)
     state_path = options.project_dir.resolve() / "state.json"
     document = bundle.document
     structure = bundle.parsed.get("structure") or {}
@@ -1357,11 +1426,23 @@ def _build_chaptered_companion(
         session_manager = LLMSessionManager(checkpoint_dir / "sessions")
     initial_names = _protected_names(bundle)
 
-    def model(prompt, schema, artifact_dir, call_label, tier):
+    def model(
+        prompt, schema, artifact_dir, call_label, tier, *, guided=False,
+        prefix_guidance=True, guidance_lane=None,
+    ):
         with submission_limiter.permit():
-            return _llm_call(llm, prompt, schema, options=options,
+            return _llm_call(llm, _guided_prompt(prompt, intent_guidance)
+                             if guided and prefix_guidance else prompt,
+                             schema, options=options,
                              artifact_dir=artifact_dir, call_label=call_label,
-                             model_tier=tier)
+                             model_tier=tier,
+                             paper_access_policy=(
+                                 _guidance_policy(
+                                     intent_guidance, lane=guidance_lane,
+                                 ) if guided else None
+                             ),
+                             intent_guidance=intent_guidance if guided else None,
+                             intent_guidance_lane=guidance_lane if guided else None)
 
     glossary_input_hash = ""
     glossary_recipe_hash = ""
@@ -1374,6 +1455,7 @@ def _build_chaptered_companion(
             "target_language": options.annotation_language,
             "index": index_pack,
             "protected_names": [],
+            **({"intent_guidance": guidance_identity} if guidance_identity else {}),
         })
         glossary_recipe_hash = lane_recipe_sha256(
             "glossary", prompt=_language_prompt_contract(PROMPT_VERSION, options),
@@ -1386,7 +1468,10 @@ def _build_chaptered_companion(
             predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
             output_validator=lambda value: isinstance(value, dict) and isinstance(value.get("entries"), list),
         )
-        if glossary_object is None and "glossary" not in regeneration:
+        if (
+            glossary_object is None and "glossary" not in regeneration
+            and guidance_identity is None
+        ):
             compatible_glossaries = []
             for record in artifact_store.iter_kind("glossary"):
                 value = record.get("output")
@@ -1426,13 +1511,17 @@ def _build_chaptered_companion(
         )
         glossary = dict(glossary_object["output"])
         write_json(checkpoint_dir / "glossary.json", glossary)
-    elif glossary_migration.get("accepted"):
+    elif glossary_migration.get("accepted") and guidance_identity is None:
         glossary = dict(glossary_migration["value"])
     elif index_entries:
         glossary = generate_index_glossary(
             index_entries, language=options.annotation_language,
             checkpoint_dir=checkpoint_dir, force="glossary" in regeneration,
-            call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
+            intent_guidance_identity=guidance_identity,
+            call_model=lambda p, s, a, l: model(
+                p, s, a, l, GLOSSARY_TIER, guided=True,
+                guidance_lane="glossary",
+            ),
         )
     else:
         glossary_document = _augmentation_document(document)
@@ -1448,7 +1537,11 @@ def _build_chaptered_companion(
                 protected_names=initial_names, checkpoint_dir=checkpoint_dir,
                 workers=options.workers, force="glossary" in regeneration,
                 page_count=_page_count(bundle),
-                call_model=lambda p, s, a, l: model(p, s, a, l, GLOSSARY_TIER),
+                intent_guidance_identity=guidance_identity,
+                call_model=lambda p, s, a, l: model(
+                    p, s, a, l, GLOSSARY_TIER, guided=True,
+                    guidance_lane="glossary",
+                ),
             )
         )
     if (
@@ -1478,8 +1571,10 @@ def _build_chaptered_companion(
         protected_names=protected_names,
         checkpoint_dir=checkpoint_dir,
         artifact_store=artifact_store,
+        intent_guidance_identity=guidance_identity,
         call_model=lambda prompt, schema, artifact_dir, call_label: model(
             prompt, schema, artifact_dir, call_label, TITLE_TRANSLATION_TIER,
+            guided=True, guidance_lane="title_translation",
         ),
     )
     blocks_by_id = {block_id(item): item for item in document.get("blocks") or []}
@@ -1752,7 +1847,10 @@ def _build_chaptered_companion(
             legacy_translation_candidates(legacy)
             if legacy is not None else accepted_translation_candidates
         )
-        if translation_candidates and not options.skip_translation:
+        if (
+            translation_candidates and not options.skip_translation
+            and guidance_identity is None
+        ):
             translation_migration = migrate_legacy_translations(
                 translation_candidates,
                 metadata=(
@@ -1841,6 +1939,7 @@ def _build_chaptered_companion(
             },
             "target_language": options.annotation_language,
             "verified_evidence": evidence,
+            **({"intent_guidance": guidance_identity} if guidance_identity else {}),
         })
         guide_recipe_hash = lane_recipe_sha256(
             "guide", prompt=CHAPTER_GUIDE_VERSION, model=options.model,
@@ -1848,7 +1947,9 @@ def _build_chaptered_companion(
             access_recipe={
                 "provider": options.provider,
                 "allow_internet": options.allow_internet,
-                "inherit_host_tools": options.inherit_host_tools,
+                "inherit_host_tools": (
+                    options.inherit_host_tools if intent_guidance is None else False
+                ),
             },
         )
         guide_ledger = None
@@ -1878,10 +1979,16 @@ def _build_chaptered_companion(
                     guide_ledger_path, from_segment_id=guide_segment_id,
                     generation=int(guide_ledger.get("generation") or 1) + 1,
                 )
-                if recipe_changed and session_manager is not None:
+                if session_manager is not None:
                     session_key = f"{chapter_id}:guide"
                     if session_manager.get_existing(session_key) is not None:
-                        session_manager.rotate(session_key, reason="guide-recipe-change")
+                        session_manager.rotate(
+                            session_key,
+                            reason=(
+                                "guide-recipe-change"
+                                if recipe_changed else "guide-semantic-input-change"
+                            ),
+                        )
             if "guide" in regeneration and guide_ledger["blocks"][0]["state"] == "accepted":
                 guide_generation = int(guide_ledger.get("generation") or 1) + 1
                 guide_ledger = invalidate_suffix(
@@ -1934,57 +2041,86 @@ def _build_chaptered_companion(
         guide_receipt: dict[str, Any] = {}
         guide_provider_receipt: dict[str, Any] = {}
         last_guide_call: dict[str, str] = {}
+        guide_policy = _guidance_policy(intent_guidance, lane="guide")
         def guide_model(prompt, schema, artifact_dir, call_label):
             if result_llm is None or session_manager is None:
-                return model(prompt, schema, artifact_dir, call_label, ANNOTATION_TIER)
+                return model(
+                    prompt, schema, artifact_dir, call_label, ANNOTATION_TIER,
+                    guided=True, prefix_guidance=False, guidance_lane="guide",
+                )
             session_key = f"{chapter_id}:guide"
             existing_session = session_manager.get_existing(session_key)
             generation = existing_session.generation if existing_session else 1
             idempotency_key = f"{chapter_id}:guide:{call_label}:generation-{generation}"
+            current_idempotency_key = idempotency_key
             last_guide_call.update({
                 "idempotency_key": idempotency_key, "artifact_dir": str(artifact_dir),
                 "generation": str(generation),
             })
-            try:
+            def invoke(
+                active_prompt: str, active_schema: dict[str, Any], evidence_round: int,
+            ) -> Any:
+                nonlocal current_idempotency_key
+                round_suffix = "" if evidence_round == 0 else f":evidence-{evidence_round:02d}"
+                current_idempotency_key = idempotency_key + round_suffix
+                active_label = (
+                    call_label if evidence_round == 0
+                    else f"{call_label}-evidence-{evidence_round:02d}"
+                )
+                active_artifact_dir = (
+                    artifact_dir if evidence_round == 0
+                    else artifact_dir / f"evidence-round-{evidence_round:02d}"
+                )
+                current_session = session_manager.get_existing(session_key)
+                last_guide_call.update({
+                    "idempotency_key": current_idempotency_key,
+                    "artifact_dir": str(active_artifact_dir),
+                })
                 with submission_limiter.permit():
-                    outcome = result_llm(
-                        prompt, schema=schema, provider=options.provider, model=options.model,
+                    return result_llm(
+                        active_prompt, schema=active_schema,
+                        provider=options.provider, model=options.model,
                         model_tier=None if options.model else ANNOTATION_TIER,
                         env=_llm_runtime_env(
                             allow_internet=options.allow_internet,
                             force_disable_internet=not options.allow_internet,
-                            inherit_host_tools=options.inherit_host_tools,
+                            inherit_host_tools=(
+                                options.inherit_host_tools
+                                if guide_policy is None else False
+                            ),
+                            paper_access_policy=guide_policy,
                         ),
-                        artifact_dir=artifact_dir, call_label=call_label,
+                        artifact_dir=active_artifact_dir, call_label=active_label,
                         idle_timeout_seconds=options.idle_timeout_seconds,
                         session_policy="stateful", session_manager=session_manager,
-                        session_key=session_key, idempotency_key=idempotency_key,
+                        session_key=session_key,
+                        idempotency_key=current_idempotency_key,
                         progress_contract_scope="session",
                         supervised_native_resume=(
-                            idempotency_key in options.supervised_native_resume_keys
+                            current_idempotency_key in options.supervised_native_resume_keys
                         ),
                         validated_legacy_logical_identity=(
                             {
-                                "provider": existing_session.provider,
-                                "model": existing_session.model,
+                                "provider": current_session.provider,
+                                "model": current_session.model,
                                 "session_key": session_key,
                                 "generation": generation,
-                                "idempotency_key": idempotency_key,
+                                "idempotency_key": current_idempotency_key,
                             }
-                            if idempotency_key in options.supervised_native_resume_keys
-                            and existing_session is not None else None
+                            if current_idempotency_key in options.supervised_native_resume_keys
+                            and current_session is not None else None
                         ),
                         validated_legacy_runtime_identity=(
                             {
-                                "session_key": existing_session.key,
-                                "provider": existing_session.provider,
-                                "model": existing_session.model,
-                                "generation": existing_session.generation,
-                                "native_session_id": existing_session.native_session_id,
-                                "recorded_fp": existing_session.runtime_fingerprint,
+                                "session_key": current_session.key,
+                                "provider": current_session.provider,
+                                "model": current_session.model,
+                                "generation": current_session.generation,
+                                "native_session_id": current_session.native_session_id,
+                                "recorded_fp": current_session.runtime_fingerprint,
                             }
-                            if idempotency_key in options.supervised_native_resume_keys
-                            and existing_session is not None else None
+                            if current_idempotency_key in options.supervised_native_resume_keys
+                            and current_session is not None else None
                         ),
                         cancel_check=cancel_inflight_check,
                         progress_callback=lambda event: (
@@ -1996,11 +2132,20 @@ def _build_chaptered_companion(
                             progress.provider_event(event),
                         )[-1],
                     )
+            try:
+                outcome = invoke(
+                    prompt, _intent_guidance_schema(schema, intent_guidance), 0,
+                )
+                outcome, final_value = _complete_stateful_reference_evidence(
+                    outcome, intent_guidance=intent_guidance, lane="guide",
+                    worker_id=call_label, schema=schema, call_round=invoke,
+                )
             except BaseException as exc:
                 if _chapter_failure_requires_supervision(exc):
                     from arc_llm import read_recovery_context
                     recovery = read_recovery_context(
-                        artifact_dir, idempotency_key=idempotency_key,
+                        Path(last_guide_call["artifact_dir"]),
+                        idempotency_key=current_idempotency_key,
                         session_manager=session_manager, session_key=session_key,
                     )
                     mark_needs_supervision(
@@ -2023,7 +2168,7 @@ def _build_chaptered_companion(
             mark_response_received(
                 guide_ledger_path, segment_id=guide_segment_id
             )
-            return dict(outcome.value)
+            return final_value
         try:
             guide = generate_chapter_guide(
                 _guide_chapter_descriptor(chapter), [
@@ -2035,8 +2180,11 @@ def _build_chaptered_companion(
                 force="guide" in regeneration, call_model=guide_model,
                 stateful=result_llm is not None,
                 allow_internet=options.allow_internet,
-                inherit_host_tools=options.inherit_host_tools,
+                inherit_host_tools=(
+                    options.inherit_host_tools if guide_policy is None else False
+                ),
                 recipe_identity=guide_recipe_hash,
+                intent_guidance=intent_guidance,
             )
         except StatefulSessionError as exc:
             mark_needs_supervision(
@@ -2136,7 +2284,9 @@ def _build_chaptered_companion(
                 / f"{lane}-runtime-generation-{generation}.json",
                 chapter_id=key[0], lane=lane, generation=generation,
                 requested_allow_internet=options.allow_internet,
-                inherit_host_tools=options.inherit_host_tools,
+                inherit_host_tools=(
+                    options.inherit_host_tools if guidance_policy is None else False
+                ),
                 existing_generation=existing_generation,
                 # rotate() deliberately retains the previous generation's
                 # provider identity as a selection hint, but its runtime
@@ -2206,6 +2356,20 @@ def _build_chaptered_companion(
                             "inspect sources in the same turn when useful, then return direct title/URL/locator citations."
                         ),
                         "target_language": options.annotation_language,
+                        **({
+                            "reference_access": (
+                                "At bootstrap, read only reference_targets applicable to this lane. "
+                                "Use arc-paper-worker get-parsed-toc/get-parsed-section and "
+                                "artifact-read pagination when a sandboxed shell is available. "
+                                "Otherwise return arc_evidence_requests for the same read-only "
+                                "operations; never parse, refresh, fetch, or use an unauthorized source."
+                            ),
+                            "reference_authority": (
+                                "The original source is authoritative for facts, coverage, and structure. "
+                                "A reference translation may influence terminology, idiom, and style only; "
+                                "never inherit its additions, omissions, or errors."
+                            ),
+                        } if intent_guidance is not None else {}),
                     },
                     static_context={
                         "chapter": _compact_chapter_descriptor(prepared.chapter),
@@ -2230,6 +2394,10 @@ def _build_chaptered_companion(
                                 document, prepared.segments[0], blocks_by_id=blocks_by_id,
                                 options=options,
                             )
+                        ),
+                        **(
+                            {"intent_guidance": worker_guidance_payload(intent_guidance)}
+                            if intent_guidance is not None else {}
                         ),
                     },
                     continuity_capsule=capsule,
@@ -2361,6 +2529,7 @@ def _build_chaptered_companion(
                     document, segment, blocks_by_id=blocks_by_id, options=options,
                 ),
                 "predecessor_accepted_chain_sha256": predecessor_chain,
+                **({"intent_guidance": guidance_identity} if guidance_identity else {}),
             }
         else:
             selected_evidence = _evidence_for_segment(
@@ -2374,6 +2543,7 @@ def _build_chaptered_companion(
                 "selected_domain_context": domain_context,
                 "access_policy": _generation_runtime_policy(options),
                 "predecessor_accepted_chain_sha256": predecessor_chain,
+                **({"intent_guidance": guidance_identity} if guidance_identity else {}),
             }
         input_hash = lane_semantic_sha256(object_lane, semantic_context)
         local_deferred_value: dict[str, Any] | None = None
@@ -2386,6 +2556,7 @@ def _build_chaptered_companion(
             deferred_output = deferred_translation
         if (
             newly_accepted
+            and intent_guidance is None
             and isinstance(deferred_output, dict)
             and (
                 identity_block.get("deferred_output_sha256") is None
@@ -2434,7 +2605,11 @@ def _build_chaptered_companion(
             )
             if (
                 accepted_block.get("input_sha256") != input_hash
-                and not (lane == "translation" and isinstance(accepted_block.get("translation"), dict))
+                and not (
+                    guidance_identity is None
+                    and lane == "translation"
+                    and isinstance(accepted_block.get("translation"), dict)
+                )
             ):
                 with lane_identity_lock:
                     current_ledger = initialize_lane_ledger(
@@ -2455,6 +2630,13 @@ def _build_chaptered_companion(
                         block_generation = int(ledger.get("generation") or 1)
                         newly_accepted = True
                         predecessor_chain = str(ledger.get("accepted_chain_sha256") or "")
+                        if session_manager is not None:
+                            session_key = f"{chapter_id}:{lane}"
+                            if session_manager.get_existing(session_key) is not None:
+                                session_manager.rotate(
+                                    session_key,
+                                    reason=f"{lane}-semantic-input-change",
+                                )
         contract_version = SCHEMA_VERSION
         recipe_hash = lane_recipe_sha256(
             object_lane,
@@ -2468,7 +2650,9 @@ def _build_chaptered_companion(
             access_recipe={
                 "provider": options.provider,
                 "allow_internet": options.allow_internet if lane == "companion" else False,
-                "inherit_host_tools": options.inherit_host_tools,
+                "inherit_host_tools": (
+                    options.inherit_host_tools if intent_guidance is None else False
+                ),
             },
         )
         reused_artifact = None
@@ -2557,6 +2741,8 @@ def _build_chaptered_companion(
         lane_llm = llm
         if result_llm is not None and session_manager is not None:
             stream = lane_stream(prepared, lane, block_generation)
+            guidance_lane = "translation" if lane == "translation" else "commentary"
+            lane_policy = _guidance_policy(intent_guidance, lane=guidance_lane)
             def lane_llm(prompt: str, **kwargs: Any) -> dict[str, Any]:
                 call_label = str(kwargs.get("call_label") or segment_id)
                 artifact_dir = Path(kwargs["artifact_dir"])
@@ -2606,11 +2792,33 @@ def _build_chaptered_companion(
                     ),
                     current_payload=current_payload,
                 )
-                try:
+                base_schema = kwargs.get("schema") or {}
+                current_idempotency_key = idempotency_key
+                current_artifact_dir = artifact_dir
+                def invoke(
+                    active_prompt: str,
+                    active_schema: dict[str, Any],
+                    evidence_round: int,
+                ) -> Any:
+                    nonlocal current_idempotency_key, current_artifact_dir
+                    round_suffix = (
+                        "" if evidence_round == 0
+                        else f":evidence-{evidence_round:02d}"
+                    )
+                    current_idempotency_key = idempotency_key + round_suffix
+                    active_label = (
+                        call_label if evidence_round == 0
+                        else f"{call_label}-evidence-{evidence_round:02d}"
+                    )
+                    active_artifact_dir = (
+                        artifact_dir if evidence_round == 0
+                        else artifact_dir / f"evidence-round-{evidence_round:02d}"
+                    )
+                    current_artifact_dir = active_artifact_dir
                     with submission_limiter.permit():
                         existing_session = session_manager.get_existing(session_key)
-                        outcome = result_llm(
-                            stateful_prompt, schema=kwargs.get("schema"),
+                        return result_llm(
+                            active_prompt, schema=active_schema,
                             provider=str(runtime_profile["provider"]),
                             model=runtime_profile.get("model"),
                             model_tier=(
@@ -2619,15 +2827,27 @@ def _build_chaptered_companion(
                             ),
                             env=_llm_runtime_env(
                                 allow_internet=bool(runtime_profile["allow_internet"]),
-                                force_disable_internet=not bool(runtime_profile["allow_internet"]),
-                                inherit_host_tools=bool(runtime_profile["inherit_host_tools"]),
-                            ), artifact_dir=artifact_dir, call_label=call_label,
+                                force_disable_internet=not bool(
+                                    runtime_profile["allow_internet"]
+                                ),
+                                inherit_host_tools=(
+                                    bool(runtime_profile["inherit_host_tools"])
+                                    if lane_policy is None else False
+                                ),
+                                paper_access_policy=lane_policy,
+                            ),
+                            artifact_dir=active_artifact_dir,
+                            call_label=active_label,
                             idle_timeout_seconds=kwargs.get("idle_timeout_seconds"),
-                            session_policy="stateful", session_manager=session_manager,
-                            session_key=session_key, idempotency_key=idempotency_key,
-                            progress_contract_scope="session", schema_formatter_enabled=False,
+                            session_policy="stateful",
+                            session_manager=session_manager,
+                            session_key=session_key,
+                            idempotency_key=current_idempotency_key,
+                            progress_contract_scope="session",
+                            schema_formatter_enabled=False,
                             supervised_native_resume=(
-                                idempotency_key in options.supervised_native_resume_keys
+                                current_idempotency_key
+                                in options.supervised_native_resume_keys
                             ),
                             validated_legacy_logical_identity=(
                                 {
@@ -2635,9 +2855,10 @@ def _build_chaptered_companion(
                                     "model": existing_session.model,
                                     "session_key": session_key,
                                     "generation": block_generation,
-                                    "idempotency_key": idempotency_key,
+                                    "idempotency_key": current_idempotency_key,
                                 }
-                                if idempotency_key in options.supervised_native_resume_keys
+                                if current_idempotency_key
+                                in options.supervised_native_resume_keys
                                 and existing_session is not None else None
                             ),
                             validated_legacy_runtime_identity=(
@@ -2649,7 +2870,8 @@ def _build_chaptered_companion(
                                     "native_session_id": existing_session.native_session_id,
                                     "recorded_fp": existing_session.runtime_fingerprint,
                                 }
-                                if idempotency_key in options.supervised_native_resume_keys
+                                if current_idempotency_key
+                                in options.supervised_native_resume_keys
                                 and existing_session is not None else None
                             ),
                             cancel_check=cancel_inflight_check,
@@ -2660,11 +2882,23 @@ def _build_chaptered_companion(
                                 progress.provider_event(event),
                             )[-1],
                         )
+                try:
+                    outcome = invoke(
+                        stateful_prompt,
+                        _intent_guidance_schema(base_schema, intent_guidance),
+                        0,
+                    )
+                    outcome, final_value = _complete_stateful_reference_evidence(
+                        outcome, intent_guidance=intent_guidance,
+                        lane=guidance_lane, worker_id=call_label,
+                        schema=base_schema, call_round=invoke,
+                    )
                 except BaseException as exc:
                     if _chapter_failure_requires_supervision(exc):
                         from arc_llm import read_recovery_context
                         recovery = read_recovery_context(
-                            artifact_dir, idempotency_key=idempotency_key,
+                            current_artifact_dir,
+                            idempotency_key=current_idempotency_key,
                             session_manager=session_manager, session_key=session_key,
                         )
                         mark_needs_supervision(
@@ -2722,7 +2956,7 @@ def _build_chaptered_companion(
                     / f"{lane}-stream-generation-{block_generation}.json",
                     stream=stream, budget=rollover_budgets[generation_key],
                 )
-                return dict(outcome.value)
+                return final_value
         try:
             if reused_artifact is not None:
                 pass
@@ -2744,6 +2978,7 @@ def _build_chaptered_companion(
                         or targeted_key in targeted_regeneration
                         or semantic_invalidated
                     ),
+                    intent_guidance=intent_guidance,
                 )[segment_id]
             else:
                 value = _generate_annotations(
@@ -2760,6 +2995,7 @@ def _build_chaptered_companion(
                         or targeted_key in targeted_regeneration
                         or semantic_invalidated
                     ),
+                    intent_guidance=intent_guidance,
                 )[segment_id]
         except BaseException as exc:
             _mark_translation_repair_supervision(
@@ -2876,7 +3112,11 @@ def _build_chaptered_companion(
             "stop_event": supervision_event,
             "cancel_check": cancel_inflight_check,
         }
-        freeze_path = checkpoint_dir / "first-chapter-freeze.json"
+        freeze_path = checkpoint_dir / (
+            "first-chapter-freeze.json"
+            if guidance_identity is None else
+            f"first-chapter-freeze.{str(guidance_identity['output_sha256'])[:16]}.json"
+        )
         existing_freeze = _load_first_chapter_freeze(
             freeze_path, chapters_pack["chapters"], required=require_first_chapter_freeze
         )
@@ -2938,6 +3178,7 @@ def _build_chaptered_companion(
             "augmentation_projection_version": AUGMENTATION_PROJECTION_VERSION,
             "segment_ids": [str(item["segment_id"]) for item in review_segments],
         },
+        **({"intent_guidance": guidance_identity} if guidance_identity else {}),
     })
     review_recipe_hash = lane_recipe_sha256(
         "review", prompt=REVIEW_VERSION, model=options.model, tier=REVIEW_TIER,
@@ -2967,6 +3208,7 @@ def _build_chaptered_companion(
             review_segments, translations, annotations, document=document, glossary=glossary,
             protected_names=protected_names, evidence=evidence, options=options,
             llm=llm, checkpoint_dir=checkpoint_dir,
+            intent_guidance=intent_guidance,
         )
         review_output = {
             "translations": translations,
@@ -3043,7 +3285,11 @@ def _build_chaptered_companion(
             existing_freeze, chapter_results, translations=translations, annotations=annotations,
         )
     if options.stop_after_first_chapter:
-        freeze_path = checkpoint_dir / "first-chapter-freeze.json"
+        freeze_path = checkpoint_dir / (
+            "first-chapter-freeze.json"
+            if guidance_identity is None else
+            f"first-chapter-freeze.{str(guidance_identity['output_sha256'])[:16]}.json"
+        )
         first_id = selected_chapters[0]["chapter_id"]
         first_segment_ids = [item["segment_id"] for item in chapter_results[first_id]["segments"]]
         freeze = {
@@ -5065,6 +5311,7 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "inherit_host_tools": options.inherit_host_tools,
         "skip_translation": options.skip_translation,
         "context_paper_ids": list(options.context_paper_ids),
+        "user_intent": options.user_intent,
         "stop_after_first_chapter": options.stop_after_first_chapter,
         "document_kind": options.document_kind,
         "idle_timeout_seconds": options.idle_timeout_seconds,
@@ -5139,6 +5386,7 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         inherit_host_tools=bool(value.get("inherit_host_tools", False)),
         skip_translation=bool(value.get("skip_translation", False)),
         context_paper_ids=tuple(value.get("context_paper_ids") or ()),
+        user_intent=(str(value.get("user_intent") or "").strip() or None),
         stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
         document_kind=str(value.get("document_kind") or "auto"),
         idle_timeout_seconds=value.get("idle_timeout_seconds"),
@@ -5265,6 +5513,7 @@ def _generate_first_round_lanes(
     checkpoint_dir: Path,
     llm: Callable[..., dict[str, Any]],
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+    intent_guidance: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Drain translation and annotation concurrently for one scheduled wave."""
     if not segments:
@@ -5283,6 +5532,7 @@ def _generate_first_round_lanes(
                 checkpoint_dir=checkpoint_dir,
                 llm=llm,
                 accepted_callback=accepted_callback,
+                intent_guidance=intent_guidance,
             ),
         }
         if not options.skip_translation:
@@ -5296,6 +5546,7 @@ def _generate_first_round_lanes(
                 checkpoint_dir=checkpoint_dir,
                 llm=llm,
                 accepted_callback=accepted_callback,
+                intent_guidance=intent_guidance,
             )
         lane_results: dict[str, dict[str, dict[str, Any]]] = {"translation": {}}
         lane_failures: dict[str, BaseException] = {}
@@ -5634,6 +5885,7 @@ def _generate_annotations(
     generation: int = 1,
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     force_generation: bool = False,
+    intent_guidance: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
     usage_state: dict[str, Any] = {"counts": {}, "topics": []}
@@ -5694,6 +5946,10 @@ def _generate_annotations(
                     "paper_context": paper_context,
                     "runtime_access": _generation_runtime_policy(options),
                     "domain_context": domain_context,
+                    **(
+                        {"intent_guidance": _intent_guidance_identity(intent_guidance)}
+                        if intent_guidance is not None else {}
+                    ),
                 },
             )
             if (
@@ -5742,7 +5998,7 @@ def _generate_annotations(
         )
         value = _llm_call(
             llm,
-            _bounded_annotation_prompt(
+            _guided_prompt(_bounded_annotation_prompt(
                 _semantic_segment_descriptor(segment),
                 selected,
                 language=options.annotation_language,
@@ -5753,7 +6009,7 @@ def _generate_annotations(
                 paper_context=paper_context,
                 domain_context=domain_context,
                 source_language=_multilingual_prompt_source(options),
-            ),
+            ), intent_guidance),
             ANNOTATION_SCHEMA,
             options=options,
             artifact_dir=(
@@ -5766,6 +6022,9 @@ def _generate_annotations(
             call_label=f"companion-annotation-{segment['segment_id']}",
             model_tier=ANNOTATION_TIER,
             allow_internet=True,
+            paper_access_policy=_guidance_policy(intent_guidance, lane="commentary"),
+            intent_guidance=intent_guidance,
+            intent_guidance_lane="commentary",
         )
         normalized = _validate_direct_annotation_sources(
             value,
@@ -5810,6 +6069,10 @@ def _generate_annotations(
                                     bundle.document, segment, blocks_by_id=by_id, options=options
                                 ),
                                 "runtime_access": _generation_runtime_policy(options),
+                                **(
+                                    {"intent_guidance": _intent_guidance_identity(intent_guidance)}
+                                    if intent_guidance is not None else {}
+                                ),
                                 "domain_context": domain_context,
                             },
                         ),
@@ -6766,6 +7029,7 @@ def _generate_translations(
     generation: int = 1,
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     force_generation: bool = False,
+    intent_guidance: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
     output: dict[str, dict[str, Any]] = {}
@@ -6793,6 +7057,10 @@ def _generate_translations(
                 "names": protected_names,
                 "paper_context": paper_context,
                 "runtime_access": _generation_runtime_policy(options),
+                **(
+                    {"intent_guidance": _intent_guidance_identity(intent_guidance)}
+                    if intent_guidance is not None else {}
+                ),
             },
         )
         input_hashes[str(segment["segment_id"])] = expected_hash
@@ -6942,7 +7210,7 @@ def _generate_translations(
                     )
                 translation = _llm_call(
                     llm,
-                    translation_prompt(
+                    _guided_prompt(translation_prompt(
                         _semantic_segment_descriptor(segment),
                         translatable,
                         language=options.annotation_language,
@@ -6950,13 +7218,16 @@ def _generate_translations(
                         protected_names=protected_names,
                         paper_context=paper_context,
                         source_language=_multilingual_prompt_source(options),
-                    ),
+                    ), intent_guidance),
                     TRANSLATION_SCHEMA,
                     options=options,
                     artifact_dir=artifact_dir,
                     call_label=f"companion-translation-{segment_id}",
                     model_tier=TRANSLATION_TIER,
                     force_offline=True,
+                    paper_access_policy=_guidance_policy(intent_guidance, lane="translation"),
+                    intent_guidance=intent_guidance,
+                    intent_guidance_lane="translation",
                 )
                 draft = _translation_primary_draft_payload(
                     segment,
@@ -7243,6 +7514,10 @@ def _generate_translations(
                                     bundle.document, segment, blocks_by_id=by_id, options=options
                                 ),
                                 "runtime_access": _generation_runtime_policy(options),
+                                **(
+                                    {"intent_guidance": _intent_guidance_identity(intent_guidance)}
+                                    if intent_guidance is not None else {}
+                                ),
                             },
                         ),
                         "generation_provenance": provenance,
@@ -7268,6 +7543,7 @@ def _review(
     options: BuildOptions,
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
+    intent_guidance: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, dict[str, Any]], dict[str, Any]]:
     active_segments = [item for item in segments if not item.get("structural_only")]
     if len(active_segments) != len(segments):
@@ -7291,6 +7567,7 @@ def _review(
             options=options,
             llm=llm,
             checkpoint_dir=checkpoint_dir,
+            intent_guidance=intent_guidance,
         )
         merged_annotations = dict(annotations)
         merged_annotations.update(reviewed_annotations)
@@ -7328,6 +7605,7 @@ def _review(
             options=options,
             llm=llm,
             checkpoint_dir=checkpoint_dir,
+            intent_guidance=intent_guidance,
         )
         return None, reviewed, review
     translations = {
@@ -7365,11 +7643,11 @@ def _review(
     }
     findings: list[dict[str, Any]] = []
     direct_payload = {**payload, "glossary": glossary, "protected_names": protected_names}
-    direct_prompt = review_prompt(
+    direct_prompt = _guided_prompt(review_prompt(
         direct_payload,
         language=options.annotation_language,
         findings=findings,
-    )
+    ), intent_guidance)
     # ``review_context_chars`` remains a user-controlled soft threshold for
     # choosing hierarchical review.  Actual calls use a small viability floor
     # and can never exceed the provider-independent 60 KiB hard ceiling.
@@ -7380,10 +7658,14 @@ def _review(
     )
     hierarchical = _utf8_size(direct_prompt) > hierarchy_threshold
     if hierarchical:
+        guidance_overhead = (
+            _utf8_size(worker_guidance_prompt_prefix(intent_guidance))
+            if intent_guidance is not None else 0
+        )
         chunks = _review_chunks(
             payload["segments"],
             language=options.annotation_language,
-            max_prompt_bytes=review_prompt_limit,
+            max_prompt_bytes=max(1, review_prompt_limit - guidance_overhead),
         )
         recovered_reviews = (
             {} if force_review else _load_recovered_section_reviews(checkpoint_dir, chunks)
@@ -7393,7 +7675,7 @@ def _review(
             chunk_text = json.dumps(
                 [item.get("source_blocks") or [] for item in chunk], ensure_ascii=False
             )
-            prompt = section_review_prompt(
+            prompt = _guided_prompt(section_review_prompt(
                 {
                     "segments": chunk,
                     "glossary": _commentary_review_glossary_projection(
@@ -7404,7 +7686,7 @@ def _review(
                     ],
                 },
                 language=options.annotation_language,
-            )
+            ), intent_guidance)
             _require_review_prompt_within_limit(
                 prompt,
                 label=f"section review {index}",
@@ -7437,6 +7719,9 @@ def _review(
                     artifact_dir=checkpoint_dir / "llm" / "section-review" / str(index),
                     call_label=f"companion-section-review-{index}",
                     model_tier=REVIEW_TIER,
+                    paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
+                    intent_guidance=intent_guidance,
+                    intent_guidance_lane="review",
                 )
             if isinstance(value, dict) and "reviewed_segment_ids" not in value:
                 legacy_reviewed = value.get("reviewed_segments")
@@ -7506,8 +7791,9 @@ def _review(
             glossary=glossary,
             protected_names=protected_names,
             language=options.annotation_language,
-            max_prompt_bytes=review_prompt_limit,
+            max_prompt_bytes=max(1, review_prompt_limit - guidance_overhead),
         )
+        final_prompt = _guided_prompt(final_prompt, intent_guidance)
     _require_review_prompt_within_limit(
         final_prompt,
         label="final review",
@@ -7521,6 +7807,9 @@ def _review(
         artifact_dir=checkpoint_dir / "llm" / "final-review",
         call_label="companion-final-review",
         model_tier=REVIEW_TIER,
+        paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
+        intent_guidance=intent_guidance,
+        intent_guidance_lane="review",
     )
     reviewed_translations = {key: {"blocks": [dict(item) for item in value.get("blocks") or []]} for key, value in translations.items()}
     reviewed = {key: dict(value) for key, value in annotations.items()}
@@ -7587,6 +7876,7 @@ def _review_commentary_only(
     options: BuildOptions,
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
+    intent_guidance: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Review commentary without exposing a translation field to the model."""
     by_id = {block_id(block): block for block in document.get("blocks") or []}
@@ -7613,9 +7903,9 @@ def _review_commentary_only(
         ),
     } for segment in segments]
     base = {"glossary": glossary}
-    direct_prompt = commentary_review_prompt(
+    direct_prompt = _guided_prompt(commentary_review_prompt(
         {**base, "segments": segment_payloads}, language=options.annotation_language
-    )
+    ), intent_guidance)
     limit = _review_prompt_byte_limit(options)
     payload_groups: list[tuple[list[dict[str, Any]], dict[str, Any]]] = [
         (segment_payloads, glossary)
@@ -7644,16 +7934,16 @@ def _review_commentary_only(
     def inspect(
         index: int, group: list[dict[str, Any]], group_glossary: dict[str, Any],
     ) -> dict[str, Any]:
-        prompt = commentary_review_prompt(
+        prompt = _guided_prompt(commentary_review_prompt(
             {"glossary": group_glossary, "segments": group},
             language=options.annotation_language,
-        )
+        ), intent_guidance)
         if _utf8_size(prompt) > limit and hierarchical and group_glossary.get("entries"):
             group_glossary = _empty_commentary_review_glossary(glossary)
-            prompt = commentary_review_prompt(
+            prompt = _guided_prompt(commentary_review_prompt(
                 {"glossary": group_glossary, "segments": group},
                 language=options.annotation_language,
-            )
+            ), intent_guidance)
         _require_review_prompt_within_limit(
             prompt, label=f"commentary-only review {index}", max_prompt_bytes=limit
         )
@@ -7685,6 +7975,9 @@ def _review_commentary_only(
                 artifact_dir=checkpoint_dir / "llm" / "commentary-review" / str(index),
                 call_label=f"companion-commentary-review-{index}",
                 model_tier=REVIEW_TIER,
+                paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
+                intent_guidance=intent_guidance,
+                intent_guidance_lane="review",
             )
         validation_error = _commentary_review_validation_error(value, group)
         if validation_error is not None:
@@ -7952,6 +8245,78 @@ def _related_work_claim_key(claim: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _intent_guidance_schema(
+    schema: dict[str, Any], intent_guidance: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if intent_guidance is None:
+        return schema
+    from arc_llm import allow_evidence_requests
+
+    return allow_evidence_requests(schema) or schema
+
+
+def _controller_evidence_prompt(responses: Sequence[Any]) -> str:
+    return (
+        "CONTROLLER REFERENCE EVIDENCE ROUND:\n"
+        + json.dumps(
+            [
+                {
+                    "request_id": response.request_id,
+                    "ok": response.ok,
+                    "data": response.data,
+                    "error": response.error,
+                    "provenance": dict(response.provenance),
+                }
+                for response in responses
+            ],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        + "\nUse these responses, request the next page only if necessary, and return "
+        "the required result plus arc_evidence_requests ([] when complete)."
+    )
+
+
+def _complete_stateful_reference_evidence(
+    initial_outcome: Any,
+    *,
+    intent_guidance: Mapping[str, Any] | None,
+    lane: str,
+    worker_id: str,
+    schema: dict[str, Any],
+    call_round: Callable[[str, dict[str, Any], int], Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Resolve controller reads as native-session delta turns for shell-less hosts."""
+    outcome = initial_outcome
+    active_schema = _intent_guidance_schema(schema, intent_guidance)
+    for round_number in range(0, 4):
+        value = dict(outcome.value)
+        if intent_guidance is None:
+            return outcome, value
+        from arc_llm import evidence_requests_from_output, resolve_evidence_round
+
+        requests = evidence_requests_from_output(
+            value, worker_id=worker_id, role="companion-content-worker",
+        )
+        if not requests:
+            value.pop("arc_evidence_requests", None)
+            return outcome, value
+        if round_number >= 3:
+            raise RuntimeError(
+                "companion reference evidence exceeded three controller rounds"
+            )
+        responses = resolve_evidence_round(
+            requests,
+            lambda material, *, round_number: resolve_worker_evidence_requests(
+                intent_guidance, material, round_number=round_number, lane=lane,
+            ),
+            round_number=round_number + 1,
+        )
+        outcome = call_round(
+            _controller_evidence_prompt(responses), active_schema, round_number + 1,
+        )
+    raise AssertionError("unreachable stateful evidence loop")
+
+
 def _llm_call(
     llm: Callable[..., dict[str, Any]],
     prompt: str,
@@ -7963,25 +8328,70 @@ def _llm_call(
     model_tier: str,
     allow_internet: bool = False,
     force_offline: bool = False,
+    paper_access_policy: Mapping[str, Any] | None = None,
+    disable_paper_cli: bool = False,
+    intent_guidance: Mapping[str, Any] | None = None,
+    intent_guidance_lane: str | None = None,
 ) -> dict[str, Any]:
     force_offline = force_offline or not allow_internet
     runtime_env = _llm_runtime_env(
         allow_internet=not force_offline and allow_internet and options.allow_internet,
         force_disable_internet=force_offline or not options.allow_internet,
-        inherit_host_tools=options.inherit_host_tools,
+        inherit_host_tools=(
+            options.inherit_host_tools
+            if paper_access_policy is None and not disable_paper_cli else False
+        ),
+        paper_access_policy=paper_access_policy,
+        disable_paper_cli=disable_paper_cli,
     )
-    return llm(
-        prompt,
-        schema=schema,
-        provider=options.provider,
-        model=options.model,
-        model_tier=None if options.model else model_tier,
-        env=runtime_env,
-        session_policy="stateless",
-        artifact_dir=artifact_dir,
-        call_label=call_label,
-        idle_timeout_seconds=options.idle_timeout_seconds,
-    )
+    active_prompt = prompt
+    active_schema = _intent_guidance_schema(schema, intent_guidance)
+    for round_number in range(0, 4):
+        value = llm(
+            active_prompt,
+            schema=active_schema,
+            provider=options.provider,
+            model=options.model,
+            model_tier=None if options.model else model_tier,
+            env=runtime_env,
+            session_policy="stateless",
+            artifact_dir=(
+                artifact_dir if round_number == 0
+                else artifact_dir / f"evidence-round-{round_number:02d}"
+            ),
+            call_label=(
+                call_label if round_number == 0
+                else f"{call_label}-evidence-{round_number:02d}"
+            ),
+            idle_timeout_seconds=options.idle_timeout_seconds,
+        )
+        if intent_guidance is None:
+            return value
+        from arc_llm import (
+            evidence_requests_from_output,
+            resolve_evidence_round,
+        )
+
+        requests = evidence_requests_from_output(
+            value, worker_id=call_label, role="companion-content-worker",
+        )
+        if not requests:
+            return {
+                key: item for key, item in value.items()
+                if key != "arc_evidence_requests"
+            }
+        if round_number >= 3:
+            raise RuntimeError("companion reference evidence exceeded three controller rounds")
+        responses = resolve_evidence_round(
+            requests,
+            lambda material, *, round_number: resolve_worker_evidence_requests(
+                intent_guidance, material, round_number=round_number,
+                lane=intent_guidance_lane,
+            ),
+            round_number=round_number + 1,
+        )
+        active_prompt = active_prompt + "\n\n" + _controller_evidence_prompt(responses)
+    raise AssertionError("unreachable evidence loop")
 
 
 def _limit_llm_concurrency(
@@ -8062,19 +8472,112 @@ def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str,
     }
 
 
+def _intent_guidance_identity(
+    artifact: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if artifact is None:
+        return None
+    references = []
+    targets = artifact.get("reference_targets") or []
+    for source in artifact.get("reference_sources") or []:
+        if not isinstance(source, Mapping):
+            continue
+        source_id = str(source.get("source_id") or "")
+        references.append({
+            "source_id": source_id,
+            "document_hash": str(
+                source.get("document_hash") or source.get("source_hash") or ""
+            ),
+            "locators": sorted({
+                str(target.get("locator") or "")
+                for target in targets
+                if isinstance(target, Mapping)
+                and str(target.get("source_id") or "") == source_id
+            }),
+        })
+    return {
+        "user_intent_sha256": artifact.get("user_intent_sha256"),
+        "semantic_input_sha256": artifact.get("semantic_input_sha256"),
+        "output_sha256": artifact.get("output_sha256"),
+        "references": references,
+    }
+
+
+def _guided_prompt(
+    prompt: str, intent_guidance: Mapping[str, Any] | None,
+) -> str:
+    if intent_guidance is None:
+        return prompt
+    return (
+        worker_guidance_prompt_prefix(intent_guidance)
+        + "\nIf this host has no sandboxed shell, request the same exact cached reads through "
+        "arc_evidence_requests. Use operations get-parsed-toc or get-parsed-section with "
+        "arguments source_id, locator, and optional byte offset/limit; return [] when no "
+        "controller read is needed.\n"
+        + prompt
+    )
+
+
+def _guidance_policy(
+    intent_guidance: Mapping[str, Any] | None,
+    *,
+    lane: str | None = None,
+) -> dict[str, Any] | None:
+    return (
+        None if intent_guidance is None
+        else worker_policy_descriptor(intent_guidance, lane=lane)
+    )
+
+
 def _llm_runtime_env(
     *,
     allow_internet: bool,
     force_disable_internet: bool = False,
     inherit_host_tools: bool = False,
+    paper_access_policy: Mapping[str, Any] | None = None,
+    disable_paper_cli: bool = False,
 ) -> dict[str, str] | None:
     """Map portable access intent onto both supported host runtimes."""
+    if disable_paper_cli:
+        inherit_host_tools = False
     env = dict(os.environ)
     if allow_internet or force_disable_internet:
         value = "true" if allow_internet else "false"
         env["ARC_CODEX_ALLOW_INTERNET"] = value
         env["ARC_CLAUDE_ALLOW_INTERNET"] = value
-    env["ARC_PAPER_CLI_ACCESS"] = "full"
+    env["ARC_PAPER_CLI_ACCESS"] = "none" if disable_paper_cli else "full"
+    for key in (
+        "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
+        "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
+    ):
+        env.pop(key, None)
+    if paper_access_policy is not None and not disable_paper_cli:
+        operations = list(
+            paper_access_policy.get("operations")
+            or paper_access_policy.get("allowed_operations")
+            or []
+        )
+        targets = paper_access_policy.get("targets")
+        if not isinstance(targets, Mapping):
+            targets = {
+                str(source_id): {"sections": []}
+                for source_id in paper_access_policy.get("authorized_source_ids") or []
+            }
+            for target in paper_access_policy.get("authorized_section_targets") or []:
+                if not isinstance(target, Mapping):
+                    continue
+                source_id = str(target.get("source_id") or "")
+                locator = str(target.get("locator") or "")
+                if source_id in targets and locator:
+                    targets[source_id]["sections"].append(locator)
+        env["ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON"] = json.dumps(
+            operations,
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        env["ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON"] = json.dumps(
+            dict(targets),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
     env["ARC_LLM_INHERIT_HOST_TOOLS"] = "true" if inherit_host_tools else "false"
     if not inherit_host_tools:
         for key in _MCP_CONFIG_ENV_KEYS:
@@ -8083,9 +8586,18 @@ def _llm_runtime_env(
         env["ARC_CLAUDE_ALLOW_MCP"] = "false"
         env["ARC_CODEX_IGNORE_USER_CONFIG"] = "true"
         env["ARC_CLAUDE_BARE"] = "true"
-        claude_web_tools = "WebSearch,WebFetch" if allow_internet else ""
-        env["ARC_CLAUDE_TOOLS"] = claude_web_tools
-        env["ARC_CLAUDE_ALLOWED_TOOLS"] = claude_web_tools
+        claude_tools = ["WebSearch", "WebFetch"] if allow_internet else []
+        claude_allowed = list(claude_tools)
+        if paper_access_policy is not None and not disable_paper_cli:
+            claude_tools.insert(0, "Bash")
+            claude_allowed = [
+                "Bash(arc-paper-worker get-parsed-toc:*)",
+                "Bash(arc-paper-worker get-parsed-section:*)",
+                "Bash(arc-paper-worker artifact-read:*)",
+                *claude_allowed,
+            ]
+        env["ARC_CLAUDE_TOOLS"] = ",".join(claude_tools)
+        env["ARC_CLAUDE_ALLOWED_TOOLS"] = ",".join(claude_allowed)
     return env
 
 
@@ -8174,6 +8686,7 @@ def _generate_title_translations(
     checkpoint_dir: Path,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
     artifact_store: AcceptedArtifactStore | None = None,
+    intent_guidance_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Translate every visible structural title without entering segment lanes."""
     if options.skip_translation:
@@ -8189,6 +8702,10 @@ def _generate_title_translations(
         "target_language": options.annotation_language,
         "glossary": title_glossary,
         "protected_names": protected_names,
+        **(
+            {"intent_guidance": dict(intent_guidance_identity)}
+            if intent_guidance_identity else {}
+        ),
     })
     recipe_sha256 = lane_recipe_sha256(
         "title_translation",

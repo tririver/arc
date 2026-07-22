@@ -88,6 +88,7 @@ def generate_chapter_guide(
     allow_internet: bool = False,
     inherit_host_tools: bool = False,
     recipe_identity: str = "",
+    intent_guidance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate one source-bounded guide and validate every external claim."""
     source = [{key: item.get(key) for key in ("block_id", "type", "title", "text", "tex") if item.get(key) is not None} for item in source_blocks]
@@ -107,6 +108,10 @@ def generate_chapter_guide(
             "inherit_host_tools": inherit_host_tools,
         },
         "recipe_identity": recipe_identity,
+        **(
+            {"intent_guidance_sha256": sha256_json(intent_guidance)}
+            if intent_guidance is not None else {}
+        ),
     })
     path = checkpoint_dir / "chapter-guide.json"
     if path.is_file() and not force:
@@ -141,8 +146,19 @@ def generate_chapter_guide(
         + "Also, never describe or predict pagination in the generated companion document.\n"
     )
     windows = _source_windows(source) if stateful else [source]
+    guidance_prefix = ""
+    if intent_guidance is not None:
+        from .intent_guidance import worker_guidance_prompt_prefix
+
+        guidance_prefix = (
+            worker_guidance_prompt_prefix(intent_guidance)
+            + "\nIf this host has no sandboxed shell, request exact cached reference reads "
+            "through arc_evidence_requests using get-parsed-toc or "
+            "get-parsed-section with source_id, locator, and optional byte "
+            "offset/limit; return [] when no controller read is needed.\n"
+        )
     if len(windows) == 1:
-        prompt = prompt_prefix + json.dumps(
+        prompt = guidance_prefix + prompt_prefix + json.dumps(
             {
                 "chapter": dict(chapter), "source_blocks": source,
                 "verified_evidence": verified, "local_direct_sources": local_direct_sources,
@@ -153,6 +169,8 @@ def generate_chapter_guide(
     else:
         for index, window in enumerate(windows, 1):
             setup_prompt = (
+                (guidance_prefix if index == 1 else "")
+                +
                 "Prepare this bounded source window for the final chapter guide. Preserve its logical "
                 "relationship to earlier windows in this same session. Do not draft the final guide yet.\n"
                 + json.dumps({

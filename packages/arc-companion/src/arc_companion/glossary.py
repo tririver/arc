@@ -40,6 +40,7 @@ def generate_glossary(
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
     page_count: int | None = None,
     source_language: str | None = None,
+    intent_guidance_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_source_language = (
         source_language if source_language and base_language(source_language) != "en" else None
@@ -61,6 +62,8 @@ def generate_glossary(
     if prompt_source_language:
         source_hash_input["source_language"] = prompt_source_language
         source_hash_input["source_term_contract"] = "exact-source-spelling-v1"
+    if intent_guidance_identity is not None:
+        source_hash_input["intent_guidance"] = intent_guidance_identity
     source_hash = sha256_json(source_hash_input)
     final_path = checkpoint_dir / "glossary.json"
     if final_path.is_file() and not force:

@@ -229,6 +229,31 @@ def test_lane_identity_excludes_runtime_and_render_options() -> None:
     ) != lane_recipe_sha256("translation", prompt="p", model="m2", tier="high")
 
 
+def test_intent_guidance_changes_only_content_lane_semantics() -> None:
+    guidance = {
+        "user_intent_sha256": "intent", "output_sha256": "guidance",
+        "references": [{"source_id": "book", "document_hash": "v2", "locator": "c2"}],
+    }
+    contexts = {
+        "segmentation": {"source": {}, "chapter": {}, "limits": {}},
+        "glossary": {"source": {}, "target_language": "zh-CN", "index": [], "protected_names": []},
+        "title_translation": {"source_titles": [], "source_language": "en", "target_language": "zh-CN", "glossary": {}, "protected_names": []},
+        "guide": {"chapter_source": {}, "target_language": "zh-CN", "verified_evidence": {}},
+        "translation": {"source_segment": {}, "target_language": "zh-CN", "glossary": {}, "protected_names": []},
+        "commentary": {"source_segment": {}, "guide": {}, "metadata": {}, "selected_evidence": {}, "selected_domain_context": {}, "access_policy": {}, "predecessor_accepted_chain_sha256": ""},
+        "review": {"translation_artifacts": {}, "commentary_artifacts": {}, "review_contract": {}},
+    }
+    for lane, context in contexts.items():
+        old_hash = lane_semantic_sha256(lane, context)
+        assert old_hash == lane_semantic_sha256(
+            lane, {**context, "intent_guidance": None},
+        )
+        changed = lane_semantic_sha256(
+            lane, {**context, "intent_guidance": guidance},
+        )
+        assert (changed == old_hash) is (lane == "segmentation")
+
+
 def test_scoped_regeneration_requires_confirmation_for_all_and_rejects_force() -> None:
     assert normalize_regeneration_lanes(["commentary", "translation", "commentary"]) == (
         "translation", "commentary"

@@ -75,13 +75,12 @@ def main(argv: list[str] | None = None) -> int:
         settings.call_id = f"call-{uuid.uuid4().hex}"
 
     command = command_argv[0]
-    if command == "artifact-read":
-        result = _read_artifact(command_argv[1:], session_dir)
-        return _finish(result, session_dir, command_argv, settings, cache_session)
-
     policy_error = _policy_error(command_argv, cache_session, session_dir)
     if policy_error is not None:
         return _finish(policy_error, session_dir, command_argv, settings, cache_session)
+    if command == "artifact-read":
+        result = _read_artifact(command_argv[1:], session_dir)
+        return _finish(result, session_dir, command_argv, settings, cache_session)
 
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -157,6 +156,9 @@ def _policy_error(
     session_dir: Path | None,
 ) -> dict[str, Any] | None:
     command = argv[0]
+    restricted_error = _restricted_read_policy_error(argv)
+    if restricted_error is not None:
+        return restricted_error
     if command == "summary-batch":
         subcommand = argv[1] if len(argv) > 1 else ""
         if subcommand == "export":
@@ -168,6 +170,120 @@ def _policy_error(
         operation = command if command != "summary-batch" else f"summary-batch {subcommand}"
         return _nested_llm_error(operation)
     return None
+
+
+def _restricted_read_policy_error(argv: list[str]) -> dict[str, Any] | None:
+    """Enforce an optional controller-authored, fail-closed read policy."""
+    raw_operations = os.environ.get("ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON")
+    raw_targets = os.environ.get("ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON")
+    if raw_operations is None and raw_targets is None:
+        return None
+    try:
+        operations = json.loads(raw_operations or "[]")
+        targets = json.loads(raw_targets or "{}")
+    except json.JSONDecodeError:
+        return _worker_error(
+            "worker_read_policy_invalid", "The controller read policy is not valid JSON"
+        )
+    if (
+        not isinstance(operations, list)
+        or not all(isinstance(value, str) and value for value in operations)
+        or not isinstance(targets, dict)
+    ):
+        return _worker_error(
+            "worker_read_policy_invalid", "The controller read policy has an invalid shape"
+        )
+    command = argv[0] if argv else ""
+    if command not in set(operations):
+        return _worker_error(
+            "worker_operation_forbidden",
+            f"{command!r} is not authorized by the controller read policy",
+        )
+    if command == "artifact-read":
+        return None
+    if command not in {"get-parsed-toc", "get-parsed-section"}:
+        return _worker_error(
+            "worker_operation_forbidden",
+            f"{command!r} is not a supported restricted read operation",
+        )
+    source_id, locator, argument_error = _restricted_read_arguments(argv, command=command)
+    if argument_error is not None:
+        return argument_error
+    source_policy = targets.get(source_id)
+    if not isinstance(source_policy, dict):
+        return _worker_error(
+            "worker_source_forbidden",
+            f"Source {source_id!r} is not authorized by the controller read policy",
+        )
+    if command == "get-parsed-toc":
+        return None
+    sections = source_policy.get("sections")
+    if not isinstance(sections, list) or locator not in sections:
+        return _worker_error(
+            "worker_section_forbidden",
+            f"Section {locator!r} is not authorized for source {source_id!r}",
+        )
+    return None
+
+
+def _restricted_read_arguments(
+    argv: list[str], *, command: str
+) -> tuple[str, str | None, dict[str, Any] | None]:
+    """Extract security-relevant arguments only when each has one meaning."""
+    source_ids: list[str] = []
+    sections: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--json":
+            index += 1
+            continue
+        if token == "--section":
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                return "", None, _worker_error(
+                    "worker_section_forbidden",
+                    "A controller-authorized --section locator is required",
+                )
+            sections.append(str(argv[index + 1]))
+            index += 2
+            continue
+        if token.startswith("--section="):
+            sections.append(token.split("=", 1)[1])
+            index += 1
+            continue
+        if token in {"--source", "--source-id", "--id", "--paper-id"} or any(
+            token.startswith(f"{flag}=")
+            for flag in ("--source", "--source-id", "--id", "--paper-id")
+        ):
+            return "", None, _worker_error(
+                "worker_source_forbidden",
+                "Restricted reads require exactly one positional source ID",
+            )
+        if token.startswith("-"):
+            return "", None, _worker_error(
+                "worker_arguments_invalid",
+                f"Unsupported restricted-read argument: {token}",
+            )
+        source_ids.append(str(token))
+        index += 1
+
+    if len(source_ids) != 1:
+        return "", None, _worker_error(
+            "worker_source_forbidden",
+            "Restricted reads require exactly one positional source ID",
+        )
+    if command == "get-parsed-toc":
+        if sections:
+            return "", None, _worker_error(
+                "worker_arguments_invalid", "get-parsed-toc does not accept --section"
+            )
+        return source_ids[0], None, None
+    if len(sections) != 1 or not sections[0]:
+        return "", None, _worker_error(
+            "worker_section_forbidden",
+            "Restricted reads require exactly one controller-authorized --section locator",
+        )
+    return source_ids[0], sections[0], None
 
 
 def _export_path_error(argv: list[str], run_root: Path | None) -> dict[str, Any] | None:

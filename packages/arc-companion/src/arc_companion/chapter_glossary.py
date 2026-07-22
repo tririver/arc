@@ -19,10 +19,17 @@ def generate_index_glossary(
     checkpoint_dir: Path,
     force: bool,
     call_model: Callable[[str, dict[str, Any], Path, str], dict[str, Any]],
+    intent_guidance_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Translate every real index entry without deduplication or truncation."""
     flattened = _flatten_index(index_entries)
-    source_sha256 = sha256_json({"entries": flattened, "language": language})
+    source_sha256 = sha256_json({
+        "entries": flattened, "language": language,
+        **(
+            {"intent_guidance": dict(intent_guidance_identity)}
+            if intent_guidance_identity is not None else {}
+        ),
+    })
     path = checkpoint_dir / "index-glossary.json"
     if path.is_file() and not force:
         try:

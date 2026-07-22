@@ -5778,6 +5778,197 @@ def test_explicit_host_tool_inheritance_preserves_host_configuration(monkeypatch
     assert env["ARC_CLAUDE_MCP_CONFIG"] == "/tmp/research-mcp.json"
 
 
+def test_disabled_paper_cli_also_forces_bare_host_isolation(monkeypatch) -> None:
+    monkeypatch.setenv("ARC_CODEX_PROFILE", "research-tools")
+    monkeypatch.setenv("ARC_CLAUDE_MCP_CONFIG", "/tmp/research-mcp.json")
+
+    env = pipeline_module._llm_runtime_env(
+        allow_internet=False,
+        inherit_host_tools=True,
+        disable_paper_cli=True,
+    )
+
+    assert env["ARC_PAPER_CLI_ACCESS"] == "none"
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
+    assert env["ARC_CODEX_ENABLE_MCP"] == "false"
+    assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+    assert "ARC_CODEX_PROFILE" not in env
+    assert "ARC_CLAUDE_MCP_CONFIG" not in env
+
+
+def test_guided_reference_policy_exposes_only_command_scoped_claude_bash() -> None:
+    env = pipeline_module._llm_runtime_env(
+        allow_internet=False,
+        inherit_host_tools=False,
+        paper_access_policy={
+            "allowed_operations": [
+                "artifact-read", "get-parsed-toc", "get-parsed-section",
+            ],
+            "authorized_source_ids": ["book"],
+            "authorized_section_targets": [
+                {"source_id": "book", "locator": "ch-2"},
+            ],
+        },
+    )
+    assert env["ARC_CLAUDE_TOOLS"] == "Bash"
+    assert env["ARC_CLAUDE_ALLOWED_TOOLS"].split(",") == [
+        "Bash(arc-paper-worker get-parsed-toc:*)",
+        "Bash(arc-paper-worker get-parsed-section:*)",
+        "Bash(arc-paper-worker artifact-read:*)",
+    ]
+    assert json.loads(env["ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON"]) == [
+        "artifact-read", "get-parsed-toc", "get-parsed-section",
+    ]
+    assert json.loads(env["ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON"]) == {
+        "book": {"sections": ["ch-2"]},
+    }
+    assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
+    assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
+
+
+def test_guided_stateless_call_uses_controller_evidence_fallback(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from arc_llm import EvidenceResponse
+
+    artifact = {
+        "schema_version": "arc.companion.intent-guidance.v1",
+        "semantic_input_sha256": "s" * 64,
+        "user_intent_sha256": "u" * 64,
+        "output_sha256": "o" * 64,
+        "resolution_status": "resolved",
+        "guidance": "Use the selected reference terminology.",
+        "reference_targets": [{
+            "source_id": "book", "locator": "ch-2", "purpose": "terms",
+            "lanes": ["translation"],
+        }],
+        "reference_sources": [{
+            "source_id": "book", "source_hash": "v1", "document_hash": "v1",
+            "metadata": {}, "toc": [{"locator": "ch-2", "title": "Two"}],
+        }],
+        "worker_payload": {
+            "guidance": "Use the selected reference terminology.",
+            "reference_targets": [{
+                "source_id": "book", "locator": "ch-2", "purpose": "terms",
+                "lanes": ["translation"],
+            }],
+        },
+    }
+    calls = []
+
+    def fake_llm(prompt, **kwargs):
+        calls.append((prompt, kwargs))
+        if len(calls) == 1:
+            return {
+                "answer": "pending",
+                "arc_evidence_requests": [{
+                    "request_id": "r1", "operation": "get-parsed-section",
+                    "arguments": {"source_id": "book", "locator": "ch-2"},
+                    "reason": "terminology",
+                }],
+            }
+        return {"answer": "done", "arc_evidence_requests": []}
+
+    monkeypatch.setattr(
+        pipeline_module, "resolve_worker_evidence_requests",
+        lambda _artifact, requests, *, round_number, lane=None: tuple(
+            EvidenceResponse(
+                request.request_id, True, {"content": "cached chapter"},
+                provenance={"provider": "local-cache", "round": round_number},
+            )
+            for request in requests
+        ),
+    )
+    result = _llm_call(
+        fake_llm, "prompt", {
+            "type": "object", "additionalProperties": False,
+            "required": ["answer"], "properties": {"answer": {"type": "string"}},
+        },
+        options=BuildOptions(paper_id="local:x", project_dir=tmp_path),
+        artifact_dir=tmp_path / "llm", call_label="guided", model_tier="medium",
+        paper_access_policy=pipeline_module.worker_policy_descriptor(artifact),
+        intent_guidance=artifact,
+        intent_guidance_lane="translation",
+    )
+    assert result == {"answer": "done"}
+    assert len(calls) == 2
+    assert "CONTROLLER REFERENCE EVIDENCE ROUND" in calls[1][0]
+    assert "arc_evidence_requests" in calls[0][1]["schema"]["properties"]
+
+
+def test_guided_stateful_call_uses_controller_evidence_delta(
+    monkeypatch,
+) -> None:
+    from arc_llm import EvidenceResponse
+
+    class Outcome:
+        def __init__(self, value):
+            self.value = value
+
+    artifact = {
+        "schema_version": "arc.companion.intent-guidance.v1",
+        "semantic_input_sha256": "s" * 64,
+        "user_intent_sha256": "u" * 64,
+        "output_sha256": "o" * 64,
+        "resolution_status": "resolved",
+        "guidance": "Use the selected terminology.",
+        "reference_targets": [{
+            "source_id": "book", "locator": "ch-2", "purpose": "terms",
+            "lanes": ["translation"],
+        }],
+        "reference_sources": [{
+            "source_id": "book", "source_hash": "v1", "document_hash": "v1",
+            "metadata": {}, "toc": [{"locator": "ch-2", "title": "Two"}],
+        }],
+        "worker_payload": {
+            "guidance": "Use the selected terminology.",
+            "reference_targets": [{
+                "source_id": "book", "locator": "ch-2", "purpose": "terms",
+                "lanes": ["translation"],
+            }],
+        },
+    }
+    initial = Outcome({
+        "answer": "pending",
+        "arc_evidence_requests": [{
+            "request_id": "r1", "operation": "get-parsed-section",
+            "arguments": {"source_id": "book", "locator": "ch-2"},
+            "reason": "terminology",
+        }],
+    })
+    calls = []
+
+    def call_round(prompt, schema, round_number):
+        calls.append((prompt, schema, round_number))
+        return Outcome({"answer": "done", "arc_evidence_requests": []})
+
+    monkeypatch.setattr(
+        pipeline_module, "resolve_worker_evidence_requests",
+        lambda _artifact, requests, *, round_number, lane=None: tuple(
+            EvidenceResponse(
+                request.request_id, True, {"content": "cached chapter"},
+                provenance={"provider": "local-cache", "lane": lane},
+            )
+            for request in requests
+        ),
+    )
+    final_outcome, value = pipeline_module._complete_stateful_reference_evidence(
+        initial, intent_guidance=artifact, lane="translation",
+        worker_id="translation-1",
+        schema={
+            "type": "object", "additionalProperties": False,
+            "required": ["answer"], "properties": {"answer": {"type": "string"}},
+        },
+        call_round=call_round,
+    )
+
+    assert final_outcome.value["answer"] == "done"
+    assert value == {"answer": "done"}
+    assert calls[0][2] == 1
+    assert "CONTROLLER REFERENCE EVIDENCE ROUND" in calls[0][0]
+    assert "arc_evidence_requests" in calls[0][1]["properties"]
+
+
 def test_source_fingerprint_excludes_runtime_access_options(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     evidence = _evidence(bundle)

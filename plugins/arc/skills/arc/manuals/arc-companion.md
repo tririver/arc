@@ -67,6 +67,12 @@ Useful flags:
   source Index remains source-only content.
 - `--source-language <BCP47-tag>`: pass the language established by the
   beginning/middle/end source sampling. The CLI does not detect it.
+- `--user-intent <text>`: freeze the exact managed-run intent and generate one
+  cached global guidance artifact shared by glossary, title, guide,
+  translation, commentary, and final-review workers. With authorized
+  `--context-paper-id` values, only compact cached TOCs are supplied initially;
+  workers later read exact selected chapters through a restricted read-only
+  ARC paper policy.
 - `--stop-after-first-chapter`: schedule only the first substantive chapter.
 - `--recovery-policy auto|manual`: automatically recover eligible blocked
   translation/commentary lanes by default, or retain a supervised stop for an

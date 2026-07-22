@@ -23,6 +23,7 @@ from .cache import (
     iter_cache_paths,
     parsed_source_annotations_cache_path,
     parsed_source_cache_path,
+    parsed_source_identity_cache_path,
     parsed_source_lock,
     read_paper_alias,
     read_json,
@@ -365,6 +366,7 @@ def parse_source(
                 path = parsed_source_cache_path(cache_id)
                 cached = read_json(path) if not refresh and not recache else None
                 if _is_current_light_cache(cached, cache_id, document_kind=document_kind):
+                    _ensure_parsed_identity_cache(cached)
                     if not include_document:
                         return ok(
                             _parsed_source_view(cached, include_document=False),
@@ -431,6 +433,7 @@ def parse_source(
                     )
                     and cached.get("source_hash") == current_hash
                 ):
+                    _ensure_parsed_identity_cache(cached)
                     if not include_document:
                         return ok(
                             _parsed_source_view(cached, include_document=False),
@@ -515,7 +518,48 @@ def get_parsed_source(source_id: str, *, include_document: bool = False) -> dict
     )
 
 
+def get_parsed_source_identity(
+    source_id: str, *, include_document: bool = False,
+) -> dict[str, Any]:
+    """Return cache-only identity/metadata without loading parsed body fields."""
+    if include_document:
+        return err(
+            "parsed_source_identity_document_forbidden",
+            "The parsed-source identity view never includes document content.",
+        )
+    lookup_id = _parsed_source_lookup_id(source_id)
+    identity = read_json(parsed_source_identity_cache_path(lookup_id))
+    if not isinstance(identity, dict):
+        return err(
+            "parsed_source_identity_not_found",
+            f"No body-free parsed-source identity found for {source_id}; recache the local source.",
+        )
+    return ok(
+        {key: identity.get(key) for key in (
+            "paper_id", "parser_version", "source_hash", "document_hash", "metadata",
+        )},
+        provider="local-cache",
+        cache="hit",
+        cache_path=str(parsed_source_identity_cache_path(lookup_id)),
+    )
+
+
+def get_parsed_source_compact_toc(source_id: str) -> dict[str, Any]:
+    """Return the body-free TOC sidecar required by intent-guidance preflight."""
+    lookup_id = _parsed_source_lookup_id(source_id)
+    identity = read_json(parsed_source_identity_cache_path(lookup_id))
+    if not isinstance(identity, dict) or not isinstance(identity.get("toc"), list):
+        return err(
+            "parsed_source_identity_not_found",
+            f"No body-free parsed-source TOC found for {source_id}; recache the local source.",
+        )
+    return ok(identity["toc"], provider="local-cache", cache="hit")
+
+
 def get_parsed_source_toc(source_id: str) -> dict[str, Any]:
+    sidecar = get_parsed_source_compact_toc(source_id)
+    if sidecar.get("ok") is True:
+        return sidecar
     parsed = _read_parsed_source(source_id)
     if parsed is None:
         return err("parsed_source_not_found", f"No parsed source found for {source_id}")
@@ -1352,6 +1396,7 @@ def _parsed(paper_id: str, *, refresh: bool, require_document: bool = False) -> 
         path = parsed_source_cache_path(normalized)
         cached = read_json(path) if not refresh else None
         if _is_current_light_cache(cached, normalized):
+            _ensure_parsed_identity_cache(cached)
             if not require_document:
                 return cached
             document = _read_rich_document(cached)
@@ -1482,11 +1527,52 @@ def _write_parsed_caches(
     light = {key: parsed.get(key) for key in PARSED_SOURCE_KEYS}
     light_path = parsed_source_cache_path(paper_id)
     write_json(light_path, light)
+    _write_parsed_identity_cache(parsed)
     rich_path: Path | None = None
     document = parsed.get("document")
     if include_document and isinstance(document, dict):
         rich_path = _write_rich_cache(parsed)
     return light_path, rich_path
+
+
+def _ensure_parsed_identity_cache(parsed: dict[str, Any]) -> Path:
+    path = parsed_source_identity_cache_path(str(parsed.get("paper_id") or ""))
+    if read_json(path) is None:
+        _write_parsed_identity_cache(parsed)
+    return path
+
+
+def _write_parsed_identity_cache(parsed: dict[str, Any]) -> Path:
+    paper_id = str(parsed.get("paper_id") or "")
+    cached_metadata = read_json(CachePaths.for_paper(paper_id).inspire_metadata)
+    cached_metadata = cached_metadata if isinstance(cached_metadata, dict) else {}
+    metadata = cached_metadata.get("metadata", cached_metadata)
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    if isinstance(parsed.get("metadata"), dict):
+        metadata.update(parsed["metadata"])
+    toc = []
+    for item in parsed.get("toc") or []:
+        if not isinstance(item, dict):
+            continue
+        compact = {
+            key: item.get(key)
+            for key in ("id", "section_id", "title", "level")
+            if item.get(key) is not None
+        }
+        if compact:
+            toc.append(compact)
+    source_hash = str(parsed.get("source_hash") or "")
+    path = parsed_source_identity_cache_path(paper_id)
+    write_json(path, {
+        "schema_version": "arc.parsed-source.identity.v1",
+        "paper_id": paper_id,
+        "parser_version": parsed.get("parser_version"),
+        "source_hash": source_hash,
+        "document_hash": source_hash,
+        "metadata": metadata,
+        "toc": toc,
+    })
+    return path
 
 
 def _write_rich_cache(parsed: dict[str, Any]) -> Path:

@@ -16,20 +16,29 @@ LANES = (
 
 _SEMANTIC_FIELDS = {
     "segmentation": ("source", "chapter", "limits"),
-    "glossary": ("source", "target_language", "index", "protected_names"),
+    "glossary": (
+        "source", "target_language", "index", "protected_names", "intent_guidance",
+    ),
     "title_translation": (
         "source_titles", "source_language", "target_language", "glossary",
-        "protected_names",
+        "protected_names", "intent_guidance",
     ),
-    "guide": ("chapter_source", "target_language", "verified_evidence"),
+    "guide": (
+        "chapter_source", "target_language", "verified_evidence", "intent_guidance",
+    ),
     "translation": (
         "source_segment", "target_language", "glossary", "protected_names",
+        "intent_guidance",
     ),
     "commentary": (
         "source_segment", "guide", "metadata", "selected_evidence",
         "selected_domain_context", "access_policy", "predecessor_accepted_chain_sha256",
+        "intent_guidance",
     ),
-    "review": ("translation_artifacts", "commentary_artifacts", "review_contract"),
+    "review": (
+        "translation_artifacts", "commentary_artifacts", "review_contract",
+        "intent_guidance",
+    ),
 }
 
 
@@ -40,7 +49,12 @@ def lane_semantic_input(lane: str, context: Mapping[str, Any]) -> dict[str, Any]
         fields = _SEMANTIC_FIELDS[lane]
     except KeyError as exc:
         raise ValueError(f"unsupported generation lane: {lane}") from exc
-    return {field: context.get(field) for field in fields}
+    projected = {field: context.get(field) for field in fields if field != "intent_guidance"}
+    # Preserve every pre-guidance semantic identity byte-for-byte.  The new
+    # field exists only for runs that actually generated guidance.
+    if "intent_guidance" in fields and context.get("intent_guidance") is not None:
+        projected["intent_guidance"] = context["intent_guidance"]
+    return projected
 
 
 def lane_semantic_sha256(lane: str, context: Mapping[str, Any]) -> str:
