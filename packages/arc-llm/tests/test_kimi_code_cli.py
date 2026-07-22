@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from arc_llm.attempt_diagnostics import AttemptDiagnostics, bind_attempt_diagnostics
 from arc_llm.providers import kimi_code_cli as kimi_module
 from arc_llm.providers.base import (
     LLMConfigurationError,
@@ -519,6 +520,38 @@ def test_idle_timeout_sends_cancel_and_kills_process_group(tmp_path):
     while _process_is_live(child_pid) and time.monotonic() < deadline:
         time.sleep(0.02)
     assert not _process_is_live(child_pid)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group assertion")
+def test_idle_timeout_attempt_timeline_records_acp_cancel_and_group_cleanup(tmp_path):
+    env = fake_env(tmp_path, scenario="timeout")
+    env["ARC_KIMI_IDLE_TIMEOUT_SECONDS"] = "0.2"
+    diagnostics = AttemptDiagnostics(
+        tmp_path / "artifacts",
+        provider="kimi-code-cli",
+        model=None,
+        fallback_index=0,
+        attempt=1,
+        call_label="timeout",
+        env=env,
+    )
+
+    with bind_attempt_diagnostics(diagnostics):
+        with pytest.raises(LLMWorkerTimeout) as caught:
+            KimiCodeCliProvider(env=env).generate_text("long prompt")
+        reference = diagnostics.finalize(outcome="timeout", error=caught.value)
+
+    record_path = (tmp_path / "artifacts") / reference.path
+    record = json.loads(record_path.read_text())
+    timeline = (record_path.parent / record["timeline"]["path"]).read_text()
+    for event in (
+        "cancellation_requested",
+        "provider_cancel_sent",
+        "stdin_close_attempted",
+        "term_attempted",
+        "process_group_outcome",
+    ):
+        assert f'"event": "{event}"' in timeline
 
 
 def _process_is_live(pid: int) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -119,6 +120,19 @@ def test_successful_call_replays_when_caller_checkpoint_was_not_written(tmp_path
     assert first.logical_receipt["replayed"] is False
     assert second.logical_receipt["replayed"] is True
     assert provider.calls == 1
+    replay_attempt = second.call_record["attempts"][0]
+    assert replay_attempt["status"] == "replayed"
+    replay_record = json.loads(
+        ((tmp_path / "artifacts") / replay_attempt["diagnostic_path"]).read_text()
+    )
+    assert replay_record["outcome"] == "replayed"
+    assert replay_record["submission_state"] == "not_submitted"
+    assert replay_record["parsed_response_candidates"][0]["source"] == (
+        "checkpoint_replayed_response"
+    )
+    replay_record_path = (tmp_path / "artifacts") / replay_attempt["diagnostic_path"]
+    timeline = (replay_record_path.parent / replay_record["timeline"]["path"]).read_text()
+    assert '"event": "checkpoint_replayed"' in timeline
 
 
 def test_paid_stateful_logical_key_replays_before_rebuilt_prompt_digest(tmp_path, monkeypatch):

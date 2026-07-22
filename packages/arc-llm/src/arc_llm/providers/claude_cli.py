@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.sessions import LLMSessionRef
+from arc_llm.attempt_diagnostics import current_attempt_diagnostics
 from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.paths import llm_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text
@@ -526,6 +527,10 @@ def _with_json_schema_contract(prompt: str, schema: Mapping[str, Any]) -> str:
 
 def _write_raw_artifacts(artifact_dir: Path | None, *, stdout: str, stderr: str) -> None:
     if artifact_dir is None:
+        return
+    if current_attempt_diagnostics() is not None:
+        # Streaming lifecycle capture already owns immutable, bounded attempt
+        # diagnostics. Do not recreate mutable call-root raw files.
         return
     artifact_dir.mkdir(parents=True, exist_ok=True)
     (artifact_dir / "raw_stdout.txt").write_text(stdout, encoding="utf-8", errors="replace")

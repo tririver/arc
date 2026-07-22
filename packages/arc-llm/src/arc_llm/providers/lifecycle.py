@@ -18,6 +18,13 @@ from .base import (
 )
 from .activity import ActivityTracker
 
+
+def _attempt_diagnostics():
+    # Lazy import avoids a package initialization cycle.
+    from arc_llm.attempt_diagnostics import current_attempt_diagnostics
+
+    return current_attempt_diagnostics()
+
 def run_streaming_process_group(
     command: Sequence[str],
     *,
@@ -45,6 +52,15 @@ def run_streaming_process_group(
             submission_state=LLMSubmissionState.NOT_SUBMITTED,
         ) from exc
 
+    diagnostics = _attempt_diagnostics()
+    if diagnostics is not None:
+        diagnostics.event(
+            "process_group_started",
+            pid=process.pid,
+            process_group_id=process.pid,
+            command_binary=str(command[0]),
+        )
+
     watchdog = start_process_group_watchdog(process, grace_seconds=terminate_grace_seconds)
     output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
     stdout_parts: list[str] = []
@@ -53,6 +69,11 @@ def run_streaming_process_group(
     def read_stream(name: str, stream: object) -> None:
         try:
             for line in stream:  # type: ignore[union-attr]
+                if diagnostics is not None:
+                    if name == "stdout":
+                        diagnostics.capture_stdout(line)
+                    else:
+                        diagnostics.capture_stderr(line)
                 output_queue.put((name, line))
         finally:
             output_queue.put((name, None))
@@ -66,14 +87,27 @@ def run_streaming_process_group(
         reader.start()
     input_submitted = threading.Event()
     def write_input() -> None:
+        if diagnostics is not None:
+            diagnostics.event("stdin_write_started", bytes=len(input_text.encode("utf-8")))
         try:
             process.stdin.write(input_text)
             process.stdin.flush()
             activity.submitted()
+            if diagnostics is not None:
+                diagnostics.mark_submitted()
             input_submitted.set()
-            process.stdin.close()
         except (BrokenPipeError, OSError):
-            pass
+            if diagnostics is not None:
+                diagnostics.event("stdin_write_failed")
+        finally:
+            closed = False
+            try:
+                process.stdin.close()
+                closed = True
+            except OSError:
+                pass
+            if diagnostics is not None:
+                diagnostics.event("stdin_close_attempted", succeeded=closed)
 
     writer = threading.Thread(target=write_input, name="arc-provider-stdin", daemon=True)
     try:
@@ -85,12 +119,16 @@ def run_streaming_process_group(
                 not input_submitted.is_set()
                 and time.monotonic() - transport_started >= activity.idle_timeout_seconds
             ):
+                if diagnostics is not None:
+                    diagnostics.event("stdin_delivery_timeout")
                 raise LLMWorkerTimeout(
                     f"{activity.provider} produced no meaningful output while delivering input for "
                     f"{activity.idle_timeout_seconds:g} seconds",
                     submission_state=LLMSubmissionState.NOT_SUBMITTED,
                 )
             if cancel_check is not None and cancel_check():
+                if diagnostics is not None:
+                    diagnostics.event("cancellation_requested")
                 raise LLMWorkerCancelled(
                     "LLM worker call was cancelled",
                     submission_state=(
@@ -114,10 +152,14 @@ def run_streaming_process_group(
                 # Diagnostics are captured but never count as meaningful work.
                 stderr_parts.append(line)
         terminate_process_group(process, grace_seconds=terminate_grace_seconds)
+        if diagnostics is not None:
+            diagnostics.event("process_exited", returncode=process.returncode)
         return subprocess.CompletedProcess(
             list(command), process.returncode, "".join(stdout_parts), "".join(stderr_parts)
         )
-    except BaseException:
+    except BaseException as exc:
+        if diagnostics is not None:
+            diagnostics.event("transport_exception", error_type=type(exc).__name__)
         terminate_process_group(process, grace_seconds=terminate_grace_seconds)
         raise
     finally:
@@ -183,13 +225,41 @@ def terminate_process_group(process: subprocess.Popen[object], *, grace_seconds:
     # leader may have exited while descendants (including a paid provider
     # helper) remain alive in the same process group.
     process.poll()
+    diagnostics = _attempt_diagnostics()
+    if diagnostics is not None:
+        diagnostics.event(
+            "process_group_cleanup_started",
+            pid=process.pid,
+            process_group_id=process.pid,
+            leader_returncode=process.returncode,
+        )
     if os.name != "posix" and process.returncode is not None:
+        if diagnostics is not None:
+            diagnostics.event(
+                "process_group_outcome", exited=True, forced=False, platform="windows"
+            )
         return
-    _signal_group(process, force=False)
+    term_delivered = _signal_group(process, force=False)
+    if diagnostics is not None:
+        diagnostics.event(
+            "term_attempted",
+            process_group_id=process.pid,
+            delivered=term_delivered,
+        )
     if _wait_for_process_group_exit(process, timeout=grace_seconds):
+        if diagnostics is not None:
+            diagnostics.event("process_group_outcome", exited=True, forced=False)
         return
-    _signal_group(process, force=True)
-    _wait_for_process_group_exit(process, timeout=grace_seconds)
+    kill_delivered = _signal_group(process, force=True)
+    if diagnostics is not None:
+        diagnostics.event(
+            "kill_attempted",
+            process_group_id=process.pid,
+            delivered=kill_delivered,
+        )
+    exited = _wait_for_process_group_exit(process, timeout=grace_seconds)
+    if diagnostics is not None:
+        diagnostics.event("process_group_outcome", exited=exited, forced=True)
 
 
 def _wait_for_process_group_exit(process: subprocess.Popen[object], *, timeout: float) -> bool:
@@ -216,16 +286,18 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
-def _signal_group(process: subprocess.Popen[object], *, force: bool) -> None:
+def _signal_group(process: subprocess.Popen[object], *, force: bool) -> bool:
     try:
         if os.name != "posix":
             process.kill() if force else process.terminate()
         else:
             os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+        return True
     except (ProcessLookupError, PermissionError, OSError):
         if process.poll() is not None:
-            return
+            return False
         try:
             process.kill() if force else process.terminate()
+            return True
         except OSError:
-            pass
+            return False

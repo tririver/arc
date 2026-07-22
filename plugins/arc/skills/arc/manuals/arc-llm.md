@@ -118,7 +118,7 @@ Use `--prompt-text` for literal text and `--prompt-file` for a UTF-8 file
 file/stdin alias for existing callers; it does not interpret its value as
 inline text.
 
-`run-json` appends an `arc_llm_call_record` v3 object to the returned JSON. This
+`run-json` appends an `arc_llm_call_record` v5 object to the returned JSON. This
 records the requested provider/model tier, actual provider/model used,
 fallback index, successful attempt number, host signal, and all failed/successful
 attempts for that call. New records also include session policy, session key,
@@ -138,6 +138,27 @@ the prompt, applies relaxed JSON parsing, validates locally, and records
 no native schema mode and always uses its prompt contract without that fallback
 warning. Do not ask workers to generate `arc_llm_call_record`; ARC attaches
 that audit field after provider output.
+
+When a caller supplies an artifact directory, each actual provider attempt gets
+a unique directory below `attempts/`. Its finalize-once record retains bounded
+sanitized stdout, provider events, stderr, preliminary parsed-response
+candidates, native session metadata, failure classification, and the process
+lifecycle timeline (submission, cancellation, stdin closure, TERM/KILL, and
+process-group outcome). Large streams are gzip-compressed when compression is
+beneficial; over-limit streams retain useful head and tail data plus explicit
+truncation metadata. Provider
+retries never overwrite an earlier attempt. The call record contains only the
+relative attempt-record path and SHA-256, not the potentially large streams.
+Credential-shaped fields, secret/config environment values, authorization
+headers, and provider keys are redacted before persistence. These artifacts are
+diagnostic evidence, not a credential store; ARC never serializes provider
+configuration values intentionally.
+
+A checkpoint replay creates an audit-only attempt record with outcome/status
+`replayed` and submission state `not_submitted`; it does not claim that ARC
+invoked or charged the provider again. If diagnostic finalization fails after a
+provider has already returned, ARC preserves the provider result and records a
+stable warning instead of retrying it.
 
 Concurrent structured batches use the first real task as a schema canary for
 each provider/runtime/model/schema/transport identity. Calls sharing an

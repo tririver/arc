@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .call_record import ARC_LLM_CALL_RECORD_SCHEMA_VERSION, attach_arc_llm_call_record, strip_arc_llm_call_records
+from .attempt_diagnostics import (
+    AttemptDiagnosticRef,
+    AttemptDiagnostics,
+    bind_attempt_diagnostics,
+    current_attempt_diagnostics,
+    sanitize_diagnostic_text,
+)
 from .call_checkpoint import (
     LLMCallNeedsSupervision,
     LLMCallRetryExhausted,
@@ -613,6 +620,8 @@ def run_json_result(
         cancel_check=cancel_check,
         paper_worker_id=session_name,
         paper_call_id=call_label or idempotency_key,
+        artifact_dir=Path(artifact_dir) if artifact_dir else None,
+        diagnostic_call_label=call_label or idempotency_key,
         call=lambda selected, config, effective_idle_timeout_seconds: _generate_json(
             selected,
             prompt,
@@ -793,6 +802,8 @@ def run_text_result(
         cancel_check=cancel_check,
         paper_worker_id=session_name,
         paper_call_id=call_label or idempotency_key,
+        artifact_dir=Path(artifact_dir) if artifact_dir else None,
+        diagnostic_call_label=call_label or idempotency_key,
         call=lambda selected, config, effective_idle_timeout_seconds: _generate_text(
             selected,
             prompt,
@@ -873,6 +884,8 @@ def _run_with_retries(
     cancel_check: Callable[[], bool] | None = None,
     paper_worker_id: str | None = None,
     paper_call_id: str | None = None,
+    artifact_dir: Path | None = None,
+    diagnostic_call_label: str | None = None,
     call: Callable[[Any, LLMConfig, float], Any],
 ) -> Any:
     del progress_callback
@@ -881,6 +894,7 @@ def _run_with_retries(
     for fallback_index, config in enumerate(configs):
         _check_cancel(cancel_check)
         provider_env = _env_with_tier_reasoning_default(env, config.provider, model_tier_requested)
+        diagnostic_env = os.environ if provider_env is None else provider_env
         try:
             effective_idle_timeout_seconds = resolve_idle_timeout_seconds(
                 idle_timeout_seconds,
@@ -891,36 +905,91 @@ def _run_with_retries(
             raise LLMConfigurationError(str(exc)) from exc
         selected = select_provider(config.provider, env=provider_env, process_chain=process_chain)
         for attempt in range(1, max_attempts + 1):
-            try:
-                _check_cancel(cancel_check)
-                try:
-                    result = call(selected, config, effective_idle_timeout_seconds)
-                except BaseException as call_exc:
-                    final_status = (
-                        "cancelled" if isinstance(call_exc, (LLMWorkerCancelled, KeyboardInterrupt)) else "failed"
-                    )
-                    try:
-                        _finalize_paper_worker_call(
-                            env,
-                            status=final_status,
-                            worker_id=paper_worker_id,
-                            call_id=paper_call_id,
-                        )
-                    except Exception as finalize_exc:
-                        call_exc.add_note(f"paper overlay finalization failed: {finalize_exc}")
-                    raise
-                _finalize_paper_worker_call(
-                    env,
-                    status="success",
-                    worker_id=paper_worker_id,
-                    call_id=paper_call_id,
+            diagnostics = (
+                AttemptDiagnostics(
+                    artifact_dir,
+                    provider=config.provider,
+                    model=config.model,
+                    fallback_index=fallback_index,
+                    attempt=attempt,
+                    call_label=diagnostic_call_label,
+                    env=diagnostic_env,
                 )
+                if artifact_dir is not None
+                else None
+            )
+            diagnostic_ref: AttemptDiagnosticRef | None = None
+            diagnostic_error: Exception | None = None
+            try:
+                with bind_attempt_diagnostics(diagnostics):
+                    _check_cancel(cancel_check)
+                    try:
+                        result = call(selected, config, effective_idle_timeout_seconds)
+                    except BaseException as call_exc:
+                        final_status = (
+                            "cancelled" if isinstance(call_exc, (LLMWorkerCancelled, KeyboardInterrupt)) else "failed"
+                        )
+                        try:
+                            _finalize_paper_worker_call(
+                                env,
+                                status=final_status,
+                                worker_id=paper_worker_id,
+                                call_id=paper_call_id,
+                            )
+                        except Exception as finalize_exc:
+                            call_exc.add_note(f"paper overlay finalization failed: {finalize_exc}")
+                        raise
+                    _finalize_paper_worker_call(
+                        env,
+                        status="success",
+                        worker_id=paper_worker_id,
+                        call_id=paper_call_id,
+                    )
+                    if diagnostics is not None:
+                        try:
+                            replayed = bool(
+                                isinstance(result, LLMCallOutcome)
+                                and isinstance(result.logical_receipt, Mapping)
+                                and result.logical_receipt.get("replayed") is True
+                            )
+                            if replayed:
+                                diagnostics.event("checkpoint_replayed")
+                            diagnostic_ref = diagnostics.finalize(
+                                outcome="replayed" if replayed else "success",
+                                native_session_id=(
+                                    result.native_session_id
+                                    if isinstance(result, LLMCallOutcome)
+                                    else None
+                                ),
+                            )
+                        except Exception as diagnostic_exc:
+                            # A paid provider result must never be discarded or
+                            # retried because its diagnostic sidecar failed.
+                            diagnostic_error = diagnostic_exc
                 value = result.value if isinstance(result, LLMCallOutcome) else result
+                if diagnostic_error is not None and isinstance(result, LLMCallOutcome):
+                    result = replace(
+                        result,
+                        warnings=tuple(
+                            dict.fromkeys(
+                                (*result.warnings, "attempt_diagnostics.persistence_failed")
+                            )
+                        ),
+                    )
                 attempt_record = _attempt_record(
                     config,
                     fallback_index=fallback_index,
                     attempt=attempt,
-                    status="success",
+                    status=(
+                        "replayed"
+                        if isinstance(result, LLMCallOutcome)
+                        and isinstance(result.logical_receipt, Mapping)
+                        and result.logical_receipt.get("replayed") is True
+                        else "success"
+                    ),
+                    diagnostic_ref=diagnostic_ref,
+                    diagnostic_error=diagnostic_error,
+                    env=diagnostic_env,
                 )
                 attempt_records.append(attempt_record)
                 if isinstance(result, LLMCallOutcome):
@@ -954,7 +1023,21 @@ def _run_with_retries(
                         ),
                     )
                 return result if return_outcome and isinstance(result, LLMCallOutcome) else value
-            except Exception as exc:
+            except BaseException as exc:
+                if diagnostics is not None and diagnostic_ref is None:
+                    with bind_attempt_diagnostics(diagnostics):
+                        try:
+                            diagnostic_ref = diagnostics.finalize(
+                                outcome=_diagnostic_outcome(exc), error=exc
+                            )
+                        except Exception as diagnostic_exc:
+                            diagnostic_error = diagnostic_exc
+                            exc.add_note(
+                                "attempt diagnostics persistence failed: "
+                                + sanitize_diagnostic_text(diagnostic_exc, diagnostic_env)[:4096]
+                            )
+                if not isinstance(exc, Exception):
+                    raise
                 failures.append(LLMAttemptFailure(provider=config.provider, attempt=attempt, error=str(exc)))
                 attempt_records.append(
                     _attempt_record(
@@ -963,6 +1046,9 @@ def _run_with_retries(
                         attempt=attempt,
                         status="failed",
                         error=exc,
+                        diagnostic_ref=diagnostic_ref,
+                        diagnostic_error=diagnostic_error,
+                        env=diagnostic_env,
                     )
                 )
                 if isinstance(
@@ -1119,6 +1205,15 @@ def _generate_json(
                 validated_legacy_logical_identity=validated_legacy_logical_identity,
             )
             if prepared_checkpoint.replay_response is not None:
+                diagnostics = current_attempt_diagnostics()
+                if diagnostics is not None:
+                    diagnostics.record_native_session_id(
+                        prepared_checkpoint.replay_response.native_session_id
+                    )
+                    diagnostics.record_candidate(
+                        prepared_checkpoint.replay_response.value,
+                        source="checkpoint_replayed_response",
+                    )
                 return prepared_checkpoint.replay_response
             progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
             if supervised_native_resume and (session is None or not session.native_session_id):
@@ -1197,6 +1292,12 @@ def _generate_json(
                 response,
                 prompt_sent_bytes=response.prompt_sent_bytes or len(provider_prompt.encode("utf-8")),
                 prompt_sent_sha256=response.prompt_sent_sha256 or sha256_text(provider_prompt),
+            )
+        diagnostics = current_attempt_diagnostics()
+        if diagnostics is not None:
+            diagnostics.record_native_session_id(response.native_session_id)
+            diagnostics.record_candidate(
+                response.value, source="provider_parsed_response"
             )
         if prepared_checkpoint is not None:
             record_response(prepared_checkpoint, response)
@@ -2147,6 +2248,9 @@ def _attempt_record(
     attempt: int,
     status: str,
     error: Exception | None = None,
+    diagnostic_ref: AttemptDiagnosticRef | None = None,
+    diagnostic_error: Exception | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     record = {
         "provider": config.provider,
@@ -2156,11 +2260,29 @@ def _attempt_record(
         "status": status,
         "error_type": None,
         "message": None,
+        "diagnostic_path": diagnostic_ref.path if diagnostic_ref else None,
+        "diagnostic_sha256": diagnostic_ref.sha256 if diagnostic_ref else None,
+        "diagnostic_error_type": (
+            type(diagnostic_error).__name__ if diagnostic_error is not None else None
+        ),
+        "diagnostic_error_message": (
+            sanitize_diagnostic_text(diagnostic_error, env)[:4096]
+            if diagnostic_error is not None
+            else None
+        ),
     }
     if error is not None:
         record["error_type"] = type(error).__name__
-        record["message"] = str(error)
+        record["message"] = sanitize_diagnostic_text(error, env)[:4096]
     return record
+
+
+def _diagnostic_outcome(exc: BaseException) -> str:
+    if isinstance(exc, (LLMWorkerCancelled, KeyboardInterrupt)):
+        return "cancelled"
+    if isinstance(exc, LLMWorkerTimeout):
+        return "timeout"
+    return "error"
 
 
 def _failure_message(failures: Sequence[LLMAttemptFailure], *, max_attempts: int = MAX_ATTEMPTS_PER_PROVIDER) -> str:

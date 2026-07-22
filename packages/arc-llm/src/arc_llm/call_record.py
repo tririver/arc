@@ -5,7 +5,7 @@ from typing import Any
 
 
 ARC_LLM_CALL_RECORD_FIELD = "arc_llm_call_record"
-ARC_LLM_CALL_RECORD_SCHEMA_VERSION = "arc.llm.call_record.v4"
+ARC_LLM_CALL_RECORD_SCHEMA_VERSION = "arc.llm.call_record.v5"
 
 ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -55,6 +55,10 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
                     "status",
                     "error_type",
                     "message",
+                    "diagnostic_path",
+                    "diagnostic_sha256",
+                    "diagnostic_error_type",
+                    "diagnostic_error_message",
                 ],
                 "properties": {
                     "provider": {"type": "string"},
@@ -64,6 +68,19 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
                     "status": {"type": "string"},
                     "error_type": {"type": ["string", "null"]},
                     "message": {"type": ["string", "null"]},
+                    "diagnostic_path": {
+                        "type": ["string", "null"],
+                        "pattern": (
+                            r"^attempts/[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-"
+                            r"f[0-9]{2,}-a[0-9]{2,}-[0-9a-f]{12}/record\.json$"
+                        ),
+                    },
+                    "diagnostic_sha256": {
+                        "type": ["string", "null"],
+                        "pattern": "^[0-9a-f]{64}$",
+                    },
+                    "diagnostic_error_type": {"type": ["string", "null"]},
+                    "diagnostic_error_message": {"type": ["string", "null"]},
                 },
             },
         },

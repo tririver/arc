@@ -134,6 +134,13 @@ class ActivityTracker:
         self._submitted_at = now
         self._last_activity_at = now
         self._next_review_at = now + self.review_interval_seconds
+        # Imported lazily to keep the provider activity layer lightweight and
+        # avoid a module cycle during package initialization.
+        from arc_llm.attempt_diagnostics import current_attempt_diagnostics
+
+        diagnostics = current_attempt_diagnostics()
+        if diagnostics is not None:
+            diagnostics.mark_submitted()
         self._emit("submitted", activity_type="provider_submission")
 
     @property

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from arc_llm.retryable_output import ProviderOutputClass, classify_provider_output_text
+from arc_llm.attempt_diagnostics import current_attempt_diagnostics
 from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.schema_cache import canonical_json, sha256_text
 from arc_llm.sessions import LLMSessionRef
@@ -265,6 +266,8 @@ class _AcpProcess:
         self._stopped = False
         self._fatal_error: LLMWorkerError | None = None
         self._fatal_lock = threading.Lock()
+        self.diagnostics = current_attempt_diagnostics()
+        self._stdin_closed = False
 
     def start(self) -> None:
         retry_safety = resolve_kimi_retry_safety(self.env)
@@ -301,6 +304,13 @@ class _AcpProcess:
                 retryable=False,
             ) from exc
         self.watchdog = start_process_group_watchdog(self.process, grace_seconds=0.35)
+        if self.diagnostics is not None:
+            self.diagnostics.event(
+                "process_group_started",
+                pid=self.process.pid,
+                process_group_id=self.process.pid,
+                command_binary=str(command[0]),
+            )
         assert self.process.stdout is not None
         assert self.process.stderr is not None
         stdout_thread = threading.Thread(target=self._read_stdout, name="arc-kimi-stdout", daemon=True)
@@ -314,6 +324,8 @@ class _AcpProcess:
         try:
             for line in self.process.stdout:
                 self.stdout_lines.append(line)
+                if self.diagnostics is not None:
+                    self.diagnostics.capture_stdout(line)
                 self.stdout_queue.put(line)
         finally:
             self.stdout_queue.put(None)
@@ -322,6 +334,8 @@ class _AcpProcess:
         assert self.process is not None and self.process.stderr is not None
         for line in self.process.stderr:
             self.stderr_lines.append(line)
+            if self.diagnostics is not None:
+                self.diagnostics.capture_stderr(line)
             disposition = classify_provider_diagnostic(
                 line,
                 submission_state=LLMSubmissionState.UNKNOWN,
@@ -347,6 +361,11 @@ class _AcpProcess:
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         if submission_barrier:
             self.activity.submitted()
+            if self.diagnostics is not None:
+                self.diagnostics.mark_submitted()
+                native_id = (submission_metadata or {}).get("native_session_id")
+                if native_id:
+                    self.diagnostics.record_native_session_id(str(native_id))
             self.activity.record_metadata(
                 "session",
                 text="provider session established",
@@ -506,11 +525,19 @@ class _AcpProcess:
         if self._stopped:
             return
         if session_id and self.process is not None and self.process.poll() is None:
+            if self.diagnostics is not None:
+                self.diagnostics.event(
+                    "cancellation_requested", native_session_id=session_id
+                )
             try:
                 self._send(
                     {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}}
                 )
+                if self.diagnostics is not None:
+                    self.diagnostics.event("provider_cancel_sent")
             except Exception:
+                if self.diagnostics is not None:
+                    self.diagnostics.event("provider_cancel_failed")
                 pass
         self._close_stdin()
         self._wait_or_signal()
@@ -524,11 +551,18 @@ class _AcpProcess:
         self._write_artifacts()
 
     def _close_stdin(self) -> None:
+        if self._stdin_closed:
+            return
+        self._stdin_closed = True
+        closed = False
         if self.process is not None and self.process.stdin is not None:
             try:
                 self.process.stdin.close()
+                closed = True
             except OSError:
                 pass
+        if self.diagnostics is not None:
+            self.diagnostics.event("stdin_close_attempted", succeeded=closed)
 
     def _wait_or_signal(self) -> None:
         process = self.process
@@ -548,6 +582,10 @@ class _AcpProcess:
 
     def _write_artifacts(self) -> None:
         if self.artifact_dir is None:
+            return
+        if self.diagnostics is not None:
+            # The runner-owned immutable attempt directory supersedes the
+            # historical mutable raw files at the call root.
             return
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         raw_events = "".join(

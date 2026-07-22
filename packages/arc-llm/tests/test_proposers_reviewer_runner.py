@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import validate
 
 from arc_llm import runner as core_runner
-from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
+from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_llm.proposers_reviewer.config import load_batch_config
 from arc_llm.proposers_reviewer import runner as runner_module
 from arc_llm.proposers_reviewer.artifacts import RunPaths, acquire_lock, atomic_write_json
@@ -861,6 +862,14 @@ def test_peer_visible_proposer_plain_text_is_wrapped_for_reviewer_context_and_wa
     assert result["status"] == "completed"
     assert wrapped["schema_version"] == "arc.llm.unstructured_output.v1"
     assert wrapped["raw_text"].startswith("Proposal: compute")
+    batch = load_batch_config(config)
+    local_record = runner_module._local_recovery_call_record(  # noqa: SLF001
+        worker=batch.loops[0].proposers[0],
+        schema=batch.loops[0].proposers[0].output_schema,
+        signal="test",
+        structured_output={"mode": "recovered"},
+    )
+    validate(local_record, ARC_LLM_CALL_RECORD_SCHEMA)
     assert warnings[-1]["worker_id"] == "proposer_001"
     assert warnings[-1]["recovery_strategy"] == "peer_visible_unstructured_output"
 
