@@ -4716,6 +4716,29 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
     checkpoint_path = checkpoint_dir / "section-reviews" / "0000.json"
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     reviewed_segments = checkpoint["review"]["reviewed_segment_ids"]
+    sparse = {
+        "segment_id": reviewed_segments[0],
+        "translation_blocks": None,
+        "commentary": None,
+        "explanation": None,
+        "commentary_sources": None,
+        "prior_work": None,
+        "later_work": None,
+    }
+    checkpoint["review"]["patches"] = [
+        {**sparse, "commentary": "局部伴读修订", "reason": "commentary"},
+        {**sparse, "explanation": "局部解释修订", "reason": "explanation"},
+    ]
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    _review(segments, translations, annotations, **kwargs)
+
+    assert len(section_calls) == 1
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert len(checkpoint["review"]["patches"]) == 1
+    assert checkpoint["review"]["patches"][0]["commentary"] == "局部伴读修订"
+    assert checkpoint["review"]["patches"][0]["explanation"] == "局部解释修订"
+
     if invalid_mode == "missing":
         checkpoint["review"]["reviewed_segment_ids"] = reviewed_segments[:1]
     else:
@@ -4760,6 +4783,255 @@ def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
         )
 
     assert not (checkpoint_dir / "section-reviews" / "0000.json").exists()
+
+
+@pytest.mark.parametrize("cached_failure", ["conflict", "malformed"])
+def test_invalid_cached_section_review_patch_reruns_provider(
+    cached_failure: str,
+    tmp_path: Path,
+) -> None:
+    segments, translations, annotations, document = _minimal_section_review_inputs()
+    section_calls: list[str] = []
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        if label.startswith("companion-section-review-"):
+            section_calls.append(label)
+            portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+            return {
+                "findings": [],
+                "reviewed_segment_ids": [
+                    item["segment"]["segment_id"] for item in portion["segments"]
+                ],
+                "patches": [],
+            }
+        return {"patches": [], "issues": []}
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    kwargs = dict(
+        document=document, glossary={"entries": []}, protected_names=[],
+        evidence={"related_papers": []},
+        options=BuildOptions(
+            paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
+            review_context_chars=1,
+        ),
+        llm=llm, checkpoint_dir=checkpoint_dir,
+    )
+    _review(segments, translations, annotations, **kwargs)
+    assert len(section_calls) == 1
+
+    checkpoint_path = checkpoint_dir / "section-reviews" / "0000.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    segment_id = checkpoint["review"]["reviewed_segment_ids"][0]
+    empty = {
+        "segment_id": segment_id,
+        "translation_blocks": None,
+        "commentary": None,
+        "explanation": None,
+        "commentary_sources": None,
+        "prior_work": None,
+        "later_work": None,
+    }
+    if cached_failure == "conflict":
+        checkpoint["review"]["patches"] = [
+            {**empty, "commentary": "版本一", "reason": "first"},
+            {**empty, "commentary": "版本二", "reason": "second"},
+        ]
+    else:
+        checkpoint["review"]["patches"] = [{
+            **empty,
+            "translation_blocks": "not-a-list",
+            "reason": "malformed",
+        }]
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    _review(segments, translations, annotations, **kwargs)
+
+    assert len(section_calls) == 2
+    repaired = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert repaired["review"]["patches"] == []
+
+
+def test_new_section_review_patch_conflict_fails_closed(tmp_path: Path) -> None:
+    segments, translations, annotations, document = _minimal_section_review_inputs()
+
+    def llm(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        if not label.startswith("companion-section-review-"):
+            raise AssertionError("final review must not run after a section conflict")
+        portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+        segment_id = portion["segments"][0]["segment"]["segment_id"]
+        empty = {
+            "segment_id": segment_id,
+            "translation_blocks": None,
+            "commentary": None,
+            "explanation": None,
+            "commentary_sources": None,
+            "prior_work": None,
+            "later_work": None,
+        }
+        return {
+            "findings": [],
+            "reviewed_segment_ids": [
+                item["segment"]["segment_id"] for item in portion["segments"]
+            ],
+            "patches": [
+                {**empty, "commentary": "版本一", "reason": "first"},
+                {**empty, "commentary": "版本二", "reason": "second"},
+            ],
+        }
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    with pytest.raises(
+        RuntimeError,
+        match="section review returned conflicting patches.*field commentary",
+    ):
+        _review(
+            segments, translations, annotations,
+            document=document, glossary={"entries": []}, protected_names=[],
+            evidence={"related_papers": []},
+            options=BuildOptions(
+                paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
+                review_context_chars=1,
+            ),
+            llm=llm, checkpoint_dir=checkpoint_dir,
+        )
+
+    assert not (checkpoint_dir / "section-reviews" / "0000.json").exists()
+
+
+def test_section_review_merges_compatible_sparse_patches_before_validation() -> None:
+    chunk = [{"segment": {
+        "segment_id": "seg-1",
+        "augmentation_block_ids": ["b1", "b2"],
+    }}]
+    empty = {
+        "segment_id": "seg-1",
+        "translation_blocks": None,
+        "commentary": None,
+        "explanation": None,
+        "commentary_sources": None,
+        "prior_work": None,
+        "later_work": None,
+    }
+    translation_blocks = [
+        {"block_id": "b1", "text": "译文一"},
+        {"block_id": "b2", "text": "译文二"},
+    ]
+    review = {
+        "reviewed_segment_ids": ["seg-1"],
+        "findings": [],
+        "patches": [
+            {
+                **empty,
+                "translation_blocks": [translation_blocks[1]],
+                "reason": "translation b2",
+            },
+            {
+                **empty,
+                "translation_blocks": [translation_blocks[0]],
+                "reason": "translation b1",
+            },
+            {
+                **empty,
+                "translation_blocks": [translation_blocks[1]],
+                "reason": "translation b2",
+            },
+            {**empty, "commentary": "伴读", "reason": "commentary"},
+            {**empty, "commentary": "伴读", "reason": "commentary"},
+        ],
+    }
+
+    normalized = pipeline_module._normalize_sparse_review_patches(
+        review,
+        block_order_by_segment=pipeline_module._review_patch_block_order(chunk),
+        scope="section review",
+    )
+
+    assert pipeline_module._section_review_validation_error(normalized, chunk) is None
+    assert normalized["patches"] == [{
+        **empty,
+        "translation_blocks": translation_blocks,
+        "commentary": "伴读",
+        "reason": "translation b2; translation b1; commentary",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("field", "first", "second", "message"),
+    [
+        ("commentary", "版本一", "版本二", "seg-1 field commentary"),
+        (
+            "translation_blocks",
+            [{"block_id": "b1", "text": "译文一"}],
+            [{"block_id": "b1", "text": "译文二"}],
+            "seg-1 translation block b1",
+        ),
+    ],
+)
+def test_section_review_sparse_patch_conflicts_fail_closed(
+    field: str, first: object, second: object, message: str,
+) -> None:
+    empty = {
+        "segment_id": "seg-1",
+        "translation_blocks": None,
+        "commentary": None,
+        "explanation": None,
+        "commentary_sources": None,
+        "prior_work": None,
+        "later_work": None,
+    }
+    review = {
+        "reviewed_segment_ids": ["seg-1"],
+        "findings": [],
+        "patches": [
+            {**empty, field: first, "reason": "first"},
+            {**empty, field: second, "reason": "second"},
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        pipeline_module._normalize_sparse_review_patches(
+            review, scope="section review",
+        )
+
+
+def test_final_review_merges_disjoint_same_segment_patches(tmp_path: Path) -> None:
+    segments, translations, annotations, document = _minimal_section_review_inputs()
+    segment_id = segments[0]["segment_id"]
+    empty = {
+        "segment_id": segment_id,
+        "translation_blocks": None,
+        "commentary": None,
+        "explanation": None,
+        "commentary_sources": None,
+        "prior_work": None,
+        "later_work": None,
+    }
+
+    def llm(_prompt: str, **kwargs):
+        assert kwargs["call_label"] == "companion-final-review"
+        return {
+            "patches": [
+                {**empty, "commentary": "合并后的伴读", "reason": "commentary"},
+                {**empty, "explanation": "合并后的解释", "reason": "explanation"},
+            ],
+            "issues": [],
+        }
+
+    _, reviewed_annotations, audit = _review(
+        segments, translations, annotations,
+        document=document, glossary={"entries": []}, protected_names=[],
+        evidence={"related_papers": []},
+        options=BuildOptions(
+            paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
+        ),
+        llm=llm, checkpoint_dir=tmp_path / "checkpoints",
+    )
+
+    assert reviewed_annotations[segment_id]["commentary"] == "合并后的伴读"
+    assert reviewed_annotations[segment_id]["explanation"] == "合并后的解释"
+    assert audit["patched_segment_ids"] == [segment_id]
 
 
 def test_direct_review_between_soft_default_and_hard_limit_becomes_hierarchical(
@@ -6780,9 +7052,15 @@ def test_generation_failure_drains_both_lanes_and_retry_only_runs_missing_segmen
         json.loads(path.read_text(encoding="utf-8"))["segment_id"]
         for path in (checkpoint / "translations").glob("*.json")
     }
-    # A terminal failure now opens the shared generation circuit immediately.
-    # No queued successor may start merely to produce a reusable checkpoint.
-    assert completed_annotations == set()
+    # A terminal failure opens the shared generation circuit immediately, but
+    # a successor that already crossed the provider boundary must drain and
+    # remain reusable.  The per-lane workers race for the shared permits, so
+    # either outcome is valid; the checkpoint must agree with the calls that
+    # actually started.
+    annotation_seg2_started = (
+        "companion-annotation-seg-0002" in failed_generation_calls
+    )
+    assert completed_annotations == ({"seg-0002"} if annotation_seg2_started else set())
     # The non-translatable second segment is a deterministic empty artifact and
     # does not cross the provider circuit.
     assert completed_translations == {"seg-0002"}
@@ -6818,11 +7096,13 @@ def test_generation_failure_drains_both_lanes_and_retry_only_runs_missing_segmen
     )
 
     assert second["ok"], second
-    assert sorted(retry_generation_calls) == [
+    expected_retry_calls = [
         "companion-annotation-seg-0001",
-        "companion-annotation-seg-0002",
         "companion-translation-seg-0001",
     ]
+    if not annotation_seg2_started:
+        expected_retry_calls.append("companion-annotation-seg-0002")
+    assert sorted(retry_generation_calls) == sorted(expected_retry_calls)
 
 
 def test_invalid_segmentation_is_not_cached(tmp_path: Path) -> None:

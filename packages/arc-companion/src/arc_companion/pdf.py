@@ -12,6 +12,18 @@ class PDFError(RuntimeError):
     """Raised when LaTeX compilation or PDF inspection fails."""
 
 
+def _first_latex_error_context(value: str, *, before: int = 2, after: int = 7) -> str:
+    """Return bounded context around the first TeX exclamation diagnostic."""
+
+    lines = value.splitlines()
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("!"):
+            start = max(0, index - before)
+            end = min(len(lines), index + after + 1)
+            return "\n".join(lines[start:end])
+    return ""
+
+
 _VISIBLE_LAYER_LABELS = {
     "译文": r"译\s*文",
     "伴读": r"伴\s*读",
@@ -48,8 +60,24 @@ def compile_latex(tex_path: Path, pdf_path: Path, *, timeout_seconds: float = 30
             check=False,
         )
         if completed.returncode != 0 or not built.is_file() or built.stat().st_size == 0:
-            tail = "\n".join((completed.stdout + "\n" + completed.stderr).splitlines()[-30:])
-            raise PDFError(f"XeLaTeX compilation failed:\n{tail}")
+            command_output = completed.stdout + "\n" + completed.stderr
+            log_path = tex_path.parent / f"{jobname}.log"
+            try:
+                log_output = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                log_output = ""
+            first_error = (
+                _first_latex_error_context(log_output)
+                or _first_latex_error_context(command_output)
+            )
+            tail = "\n".join(command_output.splitlines()[-30:])
+            diagnostic = (
+                f"First XeLaTeX error:\n{first_error}\n\n"
+                if first_error else ""
+            )
+            raise PDFError(
+                f"XeLaTeX compilation failed:\n{diagnostic}Command tail:\n{tail}"
+            )
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(built, pdf_path)
     finally:

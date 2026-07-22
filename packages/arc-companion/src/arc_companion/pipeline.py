@@ -27,7 +27,7 @@ from .content import (
     store_reader_content,
 )
 from .chapters import CHAPTERS_VERSION, build_chapters
-from .artifact_store import AcceptedArtifactStore, canonical_sha256
+from .artifact_store import AcceptedArtifactStore, artifact_id_for, canonical_sha256
 from .chapter_glossary import generate_index_glossary, project_segment_glossary
 from .chapter_guide import (
     CHAPTER_GUIDE_VERSION,
@@ -574,6 +574,7 @@ def _build_companion_unlocked(
         if (
             not options.force
             and not options.regenerate_lanes
+            and not options.regenerate_segments
             and previous_state.get("status") == "complete"
             and previous_state.get("fingerprint") == fingerprint
             and previous_state.get("translation_mode") == (
@@ -1800,6 +1801,45 @@ def _build_chaptered_companion(
                         isinstance(output, dict)
                         and sha256_json(output) == old_block.get("output_sha256")
                     ):
+                        object_kind = (
+                            "translation"
+                            if requested_lane == "translation" else "commentary"
+                        )
+                        direct_artifact_id = artifact_id_for(
+                            kind=object_kind,
+                            semantic_input_sha256=str(
+                                old_block.get("input_sha256") or ""
+                            ),
+                            output_sha256=str(
+                                old_block.get("output_sha256") or ""
+                            ),
+                            contract_version=SCHEMA_VERSION,
+                            predecessor_accepted_chain_sha256=str(
+                                old_block.get(
+                                    "predecessor_accepted_chain_sha256"
+                                ) or ""
+                            ),
+                        )
+                        source_artifact_id = None
+                        if artifact_store.path_for(
+                            object_kind, direct_artifact_id,
+                        ).is_file():
+                            source_artifact_id = direct_artifact_id
+                        else:
+                            logical_receipt = old_block.get("logical_receipt")
+                            referenced_id = (
+                                str(logical_receipt.get("artifact_id") or "")
+                                if isinstance(logical_receipt, Mapping) else ""
+                            )
+                            if referenced_id:
+                                try:
+                                    referenced_path = artifact_store.path_for(
+                                        object_kind, referenced_id,
+                                    )
+                                except Exception:
+                                    referenced_path = None
+                                if referenced_path is not None and referenced_path.is_file():
+                                    source_artifact_id = referenced_id
                         staged_outputs[old_segment_id] = {
                             "output": output,
                             "output_sha256": old_block.get("output_sha256"),
@@ -1813,6 +1853,10 @@ def _build_chaptered_companion(
                                 ),
                                 "source_logical_receipt": dict(
                                     old_block.get("logical_receipt") or {}
+                                ),
+                                **(
+                                    {"source_artifact_id": source_artifact_id}
+                                    if source_artifact_id else {}
                                 ),
                             },
                             "validation_receipt": {
@@ -2576,6 +2620,7 @@ def _build_chaptered_companion(
             }
         input_hash = lane_semantic_sha256(object_lane, semantic_context)
         local_deferred_value: dict[str, Any] | None = None
+        local_deferred_artifact: dict[str, Any] | None = None
         deferred_translation = (
             identity_block.get("deferred_translation")
             if lane == "translation" else None
@@ -2601,22 +2646,135 @@ def _build_chaptered_companion(
             )
         ):
             value = dict(deferred_output)
+            deferred_logical_receipt = dict(
+                identity_block.get("deferred_logical_receipt") or {}
+            )
+            deferred_validation_receipt = dict(
+                identity_block.get("deferred_validation_receipt") or {}
+            )
+            source_artifact_id = str(
+                deferred_logical_receipt.get("source_artifact_id") or ""
+            )
+            source_artifact = None
+            if lane == "companion":
+                if source_artifact_id:
+                    source_artifact = artifact_store.read(
+                        object_lane, source_artifact_id,
+                    )
+                    artifact_store.validate(
+                        source_artifact,
+                        expected_kind=object_lane,
+                        expected_id=source_artifact_id,
+                        output_validator=lambda output: _reusable_lane_output_valid(
+                            object_lane, segment, output,
+                            blocks_by_id=blocks_by_id,
+                            protected_names=protected_names,
+                        ),
+                    )
+                    if (
+                        source_artifact.get("contract_version") != SCHEMA_VERSION
+                        or source_artifact.get("segment_id") != segment_id
+                        or source_artifact.get("output_sha256")
+                        != sha256_json(value)
+                    ):
+                        raise RuntimeError(
+                            "deferred commentary source artifact does not match "
+                            "the staged accepted output"
+                        )
+                else:
+                    candidates = []
+                    for record in artifact_store.iter_kind(object_lane):
+                        if (
+                            record.get("contract_version") == SCHEMA_VERSION
+                            and record.get("segment_id") == segment_id
+                            and record.get("output_sha256") == sha256_json(value)
+                        ):
+                            try:
+                                artifact_store.validate(
+                                    record,
+                                    output_validator=lambda output: (
+                                        _reusable_lane_output_valid(
+                                            object_lane, segment, output,
+                                            blocks_by_id=blocks_by_id,
+                                            protected_names=protected_names,
+                                        )
+                                    ),
+                                )
+                            except Exception:
+                                continue
+                            candidates.append(record)
+                    if candidates:
+                        source_artifact = max(
+                            candidates,
+                            key=lambda item: float(item.get("created_at") or 0),
+                        )
+                        source_artifact_id = str(source_artifact["artifact_id"])
+            accepted_logical_receipt = {
+                **deferred_logical_receipt,
+                "kind": (
+                    "accepted_artifact_reuse"
+                    if source_artifact is not None
+                    else "deferred_accepted_artifact_reuse"
+                ),
+                "provider_calls": 0,
+                **(
+                    {"artifact_id": source_artifact_id}
+                    if source_artifact is not None else {}
+                ),
+            }
+            if lane == "companion" and source_artifact is None and result_llm is None:
+                checkpoint_protected_names = _protected_names_for_blocks(
+                    protected_names,
+                    _augmentation_blocks(segment, blocks_by_id),
+                )
+                _write_annotation_checkpoint(
+                    checkpoint_dir,
+                    segment=segment,
+                    generation=block_generation,
+                    annotation=value,
+                    input_sha256=_annotation_checkpoint_input_sha256(
+                        segment,
+                        bundle=bundle,
+                        blocks_by_id=blocks_by_id,
+                        options=options,
+                        segment_glossary=segment_glossary,
+                        segment_evidence=selected_evidence,
+                        protected_names=checkpoint_protected_names,
+                        domain_context=domain_context,
+                        intent_guidance=intent_guidance,
+                    ),
+                )
             ledger = accept_deferred_block(
                 path,
                 segment_id=segment_id,
                 input_sha256=input_hash,
                 output_sha256=sha256_json(value),
-                logical_receipt={
-                    **dict(identity_block.get("deferred_logical_receipt") or {}),
-                    "kind": "deferred_accepted_artifact_reuse",
-                    "provider_calls": 0,
-                },
+                logical_receipt=accepted_logical_receipt,
                 validation_receipt={
-                    **dict(identity_block.get("deferred_validation_receipt") or {}),
+                    **deferred_validation_receipt,
                     "local_validation": True,
                     "reuse_status": "deferred_hit",
+                    **(
+                        {"object_store_revalidated": True}
+                        if source_artifact is not None else {}
+                    ),
                 },
             )
+            if source_artifact is not None:
+                accepted_deferred_block = next(
+                    item for item in ledger.get("blocks") or []
+                    if item.get("segment_id") == segment_id
+                )
+                local_deferred_artifact = artifact_store.read_for_accepted_block(
+                    kind=object_lane,
+                    contract_version=SCHEMA_VERSION,
+                    ledger_block=accepted_deferred_block,
+                    output_validator=lambda output: _reusable_lane_output_valid(
+                        object_lane, segment, output,
+                        blocks_by_id=blocks_by_id,
+                        protected_names=protected_names,
+                    ),
+                )
             if lane == "translation":
                 migrated_translation = value
             local_deferred_value = value
@@ -2624,7 +2782,11 @@ def _build_chaptered_companion(
             block_state = "accepted"
             record_segment_reuse(
                 chapter_id=chapter_id, segment_id=segment_id, lane=lane,
-                status="deferred_hit", artifact_id=None,
+                status="deferred_hit",
+                artifact_id=(
+                    str(local_deferred_artifact["artifact_id"])
+                    if local_deferred_artifact is not None else None
+                ),
                 reason="staged accepted blocks passed current local validation",
             )
         semantic_invalidated = False
@@ -2685,8 +2847,64 @@ def _build_chaptered_companion(
             },
         )
         reused_artifact = None
+        accepted_commentary_artifact = None
+        accepted_commentary_checkpoint_only = False
         requested_lane = "translation" if lane == "translation" else "commentary"
         targeted_key = f"{requested_lane}:{segment_id}"
+        if (
+            lane == "companion"
+            and block_state == "accepted"
+            and local_deferred_value is None
+            and object_lane not in regeneration
+            and targeted_key not in targeted_regeneration
+        ):
+            accepted_block = next(
+                item for item in ledger["blocks"]
+                if item["segment_id"] == segment_id
+            )
+            direct_artifact_id = artifact_id_for(
+                kind=object_lane,
+                semantic_input_sha256=str(accepted_block.get("input_sha256") or ""),
+                output_sha256=str(accepted_block.get("output_sha256") or ""),
+                contract_version=contract_version,
+                predecessor_accepted_chain_sha256=str(
+                    accepted_block.get("predecessor_accepted_chain_sha256") or ""
+                ),
+            )
+            logical_receipt = accepted_block.get("logical_receipt")
+            has_reuse_binding = bool(
+                isinstance(logical_receipt, Mapping)
+                and logical_receipt.get("kind") == "accepted_artifact_reuse"
+                and logical_receipt.get("artifact_id")
+            )
+            expects_object = bool(
+                result_llm is not None
+                or artifact_store.path_for(
+                    object_lane, direct_artifact_id,
+                ).is_file()
+                or has_reuse_binding
+            )
+            if expects_object:
+                accepted_commentary_artifact = artifact_store.read_for_accepted_block(
+                    kind=object_lane,
+                    contract_version=contract_version,
+                    ledger_block=accepted_block,
+                    output_validator=lambda output: _reusable_lane_output_valid(
+                        object_lane, segment, output,
+                        blocks_by_id=blocks_by_id, protected_names=protected_names,
+                    ),
+                )
+                record_segment_reuse(
+                    chapter_id=chapter_id, segment_id=segment_id, lane=lane,
+                    status="hit",
+                    artifact_id=str(accepted_commentary_artifact["artifact_id"]),
+                    reason=(
+                        "accepted commentary object passed ledger binding and "
+                        "current local validation"
+                    ),
+                )
+            else:
+                accepted_commentary_checkpoint_only = True
         if (
             newly_accepted and object_lane not in regeneration
             and targeted_key not in targeted_regeneration
@@ -2747,6 +2965,50 @@ def _build_chaptered_companion(
                         "reuse_status": reused_artifact["reuse_status"],
                     },
                 )
+                reuse_status = str(reused_artifact["reuse_status"])
+                source_artifact_id = str(reused_artifact["artifact_id"])
+                accepted_reused_block = next(
+                    item for item in ledger.get("blocks") or []
+                    if item.get("segment_id") == segment_id
+                )
+                if str(reused_artifact.get("segment_id") or "") != segment_id:
+                    raise RuntimeError(
+                        "accepted artifact segment does not match the reused ledger block"
+                    )
+                rebound_artifact_id = artifact_id_for(
+                    kind=object_lane,
+                    semantic_input_sha256=input_hash,
+                    output_sha256=str(reused_artifact["output_sha256"]),
+                    contract_version=contract_version,
+                    predecessor_accepted_chain_sha256=str(
+                        accepted_reused_block[
+                            "predecessor_accepted_chain_sha256"
+                        ]
+                    ),
+                )
+                rebound_artifact = (
+                    reused_artifact
+                    if rebound_artifact_id == source_artifact_id
+                    else artifact_store.put_accepted(
+                        kind=object_lane,
+                        semantic_input_sha256=input_hash,
+                        recipe_sha256=str(reused_artifact["recipe_sha256"]),
+                        contract_version=contract_version,
+                        output=value,
+                        ledger_block=accepted_reused_block,
+                        provider_receipt=dict(reused_artifact["provider_receipt"]),
+                        provenance={
+                            "checkpoint_dir": str(checkpoint_dir),
+                            "chapter_id": chapter_id,
+                            "segment_id": segment_id,
+                            "derived_from_artifact_id": source_artifact_id,
+                        },
+                    )
+                )
+                reused_artifact = {
+                    **rebound_artifact,
+                    "reuse_status": reuse_status,
+                }
                 newly_accepted = False
                 record_segment_reuse(
                     chapter_id=chapter_id, segment_id=segment_id, lane=lane,
@@ -2996,7 +3258,43 @@ def _build_chaptered_companion(
                 )
                 return final_value
         try:
-            if reused_artifact is not None:
+            if accepted_commentary_artifact is not None:
+                value = dict(accepted_commentary_artifact["output"])
+            elif accepted_commentary_checkpoint_only:
+                def reject_accepted_checkpoint_provider_call(
+                    *_args: Any, **_kwargs: Any,
+                ) -> dict[str, Any]:
+                    raise RuntimeError(
+                        "accepted commentary has no reusable object and its "
+                        "local checkpoint is unavailable or invalid"
+                    )
+
+                value = _generate_annotations(
+                    [segment], options=options, bundle=bundle, evidence=evidence,
+                    domain_context=domain_context, glossary=segment_glossary,
+                    protected_names=_protected_names_for_blocks(
+                        protected_names, _augmentation_blocks(segment, blocks_by_id),
+                    ), checkpoint_dir=checkpoint_dir,
+                    llm=reject_accepted_checkpoint_provider_call,
+                    generation=block_generation, force_generation=False,
+                    intent_guidance=intent_guidance,
+                )[segment_id]
+                if not _reusable_lane_output_valid(
+                    object_lane, segment, value,
+                    blocks_by_id=blocks_by_id,
+                    protected_names=protected_names,
+                ):
+                    raise RuntimeError(
+                        "accepted commentary checkpoint fails current local validation"
+                    )
+                record_segment_reuse(
+                    chapter_id=chapter_id, segment_id=segment_id, lane=lane,
+                    status="hit", artifact_id=None,
+                    reason=(
+                        "accepted commentary checkpoint passed current local validation"
+                    ),
+                )
+            elif reused_artifact is not None:
                 pass
             elif local_deferred_value is not None:
                 value = local_deferred_value
@@ -5911,6 +6209,66 @@ def _published_pdf_outputs_match(state: dict[str, Any]) -> bool:
     return True
 
 
+def _annotation_checkpoint_input_sha256(
+    segment: dict[str, Any],
+    *,
+    bundle: SourceBundle,
+    blocks_by_id: dict[str, dict[str, Any]],
+    options: BuildOptions,
+    segment_glossary: dict[str, Any],
+    segment_evidence: dict[str, Any],
+    protected_names: list[str],
+    domain_context: dict[str, Any] | None,
+    intent_guidance: Mapping[str, Any] | None,
+) -> str:
+    """Bind an annotation checkpoint to its current deterministic inputs."""
+
+    return _segment_input_hash(
+        segment,
+        blocks_by_id,
+        glossary=segment_glossary,
+        extra={
+            "evidence": segment_evidence,
+            "names": protected_names,
+            "paper_context": _full_paper_context(
+                bundle.document, segment,
+                blocks_by_id=blocks_by_id, options=options,
+            ),
+            "runtime_access": _generation_runtime_policy(options),
+            **(
+                {"intent_guidance": _intent_guidance_identity(intent_guidance)}
+                if intent_guidance is not None else {}
+            ),
+            "domain_context": domain_context,
+        },
+    )
+
+
+def _write_annotation_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    segment: dict[str, Any],
+    generation: int,
+    annotation: dict[str, Any],
+    input_sha256: str,
+) -> None:
+    """Persist one locally validated annotation for its owning generation."""
+
+    segment_id = str(segment["segment_id"])
+    write_json(
+        _generation_segment_artifact_dir(
+            checkpoint_dir, "annotations", segment_id, generation,
+        ) / f"{_segment_checkpoint_name(segment_id)}.json",
+        {
+            "schema_version": ANNOTATION_CHECKPOINT_VERSION,
+            "segment_id": segment_id,
+            "generation": generation,
+            "input_sha256": input_sha256,
+            "annotation": annotation,
+        },
+    )
+
+
 def _generate_annotations(
     segments: list[dict[str, Any]],
     *,
@@ -5975,22 +6333,16 @@ def _generate_annotations(
             continue
         if path.is_file() and not force_generation and not options.regenerate_commentary:
             checkpoint = read_json(path)
-            paper_context = _full_paper_context(
-                bundle.document, segment, blocks_by_id=by_id, options=options
-            )
-            expected_hash = _segment_input_hash(
-                segment, by_id, glossary=segment_glossary,
-                extra={
-                    "evidence": segment_evidence,
-                    "names": protected_names,
-                    "paper_context": paper_context,
-                    "runtime_access": _generation_runtime_policy(options),
-                    "domain_context": domain_context,
-                    **(
-                        {"intent_guidance": _intent_guidance_identity(intent_guidance)}
-                        if intent_guidance is not None else {}
-                    ),
-                },
+            expected_hash = _annotation_checkpoint_input_sha256(
+                segment,
+                bundle=bundle,
+                blocks_by_id=by_id,
+                options=options,
+                segment_glossary=segment_glossary,
+                segment_evidence=segment_evidence,
+                protected_names=protected_names,
+                domain_context=domain_context,
+                intent_guidance=intent_guidance,
             )
             if (
                 isinstance(checkpoint, dict)
@@ -6088,36 +6440,24 @@ def _generate_annotations(
             else:
                 output[segment_id] = value
                 segment = next(item for item in segments if item["segment_id"] == segment_id)
-                write_json(
-                    _generation_segment_artifact_dir(
-                        checkpoint_dir, "annotations", segment_id, generation,
-                    ) / f"{_segment_checkpoint_name(segment_id)}.json",
-                    {
-                        "schema_version": ANNOTATION_CHECKPOINT_VERSION,
-                        "segment_id": segment_id,
-                        "generation": generation,
-                        "input_sha256": _segment_input_hash(
-                            segment,
-                            by_id,
-                            glossary=project_segment_glossary(
-                                _augmentation_blocks(segment, by_id), glossary,
-                            ),
-                            extra={
-                                "evidence": segment_evidence_by_id[str(segment_id)],
-                                "names": protected_names,
-                                "paper_context": _full_paper_context(
-                                    bundle.document, segment, blocks_by_id=by_id, options=options
-                                ),
-                                "runtime_access": _generation_runtime_policy(options),
-                                **(
-                                    {"intent_guidance": _intent_guidance_identity(intent_guidance)}
-                                    if intent_guidance is not None else {}
-                                ),
-                                "domain_context": domain_context,
-                            },
+                _write_annotation_checkpoint(
+                    checkpoint_dir,
+                    segment=segment,
+                    generation=generation,
+                    annotation=value,
+                    input_sha256=_annotation_checkpoint_input_sha256(
+                        segment,
+                        bundle=bundle,
+                        blocks_by_id=by_id,
+                        options=options,
+                        segment_glossary=project_segment_glossary(
+                            _augmentation_blocks(segment, by_id), glossary,
                         ),
-                        "annotation": value,
-                    },
+                        segment_evidence=segment_evidence_by_id[str(segment_id)],
+                        protected_names=protected_names,
+                        domain_context=domain_context,
+                        intent_guidance=intent_guidance,
+                    ),
                 )
                 if accepted_callback is not None:
                     accepted_callback("annotation", str(segment_id), value)
@@ -7767,18 +8107,39 @@ def _review(
                 "model_tier": REVIEW_TIER,
             })
             path = checkpoint_dir / "section-reviews" / f"{index:04d}.json"
+            invalid_matching_checkpoint = False
             if path.is_file() and not force_review:
                 checkpoint = read_json(path)
-                if (
+                try:
+                    checkpoint_review = _normalize_sparse_review_patches(
+                        checkpoint.get("review")
+                        if isinstance(checkpoint, dict) else None,
+                        block_order_by_segment=_review_patch_block_order(chunk),
+                        scope="section review checkpoint",
+                    )
+                except RuntimeError:
+                    # A conflicting or malformed cached patch is not trusted,
+                    # but it also must not prevent a fresh provider review.
+                    checkpoint_review = None
+                checkpoint_matches = (
                     isinstance(checkpoint, dict)
                     and checkpoint.get("schema_version") == SECTION_REVIEW_CHECKPOINT_VERSION
                     and checkpoint.get("input_sha256") == input_sha256
-                    and _section_review_validation_error(
-                        checkpoint.get("review"), chunk
-                    ) is None
-                ):
-                    return checkpoint["review"], "checkpoint-reuse", []
-            value = recovered_reviews.get(index)
+                )
+                checkpoint_validation_error = _section_review_validation_error(
+                    checkpoint_review, chunk
+                )
+                if checkpoint_matches and checkpoint_validation_error is None:
+                    if checkpoint_review != checkpoint.get("review"):
+                        checkpoint = {**checkpoint, "review": checkpoint_review}
+                        write_json(path, checkpoint)
+                    return checkpoint_review, "checkpoint-reuse", []
+                invalid_matching_checkpoint = bool(checkpoint_matches)
+            value = (
+                None
+                if invalid_matching_checkpoint
+                else recovered_reviews.get(index)
+            )
             disposition = "recovered-reuse" if value is not None else "provider-call"
             if value is None:
                 value = _llm_call(
@@ -7809,6 +8170,11 @@ def _review(
                         "findings": list(value.get("findings") or []),
                         "patches": [],
                     }
+            value = _normalize_sparse_review_patches(
+                value,
+                block_order_by_segment=_review_patch_block_order(chunk),
+                scope="section review",
+            )
             validation_error = _section_review_validation_error(value, chunk)
             if validation_error is not None:
                 raise RuntimeError(f"section review {index} {validation_error}")
@@ -7915,6 +8281,14 @@ def _review(
             stage="hierarchical-final" if hierarchical else "direct-final",
             audit_sink=final_evidence_round_audits,
         ),
+    )
+    review = _normalize_sparse_review_patches(
+        review,
+        block_order_by_segment={
+            str(segment["segment_id"]): _augmentation_block_ids(segment, by_id)
+            for segment in segments
+        },
+        scope="final review",
     )
     review_call_audits.append(_review_prompt_call_audit(
         final_rendered,
@@ -11597,6 +11971,9 @@ def _load_recovered_section_reviews(
             "findings": item.get("findings"),
             "patches": item.get("patches") or item.get("patch_proposals") or [],
         }
+        review = _normalize_sparse_review_patches(
+            review, scope="recovered section review",
+        )
         validation_error = _section_review_validation_error(
             review,
             [
@@ -11642,6 +12019,143 @@ def _section_review_patch_proposals(
     """Preserve already sparse, schema-validated section patches."""
     valid_ids = {str(item["segment"]["segment_id"]) for item in chunk}
     return [dict(item) for item in patches if str(item.get("segment_id") or "") in valid_ids]
+
+
+_SPARSE_REVIEW_PATCH_FIELDS = (
+    "commentary",
+    "explanation",
+    "commentary_sources",
+    "prior_work",
+    "later_work",
+)
+
+
+def _review_patch_block_order(
+    chunk: Sequence[Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    return {
+        str((item.get("segment") or {}).get("segment_id") or ""): [
+            str(value)
+            for value in (
+                (item.get("segment") or {}).get("augmentation_block_ids") or []
+            )
+        ]
+        for item in chunk
+        if isinstance(item, Mapping) and isinstance(item.get("segment"), Mapping)
+    }
+
+
+def _normalize_sparse_review_patches(
+    review: Any,
+    *,
+    block_order_by_segment: Mapping[str, Sequence[str]] | None = None,
+    scope: str = "review",
+) -> Any:
+    """Merge compatible same-segment sparse patches without hiding conflicts.
+
+    Patch reasons are audit metadata rather than replacement fields. Distinct
+    reasons are retained in first-seen order on the merged patch.
+    """
+
+    if not isinstance(review, dict) or not isinstance(review.get("patches"), list):
+        return review
+    patches = review["patches"]
+    if any(not isinstance(item, dict) for item in patches):
+        return review
+
+    block_order_by_segment = block_order_by_segment or {}
+    merged_by_segment: dict[str, dict[str, Any]] = {}
+    translation_blocks_by_segment: dict[str, dict[str, dict[str, Any]]] = {}
+    translation_order_by_segment: dict[str, list[str]] = {}
+    translation_present: set[str] = set()
+    reasons_by_segment: dict[str, list[str]] = {}
+    order: list[str] = []
+    for raw_patch in patches:
+        patch = dict(raw_patch)
+        segment_id = str(patch.get("segment_id") or "")
+        if segment_id not in merged_by_segment:
+            merged_by_segment[segment_id] = {
+                **patch,
+                **{field: None for field in _SPARSE_REVIEW_PATCH_FIELDS},
+                "translation_blocks": None,
+            }
+            translation_blocks_by_segment[segment_id] = {}
+            translation_order_by_segment[segment_id] = []
+            reasons_by_segment[segment_id] = []
+            order.append(segment_id)
+        merged = merged_by_segment[segment_id]
+        for field in _SPARSE_REVIEW_PATCH_FIELDS:
+            incoming = patch.get(field)
+            if incoming is None:
+                continue
+            existing = merged.get(field)
+            if existing is None:
+                merged[field] = incoming
+            elif canonical_sha256(existing) != canonical_sha256(incoming):
+                raise RuntimeError(
+                    f"{scope} returned conflicting patches for "
+                    f"{segment_id} field {field}"
+                )
+        incoming_blocks = patch.get("translation_blocks")
+        if incoming_blocks is not None:
+            translation_present.add(segment_id)
+            if not isinstance(incoming_blocks, list):
+                raise RuntimeError(
+                    f"{scope} returned malformed translation blocks for {segment_id}"
+                )
+            blocks_by_id = translation_blocks_by_segment[segment_id]
+            first_seen = translation_order_by_segment[segment_id]
+            for block in incoming_blocks:
+                if not isinstance(block, dict) or not str(block.get("block_id") or ""):
+                    raise RuntimeError(
+                        f"{scope} returned malformed translation blocks for {segment_id}"
+                    )
+                current_block_id = str(block["block_id"])
+                existing_block = blocks_by_id.get(current_block_id)
+                if existing_block is None:
+                    blocks_by_id[current_block_id] = dict(block)
+                    first_seen.append(current_block_id)
+                elif canonical_sha256(existing_block) != canonical_sha256(block):
+                    raise RuntimeError(
+                        f"{scope} returned conflicting patches for {segment_id} "
+                        f"translation block {current_block_id}"
+                    )
+        reason = patch.get("reason")
+        if isinstance(reason, str) and reason not in reasons_by_segment[segment_id]:
+            reasons_by_segment[segment_id].append(reason)
+
+    normalized: list[dict[str, Any]] = []
+    for segment_id in order:
+        patch = merged_by_segment[segment_id]
+        translation_blocks = translation_blocks_by_segment[segment_id]
+        if segment_id in translation_present:
+            source_order = {
+                str(block_id): index
+                for index, block_id in enumerate(
+                    block_order_by_segment.get(segment_id) or []
+                )
+            }
+            first_seen_order = {
+                block_id: index
+                for index, block_id in enumerate(
+                    translation_order_by_segment[segment_id]
+                )
+            }
+            ordered_block_ids = sorted(
+                translation_blocks,
+                key=lambda block_id: (
+                    source_order.get(block_id, len(source_order)),
+                    first_seen_order[block_id],
+                ),
+            )
+            patch["translation_blocks"] = [
+                translation_blocks[block_id] for block_id in ordered_block_ids
+            ]
+        reasons = reasons_by_segment[segment_id]
+        if reasons:
+            patch["reason"] = "; ".join(reasons)
+        normalized.append(patch)
+    return {**review, "patches": normalized}
 
 
 def _utf8_size(value: str) -> int:

@@ -33,18 +33,38 @@ def render_content(
     root = project_dir.resolve()
     started = time.monotonic()
     lock = ProjectBuildLock(root / ".arc-companion" / "render.lock")
+    build_lock = ProjectBuildLock(root / ".arc-companion-build.lock")
     try:
         lock.acquire()
     except BuildInProgressError as exc:
         return err("render_in_progress", str(exc), mode=RENDER_MODE, provider_calls=0)
     try:
+        build_lock.acquire()
+    except BuildInProgressError as exc:
+        lock.release()
+        return err("render_in_progress", str(exc), mode=RENDER_MODE, provider_calls=0)
+    web_commit: tuple[Path, bytes | None] | None = None
+    state_committed = False
+    try:
         state = _state(root)
-        digest = content_sha256 or str((state.get("published") or {}).get("content_sha256") or "")
+        published_digest = str(
+            (state.get("published") or {}).get("content_sha256") or ""
+        )
+        digest = content_sha256 or published_digest
         if not digest:
             return err(
                 "content_bundle_not_found",
                 "No last-complete reviewed-content object is published for this project",
                 mode=RENDER_MODE,
+                provider_calls=0,
+            )
+        if format != "all" and digest != published_digest:
+            return err(
+                "content_digest_requires_full_render",
+                "Rendering a different reviewed-content digest requires format=all",
+                mode=RENDER_MODE,
+                content_sha256=digest,
+                published_content_sha256=published_digest or None,
                 provider_calls=0,
             )
         try:
@@ -68,6 +88,8 @@ def render_content(
             phase = time.monotonic()
             from .web import publish_reader
 
+            index_path = root / "reader" / "index.html"
+            previous_index = index_path.read_bytes() if index_path.is_file() else None
             overrides = {"status": "complete", **content}
             web = publish_reader(
                 root,
@@ -82,10 +104,15 @@ def render_content(
                 },
                 final_overrides=overrides,
             )
+            web_commit = (index_path, previous_index)
             published["web"] = web
             phase_times["web"] = time.monotonic() - phase
         phase_times["total"] = time.monotonic() - started
-        final_state = _publish_state(root, state, content_sha256=digest, outputs=published)
+        final_state = _publish_state(
+            root, content_sha256=digest, outputs=published,
+            render_format=format,
+        )
+        state_committed = True
         data = {
             "mode": RENDER_MODE,
             "format": format,
@@ -99,15 +126,27 @@ def render_content(
         data.update({key: value for key, value in pdf.items() if key.startswith("output_")})
         data.update({key: value for key, value in web.items() if key.startswith("output_")})
         return ok(data)
-    except Exception as exc:
+    except BaseException as exc:
+        rollback_error: Exception | None = None
+        if web_commit is not None and not state_committed:
+            try:
+                _restore_web_index(*web_commit)
+            except Exception as restore_exc:  # pragma: no cover - filesystem failure
+                rollback_error = restore_exc
+        if not isinstance(exc, Exception):
+            raise
         # The commit is the state write after every requested renderer succeeds.
         # Candidate files are atomic and state still points at the prior revision.
+        message = str(exc)
+        if rollback_error is not None:
+            message += f"; web rollback failed: {rollback_error}"
         return err(
-            "render_failed", str(exc), mode=RENDER_MODE,
+            "render_failed", message, mode=RENDER_MODE,
             content_sha256=content_sha256, provider_calls=0,
             elapsed_seconds=time.monotonic() - started,
         )
     finally:
+        build_lock.release()
         lock.release()
 
 
@@ -209,11 +248,14 @@ def _publish_replace(source: Path, target: Path) -> None:
 
 def _publish_state(
     root: Path,
-    state: dict[str, Any],
     *,
     content_sha256: str,
     outputs: dict[str, Any],
+    render_format: str,
 ) -> dict[str, Any]:
+    # Rendering is serialized with generation, but re-read at the commit point
+    # so a state update made after the initial content lookup is never lost.
+    state = _state(root)
     published = dict(state.get("published") or {})
     published["content_sha256"] = content_sha256
     for lane, value in outputs.items():
@@ -227,9 +269,74 @@ def _publish_state(
     }
     if not revisions or {k: v for k, v in revisions[-1].items() if k != "published_at"} != {k: v for k, v in revision.items() if k != "published_at"}:
         revisions.append(revision)
-    merged = {**state, "schema_version": "arc.companion.state.v3", "published": published, "revisions": revisions}
+    merged = {
+        **state,
+        "schema_version": "arc.companion.state.v3",
+        "published": published,
+        "revisions": revisions,
+    }
     for value in outputs.values():
         merged.update(value)
+    if _repairs_current_render_failure(
+        state, content_sha256=content_sha256, render_format=render_format,
+    ):
+        merged["status"] = "complete"
+        merged.pop("error", None)
+        active_run = merged.get("active_run")
+        if (
+            isinstance(active_run, dict)
+            and active_run.get("status") == "failed"
+            and active_run.get("content_sha256") == content_sha256
+            and _is_render_error(active_run.get("error"))
+        ):
+            active_run = {**active_run, "status": "complete"}
+            active_run.pop("error", None)
+            merged["active_run"] = active_run
     merged["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json(root / "state.json", merged)
     return merged
+
+
+def _repairs_current_render_failure(
+    state: dict[str, Any], *, content_sha256: str, render_format: str,
+) -> bool:
+    """Return true only when an all-format render repairs this exact run."""
+
+    if (
+        render_format != "all"
+        or state.get("status") != "failed"
+        or state.get("content_sha256") != content_sha256
+    ):
+        return False
+    return _is_render_error(state.get("error"))
+
+
+def _is_render_error(error: Any) -> bool:
+    if isinstance(error, dict):
+        code = str(error.get("code") or "").casefold()
+        return code in {
+            "render_failed", "pdf_failed", "latex_failed", "typeset_failed",
+            "companion_pdf_failed",
+        }
+    message = str(error or "")
+    return message.startswith((
+        "XeLaTeX compilation failed:",
+        "source fidelity validation failed:",
+        "PDF validation failed:",
+        "PDF inspection failed:",
+    ))
+
+
+def _restore_web_index(path: Path, previous: bytes | None) -> None:
+    """Restore the sole mutable web entry point after a later commit failure."""
+
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.rollback")
+    try:
+        temporary.write_bytes(previous)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

@@ -11,7 +11,11 @@ import threading
 import pytest
 
 import arc_companion.pipeline as pipeline
-from arc_companion.artifact_store import AcceptedArtifactStore, canonical_sha256
+from arc_companion.artifact_store import (
+    AcceptedArtifactStore,
+    artifact_id_for,
+    canonical_sha256,
+)
 from arc_companion.chapter_scheduler import run_chapter_pipeline
 from arc_companion.ledger import initialize_lane_ledger, mark_needs_supervision
 from arc_companion.pipeline import BuildOptions, build_companion
@@ -231,7 +235,6 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
     }), encoding="utf-8")
     labels: list[str] = []
     prompts: list[str] = []
-    result_calls: list[dict[str, object]] = []
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
@@ -267,13 +270,6 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
             return {"issues": [], "patches": []}
         raise AssertionError(label)
 
-    def result_llm(prompt: str, **kwargs):
-        result_calls.append(dict(kwargs))
-        return SimpleNamespace(
-            value=llm(prompt, **kwargs),
-            logical_receipt={"idempotency_key": kwargs["idempotency_key"]},
-        )
-
     result = build_companion(
         BuildOptions(
             paper_id=bundle.paper_id,
@@ -287,7 +283,6 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
         ),
         source_loader=lambda *args, **kwargs: bundle,
         llm=llm,
-        result_llm=result_llm,
         compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
         pdf_validator=lambda path: {"bytes": path.stat().st_size},
     )
@@ -298,7 +293,6 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
     assert not any("glossary" in label for label in labels)
     assert all("GLOSSARY:\n" not in prompt for prompt in prompts)
     assert all("OLD_GLOSSARY_SENTINEL" not in prompt for prompt in prompts)
-    assert not any(":translation:" in str(call.get("idempotency_key")) for call in result_calls)
     assert not list((checkpoint / "chapters").rglob("translation-ledger.json"))
     assert not list(checkpoint.rglob("translations*"))
     assert not (checkpoint / "glossary.json").exists()
@@ -337,6 +331,41 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
     assert "Source Index Marker" in tex
     assert manifest["companion_layers"]["translation_mode"] is False
     assert manifest["companion_layers"]["rendered_translation_segment_ids"] == []
+
+    # Raw/custom LLM adapters do not expose provider receipts, so accepted
+    # commentary is checkpoint-backed rather than object-store-backed. A
+    # partial resume must still rehydrate it without another model call.
+    assert not (
+        tmp_path / "run" / ".arc-companion" / "objects" / "commentary"
+    ).exists()
+    annotation_calls_before = len([
+        label for label in labels if label.startswith("companion-annotation-")
+    ])
+    active_state = json.loads((tmp_path / "run" / "state.json").read_text())
+    active_state["status"] = "active"
+    (tmp_path / "run" / "state.json").write_text(json.dumps(active_state))
+    (checkpoint / "first-chapter-freeze.json").unlink()
+
+    resumed = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "run",
+            annotation_language="en",
+            workers=2,
+            skip_translation=True,
+            stop_after_first_chapter=True,
+            legacy_checkpoint=legacy,
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert resumed["ok"], resumed
+    assert len([
+        label for label in labels if label.startswith("companion-annotation-")
+    ]) == annotation_calls_before
 
 
 def test_structural_only_chapter_uses_local_receipts_without_provider_calls(
@@ -409,6 +438,256 @@ def test_structural_only_chapter_uses_local_receipts_without_provider_calls(
         assert ledger["blocks"][0]["submission_state"] == "not_submitted"
     review = json.loads((checkpoint / "chapter-review.json").read_text())
     assert review["reviewed_segment_ids"] == []
+
+
+def test_targeted_commentary_regeneration_rebinds_deferred_suffix(
+    tmp_path: Path,
+) -> None:
+    blocks = [
+        {"block_id": "c1", "type": "section", "title": "Chapter One"},
+        {"block_id": "p1", "type": "text", "text": "First claim."},
+        {"block_id": "p2", "type": "text", "text": "Second claim."},
+    ]
+    document = {
+        "schema_version": "arc.paper.document.v2", "front_matter": {},
+        "blocks": blocks, "equations": [], "figures": [], "tables": [],
+        "assets": [], "links": [], "bibliography": [],
+        "integrity": {"status": "complete", "document_hash": "deferred-commentary"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:deferred-commentary", document=document,
+        parsed={
+            "paper_id": "local:deferred-commentary", "document": document,
+            "source_hash": "deferred-commentary",
+            "structure": {"document_kind": "book", "chapters": [{
+                "title": "Chapter One", "block_ids": ["c1", "p1", "p2"],
+            }]},
+        },
+        metadata={"title": "Deferred commentary"}, references=[], citers=[],
+    )
+    labels: list[str] = []
+    annotation_generation = 0
+
+    def llm(_prompt: str, **kwargs):
+        nonlocal annotation_generation
+        label = str(kwargs["call_label"])
+        labels.append(label)
+        if label.startswith("companion-guide-"):
+            return {
+                "motivation": None, "main_content": "Two claims.",
+                "section_logic": None, "prerequisites": None,
+                "pedagogical_comparison": None, "historical_context": [],
+                "supplementary_reading": [],
+            }
+        if label.startswith("companion-segmentation-"):
+            return {"cut_after_ordinals": [2]}
+        if label.startswith("companion-annotation-"):
+            annotation_generation += 1
+            return {
+                "explanation": f"Explanation {annotation_generation}.",
+                "commentary": "", "prior_work": [], "later_work": [],
+                "context_claims": [], "evidence_ids": [], "key_points": [],
+                "source_notes": [], "evidence_requests": [],
+            }
+        if label.startswith("companion-commentary-review-"):
+            return {"issues": [], "patches": []}
+        raise AssertionError(label)
+
+    def result_llm(prompt: str, **kwargs):
+        return SimpleNamespace(
+            value=llm(prompt, **kwargs),
+            logical_receipt={"idempotency_key": kwargs["idempotency_key"]},
+        )
+
+    project = tmp_path / "run"
+    options = BuildOptions(
+        paper_id=bundle.paper_id, project_dir=project,
+        annotation_language="en", skip_translation=True, workers=1,
+    )
+    first = build_companion(
+        options, source_loader=lambda *args, **kwargs: bundle,
+        llm=llm, result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+    assert first["ok"], first
+    initial_calls = [
+        label for label in labels if label.startswith("companion-annotation-")
+    ]
+    assert len(initial_calls) == 2
+
+    regenerated = build_companion(
+        BuildOptions(
+            **{
+                **options.__dict__,
+                "regenerate_segments": ("commentary:ch-0001.seg-0001",),
+            }
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm, result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert regenerated["ok"], regenerated
+    final_calls = [
+        label for label in labels if label.startswith("companion-annotation-")
+    ]
+    assert len(final_calls) == len(initial_calls) + 1
+    checkpoint = Path(regenerated["data"]["checkpoint_dir"])
+    ledger = json.loads((
+        checkpoint / "chapters" / "ch-0001" / "companion-ledger.json"
+    ).read_text())
+    suffix = next(
+        block for block in ledger["blocks"]
+        if block["segment_id"] == "ch-0001.seg-0002"
+    )
+    assert suffix["state"] == "accepted"
+    assert suffix["validation_receipt"]["reuse_status"] == "deferred_hit"
+    assert suffix["validation_receipt"]["object_store_revalidated"] is True
+    rebound_id = suffix["logical_receipt"]["artifact_id"]
+    source_id = suffix["logical_receipt"]["source_artifact_id"]
+    assert rebound_id == source_id
+    direct_id = artifact_id_for(
+        kind="commentary",
+        semantic_input_sha256=suffix["input_sha256"],
+        output_sha256=suffix["output_sha256"],
+        contract_version=pipeline.SCHEMA_VERSION,
+        predecessor_accepted_chain_sha256=(
+            suffix["predecessor_accepted_chain_sha256"]
+        ),
+    )
+    rebound = AcceptedArtifactStore(project).read("commentary", direct_id)
+    assert rebound["provenance"]["derived_from_artifact_id"] == source_id
+
+
+def test_stateless_targeted_deferred_commentary_resumes_from_current_checkpoint(
+    tmp_path: Path,
+) -> None:
+    blocks = [
+        {"block_id": "c1", "type": "section", "title": "Chapter One"},
+        {"block_id": "p1", "type": "text", "text": "First claim."},
+        {"block_id": "p2", "type": "text", "text": "Second claim."},
+    ]
+    document = {
+        "schema_version": "arc.paper.document.v2", "front_matter": {},
+        "blocks": blocks, "equations": [], "figures": [], "tables": [],
+        "assets": [], "links": [], "bibliography": [],
+        "integrity": {"status": "complete", "document_hash": "stateless-deferred"},
+    }
+    bundle = SourceBundle(
+        paper_id="local:stateless-deferred", document=document,
+        parsed={
+            "paper_id": "local:stateless-deferred", "document": document,
+            "source_hash": "stateless-deferred",
+            "structure": {"document_kind": "book", "chapters": [{
+                "title": "Chapter One", "block_ids": ["c1", "p1", "p2"],
+            }]},
+        },
+        metadata={"title": "Stateless deferred commentary"},
+        references=[], citers=[],
+    )
+    labels: list[str] = []
+    annotation_generation = 0
+
+    def llm(_prompt: str, **kwargs):
+        nonlocal annotation_generation
+        label = str(kwargs["call_label"])
+        labels.append(label)
+        if label.startswith("companion-guide-"):
+            return {
+                "motivation": None, "main_content": "Two claims.",
+                "section_logic": None, "prerequisites": None,
+                "pedagogical_comparison": None, "historical_context": [],
+                "supplementary_reading": [],
+            }
+        if label.startswith("companion-segmentation-"):
+            return {"cut_after_ordinals": [2]}
+        if label.startswith("companion-annotation-"):
+            annotation_generation += 1
+            return {
+                "explanation": f"Explanation {annotation_generation}.",
+                "commentary": "", "prior_work": [], "later_work": [],
+                "context_claims": [], "evidence_ids": [], "key_points": [],
+                "source_notes": [], "evidence_requests": [],
+            }
+        if label.startswith("companion-commentary-review-"):
+            return {"issues": [], "patches": []}
+        raise AssertionError(label)
+
+    project = tmp_path / "run"
+    options = BuildOptions(
+        paper_id=bundle.paper_id, project_dir=project,
+        annotation_language="en", skip_translation=True, workers=1,
+    )
+    compile_failure = {"enabled": False}
+
+    def compiler(_tex: Path, pdf: Path) -> None:
+        if compile_failure["enabled"]:
+            raise RuntimeError("injected failure after deferred acceptance")
+        pdf.write_bytes(b"%PDF fixture")
+
+    first = build_companion(
+        options, source_loader=lambda *args, **kwargs: bundle,
+        llm=llm, compiler=compiler,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+    assert first["ok"], first
+    assert list(AcceptedArtifactStore(project).iter_kind("commentary")) == []
+    initial_annotation_calls = len([
+        label for label in labels if label.startswith("companion-annotation-")
+    ])
+    assert initial_annotation_calls == 2
+
+    compile_failure["enabled"] = True
+    failed = build_companion(
+        BuildOptions(
+            **{
+                **options.__dict__,
+                "regenerate_segments": ("commentary:ch-0001.seg-0001",),
+            }
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=llm, compiler=compiler,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+    assert not failed["ok"]
+    assert len([
+        label for label in labels if label.startswith("companion-annotation-")
+    ]) == initial_annotation_calls + 1
+
+    checkpoint = Path(json.loads((project / "state.json").read_text())["checkpoint_dir"])
+    ledger_path = checkpoint / "chapters" / "ch-0001" / "companion-ledger.json"
+    failed_ledger = json.loads(ledger_path.read_text())
+    suffix = next(
+        block for block in failed_ledger["blocks"]
+        if block["segment_id"] == "ch-0001.seg-0002"
+    )
+    assert suffix["state"] == "accepted"
+    assert suffix["generation"] == 2
+    suffix_checkpoints = list((checkpoint / "annotations" / "generation-2").glob("*.json"))
+    assert any(
+        json.loads(path.read_text())["segment_id"] == "ch-0001.seg-0002"
+        for path in suffix_checkpoints
+    )
+    accepted_chain = failed_ledger["accepted_chain_sha256"]
+
+    compile_failure["enabled"] = False
+    resume_calls: list[str] = []
+
+    def forbid_provider(_prompt: str, **kwargs):
+        resume_calls.append(str(kwargs.get("call_label") or ""))
+        raise AssertionError("resume must use accepted local checkpoints")
+
+    resumed = build_companion(
+        options, source_loader=lambda *args, **kwargs: bundle,
+        llm=forbid_provider, compiler=compiler,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert resumed["ok"], resumed
+    assert resume_calls == []
+    assert json.loads(ledger_path.read_text())["accepted_chain_sha256"] == accepted_chain
 
 
 def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> None:
@@ -520,6 +799,43 @@ def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> 
     assert freeze["schema_version"] == "arc.companion.first-chapter-freeze.v3"
     assert freeze["translation_mode"] == "enabled"
     assert freeze["translation_sha256"] and freeze["annotation_sha256"]
+
+    checkpoint = Path(result["data"]["checkpoint_dir"])
+    commentary_ledger_path = (
+        checkpoint / "chapters" / "ch-0001" / "companion-ledger.json"
+    )
+    commentary_chain = json.loads(
+        commentary_ledger_path.read_text()
+    )["accepted_chain_sha256"]
+    annotation_checkpoints = list((checkpoint / "annotations").glob("*.json"))
+    assert len(annotation_checkpoints) == 1
+    annotation_checkpoints[0].unlink()
+    active_state = json.loads((tmp_path / "run" / "state.json").read_text())
+    active_state["status"] = "active"
+    (tmp_path / "run" / "state.json").write_text(json.dumps(active_state))
+    (checkpoint / "first-chapter-freeze.json").unlink()
+    annotation_calls_before = len([
+        label for label in labels if label.startswith("companion-annotation-")
+    ])
+
+    restored = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id, project_dir=tmp_path / "run",
+            workers=4, stop_after_first_chapter=True,
+        ),
+        source_loader=lambda *args, **kwargs: bundle, llm=llm,
+        result_llm=result_llm,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert restored["status"] == "first_chapter_ready"
+    assert len([
+        label for label in labels if label.startswith("companion-annotation-")
+    ]) == annotation_calls_before
+    assert json.loads(
+        commentary_ledger_path.read_text()
+    )["accepted_chain_sha256"] == commentary_chain
 
     freeze["guide_sha256"] = "tampered"
     freeze_path = Path(result["data"]["checkpoint_dir"]) / "first-chapter-freeze.json"

@@ -172,6 +172,200 @@ def test_tampered_object_is_never_reused(tmp_path: Path) -> None:
         store.read("commentary", record["artifact_id"])
 
 
+def test_accepted_block_read_is_bound_to_ledger_hashes_and_segment(
+    tmp_path: Path,
+) -> None:
+    store = AcceptedArtifactStore(tmp_path)
+    output = {
+        "explanation": "accepted explanation",
+        "commentary": "accepted commentary",
+        "commentary_sources": [],
+        "prior_work": [],
+        "later_work": [],
+    }
+    block = _accepted_block(output)
+    record = store.put_accepted(
+        kind="commentary",
+        semantic_input_sha256=block["input_sha256"],
+        recipe_sha256=canonical_sha256("recipe"),
+        contract_version="commentary.v1",
+        output=output,
+        ledger_block=block,
+        provider_receipt={
+            "provider": "p", "model": "m", "call_id": "c", "usage": {},
+        },
+        provenance={"run_id": "run"},
+    )
+
+    restored = store.read_for_accepted_block(
+        kind="commentary",
+        contract_version="commentary.v1",
+        ledger_block=block,
+        output_validator=lambda value: value.get("commentary") == "accepted commentary",
+    )
+    assert restored["artifact_id"] == record["artifact_id"]
+    assert restored["output"] == output
+
+    rebound_block = {
+        **block,
+        "input_sha256": canonical_sha256({"source": "current"}),
+        "validation_receipt": {
+            "local_validation": True,
+            "object_store_revalidated": True,
+        },
+        "logical_receipt": {
+            "kind": "accepted_artifact_reuse",
+            "artifact_id": record["artifact_id"],
+            "provider_calls": 0,
+        },
+    }
+    rebound_block["accepted_chain_sha256"] = hashlib.sha256(json.dumps({
+        "predecessor": rebound_block["predecessor_accepted_chain_sha256"],
+        "segment_id": rebound_block["segment_id"],
+        "input_sha256": rebound_block["input_sha256"],
+        "output_sha256": rebound_block["output_sha256"],
+        "generation": rebound_block["generation"],
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    rebound_before = json.loads(json.dumps(rebound_block))
+
+    rebound = store.read_for_accepted_block(
+        kind="commentary",
+        contract_version="commentary.v1",
+        ledger_block=rebound_block,
+        output_validator=lambda value: value.get("commentary") == "accepted commentary",
+    )
+
+    assert rebound["artifact_id"] != record["artifact_id"]
+    assert rebound["semantic_input_sha256"] == rebound_block["input_sha256"]
+    assert rebound["output_sha256"] == rebound_block["output_sha256"]
+    assert rebound["provenance"]["derived_from_artifact_id"] == record["artifact_id"]
+    assert store.path_for("commentary", rebound["artifact_id"]).is_file()
+    assert rebound_block == rebound_before
+
+    wrong_output = {**block, "output_sha256": "f" * 64}
+    wrong_output["logical_receipt"] = {
+        "kind": "accepted_artifact_reuse",
+        "artifact_id": record["artifact_id"], "provider_calls": 0,
+    }
+    wrong_output["validation_receipt"] = {
+        "local_validation": True, "object_store_revalidated": True,
+    }
+    wrong_output["accepted_chain_sha256"] = hashlib.sha256(json.dumps({
+        "predecessor": wrong_output["predecessor_accepted_chain_sha256"],
+        "segment_id": wrong_output["segment_id"],
+        "input_sha256": wrong_output["input_sha256"],
+        "output_sha256": wrong_output["output_sha256"],
+        "generation": wrong_output["generation"],
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    with pytest.raises(ArtifactStoreError, match="output does not match"):
+        store.read_for_accepted_block(
+            kind="commentary", contract_version="commentary.v1",
+            ledger_block=wrong_output,
+        )
+
+    wrong_segment = {**block, "segment_id": "ch-0001.seg-9999"}
+    wrong_segment["logical_receipt"] = {
+        "kind": "accepted_artifact_reuse",
+        "artifact_id": record["artifact_id"], "provider_calls": 0,
+    }
+    wrong_segment["validation_receipt"] = {
+        "local_validation": True, "object_store_revalidated": True,
+    }
+    wrong_segment["accepted_chain_sha256"] = hashlib.sha256(json.dumps({
+        "predecessor": wrong_segment["predecessor_accepted_chain_sha256"],
+        "segment_id": wrong_segment["segment_id"],
+        "input_sha256": wrong_segment["input_sha256"],
+        "output_sha256": wrong_segment["output_sha256"],
+        "generation": wrong_segment["generation"],
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    with pytest.raises(ArtifactStoreError, match="segment does not match"):
+        store.read_for_accepted_block(
+            kind="commentary", contract_version="commentary.v1",
+            ledger_block=wrong_segment,
+        )
+
+    with pytest.raises(ArtifactStoreError, match="current output contract"):
+        store.read_for_accepted_block(
+            kind="commentary", contract_version="commentary.v1",
+            ledger_block=block, output_validator=lambda _value: False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("logical_kind", "validation_receipt", "message"),
+    [
+        (
+            "provider_call", {
+                "local_validation": True, "object_store_revalidated": True,
+            }, "accepted-artifact reuse receipt",
+        ),
+        (
+            "accepted_artifact_reuse", {"local_validation": True},
+            "explicit local object revalidation",
+        ),
+        (
+            "accepted_artifact_reuse", {"object_store_revalidated": True},
+            "explicit local object revalidation",
+        ),
+    ],
+)
+def test_historical_rebind_requires_explicit_reuse_validation_receipts(
+    tmp_path: Path,
+    logical_kind: str,
+    validation_receipt: dict[str, bool],
+    message: str,
+) -> None:
+    store = AcceptedArtifactStore(tmp_path)
+    output = {
+        "explanation": "accepted explanation",
+        "commentary": "accepted commentary",
+        "commentary_sources": [],
+        "prior_work": [],
+        "later_work": [],
+    }
+    original = _accepted_block(output)
+    record = store.put_accepted(
+        kind="commentary",
+        semantic_input_sha256=original["input_sha256"],
+        recipe_sha256=canonical_sha256("recipe"),
+        contract_version="commentary.v1",
+        output=output,
+        ledger_block=original,
+        provider_receipt={
+            "provider": "p", "model": "m", "call_id": "c", "usage": {},
+        },
+        provenance={"run_id": "run"},
+    )
+    rebound = {
+        **original,
+        "input_sha256": canonical_sha256({
+            "source": logical_kind,
+            "validation_receipt": validation_receipt,
+        }),
+        "validation_receipt": validation_receipt,
+        "logical_receipt": {
+            "kind": logical_kind,
+            "artifact_id": record["artifact_id"],
+            "provider_calls": 0,
+        },
+    }
+    rebound["accepted_chain_sha256"] = hashlib.sha256(json.dumps({
+        "predecessor": rebound["predecessor_accepted_chain_sha256"],
+        "segment_id": rebound["segment_id"],
+        "input_sha256": rebound["input_sha256"],
+        "output_sha256": rebound["output_sha256"],
+        "generation": rebound["generation"],
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    with pytest.raises(ArtifactStoreError, match=message):
+        store.read_for_accepted_block(
+            kind="commentary",
+            contract_version="commentary.v1",
+            ledger_block=rebound,
+            output_validator=lambda _value: True,
+        )
+
+
 def test_recipe_change_is_stale_zero_call_but_semantic_change_is_miss(tmp_path: Path) -> None:
     store = AcceptedArtifactStore(tmp_path)
     output = {"blocks": [{"block_id": "b1", "text": "译文"}]}

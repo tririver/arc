@@ -28,7 +28,11 @@ class LatexError(RuntimeError):
 
 
 def escape_tex(value: Any) -> str:
-    text = str(value or "")
+    # U+141F CANADIAN SYLLABICS FINAL ACUTE is visually confusable with a
+    # fraction slash but has no useful mathematical semantics. Model output
+    # occasionally substitutes it for an ordinary slash; normalize that one
+    # confusable before escaping so the PDF remains searchable as plain text.
+    text = str(value or "").replace("\u141f", "/")
     preserve_greek_letters = _looks_like_greek_prose(text)
     replacements = {
         "\\": r"\textbackslash{}",
@@ -95,6 +99,11 @@ _UNICODE_MATH_SYMBOLS = {
     "∫": r"\int", "ℓ": r"\ell",
     "⟨": r"\langle", "⟩": r"\rangle", "∙": r"\mathbin{\cdot}", "Ḣ": r"\dot{H}",
     "ℒ": r"\mathcal{L}", "ℋ": r"\mathcal{H}", "ℏ": r"\hbar",
+    # Common mathematical symbols also occur in otherwise-natural-language
+    # annotations. Render them as math atoms rather than asking the selected
+    # sans/CJK text font to contain a partial mathematical alphabet.
+    "−": "-", "√": r"\surd", "∂": r"\partial", "→": r"\to",
+    "⊥": r"\perp", "∥": r"\parallel",
 }
 
 _UNICODE_MATH_MODIFIERS = {
@@ -1263,7 +1272,7 @@ def _render_annotation(
         _layer_marker("COMPANION", "BEGIN", segment_id)
         +
         f"\\Needspace{{6\\baselineskip}}\n"
-        f"\\begin{{arccompanion}}\n"
+        + _begin_guarded_box("arccompanion")
         + "\n".join(sections)
         + "\n\\end{arccompanion}\n"
         + _layer_marker("COMPANION", "END", segment_id)
@@ -1304,7 +1313,7 @@ def _render_translation(
     }
     source_blocks = {block_id(item): item for item in document.get("blocks") or []}
     parts = [_layer_marker("TRANSLATION", "BEGIN", segment_id),
-             "\\begin{arctranslation}\n"]
+             _begin_guarded_box("arctranslation")]
     translated_block_ids: list[str] = []
     equation_block_ids: list[str] = []
     excluded_float_block_ids: list[str] = []
@@ -1341,6 +1350,14 @@ def _render_translation(
         "equation_block_ids": equation_block_ids,
         "excluded_float_block_ids": excluded_float_block_ids,
     }
+
+
+def _begin_guarded_box(environment: str) -> str:
+    """Begin a renderer-owned box without letting leading ``[`` become options."""
+
+    if environment not in {"arctranslation", "arccompanion", "arcchapterguide"}:
+        raise LatexError(f"unknown guarded box environment: {environment}")
+    return f"\\begin{{{environment}}}\\relax\n"
 
 
 _OPAQUE_INLINE_PATTERN = re.compile(r"\[\[ARC_INLINE:([^\]\s]+):([0-9a-f]{64})\]\]")
@@ -1775,8 +1792,9 @@ def _render_chapter_guide(guide: dict[str, Any], *, language: str) -> str:
             )
     heading = "章导读" if str(language).lower().startswith("zh") else "Chapter guide"
     return (
-        f"% ARC-CHAPTER-GUIDE-BEGIN\n\\begin{{arcchapterguide}}\n"
-        f"\\noindent\\textbf{{{heading}}}\\par\n"
+        "% ARC-CHAPTER-GUIDE-BEGIN\n"
+        + _begin_guarded_box("arcchapterguide")
+        + f"\\noindent\\textbf{{{heading}}}\\par\n"
         + "".join(parts)
         + "\\end{arcchapterguide}\n% ARC-CHAPTER-GUIDE-END\n"
     )

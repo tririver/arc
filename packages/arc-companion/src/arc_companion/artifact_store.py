@@ -158,6 +158,133 @@ class AcceptedArtifactStore:
         self.validate(record, expected_kind=kind, expected_id=artifact_id)
         return record
 
+    def read_for_accepted_block(
+        self,
+        *,
+        kind: str,
+        contract_version: str,
+        ledger_block: Mapping[str, Any],
+        output_validator: Callable[[Any], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Read the immutable object bound to an already-accepted ledger block.
+
+        Provider-accepted blocks are read through the object id reconstructed
+        from the hashes that define immutable object identity.  Older reused
+        blocks may instead reference an object accepted under a previous
+        semantic input.  Such an object is first fully validated, then accepted
+        again under the current ledger block without changing the ledger chain.
+        In either case, output hash and segment identity must agree before the
+        output is returned.
+        """
+
+        if str(ledger_block.get("state") or "") != "accepted":
+            raise ArtifactStoreError("accepted artifact lookup requires an accepted ledger block")
+        segment_id = str(ledger_block.get("segment_id") or "")
+        if not segment_id:
+            raise ArtifactStoreError("accepted ledger block has no segment identity")
+        semantic_input_sha256 = str(ledger_block.get("input_sha256") or "")
+        output_sha256 = str(ledger_block.get("output_sha256") or "")
+        predecessor = str(
+            ledger_block.get("predecessor_accepted_chain_sha256") or ""
+        )
+        for digest, label in (
+            (semantic_input_sha256, "input_sha256"),
+            (output_sha256, "output_sha256"),
+            (predecessor, "predecessor_accepted_chain_sha256"),
+        ):
+            _validate_sha(digest, label)
+        accepted_chain = str(ledger_block.get("accepted_chain_sha256") or "")
+        _validate_sha(accepted_chain, "accepted_chain_sha256")
+        expected_chain = hashlib.sha256(json.dumps({
+            "predecessor": predecessor,
+            "segment_id": segment_id,
+            "input_sha256": semantic_input_sha256,
+            "output_sha256": output_sha256,
+            "generation": ledger_block.get("generation"),
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        if accepted_chain != expected_chain:
+            raise ArtifactStoreError("accepted ledger chain receipt is invalid")
+
+        artifact_id = artifact_id_for(
+            kind=kind,
+            semantic_input_sha256=semantic_input_sha256,
+            output_sha256=output_sha256,
+            contract_version=contract_version,
+            predecessor_accepted_chain_sha256=predecessor,
+        )
+        direct_path = self.path_for(kind, artifact_id)
+        if direct_path.is_file():
+            record = self.read(kind, artifact_id)
+        else:
+            logical_receipt = ledger_block.get("logical_receipt")
+            referenced_id = (
+                str(logical_receipt.get("artifact_id") or "")
+                if isinstance(logical_receipt, Mapping) else ""
+            )
+            if not referenced_id:
+                # Preserve the normal object-store error and its resolved path.
+                record = self.read(kind, artifact_id)
+            else:
+                if logical_receipt.get("kind") != "accepted_artifact_reuse":
+                    raise ArtifactStoreError(
+                        "historical artifact rebind requires an accepted-artifact reuse receipt"
+                    )
+                validation_receipt = ledger_block.get("validation_receipt")
+                if not isinstance(validation_receipt, Mapping) or not (
+                    validation_receipt.get("local_validation") is True
+                    and validation_receipt.get("object_store_revalidated") is True
+                ):
+                    raise ArtifactStoreError(
+                        "historical artifact rebind requires explicit local object revalidation"
+                    )
+                _validate_sha(referenced_id, "artifact_id")
+                referenced = self.read(kind, referenced_id)
+                if referenced.get("contract_version") != contract_version:
+                    raise ArtifactStoreError(
+                        "referenced accepted artifact contract does not match the ledger reader"
+                    )
+                if referenced.get("segment_id") != segment_id:
+                    raise ArtifactStoreError(
+                        "referenced accepted artifact segment does not match the ledger block"
+                    )
+                if referenced.get("output_sha256") != output_sha256:
+                    raise ArtifactStoreError(
+                        "referenced accepted artifact output does not match the ledger block"
+                    )
+                self.validate(
+                    referenced,
+                    expected_kind=kind,
+                    expected_id=referenced_id,
+                    output_validator=output_validator,
+                )
+                provenance = dict(referenced.get("provenance") or {})
+                provenance["derived_from_artifact_id"] = referenced_id
+                record = self.put_accepted(
+                    kind=kind,
+                    semantic_input_sha256=semantic_input_sha256,
+                    recipe_sha256=str(referenced["recipe_sha256"]),
+                    contract_version=contract_version,
+                    output=referenced["output"],
+                    ledger_block=ledger_block,
+                    provider_receipt=dict(referenced["provider_receipt"]),
+                    provenance=provenance,
+                )
+        if record.get("contract_version") != contract_version:
+            raise ArtifactStoreError("accepted artifact contract does not match the ledger reader")
+        if record.get("segment_id") != segment_id:
+            raise ArtifactStoreError("accepted artifact segment does not match the ledger block")
+        if record.get("semantic_input_sha256") != semantic_input_sha256:
+            raise ArtifactStoreError("accepted artifact input does not match the ledger block")
+        if record.get("output_sha256") != output_sha256:
+            raise ArtifactStoreError("accepted artifact output does not match the ledger block")
+        self.validate(
+            record,
+            expected_kind=kind,
+            expected_id=artifact_id,
+            output_validator=output_validator,
+        )
+        return record
+
     def validate(
         self,
         record: Mapping[str, Any],

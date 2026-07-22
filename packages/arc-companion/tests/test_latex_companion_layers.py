@@ -11,6 +11,7 @@ import pytest
 
 from arc_companion.latex import (
     _equation_environment,
+    _begin_guarded_box,
     _layer_region,
     _preamble,
     _png_needs_latex_flattening,
@@ -819,6 +820,72 @@ def test_translation_renders_opaque_math_tokens_from_source_without_identity(tmp
     assert r"\tag" not in translation and r"\label" not in translation
 
 
+def _leading_bracket_translation_tex(tmp_path: Path) -> str:
+    document = {
+        "front_matter": {"title": "Leading bracket"},
+        "blocks": [{
+            "block_id": "p", "kind": "prose", "text": "Source footnote marker.",
+        }],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    tex, _ = render_companion_tex(
+        document,
+        [{"segment_id": "s", "block_ids": ["p"]}],
+        {"s": {"explanation": "Companion note."}},
+        translations={"s": {"blocks": [{
+            "block_id": "p", "text": "[^1] Leading translated footnote marker.",
+        }]}},
+        output_dir=tmp_path,
+        language="en",
+        source_language="en",
+    )
+    return tex
+
+
+def test_renderer_guards_optional_box_arguments_from_leading_bracket(
+    tmp_path: Path,
+) -> None:
+    tex = _leading_bracket_translation_tex(tmp_path)
+
+    assert _begin_guarded_box("arctranslation") == (
+        "\\begin{arctranslation}\\relax\n"
+    )
+    assert _begin_guarded_box("arccompanion") == "\\begin{arccompanion}\\relax\n"
+    assert _begin_guarded_box("arcchapterguide") == (
+        "\\begin{arcchapterguide}\\relax\n"
+    )
+    translation = tex.split(r"\begin{arctranslation}", 1)[1].split(
+        r"\end{arctranslation}", 1
+    )[0]
+    assert translation.startswith(r"\relax" + "\n[")
+    assert "Leading translated footnote marker." in translation
+
+
+@pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")
+def test_leading_bracket_translation_box_compiles_with_xelatex(tmp_path: Path) -> None:
+    tex_path = tmp_path / "leading-bracket-translation.tex"
+    tex_path.write_text(_leading_bracket_translation_tex(tmp_path), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            shutil.which("xelatex") or "xelatex",
+            "-halt-on-error",
+            "-interaction=nonstopmode",
+            f"-output-directory={tmp_path}",
+            str(tex_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    log = (tmp_path / "leading-bracket-translation.log").read_text(
+        encoding="utf-8", errors="replace",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr + log
+    assert "Missing \\endcsname" not in log
+
+
 def test_translation_math_delimiters_are_preserved_but_surrounding_tex_is_escaped(tmp_path: Path) -> None:
     document = {
         "blocks": [{"block_id": "p", "kind": "prose", "text": "Math."}],
@@ -1134,7 +1201,7 @@ def test_16_bit_alpha_png_is_detected_for_xelatex_flattening(tmp_path: Path) -> 
 
 
 def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() -> None:
-    glyphs = "δνθσζτ αεϵβφπη ∼≪≫≲∝≡≈∑∫ℓ⟨⟩∙ Ḣ ℒℋℏ 𝐻𝐤𝜃𝒪𝑚𝜎𝑝𝛿𝑡𝑁𝐿𝐼𝜈𝜁𝑉𝑅𝒞𝑓𝑎𝑙𝑘𝑖𝑏𝑃 ⁿ₀₁₂₃ᵢ′\u200b"
+    glyphs = "δνθσζτ αεϵβφπη ∼≪≫≲∝≡≈∑∫ℓ⟨⟩∙ Ḣ ℒℋℏ −√∂→⊥∥ᐟ 𝐻𝐤𝜃𝒪𝑚𝜎𝑝𝛿𝑡𝑁𝐿𝐼𝜈𝜁𝑉𝑅𝒞𝑓𝑎𝑙𝑘𝑖𝑏𝑃 ⁿ₀₁₂₃ᵢ′\u200b"
     rendered = escape_tex(glyphs)
 
     for glyph in glyphs.replace(" ", "").replace("\u200b", ""):
@@ -1147,6 +1214,12 @@ def test_unicode_math_glyphs_are_normalized_without_touching_equation_numbers() 
     assert r"{}^{n}" in rendered
     assert r"\mathcal{O}" in rendered
     assert r"\mathbf{k}" in rendered
+    assert r"\surd" in rendered
+    assert r"\partial" in rendered
+    assert r"\to" in rendered
+    assert r"\perp" in rendered
+    assert r"\parallel" in rendered
+    assert "ᐟ" not in rendered and "/" in rendered
     assert escape_tex("ℏ") == r"{\rmfamily\(\hbar\)}"
     assert r"\textsubscript{2}" in rendered
     assert r"\textsuperscript{{\rmfamily\(\prime\)}}" in rendered
@@ -1357,19 +1430,29 @@ def test_pdf_manifest_warns_for_rtl_layout_without_rejecting_unicode(tmp_path: P
     }]
 
 
-@pytest.mark.skipif(shutil.which("xelatex") is None, reason="XeLaTeX is not installed")
+@pytest.mark.skipif(
+    shutil.which("xelatex") is None or shutil.which("pdftotext") is None,
+    reason="XeLaTeX and pdftotext are required",
+)
 def test_common_unicode_math_glyphs_compile_as_math_atoms(tmp_path: Path) -> None:
-    rendered = escape_tex("Planck constant ℏ; integral ∫; length ℓ; power 10ⁿ")
+    rendered = escape_tex(
+        "Planck constant ℏ; integral ∫; length ℓ; power 10ⁿ; "
+        "minus −; root √; partial ∂; arrow →; perpendicular ⊥; "
+        "parallel ∥; normalized slash A ᐟ B"
+    )
     assert r"\(\hbar\)" in rendered
     assert r"\(\int\)" in rendered
     assert r"\(\ell\)" in rendered
     assert r"\({}^{n}\)" in rendered
+    assert "ᐟ" not in rendered and "A / B" in rendered
 
     tex_path = tmp_path / "planck-constant.tex"
     tex_path.write_text(
-        "\\documentclass{article}\n"
-        "\\begin{document}\n"
-        f"{rendered}\n"
+        _preamble(
+            title="Unicode math glyphs", translated_title="", authors="",
+            language="en", source_language="en",
+        )
+        + f"{rendered}\n"
         "\\end{document}\n",
         encoding="utf-8",
     )
@@ -1388,3 +1471,10 @@ def test_common_unicode_math_glyphs_compile_as_math_atoms(tmp_path: Path) -> Non
     log = (tmp_path / "planck-constant.log").read_text(encoding="utf-8", errors="replace")
     assert result.returncode == 0, result.stdout + result.stderr + log
     assert "Missing character" not in log
+    extracted = subprocess.run(
+        ["pdftotext", str(tmp_path / "planck-constant.pdf"), "-"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    for glyph in "−√∂→⊥∥":
+        assert glyph in extracted
+    assert "A / B" in extracted

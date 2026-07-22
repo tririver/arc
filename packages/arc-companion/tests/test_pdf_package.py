@@ -175,12 +175,26 @@ def test_compile_latex_cleans_unique_sidecars_after_failure(tmp_path: Path, monk
         cwd = Path(kwargs["cwd"])
         jobname = next(value.split("=", 1)[1] for value in command if value.startswith("-jobname="))
         (cwd / f"{jobname}.aux").write_bytes(b"aux")
-        (cwd / f"{jobname}.log").write_bytes(b"log")
-        return subprocess.CompletedProcess(command, 1, stdout="failed", stderr="")
+        (cwd / f"{jobname}.log").write_text(
+            "Missing character: harmless warning\n"
+            "context before\n"
+            "! Missing \\endcsname inserted.\n"
+            "<to be read again>\n"
+            "                   \\TU\\textasciicircum\n"
+            "l.4878 [\\textasciicircum{}1]\n",
+            encoding="utf-8",
+        )
+        warning_tail = "\n".join(f"warning {index}" for index in range(40))
+        return subprocess.CompletedProcess(command, 1, stdout=warning_tail, stderr="")
 
     monkeypatch.setattr(pdf_module.subprocess, "run", runner)
-    with pytest.raises(PDFError, match="XeLaTeX compilation failed"):
+    with pytest.raises(PDFError) as caught:
         compile_latex(tex_path, tmp_path / "paper.pdf")
+    message = str(caught.value)
+    assert "First XeLaTeX error:" in message
+    assert "! Missing \\endcsname inserted." in message
+    assert "l.4878" in message
+    assert "warning 39" in message
     assert not list(tmp_path.glob("arc-companion-building-*.*"))
 
 
