@@ -371,15 +371,9 @@ def _structural_source_role(node: Tag, *, kind: str) -> str:
 
 
 def _propagate_source_only_section_roles(blocks: list[dict[str, Any]]) -> None:
-    propagating_roles = {"table_of_contents", "acknowledgments", "references"}
     section_roles: dict[str, str] = {}
     for block in blocks:
-        explicit_role = str(block.get("source_role") or "")
-        role = (
-            explicit_role
-            if explicit_role in propagating_roles
-            else _source_only_heading_role(block)
-        )
+        role = str(block.get("source_role") or "") or _source_only_heading_role(block)
         if role:
             block["source_role"] = role
             section_id = str(block.get("section_id") or "")
