@@ -15,6 +15,7 @@ from arc_llm.attempt_diagnostics import current_attempt_diagnostics
 from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.paths import llm_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text
+from arc_llm.response_candidates import has_complete_candidate, material_from_claude
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
 
@@ -56,7 +57,10 @@ class ClaudeCliProvider:
         schema: dict[str, Any] | None = None,
         model: str | None = None,
     ) -> dict[str, Any]:
-        return self.generate_json_result(prompt, schema=schema, model=model).value
+        response = self.generate_json_result(prompt, schema=schema, model=model)
+        if response.deferred_output_error is not None:
+            raise response.deferred_output_error
+        return response.value
 
     def generate_json_result(
         self,
@@ -69,6 +73,7 @@ class ClaudeCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
+        defer_output_errors: bool = False,
         schema_transport: str = "auto",
         cancel_check=None,
         idle_timeout_seconds: float | None = None,
@@ -112,10 +117,26 @@ class ClaudeCliProvider:
         if result.returncode != 0:
             raise _claude_failure(result.stderr or result.stdout or "claude -p failed")
         terminal_output = _claude_terminal_json(result.stdout)
-        value, usage, returned_session_id, structured_output = _extract_claude_metadata(
-            terminal_output,
-            output_recovery=output_recovery,
-        )
+        candidate_material = material_from_claude(result.stdout)
+        deferred_output_error: BaseException | None = None
+        try:
+            value, usage, returned_session_id, structured_output = _extract_claude_metadata(
+                terminal_output,
+                output_recovery=output_recovery,
+            )
+        except LLMWorkerError as exc:
+            terminal_payload = json.loads(terminal_output)
+            if (
+                terminal_payload.get("subtype") == "error_max_structured_output_retries"
+                or not defer_output_errors
+                or not has_complete_candidate(candidate_material)
+            ):
+                raise
+            value = {}
+            usage = _usage_from_payload(terminal_payload)
+            returned_session_id = _session_id_from_payload(terminal_payload)
+            structured_output = None
+            deferred_output_error = exc
         return LLMProviderResponse(
             value,
             usage=usage,
@@ -124,6 +145,8 @@ class ClaudeCliProvider:
             raw_model_output=_claude_model_text(terminal_output),
             prompt_sent_sha256=sha256_text(effective_prompt),
             structured_output=structured_output,
+            candidate_material=candidate_material,
+            deferred_output_error=deferred_output_error,
         )
 
     def generate_text(self, prompt: str, *, model: str | None = None) -> str:

@@ -14,6 +14,7 @@ from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, valid
 from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.paths import llm_tmp_root, schema_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text, write_schema_cache_file
+from arc_llm.response_candidates import has_complete_candidate, material_from_codex
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
@@ -97,7 +98,10 @@ class CodexCliProvider:
         schema: dict[str, Any] | None = None,
         model: str | None = None,
     ) -> dict[str, Any]:
-        return self.generate_json_result(prompt, schema=schema, model=model).value
+        response = self.generate_json_result(prompt, schema=schema, model=model)
+        if response.deferred_output_error is not None:
+            raise response.deferred_output_error
+        return response.value
 
     def generate_json_result(
         self,
@@ -110,6 +114,7 @@ class CodexCliProvider:
         schema_cache_dir: Path | None = None,
         artifact_dir: Path | None = None,
         output_recovery: str = "strict",
+        defer_output_errors: bool = False,
         cancel_check=None,
         idle_timeout_seconds: float | None = None,
         progress_callback=None,
@@ -155,7 +160,20 @@ class CodexCliProvider:
             native_session_id, usage, raw_events = _parse_codex_json_events(result.stdout)
             if stateful and not resume_id and not native_session_id:
                 raise LLMWorkerError("stateful Codex call did not report thread/session id")
-            payload, structured_output = _read_json_payload(output_path, result.stdout, output_recovery=output_recovery)
+            try:
+                output_text = output_path.read_text(encoding="utf-8")
+            except OSError:
+                output_text = result.stdout
+            candidate_material = material_from_codex(raw_events, output_text)
+            deferred_output_error: BaseException | None = None
+            try:
+                payload, structured_output, output_text = _read_json_payload(
+                    output_path, result.stdout, output_recovery=output_recovery
+                )
+            except (LLMWorkerError, json.JSONDecodeError) as exc:
+                if not defer_output_errors or not has_complete_candidate(candidate_material):
+                    raise
+                payload, structured_output, deferred_output_error = {}, None, exc
             return LLMProviderResponse(
                 payload,
                 usage=usage,
@@ -165,6 +183,8 @@ class CodexCliProvider:
                 raw_model_output=json.dumps(payload, ensure_ascii=False, default=str),
                 prompt_sent_sha256=sha256_text(effective_prompt),
                 structured_output=structured_output,
+                candidate_material=candidate_material,
+                deferred_output_error=deferred_output_error,
             )
 
     def generate_text(self, prompt: str, *, model: str | None = None) -> str:
@@ -462,7 +482,7 @@ def _read_json_payload(
     stdout: str,
     *,
     output_recovery: str = "strict",
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+) -> tuple[dict[str, Any], dict[str, Any] | None, str]:
     try:
         text = output_path.read_text(encoding="utf-8")
     except OSError:
@@ -484,14 +504,14 @@ def _read_json_payload(
                         raw_text=text,
                         strategy="extract_json",
                         provider_error_type=type(exc).__name__,
-                    )
+                    ), text
                 return {}, structured_metadata(
                     severity="major",
                     warnings=["Codex output did not contain a JSON object; using local recovery.", *warnings],
                     raw_text=text,
                     strategy="natural_language_fallback",
                     provider_error_type=type(exc).__name__,
-                )
+                ), text
     if not isinstance(payload, dict):
         if output_recovery != "warn":
             raise _submitted_output_error("Codex JSON output was not an object")
@@ -501,8 +521,8 @@ def _read_json_payload(
             raw_text=text,
             strategy="natural_language_fallback",
             provider_error_type=type(payload).__name__,
-        )
-    return payload, None
+        ), text
+    return payload, None, text
 
 
 def _extract_first_json_object(text: str) -> str:

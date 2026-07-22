@@ -275,6 +275,9 @@ def test_json_direct_output_uses_canonical_schema_contract_and_null_usage(tmp_pa
 
     assert response.value == {"ok": True}
     assert response.structured_output is None
+    assert len(response.candidate_material) == 1
+    assert response.candidate_material[0].source == "kimi.session_prompt_message"
+    assert response.candidate_material[0].text == '{"ok":true}'
     assert response.usage.input_tokens is None
     assert response.usage.cached_input_tokens is None
     assert response.usage.output_tokens is None

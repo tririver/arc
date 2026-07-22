@@ -14,6 +14,7 @@ from arc_llm.retryable_output import ProviderOutputClass, classify_provider_outp
 from arc_llm.attempt_diagnostics import current_attempt_diagnostics
 from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from arc_llm.schema_cache import canonical_json, sha256_text
+from arc_llm.response_candidates import material_from_kimi
 from arc_llm.sessions import LLMSessionRef
 from arc_llm.structured_recovery import parse_json_object_relaxed, structured_metadata
 from arc_llm.usage import LLMProviderResponse, LLMUsage
@@ -100,8 +101,10 @@ class KimiCodeCliProvider:
             native_session_id=response.native_session_id,
             raw_events=response.raw_events,
             raw_output=response.raw_output,
+            raw_model_output=response.raw_model_output,
             prompt_sent_sha256=response.prompt_sent_sha256,
             structured_output=recovery,
+            candidate_material=response.candidate_material,
         )
 
     def generate_text(self, prompt: str, *, model: str | None = None) -> str:
@@ -230,6 +233,7 @@ class KimiCodeCliProvider:
                 raw_output=text,
                 raw_model_output=text,
                 prompt_sent_sha256=sha256_text(prompt),
+                candidate_material=material_from_kimi(text),
             )
         except (LLMWorkerTimeout, LLMWorkerCancelled) as exc:
             client.cancel_and_stop(native_session_id)

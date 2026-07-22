@@ -33,7 +33,7 @@ from arc_llm.schema_canary import (
     schema_canary_receipt_path,
 )
 from arc_llm.sessions import LLMSessionManager
-from arc_llm.usage import LLMProviderResponse
+from arc_llm.usage import LLMProviderResponse, ResponseCandidateMaterial
 
 
 def _identity(**changes: str | None) -> SchemaCanaryIdentity:
@@ -629,6 +629,78 @@ def test_direct_json_call_with_artifacts_does_not_enable_batch_canary(monkeypatc
     )
 
     assert result["ok"] is True
+
+
+def test_deferred_invalid_terminal_does_not_prove_schema_canary(monkeypatch, tmp_path):
+    error = LLMWorkerError(
+        "terminal strict parse error",
+        category=LLMFailureCategory.OUTPUT_INVALID,
+        submission_state=LLMSubmissionState.SUBMITTED,
+    )
+
+    class Provider:
+        def generate_json_result(self, prompt, *, defer_output_errors=False, **kwargs):
+            assert defer_output_errors is True
+            return LLMProviderResponse(
+                {},
+                candidate_material=(
+                    ResponseCandidateMaterial(
+                        "generic.provider_value", 0, value={"wrong": True}
+                    ),
+                ),
+                deferred_output_error=error,
+            )
+
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: Provider())
+    root = tmp_path / "batch-root"
+    with pytest.raises(runner.LLMTaskError, match="terminal strict parse error"):
+        runner.run_json(
+            "prompt",
+            schema={
+                "type": "object", "additionalProperties": False,
+                "required": ["ok"], "properties": {"ok": {"type": "boolean"}},
+            },
+            provider="codex-cli", model="model-a",
+            env={"ARC_HOME": str(tmp_path / "arc-home")}, process_chain=[],
+            artifact_dir=tmp_path / "call", schema_canary_root=root,
+        )
+    receipts = [json.loads(path.read_text()) for path in (root / "schema-canaries").glob("*.json")]
+    assert not any(receipt.get("status") == "proven" for receipt in receipts)
+
+
+def test_deferred_terminal_with_valid_earlier_candidate_proves_canary(monkeypatch, tmp_path):
+    class Provider:
+        def generate_json_result(self, prompt, *, defer_output_errors=False, **kwargs):
+            assert defer_output_errors is True
+            return LLMProviderResponse(
+                {},
+                candidate_material=(
+                    ResponseCandidateMaterial(
+                        "codex.completed_message", 0, value={"ok": True}
+                    ),
+                ),
+                deferred_output_error=LLMWorkerError(
+                    "terminal strict parse error",
+                    category=LLMFailureCategory.OUTPUT_INVALID,
+                    submission_state=LLMSubmissionState.SUBMITTED,
+                ),
+            )
+
+    monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: Provider())
+    root = tmp_path / "batch-root"
+    result = runner.run_json(
+        "prompt",
+        schema={
+            "type": "object", "additionalProperties": False,
+            "required": ["ok"], "properties": {"ok": {"type": "boolean"}},
+        },
+        provider="codex-cli", model="model-a",
+        env={"ARC_HOME": str(tmp_path / "arc-home")}, process_chain=[],
+        artifact_dir=tmp_path / "call", schema_canary_root=root,
+    )
+    assert result["ok"] is True
+    receipts = [json.loads(path.read_text()) for path in (root / "schema-canaries").glob("*.json")]
+    assert any(receipt.get("status") == "proven" for receipt in receipts)
 
 
 def test_schema_formatter_inherits_batch_canary_root(monkeypatch, tmp_path):

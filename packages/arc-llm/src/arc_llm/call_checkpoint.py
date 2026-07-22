@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping
 
 from .schema_cache import canonical_json, sha256_text
-from .usage import LLMProviderResponse, LLMUsage
+from .usage import LLMProviderResponse, LLMUsage, ResponseCandidateMaterial
 from .providers.base import (
     LLMAbortScope,
     LLMFailureCategory,
@@ -21,11 +21,11 @@ from .providers.base import (
 )
 
 
-SCHEMA_VERSION = "arc.llm.call_checkpoint.v4"
+SCHEMA_VERSION = "arc.llm.call_checkpoint.v5"
 
 
 class CallIdentity(str):
-    """String-compatible checkpoint identity with v4 structured components."""
+    """String-compatible checkpoint identity with structured components."""
 
     logical_identity: dict[str, Any]
     request_digest: str
@@ -93,6 +93,10 @@ class PreparedCall:
     replay_response: LLMProviderResponse[Any] | None = None
     replayed: bool = False
     _lock_handle: BinaryIO | None = None
+
+    @property
+    def owns_lock(self) -> bool:
+        return self._lock_handle is not None
 
     def release_lock(self) -> None:
         handle, self._lock_handle = self._lock_handle, None
@@ -174,7 +178,9 @@ def prepare_call(
         existing = _read(path)
         if existing is not None:
             if existing.get("schema_version") in {
-                "arc.llm.call_checkpoint.v2", "arc.llm.call_checkpoint.v3",
+                "arc.llm.call_checkpoint.v2",
+                "arc.llm.call_checkpoint.v3",
+                "arc.llm.call_checkpoint.v4",
             }:
                 existing = _upgrade_legacy_checkpoint(existing)
                 if validated_legacy_logical_identity is not None:
@@ -287,7 +293,12 @@ def prepare_call(
         raise
 
 
-def record_response(prepared: PreparedCall, response: LLMProviderResponse[Any]) -> None:
+def record_response(
+    prepared: PreparedCall,
+    response: LLMProviderResponse[Any],
+    *,
+    after_write: Callable[[], None] | None = None,
+) -> None:
     try:
         current = _require_current(prepared)
         current.update(
@@ -299,6 +310,8 @@ def record_response(prepared: PreparedCall, response: LLMProviderResponse[Any]) 
             }
         )
         _write(prepared.path, current)
+        if after_write is not None:
+            after_write()
     finally:
         prepared.release_lock()
 
@@ -520,6 +533,8 @@ def _response_to_json(response: LLMProviderResponse[Any]) -> dict[str, Any]:
         "prompt_sent_sha256": response.prompt_sent_sha256,
         "prompt_sent_bytes": response.prompt_sent_bytes,
         "structured_output": response.structured_output,
+        "candidate_material": [item.to_json() for item in response.candidate_material],
+        "candidate_selection": response.candidate_selection,
     }
 
 
@@ -527,6 +542,15 @@ def _response_from_json(value: Any) -> LLMProviderResponse[Any]:
     if not isinstance(value, Mapping):
         raise LLMCallCheckpointError("LLM response checkpoint is missing its response payload")
     usage = value.get("usage") if isinstance(value.get("usage"), Mapping) else {}
+    try:
+        candidate_material = tuple(
+            ResponseCandidateMaterial.from_json(item)
+            for item in value.get("candidate_material") or ()
+        )
+    except (TypeError, ValueError) as exc:
+        raise LLMCallCheckpointError(
+            f"LLM response checkpoint has invalid candidate material: {exc}"
+        ) from exc
     return LLMProviderResponse(
         value.get("value"),
         usage=LLMUsage(
@@ -547,6 +571,12 @@ def _response_from_json(value: Any) -> LLMProviderResponse[Any]:
         structured_output=(
             dict(value["structured_output"])
             if isinstance(value.get("structured_output"), Mapping)
+            else None
+        ),
+        candidate_material=candidate_material,
+        candidate_selection=(
+            dict(value["candidate_selection"])
+            if isinstance(value.get("candidate_selection"), Mapping)
             else None
         ),
     )
@@ -575,8 +605,19 @@ def _write(path: Path, payload: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except OSError as exc:
         raise LLMCallCheckpointError(f"Could not persist LLM call checkpoint {path}: {exc}") from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _acquire_lock(

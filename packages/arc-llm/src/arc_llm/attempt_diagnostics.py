@@ -366,10 +366,23 @@ class AttemptDiagnostics:
             self._native_session_id = sanitized
         self.event("native_session_observed", native_session_id=sanitized)
 
-    def record_candidate(self, value: Any, *, source: str) -> None:
+    def record_candidate(
+        self,
+        value: Any,
+        *,
+        source: str,
+        ordinal: int | None = None,
+        canonical_sha256: str | None = None,
+    ) -> None:
         with self._lock:
-            self._candidate_count += 1
-            sequence = self._candidate_count
+            if ordinal is None:
+                self._candidate_count += 1
+                sequence = self._candidate_count
+            else:
+                sequence = int(ordinal)
+                if sequence <= self._candidate_count:
+                    raise ValueError("diagnostic candidate ordinals must increase")
+                self._candidate_count = sequence
             if len(self._candidate_metadata) >= MAX_RESPONSE_CANDIDATES:
                 self._candidate_dropped += 1
                 if self._candidate_dropped == 1:
@@ -389,7 +402,13 @@ class AttemptDiagnostics:
                 separators=(",", ":"),
                 default=str,
             )
-            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            digest = (
+                str(canonical_sha256)
+                if canonical_sha256 is not None
+                else hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            )
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("diagnostic candidate SHA-256 must be lowercase hex")
             safe_source = _bounded_text(
                 self.redactor.text(source), MAX_CANDIDATE_SOURCE_BYTES
             )

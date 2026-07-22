@@ -54,6 +54,12 @@ from .providers.base import (
 )
 from .progress_journal import ProgressJournal
 from .progress_prompt import apply_runtime_progress_contract
+from .response_candidates import (
+    LLMResponseCandidateConflict,
+    LLMResponseCandidateReceiptError,
+    persist_selection_receipt,
+    select_response_candidate,
+)
 from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import canonical_json, schema_hash, sha256_text
@@ -1059,6 +1065,8 @@ def _run_with_retries(
                         LLMWorkerTimeout,
                         LLMCallNeedsSupervision,
                         LLMCallRetryExhausted,
+                        LLMResponseCandidateConflict,
+                        LLMResponseCandidateReceiptError,
                     ),
                 ):
                     raise
@@ -1205,16 +1213,36 @@ def _generate_json(
                 validated_legacy_logical_identity=validated_legacy_logical_identity,
             )
             if prepared_checkpoint.replay_response is not None:
+                selection = select_response_candidate(
+                    prepared_checkpoint.replay_response,
+                    schema=schema,
+                    checkpoint_identity=prepared_checkpoint.identity,
+                    replayed=True,
+                )
+                persist_selection_receipt(
+                    prepared_checkpoint.path, selection.receipt, replayed=True
+                )
+                replay_response = selection.response
                 diagnostics = current_attempt_diagnostics()
                 if diagnostics is not None:
+                    diagnostics.event("checkpoint_replayed")
                     diagnostics.record_native_session_id(
-                        prepared_checkpoint.replay_response.native_session_id
+                        replay_response.native_session_id
                     )
-                    diagnostics.record_candidate(
-                        prepared_checkpoint.replay_response.value,
-                        source="checkpoint_replayed_response",
-                    )
-                return prepared_checkpoint.replay_response
+                    for ordinal, digest, source, value in selection.diagnostic_candidates:
+                        diagnostics.record_candidate(
+                            value,
+                            source=(
+                                "checkpoint_replayed_response"
+                                if source == "generic.provider_value"
+                                else source
+                            ),
+                            ordinal=ordinal,
+                            canonical_sha256=digest,
+                        )
+                if selection.conflict is not None:
+                    raise selection.conflict
+                return replay_response
             progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
             if supervised_native_resume and (session is None or not session.native_session_id):
                 prepared_checkpoint.release_lock()
@@ -1242,6 +1270,8 @@ def _generate_json(
                     kwargs["output_recovery"] = (
                         "warn" if schema_plan.prompt_fallback else output_recovery
                     )
+                if _accepts_keyword(selected.generate_json_result, "defer_output_errors"):
+                    kwargs["defer_output_errors"] = True
                 if (
                     schema_plan.prompt_fallback
                     and _accepts_keyword(selected.generate_json_result, "schema_transport")
@@ -1255,6 +1285,64 @@ def _generate_json(
                     kwargs["cancel_check"] = cancel_check
                 return selected.generate_json_result(provider_prompt, **kwargs)
             return LLMProviderResponse(selected.generate_json(provider_prompt, schema=provider_schema, model=model))
+
+        selection = None
+
+        def validate_provider_response(
+            candidate_response: LLMProviderResponse[dict[str, Any]],
+        ) -> LLMProviderResponse[dict[str, Any]]:
+            nonlocal selection
+            if prepared_checkpoint is not None and prepared_checkpoint.owns_lock:
+                record_submitted(prepared_checkpoint)
+            if (
+                candidate_response.prompt_sent_bytes is None
+                or candidate_response.prompt_sent_sha256 is None
+            ):
+                candidate_response = replace(
+                    candidate_response,
+                    prompt_sent_bytes=(
+                        candidate_response.prompt_sent_bytes
+                        or len(provider_prompt.encode("utf-8"))
+                    ),
+                    prompt_sent_sha256=(
+                        candidate_response.prompt_sent_sha256
+                        or sha256_text(provider_prompt)
+                    ),
+                )
+            selection = select_response_candidate(
+                candidate_response,
+                schema=schema,
+                checkpoint_identity=(
+                    prepared_checkpoint.identity
+                    if prepared_checkpoint is not None
+                    else None
+                ),
+            )
+            candidate_response = selection.response
+            diagnostics = current_attempt_diagnostics()
+            if diagnostics is not None:
+                diagnostics.record_native_session_id(candidate_response.native_session_id)
+                for ordinal, digest, source, value in selection.diagnostic_candidates:
+                    diagnostics.record_candidate(
+                        value,
+                        source=(
+                            "provider_parsed_response"
+                            if source == "generic.provider_value"
+                            else source
+                        ),
+                        ordinal=ordinal,
+                        canonical_sha256=digest,
+                    )
+            if (
+                candidate_response.deferred_output_error is not None
+                and selection.receipt["decision"] == "no_schema_valid_candidate"
+            ):
+                raise candidate_response.deferred_output_error
+            if candidate_response.deferred_output_error is not None:
+                candidate_response = replace(
+                    candidate_response, deferred_output_error=None
+                )
+            return candidate_response
 
         try:
             response = _controlled_provider_call(
@@ -1282,25 +1370,42 @@ def _generate_json(
                     else None
                 ),
                 schema_canary_root=schema_canary_root,
+                response_validator=validate_provider_response,
             )
         except BaseException as exc:
-            if prepared_checkpoint is not None:
+            if prepared_checkpoint is not None and prepared_checkpoint.owns_lock:
                 record_failure(prepared_checkpoint, exc)
             raise
-        if response.prompt_sent_bytes is None or response.prompt_sent_sha256 is None:
-            response = replace(
-                response,
-                prompt_sent_bytes=response.prompt_sent_bytes or len(provider_prompt.encode("utf-8")),
-                prompt_sent_sha256=response.prompt_sent_sha256 or sha256_text(provider_prompt),
-            )
-        diagnostics = current_attempt_diagnostics()
-        if diagnostics is not None:
-            diagnostics.record_native_session_id(response.native_session_id)
-            diagnostics.record_candidate(
-                response.value, source="provider_parsed_response"
-            )
-        if prepared_checkpoint is not None:
-            record_response(prepared_checkpoint, response)
+        assert selection is not None
+        try:
+            if prepared_checkpoint is not None:
+                # Write the atomic checkpoint first, then publish the body-free
+                # sidecar before releasing ownership. A crash between those writes
+                # can rebuild the sidecar from the retained material on replay.
+                publish_receipt = lambda: persist_selection_receipt(
+                    prepared_checkpoint.path, selection.receipt
+                )
+                if _accepts_keyword(record_response, "after_write"):
+                    record_response(
+                        prepared_checkpoint,
+                        response,
+                        after_write=publish_receipt,
+                    )
+                else:
+                    # Preserve compatible test/host wrappers around the historical
+                    # two-argument checkpoint hook. The atomic response is still
+                    # authoritative and replay can recreate a missing sidecar.
+                    record_response(prepared_checkpoint, response)
+                    publish_receipt()
+        except BaseException as exc:
+            if (
+                prepared_checkpoint is not None
+                and prepared_checkpoint.owns_lock
+            ):
+                record_failure(prepared_checkpoint, exc)
+            raise
+        if selection.conflict is not None:
+            raise selection.conflict
         progress({"event": "call_finished", "substantive": False, "resumable": False})
         return response
 
@@ -1738,6 +1843,16 @@ def _logical_receipt(
         from .schema_cache import canonical_json
 
         response_sha = sha256_text(canonical_json(value))
+    candidate_receipt = None
+    if prepared is not None and response.candidate_selection is not None:
+        selection_path = prepared.path.with_name(
+            f"{prepared.path.stem}.candidate-selection.json"
+        )
+        if selection_path.is_file():
+            candidate_receipt = {
+                "path": selection_path.relative_to(prepared.path.parent.parent).as_posix(),
+                "sha256": _sha256_file(selection_path),
+            }
     return {
         "schema_version": "arc.llm.logical_receipt.v1",
         "idempotency_key": idempotency_key,
@@ -1745,7 +1860,16 @@ def _logical_receipt(
         "checkpoint_state": "validated",
         "replayed": bool(prepared and prepared.replayed),
         "response_sha256": response_sha,
+        "candidate_selection_receipt": candidate_receipt,
     }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _progress_journal(
@@ -1776,10 +1900,14 @@ def _controlled_provider_call(
     invoke: Callable[[], LLMProviderResponse[Any]],
     schema_canary: SchemaCanaryIdentity | None = None,
     schema_canary_root: Path | None = None,
+    response_validator: Callable[[LLMProviderResponse[Any]], LLMProviderResponse[Any]] | None = None,
 ) -> LLMProviderResponse[Any]:
+    def validate(response: LLMProviderResponse[Any]) -> LLMProviderResponse[Any]:
+        return response_validator(response) if response_validator is not None else response
+
     def submit() -> LLMProviderResponse[Any]:
         if provider == "manual":
-            return invoke()
+            return validate(invoke())
         safety_env = dict(os.environ)
         if env is not None:
             safety_env.update(env)
@@ -1790,7 +1918,7 @@ def _controlled_provider_call(
             cancel_check=cancel_check,
             call_label=call_label,
         ) as permit:
-            response = invoke()
+            response = validate(invoke())
             permit.report_success()
             return response
 

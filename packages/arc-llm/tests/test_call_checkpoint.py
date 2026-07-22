@@ -27,6 +27,7 @@ from arc_llm.providers.base import (
     LLMWorkerTimeout,
 )
 from arc_llm import runner
+from arc_llm import call_checkpoint as checkpoint_module
 from arc_llm.runner import run_json
 
 
@@ -91,6 +92,53 @@ def test_corrupt_checkpoint_fails_closed(tmp_path: Path) -> None:
     path.write_text("not-json", encoding="utf-8")
     with pytest.raises(RuntimeError, match="Could not read"):
         prepare_call(path, identity=identity, now=100)
+
+
+def test_v4_response_checkpoint_upgrades_and_replays(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "arc.llm.call_checkpoint.v4",
+                "identity": str(identity),
+                "logical_identity": identity.logical_identity,
+                "request_digest": identity.request_digest,
+                "request_recipe": identity.request_recipe,
+                "state": "response_received",
+                "submission_state": "submitted",
+                "attempt": 1,
+                "response": {"value": {"ok": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    replay = prepare_call(path, identity=identity)
+    assert replay.replay_response is not None
+    assert replay.replay_response.value == {"ok": True}
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == (
+        "arc.llm.call_checkpoint.v5"
+    )
+
+
+def test_v5_malformed_candidate_material_fails_as_checkpoint_error(tmp_path: Path) -> None:
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity)
+    record_response(prepared, LLMProviderResponse({"ok": True}))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["response"]["candidate_material"] = [{"protocol_position": "bad"}]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(LLMCallCheckpointError, match="invalid candidate material"):
+        prepare_call(path, identity=identity)
+
+
+def test_checkpoint_atomic_replace_fsyncs_parent_directory(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(checkpoint_module, "_fsync_directory", lambda path: calls.append(path))
+    path, identity = _identity(tmp_path)
+    prepared = prepare_call(path, identity=identity)
+    assert calls == [path.parent]
+    prepared.release_lock()
 
 
 def test_formatter_response_is_replayed_after_outer_checkpoint_crash(tmp_path: Path, monkeypatch) -> None:
@@ -287,7 +335,7 @@ def test_v2_started_checkpoint_upgrades_without_replaying(tmp_path: Path) -> Non
         prepare_call(path, identity=identity, now=101)
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "arc.llm.call_checkpoint.v4"
+    assert payload["schema_version"] == "arc.llm.call_checkpoint.v5"
     assert payload["state"] == "submitted"
 
 
@@ -322,7 +370,7 @@ def test_v3_changed_request_requires_validated_legacy_logical_identity(tmp_path:
         validated_legacy_logical_identity=rebuilt.logical_identity,
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "arc.llm.call_checkpoint.v4"
+    assert payload["schema_version"] == "arc.llm.call_checkpoint.v5"
     assert payload["logical_identity"] == rebuilt.logical_identity
     assert payload["request_digest"] == str(original)
     assert payload["state"] == "resuming"

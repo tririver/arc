@@ -8,6 +8,41 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
+class ResponseCandidateMaterial:
+    """A provider-ordered complete-response source retained for selection/replay."""
+
+    source: str
+    protocol_position: int
+    text: str | None = None
+    value: dict[str, Any] | None = None
+    event_id: str | None = None
+    supersedes: tuple[int, ...] = ()
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "protocol_position": self.protocol_position,
+            "text": self.text,
+            "value": self.value,
+            "event_id": self.event_id,
+            "supersedes": list(self.supersedes),
+        }
+
+    @classmethod
+    def from_json(cls, value: Any) -> "ResponseCandidateMaterial":
+        if not isinstance(value, dict):
+            raise ValueError("response candidate material must be an object")
+        return cls(
+            source=str(value.get("source") or "generic.provider_value"),
+            protocol_position=int(value.get("protocol_position") or 0),
+            text=value.get("text") if isinstance(value.get("text"), str) else None,
+            value=dict(value["value"]) if isinstance(value.get("value"), dict) else None,
+            event_id=str(value["event_id"]) if value.get("event_id") is not None else None,
+            supersedes=tuple(int(item) for item in value.get("supersedes") or ()),
+        )
+
+
+@dataclass(frozen=True)
 class LLMUsage:
     input_tokens: int | None = None
     cached_input_tokens: int | None = None
@@ -93,3 +128,10 @@ class LLMProviderResponse(Generic[T]):
     prompt_sent_sha256: str | None = None
     prompt_sent_bytes: int | None = None
     structured_output: dict[str, Any] | None = None
+    candidate_material: tuple[ResponseCandidateMaterial, ...] = ()
+    candidate_selection: dict[str, Any] | None = None
+    # Runtime-only: a terminal parser failure that shared candidate selection
+    # may ignore only when earlier material satisfies the business schema.
+    deferred_output_error: BaseException | None = field(
+        default=None, compare=False, repr=False
+    )

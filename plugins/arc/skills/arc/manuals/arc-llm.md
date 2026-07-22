@@ -139,6 +139,25 @@ no native schema mode and always uses its prompt contract without that fallback
 warning. Do not ask workers to generate `arc_llm_call_record`; ARC attaches
 that audit field after provider output.
 
+For structured calls, ARC retains provider-ordered complete response material
+until the call is validated. It schema-validates every complete JSON object,
+distinguishes populated required result fields from valid empty placeholders,
+and selects the last substantive equivalent result. A later empty
+output-last-message therefore cannot erase an earlier completed result.
+Malformed or truncated fragments remain in the existing relaxed-recovery path;
+they are not treated as competing completed answers. If non-equivalent
+substantive answers conflict, ARC stops for supervision unless the provider
+protocol explicitly marks the later answer as superseding the earlier one.
+
+Candidate decisions are written atomically beside the call checkpoint as
+`*.candidate-selection.json`. The receipt contains only schema/material hashes,
+candidate hashes and protocol positions, the decision, and selected or
+conflicting hashes—not candidate bodies. The checkpoint retains the paid raw
+response material needed for deterministic replay. Replaying either a selected
+answer or a conflict makes no provider call, and a changed receipt fails
+closed. The logical receipt links the selection receipt by relative path and
+SHA-256.
+
 When a caller supplies an artifact directory, each actual provider attempt gets
 a unique directory below `attempts/`. Its finalize-once record retains bounded
 sanitized stdout, provider events, stderr, preliminary parsed-response

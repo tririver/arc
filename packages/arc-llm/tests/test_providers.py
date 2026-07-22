@@ -12,6 +12,8 @@ from arc_llm.providers.claude_cli import ClaudeCliProvider
 from arc_llm.providers.codex_cli import CodexCliProvider
 from arc_llm.schema_cache import sha256_text
 from arc_llm.sessions import LLMSessionRef
+from arc_llm import runner as runner_module
+from arc_llm.runner import run_json_result
 
 
 @pytest.fixture(autouse=True)
@@ -278,6 +280,10 @@ def test_codex_stateful_first_call_uses_json_events_and_keeps_history(monkeypatc
 
     assert response.value == {"ok": True}
     assert response.native_session_id == "thread-123"
+    assert [item.source for item in response.candidate_material] == [
+        "codex.output_last_message"
+    ]
+    assert response.candidate_material[0].text == '{"ok": true}'
     assert response.usage.input_tokens == 100
     assert response.usage.cached_input_ratio == 0.7
     assert "--json" in captured["cmd"]
@@ -317,6 +323,41 @@ def test_codex_stateful_first_call_requires_thread_id(monkeypatch, tmp_path):
         assert "did not report thread/session id" in str(exc)
     else:
         raise AssertionError("expected LLMWorkerError")
+
+
+def test_codex_shared_selection_keeps_completed_event_when_output_last_is_malformed(
+    monkeypatch, tmp_path
+):
+    def fake_run(cmd, **_kwargs):
+        output_path = Path(cmd[cmd.index("--output-last-message") + 1])
+        output_path.write_text('{"ok":', encoding="utf-8")
+        stdout = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "completed-1",
+                    "type": "agent_message",
+                    "text": '{"ok":true}',
+                },
+            }
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    provider = CodexCliProvider(env={})
+    with pytest.raises(LLMWorkerError):
+        provider.generate_json_result("prompt", schema={"type": "object"})
+    monkeypatch.setattr(runner_module, "select_provider", lambda *_args, **_kwargs: provider)
+    schema = {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+    result = run_json_result(
+        "prompt", provider="codex-cli", schema=schema, env={}, process_chain=[]
+    )
+    assert result.value == {"ok": True}
 
 
 def test_codex_stateful_resume_keeps_session_when_schema_probe_fails(monkeypatch, tmp_path):
@@ -618,7 +659,12 @@ def test_claude_generate_json_parses_result_wrapper(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert ClaudeCliProvider().generate_json("prompt") == {"ok": True}
+    response = ClaudeCliProvider().generate_json_result("prompt")
+
+    assert response.value == {"ok": True}
+    assert [item.source for item in response.candidate_material] == [
+        "claude.terminal_result"
+    ]
 
 
 def test_claude_generate_json_prefers_provider_structured_output(monkeypatch):
@@ -632,7 +678,14 @@ def test_claude_generate_json_prefers_provider_structured_output(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert ClaudeCliProvider().generate_json("prompt") == {"ok": True}
+    response = ClaudeCliProvider().generate_json_result("prompt")
+
+    assert response.value == {"ok": True}
+    assert [item.source for item in response.candidate_material] == [
+        "claude.terminal_result",
+        "claude.terminal_structured_output",
+    ]
+    assert response.candidate_material[-1].supersedes == (0,)
 
 
 def test_claude_deepseek_auto_uses_prompt_contract_not_json_schema(monkeypatch):
@@ -890,6 +943,46 @@ def test_claude_natural_language_result_still_raises_in_strict_mode(monkeypatch)
 
     with pytest.raises(LLMWorkerError, match="Claude result field was not JSON"):
         ClaudeCliProvider().generate_json_result("prompt", schema={"type": "object"})
+
+
+def test_claude_shared_selection_keeps_completed_event_when_terminal_is_malformed(
+    monkeypatch
+):
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "text", "text": '{"ok":true}'}]
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "result": "not json"}),
+        ]
+    )
+    monkeypatch.setattr(
+        claude_module,
+        "_run_claude",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["claude"], 0, stdout=stdout, stderr=""
+        ),
+    )
+    provider = ClaudeCliProvider(env={"ARC_CLAUDE_JSON_SCHEMA_MODE": "prompt"})
+    with pytest.raises(LLMWorkerError):
+        provider.generate_json_result("prompt", schema={"type": "object"})
+    monkeypatch.setattr(runner_module, "select_provider", lambda *_args, **_kwargs: provider)
+    schema = {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+    result = run_json_result(
+        "prompt", provider="claude-cli", schema=schema,
+        env={"ARC_CLAUDE_JSON_SCHEMA_MODE": "prompt"}, process_chain=[]
+    )
+    assert result.value == {"ok": True}
 
 
 def test_claude_warn_mode_recovers_result_json_array(monkeypatch):
