@@ -162,6 +162,17 @@ tools it names.
 
 - Unit tests must not require network access. Network integration tests should
   stay opt-in through `ARC_RUN_NET_TESTS=1`.
+- During development, agents must not autonomously run token-expensive live
+  workflow tests. This prohibition includes complete ARC domain builds, real
+  full or substantial companion/book builds, broad live idea-generation runs,
+  and comparable end-to-end evaluations that make many model calls. Use
+  deterministic offline tests, fake providers, fixtures, and narrowly bounded
+  non-generative checks instead.
+- Do not pause an in-progress implementation to ask whether a token-expensive
+  live workflow test should be run. Finish the requested implementation,
+  offline verification, review, and commits without it. After all requested
+  work is complete and committed, the final handoff may recommend such a test
+  to the user in prose, but the agent must not start it automatically.
 - Keep tests close to the module they cover. Use repository-level tests only for
   cross-package integration behavior.
 - Keep ARC development assets, including package-local unit tests and fixtures,
