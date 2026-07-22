@@ -62,6 +62,27 @@ def test_other_client_error_aborts_batch_without_poisoning_provider():
     assert result.submission_state == LLMSubmissionState.NOT_SUBMITTED
 
 
+def test_explicit_provider_schema_rejection_has_contract_category():
+    result = classify_provider_diagnostic(
+        "HTTP 400: response_format json_schema is unsupported",
+        submission_state="submitted",
+    )
+
+    assert result is not None
+    assert result.category == LLMFailureCategory.SCHEMA
+    assert result.abort_scope == LLMAbortScope.BATCH
+
+
+def test_request_specific_invalid_request_is_not_schema_rejection():
+    result = classify_provider_diagnostic(
+        "HTTP 400: prompt exceeds the maximum context length",
+        submission_state="submitted",
+    )
+
+    assert result is not None
+    assert result.category == LLMFailureCategory.INVALID_REQUEST
+
+
 def test_unrelated_text_is_not_classified_and_kwargs_construct_error():
     assert classify_provider_diagnostic("the paper discusses quotas in gauge theory") is None
     result = classify_provider_diagnostic("HTTP 429 too many requests")

@@ -139,6 +139,16 @@ no native schema mode and always uses its prompt contract without that fallback
 warning. Do not ask workers to generate `arc_llm_call_record`; ARC attaches
 that audit field after provider output.
 
+Concurrent structured batches use the first real task as a schema canary for
+each provider/runtime/model/schema/transport identity. Calls sharing an
+unproven identity wait before provider admission. Success writes an atomic
+proof below the caller-owned run root and restores normal concurrency; a
+deterministic schema-contract rejection records one failure and blocks the
+remaining calls without submitting them. Request-specific invalid requests
+and retryable transport failures do not prove or reject the identity. Receipts
+are batch-local rather
+than stored beside provider configuration or credentials.
+
 Direct calls are stateless by default. For a debugging session that should
 reuse host conversation state, pass all session fields explicitly:
 

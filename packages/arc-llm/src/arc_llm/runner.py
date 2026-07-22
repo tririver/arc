@@ -50,6 +50,7 @@ from .progress_prompt import apply_runtime_progress_contract
 from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import canonical_json, schema_hash, sha256_text
+from .schema_canary import SchemaCanaryIdentity, run_schema_canary
 from .safety import LLMSafetyController
 from .sessions import (
     LLMSessionManager, LLMSessionRef, legacy_runtime_fingerprint,
@@ -451,6 +452,7 @@ def run_json(
     session_name: str | None = None,
     session_metadata: Mapping[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
+    schema_canary_root: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
     idle_timeout_seconds: float | None = None,
@@ -483,6 +485,7 @@ def run_json(
         session_name=session_name,
         session_metadata=session_metadata,
         artifact_dir=artifact_dir,
+        schema_canary_root=schema_canary_root,
         call_label=call_label,
         static_prefix=static_prefix,
         idle_timeout_seconds=idle_timeout_seconds,
@@ -517,6 +520,7 @@ def run_json_result(
     session_name: str | None = None,
     session_metadata: Mapping[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
+    schema_canary_root: Path | str | None = None,
     call_label: str | None = None,
     static_prefix: str | None = None,
     idle_timeout_seconds: float | None = None,
@@ -581,6 +585,11 @@ def run_json_result(
     _validate_runtime_inputs_before_artifacts(
         configs, env=env, idle_timeout_seconds=idle_timeout_seconds
     )
+    # Controller staging below injects call-local cache/work paths. They must
+    # remain in the ordinary runtime fingerprint used for session safety, but
+    # must not split one batch-wide provider/schema admission contract into a
+    # separate canary per worker artifact directory.
+    schema_canary_runtime_env = dict(env)
     _configure_paper_worker_session(
         env,
         artifact_dir=Path(artifact_dir) if artifact_dir else None,
@@ -624,6 +633,18 @@ def run_json_result(
             session_name=session_name,
             session_metadata=session_metadata,
             artifact_dir=Path(artifact_dir) if artifact_dir else None,
+            schema_canary_root=(
+                Path(schema_canary_root)
+                if schema_canary_root is not None
+                else None
+            ),
+            schema_canary_runtime_fingerprint=_runtime_fp(
+                provider_used=config.provider,
+                model=config.model,
+                model_tier=model_tier,
+                env=schema_canary_runtime_env,
+                process_chain=process_chain,
+            ),
             call_label=call_label,
             static_prefix=static_prefix,
             idle_timeout_seconds=effective_idle_timeout_seconds,
@@ -1017,6 +1038,8 @@ def _generate_json(
     session_name: str | None,
     session_metadata: Mapping[str, Any] | None,
     artifact_dir: Path | None,
+    schema_canary_root: Path | None,
+    schema_canary_runtime_fingerprint: str,
     call_label: str | None,
     static_prefix: str | None,
     idle_timeout_seconds: float | None,
@@ -1145,6 +1168,25 @@ def _generate_json(
                 cancel_check=cancel_check,
                 call_label=call_label,
                 invoke=invoke,
+                schema_canary=(
+                    SchemaCanaryIdentity(
+                        provider_id=provider_used,
+                        runtime_fingerprint=schema_canary_runtime_fingerprint,
+                        effective_model=model,
+                        effective_schema_sha256=schema_hash(
+                            schema_plan.provider_schema
+                            if schema_plan.transport_mode == "strict"
+                            else schema_plan.checkpoint_schema
+                        )
+                        or "",
+                        transport_mode=schema_plan.transport_mode,
+                    )
+                    if schema_canary_root is not None
+                    and schema_plan.checkpoint_schema is not None
+                    and schema_plan.transport_mode in {"strict", "prompt"}
+                    else None
+                ),
+                schema_canary_root=schema_canary_root,
             )
         except BaseException as exc:
             if prepared_checkpoint is not None:
@@ -1240,6 +1282,7 @@ def _generate_json(
                     env=env,
                     process_chain=process_chain,
                     artifact_dir=artifact_dir,
+                    schema_canary_root=schema_canary_root,
                     call_label=call_label,
                     idle_timeout_seconds=idle_timeout_seconds,
                     progress_callback=progress,
@@ -1269,6 +1312,7 @@ def _generate_json(
             env=env,
             process_chain=process_chain,
             artifact_dir=artifact_dir,
+            schema_canary_root=schema_canary_root,
             call_label=call_label,
             idle_timeout_seconds=idle_timeout_seconds,
             progress_callback=progress,
@@ -1629,22 +1673,34 @@ def _controlled_provider_call(
     cancel_check: Callable[[], bool] | None,
     call_label: str | None,
     invoke: Callable[[], LLMProviderResponse[Any]],
+    schema_canary: SchemaCanaryIdentity | None = None,
+    schema_canary_root: Path | None = None,
 ) -> LLMProviderResponse[Any]:
-    if provider == "manual":
-        return invoke()
-    safety_env = dict(os.environ)
-    if env is not None:
-        safety_env.update(env)
-    controller = LLMSafetyController(env=safety_env)
-    with controller.acquire_call(
-        provider,
-        timeout_seconds=None,
+    def submit() -> LLMProviderResponse[Any]:
+        if provider == "manual":
+            return invoke()
+        safety_env = dict(os.environ)
+        if env is not None:
+            safety_env.update(env)
+        controller = LLMSafetyController(env=safety_env)
+        with controller.acquire_call(
+            provider,
+            timeout_seconds=None,
+            cancel_check=cancel_check,
+            call_label=call_label,
+        ) as permit:
+            response = invoke()
+            permit.report_success()
+            return response
+
+    if schema_canary is None or schema_canary_root is None or provider == "manual":
+        return submit()
+    return run_schema_canary(
+        root=schema_canary_root,
+        identity=schema_canary,
+        invoke=submit,
         cancel_check=cancel_check,
-        call_label=call_label,
-    ) as permit:
-        response = invoke()
-        permit.report_success()
-        return response
+    )
 
 
 def _schema_cache_dir(artifact_dir: Path | None) -> Path | None:
@@ -1714,6 +1770,7 @@ def _recover_or_validate_json_output(
     env: Mapping[str, str] | None = None,
     process_chain: Sequence[str] | None = None,
     artifact_dir: Path | None = None,
+    schema_canary_root: Path | None = None,
     call_label: str | None = None,
     idle_timeout_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -1773,6 +1830,7 @@ def _recover_or_validate_json_output(
             env=env,
             process_chain=process_chain,
             artifact_dir=artifact_dir,
+            schema_canary_root=schema_canary_root,
             call_label=call_label,
             idle_timeout_seconds=idle_timeout_seconds,
             progress_callback=progress_callback,
@@ -1805,6 +1863,7 @@ def _recover_or_validate_json_output(
                 env=env,
                 process_chain=process_chain,
                 artifact_dir=artifact_dir,
+                schema_canary_root=schema_canary_root,
                 call_label=call_label,
                 idle_timeout_seconds=idle_timeout_seconds,
                 progress_callback=progress_callback,
@@ -1841,6 +1900,7 @@ def _recover_warn_schema_output(
     env: Mapping[str, str] | None,
     process_chain: Sequence[str] | None,
     artifact_dir: Path | None,
+    schema_canary_root: Path | None,
     call_label: str | None,
     idle_timeout_seconds: float | None,
     progress_callback: Callable[[dict[str, Any]], None] | None,
@@ -1876,6 +1936,8 @@ def _recover_warn_schema_output(
             # A formatter is the final paid recovery step. It must never invoke
             # another formatter or cause the original worker to be replayed.
             formatter_kwargs["schema_formatter_enabled"] = False
+            if schema_canary_root is not None:
+                formatter_kwargs["schema_canary_root"] = schema_canary_root
             if artifact_dir is not None and call_label:
                 formatter_kwargs["artifact_dir"] = artifact_dir
                 formatter_kwargs["call_label"] = f"{call_label}/schema_formatter"

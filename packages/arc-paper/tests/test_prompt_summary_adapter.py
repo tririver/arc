@@ -1,5 +1,6 @@
 from arc_paper.summary.providers import prompt as prompt_module
 from arc_paper.summary.providers.prompt import PromptProviderSummaryAdapter
+from arc_paper.summary.checkpoint import schema_canary_scope
 from arc_paper.summary.schema import load_summary_schema
 
 
@@ -51,7 +52,7 @@ def test_kimi_prompt_adapter_uses_default_model_schema_and_valid_provenance():
     assert summary["provenance"]["source_hash"] == "a" * 64
 
 
-def test_production_kimi_summary_routes_through_arc_llm_runner(monkeypatch):
+def test_production_kimi_summary_routes_through_arc_llm_runner(monkeypatch, tmp_path):
     calls = []
 
     def fake_run_json(prompt, **kwargs):
@@ -77,8 +78,10 @@ def test_production_kimi_summary_routes_through_arc_llm_runner(monkeypatch):
         "output_schema": load_summary_schema(),
     }
 
-    adapter.generate_summary(task)
+    with schema_canary_scope(tmp_path / "batch-root"):
+        adapter.generate_summary(task)
 
     assert calls
     assert all(call["provider"] == "kimi-code-cli" for call in calls)
     assert all(call["session_policy"] == "stateless" for call in calls)
+    assert all(call["schema_canary_root"] == tmp_path / "batch-root" for call in calls)

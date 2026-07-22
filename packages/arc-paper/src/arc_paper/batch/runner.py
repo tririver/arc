@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -10,6 +11,7 @@ from typing import Any
 from arc_llm.runner import resolve_llm_config
 
 from .. import service
+from ..summary.checkpoint import schema_canary_scope
 from ..summary.model import DEFAULT_SUMMARY_MODEL_TIER
 from .db import BatchDB, BatchItem
 
@@ -44,6 +46,7 @@ def run_batch(
     workers = max(1, concurrency)
     submitted = 0
     worker_id = _worker_id()
+    schema_canary_root = _schema_canary_root(db, name)
     abort_error: BaseException | None = None
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {}
@@ -54,7 +57,15 @@ def run_batch(
                 if not items:
                     break
                 for item in items:
-                    future = executor.submit(_run_one, item, db, provider=provider, model=model, model_tier=model_tier)
+                    future = executor.submit(
+                        _run_one,
+                        item,
+                        db,
+                        provider=provider,
+                        model=model,
+                        model_tier=model_tier,
+                        schema_canary_root=schema_canary_root,
+                    )
                     futures[future] = item
                 submitted += len(items)
                 if len(items) < claim_limit:
@@ -117,13 +128,27 @@ def _prefetch_one(item: BatchItem, db: BatchDB) -> None:
         db.mark_status(item.batch_name, item.paper_id, "ready")
 
 
-def _run_one(item: BatchItem, db: BatchDB, *, provider: str, model: str | None, model_tier: str | None) -> None:
+def _run_one(
+    item: BatchItem,
+    db: BatchDB,
+    *,
+    provider: str,
+    model: str | None,
+    model_tier: str | None,
+    schema_canary_root: Path,
+) -> None:
     if not item.lease_token:
         raise RuntimeError(f"Claimed batch item has no lease token: {item.paper_id}")
     heartbeat = _LeaseHeartbeat(db, item)
     with heartbeat:
         try:
-            result = service.generate_llm_summary(item.paper_id, provider=provider, model=model, model_tier=model_tier)
+            with schema_canary_scope(schema_canary_root):
+                result = service.generate_llm_summary(
+                    item.paper_id,
+                    provider=provider,
+                    model=model,
+                    model_tier=model_tier,
+                )
         except BaseException as exc:
             db.mark_status(
                 item.batch_name,
@@ -171,6 +196,11 @@ def _run_one(item: BatchItem, db: BatchDB, *, provider: str, model: str | None, 
 
 def _worker_id() -> str:
     return f"pid:{os.getpid()}:thread:{get_ident()}"
+
+
+def _schema_canary_root(db: BatchDB, name: str) -> Path:
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    return db.path.parent / "summary-batch-artifacts" / digest
 
 
 class _LeaseHeartbeat:

@@ -5,6 +5,7 @@ from arc_llm.providers.base import LLMWorkerError
 
 from arc_paper.batch.db import BatchDB
 from arc_paper.batch import runner
+from arc_paper.summary.checkpoint import current_schema_canary_root
 
 
 def test_prefetch_marks_ready(monkeypatch, tmp_path):
@@ -96,6 +97,31 @@ def test_run_batch_claims_only_available_executor_slots(monkeypatch, tmp_path):
 
     assert counts_seen[0] == {"ready": 1, "running": 1}
     assert run_result["counts"] == {"done": 2}
+
+
+def test_run_batch_gives_all_items_one_schema_canary_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    db = BatchDB.default()
+    paper_ids = [f"2001.{index:04d}" for index in range(1, 25)]
+    db.create_batch("qft", paper_ids, "paper-summary-v1")
+    for paper_id in paper_ids:
+        db.mark_status("qft", paper_id, "ready")
+    roots = []
+
+    def generate_llm_summary(paper_id, **kwargs):
+        roots.append(current_schema_canary_root())
+        return {
+            "ok": True,
+            "data": {"title": "Done"},
+            "meta": {"summary_path": str(tmp_path / f"{paper_id}.json")},
+        }
+
+    monkeypatch.setattr(runner.service, "generate_llm_summary", generate_llm_summary)
+
+    runner.run_batch("qft", provider="auto", concurrency=24, db=db)
+
+    assert len(roots) == 24
+    assert set(roots) == {runner._schema_canary_root(db, "qft")}
 
 
 def test_run_batch_rejects_auto_provider_with_exact_model_before_status_mutation(monkeypatch, tmp_path):

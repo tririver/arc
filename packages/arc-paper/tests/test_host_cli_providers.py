@@ -4,6 +4,7 @@ from arc_paper.summary.providers import claude_cli as claude_module
 from arc_paper.summary.providers import codex_cli as codex_module
 from arc_paper.summary.providers.claude_cli import ClaudeCliProvider
 from arc_paper.summary.providers.codex_cli import CodexCliProvider
+from arc_paper.summary.checkpoint import schema_canary_scope
 
 
 def valid_summary():
@@ -125,6 +126,26 @@ def test_claude_cli_provider_uses_low_default_model(monkeypatch):
 
     assert calls[0]["model"] == "haiku"
     assert calls[0]["model_tier"] == "low"
+
+
+def test_cli_summary_providers_forward_batch_schema_canary_root(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run_json(prompt, **kwargs):
+        calls.append(kwargs)
+        return valid_summary()
+
+    monkeypatch.setattr(codex_module, "run_json", fake_run_json)
+    monkeypatch.setattr(claude_module, "run_json", fake_run_json)
+
+    with schema_canary_scope(tmp_path / "batch-root"):
+        CodexCliProvider(env={}).generate_summary(llm_task(), model="test-model")
+        ClaudeCliProvider(env={}).generate_summary(llm_task(), model="test-model")
+
+    assert [call["schema_canary_root"] for call in calls] == [
+        tmp_path / "batch-root",
+        tmp_path / "batch-root",
+    ]
 
 
 def test_codex_summary_provider_keeps_test_prompt_provider():

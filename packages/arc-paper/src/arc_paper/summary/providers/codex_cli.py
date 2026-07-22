@@ -7,7 +7,7 @@ from arc_llm.runner import run_json
 
 from ..model import DEFAULT_SUMMARY_MODEL_TIER, resolve_summary_model
 from ..schema import load_summary_schema, validate_summary
-from ..checkpoint import current_provider_checkpoint
+from ..checkpoint import current_provider_checkpoint, current_schema_canary_root
 from .pipeline import apply_provider_provenance, generate_summary_with_section_pipeline
 
 
@@ -65,5 +65,6 @@ class CodexCliProvider:
             env=self.env,
             session_policy="stateless",
             artifact_dir=artifact_dir,
+            schema_canary_root=current_schema_canary_root(),
             call_label=call_label or "arc-paper/summary",
         )

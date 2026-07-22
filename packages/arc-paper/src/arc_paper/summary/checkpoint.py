@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-from contextvars import ContextVar, Token
 
 from ..cache import CachePaths, content_lock, now_iso, read_json, write_json
 
@@ -13,6 +14,9 @@ CALL_CHECKPOINT_SCHEMA = "arc.llm.call_checkpoint.v1"
 UNCERTAIN_RETRY_SECONDS = 3600
 MAX_UNCERTAIN_ATTEMPTS = 2
 _CALL_CONTEXT: ContextVar[tuple[Path, str] | None] = ContextVar("arc_paper_llm_call_context", default=None)
+_SCHEMA_CANARY_ROOT: ContextVar[Path | None] = ContextVar(
+    "arc_paper_schema_canary_root", default=None
+)
 
 
 class CallCheckpointUncertain(RuntimeError):
@@ -124,6 +128,23 @@ def run_json_checkpointed(
 def current_provider_checkpoint() -> tuple[Path | None, str | None]:
     context = _CALL_CONTEXT.get()
     return context if context is not None else (None, None)
+
+
+def current_schema_canary_root() -> Path | None:
+    """Return the Controller-owned root shared by the active summary batch."""
+
+    return _SCHEMA_CANARY_ROOT.get()
+
+
+@contextmanager
+def schema_canary_scope(root: Path):
+    """Address every nested summary call to one batch-local schema proof root."""
+
+    token = _SCHEMA_CANARY_ROOT.set(root)
+    try:
+        yield
+    finally:
+        _SCHEMA_CANARY_ROOT.reset(token)
 
 
 def _checkpoint_path(paper_id: str, call_kind: str, key: str) -> Path:

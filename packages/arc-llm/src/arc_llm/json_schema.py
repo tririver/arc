@@ -32,6 +32,7 @@ class ProviderJSONSchemaPlan:
 
     provider_schema: dict[str, Any] | None
     checkpoint_schema: dict[str, Any] | None
+    transport_mode: str = "none"
     prompt_fallback: bool = False
     warnings: tuple[str, ...] = ()
 
@@ -107,11 +108,13 @@ def plan_provider_json_schema(
         return ProviderJSONSchemaPlan(
             provider_schema=prompt_schema,
             checkpoint_schema=prompt_schema,
+            transport_mode="prompt",
         )
     if schema_has_open_object(prompt_schema):
         return ProviderJSONSchemaPlan(
             provider_schema=None,
             checkpoint_schema=prompt_schema,
+            transport_mode="prompt",
             prompt_fallback=True,
             warnings=(STRICT_SCHEMA_PROMPT_FALLBACK_WARNING,),
         )
@@ -121,6 +124,7 @@ def plan_provider_json_schema(
     return ProviderJSONSchemaPlan(
         provider_schema=provider_schema,
         checkpoint_schema=prompt_schema,
+        transport_mode="strict",
     )
 
 

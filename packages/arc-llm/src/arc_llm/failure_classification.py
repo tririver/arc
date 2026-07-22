@@ -40,6 +40,12 @@ _RATE_LIMIT_PATTERNS = (
     r"\bserver is busy\b",
     r"\bcapacity temporarily unavailable\b",
 )
+_SCHEMA_REJECTION_PATTERNS = (
+    r"\binvalid (?:json|output|response) schema\b",
+    r"\bjson_schema\b.*\b(?:invalid|unsupported|required)\b",
+    r"\bresponse_format\b.*\b(?:invalid|unsupported|required)\b",
+    r"\badditionalproperties\b.*\b(?:required|must)\b",
+)
 _RETRY_AFTER_PATTERNS = (
     r"retry-after\s*[:=]\s*(\d+(?:\.\d+)?)",
     r"retry after\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b",
@@ -80,6 +86,13 @@ def classify_provider_diagnostic(
             LLMFailureCategory.RATE_LIMIT,
             state,
             retry_after_seconds=parsed_retry_after,
+        )
+    if http_status == 400 and _matches(normalized, _SCHEMA_REJECTION_PATTERNS):
+        return LLMFailureDisposition(
+            category=LLMFailureCategory.SCHEMA,
+            abort_scope=LLMAbortScope.BATCH,
+            submission_state=state,
+            retryable=False,
         )
     if http_status is not None and 400 <= http_status < 500:
         return LLMFailureDisposition(
