@@ -558,6 +558,57 @@ def test_reader_final_checkpoint_overrides_live_state_and_supports_legacy_segmen
     assert snapshot["chapters"][0]["segments"][0]["lane_status"]["companion"] == "accepted"
 
 
+def test_explicit_current_overrides_read_legacy_reader_final_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    project, checkpoint, _segment_id = _project(tmp_path)
+    path = checkpoint / "reader-final.json"
+    write_json(path, {
+        "schema_version": "arc.companion.reader-final.v3",
+        "final_overrides": {"metadata": {"title": "Legacy checkpoint"}},
+    })
+    before = path.read_bytes()
+
+    snapshot = build_reader_snapshot(
+        project,
+        final_overrides={"metadata": {"title": "Current render"}},
+    )
+
+    assert snapshot["title"] == "Current render"
+    assert path.read_bytes() == before
+    with pytest.raises(WebReaderError, match="checkpoint schema"):
+        build_reader_snapshot(project)
+    with pytest.raises(WebReaderError, match="checkpoint schema"):
+        build_reader_snapshot(project, final_overrides={})
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "final_payload", "error"),
+    [
+        ("arc.companion.reader-final.v2", {}, "checkpoint schema"),
+        ("arc.companion.reader-final.v5", {}, "checkpoint schema"),
+        ("arc.companion.reader-final.v3", [], "no final_overrides"),
+    ],
+)
+def test_explicit_current_overrides_reject_other_or_malformed_reader_final(
+    tmp_path: Path,
+    schema_version: str,
+    final_payload: object,
+    error: str,
+) -> None:
+    project, checkpoint, _segment_id = _project(tmp_path)
+    write_json(checkpoint / "reader-final.json", {
+        "schema_version": schema_version,
+        "final_overrides": final_payload,
+    })
+
+    with pytest.raises(WebReaderError, match=error):
+        build_reader_snapshot(
+            project,
+            final_overrides={"metadata": {"title": "Current render"}},
+        )
+
+
 def test_skipped_snapshot_hides_stale_glossary_terms_and_keeps_source_index(
     tmp_path: Path,
 ) -> None:

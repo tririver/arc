@@ -684,6 +684,29 @@ def test_state_commit_failure_restores_previous_web_index(
     assert (project / "state.json").read_bytes() == before_state
 
 
+def test_web_render_upgrades_legacy_reader_final_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    project, digest = _project(tmp_path)
+    checkpoint = project / ".arc-companion" / "checkpoints" / "legacy"
+    checkpoint.mkdir(parents=True)
+    reader_final = checkpoint / "reader-final.json"
+    write_json(reader_final, {
+        "schema_version": "arc.companion.reader-final.v3",
+        "final_overrides": {"status": "complete"},
+    })
+    before = reader_final.read_bytes()
+    state = read_json(project / "state.json")
+    state["checkpoint_dir"] = str(checkpoint)
+    write_json(project / "state.json", state)
+
+    result = render_content(project, format="web", content_sha256=digest)
+
+    assert result["ok"] is True
+    assert result["data"]["provider_calls"] == 0
+    assert reader_final.read_bytes() == before
+
+
 def test_delivery_state_failure_preserves_committed_canonical_pdf(
     tmp_path: Path, monkeypatch,
 ) -> None:

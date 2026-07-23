@@ -40,6 +40,7 @@ from .source_credit import (
 
 READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v4"
 READER_FINAL_VERSION = "arc.companion.reader-final.v4"
+_LEGACY_READER_FINAL_VERSION = "arc.companion.reader-final.v3"
 WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v3"
 WEB_RENDER_VERSION = "arc.companion.web-render.v5"
 WEB_VALIDATION_VERSION = "arc.companion.web-validation.v3"
@@ -128,7 +129,9 @@ def build_reader_snapshot(
     root = Path(project_dir).resolve()
     current_state = _state(root, state)
     checkpoint = _checkpoint(root, current_state)
-    saved_overrides = _reader_final_overrides(checkpoint)
+    saved_overrides = _reader_final_overrides(
+        checkpoint, allow_legacy=bool(final_overrides),
+    )
     _require_final_reader_payload(
         current_state,
         checkpoint=checkpoint,
@@ -445,7 +448,9 @@ def prepare_reader_publish(
     root = Path(project_dir).resolve()
     current_state = _state(root, state)
     checkpoint = _checkpoint(root, current_state)
-    _reader_final_overrides(checkpoint)
+    _reader_final_overrides(
+        checkpoint, allow_legacy=bool(final_overrides),
+    )
     _require_final_reader_payload(
         current_state,
         checkpoint=checkpoint,
@@ -1597,14 +1602,25 @@ def _checkpoint(root: Path, state: Mapping[str, Any]) -> Path | None:
     return path if path.is_dir() else None
 
 
-def _reader_final_overrides(checkpoint: Path | None) -> dict[str, Any]:
+def _reader_final_overrides(
+    checkpoint: Path | None,
+    *,
+    allow_legacy: bool = False,
+) -> dict[str, Any]:
     if checkpoint is None:
         return {}
     path = checkpoint / "reader-final.json"
     if not path.is_file():
         return {}
     value = _read_object(path, label="reader final checkpoint")
-    if value.get("schema_version") != READER_FINAL_VERSION:
+    version = value.get("schema_version")
+    if (
+        version != READER_FINAL_VERSION
+        and not (
+            allow_legacy
+            and version == _LEGACY_READER_FINAL_VERSION
+        )
+    ):
         raise WebReaderError("reader final checkpoint schema is invalid")
     overrides = value.get("final_overrides")
     if not isinstance(overrides, Mapping):
@@ -2596,7 +2612,12 @@ def _prepare_source_assets(
     final_overrides: Mapping[str, Any] | None,
 ) -> tuple[ReaderObject, ...]:
     checkpoint = _checkpoint(root, state)
-    overrides = _deep_merge(_reader_final_overrides(checkpoint), final_overrides or {})
+    overrides = _deep_merge(
+        _reader_final_overrides(
+            checkpoint, allow_legacy=bool(final_overrides),
+        ),
+        final_overrides or {},
+    )
     envelope = _document_envelope(checkpoint, overrides)
     document = _document(envelope, overrides)
     assets = {
