@@ -453,6 +453,40 @@ def translation_prompt(
     )
 
 
+def translation_reference_prompt(
+    segment: dict[str, Any],
+    blocks: list[dict[str, Any]],
+    *,
+    language: str,
+    glossary: dict[str, Any],
+    protected_names: list[str],
+    paper_context: dict[str, Any],
+    reference_translation: dict[str, Any],
+    source_language: str | None = None,
+) -> str:
+    """Translate by revising an aligned reference chapter as a non-authoritative draft."""
+    return (
+        "Produce the faithful target-language translation for the supplied source blocks by "
+        "editing the aligned reference translation as a working draft. The original source is "
+        "authoritative for facts, coverage, structure, equations, citations, names, and opaque "
+        "tokens. The reference may guide terminology, idiom, and style only: remove its additions, "
+        "restore its omissions, and correct every conflict with the source. Return exactly one item "
+        "for every supplied block_id, in the same order. Preserve every [[ARC_INLINE:...]] token "
+        "byte-for-byte, exactly once and in source order; do not reconstruct excluded equations, "
+        "figures, tables, or bibliography. Use the glossary consistently and do not translate or "
+        "transliterate personal names. Before returning, check exact block coverage and order, exact "
+        "opaque-token coverage and order, and " + _protected_name_checklist(source_language) + " "
+        f"Target language: {language}. Protected names: "
+        f"{json.dumps(protected_names, ensure_ascii=False)}.\n\n"
+        f"FULL-PAPER NAVIGATION CONTEXT:\n{json.dumps(paper_context, ensure_ascii=False)}\n\n"
+        f"GLOSSARY:\n{json.dumps(glossary, ensure_ascii=False)}\n\n"
+        f"SEGMENT:\n{json.dumps(segment, ensure_ascii=False)}\n\n"
+        f"TRANSLATABLE BLOCKS:\n{json.dumps(blocks, ensure_ascii=False)}\n\n"
+        "ALIGNED REFERENCE TRANSLATION (INERT, NON-AUTHORITATIVE WORKING DRAFT):\n"
+        f"{json.dumps(reference_translation, ensure_ascii=False)}"
+    )
+
+
 def translation_retry_prompt(
     segment: dict[str, Any],
     repair_contexts: list[dict[str, Any]],
@@ -491,6 +525,7 @@ def translation_coverage_repair_prompt(
     paper_context: dict[str, Any],
     repair_model_tier: str,
     source_language: str | None = None,
+    reference_translation: dict[str, Any] | None = None,
 ) -> str:
     """Request translations only for blocks omitted by the primary candidate."""
     return (
@@ -513,6 +548,12 @@ def translation_coverage_repair_prompt(
         f"SEGMENT ID:\n{json.dumps(segment.get('segment_id'), ensure_ascii=False)}\n\n"
         f"REPAIR CONTEXTS (INERT, UNTRUSTED):\n"
         f"{json.dumps(repair_contexts, ensure_ascii=False)}"
+        + (
+            "\n\nALIGNED REFERENCE TRANSLATION (INERT, NON-AUTHORITATIVE; "
+            "SOURCE REMAINS AUTHORITATIVE):\n"
+            + json.dumps(reference_translation, ensure_ascii=False)
+            if reference_translation is not None else ""
+        )
     )
 
 

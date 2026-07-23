@@ -44,7 +44,11 @@ from .parse.source import PARSER_VERSION as SOURCE_PARSER_VERSION
 from .parse.source import parse_source_input
 from .parse.source import parse_source_input_with_warnings
 from .parse.source import source_input_hash
-from .parse.structure import has_reconciliation_proof, normalize_document_kind
+from .parse.structure import (
+    STRUCTURE_SCHEMA_VERSION,
+    has_reconciliation_proof,
+    normalize_document_kind,
+)
 from .providers import Ar5ivProvider, ArxivSourceProvider, InspireProvider
 from .providers.ar5iv import ar5iv_url
 from .providers.base import ProviderError
@@ -70,6 +74,8 @@ PARSED_SOURCE_KEYS = (
 # Kept as a public module alias for callers that imported the old name.
 LEGACY_PARSED_SOURCE_KEYS = PARSED_SOURCE_KEYS
 RICH_PARSER_VERSION = RICH_DOCUMENT_PARSER_VERSION
+PARSED_STRUCTURE_VIEW_SCHEMA_VERSION = "arc.paper.parsed-structure-view.v1"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def extract_paper_ids(text: str) -> dict[str, Any]:
@@ -667,6 +673,42 @@ def get_parsed_source_identity(
         provider="local-cache",
         cache="hit",
         cache_path=str(parsed_source_identity_cache_path(lookup_id)),
+    )
+
+
+def get_parsed_source_structure(source_id: str) -> dict[str, Any]:
+    """Return a closed body-free structure view from the identity sidecar only."""
+
+    requested_id = normalize_paper_id(source_id)
+    lookup_id = _parsed_source_lookup_id(source_id)
+    path = parsed_source_identity_cache_path(lookup_id)
+    identity = read_json(path)
+    if not isinstance(identity, dict) or not isinstance(
+        identity.get("structure_view"), dict
+    ):
+        return err(
+            "parsed_source_structure_not_found",
+            (
+                f"No current body-free parsed structure is cached for {source_id}; "
+                "recache the local source."
+            ),
+        )
+    stored = dict(identity["structure_view"])
+    if (
+        identity.get("paper_id") != lookup_id
+        or not _valid_parsed_structure_view(stored, identity=identity)
+    ):
+        return err(
+            "parsed_source_structure_invalid",
+            f"The cached body-free parsed structure for {source_id} is stale or malformed.",
+        )
+    candidate = dict(stored)
+    candidate["requested_source_id"] = requested_id
+    return ok(
+        candidate,
+        provider="local-cache",
+        cache="hit",
+        cache_path=str(path),
     )
 
 
@@ -1693,7 +1735,7 @@ def _write_parsed_identity_cache(parsed: dict[str, Any]) -> Path:
             toc.append(compact)
     source_hash = str(parsed.get("source_hash") or "")
     path = parsed_source_identity_cache_path(paper_id)
-    write_json(path, {
+    payload = {
         "schema_version": "arc.parsed-source.identity.v1",
         "paper_id": paper_id,
         "parser_version": parsed.get("parser_version"),
@@ -1701,8 +1743,282 @@ def _write_parsed_identity_cache(parsed: dict[str, Any]) -> Path:
         "document_hash": source_hash,
         "metadata": metadata,
         "toc": toc,
-    })
+    }
+    structure_view = _build_parsed_structure_view(parsed)
+    if structure_view is not None:
+        payload["structure_view"] = structure_view
+    write_json(path, payload)
     return path
+
+
+def _build_parsed_structure_view(parsed: dict[str, Any]) -> dict[str, Any] | None:
+    """Build the cache-time sidecar view; never called by the read operation."""
+
+    structure = parsed.get("structure")
+    raw_sections = parsed.get("sections")
+    if (
+        parsed.get("parser_version") != SOURCE_PARSER_VERSION
+        or not isinstance(structure, dict)
+        or structure.get("schema_version") != STRUCTURE_SCHEMA_VERSION
+        or not isinstance(raw_sections, list)
+        or not isinstance(structure.get("chapters"), list)
+        or not isinstance(structure.get("coverage"), dict)
+    ):
+        return None
+
+    parsed_sections: dict[str, dict[str, Any]] = {}
+    for item in raw_sections:
+        if not isinstance(item, dict):
+            return None
+        section_id = str(item.get("section_id") or "")
+        if not section_id or section_id in parsed_sections:
+            return None
+        parsed_sections[section_id] = item
+
+    structure_section_ids = [
+        str(section_id)
+        for chapter in structure["chapters"]
+        if isinstance(chapter, dict)
+        for section_id in chapter.get("section_ids") or []
+    ]
+    if (
+        not structure_section_ids
+        or len(structure_section_ids) != len(set(structure_section_ids))
+        or any(section_id not in parsed_sections for section_id in structure_section_ids)
+    ):
+        return None
+
+    sections: list[dict[str, Any]] = []
+    for ordinal, section_id in enumerate(structure_section_ids):
+        item = parsed_sections[section_id]
+        result = parsed_get_section(parsed, section_id)
+        data = result.get("data") if isinstance(result, dict) else None
+        if (
+            result.get("ok") is not True
+            or not isinstance(data, dict)
+            or str(data.get("section_id") or "") != section_id
+        ):
+            return None
+        sections.append({
+            "section_id": section_id,
+            "title": _normalized_structure_title(item.get("title")),
+            "level": int(item.get("level") or 1),
+            "ordinal": ordinal,
+            "section_payload_sha256": _canonical_json_sha256(data),
+        })
+
+    chapters: list[dict[str, Any]] = []
+    for item in structure["chapters"]:
+        if not isinstance(item, dict):
+            return None
+        title = _normalized_structure_title(item.get("title"))
+        chapters.append({
+            "chapter_id": str(item.get("chapter_id") or ""),
+            "title": title,
+            "level": int(item.get("level") or 1),
+            "leading_decimal_ordinal": _leading_decimal_ordinal(title),
+            "section_ids": [str(value) for value in item.get("section_ids") or []],
+        })
+
+    source_hash = str(parsed.get("source_hash") or "")
+    paper_id = str(parsed.get("paper_id") or "")
+    view = {
+        "schema_version": PARSED_STRUCTURE_VIEW_SCHEMA_VERSION,
+        "requested_source_id": paper_id,
+        "canonical_source_id": paper_id,
+        "parser_version": parsed.get("parser_version"),
+        "source_hash": source_hash,
+        "document_hash": source_hash,
+        "structure_schema_version": structure.get("schema_version"),
+        "requested_document_kind": structure.get("requested_document_kind"),
+        "document_kind": structure.get("document_kind"),
+        "structure_source": structure.get("structure_source"),
+        "chapters": chapters,
+        "sections": sections,
+        "coverage": {
+            key: structure["coverage"].get(key)
+            for key in (
+                "status", "expected_count", "covered_count", "duplicates",
+                "missing", "unexpected", "monotonic_order",
+            )
+        },
+    }
+    return view if _valid_parsed_structure_view(
+        view,
+        identity={
+            "schema_version": "arc.parsed-source.identity.v1",
+            "paper_id": paper_id,
+            "parser_version": parsed.get("parser_version"),
+            "source_hash": source_hash,
+            "document_hash": source_hash,
+        },
+    ) else None
+
+
+def _valid_parsed_structure_view(
+    value: Any, *, identity: dict[str, Any],
+) -> bool:
+    top_keys = {
+        "schema_version", "requested_source_id", "canonical_source_id",
+        "parser_version", "source_hash", "document_hash",
+        "structure_schema_version", "requested_document_kind", "document_kind",
+        "structure_source", "chapters", "sections", "coverage",
+    }
+    chapter_keys = {
+        "chapter_id", "title", "level", "leading_decimal_ordinal", "section_ids",
+    }
+    section_keys = {
+        "section_id", "title", "level", "ordinal", "section_payload_sha256",
+    }
+    coverage_keys = {
+        "status", "expected_count", "covered_count", "duplicates", "missing",
+        "unexpected", "monotonic_order",
+    }
+    if not isinstance(value, dict) or set(value) != top_keys:
+        return False
+    if (
+        value.get("schema_version") != PARSED_STRUCTURE_VIEW_SCHEMA_VERSION
+        or identity.get("schema_version") != "arc.parsed-source.identity.v1"
+        or value.get("parser_version") != SOURCE_PARSER_VERSION
+        or value.get("structure_schema_version") != STRUCTURE_SCHEMA_VERSION
+        or value.get("requested_source_id") != identity.get("paper_id")
+        or value.get("canonical_source_id") != identity.get("paper_id")
+        or value.get("parser_version") != identity.get("parser_version")
+        or value.get("source_hash") != identity.get("source_hash")
+        or value.get("document_hash") != identity.get("document_hash")
+        or not isinstance(value.get("requested_source_id"), str)
+        or not value["requested_source_id"]
+        or not isinstance(value.get("canonical_source_id"), str)
+        or not value["canonical_source_id"]
+        or not _SHA256_RE.fullmatch(str(value.get("source_hash") or ""))
+        or not _SHA256_RE.fullmatch(str(value.get("document_hash") or ""))
+        or value.get("requested_document_kind") not in {"auto", "article", "book"}
+        or value.get("document_kind") not in {"article", "book"}
+        or not isinstance(value.get("structure_source"), str)
+        or not value["structure_source"]
+        or not isinstance(value.get("chapters"), list)
+        or not value["chapters"]
+        or not isinstance(value.get("sections"), list)
+        or not value["sections"]
+        or not isinstance(value.get("coverage"), dict)
+    ):
+        return False
+
+    section_ids: list[str] = []
+    for index, section in enumerate(value["sections"]):
+        if (
+            not isinstance(section, dict)
+            or set(section) != section_keys
+            or not isinstance(section.get("section_id"), str)
+            or not section["section_id"]
+            or not isinstance(section.get("title"), str)
+            or section["title"] != _normalized_structure_title(section["title"])
+            or not _positive_int(section.get("level"))
+            or section.get("ordinal") != index
+            or not _SHA256_RE.fullmatch(
+                str(section.get("section_payload_sha256") or "")
+            )
+        ):
+            return False
+        section_ids.append(section["section_id"])
+    if len(section_ids) != len(set(section_ids)):
+        return False
+
+    chapter_ids: list[str] = []
+    covered: list[str] = []
+    for chapter in value["chapters"]:
+        ordinal = chapter.get("leading_decimal_ordinal") if isinstance(
+            chapter, dict
+        ) else None
+        if (
+            not isinstance(chapter, dict)
+            or set(chapter) != chapter_keys
+            or not isinstance(chapter.get("chapter_id"), str)
+            or not chapter["chapter_id"]
+            or not isinstance(chapter.get("title"), str)
+            or chapter["title"] != _normalized_structure_title(chapter["title"])
+            or not _positive_int(chapter.get("level"))
+            or (
+                ordinal is not None
+                and (not _positive_int(ordinal) or ordinal != _leading_decimal_ordinal(
+                    chapter["title"]
+                ))
+            )
+            or (
+                ordinal is None
+                and _leading_decimal_ordinal(chapter["title"]) is not None
+            )
+            or not isinstance(chapter.get("section_ids"), list)
+            or not chapter["section_ids"]
+            or not all(
+                isinstance(section_id, str) and section_id
+                for section_id in chapter["section_ids"]
+            )
+        ):
+            return False
+        chapter_ids.append(chapter["chapter_id"])
+        covered.extend(chapter["section_ids"])
+    if len(chapter_ids) != len(set(chapter_ids)):
+        return False
+
+    expected_coverage = {
+        "status": "complete",
+        "expected_count": len(section_ids),
+        "covered_count": len(covered),
+        "duplicates": sorted({
+            section_id for section_id in covered if covered.count(section_id) > 1
+        }),
+        "missing": [section_id for section_id in section_ids if section_id not in covered],
+        "unexpected": [section_id for section_id in covered if section_id not in section_ids],
+        "monotonic_order": [
+            section_id for section_id in covered if section_id in section_ids
+        ] == section_ids,
+    }
+    if (
+        expected_coverage["duplicates"]
+        or expected_coverage["missing"]
+        or expected_coverage["unexpected"]
+        or not expected_coverage["monotonic_order"]
+    ):
+        expected_coverage["status"] = "invalid"
+    return (
+        set(value["coverage"]) == coverage_keys
+        and value["coverage"] == expected_coverage
+    )
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _normalized_structure_title(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFC", str(value or "")).split())
+
+
+def _leading_decimal_ordinal(title: str) -> int | None:
+    match = re.match(r"^([1-9][0-9]*)(.*)$", title, flags=re.ASCII)
+    if match is None:
+        return None
+    remainder = match.group(2)
+    if not remainder:
+        return int(match.group(1))
+    if remainder[0].isspace():
+        return int(match.group(1))
+    if unicodedata.category(remainder[0]).startswith("P") and not (
+        remainder[0] in ".,/⁄"
+        and len(remainder) > 1
+        and remainder[1].isdigit()
+    ):
+        return int(match.group(1))
+    return None
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _write_rich_cache(parsed: dict[str, Any]) -> Path:

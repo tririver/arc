@@ -93,6 +93,12 @@ Useful flags:
   target have the same base language. This also disables bilingual glossary
   generation, reuse, migration, projection, prompt context, and output; a
   source Index remains source-only content.
+- `--reference-translation-id <cached-id>`: use one cached parsed translation
+  as a non-authoritative working draft without fetching or refreshing it.
+- `--reference-translation-map <source-chapter-id>=<reference-chapter-id>`:
+  repeat for a complete explicit map when strict automatic `1..N` leading
+  ordinal alignment is unavailable. Reference mode cannot be combined with
+  `--skip-translation`.
 - `--source-language <BCP47-tag>`: pass the language established by the
   beginning/middle/end source sampling. The CLI does not detect it.
 - `--user-intent <text>`: freeze the exact managed-run intent and generate one

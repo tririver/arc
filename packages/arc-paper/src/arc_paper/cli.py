@@ -166,6 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     get_parsed.add_argument("source_id")
     get_parsed.add_argument("--include-document", action="store_true")
     get_parsed.add_argument("--json", action="store_true")
+    get_parsed_structure = sub.add_parser("get-parsed-structure")
+    get_parsed_structure.add_argument("source_id")
+    get_parsed_structure.add_argument("--json", action="store_true")
     get_parsed_toc = sub.add_parser("get-parsed-toc")
     get_parsed_toc.add_argument("source_id")
     get_parsed_toc.add_argument("--json", action="store_true")
@@ -456,6 +459,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.include_document:
             return service.get_parsed_source(args.source_id, include_document=True)
         return service.get_parsed_source(args.source_id)
+    if command == "get-parsed-structure":
+        return service.get_parsed_source_structure(args.source_id)
     if command == "get-parsed-toc":
         return service.get_parsed_source_toc(args.source_id)
     if command == "get-parsed-section":

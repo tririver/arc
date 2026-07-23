@@ -287,6 +287,15 @@ arc-companion validate \
   --project-dir ./arc-tests/companion/0911.3380 --json
 ```
 
+To use an already cached parsed translation as a chapter-aligned working
+draft, add `--reference-translation-id <cached-reference-id>`. Automatic
+alignment requires complete, unique `1..N` leading chapter ordinals; otherwise
+repeat
+`--reference-translation-map <source-chapter-id>=<reference-chapter-id>` for
+every source chapter. Reference mode is cache-only, cannot be combined with
+`--skip-translation`, and keeps the original source authoritative. Recovery is
+bound to the immutable reference manifest and chapter objects.
+
 Use `--document-kind auto|article|book` to select the structure policy,
 `--idle-timeout-seconds` to override provider inactivity timeout, and
 `--regenerate-commentary` to rebuild commentary while retaining reusable

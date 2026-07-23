@@ -400,6 +400,8 @@ def render_companion_tex(
     source_language: str | None = None,
     title_translations: dict[str, Any] | list[dict[str, Any]] | None = None,
     source_credit: Mapping[str, Any] | None = None,
+    translation_reference: Mapping[str, Any] | None = None,
+    project_root: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     if augmentation_scope not in {"all", "substantive"}:
         raise ValueError(f"unsupported companion augmentation scope: {augmentation_scope}")
@@ -421,6 +423,29 @@ def render_companion_tex(
         canonical_source_credit = validate_source_credit(source_credit)
     except (SourceCreditError, TypeError) as exc:
         raise LatexError("source credit is invalid") from exc
+    compact_translation_reference = None
+    if translation_reference is not None:
+        if project_root is None:
+            raise LatexError(
+                "translation-reference validation requires the project root"
+            )
+        try:
+            from .translation_reference import (
+                TranslationReferenceError,
+                validate_translation_reference_provenance,
+            )
+            compact_translation_reference = (
+                validate_translation_reference_provenance(
+                    translation_reference,
+                    project_root=project_root.resolve(),
+                    expected_chapter_ids=[
+                        str(item.get("chapter_id") or "")
+                        for item in chapters or []
+                    ],
+                )
+            )
+        except (TranslationReferenceError, TypeError, ValueError) as exc:
+            raise LatexError("translation reference is invalid") from exc
 
     copied_assets: list[dict[str, Any]] = []
     rendered_links: list[dict[str, str]] = []
@@ -743,6 +768,10 @@ def render_companion_tex(
         "target_language": language,
         "render_warnings": _render_warnings(source_language, language),
         "source_credit": source_credit_manifest,
+        **(
+            {"translation_reference": compact_translation_reference}
+            if compact_translation_reference is not None else {}
+        ),
         "companion_layers": {
             "augmentation_scope": augmentation_scope,
             "excluded_augmentation_block_ids": [

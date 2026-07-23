@@ -36,7 +36,8 @@ def _stage_v2_policy(monkeypatch, root: Path, *, targets, sources=None):
     payload = {
         "schema_version": "arc.paper.worker-read-policy.v2",
         "operations": [
-            "artifact-read", "get-parsed-toc", "get-parsed-section", "policy-targets"
+            "artifact-read", "get-parsed-structure", "get-parsed-toc",
+            "get-parsed-section", "policy-targets",
         ],
         "authorized_source_ids": sources or sorted({item["source_id"] for item in targets}),
         "targets": targets,
@@ -123,7 +124,10 @@ def test_worker_delegates_safe_command_and_preserves_result(monkeypatch, capsys)
 def test_restricted_read_policy_allows_only_authorized_cached_section(monkeypatch, capsys):
     monkeypatch.setenv(
         "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
-        json.dumps(["get-parsed-toc", "get-parsed-section", "artifact-read"]),
+        json.dumps([
+            "get-parsed-structure", "get-parsed-toc", "get-parsed-section",
+            "artifact-read",
+        ]),
     )
     monkeypatch.setenv(
         "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
@@ -137,6 +141,10 @@ def test_restricted_read_policy_allows_only_authorized_cached_section(monkeypatc
         return 0
 
     monkeypatch.setattr(worker_cli.cli, "main", fake_main)
+    assert worker_cli.main([
+        "get-parsed-structure", "cached-book", "--json",
+    ]) == 0
+    assert _output(capsys)["ok"] is True
     assert worker_cli.main([
         "get-parsed-section", "cached-book", "--section", "chapter-2", "--json",
     ]) == 0
@@ -166,6 +174,10 @@ def test_v2_read_policy_authorizes_the_same_exact_cached_targets(
         return 0
 
     monkeypatch.setattr(worker_cli.cli, "main", fake_main)
+    assert worker_cli.main(["--session-dir", str(tmp_path),
+        "get-parsed-structure", "cached-book", "--json",
+    ]) == 0
+    assert _output(capsys)["ok"] is True
     assert worker_cli.main(["--session-dir", str(tmp_path),
         "get-parsed-section", "cached-book", "--section", "chapter-2", "--json",
     ]) == 0
@@ -323,6 +335,37 @@ def test_restricted_read_policy_rejects_duplicate_or_conflicting_security_argume
 
     assert worker_cli.main(argv) == 1
     assert _output(capsys)["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["get-parsed-structure", "cached-book", "other-book"],
+        ["get-parsed-structure", "cached-book", "--section", "chapter-2"],
+        ["get-parsed-structure", "cached-book", "--source-id", "other-book"],
+        ["get-parsed-structure", "cached-book", "--unknown"],
+    ],
+)
+def test_restricted_structure_read_rejects_locator_extra_source_and_flags(
+    monkeypatch, capsys, argv,
+):
+    monkeypatch.setenv(
+        "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
+        json.dumps(["get-parsed-structure"]),
+    )
+    monkeypatch.setenv(
+        "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
+        json.dumps({"cached-book": {"sections": []}}),
+    )
+    monkeypatch.setattr(
+        worker_cli.cli, "main",
+        lambda _argv: pytest.fail("invalid structure arguments must not dispatch"),
+    )
+
+    assert worker_cli.main(argv) == 1
+    assert _output(capsys)["error"]["code"] in {
+        "worker_arguments_invalid", "worker_source_forbidden",
+    }
 
 
 def test_worker_defers_unclassified_command_to_canonical_cli(monkeypatch, capsys):

@@ -97,6 +97,50 @@ def test_skip_translation_round_trips_through_recovery_options(tmp_path: Path) -
     assert recovered.max_auto_replacements == 3
 
 
+def test_reference_translation_options_normalize_and_round_trip(
+    tmp_path: Path,
+) -> None:
+    options = BuildOptions(
+        paper_id="local:primary",
+        project_dir=tmp_path,
+        reference_translation_id=" local:translated ",
+        reference_translation_mappings=(" ch-1 = ref-1 ", "ch-2=ref-2"),
+    )
+    recovered = _options_from_recovery(tmp_path, _recovery_options(options))
+    assert options.reference_translation_id == "local:translated"
+    assert options.reference_translation_mappings == (
+        "ch-1=ref-1", "ch-2=ref-2",
+    )
+    assert recovered.reference_translation_id == "local:translated"
+    assert recovered.reference_translation_mappings == (
+        "ch-1=ref-1", "ch-2=ref-2",
+    )
+
+
+def test_reference_translation_options_reject_invalid_combinations(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="requires reference_translation_id"):
+        BuildOptions(
+            paper_id="local:primary",
+            project_dir=tmp_path,
+            reference_translation_mappings=("ch-1=ref-1",),
+        )
+    with pytest.raises(ValueError, match="differ from the primary"):
+        BuildOptions(
+            paper_id="local:primary",
+            project_dir=tmp_path,
+            reference_translation_id="local:primary",
+        )
+    with pytest.raises(ValueError, match="skip_translation"):
+        BuildOptions(
+            paper_id="local:primary",
+            project_dir=tmp_path,
+            reference_translation_id="local:translated",
+            skip_translation=True,
+        )
+
+
 def test_source_language_round_trips_and_old_skip_infers_target(tmp_path: Path) -> None:
     original = BuildOptions(
         paper_id="local:skip-translation", project_dir=tmp_path,

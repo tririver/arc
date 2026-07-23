@@ -7954,6 +7954,53 @@ def test_stateful_lane_serializes_segment_evidence_before_next_primary(
     ]
 
 
+@pytest.mark.parametrize("failure", [FileNotFoundError("gone"), ValueError("tampered")])
+def test_reference_bootstrap_failure_releases_turn_lock_for_next_lane_attempt(
+    failure: BaseException,
+) -> None:
+    class CountingLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.release_count = 0
+
+        def acquire(self) -> bool:
+            return self._lock.acquire()
+
+        def release(self) -> None:
+            self.release_count += 1
+            self._lock.release()
+
+    lock = CountingLock()
+    stream = pipeline_module.StatefulPromptStream(
+        chapter_id="ch-1",
+        lane="translation",
+        generation=1,
+        fixed_rules={},
+        static_context={},
+    )
+
+    with pytest.raises(type(failure), match=str(failure)):
+        pipeline_module._acquire_stateful_turn_bootstrap(
+            lock,
+            stream=stream,
+            receipt_turn_count=0,
+            reference_loader=lambda: (_ for _ in ()).throw(failure),
+        )
+    assert lock.release_count == 1
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        subsequent = executor.submit(
+            pipeline_module._acquire_stateful_turn_bootstrap,
+            lock,
+            stream=stream,
+            receipt_turn_count=0,
+            reference_loader=lambda: {"chapter": "available"},
+        )
+        assert subsequent.result(timeout=2) == {"chapter": "available"}
+    lock.release()
+    assert lock.release_count == 2
+
+
 def test_typed_idle_generation_replays_source_evidence_receipt_in_production_path(
     tmp_path: Path,
 ) -> None:

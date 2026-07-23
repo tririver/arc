@@ -244,11 +244,36 @@ def test_legacy_started_lane_profile_does_not_gain_new_paper_capabilities(
         paper_runtime_profile={"arc_paper_access": "full"},
     )
 
-    assert existing["schema_version"] == "arc.companion.lane-runtime-profile.v2"
-    assert existing["migrated_from_schema_version"].endswith(".v1")
+    assert existing["schema_version"] == "arc.companion.lane-runtime-profile.v3"
+    assert existing["migrated_from_schema_version"].endswith(".v2")
+    assert existing["migration_history"] == [
+        "arc.companion.lane-runtime-profile.v1",
+        "arc.companion.lane-runtime-profile.v2",
+    ]
+    assert existing["translation_reference_workload_sha256"] is None
     assert existing["arc_paper_access"] == "none"
     assert existing["arc_paper_direct_shell"] is False
     assert existing["paper_direct_decision"] == "disabled"
+
+
+def test_reference_workload_is_pinned_in_v3_lane_profile(tmp_path) -> None:
+    path = tmp_path / "profile.json"
+    workload = "a" * 64
+    profile = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=1,
+        requested_allow_internet=False, inherit_host_tools=False,
+        existing_generation=False, recorded_runtime_fingerprint=None,
+        translation_reference_workload_sha256=workload,
+    )
+    assert profile["schema_version"] == "arc.companion.lane-runtime-profile.v3"
+    assert profile["translation_reference_workload_sha256"] == workload
+    with pytest.raises(ValueError, match="reference workload changed"):
+        resolve_lane_runtime_profile(
+            path, chapter_id="ch-1", lane="translation", generation=1,
+            requested_allow_internet=False, inherit_host_tools=False,
+            existing_generation=True, recorded_runtime_fingerprint=None,
+            translation_reference_workload_sha256="b" * 64,
+        )
 
 
 @pytest.mark.parametrize(

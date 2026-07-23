@@ -240,6 +240,8 @@ def _render_pdf(
         source_language=content.get("source_language") or "und",
         title_translations=content.get("title_translations"),
         source_credit=content["source_credit"],
+        translation_reference=content.get("translation_reference"),
+        project_root=root,
     )
     fidelity_errors = validate_tex_fidelity(tex, content["document"], source_manifest)
     if fidelity_errors:

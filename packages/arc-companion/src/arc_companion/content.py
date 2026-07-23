@@ -38,7 +38,7 @@ def store_reader_content(
     """Validate and atomically store one immutable reviewed-content object."""
     root = project_dir.resolve()
     value = _with_source_credit(deepcopy(dict(content)))
-    checks = _validate_content(value)
+    checks = _validate_content(value, project_root=root)
     content_sha256 = sha256_json(value)
     receipts = deepcopy(dict(review_receipts or {}))
     provenance = {
@@ -122,7 +122,7 @@ def load_reader_content(project_dir: Path, content_sha256: str) -> dict[str, Any
     actual = sha256_json(content)
     if actual != content_sha256 or envelope.get("content_sha256") != actual:
         raise ContentBundleError("reviewed-content object hash does not match its identity")
-    _validate_content(content)
+    _validate_content(content, project_root=project_dir.resolve())
     review_receipts = envelope.get("review_receipts")
     provenance = envelope.get("provenance")
     if not isinstance(review_receipts, dict) or not isinstance(provenance, dict):
@@ -156,7 +156,9 @@ def load_reader_content(project_dir: Path, content_sha256: str) -> dict[str, Any
         or receipt.get("validator_version") != CONTENT_RECEIPT_VERSION
         or receipt.get("content_sha256") != actual
         or receipt.get("bundle_sha256") != bundle_sha256
-        or receipt.get("checks") != _validate_content(content)
+        or receipt.get("checks") != _validate_content(
+            content, project_root=project_dir.resolve(),
+        )
         or not isinstance(receipt.get("validated_at"), str)
         or not receipt.get("validated_at")
     ):
@@ -224,7 +226,7 @@ def migrate_legacy_reader_content(
     })
     derived = _with_source_credit(deepcopy(content))
     legacy_checks = [
-        item for item in _validate_content(derived)
+        item for item in _validate_content(derived, project_root=root)
         if item != "source_credit_contract_valid"
     ]
     if (
@@ -284,6 +286,10 @@ def reader_content_from_overrides(
     # explicit.
     if "title_translations" in overrides:
         content["title_translations"] = deepcopy(overrides.get("title_translations"))
+    if overrides.get("translation_reference") is not None:
+        content["translation_reference"] = deepcopy(
+            overrides.get("translation_reference")
+        )
     return content
 
 
@@ -336,7 +342,9 @@ def checkpoint_receipts(checkpoint_dir: Path) -> tuple[dict[str, Any], dict[str,
     return chains, overlays
 
 
-def _validate_content(content: Mapping[str, Any]) -> list[str]:
+def _validate_content(
+    content: Mapping[str, Any], *, project_root: Path | None = None,
+) -> list[str]:
     document = content.get("document")
     segments = content.get("segments")
     annotations = content.get("annotations")
@@ -414,6 +422,25 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
         not _sha(value) for value in overlays.values()
     ):
         raise ContentBundleError("review overlay receipts are invalid")
+    if "translation_reference" in content:
+        if project_root is None:
+            raise ContentBundleError(
+                "translation-reference validation requires the project root"
+            )
+        try:
+            from .translation_reference import (
+                TranslationReferenceError,
+                validate_translation_reference_provenance,
+            )
+            validate_translation_reference_provenance(
+                content.get("translation_reference"),
+                project_root=project_root,
+                expected_chapter_ids=sorted(chapter_ids),
+            )
+        except (TranslationReferenceError, TypeError, ValueError) as exc:
+            raise ContentBundleError(
+                "reviewed content translation reference is invalid"
+            ) from exc
     checks = [
         "source_document_present",
         "segment_ids_unique",
@@ -428,6 +455,8 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
     ]
     if "title_translations" in content:
         checks.insert(-2, "title_translation_contract_valid")
+    if "translation_reference" in content:
+        checks.insert(-2, "translation_reference_contract_valid")
     return checks
 
 

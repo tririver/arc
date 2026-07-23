@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -2057,3 +2058,121 @@ def test_unknown_operation_raw_paths_and_extra_command_parameters_fail_closed(tm
     assert raw_command.provenance["error"]["code"] == (
         "paper_operation_parameters_invalid"
     )
+
+
+def test_controller_aggregate_is_project_stable_and_tamper_evident(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    policy = build_paper_broker_policy(access="none")
+    first = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint-first",
+        base_cache_root=tmp_path / "cache",
+        policy=policy,
+        run_id="aggregate-first",
+        generic_internet_allowed=False,
+        controller_project_root=project,
+    )
+    lookup_identity = {
+        "schema_version": "test.aggregate.v1",
+        "chapter_id": "chapter-1",
+        "sections": [{"section_id": "section-1", "sha256": "a" * 64}],
+    }
+    payload = {
+        "schema_version": "test.aggregate-payload.v1",
+        "sections": [{"section_id": "section-1", "text": "cached"}],
+    }
+
+    stored = first.store_controller_aggregate_json(
+        namespace="translation-reference",
+        lookup_identity=lookup_identity,
+        payload=payload,
+        max_bytes=4096,
+    )
+    lookup_path = project / stored["lookup_receipt_path"]
+    object_path = project / stored["object"]["object_path"]
+    assert hashlib.sha256(lookup_path.read_bytes()).hexdigest() == (
+        stored["lookup_receipt_sha256"]
+    )
+    assert hashlib.sha256(object_path.read_bytes()).hexdigest() == (
+        stored["object"]["payload_sha256"]
+    )
+
+    second = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint-second",
+        base_cache_root=tmp_path / "cache",
+        policy=build_paper_broker_policy(
+            access="full",
+            allowed_operations=["get-title"],
+        ),
+        run_id="aggregate-second",
+        generic_internet_allowed=False,
+        controller_project_root=project,
+    )
+    loaded = second.load_controller_aggregate_json(
+        namespace="translation-reference",
+        lookup_identity=lookup_identity,
+        expected_payload_sha256=stored["object"]["payload_sha256"],
+        max_bytes=4096,
+    )
+    assert loaded is not None
+    assert loaded["payload"] == payload
+    assert loaded["object"] == stored["object"]
+    assert loaded["lookup_receipt"] == stored["lookup_receipt"]
+
+    original_lookup = lookup_path.read_bytes()
+    lookup_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(broker_module.PaperBrokerError) as lookup_tamper:
+        second.load_controller_aggregate_json(
+            namespace="translation-reference",
+            lookup_identity=lookup_identity,
+            expected_payload_sha256=stored["object"]["payload_sha256"],
+            max_bytes=4096,
+        )
+    assert lookup_tamper.value.code == "paper_controller_aggregate_lookup_invalid"
+
+    lookup_path.write_bytes(original_lookup)
+    object_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(broker_module.PaperBrokerError):
+        second.load_controller_aggregate_json(
+            namespace="translation-reference",
+            lookup_identity=lookup_identity,
+            expected_payload_sha256=stored["object"]["payload_sha256"],
+            max_bytes=4096,
+        )
+
+
+def test_controller_aggregate_requires_project_root_and_missing_lookup_is_null(
+    tmp_path: Path,
+) -> None:
+    policy = build_paper_broker_policy(access="none")
+    without_root = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint",
+        base_cache_root=tmp_path / "cache",
+        policy=policy,
+        run_id="aggregate-no-root",
+        generic_internet_allowed=False,
+    )
+    with pytest.raises(broker_module.PaperBrokerError) as missing_root:
+        without_root.store_controller_aggregate_json(
+            namespace="translation-reference",
+            lookup_identity={"chapter": "one"},
+            payload={"value": "one"},
+            max_bytes=4096,
+        )
+    assert missing_root.value.code == "paper_controller_aggregate_root_required"
+
+    with_root = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint-root",
+        base_cache_root=tmp_path / "cache",
+        policy=policy,
+        run_id="aggregate-root",
+        generic_internet_allowed=False,
+        controller_project_root=tmp_path / "project",
+    )
+    assert with_root.load_controller_aggregate_json(
+        namespace="translation-reference",
+        lookup_identity={"chapter": "missing"},
+        expected_payload_sha256="a" * 64,
+        max_bytes=4096,
+    ) is None

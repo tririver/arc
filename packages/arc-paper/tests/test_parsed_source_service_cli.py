@@ -5,10 +5,27 @@ from arc_paper import cli, service
 from arc_paper.cache import (
     parsed_source_annotations_cache_path,
     parsed_source_cache_path,
+    parsed_source_identity_cache_path,
     read_json,
     rich_document_cache_path,
     write_json,
 )
+
+
+_BODY_KEYS = {
+    "body", "text", "content", "payload", "document", "equations", "runs",
+    "blocks", "pages",
+}
+
+
+def _assert_body_free(value):
+    if isinstance(value, dict):
+        assert not set(value) & _BODY_KEYS
+        for item in value.values():
+            _assert_body_free(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_body_free(item)
 
 
 def _write_tex(tmp_path):
@@ -56,6 +73,187 @@ def test_service_parse_source_caches_and_lookup_apis(monkeypatch, tmp_path):
     assert equations["data"][0]["id"] == "eq_00001"
     assert equation["data"]["tex_label"] == "eq:one"
     assert hits["data"][0]["id"] == "eq_00001"
+
+
+def test_parsed_structure_view_is_closed_body_free_and_hashes_exact_section_data(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    parsed = service.parse_source(
+        tex_path=_write_tex(tmp_path), source_id="lecture-structure",
+    )
+    assert parsed["ok"] is True
+    section = service.get_parsed_source_section("lecture-structure", "sec_0001")
+    assert section["ok"] is True
+
+    result = service.get_parsed_source_structure("lecture-structure")
+
+    assert result["ok"] is True
+    assert result["meta"]["provider"] == "local-cache"
+    assert result["meta"]["cache"] == "hit"
+    data = result["data"]
+    assert set(data) == {
+        "schema_version", "requested_source_id", "canonical_source_id",
+        "parser_version", "source_hash", "document_hash",
+        "structure_schema_version", "requested_document_kind", "document_kind",
+        "structure_source", "chapters", "sections", "coverage",
+    }
+    assert data["schema_version"] == "arc.paper.parsed-structure-view.v1"
+    assert data["structure_schema_version"] == "arc.paper.structure.v1"
+    assert data["requested_source_id"] == "lecture-structure"
+    assert data["canonical_source_id"] == "lecture-structure"
+    assert data["coverage"]["status"] == "complete"
+    assert set(data["chapters"][0]) == {
+        "chapter_id", "title", "level", "leading_decimal_ordinal", "section_ids",
+    }
+    assert set(data["sections"][0]) == {
+        "section_id", "title", "level", "ordinal", "section_payload_sha256",
+    }
+    assert set(data["coverage"]) == {
+        "status", "expected_count", "covered_count", "duplicates", "missing",
+        "unexpected", "monotonic_order",
+    }
+    assert data["sections"][0]["section_payload_sha256"] == hashlib.sha256(
+        json.dumps(
+            section["data"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    _assert_body_free(data)
+
+
+def test_parsed_structure_read_is_sidecar_only_and_never_writes_or_falls_back(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    service.parse_source(
+        tex_path=_write_tex(tmp_path), source_id="sidecar-only",
+    )
+    identity_path = parsed_source_identity_cache_path("sidecar-only")
+    before = identity_path.read_bytes()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("structure read must not fetch, parse, migrate, or write")
+
+    monkeypatch.setattr(service, "_read_parsed_source", forbidden)
+    monkeypatch.setattr(service, "_parsed", forbidden)
+    monkeypatch.setattr(service, "parse_source_input", forbidden)
+    monkeypatch.setattr(service, "parse_source_input_with_warnings", forbidden)
+    monkeypatch.setattr(service, "write_json", forbidden)
+
+    result = service.get_parsed_source_structure("sidecar-only")
+
+    assert result["ok"] is True
+    assert identity_path.read_bytes() == before
+
+
+def test_parsed_structure_missing_or_tampered_sidecar_fails_closed(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    missing = service.get_parsed_source_structure("missing")
+    assert missing["ok"] is False
+    assert missing["error"]["code"] == "parsed_source_structure_not_found"
+
+    service.parse_source(
+        tex_path=_write_tex(tmp_path), source_id="tampered-structure",
+    )
+    identity_path = parsed_source_identity_cache_path("tampered-structure")
+    identity = read_json(identity_path)
+    identity["structure_view"]["body"] = "forbidden"
+    write_json(identity_path, identity)
+
+    tampered = service.get_parsed_source_structure("tampered-structure")
+
+    assert tampered["ok"] is False
+    assert tampered["error"]["code"] == "parsed_source_structure_invalid"
+
+    del identity["structure_view"]["body"]
+    identity["schema_version"] = "foreign.identity.v1"
+    write_json(identity_path, identity)
+    foreign = service.get_parsed_source_structure("tampered-structure")
+    assert foreign["ok"] is False
+    assert foreign["error"]["code"] == "parsed_source_structure_invalid"
+
+    identity["schema_version"] = "arc.parsed-source.identity.v1"
+    identity["structure_view"]["canonical_source_id"] = "other-source"
+    write_json(identity_path, identity)
+    rebound = service.get_parsed_source_structure("tampered-structure")
+    assert rebound["ok"] is False
+    assert rebound["error"]["code"] == "parsed_source_structure_invalid"
+
+
+def test_cli_get_parsed_structure_dispatches_exact_source_only(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    service.parse_source(
+        tex_path=_write_tex(tmp_path), source_id="cli-structure",
+    )
+
+    assert cli.main(["get-parsed-structure", "cli-structure", "--json"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["data"]["canonical_source_id"] == "cli-structure"
+    _assert_body_free(result["data"])
+
+
+def test_leading_decimal_ordinal_accepts_punctuation_but_rejects_noncanonical_numbers():
+    for title in ("1 Chapter", "2. Chapter", "3, Chapter", "4!Chapter", "5—章"):
+        assert service._leading_decimal_ordinal(title) == int(title[0])
+    for title in (
+        "0 Chapter", "01 Chapter", "+1 Chapter", "-1 Chapter", "1.5 Chapter",
+        "1.５ Chapter", "1/2 Chapter", "1⁄２ Chapter", "1,000 Chapter",
+        "Ⅰ Chapter", "One Chapter", "Chapter 1", "１ Chapter",
+    ):
+        assert service._leading_decimal_ordinal(title) is None
+
+
+def test_structure_view_uses_only_the_exact_chapter_section_universe(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    parsed = service.parse_source(
+        tex_path=_write_tex(tmp_path), source_id="structure-universe",
+    )["data"]
+    excluded = dict(parsed["sections"][0])
+    excluded["section_id"] = "sec_excluded"
+    excluded["title"] = "Excluded reference matter"
+    excluded["text"] = "This excluded body must not affect structure coverage."
+    parsed["sections"].append(excluded)
+
+    view = service._build_parsed_structure_view(parsed)
+
+    assert view is not None
+    assert [item["section_id"] for item in view["sections"]] == ["sec_0001"]
+    assert view["coverage"] == {
+        "status": "complete",
+        "expected_count": 1,
+        "covered_count": 1,
+        "duplicates": [],
+        "missing": [],
+        "unexpected": [],
+        "monotonic_order": True,
+    }
+
+
+def test_structure_view_rejects_section_selector_identity_collision(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    parsed = service.parse_source(
+        tex_path=_write_tex(tmp_path), source_id="selector-collision",
+    )["data"]
+    collision = dict(parsed["sections"][0])
+    collision["section_id"] = "sec_collision"
+    collision["title"] = "sec_0001"
+    parsed["sections"].insert(0, collision)
+
+    assert service._build_parsed_structure_view(parsed) is None
 
 
 def test_service_parse_source_reuses_cached_parse_when_source_hash_matches(monkeypatch, tmp_path):

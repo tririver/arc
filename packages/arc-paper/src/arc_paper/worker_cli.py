@@ -228,7 +228,9 @@ def _restricted_read_policy_error(
         )
     if command == "artifact-read":
         return None
-    if command not in {"get-parsed-toc", "get-parsed-section"}:
+    if command not in {
+        "get-parsed-structure", "get-parsed-toc", "get-parsed-section",
+    }:
         return _worker_error(
             "worker_operation_forbidden",
             f"{command!r} is not a supported restricted read operation",
@@ -242,7 +244,7 @@ def _restricted_read_policy_error(
             "worker_source_forbidden",
             f"Source {source_id!r} is not authorized by the controller read policy",
         )
-    if command == "get-parsed-toc":
+    if command in {"get-parsed-structure", "get-parsed-toc"}:
         return None
     sections = source_policy.get("sections")
     if not isinstance(sections, list) or locator not in sections:
@@ -264,7 +266,9 @@ def _v2_read_policy_error(
         )
     if command in {"artifact-read", POLICY_TARGETS_OPERATION}:
         return None
-    if command not in {"get-parsed-toc", "get-parsed-section"}:
+    if command not in {
+        "get-parsed-structure", "get-parsed-toc", "get-parsed-section",
+    }:
         return _worker_error(
             "worker_operation_forbidden",
             f"{command!r} is not a supported restricted read operation",
@@ -277,7 +281,7 @@ def _v2_read_policy_error(
             "worker_source_forbidden",
             f"Source {source_id!r} is not authorized by the controller read policy",
         )
-    if command == "get-parsed-toc":
+    if command in {"get-parsed-structure", "get-parsed-toc"}:
         return None
     if not any(
         target["source_id"] == source_id and target["locator"] == locator
@@ -394,10 +398,10 @@ def _restricted_read_arguments(
             "worker_source_forbidden",
             "Restricted reads require exactly one positional source ID",
         )
-    if command == "get-parsed-toc":
+    if command in {"get-parsed-structure", "get-parsed-toc"}:
         if sections:
             return "", None, _worker_error(
-                "worker_arguments_invalid", "get-parsed-toc does not accept --section"
+                "worker_arguments_invalid", f"{command} does not accept --section"
             )
         return source_ids[0], None, None
     if len(sections) != 1 or not sections[0]:

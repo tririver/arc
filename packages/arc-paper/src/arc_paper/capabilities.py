@@ -196,6 +196,7 @@ def _spec(
     admin: bool = False,
     artifacts: tuple[tuple[str, ArtifactAccess], ...] = (),
     recovery: RecoveryClass | None = None,
+    result_schema: Mapping[str, Any] = RESULT_ENVELOPE_SCHEMA,
 ) -> OperationSpec:
     return OperationSpec(
         name=name,
@@ -211,6 +212,7 @@ def _spec(
         destructive=destructive,
         admin=admin,
         artifact_parameters=artifacts,
+        result_schema=result_schema,
         recovery_class=(
             recovery
             or (
@@ -229,6 +231,82 @@ _SUMMARY_OPTIONS = {
     "refresh": REFRESH,
 }
 _SOURCE_ID = {"source_id": NONEMPTY}
+
+_PARSED_STRUCTURE_CHAPTER = _object(
+    {
+        "chapter_id": NONEMPTY,
+        "title": _string(),
+        "level": {"type": "integer", "minimum": 1},
+        "leading_decimal_ordinal": _nullable({"type": "integer", "minimum": 1}),
+        "section_ids": _array(NONEMPTY, min_items=1),
+    },
+    required=(
+        "chapter_id", "title", "level", "leading_decimal_ordinal", "section_ids",
+    ),
+)
+_PARSED_STRUCTURE_SECTION = _object(
+    {
+        "section_id": NONEMPTY,
+        "title": _string(),
+        "level": {"type": "integer", "minimum": 1},
+        "ordinal": {"type": "integer", "minimum": 0},
+        "section_payload_sha256": {
+            "type": "string", "pattern": "^[0-9a-f]{64}$",
+        },
+    },
+    required=(
+        "section_id", "title", "level", "ordinal", "section_payload_sha256",
+    ),
+)
+_PARSED_STRUCTURE_COVERAGE = _object(
+    {
+        "status": _string(enum=["complete", "invalid"]),
+        "expected_count": {"type": "integer", "minimum": 0},
+        "covered_count": {"type": "integer", "minimum": 0},
+        "duplicates": _array(_string()),
+        "missing": _array(_string()),
+        "unexpected": _array(_string()),
+        "monotonic_order": {"type": "boolean"},
+    },
+    required=(
+        "status", "expected_count", "covered_count", "duplicates", "missing",
+        "unexpected", "monotonic_order",
+    ),
+)
+PARSED_STRUCTURE_DATA_SCHEMA = _object(
+    {
+        "schema_version": {"const": "arc.paper.parsed-structure-view.v1"},
+        "requested_source_id": NONEMPTY,
+        "canonical_source_id": NONEMPTY,
+        "parser_version": {"type": "integer", "minimum": 1},
+        "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "document_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "structure_schema_version": {"const": "arc.paper.structure.v1"},
+        "requested_document_kind": _string(enum=["auto", "article", "book"]),
+        "document_kind": _string(enum=["article", "book"]),
+        "structure_source": NONEMPTY,
+        "chapters": _array(_PARSED_STRUCTURE_CHAPTER, min_items=1),
+        "sections": _array(_PARSED_STRUCTURE_SECTION, min_items=1),
+        "coverage": _PARSED_STRUCTURE_COVERAGE,
+    },
+    required=(
+        "schema_version", "requested_source_id", "canonical_source_id",
+        "parser_version", "source_hash", "document_hash",
+        "structure_schema_version", "requested_document_kind", "document_kind",
+        "structure_source", "chapters", "sections", "coverage",
+    ),
+)
+PARSED_STRUCTURE_RESULT_SCHEMA = _object(
+    {
+        "ok": {"type": "boolean"},
+        "data": {"anyOf": [PARSED_STRUCTURE_DATA_SCHEMA, {"type": "null"}]},
+        "error": {"type": "object"},
+        "errors": {"type": "array"},
+        "meta": {"type": "object"},
+        "validation_errors": _array(_string()),
+    },
+    required=("ok", "data", "errors", "meta"),
+)
 
 
 _OPERATIONS = (
@@ -262,6 +340,15 @@ _OPERATIONS = (
             required=("source_id",),
         ),
         "service.get_parsed_source_identity", positional=("source_id",), cache="read",
+    ),
+    _spec(
+        "get-parsed-structure",
+        "Read a closed body-free cached parsed-source structure view.",
+        _object(_SOURCE_ID, required=("source_id",)),
+        "service.get_parsed_source_structure",
+        positional=("source_id",),
+        cache="read",
+        result_schema=PARSED_STRUCTURE_RESULT_SCHEMA,
     ),
     *(
         _spec(

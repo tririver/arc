@@ -136,6 +136,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     build.add_argument(
+        "--reference-translation-id",
+        default=None,
+        metavar="SOURCE_ID",
+        help=(
+            "cached source ID for an existing translation used only by the "
+            "translation lane"
+        ),
+    )
+    build.add_argument(
+        "--reference-translation-map",
+        action="append",
+        default=[],
+        metavar="SOURCE_CHAPTER=REFERENCE_CHAPTER",
+        help="repeat to map every source chapter explicitly in source order",
+    )
+    build.add_argument(
         "--user-intent",
         default=None,
         help=(
@@ -315,6 +331,10 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 inherit_host_tools=args.inherit_host_tools,
                 skip_translation=args.skip_translation,
                 context_paper_ids=tuple(args.context_paper_id),
+                reference_translation_id=args.reference_translation_id,
+                reference_translation_mappings=tuple(
+                    args.reference_translation_map
+                ),
                 user_intent=args.user_intent,
                 stop_after_first_chapter=args.stop_after_first_chapter,
                 document_kind=args.document_kind,

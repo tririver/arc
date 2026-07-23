@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -54,6 +55,12 @@ BROKER_RECEIPT_SCHEMA_VERSION = "arc.companion.paper-broker-receipt.v1"
 BROKER_HANDLE_SCHEMA_VERSION = "arc.companion.paper-broker-handle.v1"
 BROKER_PAGE_SCHEMA_VERSION = "arc.companion.paper-broker-page.v1"
 BROKER_OBJECT_SCHEMA_VERSION = "arc.companion.paper-broker-object.v1"
+CONTROLLER_AGGREGATE_OBJECT_SCHEMA_VERSION = (
+    "arc.companion.paper-broker-controller-aggregate-object.v1"
+)
+CONTROLLER_AGGREGATE_LOOKUP_SCHEMA_VERSION = (
+    "arc.companion.paper-broker-controller-aggregate-lookup.v1"
+)
 LIST_REFERENCE_TARGETS_OPERATION = "list-reference-targets"
 ARTIFACT_READ_OPERATION = "artifact-read"
 MAX_INLINE_BYTES = 64 * 1024
@@ -390,6 +397,7 @@ class PaperBroker:
         broker_job_manager: BrokerJobManager | None = None,
         managed_job_wait_context: Callable[[], ContextManager[None]] | None = None,
         managed_job_cancel_check: Callable[[], bool] | None = None,
+        controller_project_root: Path | str | None = None,
     ) -> None:
         self.policy = policy
         self.run_id = str(run_id).strip()
@@ -401,12 +409,34 @@ class PaperBroker:
         self.handles_root = self.root / "handles"
         self.receipts_root = self.root / "receipts"
         self.inputs_root = self.root / "controller-inputs"
+        self.controller_project_root = (
+            None
+            if controller_project_root is None
+            else Path(controller_project_root).expanduser().resolve()
+        )
+        self.controller_objects_root = (
+            None
+            if self.controller_project_root is None
+            else self.controller_project_root
+            / ".arc-companion" / "paper-broker" / "controller-objects"
+        )
         for directory in (
             self.root, self.objects_root, self.handles_root,
             self.receipts_root, self.inputs_root,
         ):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             _chmod(directory, 0o700)
+        if self.controller_objects_root is not None:
+            if not _is_relative_to(
+                self.controller_objects_root, self.controller_project_root
+            ):
+                raise ValueError(
+                    "Controller aggregate root escapes the resolved project root"
+                )
+            self.controller_objects_root.mkdir(
+                parents=True, exist_ok=True, mode=0o700
+            )
+            _chmod(self.controller_objects_root, 0o700)
         session_key = _canonical_hash({
             "run_id": self.run_id,
             "policy_sha256": policy.policy_sha256,
@@ -786,6 +816,281 @@ class PaperBroker:
             "total_size": len(payload),
             "eof": next_offset >= len(payload),
             "sha256": record["sha256"],
+        }
+
+    def store_controller_aggregate_json(
+        self,
+        *,
+        namespace: str,
+        lookup_identity: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        """Store canonical JSON under a project-stable Controller identity."""
+
+        namespace_root = self._controller_aggregate_namespace(namespace)
+        limit = _positive_byte_limit(max_bytes)
+        identity = _json_object(
+            lookup_identity, "Controller aggregate lookup identity"
+        )
+        value = _json_object(payload, "Controller aggregate payload")
+        payload_bytes = _canonical_json(value).encode("utf-8")
+        if len(payload_bytes) > limit:
+            raise PaperBrokerError(
+                "paper_controller_aggregate_too_large",
+                "Controller aggregate payload exceeds its byte limit.",
+            )
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        identity_sha256 = _canonical_hash(identity)
+        objects_root = namespace_root / "objects"
+        lookups_root = namespace_root / "lookups"
+        for directory in (objects_root, lookups_root):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _chmod(directory, 0o700)
+        object_path = objects_root / f"sha256-{payload_sha256}.json"
+        lookup_path = lookups_root / f"sha256-{identity_sha256}.json"
+        if object_path.exists():
+            if _verified_bytes(object_path, payload_sha256) != payload_bytes:
+                raise PaperBrokerError(
+                    "paper_controller_aggregate_object_invalid",
+                    "Controller aggregate object has conflicting canonical bytes.",
+                )
+        else:
+            _atomic_bytes(object_path, payload_bytes, mode=0o600)
+        assert self.controller_project_root is not None
+        object_relative = object_path.relative_to(
+            self.controller_project_root
+        ).as_posix()
+        lookup_relative = lookup_path.relative_to(
+            self.controller_project_root
+        ).as_posix()
+        lookup = {
+            "schema_version": CONTROLLER_AGGREGATE_LOOKUP_SCHEMA_VERSION,
+            "namespace": namespace,
+            "lookup_identity": identity,
+            "lookup_identity_sha256": identity_sha256,
+            "object_path": object_relative,
+            "payload_sha256": payload_sha256,
+            "size_bytes": len(payload_bytes),
+            "media_type": "application/json",
+        }
+        if lookup_path.exists():
+            existing = self._read_controller_aggregate_lookup(
+                namespace=namespace,
+                lookup_identity=identity,
+                lookup_identity_sha256=identity_sha256,
+                lookup_path=lookup_path,
+                max_bytes=limit,
+            )
+            if existing != lookup:
+                raise PaperBrokerError(
+                    "paper_controller_aggregate_lookup_invalid",
+                    "Controller aggregate lookup conflicts with immutable content.",
+                )
+        else:
+            lookup_bytes = _canonical_json(lookup).encode("utf-8")
+            if len(lookup_bytes) > 128 * 1024:
+                raise PaperBrokerError(
+                    "paper_controller_aggregate_lookup_invalid",
+                    "Controller aggregate lookup receipt exceeds its byte limit.",
+                )
+            _atomic_bytes(lookup_path, lookup_bytes, mode=0o600)
+        return {
+            "object": self._controller_object_descriptor(
+                namespace=namespace,
+                object_path=object_relative,
+                payload_sha256=payload_sha256,
+                size_bytes=len(payload_bytes),
+            ),
+            "lookup_receipt": lookup,
+            "lookup_receipt_path": lookup_relative,
+            "lookup_receipt_sha256": _canonical_hash(lookup),
+        }
+
+    def load_controller_aggregate_json(
+        self,
+        *,
+        namespace: str,
+        lookup_identity: Mapping[str, Any],
+        expected_payload_sha256: str,
+        max_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Load and verify one project-stable Controller aggregate."""
+
+        namespace_root = self._controller_aggregate_namespace(namespace)
+        limit = _positive_byte_limit(max_bytes)
+        identity = _json_object(
+            lookup_identity, "Controller aggregate lookup identity"
+        )
+        identity_sha256 = _canonical_hash(identity)
+        lookup_path = (
+            namespace_root / "lookups" / f"sha256-{identity_sha256}.json"
+        )
+        if not lookup_path.exists():
+            return None
+        lookup = self._read_controller_aggregate_lookup(
+            namespace=namespace,
+            lookup_identity=identity,
+            lookup_identity_sha256=identity_sha256,
+            lookup_path=lookup_path,
+            max_bytes=limit,
+        )
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", expected_payload_sha256)
+            or lookup["payload_sha256"] != expected_payload_sha256
+        ):
+            raise PaperBrokerError(
+                "paper_controller_aggregate_object_invalid",
+                "Controller aggregate payload identity changed.",
+            )
+        assert self.controller_project_root is not None
+        object_path = (
+            self.controller_project_root / str(lookup["object_path"])
+        ).resolve()
+        payload_bytes = _verified_bytes(
+            object_path, str(lookup["payload_sha256"])
+        )
+        if len(payload_bytes) != lookup["size_bytes"] or len(payload_bytes) > limit:
+            raise PaperBrokerError(
+                "paper_controller_aggregate_object_invalid",
+                "Controller aggregate object size is invalid.",
+            )
+        try:
+            payload = json.loads(payload_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PaperBrokerError(
+                "paper_controller_aggregate_object_invalid",
+                "Controller aggregate object is not valid JSON.",
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or _canonical_json(payload).encode("utf-8") != payload_bytes
+        ):
+            raise PaperBrokerError(
+                "paper_controller_aggregate_object_invalid",
+                "Controller aggregate object is not canonical JSON.",
+            )
+        return {
+            "object": self._controller_object_descriptor(
+                namespace=namespace,
+                object_path=str(lookup["object_path"]),
+                payload_sha256=str(lookup["payload_sha256"]),
+                size_bytes=int(lookup["size_bytes"]),
+            ),
+            "lookup_receipt": lookup,
+            "lookup_receipt_path": lookup_path.relative_to(
+                self.controller_project_root
+            ).as_posix(),
+            "lookup_receipt_sha256": _canonical_hash(lookup),
+            "payload": payload,
+        }
+
+    def _controller_aggregate_namespace(self, namespace: str) -> Path:
+        if self.controller_project_root is None or self.controller_objects_root is None:
+            raise PaperBrokerError(
+                "paper_controller_aggregate_root_required",
+                "Controller aggregate storage requires a resolved project root.",
+            )
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", namespace):
+            raise PaperBrokerError(
+                "paper_controller_aggregate_namespace_invalid",
+                "Controller aggregate namespace is invalid.",
+            )
+        root = self.controller_objects_root.resolve()
+        namespace_root = (root / namespace).resolve()
+        if (
+            not _is_relative_to(root, self.controller_project_root)
+            or not _is_relative_to(namespace_root, root)
+        ):
+            raise PaperBrokerError(
+                "paper_controller_aggregate_root_invalid",
+                "Controller aggregate storage escapes the project.",
+            )
+        return namespace_root
+
+    def _read_controller_aggregate_lookup(
+        self,
+        *,
+        namespace: str,
+        lookup_identity: Mapping[str, Any],
+        lookup_identity_sha256: str,
+        lookup_path: Path,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        try:
+            if lookup_path.stat().st_size > 128 * 1024:
+                raise ValueError("lookup receipt exceeds byte limit")
+            lookup = json.loads(lookup_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise PaperBrokerError(
+                "paper_controller_aggregate_lookup_invalid",
+                "Controller aggregate lookup receipt is unreadable.",
+            ) from exc
+        keys = {
+            "schema_version", "namespace", "lookup_identity",
+            "lookup_identity_sha256", "object_path", "payload_sha256",
+            "size_bytes", "media_type",
+        }
+        payload_sha256 = str(
+            lookup.get("payload_sha256") if isinstance(lookup, dict) else ""
+        )
+        assert self.controller_project_root is not None
+        expected_object = (
+            self.controller_objects_root / namespace / "objects"
+            / f"sha256-{payload_sha256}.json"
+        ).resolve()
+        try:
+            object_relative = expected_object.relative_to(
+                self.controller_project_root
+            ).as_posix()
+        except ValueError as exc:
+            raise PaperBrokerError(
+                "paper_controller_aggregate_lookup_invalid",
+                "Controller aggregate object path escapes the project.",
+            ) from exc
+        if (
+            not isinstance(lookup, dict)
+            or set(lookup) != keys
+            or lookup.get("schema_version")
+            != CONTROLLER_AGGREGATE_LOOKUP_SCHEMA_VERSION
+            or lookup.get("namespace") != namespace
+            or lookup.get("lookup_identity") != dict(lookup_identity)
+            or lookup.get("lookup_identity_sha256") != lookup_identity_sha256
+            or not re.fullmatch(r"[0-9a-f]{64}", payload_sha256)
+            or lookup.get("object_path") != object_relative
+            or lookup.get("media_type") != "application/json"
+            or isinstance(lookup.get("size_bytes"), bool)
+            or not isinstance(lookup.get("size_bytes"), int)
+            or lookup.get("size_bytes") < 2
+            or lookup.get("size_bytes") > max_bytes
+        ):
+            raise PaperBrokerError(
+                "paper_controller_aggregate_lookup_invalid",
+                "Controller aggregate lookup receipt is invalid.",
+            )
+        payload = _verified_bytes(expected_object, payload_sha256)
+        if len(payload) != lookup["size_bytes"]:
+            raise PaperBrokerError(
+                "paper_controller_aggregate_lookup_invalid",
+                "Controller aggregate lookup size does not match its object.",
+            )
+        return lookup
+
+    @staticmethod
+    def _controller_object_descriptor(
+        *,
+        namespace: str,
+        object_path: str,
+        payload_sha256: str,
+        size_bytes: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": CONTROLLER_AGGREGATE_OBJECT_SCHEMA_VERSION,
+            "namespace": namespace,
+            "object_path": object_path,
+            "payload_sha256": payload_sha256,
+            "size_bytes": size_bytes,
+            "media_type": "application/json",
         }
 
     def _resolve_one(
@@ -2185,6 +2490,15 @@ def _json_object(value: Any, label: str) -> dict[str, Any]:
             "paper_operation_parameters_invalid", f"{label} must be finite JSON."
         ) from exc
     return result
+
+
+def _positive_byte_limit(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise PaperBrokerError(
+            "paper_controller_aggregate_limit_invalid",
+            "Controller aggregate byte limit must be a positive integer.",
+        )
+    return value
 
 
 def _canonical_json(value: Any) -> str:

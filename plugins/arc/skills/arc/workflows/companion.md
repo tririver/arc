@@ -117,6 +117,16 @@ The CLI does not add a second language detector; pass the canonical BCP-47 tag
 from the sampled agent decision as `--source-language`. This decision remains
 the authoritative mode signal.
 
+When Phase 1 selects a cached translation as a working draft, add
+`--reference-translation-id <cached-id>`. ARC accepts automatic alignment only
+for a complete, unique `1..N` leading-ordinal mapping. Otherwise repeat
+`--reference-translation-map <source-chapter-id>=<reference-chapter-id>` for
+every source chapter. Do not combine this with `--skip-translation`, and do not
+fetch or refresh the reference: missing or ambiguous cached structure is a
+closed preflight failure before intent or model work. Recovery verifies the
+immutable reference manifest and rotates a generation when the chapter
+workload changes.
+
 Use `--recache` to rebuild cached parsing and PDF reconciliation, `--refresh`
 only when fresh remote data was requested, and never both. Useful controls are
 `--idle-timeout-seconds <seconds>`, `--regenerate-commentary`, and

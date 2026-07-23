@@ -13,7 +13,7 @@ def test_catalog_publishes_strict_valid_schemas_and_effect_classification():
     document = capabilities.catalog_document()
 
     assert document["schema_version"] == "arc.paper.capability-catalog.v2"
-    assert len(document["operations"]) == len(capabilities.OPERATION_CATALOG) == 42
+    assert len(document["operations"]) == len(capabilities.OPERATION_CATALOG) == 43
     assert [item["name"] for item in document["operations"]] == sorted(
         capabilities.OPERATION_CATALOG
     )
@@ -68,6 +68,36 @@ def test_catalog_publishes_strict_valid_schemas_and_effect_classification():
     mark = capabilities.get_operation_spec("mark-parsed-equation")
     assert mark is not None
     assert mark.recovery_class == "transactional"
+
+    structure = capabilities.get_operation_spec("get-parsed-structure")
+    assert structure is not None
+    assert structure.executor == "service.get_parsed_source_structure"
+    assert structure.positional_parameters == ("source_id",)
+    assert structure.network_access == "none"
+    assert structure.cache_access == "read"
+    assert structure.parameter_schema == {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"source_id": {"type": "string", "minLength": 1}},
+        "additionalProperties": False,
+        "required": ["source_id"],
+    }
+    result_data = structure.result_schema["properties"]["data"]["anyOf"][0]
+    assert result_data["additionalProperties"] is False
+    assert set(result_data["properties"]) == {
+        "schema_version", "requested_source_id", "canonical_source_id",
+        "parser_version", "source_hash", "document_hash",
+        "structure_schema_version", "requested_document_kind", "document_kind",
+        "structure_source", "chapters", "sections", "coverage",
+    }
+    assert result_data["properties"]["chapters"]["items"]["additionalProperties"] is False
+    assert result_data["properties"]["sections"]["items"]["additionalProperties"] is False
+    assert result_data["properties"]["coverage"]["additionalProperties"] is False
+    invalid = capabilities.dispatch_operation("get-parsed-structure", {})
+    assert invalid["error"]["code"] == "paper_operation_parameters_invalid"
+    assert not list(
+        Draft202012Validator(structure.result_schema).iter_errors(invalid)
+    )
 
 
 def _subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:

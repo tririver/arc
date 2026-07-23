@@ -344,6 +344,24 @@ def build_reader_snapshot(
             "annotation_segment_ids": annotated_ids,
         },
     }
+    if overrides.get("translation_reference") is not None:
+        try:
+            from .translation_reference import (
+                TranslationReferenceError,
+                validate_translation_reference_provenance,
+            )
+            snapshot["translation_reference"] = (
+                validate_translation_reference_provenance(
+                    overrides.get("translation_reference"),
+                    project_root=root,
+                    expected_chapter_ids=[
+                        str(item.get("chapter_id") or "")
+                        for item in chapters
+                    ],
+                )
+            )
+        except (TranslationReferenceError, TypeError, ValueError) as exc:
+            raise WebReaderError("reader translation reference is invalid") from exc
     snapshot["revision"] = sha256_json(snapshot)
     return snapshot
 
@@ -435,6 +453,10 @@ def publish_reader(
         "assets": [*builtin_assets, *source_assets],
         "coverage": deepcopy(value.get("coverage") or {}),
         "source_credit": _source_credit_manifest(value),
+        **(
+            {"translation_reference": deepcopy(value["translation_reference"])}
+            if value.get("translation_reference") is not None else {}
+        ),
     }
     manifest_bytes = _json_file_bytes(manifest)
     manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
@@ -616,6 +638,29 @@ def _validate_reader_bundle(
         item["source_name"] for item in source_credit["authors"]
     ]:
         raise WebReaderError("legacy reader authors differ from source credit")
+    if snapshot.get("translation_reference") is not None:
+        try:
+            from .translation_reference import (
+                TranslationReferenceError,
+                validate_translation_reference_provenance,
+            )
+            compact_reference = validate_translation_reference_provenance(
+                snapshot.get("translation_reference"),
+                project_root=root,
+                expected_chapter_ids=list(
+                    (snapshot.get("coverage") or {}).get("chapter_ids") or []
+                ),
+            )
+        except (TranslationReferenceError, TypeError, ValueError) as exc:
+            raise WebReaderError("reader translation reference is invalid") from exc
+        if manifest.get("translation_reference") != compact_reference:
+            raise WebReaderError(
+                "web manifest translation reference differs from the reader snapshot"
+            )
+    elif "translation_reference" in manifest:
+        raise WebReaderError(
+            "web manifest contains translation reference absent from the snapshot"
+        )
 
     assets = manifest.get("assets")
     if not isinstance(assets, list):

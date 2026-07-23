@@ -165,6 +165,7 @@ from .prompts import (
     section_review_prompt,
     translation_coverage_repair_prompt,
     translation_prompt,
+    translation_reference_prompt,
     translation_retry_prompt,
 )
 from .projection import (
@@ -206,6 +207,16 @@ from .title_translation import (
     merge_title_translation_chunks,
     title_translation_prompt,
     validate_title_translations,
+)
+from .translation_reference import (
+    TranslationReferenceBundle,
+    TRANSLATION_REFERENCE_PROMPT_VERSION,
+    build_primary_structure_view,
+    load_reference_chapter_payload,
+    normalize_mapping_options,
+    resolve_translation_reference,
+    validate_translation_reference_bundle,
+    validate_translation_reference_provenance,
 )
 from .stateful_pipeline import (
     ContextRolloverBudget,
@@ -402,6 +413,8 @@ class BuildOptions:
     user_intent: str | None = None
     source_credit_reference_id: str | None = None
     source_credit_author_mapping: tuple[Mapping[str, str], ...] = ()
+    reference_translation_id: str | None = None
+    reference_translation_mappings: tuple[str, ...] = ()
     stop_after_first_chapter: bool = False
     document_kind: str = "auto"
     idle_timeout_seconds: float | None = None
@@ -438,6 +451,22 @@ class BuildOptions:
             for item in self.source_credit_author_mapping
         ):
             raise ValueError("source_credit_author_mapping entries must be mappings")
+        reference_id = str(self.reference_translation_id or "").strip() or None
+        mappings = normalize_mapping_options(self.reference_translation_mappings)
+        if mappings and reference_id is None:
+            raise ValueError(
+                "reference_translation_mappings requires reference_translation_id"
+            )
+        if reference_id == self.paper_id.strip():
+            raise ValueError(
+                "reference_translation_id must differ from the primary source"
+            )
+        if self.skip_translation and (reference_id is not None or mappings):
+            raise ValueError(
+                "reference translation options cannot be used with skip_translation"
+            )
+        object.__setattr__(self, "reference_translation_id", reference_id)
+        object.__setattr__(self, "reference_translation_mappings", mappings)
         child_budget = (
             self.arc_paper_child_llm_max_calls,
             self.arc_paper_child_llm_max_tokens,
@@ -581,6 +610,7 @@ def build_companion(
         from arc_llm.cancellation import install_signal_cancel_chain
 
         with install_signal_cancel_chain() as cancel_check:
+            entry_recovery_authority = _capture_recovery_source_authority(options)
             result = _build_companion_unlocked(
                 options,
                 source_loader=source_loader,
@@ -595,13 +625,27 @@ def build_companion(
                 and isinstance(result, dict)
                 and result.get("status") == "needs_supervision"
             ):
+                current_recovery_authority = _capture_recovery_source_authority(
+                    options,
+                )
+                recovery_authority = (
+                    current_recovery_authority or entry_recovery_authority
+                )
                 return _resume_companion_unlocked(
                     options.project_dir.resolve(),
                     action="auto",
                     cancel_check=cancel_check,
                     continuation=lambda recovered_options: _build_companion_unlocked(
                         recovered_options,
-                        source_loader=source_loader,
+                        source_loader=lambda paper_id, **kwargs: (
+                            _load_recovery_source_bundle(
+                                recovered_options,
+                                paper_id=paper_id,
+                                load_kwargs=kwargs,
+                                recovery_authority=recovery_authority,
+                                authoritative_source_loader=source_loader,
+                            )
+                        ),
                         llm=llm,
                         compiler=compiler,
                         pdf_validator=pdf_validator,
@@ -610,6 +654,8 @@ def build_companion(
                     ),
                     source_preflight=lambda: _preflight_automatic_recovery_source(
                         options,
+                        recovery_authority=recovery_authority,
+                        authoritative_source_loader=source_loader,
                     ),
                 )
             return result
@@ -677,6 +723,10 @@ def _build_companion_unlocked(
         notice=notice,
         diagnostics=[],
         pending_build_request_sha256=build_request_sha256,
+        translation_reference_manifest_path=None,
+        translation_reference_manifest_sha256=None,
+        translation_reference_source_id=None,
+        translation_reference_source_hash=None,
     )
 
     try:
@@ -686,35 +736,75 @@ def _build_companion_unlocked(
             recache=options.recache,
             document_kind=options.document_kind,
         )
-        source_credit_diagnostics: list[dict[str, str]] = []
-        source_credit = _source_credit_for_bundle(
-            options, bundle, diagnostics=source_credit_diagnostics,
+        prebuilt_chapters_pack = (
+            build_chapters(
+                bundle.document,
+                structure=bundle.parsed.get("structure") or {},
+            )
+            if isinstance(bundle.parsed.get("structure"), dict)
+            else None
         )
-        diagnostics = (*bundle.diagnostics, *source_credit_diagnostics)
-        source_credit_refresh = _refresh_completed_source_credit_only(
-            options=options,
-            bundle=bundle,
-            source_credit=source_credit,
-            previous_state=previous_state,
-            state_path=state_path,
-            build_request_sha256=build_request_sha256,
-            credit_neutral_build_request_sha256=(
-                credit_neutral_build_request_sha256
-            ),
-            diagnostics=diagnostics,
-            compiler=compiler,
-            pdf_validator=pdf_validator,
-            notice=notice,
+        translation_reference_bundle: TranslationReferenceBundle | None = None
+        if options.reference_translation_id is not None:
+            from arc_paper.cache import cache_root
+
+            reference_policy = build_paper_broker_policy(
+                access="full",
+                allowed_operations=(
+                    "get-parsed-identity",
+                    "get-parsed-structure",
+                    "get-parsed-section",
+                ),
+                authorized_source_ids=(options.reference_translation_id,),
+                paper_network_authorized=False,
+                direct_shell_requested=False,
+                managed_job_route=False,
+            )
+            reference_broker = PaperBroker(
+                checkpoint_root=(
+                    project_dir / ".arc-companion"
+                    / "translation-references" / "controller"
+                ),
+                base_cache_root=cache_root(),
+                policy=reference_policy,
+                run_id=(
+                    "translation-reference-"
+                    + sha256_json({
+                        "primary": bundle.paper_id,
+                        "reference": options.reference_translation_id,
+                        "mappings": list(
+                            options.reference_translation_mappings
+                        ),
+                    })[:24]
+                ),
+                generic_internet_allowed=False,
+                controller_project_root=project_dir,
+            )
+            if prebuilt_chapters_pack is None:
+                raise ValueError(
+                    "reference translation requires authoritative source chapters"
+                )
+            translation_reference_bundle = resolve_translation_reference(
+                project_dir=project_dir,
+                checkpoint_dir=None,
+                primary_parsed=bundle.parsed,
+                primary_document=bundle.document,
+                chapters_pack=prebuilt_chapters_pack,
+                requested_reference_id=options.reference_translation_id,
+                explicit_mappings=options.reference_translation_mappings,
+                broker=reference_broker,
+            )
+        translation_reference_manifest_sha256 = (
+            translation_reference_bundle.manifest_sha256
+            if translation_reference_bundle is not None else None
         )
-        if source_credit_refresh is not None:
-            return source_credit_refresh
         generation_document = _generation_document(bundle.document)
         bootstrap_fingerprint = _fingerprint(
             bundle, options, evidence={}, domain_context=None,
+            translation_reference_manifest_sha256=(
+                translation_reference_manifest_sha256
+            ),
         )
-        # The UUID is assigned only after source acceptance. It identifies one
-        # exact request+source build, survives recovery of that snapshot, and
-        # rotates for force, request changes, or newly accepted source content.
         build_instance_id = (
             reusable_build_instance_id
             if (
@@ -735,22 +825,172 @@ def _build_companion_unlocked(
             source_credit_neutral_source_sha256=(
                 _source_credit_neutral_source_identity(bundle)
             ),
+            translation_reference_manifest_path=(
+                str(
+                    translation_reference_bundle.manifest_path.relative_to(
+                        project_dir
+                    )
+                )
+                if translation_reference_bundle is not None else None
+            ),
+            translation_reference_manifest_sha256=(
+                translation_reference_manifest_sha256
+            ),
+            translation_reference_source_id=(
+                str(
+                    translation_reference_bundle.manifest["reference"][
+                        "canonical_id"
+                    ]
+                )
+                if translation_reference_bundle is not None else None
+            ),
+            translation_reference_source_hash=(
+                str(
+                    translation_reference_bundle.manifest["reference"][
+                        "source_hash"
+                    ]
+                )
+                if translation_reference_bundle is not None else None
+            ),
         )
+        fingerprint = bootstrap_fingerprint
+        checkpoint_dir = (
+            project_dir / ".arc-companion" / "checkpoints" / fingerprint
+        )
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        write_json(checkpoint_dir / "document.json", bundle.parsed)
+        if prebuilt_chapters_pack is not None:
+            write_json(checkpoint_dir / "chapters.json", prebuilt_chapters_pack)
+        if translation_reference_bundle is not None:
+            write_json(checkpoint_dir / "translation-reference.json", {
+                "schema_version": (
+                    "arc.companion.translation-reference-validation.v1"
+                ),
+                "manifest_path": str(
+                    translation_reference_bundle.manifest_path.relative_to(
+                        project_dir
+                    )
+                ),
+                "manifest_sha256": translation_reference_manifest_sha256,
+                "compact_provenance": dict(
+                    translation_reference_bundle.compact_provenance
+                ),
+            })
+        write_json(checkpoint_dir / "source-snapshot-receipt.json", {
+            "schema_version": "arc.companion.source-snapshot-receipt.v2",
+            "paper_id": bundle.paper_id,
+            "fingerprint": fingerprint,
+            "checkpoint_identity": checkpoint_dir.name,
+            "build_instance_id": build_instance_id,
+            "build_request_sha256": build_request_sha256,
+            "build_source_fingerprint": fingerprint,
+            "document_payload_sha256": sha256_json(bundle.parsed),
+            "chapters_pack_sha256": (
+                sha256_json(prebuilt_chapters_pack)
+                if prebuilt_chapters_pack is not None else None
+            ),
+            "evidence_sha256": None,
+            "domain_context_sha256": None,
+            "translation_reference_manifest_path": (
+                str(
+                    translation_reference_bundle.manifest_path.relative_to(
+                        project_dir
+                    )
+                )
+                if translation_reference_bundle is not None else None
+            ),
+            "translation_reference_manifest_sha256": (
+                translation_reference_manifest_sha256
+            ),
+            "translation_reference_source_id": (
+                str(
+                    translation_reference_bundle.manifest["reference"][
+                        "canonical_id"
+                    ]
+                )
+                if translation_reference_bundle is not None else None
+            ),
+            "translation_reference_source_hash": (
+                str(
+                    translation_reference_bundle.manifest["reference"][
+                        "source_hash"
+                    ]
+                )
+                if translation_reference_bundle is not None else None
+            ),
+        })
+        source_credit_diagnostics: list[dict[str, str]] = []
+        source_credit = _source_credit_for_bundle(
+            options, bundle, diagnostics=source_credit_diagnostics,
+        )
+        diagnostics = (*bundle.diagnostics, *source_credit_diagnostics)
+        source_credit_refresh = _refresh_completed_source_credit_only(
+            options=options,
+            bundle=bundle,
+            source_credit=source_credit,
+            previous_state=previous_state,
+            state_path=state_path,
+            build_request_sha256=build_request_sha256,
+            credit_neutral_build_request_sha256=(
+                credit_neutral_build_request_sha256
+            ),
+            diagnostics=diagnostics,
+            compiler=compiler,
+            pdf_validator=pdf_validator,
+            notice=notice,
+            translation_reference_bundle=translation_reference_bundle,
+            translation_reference_provenance=(
+                dict(translation_reference_bundle.compact_provenance)
+                if translation_reference_bundle is not None else None
+            ),
+        )
+        if source_credit_refresh is not None:
+            return source_credit_refresh
         def register_bootstrap_recovery_root(root: Path) -> None:
             nonlocal checkpoint_dir
             checkpoint_dir = root.resolve(strict=False)
             write_json(checkpoint_dir / "source-snapshot-receipt.json", {
-                "schema_version": (
-                    "arc.companion.source-snapshot-receipt.v1"
-                ),
+                "schema_version": "arc.companion.source-snapshot-receipt.v2",
                 "paper_id": bundle.paper_id,
                 "fingerprint": bootstrap_fingerprint,
+                "checkpoint_identity": checkpoint_dir.name,
                 "build_instance_id": build_instance_id,
                 "build_request_sha256": build_request_sha256,
                 "build_source_fingerprint": bootstrap_fingerprint,
                 "document_payload_sha256": sha256_json(bundle.parsed),
+                "chapters_pack_sha256": (
+                    sha256_json(prebuilt_chapters_pack)
+                    if prebuilt_chapters_pack is not None else None
+                ),
                 "evidence_sha256": None,
                 "domain_context_sha256": None,
+                "translation_reference_manifest_path": (
+                    str(
+                        translation_reference_bundle.manifest_path.relative_to(
+                            project_dir
+                        )
+                    )
+                    if translation_reference_bundle is not None else None
+                ),
+                "translation_reference_manifest_sha256": (
+                    translation_reference_manifest_sha256
+                ),
+                "translation_reference_source_id": (
+                    str(
+                        translation_reference_bundle.manifest["reference"][
+                            "canonical_id"
+                        ]
+                    )
+                    if translation_reference_bundle is not None else None
+                ),
+                "translation_reference_source_hash": (
+                    str(
+                        translation_reference_bundle.manifest["reference"][
+                            "source_hash"
+                        ]
+                    )
+                    if translation_reference_bundle is not None else None
+                ),
             })
             _state(
                 state_path,
@@ -797,7 +1037,12 @@ def _build_companion_unlocked(
             domain_id=options.domain_id,
             domain_manifest=options.domain_manifest,
         )
-        fingerprint = _fingerprint(bundle, options, evidence=evidence, domain_context=domain_context)
+        fingerprint = _fingerprint(
+            bundle, options, evidence=evidence, domain_context=domain_context,
+            translation_reference_manifest_sha256=(
+                translation_reference_manifest_sha256
+            ),
+        )
         checkpoint_dir = _checkpoint_dir_with_legacy_worker_migration(
             project_dir,
             fingerprint=fingerprint,
@@ -973,16 +1218,48 @@ def _build_companion_unlocked(
         if domain_context is not None:
             write_json(checkpoint_dir / "domain-context.json", domain_context)
         write_json(checkpoint_dir / "source-snapshot-receipt.json", {
-            "schema_version": "arc.companion.source-snapshot-receipt.v1",
+            "schema_version": "arc.companion.source-snapshot-receipt.v2",
             "paper_id": bundle.paper_id,
             "fingerprint": fingerprint,
+            "checkpoint_identity": checkpoint_dir.name,
             "build_instance_id": build_instance_id,
             "build_request_sha256": build_request_sha256,
             "build_source_fingerprint": bootstrap_fingerprint,
             "document_payload_sha256": sha256_json(bundle.parsed),
+            "chapters_pack_sha256": (
+                sha256_json(prebuilt_chapters_pack)
+                if prebuilt_chapters_pack is not None else None
+            ),
             "evidence_sha256": sha256_json(evidence),
             "domain_context_sha256": (
                 sha256_json(domain_context) if domain_context is not None else None
+            ),
+            "translation_reference_manifest_path": (
+                str(
+                    translation_reference_bundle.manifest_path.relative_to(
+                        project_dir
+                    )
+                )
+                if translation_reference_bundle is not None else None
+            ),
+            "translation_reference_manifest_sha256": (
+                translation_reference_manifest_sha256
+            ),
+            "translation_reference_source_id": (
+                str(
+                    translation_reference_bundle.manifest["reference"][
+                        "canonical_id"
+                    ]
+                )
+                if translation_reference_bundle is not None else None
+            ),
+            "translation_reference_source_hash": (
+                str(
+                    translation_reference_bundle.manifest["reference"][
+                        "source_hash"
+                    ]
+                )
+                if translation_reference_bundle is not None else None
             ),
         })
         if isinstance(bundle.parsed.get("structure"), dict):
@@ -997,6 +1274,8 @@ def _build_companion_unlocked(
                 intent_guidance=intent_guidance,
                 cancel_check=cancel_check,
                 submission_limiter=submission_limiter,
+                chapters_pack=prebuilt_chapters_pack,
+                translation_reference_bundle=translation_reference_bundle,
                 require_first_chapter_freeze=(
                     previous_state.get("status") == "first_chapter_ready"
                     and previous_state.get("intent_guidance_identity")
@@ -1515,6 +1794,8 @@ def _build_chaptered_companion(
     require_first_chapter_freeze: bool = False,
     cancel_check: Callable[[], bool] | None = None,
     submission_limiter: LLMSubmissionLimiter | None = None,
+    chapters_pack: Mapping[str, Any] | None = None,
+    translation_reference_bundle: TranslationReferenceBundle | None = None,
 ) -> dict[str, Any]:
     """Execute the chapter contract while retaining legacy runs for old caches."""
     regeneration = set(options.regenerate_lanes)
@@ -1533,7 +1814,11 @@ def _build_chaptered_companion(
         list(index_pack.get("entries") or []) if isinstance(index_pack, dict)
         else list(index_pack)
     )
-    chapters_pack = build_chapters(document, structure=structure)
+    chapters_pack = (
+        dict(chapters_pack)
+        if chapters_pack is not None
+        else build_chapters(document, structure=structure)
+    )
     write_json(checkpoint_dir / "chapters.json", chapters_pack)
     chapter_segments_ready = {
         str(item["chapter_id"]): threading.Event()
@@ -1583,7 +1868,10 @@ def _build_chaptered_companion(
     write_json(checkpoint_dir / "object-migration.json", object_migration)
     accepted_translation_candidates = (
         {}
-        if "translation" in regeneration else
+        if (
+            "translation" in regeneration
+            or translation_reference_bundle is not None
+        ) else
         accepted_translation_projection_candidates(
             artifact_store,
             source_hash=migration_source_hash,
@@ -1946,6 +2234,14 @@ def _build_chaptered_companion(
                 "translation_mode": (
                     "skipped" if options.skip_translation else "enabled"
                 ),
+                **(
+                    {
+                        "translation_reference": dict(
+                            translation_reference_bundle.compact_provenance
+                        )
+                    }
+                    if translation_reference_bundle is not None else {}
+                ),
             }
 
     def segment_glossary_for(segment: dict[str, Any]) -> dict[str, Any]:
@@ -2229,6 +2525,8 @@ def _build_chaptered_companion(
                 final_overrides=chapter_reader_overrides(),
             )
         translation_candidates = (
+            {}
+            if translation_reference_bundle is not None else
             legacy_translation_candidates(legacy)
             if legacy is not None else accepted_translation_candidates
         )
@@ -2892,6 +3190,15 @@ def _build_chaptered_companion(
 
     def lane_stream(prepared, lane: str, generation: int) -> StatefulPromptStream:
         key = (str(prepared.chapter["chapter_id"]), lane, generation)
+        stream_chapter_reference = (
+            translation_reference_bundle.chapter(key[0])
+            if lane == "translation" and translation_reference_bundle is not None
+            else None
+        )
+        stream_reference_identity = (
+            stream_chapter_reference.semantic_identity()
+            if stream_chapter_reference is not None else None
+        )
         with stream_lock:
             session_key = f"{key[0]}:{lane}"
             ref = session_manager.get_existing(session_key)
@@ -2920,6 +3227,10 @@ def _build_chaptered_companion(
                 provider=options.provider, model=options.model,
                 model_tier=(TRANSLATION_TIER if lane == "translation" else ANNOTATION_TIER),
                 paper_runtime_profile=_requested_paper_runtime_profile(options),
+                translation_reference_workload_sha256=(
+                    stream_chapter_reference.semantic_identity_sha256
+                    if stream_chapter_reference is not None else None
+                ),
             )
             stream = prompt_streams.get(key)
             if stream is None:
@@ -2993,7 +3304,10 @@ def _build_chaptered_companion(
                                 "A reference translation may influence terminology, idiom, and style only; "
                                 "never inherit its additions, omissions, or errors."
                             ),
-                        } if intent_guidance is not None else {}),
+                        } if (
+                            intent_guidance is not None
+                            or stream_chapter_reference is not None
+                        ) else {}),
                     },
                     static_context={
                         "chapter": _compact_chapter_descriptor(prepared.chapter),
@@ -3026,6 +3340,10 @@ def _build_chaptered_companion(
                             )}
                             if intent_guidance is not None else {}
                         ),
+                        **(
+                            {"translation_reference": stream_reference_identity}
+                            if stream_reference_identity is not None else {}
+                        ),
                     },
                     continuity_capsule=capsule,
                 )
@@ -3044,6 +3362,20 @@ def _build_chaptered_companion(
     def run_lane(prepared, segment, lane):
         lane_binding = pipeline_lane_binding(str(lane))
         chapter_id, segment_id = prepared.chapter["chapter_id"], segment["segment_id"]
+        chapter_reference = (
+            translation_reference_bundle.chapter(str(chapter_id))
+            if lane == "translation"
+            and translation_reference_bundle is not None
+            else None
+        )
+        chapter_reference_identity = (
+            chapter_reference.semantic_identity()
+            if chapter_reference is not None else None
+        )
+        chapter_reference_identity_sha256 = (
+            chapter_reference.semantic_identity_sha256
+            if chapter_reference is not None else None
+        )
         # The scheduler may expose prepared segment objects while the chapter
         # preparation worker is still committing explicit invalidations.  A
         # paid lane must not snapshot its generation until that transaction is
@@ -3111,7 +3443,16 @@ def _build_chaptered_companion(
             ledger_block = next(
                 item for item in ledger["blocks"] if item["segment_id"] == segment_id
             )
-            if isinstance(ledger_block.get("translation"), dict):
+            if (
+                isinstance(ledger_block.get("translation"), dict)
+                and (
+                    chapter_reference_identity_sha256 is None
+                    or (
+                        ledger_block.get("validation_receipt") or {}
+                    ).get("translation_reference_identity_sha256")
+                    == chapter_reference_identity_sha256
+                )
+            ):
                 migrated_translation = dict(ledger_block["translation"])
                 migration_status = str(
                     (ledger_block.get("validation_receipt") or {}).get(
@@ -3163,6 +3504,10 @@ def _build_chaptered_companion(
                 ),
                 "predecessor_accepted_chain_sha256": predecessor_chain,
                 **({"intent_guidance": guidance_identity} if guidance_identity else {}),
+                **(
+                    {"translation_reference": chapter_reference_identity}
+                    if chapter_reference_identity is not None else {}
+                ),
             }
         else:
             selected_evidence = _evidence_for_segment(
@@ -3191,6 +3536,14 @@ def _build_chaptered_companion(
         if (
             newly_accepted
             and intent_guidance is None
+            and (
+                lane != "translation"
+                or chapter_reference_identity_sha256 is None
+                or (
+                    identity_block.get("deferred_validation_receipt") or {}
+                ).get("translation_reference_identity_sha256")
+                == chapter_reference_identity_sha256
+            )
             and isinstance(deferred_output, dict)
             and (
                 identity_block.get("deferred_output_sha256") is None
@@ -3359,6 +3712,7 @@ def _build_chaptered_companion(
                 and not (
                     guidance_identity is None
                     and lane == "translation"
+                    and chapter_reference_identity_sha256 is None
                     and isinstance(accepted_block.get("translation"), dict)
                 )
             ):
@@ -3393,6 +3747,9 @@ def _build_chaptered_companion(
             object_lane,
             prompt=(
                 _language_prompt_contract(TRANSLATION_PROMPT_VERSION, options)
+                if lane == "translation"
+                and chapter_reference_identity is None
+                else TRANSLATION_REFERENCE_PROMPT_VERSION
                 if lane == "translation"
                 else _language_prompt_contract(COMMENTARY_PROMPT_VERSION, options)
             ),
@@ -3592,6 +3949,40 @@ def _build_chaptered_companion(
         lane_llm = llm
         transport_control: dict[str, str | None] = {"idempotency_key": None}
         if result_llm is not None and session_manager is not None:
+            runtime_profile_path = (
+                checkpoint_dir / "chapters" / str(chapter_id)
+                / f"{lane}-runtime-generation-{block_generation}.json"
+            )
+            existing_runtime_profile = _read_checkpoint_json(
+                runtime_profile_path, root=checkpoint_dir,
+            )
+            if (
+                chapter_reference_identity_sha256 is not None
+                and isinstance(existing_runtime_profile, dict)
+                and (
+                    existing_runtime_profile.get("schema_version")
+                    != "arc.companion.lane-runtime-profile.v3"
+                    or existing_runtime_profile.get(
+                        "translation_reference_workload_sha256"
+                    )
+                    != chapter_reference_identity_sha256
+                )
+            ):
+                with lane_identity_lock:
+                    ledger = invalidate_suffix(
+                        path,
+                        from_segment_id=segment_id,
+                        generation=int(ledger.get("generation") or 1) + 1,
+                    )
+                    block_generation = int(ledger.get("generation") or 1)
+                    block_state = "prepared"
+                    newly_accepted = True
+                session_key = f"{chapter_id}:{lane}"
+                if session_manager.get_existing(session_key) is not None:
+                    session_manager.rotate(
+                        session_key,
+                        reason="translation-reference-workload-change",
+                    )
             stream = lane_stream(prepared, lane, block_generation)
             guidance_lane = "translation" if lane == "translation" else "commentary"
             lane_policy = _guidance_policy(intent_guidance, lane=guidance_lane)
@@ -3657,19 +4048,39 @@ def _build_chaptered_companion(
                     ),
                 }
                 current_payload["segment_glossary"] = segment_glossary
+                if chapter_reference_identity is not None:
+                    current_payload["translation_reference"] = (
+                        chapter_reference_identity
+                    )
                 generation_key = (chapter_id, lane, block_generation)
                 with stream_lock:
                     turn_lock = stateful_turn_locks.setdefault(
                         generation_key, threading.Lock(),
                     )
-                turn_lock.acquire()
-                turn_lock_held = True
-                stream.reconcile_turn_count(
-                    session_manager.turn_count(
+                reference_working_draft = _acquire_stateful_turn_bootstrap(
+                    turn_lock,
+                    stream=stream,
+                    receipt_turn_count=session_manager.turn_count(
                         session_key, generation=block_generation,
-                    )
+                    ),
+                    reference_loader=(
+                        lambda: load_reference_chapter_payload(
+                            translation_reference_bundle,
+                            chapter_id,
+                        )
+                        if (
+                            chapter_reference is not None
+                            and stream.turn_count == 0
+                        )
+                        else None
+                    ),
                 )
+                turn_lock_held = True
                 try:
+                    if reference_working_draft is not None:
+                        current_payload["translation_reference_working_draft"] = (
+                            reference_working_draft
+                        )
                     runtime_profile = lane_runtime_profiles[generation_key]
                     effective_lane_structured_policy = bool(
                         lane_structured_policy_supported
@@ -3706,12 +4117,24 @@ def _build_chaptered_companion(
                                 pinned_policy, options=options,
                             ),
                         )
-                    stateful_prompt = stream.request(
-                        (prompt if correction else (
+                    request_text = (
+                        "Use the translation-reference working draft supplied at "
+                        "this generation's bootstrap and the compact immutable "
+                        "reference identity in the current payload. The source "
+                        "remains authoritative; repair only the requested current "
+                        "segment."
+                        if (
+                            chapter_reference_identity is not None
+                            and stream.turn_count > 0
+                        )
+                        else prompt if correction else (
                             "Translate the current segment payload under the generation rules."
                             if lane == "translation" else
                             "Research when useful and write the current segment annotation under the generation rules."
-                        )), cursor=segment_id,
+                        )
+                    )
+                    stateful_prompt = stream.request(
+                        request_text, cursor=segment_id,
                         source_sha256=_segment_input_hash(
                             segment, blocks_by_id, glossary=segment_glossary
                         ),
@@ -3879,6 +4302,11 @@ def _build_chaptered_companion(
                             session_policy="stateful",
                             session_manager=session_manager,
                             session_key=session_key,
+                            session_metadata={
+                                "translation_reference_workload_sha256": (
+                                    chapter_reference_identity_sha256
+                                ),
+                            },
                             idempotency_key=current_idempotency_key,
                             progress_contract_scope="session",
                             schema_formatter_enabled=False,
@@ -4177,6 +4605,13 @@ def _build_chaptered_companion(
                         or semantic_invalidated
                     ),
                     intent_guidance=intent_guidance,
+                    translation_reference_identity=chapter_reference_identity,
+                    translation_reference_payload=(
+                        load_reference_chapter_payload(
+                            translation_reference_bundle, chapter_id,
+                        )
+                        if chapter_reference is not None else None
+                    ),
                     cancel_check=cancel_inflight_check,
                 )[segment_id]
             else:
@@ -4233,7 +4668,19 @@ def _build_chaptered_companion(
                 receipt=logical_receipts.get(
                     f"companion-{'translation' if lane == 'translation' else 'annotation'}-{segment_id}"
                 ), input_sha256=input_hash, output_sha256=sha256_json(value),
-                validation_receipt={"local_validation": True, "correction_turns_max": 1},
+                validation_receipt={
+                    "local_validation": True,
+                    "correction_turns_max": 1,
+                    **(
+                        {
+                            "translation_reference_identity_sha256": (
+                                chapter_reference_identity_sha256
+                            ),
+                            "translation_reference": chapter_reference_identity,
+                        }
+                        if chapter_reference_identity is not None else {}
+                    ),
+                },
             )
             call_label = (
                 f"companion-{'translation' if lane == 'translation' else 'annotation'}-{segment_id}"
@@ -4256,6 +4703,14 @@ def _build_chaptered_companion(
                         "checkpoint_dir": str(checkpoint_dir),
                         "chapter_id": chapter_id,
                         "segment_id": segment_id,
+                        **(
+                            {
+                                "translation_reference": (
+                                    chapter_reference_identity
+                                )
+                            }
+                            if chapter_reference_identity is not None else {}
+                        ),
                     },
                 )
         if newly_accepted:
@@ -4332,7 +4787,15 @@ def _build_chaptered_companion(
             f"first-chapter-freeze.{str(guidance_identity['output_sha256'])[:16]}.json"
         )
         existing_freeze = _load_first_chapter_freeze(
-            freeze_path, chapters_pack["chapters"], required=require_first_chapter_freeze
+            freeze_path,
+            chapters_pack["chapters"],
+            required=require_first_chapter_freeze,
+            translation_reference_identity_sha256=(
+                translation_reference_bundle.chapter(
+                    str(chapters_pack["chapters"][0]["chapter_id"])
+                ).semantic_identity_sha256
+                if translation_reference_bundle is not None else None
+            ),
         )
         if existing_freeze is not None and not options.stop_after_first_chapter:
             first_results = run_chapter_pipeline(
@@ -4475,6 +4938,14 @@ def _build_chaptered_companion(
         "source_language": options.source_language,
         "title_translations": title_translations,
         "translation_mode": "skipped" if options.skip_translation else "enabled",
+        **(
+            {
+                "translation_reference": dict(
+                    translation_reference_bundle.compact_provenance
+                )
+            }
+            if translation_reference_bundle is not None else {}
+        ),
     }
     content_object = _store_reviewed_content(
         options.project_dir.resolve(), checkpoint_dir=checkpoint_dir,
@@ -4498,6 +4969,10 @@ def _build_chaptered_companion(
         manifest_name="source-manifest.json", validation_name="validation.json",
         compiler=compiler, pdf_validator=pdf_validator, augmentation_scope="substantive",
         chapters=selected_chapters, chapter_guides=guides,
+        translation_reference=(
+            dict(translation_reference_bundle.compact_provenance)
+            if translation_reference_bundle is not None else None
+        ),
     )
     if existing_freeze is not None:
         _verify_frozen_first_chapter_final(
@@ -4529,6 +5004,12 @@ def _build_chaptered_companion(
             "annotation_sha256": sha256_json({value: annotations[value] for value in first_segment_ids}),
             "tex_sha256": artifact["tex_sha256"], "pdf_sha256": artifact["pdf_sha256"],
             "manifest_sha256": artifact["manifest_sha256"],
+            "translation_reference_identity_sha256": (
+                translation_reference_bundle.chapter(
+                    str(first_id)
+                ).semantic_identity_sha256
+                if translation_reference_bundle is not None else None
+            ),
         }
         if freeze_path.is_file() and read_json(freeze_path) != freeze:
             raise RuntimeError("the confirmed first chapter freeze manifest changed")
@@ -7330,10 +7811,14 @@ def _continue_supervised_build(
         return continuation(options)
     if build_companion is not _BUILD_COMPANION_ENTRYPOINT:
         return build_companion(options)
+    recovery_authority = _capture_recovery_source_authority(options)
     return _build_companion_unlocked(
         options,
         source_loader=lambda paper_id, **kwargs: _load_recovery_source_bundle(
-            options, paper_id=paper_id, load_kwargs=kwargs,
+            options,
+            paper_id=paper_id,
+            load_kwargs=kwargs,
+            recovery_authority=recovery_authority,
         ),
         llm=None,
         compiler=compile_latex,
@@ -7343,23 +7828,153 @@ def _continue_supervised_build(
     )
 
 
+@dataclass(frozen=True)
+class _RecoverySourceAuthority:
+    """Immutable recovery authority captured before build state is cleared."""
+
+    checkpoint_dir: Path
+    expected_fingerprint: str
+    reference_tuple: tuple[str | None, str | None, str | None, str | None]
+    receipt_sha256: str | None
+    reference_binding_sha256: str | None
+
+
+_TRANSLATION_REFERENCE_STATE_KEYS = (
+    "translation_reference_manifest_path",
+    "translation_reference_manifest_sha256",
+    "translation_reference_source_id",
+    "translation_reference_source_hash",
+)
+
+
+def _capture_recovery_source_authority(
+    options: BuildOptions,
+) -> _RecoverySourceAuthority | None:
+    """Capture prior state plus immutable receipts before loading_source clears it."""
+
+    project_dir = options.project_dir.resolve()
+    state = _read_optional_json(project_dir / "state.json")
+    active_run = state.get("active_run")
+    active_run = active_run if isinstance(active_run, dict) else {}
+    expected_fingerprint = str(
+        state.get("fingerprint") or active_run.get("fingerprint") or ""
+    )
+    if not expected_fingerprint:
+        return None
+    checkpoint_dir = _checkpoint_dir_from_recovery_state(project_dir, state)
+    if not checkpoint_dir.is_dir() or checkpoint_dir.name != expected_fingerprint:
+        return None
+    reference_tuple = tuple(
+        (
+            str(state.get(key) if key in state else active_run.get(key))
+            if (state.get(key) if key in state else active_run.get(key))
+            is not None
+            else None
+        )
+        for key in _TRANSLATION_REFERENCE_STATE_KEYS
+    )
+    if not (
+        all(value is None for value in reference_tuple)
+        or all(isinstance(value, str) and value for value in reference_tuple)
+    ):
+        return None
+    receipt = _read_checkpoint_json(
+        checkpoint_dir / "source-snapshot-receipt.json",
+        root=checkpoint_dir,
+    )
+    receipt_sha256 = sha256_json(receipt) if isinstance(receipt, dict) else None
+    binding_sha256: str | None = None
+    if all(value is not None for value in reference_tuple):
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema_version")
+            != "arc.companion.source-snapshot-receipt.v2"
+            or receipt.get("fingerprint") != expected_fingerprint
+            or receipt.get("checkpoint_identity") != checkpoint_dir.name
+            or tuple(receipt.get(key) for key in _TRANSLATION_REFERENCE_STATE_KEYS)
+            != reference_tuple
+        ):
+            return None
+        binding = _read_checkpoint_json(
+            checkpoint_dir / "translation-reference.json",
+            root=checkpoint_dir,
+        )
+        chapters_payload = _read_checkpoint_json(
+            checkpoint_dir / "chapters.json", root=checkpoint_dir,
+        )
+        expected_chapter_ids = [
+            str(item.get("chapter_id") or "")
+            for item in (
+                chapters_payload.get("chapters") or []
+                if isinstance(chapters_payload, dict) else []
+            )
+            if isinstance(item, dict)
+        ]
+        try:
+            compact = (
+                validate_translation_reference_provenance(
+                    binding.get("compact_provenance"),
+                    project_root=project_dir,
+                    expected_chapter_ids=expected_chapter_ids,
+                )
+                if (
+                    isinstance(binding, dict)
+                    and set(binding) == {
+                        "schema_version",
+                        "manifest_path",
+                        "manifest_sha256",
+                        "compact_provenance",
+                    }
+                    and binding.get("schema_version")
+                    == "arc.companion.translation-reference-validation.v1"
+                    and binding.get("manifest_path") == reference_tuple[0]
+                    and binding.get("manifest_sha256") == reference_tuple[1]
+                )
+                else None
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            compact = None
+        if (
+            compact is None
+            or compact.get("canonical_reference_id") != reference_tuple[2]
+            or compact.get("reference_source_sha256") != reference_tuple[3]
+            or compact.get("requested_reference_id")
+            != options.reference_translation_id
+        ):
+            return None
+        binding_sha256 = sha256_json(binding)
+    return _RecoverySourceAuthority(
+        checkpoint_dir=checkpoint_dir,
+        expected_fingerprint=expected_fingerprint,
+        reference_tuple=reference_tuple,
+        receipt_sha256=receipt_sha256,
+        reference_binding_sha256=binding_sha256,
+    )
+
+
 def _load_recovery_source_bundle(
     options: BuildOptions,
     *,
     paper_id: str,
     load_kwargs: Mapping[str, Any],
+    recovery_authority: _RecoverySourceAuthority | None = None,
+    authoritative_source_loader: Callable[..., SourceBundle] | None = None,
 ) -> SourceBundle:
     """Load source normally, or verify and reuse the immutable build snapshot."""
 
+    authority = (
+        recovery_authority
+        if recovery_authority is not None
+        else _capture_recovery_source_authority(options)
+    )
     try:
-        return load_source_bundle(paper_id, **dict(load_kwargs))
-    except SourceError as original_error:
-        state = _read_optional_json(options.project_dir.resolve() / "state.json")
-        active_run = state.get("active_run")
-        active_run = active_run if isinstance(active_run, dict) else {}
-        checkpoint_dir = _checkpoint_dir_from_recovery_state(
-            options.project_dir.resolve(), state,
+        return (authoritative_source_loader or load_source_bundle)(
+            paper_id, **dict(load_kwargs),
         )
+    except SourceError as original_error:
+        if authority is None:
+            raise original_error
+        checkpoint_dir = authority.checkpoint_dir
         payload = _read_checkpoint_json(
             checkpoint_dir / "document.json", root=checkpoint_dir,
         )
@@ -7409,11 +8024,12 @@ def _load_recovery_source_bundle(
                 if isinstance(item, dict)
             ),
         )
-        expected_fingerprint = str(
-            state.get("fingerprint") or active_run.get("fingerprint") or checkpoint_dir.name
-        )
+        expected_fingerprint = authority.expected_fingerprint
         actual_fingerprint = _fingerprint(
             bundle, options, evidence=_evidence(bundle), domain_context=None,
+            translation_reference_manifest_sha256=(
+                authority.reference_tuple[1]
+            ),
         )
         if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
             raise SourceError(
@@ -7423,14 +8039,23 @@ def _load_recovery_source_bundle(
         receipt = _read_checkpoint_json(
             checkpoint_dir / "source-snapshot-receipt.json", root=checkpoint_dir,
         )
+        current_receipt_sha256 = (
+            sha256_json(receipt) if isinstance(receipt, dict) else None
+        )
+        if current_receipt_sha256 != authority.receipt_sha256:
+            raise SourceError(
+                "The checkpoint source snapshot receipt is invalid or changed"
+            ) from original_error
         if receipt is not None:
             domain_context = _read_checkpoint_json(
                 checkpoint_dir / "domain-context.json", root=checkpoint_dir,
             )
-            if not (
+            receipt_schema = (
+                str(receipt.get("schema_version") or "")
+                if isinstance(receipt, dict) else ""
+            )
+            common_valid = (
                 isinstance(receipt, dict)
-                and receipt.get("schema_version")
-                == "arc.companion.source-snapshot-receipt.v1"
                 and receipt.get("paper_id") == paper_id
                 and receipt.get("fingerprint") == expected_fingerprint
                 and receipt.get("document_payload_sha256") == sha256_json(payload)
@@ -7438,14 +8063,132 @@ def _load_recovery_source_bundle(
                 and receipt.get("domain_context_sha256") == (
                     sha256_json(domain_context) if domain_context is not None else None
                 )
-            ):
+            )
+            if receipt_schema == "arc.companion.source-snapshot-receipt.v2":
+                chapters_payload = _read_checkpoint_json(
+                    checkpoint_dir / "chapters.json", root=checkpoint_dir,
+                )
+                expected_reference = dict(zip(
+                    _TRANSLATION_REFERENCE_STATE_KEYS,
+                    authority.reference_tuple,
+                    strict=True,
+                ))
+                reference_valid = all(
+                    receipt.get(key) == value
+                    for key, value in expected_reference.items()
+                )
+                if expected_reference[
+                    "translation_reference_manifest_sha256"
+                ] is not None:
+                    binding = _read_checkpoint_json(
+                        checkpoint_dir / "translation-reference.json",
+                        root=checkpoint_dir,
+                    )
+                    try:
+                        compact = (
+                            validate_translation_reference_provenance(
+                                binding.get("compact_provenance"),
+                                project_root=options.project_dir.resolve(),
+                                expected_chapter_ids=[
+                                    str(item.get("chapter_id") or "")
+                                    for item in (
+                                        chapters_payload.get("chapters") or []
+                                        if isinstance(chapters_payload, dict)
+                                        else []
+                                    )
+                                    if isinstance(item, dict)
+                                ],
+                            )
+                            if (
+                                isinstance(binding, dict)
+                                and set(binding) == {
+                                    "schema_version",
+                                    "manifest_path",
+                                    "manifest_sha256",
+                                    "compact_provenance",
+                                }
+                                and binding.get("schema_version")
+                                == (
+                                    "arc.companion."
+                                    "translation-reference-validation.v1"
+                                )
+                                and binding.get("manifest_path")
+                                == expected_reference[
+                                    "translation_reference_manifest_path"
+                                ]
+                                and binding.get("manifest_sha256")
+                                == expected_reference[
+                                    "translation_reference_manifest_sha256"
+                                ]
+                                and sha256_json(binding)
+                                == authority.reference_binding_sha256
+                            )
+                            else None
+                        )
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        compact = None
+                    reference_valid = (
+                        reference_valid
+                        and compact is not None
+                        and compact == binding.get("compact_provenance")
+                        and compact.get("canonical_reference_id")
+                        == expected_reference[
+                            "translation_reference_source_id"
+                        ]
+                        and compact.get("reference_source_sha256")
+                        == expected_reference[
+                            "translation_reference_source_hash"
+                        ]
+                        and compact.get("requested_reference_id")
+                        == options.reference_translation_id
+                    )
+                else:
+                    reference_valid = (
+                        reference_valid
+                        and all(
+                            value is None
+                            for value in expected_reference.values()
+                        )
+                        and options.reference_translation_id is None
+                    )
+                common_valid = (
+                    common_valid
+                    and receipt.get("checkpoint_identity")
+                    == checkpoint_dir.name
+                    and receipt.get("chapters_pack_sha256")
+                    == (
+                        sha256_json(chapters_payload)
+                        if chapters_payload is not None else None
+                    )
+                    and reference_valid
+                )
+            elif receipt_schema == "arc.companion.source-snapshot-receipt.v1":
+                common_valid = (
+                    common_valid
+                    and options.reference_translation_id is None
+                    and not any(
+                        authority.reference_tuple
+                    )
+                )
+            else:
+                common_valid = False
+            if not common_valid:
                 raise SourceError(
                     "The checkpoint source snapshot receipt is invalid or changed"
                 ) from original_error
+        elif options.reference_translation_id is not None:
+            raise SourceError(
+                "The checkpoint source snapshot receipt is invalid or changed"
+            ) from original_error
         return bundle
 
 
-def _preflight_automatic_recovery_source(options: BuildOptions) -> None:
+def _preflight_automatic_recovery_source(
+    options: BuildOptions,
+    *,
+    recovery_authority: _RecoverySourceAuthority | None = None,
+    authoritative_source_loader: Callable[..., SourceBundle] | None = None,
+) -> None:
     """Prove source authority before spending any replacement budget."""
 
     _load_recovery_source_bundle(
@@ -7456,6 +8199,8 @@ def _preflight_automatic_recovery_source(options: BuildOptions) -> None:
             "recache": options.recache,
             "document_kind": options.document_kind,
         },
+        recovery_authority=recovery_authority,
+        authoritative_source_loader=authoritative_source_loader,
     )
 
 
@@ -8236,6 +8981,10 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "source_credit_author_mapping": [
             dict(item) for item in options.source_credit_author_mapping
         ],
+        "reference_translation_id": options.reference_translation_id,
+        "reference_translation_mappings": list(
+            options.reference_translation_mappings
+        ),
         "stop_after_first_chapter": options.stop_after_first_chapter,
         "document_kind": options.document_kind,
         "idle_timeout_seconds": options.idle_timeout_seconds,
@@ -8354,6 +9103,12 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
             for item in value.get("source_credit_author_mapping") or ()
             if isinstance(item, Mapping)
         ),
+        reference_translation_id=(
+            str(value.get("reference_translation_id") or "").strip() or None
+        ),
+        reference_translation_mappings=tuple(
+            value.get("reference_translation_mappings") or ()
+        ),
         stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
         document_kind=str(value.get("document_kind") or "auto"),
         idle_timeout_seconds=value.get("idle_timeout_seconds"),
@@ -8370,7 +9125,11 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
 
 
 def _load_first_chapter_freeze(
-    path: Path, chapters: list[dict[str, Any]], *, required: bool,
+    path: Path,
+    chapters: list[dict[str, Any]],
+    *,
+    required: bool,
+    translation_reference_identity_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     if not path.is_file():
         if required:
@@ -8382,6 +9141,8 @@ def _load_first_chapter_freeze(
         or not chapters or freeze.get("chapter_id") != chapters[0].get("chapter_id")
         or freeze.get("chapter_sha256") != sha256_json(chapters[0])
         or freeze.get("translation_mode") not in {"enabled", "skipped"}
+        or freeze.get("translation_reference_identity_sha256")
+        != translation_reference_identity_sha256
     ):
         raise RuntimeError("the confirmed first chapter freeze manifest is invalid")
     return freeze
@@ -8639,6 +9400,7 @@ def _publish_pdf_artifact(
     chapter_guides: dict[str, dict[str, Any]] | None = None,
     source_language: str | None = None,
     title_translations: dict[str, Any] | list[dict[str, Any]] | None = None,
+    translation_reference: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Render, validate, and atomically publish one preview or final PDF artifact."""
     # Final builds never overwrite a path referenced by the published state.
@@ -8674,6 +9436,8 @@ def _publish_pdf_artifact(
         source_language=source_language,
         title_translations=title_translations,
         source_credit=source_credit,
+        translation_reference=translation_reference,
+        project_root=output_dir,
     )
     fidelity_errors = validate_tex_fidelity(tex, document, source_manifest)
     if fidelity_errors:
@@ -10053,6 +10817,7 @@ def _translation_primary_draft_payload(
     input_sha256: str,
     origin: str,
     generation: int = 1,
+    translation_reference_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     model_generated = origin == "primary-model"
     return {
@@ -10062,10 +10827,18 @@ def _translation_primary_draft_payload(
         "input_sha256": input_sha256,
         "candidate_provenance": {
             "origin": origin,
-            "prompt_version": TRANSLATION_PROMPT_VERSION if model_generated else None,
+            "prompt_version": (
+                TRANSLATION_REFERENCE_PROMPT_VERSION
+                if model_generated and translation_reference_identity is not None
+                else TRANSLATION_PROMPT_VERSION if model_generated else None
+            ),
             "response_schema_version": SCHEMA_VERSION if model_generated else None,
             "model_tier": TRANSLATION_TIER if model_generated else None,
         },
+        **(
+            {"translation_reference": dict(translation_reference_identity)}
+            if translation_reference_identity is not None else {}
+        ),
         "translation": translation,
     }
 
@@ -10566,6 +11339,8 @@ def _generate_translations(
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     force_generation: bool = False,
     intent_guidance: Mapping[str, Any] | None = None,
+    translation_reference_identity: Mapping[str, Any] | None = None,
+    translation_reference_payload: Mapping[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
@@ -10597,6 +11372,10 @@ def _generate_translations(
                 **(
                     {"intent_guidance": _intent_guidance_identity(intent_guidance)}
                     if intent_guidance is not None else {}
+                ),
+                **(
+                    {"translation_reference": dict(translation_reference_identity)}
+                    if translation_reference_identity is not None else {}
                 ),
             },
         )
@@ -10746,9 +11525,19 @@ def _generate_translations(
                     raise RuntimeError(
                         f"translation token placement repair attempt already consumed for {segment_id}"
                     )
-                translation = _llm_call(
-                    llm,
-                    _guided_prompt(translation_prompt(
+                primary_prompt = (
+                    translation_reference_prompt(
+                        _semantic_segment_descriptor(segment),
+                        translatable,
+                        language=options.annotation_language,
+                        glossary=segment_glossary,
+                        protected_names=protected_names,
+                        paper_context=paper_context,
+                        reference_translation=dict(translation_reference_payload),
+                        source_language=_multilingual_prompt_source(options),
+                    )
+                    if translation_reference_payload is not None
+                    else translation_prompt(
                         _semantic_segment_descriptor(segment),
                         translatable,
                         language=options.annotation_language,
@@ -10756,7 +11545,13 @@ def _generate_translations(
                         protected_names=protected_names,
                         paper_context=paper_context,
                         source_language=_multilingual_prompt_source(options),
-                    ), intent_guidance, lane="translation"),
+                    )
+                )
+                translation = _llm_call(
+                    llm,
+                    _guided_prompt(
+                        primary_prompt, intent_guidance, lane="translation",
+                    ),
                     TRANSLATION_SCHEMA,
                     options=options,
                     artifact_dir=artifact_dir,
@@ -10796,6 +11591,7 @@ def _generate_translations(
                     input_sha256=input_hashes[segment_id],
                     origin="primary-model",
                     generation=generation,
+                    translation_reference_identity=translation_reference_identity,
                 )
                 write_json(draft_path, draft)
                 candidate_provenance = dict(draft["candidate_provenance"])
@@ -10940,6 +11736,11 @@ def _generate_translations(
                                 },
                                 repair_model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
                                 source_language=_multilingual_prompt_source(options),
+                                reference_translation=(
+                                    dict(translation_reference_payload)
+                                    if translation_reference_payload is not None
+                                    else None
+                                ),
                             ),
                             TRANSLATION_COVERAGE_REPAIR_SCHEMA,
                             options=options,
@@ -11195,9 +11996,26 @@ def _generate_translations(
                                     {"intent_guidance": _intent_guidance_identity(intent_guidance)}
                                     if intent_guidance is not None else {}
                                 ),
+                                **(
+                                    {
+                                        "translation_reference": dict(
+                                            translation_reference_identity
+                                        )
+                                    }
+                                    if translation_reference_identity is not None
+                                    else {}
+                                ),
                             },
                         ),
                         "generation_provenance": provenance,
+                        **(
+                            {
+                                "translation_reference": dict(
+                                    translation_reference_identity
+                                )
+                            }
+                            if translation_reference_identity is not None else {}
+                        ),
                         "translation": value,
                     },
                 )
@@ -12535,6 +13353,24 @@ def _release_turn_lock_while_waiting(
         yield
     finally:
         lock.acquire()
+
+
+def _acquire_stateful_turn_bootstrap(
+    lock: threading.Lock,
+    *,
+    stream: StatefulPromptStream,
+    receipt_turn_count: int,
+    reference_loader: Callable[[], Any],
+) -> Any:
+    """Acquire one turn and release it if bootstrap reconciliation cannot finish."""
+
+    lock.acquire()
+    try:
+        stream.reconcile_turn_count(receipt_turn_count)
+        return reference_loader()
+    except BaseException:
+        lock.release()
+        raise
 
 
 def _paper_broker_bootstrap_prompt(
@@ -14472,6 +15308,7 @@ def _fingerprint(
     *,
     evidence: dict[str, Any],
     domain_context: dict[str, Any] | None = None,
+    translation_reference_manifest_sha256: str | None = None,
 ) -> str:
     return sha256_json(
         _fingerprint_payload(
@@ -14479,6 +15316,9 @@ def _fingerprint(
             options,
             evidence=evidence,
             domain_context=domain_context,
+            translation_reference_manifest_sha256=(
+                translation_reference_manifest_sha256
+            ),
         )
     )
 
@@ -14795,6 +15635,7 @@ def _fingerprint_payload(
     *,
     evidence: dict[str, Any],
     domain_context: dict[str, Any] | None = None,
+    translation_reference_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     integrity = bundle.document.get("integrity") or {}
     # This identity owns only stable source partition storage. Generation
@@ -14817,6 +15658,14 @@ def _fingerprint_payload(
             or bundle.parsed.get("asset_manifest_hash")
         ),
         "language": options.annotation_language,
+        **(
+            {
+                "translation_reference_manifest_sha256": (
+                    translation_reference_manifest_sha256
+                )
+            }
+            if translation_reference_manifest_sha256 is not None else {}
+        ),
     }
 
 
@@ -17980,6 +18829,8 @@ def _refresh_completed_source_credit_only(
     compiler: Callable[[Path, Path], None],
     pdf_validator: Callable[[Path], dict[str, object]],
     notice: str | None,
+    translation_reference_bundle: TranslationReferenceBundle | None = None,
+    translation_reference_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Re-render a completed build when only source-credit fidelity is stale."""
 
@@ -18015,6 +18866,19 @@ def _refresh_completed_source_credit_only(
             return None
     old_content = envelope.get("content")
     if not isinstance(old_content, Mapping):
+        return None
+    if translation_reference_bundle is not None:
+        validate_translation_reference_bundle(translation_reference_bundle)
+        current_reference = validate_translation_reference_provenance(
+            translation_reference_provenance,
+            project_root=options.project_dir.resolve(),
+            expected_chapter_ids=tuple(
+                translation_reference_bundle.chapters
+            ),
+        )
+    else:
+        current_reference = None
+    if old_content.get("translation_reference") != current_reference:
         return None
     old_credit_hash = str(
         old_content.get("source_credit_sha256")
@@ -18074,6 +18938,10 @@ def _refresh_completed_source_credit_only(
     content["metadata"] = deepcopy(bundle.metadata)
     content["source_credit"] = canonical
     content["source_credit_sha256"] = canonical["canonical_sha256"]
+    if current_reference is not None:
+        content["translation_reference"] = deepcopy(current_reference)
+    else:
+        content.pop("translation_reference", None)
     stored = store_reader_content(
         options.project_dir.resolve(),
         content=content,
@@ -18085,6 +18953,10 @@ def _refresh_completed_source_credit_only(
         "metadata": deepcopy(bundle.metadata),
         "source_credit": canonical,
     })
+    if current_reference is not None:
+        final_overrides["translation_reference"] = deepcopy(current_reference)
+    else:
+        final_overrides.pop("translation_reference", None)
     _write_reader_final_checkpoint(checkpoint, final_overrides)
     stem = (
         f"{safe_name(bundle.paper_id)}_companion_"
@@ -18115,6 +18987,7 @@ def _refresh_completed_source_credit_only(
             augmentation_scope="substantive",
             chapters=list(content["chapters"]),
             chapter_guides=dict(content["chapter_guides"]),
+            translation_reference=current_reference,
         )
         web_state = _publish_reader_update(
             options.project_dir.resolve(),
@@ -18366,9 +19239,14 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
         previous.pop("notice", None)
     if values.get("build_instance_id") is not None:
         previous.pop("pending_build_request_sha256", None)
+    explicit_reference_nulls = {
+        key: None for key, value in values.items()
+        if key.startswith("translation_reference_") and value is None
+    }
     state = {
         **previous,
         **{key: value for key, value in values.items() if value is not None},
+        **explicit_reference_nulls,
     }
     if (
         values.get("output_pdf")
@@ -18460,7 +19338,10 @@ def _fingerprint_bound_state_key(key: str) -> bool:
         "web_manifest_sha256",
         "web",
     } or key.startswith(
-        ("preview_", "output_", "source_manifest_", "validation_")
+        (
+            "preview_", "output_", "source_manifest_", "validation_",
+            "translation_reference_",
+        )
     )
 
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import re
 from threading import BoundedSemaphore, Lock
 from typing import Any, Iterator, Mapping
 import uuid
@@ -12,8 +13,9 @@ import uuid
 
 STATEFUL_TURN_VERSION = "arc.companion.stateful-turn.v2"
 STATEFUL_STREAM_STATE_VERSION = "arc.companion.stateful-stream-state.v1"
-LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v2"
-LEGACY_LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v1"
+LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v3"
+LEGACY_LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v2"
+EARLIEST_LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v1"
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 ROLLOVER_FRACTION = 0.70
 
@@ -274,8 +276,16 @@ def resolve_lane_runtime_profile(
     provider: str = "auto", model: str | None = None,
     model_tier: str | None = None,
     paper_runtime_profile: Mapping[str, Any] | None = None,
+    translation_reference_workload_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Pin one access recipe for every primary/repair call in a generation."""
+    if (
+        translation_reference_workload_sha256 is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}", translation_reference_workload_sha256,
+        ) is None
+    ):
+        raise ValueError("translation-reference workload hash is invalid")
     try:
         existing = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -288,14 +298,15 @@ def resolve_lane_runtime_profile(
     if isinstance(existing, Mapping):
         if existing.get("schema_version") not in {
             LANE_RUNTIME_PROFILE_VERSION, LEGACY_LANE_RUNTIME_PROFILE_VERSION,
+            EARLIEST_LANE_RUNTIME_PROFILE_VERSION,
         } or any(
             existing.get(key) != value for key, value in identity.items()
         ):
             raise ValueError(f"lane runtime profile identity changed: {path}")
-        if existing.get("schema_version") == LEGACY_LANE_RUNTIME_PROFILE_VERSION:
+        if existing.get("schema_version") == EARLIEST_LANE_RUNTIME_PROFILE_VERSION:
             migrated = {
                 **dict(existing),
-                "schema_version": LANE_RUNTIME_PROFILE_VERSION,
+                "schema_version": LEGACY_LANE_RUNTIME_PROFILE_VERSION,
                 "arc_paper_access": "none",
                 "paper_policy_sha256": None,
                 "paper_catalog_sha256": None,
@@ -307,10 +318,39 @@ def resolve_lane_runtime_profile(
                 "paper_child_llm_max_calls": None,
                 "paper_child_llm_max_tokens": None,
                 "paper_child_llm_output_reserve_tokens": None,
+                "migrated_from_schema_version": EARLIEST_LANE_RUNTIME_PROFILE_VERSION,
+                "migration_history": [
+                    EARLIEST_LANE_RUNTIME_PROFILE_VERSION,
+                    LEGACY_LANE_RUNTIME_PROFILE_VERSION,
+                ],
+            }
+            _atomic_write_json(path, migrated)
+            existing = migrated
+        if existing.get("schema_version") == LEGACY_LANE_RUNTIME_PROFILE_VERSION:
+            if translation_reference_workload_sha256 is not None:
+                raise ValueError(
+                    "legacy lane runtime profile cannot resume a reference-backed "
+                    "translation generation"
+                )
+            migrated = {
+                **dict(existing),
+                "schema_version": LANE_RUNTIME_PROFILE_VERSION,
+                "translation_reference_workload_sha256": None,
                 "migrated_from_schema_version": LEGACY_LANE_RUNTIME_PROFILE_VERSION,
+                "migration_history": list(
+                    existing.get("migration_history")
+                    or [LEGACY_LANE_RUNTIME_PROFILE_VERSION]
+                ),
             }
             _atomic_write_json(path, migrated)
             return migrated
+        if (
+            existing.get("translation_reference_workload_sha256")
+            != translation_reference_workload_sha256
+        ):
+            raise ValueError(
+                "lane translation-reference workload changed after generation start"
+            )
         _validate_paper_runtime_recipe(
             existing, paper_runtime_profile or {}, allow_provisional=True,
         )
@@ -332,6 +372,9 @@ def resolve_lane_runtime_profile(
         "model": model,
         "model_tier": model_tier,
         "recorded_runtime_fingerprint": recorded_runtime_fingerprint,
+        "translation_reference_workload_sha256": (
+            translation_reference_workload_sha256
+        ),
         **dict(paper_runtime_profile or {}),
     }
     _atomic_write_json(path, profile)

@@ -28,6 +28,7 @@ from arc_companion.prompts import (
     section_review_prompt,
     translation_coverage_repair_prompt,
     translation_prompt,
+    translation_reference_prompt,
 )
 
 
@@ -65,6 +66,23 @@ def test_all_companion_schemas_satisfy_codex_strict_object_contract() -> None:
         provider_schema = to_provider_json_schema(schema)
         assert provider_schema is not None
         _assert_codex_strict_objects(provider_schema)
+
+
+def test_reference_translation_prompt_keeps_source_authoritative() -> None:
+    prompt = translation_reference_prompt(
+        {"segment_id": "seg-1"},
+        [{"block_id": "b1", "text": "Source"}],
+        language="zh-CN",
+        glossary={},
+        protected_names=["Alice"],
+        paper_context={},
+        reference_translation={"sections": [{"text": "Working draft"}]},
+        source_language="en",
+    )
+    assert "working draft" in prompt
+    assert "original source is authoritative" in prompt
+    assert "remove its additions" in prompt
+    assert '"block_id": "b1"' in prompt
 
 
 def test_review_patch_uses_null_for_unchanged_optional_replacements() -> None:
