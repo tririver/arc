@@ -53,6 +53,7 @@ def enrich_status(project_dir: Path, state: Mapping[str, Any]) -> dict[str, Any]
     lock_owner = inspect_lock(root / ".arc-companion-build.lock")
     phase = str(state.get("status") or "unknown")
     recovery = _recovery_status(root)
+    provenance = _provenance_status(root, state)
     return {
         **dict(state),
         "current_phase": phase,
@@ -64,6 +65,33 @@ def enrich_status(project_dir: Path, state: Mapping[str, Any]) -> dict[str, Any]
         "last_progress_at": last_progress or state.get("updated_at"),
         "phase_elapsed_seconds": timings,
         **recovery,
+        **provenance,
+    }
+
+
+def _provenance_status(
+    root: Path, state: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        from .provenance import validate_published_provenance
+
+        value = validate_published_provenance(root, state)
+    except Exception:
+        return {
+            "provenance_status": "invalid",
+            "provenance_counts_status": "invalid",
+        }
+    if value is None:
+        return {
+            "provenance_status": "unavailable",
+            "provenance_counts_status": "unavailable",
+        }
+    mapping = ((state.get("published") or {}).get("provenance") or {})
+    return {
+        "provenance_status": "complete",
+        "provenance_final_id": value["final_id"],
+        "provenance_path": mapping.get("path"),
+        "provenance_counts_status": "complete",
     }
 
 

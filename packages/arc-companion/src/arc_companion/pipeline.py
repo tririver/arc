@@ -713,25 +713,12 @@ def build_companion(
         )
 
         def finish(result: dict[str, Any]) -> dict[str, Any]:
-            latest = _read_optional_json(state_path)
-            data = result.get("data")
-            if (
-                result.get("ok") is True
-                and isinstance(data, Mapping)
-                and latest.get("status") == "complete"
-                and _gc_publication_identity(latest) != publication_before
-            ):
-                from .gc import run_post_publication_gc
-
-                run_post_publication_gc(
-                    project_dir,
-                    state_merger=lambda values: _merge_gc_state(
-                        state_path, dict(values),
-                    ),
-                    lock_already_held=True,
-                )
-                return {**result, "data": _read_optional_json(state_path)}
-            return result
+            return _finalize_pipeline_provenance(
+                project_dir,
+                state_path=state_path,
+                result=result,
+                publication_before=publication_before,
+            )
 
         from arc_llm.cancellation import install_signal_cancel_chain
 
@@ -833,6 +820,145 @@ def _merge_gc_state(
             merged[key] = value
     write_json(state_path, merged)
     return merged
+
+
+def _merge_provenance_state(
+    state_path: Path, values: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = _read_optional_json(state_path)
+    published = dict(merged.get("published") or {})
+    if values.get("published_provenance") is not None:
+        from .provenance import PROVENANCE_POLICY_VERSION
+
+        published["provenance"] = dict(values["published_provenance"])
+        merged["provenance_policy_version"] = PROVENANCE_POLICY_VERSION
+        merged.pop("provenance_warning", None)
+    if values.get("provenance_warning") is not None:
+        if not values.get("preserve_published_provenance"):
+            published.pop("provenance", None)
+        merged["provenance_warning"] = dict(values["provenance_warning"])
+    merged["published"] = published
+    write_json(state_path, merged)
+    return merged
+
+
+def _finalize_pipeline_provenance(
+    project_dir: Path,
+    *,
+    state_path: Path,
+    result: Any,
+    publication_before: Mapping[str, Any],
+) -> Any:
+    if not isinstance(result, dict):
+        return result
+    latest = _read_optional_json(state_path)
+    data = result.get("data")
+    provenance_status = _published_provenance_status(project_dir, latest)
+    publication_changed = (
+        _gc_publication_identity(latest) != publication_before
+    )
+    provenance_mandatory = (
+        publication_changed
+        and _new_publication_requires_provenance(latest)
+    )
+    if (
+        result.get("ok") is not True
+        or not isinstance(data, Mapping)
+        or latest.get("status") != "complete"
+        or not (
+            publication_changed
+            or provenance_status != "valid"
+        )
+    ):
+        return result
+    from .gc import run_post_publication_gc
+    from .provenance import (
+        ProvenanceError,
+        commit_final_provenance,
+        plan_final_provenance,
+    )
+
+    if publication_changed:
+        run_post_publication_gc(
+            project_dir,
+            state_merger=lambda values: _merge_gc_state(
+                state_path, dict(values),
+            ),
+            lock_already_held=True,
+        )
+        latest = _read_optional_json(state_path)
+    failure_code: str | None = None
+    failure_message: str | None = None
+    try:
+        plan = plan_final_provenance(
+            project_dir,
+            state=latest,
+            mode="build" if publication_changed else "legacy_upgrade",
+        )
+        commit_final_provenance(
+            project_dir,
+            plan=plan,
+            state=latest,
+            state_merger=lambda values: _merge_provenance_state(
+                state_path, dict(values),
+            ),
+        )
+    except ProvenanceError as exc:
+        failure_code = exc.code
+        failure_message = str(exc)[:256]
+    except Exception as exc:
+        failure_code = "provenance_failed"
+        failure_message = str(exc)[:256] or exc.__class__.__name__
+    if failure_code is not None and failure_message is not None:
+        _merge_provenance_state(state_path, {
+            "provenance_warning": {
+                "code": failure_code,
+                "message": failure_message,
+            },
+            "preserve_published_provenance": provenance_status == "invalid",
+        })
+        if provenance_mandatory or provenance_status == "invalid":
+            return err(
+                "companion_provenance_failed",
+                failure_message,
+                project_dir=str(project_dir),
+                publication_preserved=True,
+                provenance_code=failure_code,
+            )
+    return {**result, "data": _read_optional_json(state_path)}
+
+
+def _new_publication_requires_provenance(
+    state: Mapping[str, Any],
+) -> bool:
+    published = state.get("published")
+    published = published if isinstance(published, Mapping) else {}
+    pdf = published.get("pdf")
+    pdf = pdf if isinstance(pdf, Mapping) else {}
+    return (
+        state.get("status") == "complete"
+        and bool(state.get("fingerprint"))
+        and bool(state.get("checkpoint_dir"))
+        and bool(
+            state.get("checkpoint_identity") or state.get("fingerprint")
+        )
+        and pdf.get("validator_version") == PDF_VALIDATOR_VERSION
+    )
+
+
+def _published_provenance_status(
+    project_dir: Path, state: Mapping[str, Any],
+) -> str:
+    from .provenance import validate_published_provenance
+
+    published = state.get("published")
+    if not isinstance(published, Mapping) or "provenance" not in published:
+        return "absent"
+    try:
+        value = validate_published_provenance(project_dir, state)
+    except Exception:
+        return "invalid"
+    return "valid" if value is not None else "absent"
 
 
 def _build_companion_unlocked(
@@ -6387,15 +6513,25 @@ def resume_companion(
             retryable=True,
         )
     try:
+        state_path = resolved / "state.json"
+        publication_before = _gc_publication_identity(
+            _read_optional_json(state_path),
+        )
         from arc_llm.cancellation import install_signal_cancel_chain
 
         with install_signal_cancel_chain() as cancel_check:
-            return _resume_companion_unlocked(
+            result = _resume_companion_unlocked(
                 resolved,
                 action=action,
                 confirm_possible_duplicate_charge=confirm_possible_duplicate_charge,
                 cancel_check=cancel_check,
             )
+        return _finalize_pipeline_provenance(
+            resolved,
+            state_path=state_path,
+            result=result,
+            publication_before=publication_before,
+        )
     finally:
         lock.release()
 
@@ -10717,12 +10853,18 @@ def validate_project(
             raise RuntimeError(
                 "validated PDF/Web source-credit observations differ"
             )
+        from .provenance import validate_published_provenance
+
+        provenance_report = validate_published_provenance(
+            project_dir.resolve(), state,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         return err("companion_validation_failed", str(exc))
     return ok({
         "pdf": report,
         "web": web_report,
         "manifest": manifest,
+        "provenance": provenance_report,
         "output_pdf": str(pdf),
         "output_run_pdf": effective.get("output_run_pdf"),
     })
@@ -23853,6 +23995,17 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
     if values.get("output_run_pdf"):
         state["run_pdf_managed_path"] = values["output_run_pdf"]
     published = dict(previous.get("published") or {})
+    if fingerprint_changed or fingerprint_unresolved or any(
+        values.get(key) is not None
+        for key in (
+            "content_sha256",
+            "output_pdf",
+            "output_html",
+            "validation_path",
+            "web_manifest_path",
+        )
+    ):
+        published.pop("provenance", None)
     content_sha256 = values.get("content_sha256")
     if content_sha256:
         published["content_sha256"] = content_sha256

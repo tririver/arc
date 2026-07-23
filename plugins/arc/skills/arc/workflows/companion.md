@@ -400,7 +400,9 @@ translation IDs and TeX contains no translation markers. Use invisible
 manifest or TeX markers for hierarchy checks rather than reader-visible labels.
 Also require web-manifest path containment and hashes, complete local asset
 closure, snapshot coverage, and the same source/translation/commentary order as
-the PDF.
+the PDF. When published final provenance is present, require `validate` to
+recheck its closed checkpoint/content/output/control graph and final semantic
+ID; partial or tampered provenance is a validation failure.
 
 ### Step 3: Deliver
 
@@ -430,8 +432,13 @@ build lock remains held. This removes only strictly recognized superseded
 Reader/render history; it permanently retains current outputs, checkpoints,
 reviewed-content objects, recovery caches, audit records, provenance, package
 inputs, and unknown user files. A cleanup warning does not invalidate the
-published result. For explicit review, inspect the deterministic dry-run and
-bind apply to its candidate digest:
+published result. ARC then closes immutable final provenance over the current
+checkpoint, reviewed content, exact PDF/Reader outputs, applicable control
+receipts, compact partial-attribution counts, and the exact terminal GC receipt
+when current publication state has one.
+A legacy completed or PDF-reuse fast path with missing provenance performs this
+closure without generation or rerendering. For explicit review, inspect the
+deterministic dry-run and bind apply to its candidate digest:
 
 ```bash
 arc-companion gc --project-dir <project-dir> --json
@@ -448,8 +455,10 @@ arc-companion package --project-dir <project-dir> --json
 ```
 
 The package must include the PDF validation set plus every manifest-declared
-web file: HTML, snapshot, JavaScript, CSS, local KaTeX/fonts, and media. Reject
-paths outside the project and any hash mismatch.
+web file: HTML, snapshot, JavaScript, CSS, local KaTeX/fonts, and media. It also
+includes the validated final-provenance object and compact count basis when
+published, but not body-bearing control receipts. Reject paths outside the
+project and any hash mismatch.
 
 ## Phase 4: Self-Reflection
 

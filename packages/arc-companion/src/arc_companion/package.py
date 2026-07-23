@@ -188,6 +188,9 @@ def package_project(project_dir: Path) -> dict[str, object]:
                 raise ValueError(f"TeX asset hash mismatch: {asset_path}")
             files.append(asset_path)
         files.extend(_web_files(root, effective))
+        from .provenance import provenance_package_paths
+
+        files.extend(provenance_package_paths(root, state))
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         return err("companion_package_failed", str(exc))
 

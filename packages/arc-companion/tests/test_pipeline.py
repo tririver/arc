@@ -9678,7 +9678,9 @@ def test_json_emit_warns_about_segmentation_failure_on_stderr(capsys) -> None:
     assert captured.err == "WARNING: window w-0002 failed after 3 attempts\n"
 
 
-def test_exact_pdf_resume_is_a_state_file_noop(tmp_path: Path) -> None:
+def test_exact_pdf_resume_upgrades_provenance_without_generation_or_gc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bundle = _bundle(tmp_path)
     project = tmp_path / "exact-pdf-resume"
     compile_count = 0
@@ -9800,8 +9802,16 @@ def test_exact_pdf_resume_is_a_state_file_noop(tmp_path: Path) -> None:
     state.update(current_fields)
     write_json(state_path, state)
     before_bytes = state_path.read_bytes()
-    before_stat = state_path.stat()
     initial_compile_count = compile_count
+    import arc_companion.gc as gc_module
+
+    monkeypatch.setattr(
+        gc_module,
+        "run_post_publication_gc",
+        lambda *_args, **_kwargs: pytest.fail(
+            "T20 GC called on exact build no-op provenance upgrade"
+        ),
+    )
 
     resumed = build_companion(
         BuildOptions(paper_id=bundle.paper_id, project_dir=project),
@@ -9814,10 +9824,44 @@ def test_exact_pdf_resume_is_a_state_file_noop(tmp_path: Path) -> None:
     assert resumed["ok"], resumed
     assert resumed["meta"]["resumed"] is True
     assert compile_count == initial_compile_count
-    assert state_path.read_bytes() == before_bytes
-    after_stat = state_path.stat()
-    assert after_stat.st_ino == before_stat.st_ino
-    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+    assert state_path.read_bytes() != before_bytes
+    current = read_json(state_path)
+    assert current["published"]["provenance"]["status"] == "complete"
+    assert not current.get("provenance_warning")
+    # The prior publication's cleanup warning remains diagnostic state; the
+    # no-op provenance upgrade does not rerun T20.
+    assert current["artifact_gc_warning"]["code"] == "gc_reader_invalid"
+
+    import arc_companion.provenance as provenance_module
+
+    bad_sha256 = "0" * 64
+    current["published"]["provenance"]["sha256"] = bad_sha256
+    write_json(state_path, current)
+    monkeypatch.setattr(
+        provenance_module,
+        "commit_final_provenance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            provenance_module.ProvenanceError(
+                "injected_provenance_failure", "injected repair failure",
+            )
+        ),
+    )
+
+    rejected = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=lambda *_args, **_kwargs: pytest.fail("model called"),
+        compiler=lambda *_args: pytest.fail("compiler called"),
+        pdf_validator=lambda _path: pytest.fail("validator called"),
+    )
+
+    assert rejected["ok"] is False
+    assert rejected["error"]["code"] == "companion_provenance_failed"
+    preserved = read_json(state_path)
+    assert preserved["published"]["provenance"]["sha256"] == bad_sha256
+    assert preserved["provenance_warning"]["code"] == (
+        "injected_provenance_failure"
+    )
 
 
 @pytest.mark.parametrize("interrupted_status", ["typesetting", "failed"])
@@ -9961,6 +10005,9 @@ def test_interrupted_final_state_adopts_published_revision_without_recompile(
     assert resumed["ok"], resumed
     assert resumed["meta"]["resumed"] is True
     assert resumed["data"]["output_pdf_sha256"] == sha256_file(pdf)
+    assert resumed["data"]["published"]["pdf"]["render_version"] == (
+        PDF_RENDER_VERSION
+    )
 
 
 def test_complete_resume_requires_matching_output_hashes(tmp_path: Path) -> None:

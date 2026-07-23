@@ -926,6 +926,7 @@ def match_validated_pdf_revision(
                 "render_stem",
                 "render_identity_receipt_path",
                 "render_identity_receipt_sha256",
+                "render_version",
                 "render_recipe_sha256",
                 "validator_version",
                 "output_tex",

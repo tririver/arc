@@ -189,6 +189,22 @@ def render_content(
                     and state.get(key) == value
                     for key, value in delivery.items()
                 ) and delivery_was_valid:
+                    prior_provenance_status = _published_provenance_status(
+                        root, state,
+                    )
+                    final_state, provenance_failure = (
+                        _finalize_render_provenance(
+                            root, mode="render_pdf",
+                            refresh_if_valid=False, run_gc=False,
+                        )
+                    )
+                    if (
+                        provenance_failure is not None
+                        and prior_provenance_status == "invalid"
+                    ):
+                        return _provenance_render_error(
+                            provenance_failure, content_sha256=digest,
+                        )
                     phase_times["total"] = time.monotonic() - started
                     return ok({
                         "mode": RENDER_MODE,
@@ -196,7 +212,7 @@ def render_content(
                         "content_sha256": digest,
                         "provider_calls": 0,
                         "phase_times_seconds": phase_times,
-                        "published": state.get("published"),
+                        "published": final_state.get("published"),
                         "output_pdf": published["pdf"]["output_pdf"],
                         "output_pdf_sha256": published["pdf"][
                             "output_pdf_sha256"
@@ -211,6 +227,20 @@ def render_content(
                     outputs={"pdf": published["pdf"]},
                     render_format=format,
                 )
+                prior_provenance_status = _published_provenance_status(
+                    root, final_state,
+                )
+                final_state, provenance_failure = _finalize_render_provenance(
+                    root, mode="render_pdf",
+                    refresh_if_valid=True, run_gc=False,
+                )
+                if (
+                    provenance_failure is not None
+                    and prior_provenance_status == "invalid"
+                ):
+                    return _provenance_render_error(
+                        provenance_failure, content_sha256=digest,
+                    )
                 phase_times["total"] = time.monotonic() - started
                 return ok({
                     "mode": RENDER_MODE,
@@ -348,19 +378,35 @@ def render_content(
                 outputs={"pdf": published["pdf"]},
                 render_format=format,
             )
-        if (
+        history_changed = (
             (format in {"pdf", "all"} and not pdf_reused)
             or reader_published
-        ):
-            from .gc import run_post_publication_gc
-
-            run_post_publication_gc(
+        )
+        prior_provenance_status = _published_provenance_status(
+            root, final_state,
+        )
+        if history_changed or prior_provenance_status != "valid":
+            final_state, provenance_failure = _finalize_render_provenance(
                 root,
-                state_merger=lambda values: _merge_gc_state(
-                    root, dict(values),
-                ),
-                lock_already_held=True,
+                mode={
+                    "pdf": "render_pdf",
+                    "web": "render_web",
+                    "all": "render_all",
+                }[format],
+                refresh_if_valid=True,
+                run_gc=history_changed,
             )
+            if (
+                history_changed
+                and provenance_failure is not None
+                and _new_publication_requires_provenance(final_state)
+            ) or (
+                provenance_failure is not None
+                and prior_provenance_status == "invalid"
+            ):
+                return _provenance_render_error(
+                    provenance_failure, content_sha256=digest,
+                )
         phase_times["total"] = time.monotonic() - started
         data = {
             "mode": RENDER_MODE,
@@ -769,9 +815,22 @@ def _publish_state(
     state = normalize_run_root_pdf_state(_state(root))
     managed_run_pdf = managed_run_root_pdf_path(state)
     published = dict(state.get("published") or {})
+    prior_content = published.get("content_sha256")
+    prior_lanes = {
+        lane: _published_lane_identity(published.get(lane))
+        for lane in outputs
+    }
     published["content_sha256"] = content_sha256
     for lane, value in outputs.items():
         published[lane] = dict(value)
+    if (
+        prior_content != content_sha256
+        or any(
+            prior_lanes[lane] != _published_lane_identity(value)
+            for lane, value in outputs.items()
+        )
+    ):
+        published.pop("provenance", None)
     revisions = list(state.get("revisions") or [])
     revision = {
         "content_sha256": content_sha256,
@@ -830,6 +889,135 @@ def _merge_gc_state(root: Path, values: dict[str, Any]) -> dict[str, Any]:
     merged["schema_version"] = "arc.companion.state.v3"
     write_json(root / "state.json", merged)
     return merged
+
+
+def _merge_provenance_state(
+    root: Path, values: dict[str, Any],
+) -> dict[str, Any]:
+    merged = _state(root)
+    published = dict(merged.get("published") or {})
+    if values.get("published_provenance") is not None:
+        from .provenance import PROVENANCE_POLICY_VERSION
+
+        published["provenance"] = dict(values["published_provenance"])
+        merged["provenance_policy_version"] = PROVENANCE_POLICY_VERSION
+        merged.pop("provenance_warning", None)
+    if values.get("provenance_warning") is not None:
+        if not values.get("preserve_published_provenance"):
+            published.pop("provenance", None)
+        merged["provenance_warning"] = dict(values["provenance_warning"])
+    merged["published"] = published
+    write_json(root / "state.json", merged)
+    return merged
+
+
+def _published_provenance_status(
+    root: Path, state: dict[str, Any],
+) -> str:
+    from .provenance import validate_published_provenance
+
+    published = state.get("published")
+    if not isinstance(published, dict) or "provenance" not in published:
+        return "absent"
+    try:
+        value = validate_published_provenance(root, state)
+    except Exception:
+        return "invalid"
+    return "valid" if value is not None else "absent"
+
+
+def _finalize_render_provenance(
+    root: Path,
+    *,
+    mode: str,
+    refresh_if_valid: bool,
+    run_gc: bool,
+) -> tuple[dict[str, Any], dict[str, str] | None]:
+    current = _state(root)
+    provenance_status = _published_provenance_status(root, current)
+    if not refresh_if_valid and provenance_status == "valid":
+        return current, None
+    from .gc import run_post_publication_gc
+    from .provenance import (
+        ProvenanceError,
+        commit_final_provenance,
+        plan_final_provenance,
+    )
+
+    if run_gc:
+        run_post_publication_gc(
+            root,
+            state_merger=lambda values: _merge_gc_state(root, dict(values)),
+            lock_already_held=True,
+        )
+        current = _state(root)
+    failure: dict[str, str] | None = None
+    try:
+        plan = plan_final_provenance(root, state=current, mode=mode)
+        commit_final_provenance(
+            root,
+            plan=plan,
+            state=current,
+            state_merger=lambda values: _merge_provenance_state(
+                root, dict(values),
+            ),
+        )
+    except ProvenanceError as exc:
+        failure = {"code": exc.code, "message": str(exc)[:256]}
+        _merge_provenance_state(root, {
+            "provenance_warning": failure,
+            "preserve_published_provenance": provenance_status == "invalid",
+        })
+    except Exception as exc:
+        failure = {
+            "code": "provenance_failed",
+            "message": str(exc)[:256] or exc.__class__.__name__,
+        }
+        _merge_provenance_state(root, {
+            "provenance_warning": failure,
+            "preserve_published_provenance": provenance_status == "invalid",
+        })
+    return _state(root), failure
+
+
+def _provenance_render_error(
+    failure: dict[str, str], *, content_sha256: str,
+) -> dict[str, Any]:
+    return err(
+        "companion_provenance_failed",
+        failure["message"],
+        mode=RENDER_MODE,
+        content_sha256=content_sha256,
+        provider_calls=0,
+        publication_preserved=True,
+        provenance_code=failure["code"],
+    )
+
+
+def _published_lane_identity(value: Any) -> dict[str, Any]:
+    return {
+        key: item
+        for key, item in dict(value or {}).items()
+        if key.endswith("_sha256") or key.endswith("_version")
+    }
+
+
+def _new_publication_requires_provenance(
+    state: dict[str, Any],
+) -> bool:
+    published = state.get("published")
+    published = published if isinstance(published, dict) else {}
+    pdf = published.get("pdf")
+    pdf = pdf if isinstance(pdf, dict) else {}
+    return (
+        state.get("status") == "complete"
+        and bool(state.get("fingerprint"))
+        and bool(state.get("checkpoint_dir"))
+        and bool(
+            state.get("checkpoint_identity") or state.get("fingerprint")
+        )
+        and pdf.get("validator_version") == PDF_VALIDATOR_VERSION
+    )
 
 
 def _repairs_current_render_failure(

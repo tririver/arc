@@ -229,6 +229,37 @@ def gc_project(
         return err(exc.code, str(exc))
 
 
+def load_gc_receipt(
+    project_dir: Path, receipt_path: str | Path,
+) -> Mapping[str, Any]:
+    """Read and owner-validate one exact terminal GC receipt."""
+
+    root = _project_root(project_dir)
+    relative = _safe_relative(receipt_path)
+    path = root / relative
+    try:
+        transaction_id = path.stem
+    except ValueError as exc:
+        raise CompanionGCError(
+            "gc_transaction_invalid", "GC receipt path is invalid",
+        ) from exc
+    if (
+        path.parent != root / ".arc-companion" / "gc" / "receipts"
+        or not _SHA256.fullmatch(transaction_id)
+    ):
+        raise CompanionGCError(
+            "gc_transaction_invalid", "GC receipt path is outside its exact root",
+        )
+    value = _read_terminal_receipt(
+        root, path, transaction_id=transaction_id,
+    )
+    if value is None:
+        raise CompanionGCError(
+            "gc_transaction_invalid", "terminal GC receipt is missing",
+        )
+    return value
+
+
 def _discover_gc(
     project_dir: Path,
     *,
@@ -294,6 +325,20 @@ def _discover_gc(
         root, allow_gc_transaction=allow_gc_transaction,
     )
     explicit_roots = _extra_root_records(root, extra_roots)
+    try:
+        from .provenance import retained_provenance_paths
+
+        explicit_roots.update(
+            _relative(root, path)
+            for path in retained_provenance_paths(root, state)
+        )
+    except ImportError:
+        pass
+    except Exception as exc:
+        raise CompanionGCError(
+            "gc_provenance_invalid",
+            "published provenance roots are invalid",
+        ) from exc
     retained_paths = set(explicit_roots)
     warnings: set[str] = set()
 
@@ -847,7 +892,12 @@ def _relative(root: Path, path: Path) -> str:
 
 
 def _rooted(path: str, roots: Iterable[str]) -> bool:
-    return any(path == root or path.startswith(root + "/") for root in roots)
+    return any(
+        path == root
+        or path.startswith(root + "/")
+        or root.startswith(path + "/")
+        for root in roots
+    )
 
 
 def _require_regular_or_missing(

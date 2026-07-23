@@ -538,6 +538,24 @@ HTML source/translation/commentary ordering. Deliver the validated full PDF and
 static reader; normal non-JSON output prints the run-root delivery PDF when present
 and otherwise falls back to the internal PDF path.
 
+Successful final publication also closes an immutable
+`arc.companion.final-provenance.v1` object. It binds the current checkpoint and
+reviewed-content identities, exact owner-validated PDF/Reader files, applicable
+source/translation/review/recovery controls, the exact terminal GC receipt when
+one exists for that publication, and a compact count basis. Counts are reported
+as partially attributed unless the
+available review receipts prove more; ARC does not infer exhaustive historical
+LLM attribution. The final ID excludes project-relative paths while every file
+reference retains its path, SHA-256, byte count, and schema. `validate`
+revalidates this graph with the owning validators, `status` exposes only its
+safe identity/status/count summary, and `package` includes the final provenance
+object and count basis without copying body-bearing control receipts.
+Missing provenance remains a nonblocking legacy upgrade, but a present invalid
+mapping is never silently downgraded to unavailable. Failed repair preserves
+that mapping for diagnosis and returns `companion_provenance_failed`. The same
+stable error is returned when a new current-validator publication cannot close
+provenance; its already-durable output remains available for inspection.
+
 The stable run-root delivery PDF is the preferred handoff path. It is written
 directly inside the resolved `--project-dir`, not its parent. The internal
 render revision remains the authoritative `output_pdf` used by validation and
@@ -560,9 +578,10 @@ content-addressed records keep their full 64-character identities.
 Final publication performs best-effort latest-only cleanup after the new
 Reader/PDF state and run-root delivery are durable. It does not run for
 unchanged renders, delivery-only repair, previews, first-chapter output,
-failures, or supervised state. Cleanup failure never rolls back a valid
-publication; `state.json` records either the terminal GC receipt identity or a
-bounded `artifact_gc_warning`.
+failures, or supervised state. Closing missing final provenance on a completed
+legacy or PDF fast path also does not run cleanup. Cleanup failure never rolls
+back a valid publication; `state.json` records either the terminal GC receipt
+identity or a bounded `artifact_gc_warning`.
 
 Use dry-run discovery before an explicit cleanup:
 
