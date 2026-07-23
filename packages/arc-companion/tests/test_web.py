@@ -245,6 +245,111 @@ def _project(tmp_path: Path, *, translation_state: str = "accepted") -> tuple[Pa
     return project, checkpoint, segment_id
 
 
+def _install_legacy_reader_bundle(
+    project: Path,
+    *,
+    malformed_revision: bool = False,
+) -> dict[str, object]:
+    import arc_companion.web as web
+
+    candidate = prepare_reader_publish(
+        project,
+        created_at=datetime(2026, 7, 22, tzinfo=timezone.utc),
+    )
+    for item in candidate.objects:
+        if item.kind in {"builtin-asset", "source-asset"}:
+            path = project / item.relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(item.data)
+
+    snapshot = deepcopy(dict(candidate.semantic.snapshot))
+    snapshot["schema_version"] = "arc.companion.reader-snapshot.v3"
+    snapshot["web_render_version"] = "arc.companion.web-render.v4"
+    for key in (
+        "source_credit",
+        "source_credit_sha256",
+        "source_credit_order",
+        "source_credit_visible_projection",
+        "source_credit_front_matter_block_ids",
+        "source_credit_replaced_block_ids",
+        "translation_reference",
+    ):
+        snapshot.pop(key, None)
+    snapshot["revision"] = sha256_json({
+        key: value for key, value in snapshot.items() if key != "revision"
+    })
+    if malformed_revision:
+        snapshot["revision"] = "0" * 64
+    snapshot_bytes = web._json_file_bytes(snapshot)
+    snapshot_hash = hashlib.sha256(snapshot_bytes).hexdigest()
+    snapshot_relative = f"reader/data/snapshot-{snapshot_hash}.json"
+    snapshot_path = project / snapshot_relative
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_bytes(snapshot_bytes)
+
+    data_bytes = (
+        "window.__ARC_COMPANION_SNAPSHOT__ = "
+        + web._safe_script_json(snapshot)
+        + ";\n"
+    ).encode()
+    data_hash = hashlib.sha256(data_bytes).hexdigest()
+    data_relative = f"reader/data/snapshot-{data_hash}.js"
+    (project / data_relative).write_bytes(data_bytes)
+
+    current_manifest = json.loads(next(
+        item.data for item in candidate.objects if item.kind == "manifest"
+    ))
+    old_data_name = Path(current_manifest["data_script"]["path"]).name
+    index_bytes = candidate.index.data.replace(
+        old_data_name.encode(), Path(data_relative).name.encode(),
+    )
+    index_path = project / "reader" / "index.html"
+    index_path.write_bytes(index_bytes)
+
+    def record(relative: str, value: bytes) -> dict[str, object]:
+        return {
+            "path": relative,
+            "sha256": hashlib.sha256(value).hexdigest(),
+            "bytes": len(value),
+        }
+
+    manifest = deepcopy(current_manifest)
+    manifest["schema_version"] = "arc.companion.web-manifest.v2"
+    manifest["web_render_version"] = "arc.companion.web-render.v4"
+    manifest["snapshot"] = record(snapshot_relative, snapshot_bytes)
+    manifest["data_script"] = record(data_relative, data_bytes)
+    manifest["index"] = record("reader/index.html", index_bytes)
+    for key in (
+        "reader_semantic_sha256",
+        "source_credit",
+        "translation_reference",
+    ):
+        manifest.pop(key, None)
+    manifest_bytes = web._json_file_bytes(manifest)
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_path = (
+        project / "reader" / "data" / f"manifest-{manifest_hash}.json"
+    )
+    manifest_path.write_bytes(manifest_bytes)
+
+    identity: dict[str, object] = {
+        "output_html": str(index_path),
+        "output_html_sha256": hashlib.sha256(index_bytes).hexdigest(),
+        "reader_snapshot_path": str(snapshot_path),
+        "reader_snapshot_sha256": snapshot_hash,
+        "web_manifest_path": str(manifest_path),
+        "web_manifest_sha256": manifest_hash,
+        "web_render_version": "arc.companion.web-render.v4",
+    }
+    state = {
+        **read_json(project / "state.json"),
+        **identity,
+        "published": {"web": dict(identity)},
+    }
+    write_json(project / "state.json", state)
+    return state
+
+
 def test_snapshot_discovers_only_hash_verified_accepted_lane_values(tmp_path: Path) -> None:
     project, _checkpoint, segment_id = _project(tmp_path)
 
@@ -899,6 +1004,111 @@ def test_current_bundle_without_semantic_field_is_adopted_without_rewrite(
 
     assert state["reader_committed_semantic_sha256"]
     assert {path: path.stat().st_mtime_ns for path in files} == before
+
+
+def test_state_bound_legacy_bundle_upgrades_through_coordinator(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    state = _install_legacy_reader_bundle(project)
+    old_index = (project / "reader" / "index.html").read_bytes()
+    for key in (
+        "output_html",
+        "output_html_sha256",
+        "reader_snapshot_path",
+        "reader_snapshot_sha256",
+        "web_manifest_path",
+        "web_manifest_sha256",
+        "web_render_version",
+    ):
+        state.pop(key)
+    write_json(project / "state.json", state)
+
+    def load() -> dict[str, object]:
+        return dict(state)
+
+    def merge(values) -> dict[str, object]:
+        state.update(values)
+        write_json(project / "state.json", state)
+        return dict(state)
+
+    coordinator = create_reader_publish_coordinator(
+        project,
+        state_loader=load,
+        state_merger=merge,
+        utc_now=lambda: datetime(2026, 7, 23, tzinfo=timezone.utc),
+        monotonic=lambda: 1.0,
+    )
+    assert state["reader_dirty"] is True
+    assert state["reader_committed_semantic_sha256"] == ""
+
+    result = coordinator.request(lambda: None, final=True, strict=True)
+
+    assert result.published is True
+    assert (project / "reader" / "index.html").read_bytes() != old_index
+    inspected = inspect_reader_publish(project)
+    assert inspected is not None
+    assert inspected["web_render_version"] == WEB_RENDER_VERSION
+
+
+def test_legacy_upgrade_refuses_disagreeing_state_and_preserves_index(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    state = _install_legacy_reader_bundle(project)
+    candidate = prepare_reader_publish(project, state=state)
+    old_index = (project / "reader" / "index.html").read_bytes()
+    disk_state = read_json(project / "state.json")
+    disk_state["published"]["web"]["output_html_sha256"] = "f" * 64
+    write_json(project / "state.json", disk_state)
+
+    with pytest.raises(WebReaderError):
+        publish_prepared_reader(candidate)
+
+    assert (project / "reader" / "index.html").read_bytes() == old_index
+
+
+def test_legacy_upgrade_refuses_malformed_bound_bundle_and_preserves_index(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    state = _install_legacy_reader_bundle(
+        project, malformed_revision=True,
+    )
+    candidate = prepare_reader_publish(project, state=state)
+    old_index = (project / "reader" / "index.html").read_bytes()
+
+    with pytest.raises(WebReaderError, match="snapshot schema"):
+        publish_prepared_reader(candidate)
+
+    assert (project / "reader" / "index.html").read_bytes() == old_index
+
+
+def test_legacy_upgrade_post_index_failure_restores_then_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arc_companion.web as web
+
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    state = _install_legacy_reader_bundle(project)
+    candidate = prepare_reader_publish(project, state=state)
+    index_path = project / "reader" / "index.html"
+    old_index = index_path.read_bytes()
+
+    def fail_after_index(label: str) -> None:
+        if label == "post-index-validation":
+            raise RuntimeError("injected legacy upgrade failure")
+
+    monkeypatch.setattr(web, "_publish_fault_point", fail_after_index)
+    with pytest.raises(RuntimeError, match="legacy upgrade failure"):
+        publish_prepared_reader(candidate)
+    assert index_path.read_bytes() == old_index
+
+    monkeypatch.setattr(web, "_publish_fault_point", lambda _label: None)
+    result = publish_prepared_reader(candidate)
+    assert index_path.read_bytes() != old_index
+    assert result["web_render_version"] == WEB_RENDER_VERSION
 
 
 def test_post_index_state_failure_retries_by_adoption_without_web_rewrite(

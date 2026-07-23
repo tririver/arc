@@ -43,6 +43,18 @@ READER_FINAL_VERSION = "arc.companion.reader-final.v4"
 WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v3"
 WEB_RENDER_VERSION = "arc.companion.web-render.v5"
 WEB_VALIDATION_VERSION = "arc.companion.web-validation.v3"
+_LEGACY_READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v3"
+_LEGACY_WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v2"
+_LEGACY_WEB_RENDER_VERSION = "arc.companion.web-render.v4"
+_READER_IDENTITY_FIELDS = (
+    "output_html",
+    "output_html_sha256",
+    "reader_snapshot_path",
+    "reader_snapshot_sha256",
+    "web_manifest_path",
+    "web_manifest_sha256",
+    "web_render_version",
+)
 
 _STATE_VERSIONS = {
     "arc.companion.state.v1",
@@ -98,6 +110,7 @@ class PreparedWebReaderPublish:
     objects: tuple[ReaderObject, ...]
     index: ReaderObject
     outputs: Mapping[str, Any]
+    prior_reader_state: Mapping[str, Any]
 
 
 def build_reader_snapshot(
@@ -540,6 +553,7 @@ def prepare_reader_publish(
         ),
         index=index_object,
         outputs=outputs,
+        prior_reader_state=_reader_identity_state(current_state),
     )
 
 
@@ -562,12 +576,28 @@ def _publish_prepared_reader_locked(
         # invalid or unexplained pointer.
         try:
             inspect_reader_publish(root)
-        except ReaderDependencyMissing:
-            if index_path.is_symlink() or not index_path.is_file():
-                raise
-            previous_index = index_path.read_bytes()
-            if previous_index != candidate.index.data:
-                raise
+        except WebReaderError as strict_error:
+            try:
+                durable_identity = _reader_identity_state(_state(root, None))
+                if durable_identity != dict(candidate.prior_reader_state):
+                    raise WebReaderError(
+                        "prepared legacy Reader identity is no longer current"
+                    )
+                _inspect_state_bound_legacy_reader(
+                    root,
+                    durable_identity,
+                    expected_index_path=index_path,
+                )
+            except WebReaderError:
+                if not isinstance(strict_error, ReaderDependencyMissing):
+                    raise strict_error
+                if index_path.is_symlink() or not index_path.is_file():
+                    raise strict_error
+                previous_index = index_path.read_bytes()
+                if previous_index != candidate.index.data:
+                    raise strict_error
+            else:
+                previous_index = index_path.read_bytes()
         else:
             previous_index = index_path.read_bytes()
 
@@ -701,6 +731,98 @@ def inspect_reader_publish(project_dir: Path) -> dict[str, Any] | None:
     }
 
 
+def _reader_identity_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture one complete Reader identity and reject split state selection."""
+    direct = {
+        key: deepcopy(state[key])
+        for key in _READER_IDENTITY_FIELDS
+        if state.get(key) not in (None, "")
+    }
+    published = state.get("published")
+    web = published.get("web") if isinstance(published, Mapping) else None
+    published_identity = {
+        key: deepcopy(web[key])
+        for key in _READER_IDENTITY_FIELDS
+        if isinstance(web, Mapping) and web.get(key) not in (None, "")
+    }
+    required = set(_READER_IDENTITY_FIELDS)
+    if direct and set(direct) != required:
+        raise WebReaderError("top-level Reader identity is incomplete")
+    if published_identity and set(published_identity) != required:
+        raise WebReaderError("published Reader identity is incomplete")
+    if direct and published_identity and published_identity != direct:
+        raise WebReaderError(
+            "published Reader identity disagrees with top-level state"
+        )
+    return published_identity or direct
+
+
+def _inspect_state_bound_legacy_reader(
+    root: Path,
+    state: Mapping[str, Any],
+    *,
+    expected_index_path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate only the immediately preceding, exactly state-bound bundle."""
+    if set(state) != set(_READER_IDENTITY_FIELDS):
+        raise WebReaderError(
+            "legacy Reader upgrade requires a complete state binding"
+        )
+    if state.get("web_render_version") != _LEGACY_WEB_RENDER_VERSION:
+        raise WebReaderError("state-bound Reader is not a supported legacy bundle")
+
+    paths: dict[str, Path] = {}
+    for key, hash_key in (
+        ("output_html", "output_html_sha256"),
+        ("reader_snapshot_path", "reader_snapshot_sha256"),
+        ("web_manifest_path", "web_manifest_sha256"),
+    ):
+        raw = Path(str(state[key]))
+        unresolved = raw if raw.is_absolute() else root / raw
+        _reject_symlink_components(root, unresolved)
+        path = _inside(root, raw)
+        try:
+            mode = unresolved.lstat().st_mode
+        except FileNotFoundError as exc:
+            raise WebReaderError(
+                f"state-bound legacy Reader artifact is missing: {path}"
+            ) from exc
+        if (
+            not stat.S_ISREG(mode)
+            or path.stat().st_size == 0
+            or sha256_file(path) != str(state[hash_key])
+        ):
+            raise WebReaderError(
+                f"state-bound legacy Reader identity is invalid: {key}"
+            )
+        paths[key] = path
+
+    index_path = paths["output_html"]
+    required_index = (
+        expected_index_path.resolve()
+        if expected_index_path is not None
+        else (root / "reader" / "index.html").resolve()
+    )
+    if index_path != required_index:
+        raise WebReaderError(
+            "state-bound legacy Reader does not select the committed index"
+        )
+    manifest_path = paths["web_manifest_path"]
+    snapshot_path = paths["reader_snapshot_path"]
+    manifest = _read_object(
+        manifest_path, label="state-bound legacy web manifest",
+    )
+    index_text = index_path.read_text(encoding="utf-8")
+    _validate_legacy_reader_bundle(
+        root,
+        index_path=index_path,
+        snapshot_path=snapshot_path,
+        manifest=manifest,
+        index_text=index_text,
+    )
+    return dict(state)
+
+
 def create_reader_publish_coordinator(
     project_dir: Path,
     *,
@@ -718,10 +840,20 @@ def create_reader_publish_coordinator(
     state = dict(state_loader())
     try:
         inspected = inspect_reader_publish(root)
-    except ReaderDependencyMissing:
-        # A matching prepared index may repair missing immutable dependencies;
-        # publish_prepared_reader still refuses an unexplained pointer.
-        inspected = None
+    except WebReaderError as strict_error:
+        try:
+            _inspect_state_bound_legacy_reader(
+                root, _reader_identity_state(state),
+            )
+        except WebReaderError:
+            if not isinstance(strict_error, ReaderDependencyMissing):
+                raise strict_error
+            # A matching prepared index may repair missing immutable
+            # dependencies; publish_prepared_reader still refuses an
+            # unexplained pointer.
+            inspected = None
+        else:
+            inspected = None
     if inspected is None:
         state = dict(state_merger({
             "reader_publish_state_version": READER_PUBLISH_STATE_VERSION,
@@ -863,83 +995,81 @@ def _validate_reader_bundle(
     index_text: str,
 ) -> tuple[dict[str, Any], list[str]]:
     """Validate one candidate without requiring its index to be committed."""
+    return _validate_reader_bundle_contract(
+        root,
+        index_path=index_path,
+        snapshot_path=snapshot_path,
+        manifest=manifest,
+        index_text=index_text,
+        legacy=False,
+    )
+
+
+def _validate_legacy_reader_bundle(
+    root: Path,
+    *,
+    index_path: Path,
+    snapshot_path: Path,
+    manifest: Mapping[str, Any],
+    index_text: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate the exact historical contract admitted only for replacement."""
+    return _validate_reader_bundle_contract(
+        root,
+        index_path=index_path,
+        snapshot_path=snapshot_path,
+        manifest=manifest,
+        index_text=index_text,
+        legacy=True,
+    )
+
+
+def _validate_reader_bundle_contract(
+    root: Path,
+    *,
+    index_path: Path,
+    snapshot_path: Path,
+    manifest: Mapping[str, Any],
+    index_text: str,
+    legacy: bool,
+) -> tuple[dict[str, Any], list[str]]:
     snapshot = _read_object(snapshot_path, label="reader snapshot")
-    if snapshot.get("schema_version") != READER_SNAPSHOT_VERSION:
+    snapshot_version = (
+        _LEGACY_READER_SNAPSHOT_VERSION if legacy else READER_SNAPSHOT_VERSION
+    )
+    manifest_version = (
+        _LEGACY_WEB_MANIFEST_VERSION if legacy else WEB_MANIFEST_VERSION
+    )
+    render_version = (
+        _LEGACY_WEB_RENDER_VERSION if legacy else WEB_RENDER_VERSION
+    )
+    if snapshot.get("schema_version") != snapshot_version:
         raise WebReaderError("reader snapshot schema is invalid")
-    if manifest.get("schema_version") != WEB_MANIFEST_VERSION:
+    if (
+        legacy
+        and snapshot.get("web_render_version")
+        != _LEGACY_WEB_RENDER_VERSION
+    ):
+        raise WebReaderError("reader snapshot render version is stale")
+    if manifest.get("schema_version") != manifest_version:
         raise WebReaderError("web manifest schema is invalid")
-    if manifest.get("web_render_version") != WEB_RENDER_VERSION:
+    if manifest.get("web_render_version") != render_version:
         raise WebReaderError("web manifest render version is stale")
     expected_revision = sha256_json(
         {key: item for key, item in snapshot.items() if key != "revision"}
     )
     if snapshot.get("revision") != expected_revision:
         raise WebReaderError("reader snapshot revision is invalid")
-    try:
-        source_credit = validate_source_credit(snapshot.get("source_credit"))
-    except (SourceCreditError, TypeError) as exc:
-        raise WebReaderError("reader source credit is invalid") from exc
-    if snapshot.get("source_credit_sha256") != source_credit["canonical_sha256"]:
-        raise WebReaderError("reader source-credit hash is invalid")
-    expected_credit_manifest = _source_credit_manifest(snapshot)
-    if manifest.get("source_credit") != expected_credit_manifest:
-        raise WebReaderError("web manifest source credit differs from the reader snapshot")
-    front_ids = snapshot.get("source_credit_front_matter_block_ids")
-    if not isinstance(front_ids, list) or not all(
-        isinstance(item, str) for item in front_ids
-    ):
-        raise WebReaderError("reader source-credit front-matter placement is invalid")
-    expected_order = source_credit_placement(
-        source_credit, front_matter_block_ids=front_ids,
-    )
-    if snapshot.get("source_credit_order") != expected_order:
-        raise WebReaderError("reader source-credit order is invalid")
-    expected_visible = _source_credit_visible_projection(
-        source_credit, expected_order,
-    )
-    if snapshot.get("source_credit_visible_projection") != expected_visible:
-        raise WebReaderError("reader source-credit visible projection is invalid")
-    expected_replaced = [
-        str(item["block_id"])
-        for item in expected_order
-        if item["slot"] == "source_block" and item["block_id"]
-    ]
-    if snapshot.get("source_credit_replaced_block_ids") != expected_replaced:
-        raise WebReaderError("reader source-credit replacement blocks are invalid")
-    if snapshot.get("authors") != [
-        item["source_name"] for item in source_credit["authors"]
-    ]:
-        raise WebReaderError("legacy reader authors differ from source credit")
-    if snapshot.get("translation_reference") is not None:
-        try:
-            from .translation_reference import (
-                TranslationReferenceError,
-                validate_translation_reference_provenance,
-            )
-            compact_reference = validate_translation_reference_provenance(
-                snapshot.get("translation_reference"),
-                project_root=root,
-                expected_chapter_ids=list(
-                    (snapshot.get("coverage") or {}).get("chapter_ids") or []
-                ),
-            )
-        except (TranslationReferenceError, TypeError, ValueError) as exc:
-            raise WebReaderError("reader translation reference is invalid") from exc
-        if manifest.get("translation_reference") != compact_reference:
-            raise WebReaderError(
-                "web manifest translation reference differs from the reader snapshot"
-            )
-    elif "translation_reference" in manifest:
-        raise WebReaderError(
-            "web manifest contains translation reference absent from the snapshot"
-        )
+    if not legacy:
+        _validate_current_reader_metadata(root, snapshot, manifest)
 
     assets = manifest.get("assets")
     if not isinstance(assets, list):
         raise WebReaderError("web manifest assets must be an array")
     for record in (manifest.get("snapshot"), manifest.get("data_script"), *assets):
         _validate_file_record(root, record)
-    _validate_source_asset_bindings(root, snapshot, assets)
+    if not legacy:
+        _validate_source_asset_bindings(root, snapshot, assets)
     _validate_memory_file_record(
         root,
         manifest.get("index"),
@@ -988,6 +1118,81 @@ def _validate_reader_bundle(
         raise WebReaderError("reader chapter content differs from declared segment coverage")
     _validate_snapshot_terms(snapshot)
     return snapshot, segment_ids
+
+
+def _validate_current_reader_metadata(
+    root: Path,
+    snapshot: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> None:
+    try:
+        source_credit = validate_source_credit(snapshot.get("source_credit"))
+    except (SourceCreditError, TypeError) as exc:
+        raise WebReaderError("reader source credit is invalid") from exc
+    if snapshot.get("source_credit_sha256") != source_credit["canonical_sha256"]:
+        raise WebReaderError("reader source-credit hash is invalid")
+    expected_credit_manifest = _source_credit_manifest(snapshot)
+    if manifest.get("source_credit") != expected_credit_manifest:
+        raise WebReaderError(
+            "web manifest source credit differs from the reader snapshot"
+        )
+    front_ids = snapshot.get("source_credit_front_matter_block_ids")
+    if not isinstance(front_ids, list) or not all(
+        isinstance(item, str) for item in front_ids
+    ):
+        raise WebReaderError(
+            "reader source-credit front-matter placement is invalid"
+        )
+    expected_order = source_credit_placement(
+        source_credit, front_matter_block_ids=front_ids,
+    )
+    if snapshot.get("source_credit_order") != expected_order:
+        raise WebReaderError("reader source-credit order is invalid")
+    expected_visible = _source_credit_visible_projection(
+        source_credit, expected_order,
+    )
+    if snapshot.get("source_credit_visible_projection") != expected_visible:
+        raise WebReaderError(
+            "reader source-credit visible projection is invalid"
+        )
+    expected_replaced = [
+        str(item["block_id"])
+        for item in expected_order
+        if item["slot"] == "source_block" and item["block_id"]
+    ]
+    if snapshot.get("source_credit_replaced_block_ids") != expected_replaced:
+        raise WebReaderError(
+            "reader source-credit replacement blocks are invalid"
+        )
+    if snapshot.get("authors") != [
+        item["source_name"] for item in source_credit["authors"]
+    ]:
+        raise WebReaderError("legacy reader authors differ from source credit")
+    if snapshot.get("translation_reference") is not None:
+        try:
+            from .translation_reference import (
+                TranslationReferenceError,
+                validate_translation_reference_provenance,
+            )
+            compact_reference = validate_translation_reference_provenance(
+                snapshot.get("translation_reference"),
+                project_root=root,
+                expected_chapter_ids=list(
+                    (snapshot.get("coverage") or {}).get("chapter_ids") or []
+                ),
+            )
+        except (TranslationReferenceError, TypeError, ValueError) as exc:
+            raise WebReaderError(
+                "reader translation reference is invalid"
+            ) from exc
+        if manifest.get("translation_reference") != compact_reference:
+            raise WebReaderError(
+                "web manifest translation reference differs from the reader snapshot"
+            )
+    elif "translation_reference" in manifest:
+        raise WebReaderError(
+            "web manifest contains translation reference absent from the snapshot"
+        )
 
 
 def _validate_source_asset_bindings(
