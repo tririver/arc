@@ -1323,15 +1323,10 @@ def test_readme_documents_marketplace_first_install() -> None:
     assert "packaging/claude/arc" not in text
 
 
-def test_readme_does_not_reference_non_repository_local_artifacts() -> None:
+def test_readme_examples_use_the_ignored_run_tree_not_reference_material() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    unavailable_artifacts = [
-        "0_ref/",
-        "arc-tests/",
-    ]
-
-    for artifact in unavailable_artifacts:
-        assert artifact not in text
+    assert "0_ref/" not in text
+    assert "--project-dir ./arc-tests/companion/0911.3380" in text
 
 
 def test_interaction_reference_allows_portable_typed_fallback() -> None:
