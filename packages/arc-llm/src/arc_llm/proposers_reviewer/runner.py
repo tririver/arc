@@ -961,6 +961,7 @@ def _local_recovery_call_record(
         "generation": None,
         "prompt_bytes": None,
         "logical_receipt": None,
+        "budget_receipt": None,
         "usage": {},
         "warnings": [],
         "call_status": "recovered",

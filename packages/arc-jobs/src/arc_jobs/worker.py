@@ -83,6 +83,7 @@ def run_job(job_id: str) -> int:
             cwd=cwd,
             paths=paths,
             environment=restored_environment(job.get("environment")),
+            job_type=str(job.get("job_type") or ""),
         )
         persist_result(job_id, result, paths=paths)
         output = result.get("output") if isinstance(result, dict) else None
@@ -160,10 +161,13 @@ def _run_command(
     cwd: str,
     paths: JobPaths,
     environment: dict[str, str],
+    job_type: str,
 ) -> tuple[dict[str, Any], int]:
     launch_argv = [command, *argv[1:]]
     paths.progress_sidechannel.unlink(missing_ok=True)
     environment = dict(environment)
+    environment["ARC_JOB_ID"] = job_id
+    environment["ARC_JOB_TYPE"] = job_type
     environment["ARC_JOB_PROGRESS_FILE"] = str(paths.progress_sidechannel)
     progress_offset, progress_buffer = 0, b""
     with open_private_binary(paths.stdout) as stdout, open_private_binary(paths.stderr) as stderr:

@@ -7,8 +7,9 @@ from typing import Any, Callable
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA
 from arc_llm.runner import resolve_llm_config, run_json
 
+from .execution import current_cancel_check, current_progress_callback
 from .ids import arxiv_path_id, doi_value, extract_paper_ids, inspire_recid, normalize_paper_id
-from .summary.checkpoint import run_json_checkpointed
+from .summary.checkpoint import current_provider_checkpoint, run_json_checkpointed
 
 
 MetadataLookup = Callable[..., dict[str, Any]]
@@ -86,7 +87,7 @@ def infer_main_references(
         prompt=prompt,
         schema=REFERENCE_INFERENCE_SCHEMA,
         model=config.model,
-        run_json=lambda prompt, schema, model: run_json(
+        run_json=lambda prompt, schema, model: _run_reference_json(
             prompt,
             schema=schema,
             provider=config.provider,
@@ -110,6 +111,34 @@ def infer_main_references(
     if isinstance(payload.get(ARC_LLM_CALL_RECORD_FIELD), dict):
         verified[ARC_LLM_CALL_RECORD_FIELD] = payload[ARC_LLM_CALL_RECORD_FIELD]
     return verified
+
+
+def _run_reference_json(
+    prompt: str,
+    *,
+    schema: dict[str, Any],
+    provider: str,
+    model: str | None,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    artifact_dir, call_label = current_provider_checkpoint()
+    if artifact_dir is None or call_label is None:
+        raise ReferenceInferenceError(
+            "reference_inference_checkpoint_missing",
+            "Reference inference requires a durable provider checkpoint.",
+        )
+    return run_json(
+        prompt,
+        schema=schema,
+        provider=provider,
+        model=model,
+        env=env,
+        artifact_dir=artifact_dir,
+        call_label=call_label,
+        idempotency_key=call_label,
+        progress_callback=current_progress_callback(),
+        cancel_check=current_cancel_check(),
+    )
 
 
 def _internet_enabled_env() -> dict[str, str]:

@@ -156,11 +156,32 @@ def test_llm_infer_main_references_explicit_ids_override_stale_cache(monkeypatch
 
 def test_llm_infer_main_references_enables_web_and_verifies_candidates(monkeypatch, tmp_path):
     monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path))
+    from arc_paper.execution import managed_execution_scope
 
-    def run_json(prompt, *, schema=None, provider="auto", model=None, env=None, process_chain=None):
+    progress = lambda _event: None
+    cancel = lambda: False
+
+    def run_json(
+        prompt,
+        *,
+        schema=None,
+        provider="auto",
+        model=None,
+        env=None,
+        artifact_dir=None,
+        call_label=None,
+        idempotency_key=None,
+        progress_callback=None,
+        cancel_check=None,
+    ):
         assert "Use live web search" in prompt
         assert env["ARC_CODEX_ALLOW_INTERNET"] == "true"
         assert env["ARC_CLAUDE_ALLOW_INTERNET"] == "true"
+        assert artifact_dir is not None
+        assert call_label == idempotency_key
+        assert call_label.startswith("main-reference-inference-")
+        assert progress_callback is progress
+        assert cancel_check is cancel
         return {
             "focus_scope": "one_domain",
             "candidates": [
@@ -178,7 +199,13 @@ def test_llm_infer_main_references_enables_web_and_verifies_candidates(monkeypat
     monkeypatch.setattr(reference_inference, "run_json", run_json)
     monkeypatch.setattr(service, "_inspire", FakeInspire())
 
-    result = service.llm_infer_main_references("Find the key paper on CMB trispectrum.", provider="codex-cli")
+    with managed_execution_scope(
+        progress_callback=progress,
+        cancel_check=cancel,
+    ):
+        result = service.llm_infer_main_references(
+            "Find the key paper on CMB trispectrum.", provider="codex-cli",
+        )
 
     assert result["ok"] is True
     assert result["data"] == ["arXiv:0911.3380"]

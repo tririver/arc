@@ -190,6 +190,51 @@ class PreparedCall:
         _release_handle(handle)
 
 
+def checkpoint_budget_state(
+    path: Path,
+    *,
+    expected_identity: str,
+) -> dict[str, Any]:
+    """Read the durable fields needed to reconcile a shared call budget."""
+
+    lock = _acquire_lock(path)
+    try:
+        value = _read(path, lock=lock)
+        if (
+            not isinstance(value, Mapping)
+            or value.get("schema_version") != SCHEMA_VERSION
+            or value.get("identity") != expected_identity
+        ):
+            raise LLMCallCheckpointError(
+                f"LLM call checkpoint identity mismatch: {path}"
+            )
+        logical_identity = value.get("logical_identity")
+        provider = (
+            str(logical_identity.get("provider") or "")
+            if isinstance(logical_identity, Mapping)
+            else ""
+        )
+        usage = None
+        if value.get("state") in {"response_received", "validated"}:
+            response = _response_from_json(value.get("response"))
+            if response.usage.status == "known":
+                usage = {
+                    "input_tokens": response.usage.total_input_tokens or 0,
+                    "output_tokens": response.usage.output_tokens or 0,
+                }
+        return {
+            "state": str(value.get("state") or ""),
+            "submission_state": str(
+                value.get("submission_state") or "unknown"
+            ),
+            "attempt": int(value.get("attempt") or 1),
+            "provider": provider,
+            "usage": usage,
+        }
+    finally:
+        _release_handle(lock)
+
+
 def checkpoint_path(
     artifact_dir: Path,
     *,

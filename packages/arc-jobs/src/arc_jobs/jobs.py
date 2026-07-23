@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import signal
@@ -15,9 +16,15 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import contextmanager
 from threading import Lock, RLock, get_ident
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback is process-local.
+    fcntl = None
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -161,10 +168,20 @@ class JobManager:
         argv: Sequence[str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
         environment: Mapping[str, str] | None = None,
+        job_id: str | None = None,
+        full_identity: Mapping[str, Any] | None = None,
+        public_payload: Mapping[str, Any] | None = None,
+        public_projection: str | None = None,
     ) -> str:
         """Create a job, using a thread runner or an allowlisted CLI argv."""
         payload_dict = dict(payload or {})
         _validate_status_payload(payload_dict)
+        public_payload_dict = (
+            payload_dict if public_payload is None else dict(public_payload)
+        )
+        _validate_status_payload(public_payload_dict)
+        if public_projection not in {None, "bounded"}:
+            raise ValueError("public_projection must be bounded when provided")
         normalized_argv: list[str] | None = None
         command: str | None = None
         if argv is not None:
@@ -176,9 +193,36 @@ class JobManager:
         if not use_thread_worker and normalized_argv is None:
             raise ValueError("process jobs require an allowlisted ARC CLI argv")
 
-        job_id = uuid4().hex
+        if job_id is not None:
+            job_id = safe_job_id(job_id)
+            if full_identity is None:
+                raise ValueError("deterministic job_id requires full_identity")
+        else:
+            if full_identity is not None:
+                raise ValueError("full_identity requires deterministic job_id")
+            job_id = uuid4().hex
         paths = JobPaths.for_job(job_id)
         now = now_iso()
+        request_identity_sha256 = _canonical_sha256(
+            {
+                "job_type": job_type,
+                "payload": payload_dict,
+                "argv": normalized_argv,
+                "cwd": normalized_cwd,
+                "environment": environment_snapshot,
+                "execution_mode": "thread" if use_thread_worker else "process",
+                "full_identity": dict(full_identity) if full_identity is not None else None,
+                "public_payload": public_payload_dict,
+                "public_projection": public_projection,
+            }
+        )
+        payload_sha256 = _canonical_sha256(payload_dict)
+        argv_sha256 = (
+            _canonical_sha256(normalized_argv)
+            if normalized_argv is not None else None
+        )
+        environment_identity_sha256 = _canonical_sha256(environment_snapshot)
+        public_payload_sha256 = _canonical_sha256(public_payload_dict)
         job: dict[str, Any] = {
             "schema_version": "arc.job.v1",
             "job_id": job_id,
@@ -187,14 +231,21 @@ class JobManager:
             "created_at": now,
             "execution_mode": "thread" if use_thread_worker else "process",
             "environment": environment_snapshot,
+            "request_identity_sha256": request_identity_sha256,
+            "payload_sha256": payload_sha256,
+            "argv_sha256": argv_sha256,
+            "environment_identity_sha256": environment_identity_sha256,
+            "public_payload_sha256": public_payload_sha256,
+            "public_payload": public_payload_dict,
         }
+        if full_identity is not None:
+            job["full_identity"] = dict(full_identity)
+        if public_projection is not None:
+            job["public_projection"] = public_projection
         if normalized_argv is not None:
             job["argv"] = normalized_argv
             job["command"] = command
             job["cwd"] = normalized_cwd
-        _ensure_private_dir(paths.job_dir.parent)
-        paths.job_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
-        write_json(paths.job, job)
         status: dict[str, Any] = {
             "schema_version": "arc.job_status.v1",
             "job_id": job_id,
@@ -207,20 +258,60 @@ class JobManager:
             "last_substantive_excerpt": None,
             "last_substantive_at": None,
             "artifact_paths": [],
-            "payload": payload_dict,
+            "payload": public_payload_dict,
             "cancel_requested": False,
             "started_at": now,
             "updated_at": now,
             "finished_at": None,
             "execution_mode": "thread" if use_thread_worker else "process",
-            **payload_dict,
+            **public_payload_dict,
         }
         if normalized_argv is not None:
             status["argv"] = normalized_argv
             status["command"] = command
             status["cwd"] = normalized_cwd
-        write_json(paths.status, status)
-        append_event(job_id, {"event": "job_queued"})
+        root = paths.job_dir.parent
+        _ensure_private_dir(root)
+        with submission_lock(root):
+            if paths.job_dir.is_symlink():
+                raise ValueError(f"job directory must not be a symlink: {paths.job_dir}")
+            if paths.job_dir.exists():
+                existing = read_json(paths.job)
+                if (
+                    full_identity is not None
+                    and isinstance(existing, Mapping)
+                    and existing.get("schema_version") == "arc.job.v1"
+                    and existing.get("job_id") == job_id
+                    and existing.get("job_type") == job_type
+                    and existing.get("payload") == payload_dict
+                    and existing.get("argv") == normalized_argv
+                    and existing.get("cwd") == (
+                        normalized_cwd if normalized_argv is not None else None
+                    )
+                    and existing.get("environment") == environment_snapshot
+                    and (
+                        existing.get("public_projection")
+                        == public_projection
+                    )
+                    and existing.get("request_identity_sha256")
+                    == request_identity_sha256
+                    and existing.get("payload_sha256") == payload_sha256
+                    and existing.get("argv_sha256") == argv_sha256
+                    and existing.get("environment_identity_sha256")
+                    == environment_identity_sha256
+                    and existing.get("public_payload_sha256")
+                    == public_payload_sha256
+                    and existing.get("public_payload") == public_payload_dict
+                    and existing.get("full_identity") == dict(full_identity)
+                ):
+                    return job_id
+                raise ValueError(
+                    f"deterministic job identity collision or request mismatch: {job_id}"
+                )
+            paths.job_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+            write_json(paths.job, job)
+            write_json(paths.status, status)
+            append_event(job_id, {"event": "job_queued"})
 
         if use_thread_worker:
             assert runner is not None
@@ -274,6 +365,12 @@ class JobManager:
         status.setdefault("meta", {})
         status["events"] = tail_events(paths.events, limit=self._event_limit)
         status["eta"] = estimate_eta(status)
+        job = read_json(paths.job, {})
+        if (
+            isinstance(job, Mapping)
+            and job.get("public_projection") == "bounded"
+        ):
+            status = _bounded_public_status(status)
         return status
 
     def result(self, job_id: str) -> dict[str, Any]:
@@ -284,6 +381,18 @@ class JobManager:
         assert paths is not None
         stored = read_json(paths.result)
         result = _unwrap_result(stored)
+        job = read_json(paths.job, {})
+        bounded = (
+            isinstance(job, Mapping)
+            and job.get("public_projection") == "bounded"
+        )
+        if bounded and isinstance(result, Mapping):
+            output = result.get("output")
+            result = dict(output) if isinstance(output, Mapping) else {
+                key: result.get(key)
+                for key in ("status", "job_id", "identity_sha256", "result_sha256")
+                if result.get(key) is not None
+            }
         if status.get("status") in SUCCESS_TERMINAL_STATUSES:
             return {
                 "ok": True,
@@ -291,10 +400,22 @@ class JobManager:
                 "job_id": job_id,
                 "job_type": status.get("job_type"),
                 "result": result,
-                "meta": {"job": job_meta(status, paths=paths)},
+                "meta": {"job": _public_job_meta(status, paths, bounded)},
             }
         if status.get("status") in {"failed", "cancelled", "cancel_requested"}:
             error = read_json(paths.error) or status.get("error")
+            if bounded and isinstance(error, Mapping):
+                error = {
+                    key: error.get(key)
+                    for key in (
+                        "code",
+                        "category",
+                        "submission_state",
+                        "retryable",
+                        "termination_attempted",
+                    )
+                    if error.get(key) is not None
+                }
             response = {
                 "ok": False,
                 "status": status.get("status"),
@@ -306,7 +427,7 @@ class JobManager:
                     "message": f"ARC job {status.get('status')}",
                 },
                 "errors": [],
-                "meta": {"job": job_meta(status, paths=paths)},
+                "meta": {"job": _public_job_meta(status, paths, bounded)},
             }
             if stored is not None:
                 response["result"] = result
@@ -321,7 +442,7 @@ class JobManager:
                 "cli_command": arc_jobs_cli_command("status", job_id, "--json"),
                 "poll_after_seconds": 5,
             },
-            "meta": {"job": job_meta(status, paths=paths)},
+            "meta": {"job": _public_job_meta(status, paths, bounded)},
         }
 
     def list_jobs(self) -> dict[str, Any]:
@@ -343,32 +464,139 @@ class JobManager:
         items.sort(key=lambda item: str(item.get("started_at") or ""), reverse=True)
         return {"ok": True, "data": {"jobs": items}, "errors": [], "meta": {}}
 
-    def cancel(self, job_id: str) -> dict[str, Any]:
+    def cancel(
+        self,
+        job_id: str,
+        *,
+        condition: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Request cancellation atomically with an optional caller condition.
+
+        The condition runs under the same cross-process submission guard used
+        by deterministic job creation. This lets a composing package make a
+        last-waiter decision without a new submission racing into the gap.
+        """
+
         paths = find_job_paths(job_id)
         if paths is None or not paths.status.exists():
             return unknown_job(job_id)
-        current = read_json(paths.status, {})
-        if isinstance(current, dict) and current.get("status") in TERMINAL_STATUSES:
+        requested = False
+        unchanged = False
+        with submission_lock(paths.job_dir.parent):
+            current = read_json(paths.status, {})
+            if (
+                isinstance(current, dict)
+                and current.get("status") in TERMINAL_STATUSES
+            ):
+                unchanged = True
+            elif condition is not None and not condition():
+                unchanged = True
+            else:
+                # Publish status before the marker. Workers act on the marker,
+                # so cancellation cannot finalize before its request is
+                # durable.
+                update_status(
+                    job_id,
+                    paths=paths,
+                    status="cancel_requested",
+                    phase="cancel_requested",
+                    cancel_requested=True,
+                    error={
+                        "code": "job_cancel_requested",
+                        "message": (
+                            "Cancellation was requested; the running command "
+                            "is being terminated."
+                        ),
+                    },
+                )
+                write_private_text(paths.cancel_request, now_iso())
+                append_event(
+                    job_id, {"event": "job_cancel_requested"}, paths=paths,
+                )
+                requested = True
+        if unchanged:
             return self.status(job_id)
-        # Publish the status before the marker. Workers act on the marker, so they
-        # cannot finalize cancellation before the request status is persisted.
-        update_status(
-            job_id,
-            paths=paths,
-            status="cancel_requested",
-            phase="cancel_requested",
-            cancel_requested=True,
-            error={
-                "code": "job_cancel_requested",
-                "message": "Cancellation was requested; the running command is being terminated.",
-            },
-        )
-        write_private_text(paths.cancel_request, now_iso())
-        append_event(job_id, {"event": "job_cancel_requested"}, paths=paths)
         with self._lock:
             future = self._futures.get(job_id)
-        if future is not None and future.cancel():
+        if requested and future is not None and future.cancel():
             set_error(job_id, "job_cancelled", "ARC job was cancelled before it started.", cancelled=True, paths=paths)
+        return self.status(job_id)
+
+    def retry_verified_not_submitted(
+        self,
+        job_id: str,
+        *,
+        recovery_receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Relaunch a lost process only after its caller proves no submission."""
+
+        paths = find_job_paths(job_id)
+        if paths is None:
+            return unknown_job(job_id)
+        allowed_receipt_keys = {
+            "recovery_reason", "identity_sha256", "budget_disposition",
+        }
+        if (
+            set(recovery_receipt) - allowed_receipt_keys
+            or recovery_receipt.get("recovery_reason")
+            != "provider_not_submitted"
+        ):
+            raise ValueError("verified retry receipt is invalid")
+        with submission_lock(paths.job_dir.parent):
+            current = read_json(paths.status, {})
+            error = current.get("error") if isinstance(current, Mapping) else None
+            if (
+                not isinstance(current, dict)
+                or current.get("status") != "failed"
+                or not isinstance(error, Mapping)
+                or error.get("code") not in {
+                    "job_worker_lost",
+                    "job_worker_unavailable",
+                    "job_environment_invalid",
+                    "job_worker_launch_failed",
+                    "job_command_failed",
+                    "job_command_reported_failure",
+                    "job_failed",
+                }
+                or paths.cancel_request.exists()
+            ):
+                raise ValueError("job is not eligible for verified retry")
+            process = current.get("process")
+            if isinstance(process, Mapping) and (
+                _pid_record_alive(process)
+                or _recorded_process_group_alive(process)
+            ):
+                raise ValueError("lost job process is still alive")
+            recovery_attempt = int(current.get("recovery_attempt") or 0) + 1
+            cleaned = {
+                key: value for key, value in current.items()
+                if key not in {
+                    "error", "finished_at", "process", "worker",
+                    "cancel_requested",
+                }
+            }
+            cleaned.update({
+                "status": "queued",
+                "phase": "recovery_queued",
+                "updated_at": now_iso(),
+                "finished_at": None,
+                "cancel_requested": False,
+                "recovery_attempt": recovery_attempt,
+                "recovery_receipt": dict(recovery_receipt),
+            })
+            write_json(paths.status, cleaned)
+            append_event(
+                job_id,
+                {
+                    "event": "job_verified_retry",
+                    "recovery_attempt": recovery_attempt,
+                    "identity_short": str(
+                        recovery_receipt.get("identity_sha256") or ""
+                    )[:12],
+                },
+                paths=paths,
+            )
+        self._launch_worker(job_id)
         return self.status(job_id)
 
     def _use_thread_worker(self) -> bool:
@@ -567,6 +795,16 @@ _SNAPSHOT_ENV_KEYS = frozenset(
         "ARC_RUNTIME_HOME",
         "ARC_AGENT_HOST",
         "ARC_PAPER_CACHE",
+        "ARC_PAPER_ACCESS",
+        "ARC_PAPER_CLI_ACCESS",
+        "ARC_INTERNAL_PAPER_ACCESS_LEGACY_MIRROR",
+        "ARC_PAPER_WORKER_BASE_CACHE",
+        "ARC_PAPER_WORKER_TOMBSTONE_DIR",
+        "ARC_PAPER_WORKER_SESSION_ID",
+        "ARC_PAPER_WORKER_SESSION_DIR",
+        "ARC_PAPER_BROKER_ROOT",
+        "ARC_LLM_INHERIT_HOST_TOOLS",
+        "ARC_BROKER_JOB_DEPTH",
         "ARC_DOMAIN_CACHE",
         "ARC_LLM_CACHE",
         "ARC_JOBS_CACHE",
@@ -1004,18 +1242,25 @@ def finish_job(job_id: str, result: Any, status: str) -> None:
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"invalid terminal job status: {status}")
     paths = find_job_paths(job_id) or JobPaths.for_job(job_id)
-    persist_result(job_id, result, paths=paths)
-    finished_at = now_iso()
-    update_status(
-        job_id,
-        paths=paths,
-        status=status,
-        phase=status,
-        finished_at=finished_at,
-        result_path=str(paths.result),
-    )
-    append_event(job_id, {"event": f"job_{status}"}, paths=paths)
-    record_history(job_id, status=status, paths=paths)
+    with submission_lock(paths.job_dir.parent):
+        current = read_json(paths.status, {})
+        if (
+            isinstance(current, Mapping)
+            and current.get("status") in TERMINAL_STATUSES
+        ):
+            return
+        persist_result(job_id, result, paths=paths)
+        finished_at = now_iso()
+        update_status(
+            job_id,
+            paths=paths,
+            status=status,
+            phase=status,
+            finished_at=finished_at,
+            result_path=str(paths.result),
+        )
+        append_event(job_id, {"event": f"job_{status}"}, paths=paths)
+        record_history(job_id, status=status, paths=paths)
 
 
 def set_error(
@@ -1028,25 +1273,36 @@ def set_error(
     paths: JobPaths | None = None,
 ) -> None:
     paths = paths or find_job_paths(job_id) or JobPaths.for_job(job_id)
-    error = {
-        "schema_version": "arc.job_error.v1",
-        "code": code,
-        "message": message,
-        **dict(details or {}),
-    }
-    write_json(paths.error, error)
-    status = "cancelled" if cancelled else "failed"
-    update_status(
-        job_id,
-        paths=paths,
-        status=status,
-        phase=status,
-        finished_at=now_iso(),
-        error=error,
-        error_path=str(paths.error),
-    )
-    append_event(job_id, {"event": f"job_{status}", "error_code": code}, paths=paths)
-    record_history(job_id, status=status, paths=paths)
+    with submission_lock(paths.job_dir.parent):
+        current = read_json(paths.status, {})
+        if (
+            isinstance(current, Mapping)
+            and current.get("status") in TERMINAL_STATUSES
+        ):
+            return
+        error = {
+            "schema_version": "arc.job_error.v1",
+            "code": code,
+            "message": message,
+            **dict(details or {}),
+        }
+        write_json(paths.error, error)
+        status = "cancelled" if cancelled else "failed"
+        update_status(
+            job_id,
+            paths=paths,
+            status=status,
+            phase=status,
+            finished_at=now_iso(),
+            error=error,
+            error_path=str(paths.error),
+        )
+        append_event(
+            job_id,
+            {"event": f"job_{status}", "error_code": code},
+            paths=paths,
+        )
+        record_history(job_id, status=status, paths=paths)
 
 
 def is_cancel_requested(job_id: str) -> bool:
@@ -1151,9 +1407,47 @@ def estimate_eta(status: Mapping[str, Any]) -> dict[str, Any]:
 def write_json(path: Path, data: Any) -> None:
     _ensure_private_dir(path.parent)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.{get_ident()}.{time.time_ns()}.tmp")
-    write_private_text(temporary, json.dumps(data, indent=2, ensure_ascii=False), exclusive=True)
-    temporary.replace(path)
+    encoded = json.dumps(data, indent=2, ensure_ascii=False)
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        parent_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     _chmod_private_file(path)
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@contextmanager
+def submission_lock(root: Path):
+    """Serialize deterministic publication across Controller processes."""
+
+    lock_path = root / ".submission.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -1177,6 +1471,73 @@ def job_meta(status: Mapping[str, Any], *, paths: JobPaths | None = None) -> dic
         "finished_at": status.get("finished_at"),
         "status_path": str(paths.status) if paths is not None else None,
     }
+
+
+def _public_job_meta(
+    status: Mapping[str, Any],
+    paths: JobPaths,
+    bounded: bool,
+) -> dict[str, Any]:
+    if not bounded:
+        return job_meta(status, paths=paths)
+    return {
+        key: status.get(key)
+        for key in (
+            "job_id", "job_type", "status", "phase",
+            "started_at", "updated_at", "finished_at",
+        )
+    }
+
+
+def _bounded_public_status(status: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "schema_version", "job_id", "job_type", "status", "phase",
+        "review_sequence", "last_activity_at", "last_substantive_at",
+        "cancel_requested", "started_at", "updated_at", "finished_at",
+        "execution_mode", "ok", "eta", "events",
+        "worker_launch_attempts", "operation", "operation_version",
+        "identity_sha256", "identity_short", "budget_identity_sha256",
+        "transaction_receipt_sha256", "deduplicated", "depth",
+        "paper_access", "result_sha256", "error_sha256",
+        "recovery_attempt", "evidence_round", "budget",
+    }
+    result = {
+        key: value for key, value in status.items() if key in allowed
+    }
+    progress = status.get("progress")
+    if isinstance(progress, Mapping):
+        progress_keys = {
+            "completed", "total", "current", "attempt", "round",
+            "recovery_attempt", "evidence_round",
+        }
+        result["progress"] = {
+            key: value
+            for key, value in progress.items()
+            if key in progress_keys and isinstance(value, (int, float))
+        }
+    error = status.get("error")
+    if isinstance(error, Mapping):
+        error_keys = {
+            "code", "category", "submission_state", "retryable",
+            "termination_attempted",
+        }
+        result["error"] = {
+            key: value for key, value in error.items() if key in error_keys
+        }
+    events = status.get("events")
+    if isinstance(events, list):
+        event_keys = {
+            "schema_version", "event", "at", "phase", "status",
+            "sequence", "completed", "total", "operation",
+            "identity_short", "result_sha256", "error_sha256",
+            "budget_remaining_calls", "budget_remaining_tokens",
+            "recovery_attempt",
+        }
+        result["events"] = [
+            {key: value for key, value in item.items() if key in event_keys}
+            for item in events if isinstance(item, Mapping)
+        ]
+    return result
 
 
 def unknown_job(job_id: str) -> dict[str, Any]:

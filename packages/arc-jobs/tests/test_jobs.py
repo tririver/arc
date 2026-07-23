@@ -110,6 +110,79 @@ def test_thread_job_compatibility_and_protocol_neutral_schema(tmp_path, monkeypa
     assert stored["schema_version"] == "arc.job_result.v1"
 
 
+def test_deterministic_start_deduplicates_exact_concurrent_submission(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path))
+    manager = JobManager(max_workers=1, worker_mode="thread")
+    calls = 0
+
+    def runner(progress, cancel):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    kwargs = {
+        "job_type": "paper_operation",
+        "payload": {"operation": "paper_summary", "paper_id": "x"},
+        "runner": runner,
+        "job_id": "paper-0123456789abcdef0123",
+        "full_identity": {
+            "operation": "paper_summary",
+            "request_sha256": "a" * 64,
+        },
+    }
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        job_ids = list(pool.map(lambda _: manager.start(**kwargs), range(8)))
+
+    assert job_ids == ["paper-0123456789abcdef0123"] * 8
+    assert manager.wait(job_ids[0], timeout=2)
+    assert calls == 1
+    stored = read_json(JobPaths.for_job(job_ids[0]).job)
+    assert stored["full_identity"] == kwargs["full_identity"]
+    assert len(stored["request_identity_sha256"]) == 64
+    assert len(stored["payload_sha256"]) == 64
+    assert stored["argv_sha256"] is None
+    assert len(stored["environment_identity_sha256"]) == 64
+
+
+def test_deterministic_start_rejects_identity_or_payload_mismatch(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path))
+    manager = JobManager(max_workers=1, worker_mode="thread")
+    identity = {"operation": "paper_summary", "request_sha256": "a" * 64}
+    job_id = manager.start(
+        job_type="paper_operation",
+        payload={"paper_id": "x"},
+        runner=lambda progress, cancel: {"ok": True},
+        job_id="paper-0123456789abcdef0123",
+        full_identity=identity,
+    )
+    assert job_id == "paper-0123456789abcdef0123"
+
+    with pytest.raises(ValueError, match="collision or request mismatch"):
+        manager.start(
+            job_type="paper_operation",
+            payload={"paper_id": "different"},
+            runner=lambda progress, cancel: {"ok": True},
+            job_id=job_id,
+            full_identity=identity,
+        )
+
+    with pytest.raises(ValueError, match="collision or request mismatch"):
+        manager.start(
+            job_type="paper_operation",
+            payload={"paper_id": "x"},
+            runner=lambda progress, cancel: {"ok": True},
+            job_id=job_id,
+            full_identity={
+                "operation": "paper_summary",
+                "request_sha256": "b" * 64,
+            },
+        )
+
+
 def test_thread_job_cooperative_cancel(tmp_path, monkeypatch):
     monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path))
     manager = JobManager(max_workers=1, worker_mode="thread")
@@ -215,6 +288,30 @@ def test_process_job_runs_in_explicit_working_directory(tmp_path, monkeypatch):
     assert result["result"]["output"]["data"]["cwd"] == str(work.resolve())
 
 
+def test_worker_injects_internal_job_identity_after_environment_restore(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(
+        tmp_path,
+        monkeypatch,
+        body=(
+            "printf '{\"ok\":true,\"data\":{\"job_id\":\"%s\","
+            "\"job_type\":\"%s\"}}' \"$ARC_JOB_ID\" \"$ARC_JOB_TYPE\""
+        ),
+    )
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"], job_type="paper_broker_operation")
+
+    assert worker.run_job(job_id) == 0
+    data = manager.result(job_id)["result"]["output"]["data"]
+    assert data == {"job_id": job_id, "job_type": "paper_broker_operation"}
+    persisted = read_json(JobPaths.for_job(job_id).job)["environment"]
+    assert "ARC_JOB_ID" not in persisted
+    assert "ARC_JOB_TYPE" not in persisted
+
+
 def test_worker_persists_nonzero_exit_and_json_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
     _install_fake_cli(tmp_path, monkeypatch, body="printf 'boom' >&2; exit 9")
@@ -228,6 +325,78 @@ def test_worker_persists_nonzero_exit_and_json_failure(tmp_path, monkeypatch):
     assert result["error"]["code"] == "job_command_failed"
     assert result["error"]["exit_code"] == 9
     assert result["result"]["exit_code"] == 9
+
+
+def test_launch_maps_invalid_persisted_environment_before_process(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(tmp_path, monkeypatch, body="printf '{\"ok\":true}'")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    paths = JobPaths.for_job(job_id)
+    job = read_json(paths.job)
+    job["environment"]["ARC_LLM_TIMEOUT_SECONDS"] = "1"
+    write_json(paths.job, job)
+
+    JobManager._launch_worker(manager, job_id)
+
+    assert manager.status(job_id)["error"]["code"] == "job_environment_invalid"
+
+
+def test_launch_maps_process_creation_failure_before_command(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(tmp_path, monkeypatch, body="printf '{\"ok\":true}'")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    monkeypatch.setattr(
+        jobs_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("test launch failure")
+        ),
+    )
+
+    JobManager._launch_worker(manager, job_id)
+
+    assert manager.status(job_id)["error"]["code"] == "job_worker_launch_failed"
+
+
+def test_concurrent_completion_is_not_overwritten_by_cancel(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(
+        tmp_path, monkeypatch,
+        body="printf '%s' '{\"ok\":true}'",
+    )
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    barrier = Event()
+
+    def complete():
+        barrier.wait()
+        jobs_module.finish_job(job_id, {"ok": True}, "done")
+
+    def cancel():
+        barrier.wait()
+        manager.cancel(job_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        completion = pool.submit(complete)
+        cancellation = pool.submit(cancel)
+        barrier.set()
+        completion.result()
+        cancellation.result()
+
+    status = manager.status(job_id)
+    assert status["status"] == "done"
+    assert manager.result(job_id)["ok"] is True
 
 
 @pytest.mark.parametrize(

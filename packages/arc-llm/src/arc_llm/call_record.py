@@ -5,7 +5,7 @@ from typing import Any
 
 
 ARC_LLM_CALL_RECORD_FIELD = "arc_llm_call_record"
-ARC_LLM_CALL_RECORD_SCHEMA_VERSION = "arc.llm.call_record.v5"
+ARC_LLM_CALL_RECORD_SCHEMA_VERSION = "arc.llm.call_record.v6"
 
 ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -27,6 +27,7 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
         "generation",
         "prompt_bytes",
         "logical_receipt",
+        "budget_receipt",
         "usage",
         "warnings",
         "call_status",
@@ -96,6 +97,7 @@ ARC_LLM_CALL_RECORD_SCHEMA: dict[str, Any] = {
         "generation": {"type": ["integer", "null"], "minimum": 1},
         "prompt_bytes": {"type": ["integer", "null"], "minimum": 0},
         "logical_receipt": {"type": ["object", "null"]},
+        "budget_receipt": {"type": ["object", "null"]},
         "usage": {"type": "object"},
         "warnings": {"type": "array", "items": {"type": "string"}},
         "call_status": {"enum": ["valid", "recovered", "provider_error", "schema_error", "timeout", "cancelled"]},

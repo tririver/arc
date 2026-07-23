@@ -54,11 +54,16 @@ class ProgressJournal:
         self._lock = threading.Lock()
         self._sequence = 0
         self._native_session_id: str | None = None
+        self._submission_recorded = False
 
     def __call__(self, raw_event: Mapping[str, Any]) -> None:
         with self._lock:
-            if raw_event.get("event") == "submitted" and self.submission_callback is not None:
+            if (
+                not self._submission_recorded
+                and self.submission_callback is not None
+            ):
                 self.submission_callback()
+                self._submission_recorded = True
             self._sequence += 1
             event = _normalize_event(
                 raw_event,
@@ -82,6 +87,17 @@ class ProgressJournal:
 
         with self._lock:
             self.submission_callback = callback
+            self._submission_recorded = False
+
+    def record_submission_barrier(self) -> None:
+        """Persist the bound submission barriers exactly once."""
+
+        with self._lock:
+            if self._submission_recorded:
+                return
+            if self.submission_callback is not None:
+                self.submission_callback()
+            self._submission_recorded = True
 
     def update_identity(self, **values: Any) -> None:
         """Attach identity fields learned only after the session lock is held."""

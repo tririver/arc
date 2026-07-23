@@ -204,6 +204,9 @@ preflight, and is limited to policy-authorized `network=none` operations; a
 failed preflight blocks before the provider call. Reference text may guide
 terminology, idiom, and style, but the
 original source remains authoritative for facts, coverage, and structure.
+Managed ARC-paper child LLM/jobs remain off unless the build supplies all three
+finite child-budget flags documented in `manuals/arc-companion.md`; that
+run-shared ledger and its job tickets are recovery state, not content inputs.
 
 Later turns contain only the current segment, its glossary
 projection when translation is enabled, neighboring source anchors, bounded

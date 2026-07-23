@@ -4,6 +4,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from arc_llm.runner import run_json
 
+from ...execution import current_cancel_check, current_progress_callback
 from ..model import DEFAULT_SUMMARY_MODEL_TIER, resolve_summary_model
 from ..schema import load_summary_schema, validate_summary
 from ..checkpoint import current_provider_checkpoint, current_schema_canary_root
@@ -65,4 +66,6 @@ class PromptProviderSummaryAdapter:
             artifact_dir=artifact_dir,
             schema_canary_root=current_schema_canary_root(),
             call_label=call_label or "arc-paper/summary",
+            progress_callback=current_progress_callback(),
+            cancel_check=current_cancel_check(),
         )

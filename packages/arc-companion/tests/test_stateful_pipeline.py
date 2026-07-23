@@ -256,6 +256,12 @@ def test_legacy_started_lane_profile_does_not_gain_new_paper_capabilities(
     [
         {"arc_paper_access": "none", "arc_paper_direct_shell": False},
         {"arc_paper_access": "full", "arc_paper_direct_shell": True},
+        {
+            "paper_managed_job_route": True,
+            "paper_child_llm_max_calls": 2,
+            "paper_child_llm_max_tokens": 2_000,
+            "paper_child_llm_output_reserve_tokens": 100,
+        },
     ],
 )
 def test_started_v2_lane_rejects_access_or_direct_recipe_drift(

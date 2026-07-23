@@ -69,6 +69,12 @@ Controller policies normally include all non-admin, non-destructive, non-LLM,
 non-job operations. Broker artifact arguments accept only Controller-registered
 handles bound to the current run, access mode, operation, and parameter; an
 arbitrary path or worker-created handle is never registered.
+The optional managed-job route carries only those opaque handles into its
+private job record. A controller-minted authorization receipt binds each handle
+to its operation, parameter, access mode, and handle-record hash; the worker
+resolves it inside the controller-owned artifact root. Batch exports therefore
+never accept or expose a caller path through managed arguments or public job
+status.
 
 ## Deterministic CLI
 

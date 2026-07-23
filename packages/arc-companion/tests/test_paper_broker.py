@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 import threading
@@ -9,13 +10,31 @@ import time
 
 import pytest
 
+from arc_jobs import JobManager, JobPaths
+from arc_jobs.jobs import finish_job
 from arc_llm import EvidenceJournal, EvidenceJournalContext, EvidenceRequest
+from arc_llm.budget import (
+    SharedBudget,
+    current_shared_budget_binding,
+)
+from arc_paper.broker_jobs import (
+    BROKER_JOB_TYPE,
+    BrokerJobExecutionContext,
+    BrokerJobManager,
+    BrokerJobTerminal,
+    BrokerJobTicket,
+    run_broker_job_worker,
+)
+from arc_paper.capabilities import get_operation_spec
+from arc_paper.ids import paper_ids_safe_dir_name
 from arc_companion import paper_broker as broker_module
+from arc_companion import pipeline as pipeline_module
 from arc_companion.pipeline import (
     BuildOptions,
     _llm_runtime_env,
     _paper_broker_for_call,
     _paper_broker_policy_for_call,
+    _release_turn_lock_while_waiting,
     _requested_paper_runtime_profile,
     _resolved_paper_runtime_profile,
 )
@@ -136,7 +155,103 @@ def test_intent_policy_freezes_operations_while_general_full_uses_safe_default(
         "arc_paper_direct_shell": False,
         "paper_direct_decision": "controller",
         "direct_shell_probe_id": "probe-not-requested",
+        "paper_managed_job_route": False,
+        "paper_child_llm_max_calls": None,
+        "paper_child_llm_max_tokens": None,
+        "paper_child_llm_output_reserve_tokens": None,
     }
+
+
+def test_managed_child_budget_is_explicit_finite_and_shared(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    with pytest.raises(ValueError, match="requires positive finite"):
+        BuildOptions(
+            paper_id="0911.3380",
+            project_dir=tmp_path / "invalid",
+            arc_paper_child_llm_max_calls=2,
+        )
+    with pytest.raises(ValueError, match="requires arc_paper_access=full"):
+        BuildOptions(
+            paper_id="0911.3380",
+            project_dir=tmp_path / "disabled",
+            arc_paper_access="none",
+            arc_paper_child_llm_max_calls=2,
+            arc_paper_child_llm_max_tokens=2_000,
+            arc_paper_child_llm_output_reserve_tokens=100,
+        )
+    options = BuildOptions(
+        paper_id="0911.3380",
+        project_dir=tmp_path / "project",
+        arc_paper_child_llm_max_calls=2,
+        arc_paper_child_llm_max_tokens=2_000,
+        arc_paper_child_llm_output_reserve_tokens=100,
+    )
+    policy = _paper_broker_policy_for_call(
+        options=options,
+        paper_access_policy={
+            "operations": ["get-llm-summary"],
+            "authorized_source_ids": ["0911.3380"],
+        },
+        nested_shell_capability=None,
+    )
+    lock = threading.Lock()
+    lock.acquire()
+    broker = _paper_broker_for_call(
+        options=options,
+        intent_guidance={},
+        lane="translation",
+        policy=policy,
+        journal_context=None,
+        checkpoint_root=tmp_path / "checkpoint",
+        broker_run_id="run-1",
+        managed_job_wait_context=lambda: (
+            _release_turn_lock_while_waiting(lock)
+        ),
+    )
+    same_budget_broker = _paper_broker_for_call(
+        options=options,
+        intent_guidance={},
+        lane="guide",
+        policy=policy,
+        journal_context=None,
+        checkpoint_root=tmp_path / "checkpoint",
+        broker_run_id="run-1",
+        managed_job_wait_context=lambda: nullcontext(),
+    )
+
+    assert policy is not None
+    assert "arc-paper.get-llm-summary.v1" in policy.allowed_operation_ids
+    assert broker is not None and broker.managed_job_context is not None
+    assert same_budget_broker is not None
+    assert (
+        same_budget_broker.managed_job_context.budget.identity_sha256
+        == broker.managed_job_context.budget.identity_sha256
+    )
+    requested = _requested_paper_runtime_profile(options)
+    assert requested["paper_managed_job_route"] is True
+    assert requested["paper_child_llm_max_calls"] == 2
+    recovered = pipeline_module._options_from_recovery(
+        options.project_dir,
+        pipeline_module._recovery_options(options),
+    )
+    assert recovered.arc_paper_child_llm_max_calls == 2
+    assert recovered.arc_paper_child_llm_max_tokens == 2_000
+    assert recovered.arc_paper_child_llm_output_reserve_tokens == 100
+    acquired = threading.Event()
+
+    def take_released_lock():
+        with lock:
+            acquired.set()
+
+    with broker.managed_job_wait_context():
+        contender = threading.Thread(target=take_released_lock)
+        contender.start()
+        assert acquired.wait(timeout=1)
+        contender.join(timeout=1)
+    assert lock.acquire(blocking=False) is False
+    lock.release()
 
 
 def test_companion_runtime_env_rejects_process_alias_conflict_before_call(
@@ -465,6 +580,910 @@ def test_llm_and_job_operations_defer_to_managed_job_route(monkeypatch, tmp_path
 
     assert response.ok is False
     assert response.provenance["error"]["code"] == "managed_job_required"
+
+
+def test_managed_job_wait_uses_outer_capacity_release_context(tmp_path):
+    budget = SharedBudget.create(
+        tmp_path / "budget" / "budget.sqlite3",
+        budget_id="parent",
+        max_calls=2,
+        max_tokens=2_000,
+    )
+    waiting = False
+    entered_wait = False
+    manager_calls = {"submit": 0, "terminal": 0, "wait": 0}
+
+    @contextmanager
+    def released_capacity():
+        nonlocal waiting, entered_wait
+        waiting = True
+        entered_wait = True
+        try:
+            yield
+        finally:
+            waiting = False
+
+    ticket = BrokerJobTicket(
+        job_id="paper-" + "a" * 20,
+        identity_sha256="a" * 64,
+        operation_version=1,
+        budget_identity_sha256=budget.reference.identity_sha256,
+        transaction_receipt_sha256="b" * 64,
+    )
+    context = EvidenceJournalContext(
+        journal_root=tmp_path / "journal",
+        run_id="run-1",
+        lane_id="translation",
+        worker_id="worker-1",
+        logical_task_id="segment-1",
+        source_generation=1,
+        policy_hash="embedding-policy",
+        runtime_hash="embedding-runtime",
+    )
+
+    class FakeJobs:
+        def submit(self, **kwargs):
+            manager_calls["submit"] += 1
+            return BrokerJobTicket(
+                job_id=ticket.job_id,
+                identity_sha256=ticket.identity_sha256,
+                operation_version=ticket.operation_version,
+                budget_identity_sha256=ticket.budget_identity_sha256,
+                transaction_receipt_sha256=kwargs[
+                    "transaction_receipt_sha256"
+                ],
+            )
+
+        def terminal(self, supplied):
+            manager_calls["terminal"] += 1
+            return None
+
+        def wait(self, supplied, *, timeout):
+            manager_calls["wait"] += 1
+            assert timeout == 30.0
+            assert waiting is True
+            journal_states = {
+                value.get("state")
+                for path in (tmp_path / "journal").rglob("*.json")
+                if isinstance(
+                    value := json.loads(path.read_text(encoding="utf-8")),
+                    dict,
+                )
+            }
+            assert "prepared" in journal_states
+            assert "waiting" not in journal_states
+            journal_receipts = [
+                value
+                for path in (tmp_path / "journal" / "receipts").glob("*.json")
+                if isinstance(
+                    value := json.loads(path.read_text(encoding="utf-8")),
+                    dict,
+                )
+            ]
+            assert [
+                value["address"]["evidence_round"] for value in journal_receipts
+            ] == [1]
+            if manager_calls["wait"] == 1:
+                return None
+            return BrokerJobTerminal(
+                supplied.job_id,
+                "done",
+                {"ok": True, "data": {"summary": "managed"}},
+                None,
+                "c" * 64,
+                {
+                    "schema_version": "arc.paper.broker-job-terminal.v1",
+                    "job_schema_version": "arc.job.v1",
+                    "job_id": supplied.job_id,
+                    "identity_sha256": supplied.identity_sha256,
+                    "request_identity_sha256": "e" * 64,
+                    "payload_sha256": "f" * 64,
+                    "status": "done",
+                    "deduplicated": False,
+                    "budget_identity_sha256": supplied.budget_identity_sha256,
+                    "budget": {
+                        "max_calls": 2,
+                        "max_tokens": 2_000,
+                        "charged_calls": 1,
+                        "charged_tokens": 120,
+                        "outstanding_calls": 0,
+                        "outstanding_tokens": 0,
+                        "remaining_calls": 1,
+                        "remaining_tokens": 1_880,
+                        "overdrawn": False,
+                    },
+                    "depth": 1,
+                    "paper_access": "none",
+                    "result_sha256": "c" * 64,
+                    "error_sha256": None,
+                    "recovery_attempt": 0,
+                },
+            )
+
+    broker = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint",
+        base_cache_root=tmp_path / "cache",
+        policy=build_paper_broker_policy(
+            allowed_operations=["get-llm-summary"],
+            managed_job_route=True,
+        ),
+        run_id="run-1",
+        generic_internet_allowed=False,
+        journal_context=context,
+        managed_job_context=BrokerJobExecutionContext(
+            budget.reference,
+            100,
+        ),
+        broker_job_manager=FakeJobs(),
+        managed_job_wait_context=released_capacity,
+    )
+    response = broker.resolve_round(
+        (_request("get-llm-summary", {
+            "paper_ids": ["0911.3380"],
+            "provider": "auto",
+            "model": None,
+            "model_tier": "medium",
+            "refresh": False,
+        }),),
+        round_number=1,
+    )[0]
+
+    assert response.ok is True
+    assert response.data["data"]["summary"] == "managed"
+    assert response.provenance["managed_job"]["job_id"] == ticket.job_id
+    assert response.provenance["managed_job"]["budget_identity_sha256"] == (
+        budget.reference.identity_sha256
+    )
+    managed = response.provenance["managed_job"]
+    assert managed["status"] == "done"
+    assert managed["deduplicated"] is False
+    assert managed["budget"]["charged_calls"] == 1
+    assert managed["depth"] == 1
+    assert managed["paper_access"] == "none"
+    assert managed["result_sha256"] == "c" * 64
+    assert managed["error_sha256"] is None
+    assert managed["recovery_attempt"] == 0
+    assert managed["evidence_round"] == 1
+    assert entered_wait is True
+    assert waiting is False
+    assert manager_calls == {"submit": 1, "terminal": 1, "wait": 2}
+    states = {
+        value.get("state")
+        for path in (tmp_path / "journal").rglob("*.json")
+        if isinstance(value := json.loads(path.read_text(encoding="utf-8")), dict)
+    }
+    assert "response_persisted" in states
+    replay = broker.resolve_round(
+        (_request("get-llm-summary", {
+            "paper_ids": ["0911.3380"],
+            "provider": "auto",
+            "model": None,
+            "model_tier": "medium",
+            "refresh": False,
+        }),),
+        round_number=1,
+    )[0]
+    assert replay == response
+    assert manager_calls == {"submit": 1, "terminal": 1, "wait": 2}
+
+
+def test_managed_job_failure_preserves_terminal_provenance(
+    tmp_path,
+) -> None:
+    budget = SharedBudget.create(
+        tmp_path / "budget" / "budget.sqlite3",
+        budget_id="parent",
+        max_calls=1,
+        max_tokens=1_000,
+    )
+
+    class FailedJobs:
+        def submit(self, **kwargs):
+            identity = "a" * 64
+            return BrokerJobTicket(
+                job_id="paper-" + identity[:20],
+                identity_sha256=identity,
+                operation_version=1,
+                budget_identity_sha256=budget.reference.identity_sha256,
+                transaction_receipt_sha256=kwargs["transaction_receipt_sha256"],
+            )
+
+        def terminal(self, supplied):
+            return BrokerJobTerminal(
+                supplied.job_id,
+                "failed",
+                None,
+                {
+                    "code": "paper_broker_job_failed",
+                    "message": "private provider disposition",
+                },
+                None,
+                {
+                    "schema_version": "arc.paper.broker-job-terminal.v1",
+                    "job_schema_version": "arc.job.v1",
+                    "job_id": supplied.job_id,
+                    "identity_sha256": supplied.identity_sha256,
+                    "request_identity_sha256": "e" * 64,
+                    "payload_sha256": "f" * 64,
+                    "status": "failed",
+                    "deduplicated": False,
+                    "budget_identity_sha256": supplied.budget_identity_sha256,
+                    "budget": {
+                        "max_calls": 1,
+                        "max_tokens": 1_000,
+                        "charged_calls": 1,
+                        "charged_tokens": 100,
+                    },
+                    "depth": 1,
+                    "paper_access": "none",
+                    "result_sha256": None,
+                    "error_sha256": "9" * 64,
+                    "recovery_attempt": 1,
+                },
+            )
+
+    @contextmanager
+    def released_capacity():
+        yield
+
+    broker = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint",
+        base_cache_root=tmp_path / "cache",
+        policy=build_paper_broker_policy(
+            allowed_operations=["get-llm-summary"],
+            managed_job_route=True,
+        ),
+        run_id="run-1",
+        generic_internet_allowed=False,
+        journal_context=EvidenceJournalContext(
+            journal_root=tmp_path / "journal",
+            run_id="run-1",
+            lane_id="translation",
+            worker_id="worker-1",
+            logical_task_id="segment-1",
+            source_generation=1,
+            policy_hash="embedding-policy",
+            runtime_hash="embedding-runtime",
+        ),
+        managed_job_context=BrokerJobExecutionContext(
+            budget.reference, 100,
+        ),
+        broker_job_manager=FailedJobs(),
+        managed_job_wait_context=released_capacity,
+    )
+    response = broker.resolve_round(
+        (_request("get-llm-summary", {
+            "paper_ids": ["0911.3380"],
+            "provider": "auto",
+            "model": None,
+            "model_tier": "medium",
+            "refresh": False,
+        }),),
+        round_number=1,
+    )[0]
+
+    assert response.ok is False
+    assert response.error == (
+        "Managed ARC-paper job failed; inspect its private job receipt."
+    )
+    assert "private provider disposition" not in response.error
+    managed = response.provenance["managed_job"]
+    assert managed["status"] == "failed"
+    assert managed["error_sha256"] == "9" * 64
+    assert managed["result_sha256"] is None
+    assert managed["recovery_attempt"] == 1
+    assert managed["evidence_round"] == 1
+    assert managed["depth"] == 1
+    assert managed["paper_access"] == "none"
+
+
+def test_two_addressed_workers_share_managed_child_and_isolate_delivery(
+    tmp_path,
+) -> None:
+    budget = SharedBudget.create(
+        tmp_path / "budget" / "budget.sqlite3",
+        budget_id="parent",
+        max_calls=2,
+        max_tokens=2_000,
+    )
+    barrier = threading.Barrier(2)
+    state_lock = threading.Lock()
+    released = threading.local()
+    state = {
+        "submit": 0,
+        "terminal": 0,
+        "wait": 0,
+        "child_provider": 0,
+        "ready": False,
+        "tickets": [],
+        "first_polls": {},
+    }
+
+    class SharedJobs:
+        def submit(self, **kwargs):
+            identity = "a" * 64
+            ticket = BrokerJobTicket(
+                job_id="paper-" + identity[:20],
+                identity_sha256=identity,
+                operation_version=1,
+                budget_identity_sha256=budget.reference.identity_sha256,
+                transaction_receipt_sha256=kwargs["transaction_receipt_sha256"],
+            )
+            with state_lock:
+                state["submit"] += 1
+                state["tickets"].append(ticket)
+            return ticket
+
+        def terminal(self, supplied):
+            with state_lock:
+                state["terminal"] += 1
+                ready = state["ready"]
+            return self._result(supplied) if ready else None
+
+        def wait(self, supplied, *, timeout):
+            assert timeout == 30.0
+            assert getattr(released, "active", False) is True
+            with state_lock:
+                state["wait"] += 1
+                first = not state["first_polls"].get(
+                    supplied.transaction_receipt_sha256,
+                )
+                state["first_polls"][supplied.transaction_receipt_sha256] = True
+            if first:
+                barrier.wait(timeout=5)
+                receipts = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in (tmp_path / "journal" / "receipts").glob("*.json")
+                ]
+                assert len(receipts) == 2
+                assert {item["state"] for item in receipts} == {"prepared"}
+                assert {
+                    item["address"]["evidence_round"] for item in receipts
+                } == {1}
+                return None
+            with state_lock:
+                if not state["ready"]:
+                    state["child_provider"] += 1
+                    reservation = budget.reserve(
+                        checkpoint_identity="shared-managed-provider",
+                        provider_attempt=1,
+                        prompt_bytes=8,
+                        output_reserve_tokens=100,
+                    )
+                    reservation.mark_submitted()
+                    reservation.settle_known(input_tokens=4, output_tokens=2)
+                    state["ready"] = True
+            return self._result(supplied)
+
+        def _result(self, supplied):
+            snapshot = budget.snapshot()
+            return BrokerJobTerminal(
+                supplied.job_id,
+                "done",
+                {"ok": True, "data": {"summary": "one shared child"}},
+                None,
+                "c" * 64,
+                {
+                    "schema_version": "arc.paper.broker-job-terminal.v1",
+                    "job_schema_version": "arc.job.v1",
+                    "job_id": supplied.job_id,
+                    "identity_sha256": supplied.identity_sha256,
+                    "request_identity_sha256": "d" * 64,
+                    "payload_sha256": "e" * 64,
+                    "status": "done",
+                    "deduplicated": True,
+                    "budget_identity_sha256": (
+                        budget.reference.identity_sha256
+                    ),
+                    "budget": snapshot.to_json(),
+                    "depth": 1,
+                    "paper_access": "none",
+                    "result_sha256": "c" * 64,
+                    "error_sha256": None,
+                    "recovery_attempt": 0,
+                },
+            )
+
+    @contextmanager
+    def release_all_capacity():
+        released.active = True
+        try:
+            yield
+        finally:
+            released.active = False
+
+    jobs = SharedJobs()
+    request_arguments = {
+        "paper_ids": ["0911.3380"],
+        "provider": "auto",
+        "model": None,
+        "model_tier": "medium",
+        "refresh": False,
+    }
+    requests = [
+        EvidenceRequest(
+            request_id="request-1",
+            operation="get-llm-summary",
+            arguments=request_arguments,
+            reason="test",
+            worker_id=f"worker-{index}",
+            role="companion-content-worker",
+        )
+        for index in (1, 2)
+    ]
+    contexts = [
+        EvidenceJournalContext(
+            journal_root=tmp_path / "journal",
+            run_id="run-1",
+            lane_id="translation",
+            worker_id=f"worker-{index}",
+            logical_task_id=f"segment-{index}",
+            source_generation=1,
+            policy_hash="embedding-policy",
+            runtime_hash="embedding-runtime",
+        )
+        for index in (1, 2)
+    ]
+    brokers = [
+        PaperBroker(
+            checkpoint_root=tmp_path / "checkpoint",
+            base_cache_root=tmp_path / "cache",
+            policy=build_paper_broker_policy(
+                allowed_operations=["get-llm-summary"],
+                managed_job_route=True,
+            ),
+            run_id="run-1",
+            generic_internet_allowed=False,
+            journal_context=context,
+            managed_job_context=BrokerJobExecutionContext(
+                budget.reference, 100,
+            ),
+            broker_job_manager=jobs,
+            managed_job_wait_context=release_all_capacity,
+        )
+        for context in contexts
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(
+            lambda pair: pair[0].resolve_round(
+                (pair[1],), round_number=1,
+            )[0],
+            zip(brokers, requests, strict=True),
+        ))
+
+    assert all(response.ok for response in responses)
+    assert state["submit"] == 2
+    assert state["wait"] == 4
+    assert state["child_provider"] == 1
+    assert {ticket.job_id for ticket in state["tickets"]} == {
+        "paper-" + "a" * 20,
+    }
+    assert len({
+        ticket.transaction_receipt_sha256 for ticket in state["tickets"]
+    }) == 2
+    assert budget.snapshot().charged_calls == 1
+
+    for index, (broker, context, request) in enumerate(
+        zip(brokers, contexts, requests, strict=True), start=1,
+    ):
+        broker.mark_delivered(
+            (request,),
+            round_number=1,
+            target_generation=1,
+            target_session=f"session-{index}",
+            followup_id=f"followup-{index}",
+        )
+        receipt = EvidenceJournal(context.journal_root).read_receipt(
+            context.address(request.request_id, evidence_round=1),
+        )
+        assert receipt["state"] == "delivered"
+        assert receipt["deliveries"] == [{
+            "target_generation": 1,
+            "target_session": f"session-{index}",
+            "followup_id": f"followup-{index}",
+            "delivered_at": receipt["deliveries"][0]["delivered_at"],
+        }]
+
+
+def test_actual_broker_job_manager_releases_capacity_and_delivers_once(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "jobs-cache"))
+    jobs = JobManager(worker_mode="process")
+    monkeypatch.setattr(jobs, "_launch_worker", lambda job_id: None)
+    manager = BrokerJobManager(jobs)
+    budget = SharedBudget.create(
+        tmp_path / "budget" / "budget.sqlite3",
+        budget_id="parent",
+        max_calls=1,
+        max_tokens=2_000,
+    )
+    context = EvidenceJournalContext(
+        journal_root=tmp_path / "journal",
+        run_id="run-1",
+        lane_id="translation",
+        worker_id="worker-1",
+        logical_task_id="segment-1",
+        source_generation=1,
+        policy_hash="embedding-policy",
+        runtime_hash="embedding-runtime",
+    )
+    capacity_released = threading.Event()
+
+    @contextmanager
+    def released_capacity():
+        capacity_released.set()
+        try:
+            yield
+        finally:
+            capacity_released.clear()
+
+    broker = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint",
+        base_cache_root=tmp_path / "cache",
+        policy=build_paper_broker_policy(
+            allowed_operations=["get-llm-summary"],
+            managed_job_route=True,
+        ),
+        run_id="run-1",
+        generic_internet_allowed=False,
+        journal_context=context,
+        managed_job_context=BrokerJobExecutionContext(
+            budget.reference, 100,
+        ),
+        broker_job_manager=manager,
+        managed_job_wait_context=released_capacity,
+    )
+    request = _request("get-llm-summary", {
+        "paper_ids": ["0911.3380"],
+        "provider": "auto",
+        "model": None,
+        "model_tier": "medium",
+        "refresh": False,
+    })
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            lambda: broker.resolve_round((request,), round_number=1)[0]
+        )
+        deadline = time.monotonic() + 3
+        job_dirs: list[Path] = []
+        while time.monotonic() < deadline:
+            root = tmp_path / "jobs-cache" / "jobs"
+            job_dirs = (
+                [path for path in root.iterdir() if path.name.startswith("paper-")]
+                if root.is_dir() else []
+            )
+            if job_dirs and capacity_released.is_set():
+                break
+            time.sleep(0.01)
+        assert len(job_dirs) == 1
+        job_id = job_dirs[0].name
+        prepared = EvidenceJournal(context.journal_root).read_receipt(
+            context.address(request.request_id, evidence_round=1),
+        )
+        assert prepared["state"] == "prepared"
+        assert capacity_released.is_set()
+
+        def fake_dispatch(operation, arguments):
+            del operation, arguments
+            reservation = current_shared_budget_binding(required=True).reserve(
+                checkpoint_identity="actual-manager-provider",
+                provider_attempt=1,
+                prompt_bytes=8,
+            )
+            reservation.mark_submitted()
+            reservation.settle_known(input_tokens=4, output_tokens=2)
+            return {"ok": True, "data": {"summary": "actual manager"}}
+
+        monkeypatch.setattr(
+            "arc_paper.broker_jobs.dispatch_operation", fake_dispatch,
+        )
+        monkeypatch.setenv("ARC_JOB_ID", job_id)
+        monkeypatch.setenv("ARC_JOB_TYPE", BROKER_JOB_TYPE)
+        worker_receipt = run_broker_job_worker()
+        finish_job(job_id, worker_receipt, "done")
+        response = future.result(timeout=3)
+
+    assert response.ok is True
+    assert response.data["data"]["summary"] == "actual manager"
+    assert budget.snapshot().charged_calls == 1
+    broker.mark_delivered(
+        (request,),
+        round_number=1,
+        target_generation=1,
+        target_session="session-1",
+        followup_id="followup-1",
+    )
+    broker.mark_delivered(
+        (request,),
+        round_number=1,
+        target_generation=1,
+        target_session="session-1",
+        followup_id="followup-1",
+    )
+    delivered = EvidenceJournal(context.journal_root).read_receipt(
+        context.address(request.request_id, evidence_round=1),
+    )
+    assert delivered["state"] == "delivered"
+    assert len(delivered["deliveries"]) == 1
+    assert JobPaths.for_job(job_id).result.is_file()
+
+
+def test_managed_job_prepared_recovery_attaches_persisted_ticket(
+    tmp_path,
+) -> None:
+    budget = SharedBudget.create(
+        tmp_path / "budget" / "budget.sqlite3",
+        budget_id="parent",
+        max_calls=2,
+        max_tokens=2_000,
+    )
+    context = EvidenceJournalContext(
+        journal_root=tmp_path / "journal",
+        run_id="run-1",
+        lane_id="translation",
+        worker_id="worker-1",
+        logical_task_id="segment-1",
+        source_generation=1,
+        policy_hash="embedding-policy",
+        runtime_hash="embedding-runtime",
+    )
+
+    class FakeJobs:
+        def __init__(self):
+            self.submissions = 0
+
+        def submit(self, **kwargs):
+            self.submissions += 1
+            identity = "a" * 64
+            return BrokerJobTicket(
+                job_id="paper-" + identity[:20],
+                identity_sha256=identity,
+                operation_version=1,
+                budget_identity_sha256=budget.reference.identity_sha256,
+                transaction_receipt_sha256=kwargs[
+                    "transaction_receipt_sha256"
+                ],
+            )
+
+        def terminal(self, supplied):
+            return BrokerJobTerminal(
+                supplied.job_id,
+                "done",
+                {"ok": True, "data": {"summary": "attached"}},
+                None,
+                "c" * 64,
+            )
+
+    @contextmanager
+    def released_capacity():
+        yield
+
+    jobs = FakeJobs()
+    broker = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint",
+        base_cache_root=tmp_path / "cache",
+        policy=build_paper_broker_policy(
+            allowed_operations=["get-llm-summary"],
+            managed_job_route=True,
+        ),
+        run_id="run-1",
+        generic_internet_allowed=False,
+        journal_context=context,
+        managed_job_context=BrokerJobExecutionContext(
+            budget.reference,
+            100,
+        ),
+        broker_job_manager=jobs,
+        managed_job_wait_context=released_capacity,
+    )
+    request = broker.canonicalize_request(
+        _request("get-llm-summary", {
+            "paper_ids": ["0911.3380"],
+            "provider": "auto",
+            "model": None,
+            "model_tier": "medium",
+            "refresh": False,
+        })
+    )
+    journal = EvidenceJournal(context.journal_root)
+
+    def crash_after_prepare(state, _address, receipt):
+        if state == "prepared":
+            assert receipt["transaction_receipt"]["job_ticket"]
+            raise RuntimeError("simulated prepared crash")
+
+    with pytest.raises(RuntimeError, match="simulated prepared crash"):
+        journal.resolve_round(
+            broker.journal_context,
+            (request,),
+            broker.controller,
+            round_number=1,
+            operation_policies={
+                request.operation: broker._journal_policy(
+                    request, round_number=1,
+                )
+            },
+            transition_hook=crash_after_prepare,
+        )
+
+    recovered = broker.resolve_round((request,), round_number=1)
+
+    assert recovered[0].ok is True
+    assert recovered[0].data["data"]["summary"] == "attached"
+    assert jobs.submissions == 1
+
+
+def test_managed_job_identity_tracks_real_cache_bodies_when_metadata_is_stale(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "jobs-cache"))
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    jobs = JobManager(worker_mode="process")
+    monkeypatch.setattr(jobs, "_launch_worker", lambda job_id: None)
+    manager = BrokerJobManager(jobs)
+    budget = SharedBudget.create(
+        tmp_path / "budget" / "budget.sqlite3",
+        budget_id="parent",
+        max_calls=3,
+        max_tokens=3_000,
+    )
+    source_id = "0911.3380"
+    from arc_paper.parse.document import RICH_DOCUMENT_PARSER_VERSION
+    from arc_paper.parse.source import PARSER_VERSION
+    from arc_paper.service import _write_parsed_caches
+
+    source_path, rich_path = _write_parsed_caches({
+        "paper_id": source_id,
+        "parser_version": PARSER_VERSION,
+        "source_hash": "source-v1",
+        "toc": [],
+        "sections": [],
+        "equations": [],
+        "structure": {},
+        "index_entries": {},
+        "metadata": {"title": "Cache identity fixture"},
+        "document": {
+            "schema_version": "arc.rich-document.v1",
+            "parser_version": RICH_DOCUMENT_PARSER_VERSION,
+            "blocks": [{"text": "rich version one"}],
+        },
+    }, include_document=True)
+    assert rich_path is not None
+    policy = build_paper_broker_policy(
+        allowed_operations=["get-llm-summary"],
+        managed_job_route=True,
+    )
+    request = _request("get-llm-summary", {
+        "paper_ids": [source_id],
+        "provider": "auto",
+        "model": None,
+        "model_tier": "medium",
+        "refresh": False,
+    })
+    spec = get_operation_spec("get-llm-summary")
+    assert spec is not None
+
+    def submit(checkpoint_name: str):
+        broker = PaperBroker(
+            checkpoint_root=tmp_path / checkpoint_name,
+            base_cache_root=tmp_path / "cache",
+            policy=policy,
+            run_id="run-1",
+            generic_internet_allowed=False,
+            managed_job_context=BrokerJobExecutionContext(
+                budget.reference, 100,
+            ),
+            broker_job_manager=manager,
+            managed_job_wait_context=lambda: nullcontext(),
+        )
+        canonical = broker.canonicalize_request(request)
+        _receipt, ticket = broker._ensure_managed_job_ticket(
+            canonical, spec, 1, "a" * 64,
+        )
+        return ticket
+
+    first = submit("checkpoint-v1")
+    light = json.loads(source_path.read_text(encoding="utf-8"))
+    light["test_body_revision"] = "version two"
+    source_path.write_text(
+        json.dumps(light),
+        encoding="utf-8",
+    )
+    second = submit("checkpoint-v2")
+    rich_path.write_text(
+        json.dumps({
+            "paper_id": source_id,
+            "source_hash": "source-v1",
+            "rich_parser_version": RICH_DOCUMENT_PARSER_VERSION,
+            "document": {
+                "schema_version": "arc.rich-document.v1",
+                "parser_version": RICH_DOCUMENT_PARSER_VERSION,
+                "blocks": [{"text": "rich version two"}],
+            },
+        }),
+        encoding="utf-8",
+    )
+    third = submit("checkpoint-v3")
+
+    assert first.job_id != second.job_id
+    assert first.identity_sha256 != second.identity_sha256
+    assert third.job_id not in {first.job_id, second.job_id}
+    assert third.identity_sha256 not in {
+        first.identity_sha256, second.identity_sha256,
+    }
+
+
+def test_managed_job_wait_cancellation_detaches_waiter_before_poll(
+    tmp_path,
+) -> None:
+    budget = SharedBudget.create(
+        tmp_path / "budget" / "budget.sqlite3",
+        budget_id="parent",
+        max_calls=1,
+        max_tokens=1_000,
+    )
+    ticket = BrokerJobTicket(
+        job_id="paper-" + "a" * 20,
+        identity_sha256="a" * 64,
+        operation_version=1,
+        budget_identity_sha256=budget.reference.identity_sha256,
+        transaction_receipt_sha256="b" * 64,
+    )
+
+    class FakeJobs:
+        cancelled = False
+
+        def terminal(self, supplied):
+            return None
+
+        def wait(self, supplied, *, timeout):
+            pytest.fail("cancelled waiter must not poll")
+
+        def cancel(self, supplied):
+            self.cancelled = True
+            return {"status": "waiter_cancelled"}
+
+    @contextmanager
+    def released_capacity():
+        yield
+
+    jobs = FakeJobs()
+    broker = PaperBroker(
+        checkpoint_root=tmp_path / "checkpoint",
+        base_cache_root=tmp_path / "cache",
+        policy=build_paper_broker_policy(
+            allowed_operations=["get-llm-summary"],
+            managed_job_route=True,
+        ),
+        run_id="run-1",
+        generic_internet_allowed=False,
+        managed_job_context=BrokerJobExecutionContext(
+            budget.reference, 100,
+        ),
+        broker_job_manager=jobs,
+        managed_job_wait_context=released_capacity,
+        managed_job_cancel_check=lambda: True,
+    )
+    request = broker.canonicalize_request(
+        _request("get-llm-summary", {
+            "paper_ids": ["0911.3380"],
+            "provider": "auto",
+            "model": None,
+            "model_tier": "medium",
+            "refresh": False,
+        })
+    )
+
+    with pytest.raises(Exception, match="waiter was cancelled"):
+        broker._managed_job_envelope(
+            request,
+            spec=broker_module.get_operation_spec("get-llm-summary"),
+            ticket=ticket,
+        )
+    assert jobs.cancelled is True
 
 
 @pytest.mark.parametrize(

@@ -1204,13 +1204,13 @@ def test_run_json_without_schema_passes_none_and_adds_call_record(monkeypatch):
     assert ARC_LLM_CALL_RECORD_FIELD in result
 
 
-def test_call_record_v5_requires_warnings_and_existing_provider_emits_empty_list(monkeypatch):
+def test_call_record_v6_requires_warnings_and_existing_provider_emits_empty_list(monkeypatch):
     monkeypatch.setattr(runner, "select_provider", lambda provider_name, **kwargs: FakeProvider())
 
     result = run_json("prompt", provider="codex-cli", env={}, process_chain=[])
     record = result[ARC_LLM_CALL_RECORD_FIELD]
 
-    assert ARC_LLM_CALL_RECORD_SCHEMA_VERSION == "arc.llm.call_record.v5"
+    assert ARC_LLM_CALL_RECORD_SCHEMA_VERSION == "arc.llm.call_record.v6"
     assert "warnings" in ARC_LLM_CALL_RECORD_SCHEMA["required"]
     assert record["warnings"] == []
 

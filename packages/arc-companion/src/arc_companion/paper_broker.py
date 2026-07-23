@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, ContextManager, Iterable, Mapping, Sequence
 from urllib.parse import quote, urlsplit
 
 from arc_llm import (
@@ -37,7 +37,14 @@ from arc_paper.capabilities import (
     dispatch_operation,
     get_operation_spec,
 )
-from arc_paper.ids import normalize_paper_id
+from arc_paper.ids import normalize_paper_id, paper_ids_safe_dir_name
+from arc_paper.parse.document import RICH_DOCUMENT_PARSER_VERSION
+from arc_paper.broker_jobs import (
+    BrokerJobExecutionContext,
+    BrokerJobManager,
+    BrokerJobTicket,
+)
+from arc_llm.budget import SharedBudget
 from arc_paper.worker_session import PromotionResult, WorkerCacheSession
 
 
@@ -66,11 +73,13 @@ class PaperBrokerError(RuntimeError):
         *,
         category: str = "local",
         retryable: bool = False,
+        provenance: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.category = category
         self.retryable = retryable
+        self.provenance = dict(provenance or {})
 
 
 @dataclass(frozen=True)
@@ -99,7 +108,9 @@ class PaperBrokerPolicy:
         return value
 
 
-def default_operation_specs() -> tuple[OperationSpec, ...]:
+def default_operation_specs(
+    *, include_managed_jobs: bool = False,
+) -> tuple[OperationSpec, ...]:
     """Return normal Controller operations, excluding T13/admin boundaries."""
 
     return tuple(
@@ -108,8 +119,10 @@ def default_operation_specs() -> tuple[OperationSpec, ...]:
         if not (
             spec.admin
             or spec.destructive
-            or spec.uses_llm
-            or spec.is_job
+            or (
+                not include_managed_jobs
+                and (spec.uses_llm or spec.is_job)
+            )
         )
     )
 
@@ -203,13 +216,16 @@ def build_paper_broker_policy(
     paper_network_authorized: bool | None = None,
     direct_shell_requested: bool = False,
     nested_shell_capability: Mapping[str, Any] | Any | None = None,
+    managed_job_route: bool = False,
 ) -> PaperBrokerPolicy:
     normalized_access = str(access or "").strip().lower()
     if normalized_access not in {"none", "full"}:
         raise ValueError("arc_paper_access must be none or full")
     specs: list[OperationSpec] = []
     requested = list(allowed_operations) if allowed_operations is not None else [
-        spec.name for spec in default_operation_specs()
+        spec.name for spec in default_operation_specs(
+            include_managed_jobs=managed_job_route,
+        )
     ]
     for operation in requested:
         spec = get_operation_spec(str(operation))
@@ -217,7 +233,7 @@ def build_paper_broker_policy(
             raise ValueError(f"unknown ARC-paper operation: {operation}")
         if spec.admin or spec.destructive:
             raise ValueError(f"normal Broker policy cannot authorize {spec.name}")
-        if spec.uses_llm or spec.is_job:
+        if (spec.uses_llm or spec.is_job) and not managed_job_route:
             continue
         if spec.operation_id not in {item.operation_id for item in specs}:
             specs.append(spec)
@@ -370,6 +386,10 @@ class PaperBroker:
         target_lister: Callable[..., Mapping[str, Any]] | None = None,
         max_parallel_fetches: int = 4,
         transition_hook: Callable[[str, Mapping[str, Any]], None] | None = None,
+        managed_job_context: BrokerJobExecutionContext | None = None,
+        broker_job_manager: BrokerJobManager | None = None,
+        managed_job_wait_context: Callable[[], ContextManager[None]] | None = None,
+        managed_job_cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         self.policy = policy
         self.run_id = str(run_id).strip()
@@ -422,6 +442,15 @@ class PaperBroker:
         )
         self.target_lister = target_lister
         self._transition_hook = transition_hook
+        self.managed_job_context = managed_job_context
+        self.broker_job_manager = broker_job_manager
+        self.managed_job_wait_context = managed_job_wait_context
+        self.managed_job_cancel_check = managed_job_cancel_check
+        if managed_job_context is not None and managed_job_wait_context is None:
+            raise ValueError(
+                "managed paper jobs require an outer wait context that releases "
+                "provider/session capacity"
+            )
 
     @property
     def catalog(self) -> dict[str, Any]:
@@ -648,6 +677,9 @@ class PaperBroker:
             key: normalized[key]
             for key in ("code", "category", "retryable")
         }
+        extra_provenance = getattr(exc, "provenance", None)
+        if isinstance(extra_provenance, Mapping):
+            provenance.update(dict(extra_provenance))
         return EvidenceResponse(
             request.request_id,
             False,
@@ -800,7 +832,10 @@ class PaperBroker:
     ) -> EvidenceResponse:
         spec = get_operation_spec(request.operation)
         assert spec is not None
-        if spec.uses_llm or spec.is_job or spec.recovery_class == "managed_job":
+        managed_job = (
+            spec.uses_llm or spec.is_job or spec.recovery_class == "managed_job"
+        )
+        if managed_job and self.managed_job_context is None:
             raise PaperBrokerError(
                 "managed_job_required",
                 "This ARC-paper operation requires the managed job route.",
@@ -820,8 +855,15 @@ class PaperBroker:
         if receipt is not None and receipt.get("state") == "result_persisted":
             return self._response_from_receipt(receipt, request.request_id)
         if receipt is None:
-            receipt = self._prepared_receipt(request, spec, round_number, address_hash)
-            _atomic_json(receipt_path, receipt, max_bytes=_MAX_RECEIPT_BYTES)
+            if managed_job:
+                receipt, _ticket = self._ensure_managed_job_ticket(
+                    request, spec, round_number, address_hash,
+                )
+            else:
+                receipt = self._prepared_receipt(
+                    request, spec, round_number, address_hash,
+                )
+                _atomic_json(receipt_path, receipt, max_bytes=_MAX_RECEIPT_BYTES)
             self._notify_transition("prepared", receipt)
         elif receipt.get("state") not in {
             "prepared", "object_persisted", "promotion_persisted",
@@ -829,15 +871,35 @@ class PaperBroker:
             raise PaperBrokerError(
                 "paper_broker_receipt_corrupt", "Paper Broker receipt state is invalid."
             )
-        call_id = f"call-{address_hash[:32]}"
+        ticket = (
+            self._ticket_from_receipt(receipt, spec=spec, address_hash=address_hash)
+            if managed_job else None
+        )
+        call_id = (
+            f"call-{ticket.identity_sha256[:32]}"
+            if ticket is not None else f"call-{address_hash[:32]}"
+        )
+        managed_terminal_receipt = (
+            dict(receipt["managed_job_terminal"])
+            if isinstance(receipt.get("managed_job_terminal"), Mapping)
+            else None
+        )
         state = str(receipt.get("state"))
         if state == "prepared":
-            with self.session.in_process(call_id):
-                envelope = dispatch_operation(
-                    spec.name,
-                    request.arguments,
-                    artifact_resolver=self._artifact_resolver,
+            if managed_job:
+                envelope, managed_terminal_receipt = self._managed_job_envelope(
+                    request,
+                    spec=spec,
+                    ticket=ticket,
+                    round_number=round_number,
                 )
+            else:
+                with self.session.in_process(call_id):
+                    envelope = dispatch_operation(
+                        spec.name,
+                        request.arguments,
+                        artifact_resolver=self._artifact_resolver,
+                    )
             self.session.record_call(
                 worker_id=request.worker_id or "companion-worker",
                 call_id=call_id,
@@ -856,6 +918,14 @@ class PaperBroker:
                 "result_object": object_record,
                 "handle": handle,
                 "warnings": list(warnings),
+                **(
+                    {
+                        "managed_job_terminal": dict(
+                            managed_terminal_receipt
+                        )
+                    }
+                    if managed_terminal_receipt is not None else {}
+                ),
                 "object_persisted_at": _now(),
             }
             _atomic_json(receipt_path, receipt, max_bytes=_MAX_RECEIPT_BYTES)
@@ -926,6 +996,22 @@ class PaperBroker:
             warnings=warnings,
             promotion=promotion,
             round_number=round_number,
+            managed_job_receipt=(
+                {
+                    **dict(managed_terminal_receipt or {}),
+                    "job_id": ticket.job_id,
+                    "identity_sha256": ticket.identity_sha256,
+                    "ticket_sha256": receipt.get("job_ticket_sha256"),
+                    "budget_identity_sha256": (
+                        ticket.budget_identity_sha256
+                    ),
+                    "transaction_receipt_sha256": (
+                        ticket.transaction_receipt_sha256
+                    ),
+                    "evidence_round": round_number,
+                }
+                if ticket is not None else None
+            ),
         )
         final = {
             **receipt,
@@ -939,6 +1025,208 @@ class PaperBroker:
         _atomic_json(receipt_path, final, max_bytes=_MAX_RECEIPT_BYTES)
         self._notify_transition("result_persisted", final)
         return response
+
+    def _ensure_managed_job_ticket(
+        self,
+        request: EvidenceRequest,
+        spec: OperationSpec,
+        round_number: int,
+        address_hash: str,
+    ) -> tuple[dict[str, Any], BrokerJobTicket]:
+        context = self.managed_job_context
+        if context is None:
+            raise PaperBrokerError(
+                "managed_job_required",
+                "This ARC-paper operation requires the managed job route.",
+            )
+        path = self.receipts_root / f"{address_hash}.json"
+        receipt = self._load_broker_receipt(path, request)
+        if receipt is not None and receipt.get("job_ticket") is not None:
+            return receipt, self._ticket_from_receipt(
+                receipt, spec=spec, address_hash=address_hash,
+            )
+        if receipt is not None and receipt.get("state") != "prepared":
+            raise PaperBrokerError(
+                "paper_broker_job_ticket_corrupt",
+                "Managed job result stages require a persisted job ticket.",
+            )
+        budget = SharedBudget.open(context.budget)
+        source_ids = self._source_ids(request.arguments)
+        cached_sources = self._managed_cached_source_identities(source_ids)
+        manager = self.broker_job_manager or BrokerJobManager()
+        ticket = manager.submit(
+            operation=spec.name,
+            arguments=request.arguments,
+            budget=budget,
+            output_reserve_tokens=context.output_reserve_tokens,
+            parent_run_id=self.run_id,
+            policy_sha256=self.policy.policy_sha256,
+            runtime_sha256=(
+                self.journal_context.runtime_hash
+                if self.journal_context is not None
+                else _canonical_hash({
+                    "broker_schema_version": BROKER_SCHEMA_VERSION,
+                    "policy_sha256": self.policy.policy_sha256,
+                })
+            ),
+            transaction_receipt_sha256=address_hash,
+            network_authorized=self.policy.paper_network_authorized,
+            source_sha256=(
+                _canonical_hash(cached_sources) if source_ids else None
+            ),
+            content_sha256=_canonical_hash({
+                "schema_version": "arc.companion.paper-managed-content.v3",
+                "operation_id": spec.operation_id,
+                "arguments": dict(request.arguments),
+                "cached_source_identities": cached_sources,
+                "authorized_source_ids": list(
+                    self.policy.authorized_source_ids
+                ),
+                "authorized_sections": [
+                    list(item) for item in self.policy.authorized_sections
+                ],
+            }),
+            refresh=bool(request.arguments.get("refresh", False)),
+            cache_environment=self.session.environment(),
+            artifact_root=self.root,
+            artifact_authorizations=self._managed_artifact_authorizations(
+                spec, request.arguments,
+            ),
+        )
+        prepared = receipt or self._prepared_receipt(
+            request, spec, round_number, address_hash,
+        )
+        prepared = {
+            **prepared,
+            "job_ticket": ticket.to_json(),
+            "job_ticket_sha256": _canonical_hash(ticket.to_json()),
+        }
+        _atomic_json(path, prepared, max_bytes=_MAX_RECEIPT_BYTES)
+        return prepared, ticket
+
+    def _managed_artifact_authorizations(
+        self,
+        spec: OperationSpec,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        authorizations: dict[str, dict[str, Any]] = {}
+        for parameter, access in spec.artifact_parameters:
+            handle = arguments.get(parameter)
+            if handle is None:
+                continue
+            handle_id = (
+                str(handle.get("handle_id") or "")
+                if isinstance(handle, Mapping) else ""
+            )
+            record = self._read_handle(handle_id)
+            if [spec.name, parameter, access] not in record.get("contexts", []):
+                raise PaperBrokerError(
+                    "paper_artifact_handle_forbidden",
+                    "Artifact handle is not authorized for this managed job.",
+                )
+            authorizations[parameter] = {
+                "handle_id": handle_id,
+                "operation": spec.name,
+                "parameter": parameter,
+                "access": access,
+                "handle_receipt_sha256": _canonical_hash(record),
+            }
+        return authorizations
+
+    def _ticket_from_receipt(
+        self,
+        receipt: Mapping[str, Any],
+        *,
+        spec: OperationSpec,
+        address_hash: str,
+    ) -> BrokerJobTicket:
+        raw = receipt.get("job_ticket")
+        if not isinstance(raw, Mapping):
+            raise PaperBrokerError(
+                "paper_broker_job_ticket_corrupt",
+                "Managed job receipt has no valid ticket.",
+            )
+        try:
+            ticket = BrokerJobTicket.from_json(raw)
+        except Exception as exc:
+            raise PaperBrokerError(
+                "paper_broker_job_ticket_corrupt",
+                "Managed job ticket is invalid.",
+            ) from exc
+        if (
+            receipt.get("job_ticket_sha256") != _canonical_hash(ticket.to_json())
+            or ticket.operation_version != spec.version
+            or ticket.transaction_receipt_sha256 != address_hash
+            or self.managed_job_context is None
+            or ticket.budget_identity_sha256
+            != self.managed_job_context.budget.identity_sha256
+        ):
+            raise PaperBrokerError(
+                "paper_broker_job_ticket_corrupt",
+                "Managed job ticket guards do not match the Broker receipt.",
+            )
+        return ticket
+
+    def _managed_job_envelope(
+        self,
+        request: EvidenceRequest,
+        *,
+        spec: OperationSpec,
+        ticket: BrokerJobTicket | None,
+        round_number: int = 1,
+    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+        context = self.managed_job_context
+        if context is None:
+            raise PaperBrokerError(
+                "managed_job_required",
+                "This ARC-paper operation requires the managed job route.",
+            )
+        manager = self.broker_job_manager or BrokerJobManager()
+        if ticket is None:
+            raise PaperBrokerError(
+                "paper_broker_job_ticket_corrupt",
+                "Managed job receipt has no attachable ticket.",
+            )
+        terminal = manager.terminal(ticket)
+        if terminal is None:
+            assert self.managed_job_wait_context is not None
+            with self.managed_job_wait_context():
+                while terminal is None:
+                    if (
+                        self.managed_job_cancel_check is not None
+                        and self.managed_job_cancel_check()
+                    ):
+                        manager.cancel(ticket)
+                        raise PaperBrokerError(
+                            "paper_broker_job_cancelled",
+                            "Managed ARC-paper job waiter was cancelled.",
+                            category="managed_job",
+                            retryable=False,
+                        )
+                    terminal = manager.wait(ticket, timeout=30.0)
+        if terminal.result is not None:
+            return dict(terminal.result), dict(terminal.receipt or {})
+        error = terminal.error or {
+            "code": "paper_broker_job_failed",
+            "message": "Managed ARC-paper job failed without a result.",
+        }
+        terminal_provenance = {
+            **dict(terminal.receipt or {}),
+            "job_id": ticket.job_id,
+            "identity_sha256": ticket.identity_sha256,
+            "budget_identity_sha256": ticket.budget_identity_sha256,
+            "transaction_receipt_sha256": ticket.transaction_receipt_sha256,
+            "evidence_round": round_number,
+        }
+        raise PaperBrokerError(
+            str(error.get("code") or "paper_broker_job_failed"),
+            _managed_job_public_error(
+                str(error.get("code") or "paper_broker_job_failed"),
+            ),
+            category="managed_job",
+            retryable=False,
+            provenance={"managed_job": terminal_provenance},
+        )
 
     def _object_stage(
         self, receipt: Mapping[str, Any]
@@ -1009,6 +1297,7 @@ class PaperBroker:
         warnings: Sequence[str],
         promotion: PromotionResult,
         round_number: int,
+        managed_job_receipt: Mapping[str, Any] | None = None,
     ) -> EvidenceResponse:
         ok = cleaned.get("ok") is True
         error = cleaned.get("error") if isinstance(cleaned.get("error"), Mapping) else {}
@@ -1030,6 +1319,8 @@ class PaperBroker:
             "warnings": list(warnings),
             "source_hashes": _result_hashes(cleaned),
         }
+        if managed_job_receipt is not None:
+            provenance["managed_job"] = dict(managed_job_receipt)
         if not ok:
             provenance["error"] = _envelope_error_metadata(error)
         provisional = EvidenceResponse(
@@ -1121,6 +1412,117 @@ class PaperBroker:
                 if isinstance(item, str) and item and item not in values:
                     values.append(item)
         return values
+
+    def _managed_cached_source_identities(
+        self,
+        source_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Bind jobs to exact cached bodies as well as metadata sidecars."""
+
+        records: list[dict[str, Any]] = []
+        roots = (
+            ("overlay", self.session.overlay_root),
+            ("base", self.session.base_root),
+        )
+
+        def visible_file(relative: Path) -> tuple[str, bytes] | None:
+            for layer, root in roots:
+                path = root / relative
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    return layer, path.read_bytes()
+                except OSError as exc:
+                    raise PaperBrokerError(
+                        "paper_cached_source_identity_corrupt",
+                        "Cached parsed-source content is unreadable.",
+                    ) from exc
+            return None
+
+        for source_id in source_ids:
+            safe_name = paper_ids_safe_dir_name([source_id])
+            identity_file = visible_file(
+                Path("source-identities") / f"{safe_name}.json"
+            )
+            parsed_file = visible_file(Path("sources") / f"{safe_name}.json")
+            selected: dict[str, Any] | None = None
+            if identity_file is not None:
+                layer, payload = identity_file
+                try:
+                    value = json.loads(payload)
+                except (UnicodeError, json.JSONDecodeError) as exc:
+                    raise PaperBrokerError(
+                        "paper_cached_source_identity_corrupt",
+                        "Cached parsed-source identity is invalid.",
+                    ) from exc
+                if not isinstance(value, Mapping):
+                    raise PaperBrokerError(
+                        "paper_cached_source_identity_corrupt",
+                        "Cached parsed-source identity is invalid.",
+                    )
+                source_hash = str(value.get("source_hash") or "")
+                parsed_value: Mapping[str, Any] | None = None
+                if parsed_file is not None:
+                    try:
+                        candidate = json.loads(parsed_file[1])
+                    except (UnicodeError, json.JSONDecodeError):
+                        candidate = None
+                    if isinstance(candidate, Mapping):
+                        parsed_value = candidate
+                rich_source_hash = str(
+                    (parsed_value or {}).get("source_hash") or ""
+                )
+                rich_file = (
+                    visible_file(
+                        Path("rich-sources")
+                        / safe_name
+                        / f"v{RICH_DOCUMENT_PARSER_VERSION}"
+                        / f"{rich_source_hash}.json"
+                    )
+                    if rich_source_hash
+                    else None
+                )
+                selected = {
+                    "source_id": source_id,
+                    "cache_state": "available",
+                    "cache_layer": layer,
+                    "identity_file_sha256": hashlib.sha256(payload).hexdigest(),
+                    "parsed_source": (
+                        {
+                            "cache_layer": parsed_file[0],
+                            "sha256": hashlib.sha256(parsed_file[1]).hexdigest(),
+                        }
+                        if parsed_file is not None else None
+                    ),
+                    "rich_source": (
+                        {
+                            "cache_layer": rich_file[0],
+                            "sha256": hashlib.sha256(rich_file[1]).hexdigest(),
+                        }
+                        if rich_file is not None else None
+                    ),
+                    "declared_source_hash": source_hash,
+                    "declared_document_hash": str(
+                        value.get("document_hash") or ""
+                    ),
+                }
+            records.append(selected or {
+                "source_id": source_id,
+                "cache_state": "missing",
+                "cache_layer": None,
+                "identity_file_sha256": None,
+                "parsed_source": (
+                    {
+                        "cache_layer": parsed_file[0],
+                        "sha256": hashlib.sha256(parsed_file[1]).hexdigest(),
+                    }
+                    if parsed_file is not None else None
+                ),
+                "rich_source": None,
+                "declared_source_hash": None,
+                "declared_document_hash": None,
+            })
+        return records
 
     def _canonical_source(self, source_id: str) -> str:
         normalized = normalize_paper_id(source_id)
@@ -1290,6 +1692,15 @@ class PaperBroker:
             raise PaperBrokerError(
                 "paper_broker_receipt_corrupt", "Paper Broker receipt is corrupt."
             ) from exc
+        raw_ticket = value.get("job_ticket") if isinstance(value, dict) else None
+        ticket_identity = (
+            str(raw_ticket.get("identity_sha256") or "")
+            if isinstance(raw_ticket, Mapping) else ""
+        )
+        expected_call_id = (
+            f"call-{ticket_identity[:32]}"
+            if len(ticket_identity) == 64 else f"call-{path.stem[:32]}"
+        )
         if (
             not isinstance(value, dict)
             or value.get("schema_version") != BROKER_RECEIPT_SCHEMA_VERSION
@@ -1306,7 +1717,7 @@ class PaperBroker:
             }
             or (
                 value.get("state") != "prepared"
-                and value.get("call_id") != f"call-{path.stem[:32]}"
+                and value.get("call_id") != expected_call_id
             )
         ):
             raise PaperBrokerError(
@@ -1358,22 +1769,41 @@ class PaperBroker:
     ) -> EvidenceOperationPolicy:
         spec = get_operation_spec(request.operation)
         idempotent = spec is None or spec.recovery_class == "idempotent"
+        managed_job = bool(
+            spec is not None
+            and (
+                spec.uses_llm
+                or spec.is_job
+                or spec.recovery_class == "managed_job"
+            )
+        )
 
         def transaction(_request: EvidenceRequest) -> Mapping[str, Any]:
             canonical = self.canonicalize_request(_request)
             address_hash = self._broker_address_hash(canonical, round_number)
             path = self.receipts_root / f"{address_hash}.json"
-            if not path.exists() and spec is not None:
+            ticket = None
+            if managed_job and spec is not None:
+                _receipt, ticket = self._ensure_managed_job_ticket(
+                    canonical, spec, round_number, address_hash,
+                )
+            elif not path.exists() and spec is not None:
                 _atomic_json(
                     path,
                     self._prepared_receipt(canonical, spec, round_number, address_hash),
                     max_bytes=_MAX_RECEIPT_BYTES,
                 )
-            return {
+            transaction_receipt = {
                 "schema_version": BROKER_RECEIPT_SCHEMA_VERSION,
                 "address_sha256": address_hash,
                 "policy_sha256": self.policy.policy_sha256,
             }
+            if ticket is not None:
+                transaction_receipt.update({
+                    "job_ticket": ticket.to_json(),
+                    "job_ticket_sha256": _canonical_hash(ticket.to_json()),
+                })
+            return transaction_receipt
 
         def recover(
             _request: EvidenceRequest, transaction_receipt: Mapping[str, Any]
@@ -1385,6 +1815,31 @@ class PaperBroker:
                 raise EvidenceJournalRecoveryError("paper Broker receipt address changed")
             path = self.receipts_root / f"{digest}.json"
             receipt = self._load_broker_receipt(path, canonical)
+            if managed_job and spec is not None:
+                if receipt is None:
+                    # No job ticket was durably published. Deterministic
+                    # creation remains safe in this pre-job recovery window.
+                    receipt, ticket = self._ensure_managed_job_ticket(
+                        canonical, spec, round_number, digest,
+                    )
+                else:
+                    ticket = self._ticket_from_receipt(
+                        receipt, spec=spec, address_hash=digest,
+                    )
+                transaction_ticket = transaction_receipt.get("job_ticket")
+                if (
+                    not isinstance(transaction_ticket, Mapping)
+                    or BrokerJobTicket.from_json(transaction_ticket) != ticket
+                    or transaction_receipt.get("job_ticket_sha256")
+                    != _canonical_hash(ticket.to_json())
+                ):
+                    raise EvidenceJournalRecoveryError(
+                        "managed paper job transaction ticket changed"
+                    )
+                return EvidenceExecution(
+                    self._resolve_one(canonical, round_number=round_number),
+                    transaction_receipt,
+                )
             if receipt is not None and receipt.get("state") == "result_persisted":
                 return EvidenceExecution(
                     self._response_from_receipt(receipt, canonical.request_id),
@@ -1677,6 +2132,21 @@ def _normalize_error(exc: Exception) -> dict[str, Any]:
         "code": "paper_operation_failed", "category": "operation",
         "retryable": False, "message": "ARC-paper operation failed.",
     }
+
+
+def _managed_job_public_error(code: str) -> str:
+    """Return a stable model-facing message without private child diagnostics."""
+
+    if code == "paper_broker_job_cancelled":
+        return "Managed ARC-paper job was cancelled."
+    if code == "paper_broker_job_needs_supervision":
+        return "Managed ARC-paper job requires operator supervision."
+    if code in {
+        "child_budget_required",
+        "child_budget_exhausted",
+    }:
+        return "Managed ARC-paper child budget is unavailable."
+    return "Managed ARC-paper job failed; inspect its private job receipt."
 
 
 def _envelope_error_metadata(error: Mapping[str, Any]) -> dict[str, Any]:

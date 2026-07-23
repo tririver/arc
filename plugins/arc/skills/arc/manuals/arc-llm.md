@@ -194,6 +194,14 @@ invoked or charged the provider again. If diagnostic finalization fails after a
 provider has already returned, ARC preserves the provider result and records a
 stable warning instead of retrying it.
 
+Managed descendants use a finite SQLite budget owned by the parent run. The
+first real provider call atomically adopts its job admission, while later calls
+reserve their own deterministic checkpoint identity and attempt. Submission is
+recorded durably before provider progress is accepted. Replay returns the
+persisted settlement without another charge; dead proven-unsubmitted owners
+may be taken over, while submitted or unknown crash remnants are charged
+conservatively and routed to supervision.
+
 Concurrent structured batches use the first real task as a schema canary for
 each provider/runtime/model/schema/transport identity. Calls sharing an
 unproven identity wait before provider admission. Success writes an atomic

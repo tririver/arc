@@ -81,6 +81,13 @@ Useful flags:
   ARC-paper access completely. The default is `full`.
 - `--arc-paper-direct-shell`: opt in to the trusted cache-only direct subset;
   unavailable capability is a preflight error, not a Controller fallback.
+- `--arc-paper-child-llm-max-calls N`,
+  `--arc-paper-child-llm-max-tokens N`, and
+  `--arc-paper-child-llm-output-reserve-tokens N`: together opt in to managed
+  child LLM/job operations. All three positive finite values and
+  `--arc-paper-access full` are required. The private run-shared budget,
+  reservations, tickets, and settlements persist across resume; unknown usage
+  is charged at the reservation and uncertain submitted work needs supervision.
 - `--skip-translation`: omit translation only after the workflow agent has
   confirmed from beginning, middle, and end body samples that the source and
   target have the same base language. This also disables bilingual glossary
@@ -109,6 +116,11 @@ Useful flags:
 `workers` is one global LLM-call concurrency budget shared by chapter
 preparation, translation, commentary, and review. Changing it does
 not invalidate content checkpoints.
+
+Controller jobs persist their opaque ticket before waiting. Polling releases
+the stateful lane turn and holds no provider concurrency permit, then reacquires
+the turn before evidence finalization. Cancelling one waiter does not cancel a
+deduplicated job that still has another active waiter.
 
 The CLI deliberately performs no automatic language detection. The agent
 running `workflows/companion.md` inspects substantive source body text near the

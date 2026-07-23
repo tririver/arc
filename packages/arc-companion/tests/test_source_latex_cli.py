@@ -417,6 +417,28 @@ def test_cli_is_controller_only_and_keeps_internet_enabled(tmp_path: Path, monke
     assert captured["options"].allow_internet is True
 
 
+def test_cli_passes_explicit_managed_child_budget(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    captured = {}
+
+    def fake_build(options):
+        captured["options"] = options
+        return {"ok": True, "data": {"status": "complete"}, "meta": {}}
+
+    monkeypatch.setattr(cli, "build_companion", fake_build)
+    assert cli.main([
+        "build", "local:test", "--project-dir", str(tmp_path),
+        "--arc-paper-child-llm-max-calls", "3",
+        "--arc-paper-child-llm-max-tokens", "4000",
+        "--arc-paper-child-llm-output-reserve-tokens", "200",
+    ]) == 0
+    options = captured["options"]
+    assert options.arc_paper_child_llm_max_calls == 3
+    assert options.arc_paper_child_llm_max_tokens == 4000
+    assert options.arc_paper_child_llm_output_reserve_tokens == 200
+
+
 def test_cli_returns_nonzero_for_error_envelope(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         cli,

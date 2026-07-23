@@ -6,6 +6,13 @@ from .jobs import (
     JobCancelled,
     JobManager,
     JobPaths,
+    append_event,
+    is_cancel_requested,
+    read_job,
+    read_json,
+    record_progress,
+    submission_lock,
+    write_json,
 )
 
 __all__ = [
@@ -14,5 +21,12 @@ __all__ = [
     "JobCancelled",
     "JobManager",
     "JobPaths",
+    "append_event",
+    "is_cancel_requested",
+    "read_job",
+    "read_json",
+    "record_progress",
+    "submission_lock",
+    "write_json",
 ]
 __version__ = "1.0.0"

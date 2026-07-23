@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Cache-first ar5iv and INSPIRE paper query tools")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    broker_worker = sub.add_parser("_broker-job-worker", help=argparse.SUPPRESS)
+    broker_worker.add_argument("--json", action="store_true")
+
     extract = sub.add_parser("extract-paper-ids", aliases=["extract-ids"])
     extract.add_argument("text", nargs="*")
     extract.add_argument("--file", default=None)
@@ -301,6 +304,10 @@ def _cache_filter_args(parser: argparse.ArgumentParser, *, include_all: bool) ->
 
 def _dispatch(args: argparse.Namespace) -> Any:
     command = args.command
+    if command == "_broker-job-worker":
+        from .broker_jobs import run_broker_job_worker
+
+        return run_broker_job_worker()
     if command == "cache":
         if args.cache_command == "list":
             return service.list_cached_papers(ids=args.ids, since=args.since, older_than=args.older_than)

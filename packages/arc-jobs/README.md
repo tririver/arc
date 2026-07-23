@@ -34,6 +34,22 @@ Set `ARC_JOBS_CACHE` to override the job-state directory and
 `ARC_JOBS_WORKER_MODE=thread` only when embedding a cooperative in-process
 runner. Normal CLI jobs use isolated worker processes.
 
+Embedded Controllers may provide both a deterministic `job_id` and a complete
+`full_identity` to `JobManager.start`. Exact concurrent submissions reuse the
+same persisted job; any identity, payload, argv, working-directory, or
+environment mismatch fails closed. Existing callers that omit these arguments
+continue to receive random job IDs. Workers add internal `ARC_JOB_ID` and
+`ARC_JOB_TYPE` values only after restoring the persisted allowlisted
+environment.
+
+Composing packages should import durable job primitives from the public
+`arc_jobs` package namespace. The supported helpers are `read_job`,
+`read_json`, `write_json`, `append_event`, `record_progress`, and
+`is_cancel_requested`; callers must not import implementation details from
+`arc_jobs.jobs`. `JobManager.cancel(..., condition=...)` runs the optional
+condition under the deterministic submission lock, allowing a composing
+package to make an atomic last-subscriber cancellation decision.
+
 Job directories are private (`0700`) and state, result, event, lock, log, and
 SQLite files are private (`0600`). Recovery leases use both the worker PID and
 the operating-system process start identity, rather than expiring a healthy

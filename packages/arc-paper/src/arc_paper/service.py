@@ -48,6 +48,7 @@ from .providers import Ar5ivProvider, ArxivSourceProvider, InspireProvider
 from .providers.ar5iv import ar5iv_url
 from .providers.base import ProviderError
 from .reference_inference import ReferenceInferenceError, infer_main_references
+from .execution import current_progress_callback
 from .results import err, ok
 from .search import FullTextSearchFile, search_parsed_full_text
 from .summary.input_pack import build_input_pack
@@ -876,6 +877,7 @@ def get_llm_summary(
     refresh: bool = False,
     progress_callback: ProgressCallback | None = None,
 ):
+    progress_callback = progress_callback or current_progress_callback()
     return _map(
         ids,
         lambda paper_id: _get_or_generate_summary_one(
@@ -902,6 +904,7 @@ def generate_llm_summary(
     refresh: bool = False,
     progress_callback: ProgressCallback | None = None,
 ):
+    progress_callback = progress_callback or current_progress_callback()
     return _map(
         ids,
         lambda paper_id: _generate_summary_one(

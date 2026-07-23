@@ -94,6 +94,9 @@ def test_catalog_covers_registered_cli_commands_and_aliases(monkeypatch):
     root_commands = _subcommands(captured["parser"])
     compound = {"cache", "doctor", "summary-batch"}
     for name, parser in root_commands.items():
+        if name.startswith("_"):
+            assert capabilities.operation_name_from_argv([name]) is None
+            continue
         if name in compound:
             for subcommand in _subcommands(parser):
                 assert capabilities.operation_name_from_argv([name, subcommand]) is not None

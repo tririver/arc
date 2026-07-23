@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
+import uuid
 
 import jsonschema
 import pytest
@@ -6549,6 +6552,645 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
     )
 
 
+def test_guided_stateless_managed_job_wait_and_cancel_hook(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from arc_llm import EvidenceJournal, EvidenceJournalContext
+    from arc_companion.intent_guidance import (
+        INTENT_GUIDANCE_VERSION,
+        _target_catalog_metadata,
+        _worker_payload_unvalidated,
+    )
+    from arc_paper.broker_jobs import BrokerJobTerminal, BrokerJobTicket
+
+    artifact = {
+        "schema_version": INTENT_GUIDANCE_VERSION,
+        "semantic_input_sha256": "s" * 64,
+        "user_intent_sha256": "u" * 64,
+        "output_sha256": "o" * 64,
+        "resolution_status": "resolved",
+        "guidance": "Use a managed summary.",
+        "reference_targets": [],
+        "reference_sources": [],
+    }
+    artifact["target_catalog"] = _target_catalog_metadata([])
+    artifact["worker_payload"] = _worker_payload_unvalidated(
+        artifact, lane=None,
+    )
+    llm_calls = []
+    cancel_polls = 0
+
+    def cancel_check():
+        nonlocal cancel_polls
+        cancel_polls += 1
+        return False
+
+    def fake_llm(prompt, **kwargs):
+        llm_calls.append((prompt, kwargs))
+        assert kwargs["cancel_check"] is cancel_check
+        if len(llm_calls) == 1:
+            return {
+                "answer": "pending",
+                "arc_evidence_requests": [{
+                    "request_id": "managed-r1",
+                    "operation": "get-llm-summary",
+                    "arguments": {
+                        "paper_ids": ["0911.3380"],
+                        "provider": "auto",
+                        "model": None,
+                        "model_tier": "medium",
+                        "refresh": False,
+                    },
+                    "reason": "summary",
+                }],
+            }
+        return {"answer": "done", "arc_evidence_requests": []}
+
+    manager_counts = {"submit": 0, "terminal": 0, "wait": 0}
+
+    class Jobs:
+        def submit(self, **kwargs):
+            manager_counts["submit"] += 1
+            identity = "a" * 64
+            return BrokerJobTicket(
+                job_id="paper-" + identity[:20],
+                identity_sha256=identity,
+                operation_version=1,
+                budget_identity_sha256=kwargs[
+                    "budget"
+                ].reference.identity_sha256,
+                transaction_receipt_sha256=kwargs[
+                    "transaction_receipt_sha256"
+                ],
+            )
+
+        def terminal(self, supplied):
+            manager_counts["terminal"] += 1
+            return None
+
+        def wait(self, supplied, *, timeout):
+            manager_counts["wait"] += 1
+            return BrokerJobTerminal(
+                supplied.job_id,
+                "done",
+                {"ok": True, "data": {"summary": "managed"}},
+                None,
+                "c" * 64,
+                {
+                    "schema_version": "arc.paper.broker-job-terminal.v1",
+                    "job_schema_version": "arc.job.v1",
+                    "job_id": supplied.job_id,
+                    "identity_sha256": supplied.identity_sha256,
+                    "request_identity_sha256": "d" * 64,
+                    "payload_sha256": "e" * 64,
+                    "status": "done",
+                    "deduplicated": False,
+                    "budget_identity_sha256": supplied.budget_identity_sha256,
+                    "budget": {"charged_calls": 1, "charged_tokens": 10},
+                    "depth": 1,
+                    "paper_access": "none",
+                    "result_sha256": "c" * 64,
+                    "error_sha256": None,
+                    "recovery_attempt": 0,
+                },
+            )
+
+    jobs = Jobs()
+    monkeypatch.setattr(
+        "arc_companion.paper_broker.BrokerJobManager",
+        lambda: jobs,
+    )
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "paper-cache"))
+    journal_context = EvidenceJournalContext(
+        journal_root=tmp_path / "checkpoint" / "evidence-journal",
+        run_id="f" * 64,
+        lane_id="translation",
+        worker_id="guided",
+        logical_task_id="translation:segment-1:generation-1",
+        source_generation=1,
+        policy_hash="policy-hash",
+        runtime_hash="runtime-hash",
+    )
+    result = _llm_call(
+        fake_llm,
+        "prompt",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+        options=BuildOptions(
+            paper_id="local:x",
+            project_dir=tmp_path,
+            provider="codex-cli",
+            arc_paper_child_llm_max_calls=2,
+            arc_paper_child_llm_max_tokens=2_000,
+            arc_paper_child_llm_output_reserve_tokens=100,
+        ),
+        artifact_dir=tmp_path / "llm",
+        call_label="guided",
+        model_tier="medium",
+        paper_access_policy={
+            "operations": ["get-llm-summary"],
+            "authorized_source_ids": [],
+            "authorized_section_targets": [],
+        },
+        intent_guidance=artifact,
+        intent_guidance_lane="translation",
+        evidence_journal_context=journal_context,
+        cancel_check=cancel_check,
+    )
+
+    assert result == {"answer": "done"}
+    assert len(llm_calls) == 2
+    assert manager_counts == {"submit": 1, "terminal": 1, "wait": 1}
+    assert cancel_polls >= 1
+
+
+def test_production_managed_wait_releases_real_limiter_and_delivers_once(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from arc_jobs import JobManager
+    from arc_jobs.jobs import finish_job
+    from arc_llm import EvidenceJournal, EvidenceJournalContext
+    from arc_llm.budget import current_shared_budget_binding
+    from arc_companion.stateful_pipeline import LLMSubmissionLimiter
+    from arc_paper.broker_jobs import (
+        BROKER_JOB_TYPE,
+        BrokerJobManager,
+        run_broker_job_worker,
+    )
+
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "jobs-cache"))
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "paper-cache"))
+    jobs = JobManager(worker_mode="process")
+    monkeypatch.setattr(jobs, "_launch_worker", lambda job_id: None)
+    manager = BrokerJobManager(jobs)
+    monkeypatch.setattr(
+        "arc_companion.paper_broker.BrokerJobManager",
+        lambda: manager,
+    )
+    provider_calls: list[str] = []
+
+    def provider(prompt, **kwargs):
+        del kwargs
+        if prompt == "sibling":
+            provider_calls.append("sibling")
+            return {"answer": "sibling"}
+        if "CONTROLLER REFERENCE EVIDENCE ROUND" in prompt:
+            provider_calls.append("followup")
+            return {"answer": "done", "arc_evidence_requests": []}
+        provider_calls.append("initial")
+        return {
+            "answer": "pending",
+            "arc_evidence_requests": [{
+                "request_id": "managed-r1",
+                "operation": "get-llm-summary",
+                "arguments": {
+                    "paper_ids": ["0911.3380"],
+                    "provider": "auto",
+                    "model": None,
+                    "model_tier": "medium",
+                    "refresh": False,
+                },
+                "reason": "summary",
+            }],
+        }
+
+    limited_provider = _limit_llm_concurrency(
+        provider,
+        1,
+        submission_limiter=LLMSubmissionLimiter(1),
+    )
+    context = EvidenceJournalContext(
+        journal_root=tmp_path / "checkpoint" / "evidence-journal",
+        run_id="f" * 64,
+        lane_id="translation",
+        worker_id="guided",
+        logical_task_id="translation:segment-1:generation-1",
+        source_generation=1,
+        policy_hash="policy-hash",
+        runtime_hash="runtime-hash",
+    )
+    options = BuildOptions(
+        paper_id="local:x",
+        project_dir=tmp_path,
+        provider="codex-cli",
+        arc_paper_child_llm_max_calls=1,
+        arc_paper_child_llm_max_tokens=2_000,
+        arc_paper_child_llm_output_reserve_tokens=100,
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}},
+    }
+    kwargs = {
+        "options": options,
+        "artifact_dir": tmp_path / "llm",
+        "call_label": "guided",
+        "model_tier": "medium",
+        "paper_access_policy": {
+            "operations": ["get-llm-summary"],
+            "authorized_source_ids": [],
+            "authorized_section_targets": [],
+        },
+        "intent_guidance": {},
+        "intent_guidance_lane": "translation",
+        "evidence_journal_context": context,
+    }
+
+    pool = ThreadPoolExecutor(max_workers=3)
+    resolution = None
+    job_id = None
+    try:
+        resolution = pool.submit(
+            lambda: _llm_call(
+                limited_provider, "prompt", schema, **kwargs,
+            )
+        )
+        deadline = time.monotonic() + 15
+        job_dirs: list[Path] = []
+        while time.monotonic() < deadline:
+            root = tmp_path / "jobs-cache" / "jobs"
+            job_dirs = (
+                [
+                    path for path in root.iterdir()
+                    if path.name.startswith("paper-")
+                    and (path / "job.json").is_file()
+                ]
+                if root.is_dir() else []
+            )
+            if job_dirs:
+                break
+            time.sleep(0.01)
+        assert len(job_dirs) == 1
+        # The first provider call has returned and its one shared permit must
+        # be free while the real managed child is still pending.
+        sibling = pool.submit(limited_provider, "sibling")
+        assert sibling.result(timeout=1) == {"answer": "sibling"}
+
+        def dispatch(operation, arguments):
+            del operation, arguments
+            reservation = current_shared_budget_binding(required=True).reserve(
+                checkpoint_identity="production-integration-provider",
+                provider_attempt=1,
+                prompt_bytes=8,
+            )
+            reservation.mark_submitted()
+            reservation.settle_known(input_tokens=4, output_tokens=2)
+            return {"ok": True, "data": {"summary": "actual child"}}
+
+        monkeypatch.setattr(
+            "arc_paper.broker_jobs.dispatch_operation", dispatch,
+        )
+        job_id = job_dirs[0].name
+        monkeypatch.setenv("ARC_JOB_ID", job_id)
+        monkeypatch.setenv("ARC_JOB_TYPE", BROKER_JOB_TYPE)
+        worker_receipt = run_broker_job_worker()
+        finish_job(job_id, worker_receipt, "done")
+        assert resolution.result(timeout=3) == {"answer": "done"}
+    finally:
+        if job_id is None:
+            cleanup_root = tmp_path / "jobs-cache" / "jobs"
+            cleanup_deadline = time.monotonic() + 2
+            cleanup_jobs: list[Path] = []
+            while time.monotonic() < cleanup_deadline:
+                cleanup_jobs = (
+                    [
+                        path for path in cleanup_root.iterdir()
+                        if path.name.startswith("paper-")
+                    ]
+                    if cleanup_root.is_dir() else []
+                )
+                if cleanup_jobs:
+                    break
+                time.sleep(0.01)
+            if len(cleanup_jobs) == 1:
+                job_id = cleanup_jobs[0].name
+        if (
+            resolution is not None
+            and not resolution.done()
+            and job_id is not None
+        ):
+            finish_job(job_id, {"ok": False}, "failed")
+        pool.shutdown(wait=True, cancel_futures=True)
+
+    receipt = EvidenceJournal(context.journal_root).read_receipt(
+        context.address("managed-r1", evidence_round=1),
+    )
+    assert receipt["state"] == "delivered"
+    assert len(receipt["deliveries"]) == 1
+    assert provider_calls == ["initial", "sibling", "followup"]
+
+    # Replaying the same production call reuses the terminal child and the
+    # same delivery address; neither child submission nor delivery duplicates.
+    assert _llm_call(
+        limited_provider, "prompt", schema, **kwargs,
+    ) == {"answer": "done"}
+    assert len([
+        path for path in (tmp_path / "jobs-cache" / "jobs").iterdir()
+        if path.name.startswith("paper-")
+    ]) == 1
+    replayed_receipt = EvidenceJournal(context.journal_root).read_receipt(
+        context.address("managed-r1", evidence_round=1),
+    )
+    assert len(replayed_receipt["deliveries"]) == 1
+
+
+def test_stateless_managed_calls_share_scope_across_labels_and_generations(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "paper-cache"))
+    options = BuildOptions(
+        paper_id="local:x",
+        project_dir=tmp_path,
+        provider="codex-cli",
+        arc_paper_child_llm_max_calls=2,
+        arc_paper_child_llm_max_tokens=2_000,
+        arc_paper_child_llm_output_reserve_tokens=100,
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}},
+    }
+    policy = {
+        "operations": ["get-llm-summary"],
+        "authorized_source_ids": [],
+        "authorized_section_targets": [],
+    }
+    build_instance_id = uuid.uuid4().hex
+
+    def invoke(label: str, generation: int = 1):
+        return _llm_call(
+            lambda prompt, **kwargs: {"answer": label},
+            "prompt",
+            schema,
+            options=options,
+            artifact_dir=tmp_path / "llm" / label,
+            call_label=label,
+            model_tier="medium",
+            paper_access_policy=policy,
+            intent_guidance={},
+            intent_guidance_lane="translation",
+            managed_broker_build_instance_id=build_instance_id,
+            managed_broker_generation=generation,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(invoke, ("lane-a", "lane-b")))
+
+    assert {item["answer"] for item in results} == {"lane-a", "lane-b"}
+    root, run_id = pipeline_module._stateless_managed_broker_scope(
+        options,
+        build_instance_id=build_instance_id,
+    )
+    budget_path = root / "paper-broker" / "child-llm-budget.sqlite3"
+    assert budget_path.is_file()
+    from arc_llm.budget import SharedBudget
+
+    budget = SharedBudget.create(
+        budget_path,
+        budget_id=f"companion-paper-child:{run_id}",
+        max_calls=2,
+        max_tokens=2_000,
+    )
+    reservation = budget.reserve(
+        checkpoint_identity="generation-1-provider-call",
+        provider_attempt=1,
+        prompt_bytes=40,
+        output_reserve_tokens=100,
+    )
+    reservation.mark_submitted()
+    reservation.settle_known(input_tokens=10, output_tokens=5)
+
+    assert invoke("generation-2", generation=2)["answer"] == "generation-2"
+    assert budget.snapshot().charged_calls == 1
+    assert budget.snapshot().remaining_calls == 1
+    changed = replace(
+        options,
+        arc_paper_child_llm_max_calls=3,
+    )
+    changed_root, changed_run_id = (
+        pipeline_module._stateless_managed_broker_scope(
+            changed,
+            build_instance_id=build_instance_id,
+        )
+    )
+    assert changed_root != root
+    assert changed_run_id != run_id
+    next_build_root, next_build_run_id = (
+        pipeline_module._stateless_managed_broker_scope(
+            options,
+            build_instance_id=uuid.uuid4().hex,
+        )
+    )
+    assert next_build_root != root
+    assert next_build_run_id != run_id
+
+
+def test_stateless_managed_call_rejects_missing_build_scope(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from arc_llm import runner
+
+    prepared: list[bool] = []
+
+    def forbidden_prepare(*args, **kwargs):
+        prepared.append(True)
+        raise AssertionError("runtime preparation must not run")
+
+    monkeypatch.setattr(runner, "prepare_runtime_prompt", forbidden_prepare)
+    before = set(tmp_path.iterdir())
+    artifact_dir = tmp_path / "llm"
+    with pytest.raises(RuntimeError, match="build instance"):
+        _llm_call(
+            lambda prompt, **kwargs: {"answer": "unused"},
+            "prompt",
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+            options=BuildOptions(
+                paper_id="local:x",
+                project_dir=tmp_path,
+                arc_paper_child_llm_max_calls=1,
+                arc_paper_child_llm_max_tokens=1_000,
+                arc_paper_child_llm_output_reserve_tokens=100,
+            ),
+            artifact_dir=artifact_dir,
+            call_label="missing-build-scope",
+            model_tier="medium",
+            paper_access_policy={
+                "operations": ["get-llm-summary"],
+                "authorized_source_ids": [],
+                "authorized_section_targets": [],
+            },
+            intent_guidance={},
+            intent_guidance_lane="translation",
+        )
+    assert prepared == []
+    assert not artifact_dir.exists()
+    assert set(tmp_path.iterdir()) == before
+
+
+def test_bootstrap_production_closure_propagates_cancel_check(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    bundle = _citation_translation_bundle([])
+    sentinel_cancel = lambda: False
+    seen: list[object] = []
+
+    def fake_llm_call(*args, **kwargs):
+        seen.append(kwargs.get("cancel_check"))
+        return {"guidance": "bounded"}
+
+    def fake_intent_guidance(*args, call_model, **kwargs):
+        del args, kwargs
+        call_model(
+            "prompt",
+            {
+                "type": "object",
+                "properties": {"guidance": {"type": "string"}},
+                "required": ["guidance"],
+            },
+            tmp_path / "intent-call",
+            "intent-call",
+        )
+        raise RuntimeError("stop after production closure")
+
+    monkeypatch.setattr(pipeline_module, "_llm_call", fake_llm_call)
+    monkeypatch.setattr(
+        pipeline_module, "build_intent_guidance", fake_intent_guidance,
+    )
+    pipeline_module._build_companion_unlocked(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "project",
+            user_intent="explain",
+        ),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=lambda *args, **kwargs: {},
+        cancel_check=sentinel_cancel,
+    )
+
+    assert seen == [sentinel_cancel]
+
+
+def test_build_instance_is_durable_for_recovery_and_rotates_for_new_build(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    bundle = _citation_translation_bundle([])
+    project_dir = tmp_path / "project"
+    receipts: list[dict[str, object]] = []
+
+    def stop_after_bootstrap(
+        *args, register_recovery_root, **kwargs,
+    ):
+        del args, kwargs
+        root = project_dir / "bootstrap-checkpoint"
+        root.mkdir(parents=True, exist_ok=True)
+        register_recovery_root(root)
+        receipts.append(
+            json.loads(
+                (root / "source-snapshot-receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+        raise RuntimeError("stop after durable bootstrap")
+
+    monkeypatch.setattr(
+        pipeline_module, "build_intent_guidance", stop_after_bootstrap,
+    )
+
+    def start(
+        *, intent: str, source_bundle=None, force: bool = False,
+    ) -> str:
+        accepted_bundle = source_bundle or bundle
+        result = pipeline_module._build_companion_unlocked(
+            BuildOptions(
+                paper_id=accepted_bundle.paper_id,
+                project_dir=project_dir,
+                user_intent=intent,
+                force=force,
+            ),
+            source_loader=lambda *args, **kwargs: accepted_bundle,
+            llm=lambda *args, **kwargs: {},
+        )
+        assert result["ok"] is False
+        state = json.loads(
+            (project_dir / "state.json").read_text(encoding="utf-8")
+        )
+        assert state["build_instance_id"] == receipts[-1][
+            "build_instance_id"
+        ]
+        assert state["build_source_fingerprint"] == receipts[-1][
+            "build_source_fingerprint"
+        ]
+        return str(state["build_instance_id"])
+
+    first = start(intent="explain the derivation")
+    recovery = start(intent="explain the derivation")
+    revised_bundle = replace(
+        bundle,
+        document={
+            **bundle.document,
+            "integrity": {
+                **dict(bundle.document.get("integrity") or {}),
+                "document_hash": hashlib.sha256(
+                    b"accepted-source-revision-2"
+                ).hexdigest(),
+            },
+        },
+    )
+    new_source = start(
+        intent="explain the derivation", source_bundle=revised_bundle,
+    )
+    new_intent = start(
+        intent="audit the assumptions", source_bundle=revised_bundle,
+    )
+    forced = start(
+        intent="audit the assumptions",
+        source_bundle=revised_bundle,
+        force=True,
+    )
+
+    assert recovery == first
+    assert len({first, new_source, new_intent, forced}) == 4
+    options = BuildOptions(
+        paper_id=bundle.paper_id,
+        project_dir=project_dir,
+        arc_paper_child_llm_max_calls=1,
+        arc_paper_child_llm_max_tokens=1_000,
+        arc_paper_child_llm_output_reserve_tokens=100,
+    )
+    first_scope = pipeline_module._stateless_managed_broker_scope(
+        options, build_instance_id=first,
+    )
+    recovery_scope = pipeline_module._stateless_managed_broker_scope(
+        options, build_instance_id=recovery,
+    )
+    new_source_scope = pipeline_module._stateless_managed_broker_scope(
+        options, build_instance_id=new_source,
+    )
+    new_scope = pipeline_module._stateless_managed_broker_scope(
+        options, build_instance_id=new_intent,
+    )
+    forced_scope = pipeline_module._stateless_managed_broker_scope(
+        options, build_instance_id=forced,
+    )
+    assert recovery_scope == first_scope
+    assert len({
+        first_scope, new_source_scope, new_scope, forced_scope,
+    }) == 4
+
+
 @pytest.mark.parametrize(
     ("provider", "denied_status"),
     [
@@ -6898,6 +7540,7 @@ def test_stateful_lane_serializes_segment_evidence_before_next_primary(
 def test_typed_idle_generation_replays_source_evidence_receipt_in_production_path(
     tmp_path: Path,
 ) -> None:
+    from contextlib import nullcontext
     from arc_companion.intent_guidance import _build_artifact
     from arc_companion.io import read_json
     from arc_companion.ledger import (
@@ -6912,6 +7555,12 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         mark_replacement,
     )
     from arc_llm import EvidenceJournal
+    from arc_llm.budget import SharedBudget
+    from arc_paper.broker_jobs import (
+        BrokerJobExecutionContext,
+        BrokerJobTerminal,
+        BrokerJobTicket,
+    )
 
     class Outcome:
         def __init__(self, value):
@@ -6931,6 +7580,7 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         checkpoint_dir / "chapters" / "chapter-1" / "translation-ledger.json"
     )
     fingerprint = "a" * 64
+    build_instance_id = uuid.uuid4().hex
     session_key = "chapter-1:translation"
     segment_id = "seg-1"
     source_base = f"{session_key}:{segment_id}:generation-1"
@@ -6972,8 +7622,14 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         "answer": "pending",
         "arc_evidence_requests": [{
             "request_id": "r1",
-            "operation": "list-reference-targets",
-            "arguments": {"source_id": "book"},
+            "operation": "get-llm-summary",
+            "arguments": {
+                "paper_ids": ["0911.3380"],
+                "provider": "auto",
+                "model": None,
+                "model_tier": "medium",
+                "refresh": False,
+            },
             "reason": "terminology",
         }],
     })
@@ -6985,7 +7641,7 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
     }
     source_context = pipeline_module._companion_evidence_journal_context(
         checkpoint_dir=checkpoint_dir,
-        run_id=fingerprint,
+        run_id=build_instance_id,
         lane="translation",
         worker_id="translation-1",
         logical_task_id=source_base,
@@ -6996,29 +7652,92 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
     from arc_companion.paper_broker import PaperBroker, build_paper_broker_policy
 
     broker_policy = build_paper_broker_policy(
-        allowed_operations=["get-parsed-section"],
-        authorized_source_ids=["book"],
-        authorized_sections=[{"source_id": "book", "section": "ch-2"}],
+        allowed_operations=["get-llm-summary"],
+        managed_job_route=True,
     )
+    child_budget = SharedBudget.create(
+        checkpoint_dir / "managed-budget.sqlite3",
+        budget_id="typed-idle-managed-child",
+        max_calls=2,
+        max_tokens=2_000,
+    )
+    managed_counts = {
+        "submit": 0, "terminal": 0, "wait": 0, "child_provider": 0,
+    }
 
-    def target_lister(**arguments):
-        return pipeline_module.list_reference_targets(
-            artifact,
-            lane="translation",
-            cursor=arguments.get("cursor"),
-            source_id=arguments.get("source_id"),
-            query=arguments.get("query"),
-            limit_bytes=arguments.get("limit_bytes"),
-        )
+    class SharedManagedJobs:
+        def submit(self, **kwargs):
+            managed_counts["submit"] += 1
+            identity = "b" * 64
+            return BrokerJobTicket(
+                job_id="paper-" + identity[:20],
+                identity_sha256=identity,
+                operation_version=1,
+                budget_identity_sha256=child_budget.reference.identity_sha256,
+                transaction_receipt_sha256=kwargs["transaction_receipt_sha256"],
+            )
+
+        def terminal(self, supplied):
+            managed_counts["terminal"] += 1
+            return None
+
+        def wait(self, supplied, *, timeout):
+            assert timeout == 30.0
+            managed_counts["wait"] += 1
+            managed_counts["child_provider"] += 1
+            reservation = child_budget.reserve(
+                checkpoint_identity="typed-idle-child-provider",
+                provider_attempt=1,
+                prompt_bytes=8,
+                output_reserve_tokens=100,
+            )
+            reservation.mark_submitted()
+            reservation.settle_known(input_tokens=4, output_tokens=2)
+            snapshot = child_budget.snapshot()
+            return BrokerJobTerminal(
+                supplied.job_id,
+                "done",
+                {"ok": True, "data": {"summary": "managed evidence"}},
+                None,
+                "c" * 64,
+                {
+                    "schema_version": "arc.paper.broker-job-terminal.v1",
+                    "job_schema_version": "arc.job.v1",
+                    "job_id": supplied.job_id,
+                    "identity_sha256": supplied.identity_sha256,
+                    "request_identity_sha256": "d" * 64,
+                    "payload_sha256": "e" * 64,
+                    "status": "done",
+                    "deduplicated": False,
+                    "budget_identity_sha256": (
+                        child_budget.reference.identity_sha256
+                    ),
+                    "budget": snapshot.to_json(),
+                    "depth": 1,
+                    "paper_access": "none",
+                    "result_sha256": "c" * 64,
+                    "error_sha256": None,
+                    "recovery_attempt": 0,
+                },
+            )
+
+    shared_jobs = SharedManagedJobs()
+
+    def released_wait_capacity():
+        return nullcontext()
 
     source_broker = PaperBroker(
         checkpoint_root=checkpoint_dir,
         base_cache_root=tmp_path / "paper-cache",
         policy=broker_policy,
-        run_id=fingerprint,
+        run_id=build_instance_id,
         generic_internet_allowed=False,
         journal_context=source_context,
-        target_lister=target_lister,
+        managed_job_context=BrokerJobExecutionContext(
+            child_budget.reference, 100,
+        ),
+        broker_job_manager=shared_jobs,
+        managed_job_wait_context=released_wait_capacity,
     )
     first_outcome, first_value = pipeline_module._complete_stateful_reference_evidence(
         initial,
@@ -7036,7 +7755,12 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         followup_id=source_base,
     )
     assert first_outcome.value["answer"] == first_value["answer"] == "done"
-    assert artifact.target_reads > 0
+    initial_counts = dict(managed_counts)
+    initial_budget = child_budget.snapshot()
+    assert initial_counts == {
+        "submit": 1, "terminal": 1, "wait": 1, "child_provider": 1,
+    }
+    assert initial_budget.charged_calls == 1
 
     mark_needs_supervision(
         ledger_path,
@@ -7098,7 +7822,7 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         pipeline_module._companion_evidence_source_identity(
             project_dir=project_dir,
             checkpoint_dir=checkpoint_dir,
-            run_id=fingerprint,
+            checkpoint_fingerprint=fingerprint,
             ledger_path=ledger_path,
             ledger=validated_ledger,
             session_key=session_key,
@@ -7110,7 +7834,7 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
     assert (source_generation, source_logical_task) == (1, source_base)
     replay_context = pipeline_module._companion_evidence_journal_context(
         checkpoint_dir=checkpoint_dir,
-        run_id=fingerprint,
+        run_id=build_instance_id,
         lane="translation",
         worker_id="translation-1",
         logical_task_id=source_logical_task,
@@ -7122,10 +7846,14 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         checkpoint_root=checkpoint_dir,
         base_cache_root=tmp_path / "paper-cache",
         policy=broker_policy,
-        run_id=fingerprint,
+        run_id=build_instance_id,
         generic_internet_allowed=False,
         journal_context=replay_context,
-        target_lister=target_lister,
+        managed_job_context=BrokerJobExecutionContext(
+            child_budget.reference, 100,
+        ),
+        broker_job_manager=shared_jobs,
+        managed_job_wait_context=released_wait_capacity,
     )
     artifact.target_reads = 0
     replay_outcome, replay_value = pipeline_module._complete_stateful_reference_evidence(
@@ -7145,6 +7873,8 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
     )
     assert replay_outcome.value["answer"] == replay_value["answer"] == "done"
     assert artifact.target_reads == 0
+    assert managed_counts == initial_counts
+    assert child_budget.snapshot() == initial_budget
     receipt = EvidenceJournal(source_context.journal_root).read_receipt(
         source_context.address("r1", evidence_round=1)
     )
@@ -7190,7 +7920,7 @@ def test_evidence_source_identity_rejects_one_sided_rotation_authority(
         pipeline_module._companion_evidence_source_identity(
             project_dir=project_dir,
             checkpoint_dir=checkpoint_dir,
-            run_id=fingerprint,
+            checkpoint_fingerprint=fingerprint,
             ledger_path=ledger_path,
             ledger=ledger_signal,
             session_key=session_key,
@@ -7224,7 +7954,7 @@ def test_evidence_source_identity_rejects_one_sided_rotation_authority(
         pipeline_module._companion_evidence_source_identity(
             project_dir=project_dir,
             checkpoint_dir=checkpoint_dir,
-            run_id=fingerprint,
+            checkpoint_fingerprint=fingerprint,
             ledger_path=ledger_path,
             ledger={"supervision_history": []},
             session_key=session_key,
@@ -7271,7 +8001,7 @@ def test_non_evidence_idle_rotation_uses_current_evidence_identity(tmp_path: Pat
     assert pipeline_module._companion_evidence_source_identity(
         project_dir=project_dir,
         checkpoint_dir=checkpoint_dir,
-        run_id=fingerprint,
+        checkpoint_fingerprint=fingerprint,
         ledger_path=ledger_path,
         ledger={"supervision_history": []},
         session_key="ch:translation",

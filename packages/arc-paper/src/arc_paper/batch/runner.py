@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from contextvars import copy_context
 from pathlib import Path
 from threading import Event, Thread, get_ident
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 from arc_llm.runner import resolve_llm_config
 
 from .. import service
+from ..execution import check_cancelled
 from ..summary.checkpoint import schema_canary_scope
 from ..summary.model import DEFAULT_SUMMARY_MODEL_TIER
 from .db import BatchDB, BatchItem
@@ -51,13 +53,16 @@ def run_batch(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {}
         while abort_error is None:
+            check_cancelled()
             while len(futures) < workers and submitted < limit:
+                check_cancelled()
                 claim_limit = min(workers - len(futures), limit - submitted)
                 items = db.claim_ready_items(name, limit=claim_limit, worker_id=worker_id)
                 if not items:
                     break
                 for item in items:
                     future = executor.submit(
+                        copy_context().run,
                         _run_one,
                         item,
                         db,
@@ -137,6 +142,7 @@ def _run_one(
     model_tier: str | None,
     schema_canary_root: Path,
 ) -> None:
+    check_cancelled()
     if not item.lease_token:
         raise RuntimeError(f"Claimed batch item has no lease token: {item.paper_id}")
     heartbeat = _LeaseHeartbeat(db, item)
@@ -150,15 +156,26 @@ def _run_one(
                     model_tier=model_tier,
                 )
         except BaseException as exc:
-            db.mark_status(
-                item.batch_name,
-                item.paper_id,
-                "failed",
-                lease_token=item.lease_token,
-                provider=provider,
-                model=model,
-                last_error=str(exc),
-            )
+            if _budget_exception(exc):
+                db.mark_status(
+                    item.batch_name,
+                    item.paper_id,
+                    "ready",
+                    lease_token=item.lease_token,
+                    provider=provider,
+                    model=model,
+                    last_error=str(exc),
+                )
+            else:
+                db.mark_status(
+                    item.batch_name,
+                    item.paper_id,
+                    "failed",
+                    lease_token=item.lease_token,
+                    provider=provider,
+                    model=model,
+                    last_error=str(exc),
+                )
             raise
     if heartbeat.failed:
         db.mark_status(
@@ -255,3 +272,27 @@ def _abort_batch_exception(exc: BaseException) -> bool:
         if current.__context__ is not None and current.__context__ is not current.__cause__:
             pending.append(current.__context__)
     return False
+
+
+def _budget_exception(exc: BaseException) -> bool:
+    return any(
+        getattr(current, "code", "") in {
+            "child_budget_required", "child_budget_exhausted",
+        }
+        for current in _exception_chain(exc)
+    )
+
+
+def _exception_chain(exc: BaseException):
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None and current.__context__ is not current.__cause__:
+            pending.append(current.__context__)

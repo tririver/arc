@@ -303,6 +303,10 @@ def resolve_lane_runtime_profile(
                 "arc_paper_direct_shell": False,
                 "paper_direct_decision": "disabled",
                 "direct_shell_probe_id": "none",
+                "paper_managed_job_route": False,
+                "paper_child_llm_max_calls": None,
+                "paper_child_llm_max_tokens": None,
+                "paper_child_llm_output_reserve_tokens": None,
                 "migrated_from_schema_version": LEGACY_LANE_RUNTIME_PROFILE_VERSION,
             }
             _atomic_write_json(path, migrated)
@@ -350,6 +354,10 @@ def _validate_paper_runtime_recipe(
         "paper_network_authorized": "paper network decision",
         "paper_direct_decision": "direct route",
         "direct_shell_probe_id": "direct-shell probe",
+        "paper_managed_job_route": "managed-job route",
+        "paper_child_llm_max_calls": "child LLM call budget",
+        "paper_child_llm_max_tokens": "child LLM token budget",
+        "paper_child_llm_output_reserve_tokens": "child LLM output reserve",
     }
     provisional = {
         "paper_policy_sha256": {None},
@@ -361,6 +369,11 @@ def _validate_paper_runtime_recipe(
         if key not in requested:
             continue
         value = requested.get(key)
+        if (
+            key.startswith("paper_child_llm_")
+            or key == "paper_managed_job_route"
+        ) and key not in pinned and value in {None, False}:
+            continue
         if allow_provisional and (
             value in provisional.get(key, set())
             or pinned.get(key) in provisional.get(key, set())

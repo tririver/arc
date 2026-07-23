@@ -301,6 +301,15 @@ fetches. `--arc-paper-direct-shell` is a separate trusted opt-in that fails
 preflight unless a nested sandboxed shell is proven and exposes only
 policy-authorized `network=none` operations. Large Broker results use verified
 content-addressed handles and pages across at most three evidence rounds.
+Managed ARC-paper operations that may create descendant LLM calls stay disabled
+unless all three finite flags are supplied:
+`--arc-paper-child-llm-max-calls`,
+`--arc-paper-child-llm-max-tokens`, and
+`--arc-paper-child-llm-output-reserve-tokens`. They require
+`--arc-paper-access full`. One private budget ledger is shared by the run and
+reopened during recovery; known usage is charged exactly, unavailable usage is
+charged conservatively, and a submitted call without a durable response stops
+for supervision rather than being resubmitted.
 
 For a managed companion workflow, the executing agent inspects substantive
 source body text near the beginning, middle, and end before building. It

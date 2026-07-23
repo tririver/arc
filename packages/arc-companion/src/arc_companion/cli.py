@@ -85,6 +85,35 @@ def main(argv: list[str] | None = None) -> int:
         help="Explicitly request trusted nested-shell ARC-paper access.",
     )
     build.add_argument(
+        "--arc-paper-child-llm-max-calls",
+        type=int,
+        default=None,
+        help=(
+            "opt in to managed ARC-paper child LLM operations with this finite "
+            "run-shared call limit; requires full paper access and both token "
+            "flags (default: managed child calls disabled); the persisted budget "
+            "is reused during recovery"
+        ),
+    )
+    build.add_argument(
+        "--arc-paper-child-llm-max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "finite run-shared token limit; must be set with the two other "
+            "managed child budget flags"
+        ),
+    )
+    build.add_argument(
+        "--arc-paper-child-llm-output-reserve-tokens",
+        type=int,
+        default=None,
+        help=(
+            "per-call output token reservation; must be set with the two other "
+            "managed child budget flags"
+        ),
+    )
+    build.add_argument(
         "--inherit-host-tools",
         action="store_true",
         help=(
@@ -274,6 +303,15 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 allow_internet=not args.no_internet,
                 arc_paper_access=paper_access.access,
                 arc_paper_direct_shell=args.arc_paper_direct_shell,
+                arc_paper_child_llm_max_calls=(
+                    args.arc_paper_child_llm_max_calls
+                ),
+                arc_paper_child_llm_max_tokens=(
+                    args.arc_paper_child_llm_max_tokens
+                ),
+                arc_paper_child_llm_output_reserve_tokens=(
+                    args.arc_paper_child_llm_output_reserve_tokens
+                ),
                 inherit_host_tools=args.inherit_host_tools,
                 skip_translation=args.skip_translation,
                 context_paper_ids=tuple(args.context_paper_id),

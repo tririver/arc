@@ -4,6 +4,22 @@ from importlib import import_module
 
 from .call_record import ARC_LLM_CALL_RECORD_FIELD, ARC_LLM_CALL_RECORD_SCHEMA_VERSION, strip_arc_llm_call_records
 from .call_checkpoint import SupervisedNativeResumeAuthorization
+from .budget import (
+    BUDGET_SCHEMA_VERSION,
+    BudgetCorrupt,
+    BudgetError,
+    BudgetExhausted,
+    BudgetReference,
+    BudgetRequired,
+    BudgetReservation,
+    BudgetSettlement,
+    BudgetSnapshot,
+    SharedBudget,
+    SharedBudgetBinding,
+    current_shared_budget,
+    current_shared_budget_binding,
+    shared_budget_context,
+)
 from .cancellation import install_signal_cancel_chain
 from .evidence import (
     EVIDENCE_REQUESTS_FIELD,
@@ -79,6 +95,15 @@ def __getattr__(name: str):
 
 __all__ = [
     "HostDetection",
+    "BUDGET_SCHEMA_VERSION",
+    "BudgetCorrupt",
+    "BudgetError",
+    "BudgetExhausted",
+    "BudgetReference",
+    "BudgetRequired",
+    "BudgetReservation",
+    "BudgetSettlement",
+    "BudgetSnapshot",
     "EVIDENCE_REQUESTS_FIELD",
     "EvidenceControllerCallback",
     "EvidenceExecution",
@@ -112,10 +137,14 @@ __all__ = [
     "NestedShellCapability",
     "ProviderSelection",
     "SupervisedNativeResumeAuthorization",
+    "SharedBudget",
+    "SharedBudgetBinding",
     "ARC_LLM_CALL_RECORD_FIELD",
     "ARC_LLM_CALL_RECORD_SCHEMA_VERSION",
     "detect_host",
     "classify_provider_diagnostic",
+    "current_shared_budget",
+    "current_shared_budget_binding",
     "disposition_error_kwargs",
     "allow_evidence_requests",
     "evidence_requests_from_output",
@@ -137,5 +166,6 @@ __all__ = [
     "run_text",
     "run_text_result",
     "select_llm_provider",
+    "shared_budget_context",
     "strip_arc_llm_call_records",
 ]

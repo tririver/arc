@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import wraps
@@ -379,6 +380,9 @@ class BuildOptions:
     allow_internet: bool = True
     arc_paper_access: str = "full"
     arc_paper_direct_shell: bool = False
+    arc_paper_child_llm_max_calls: int | None = None
+    arc_paper_child_llm_max_tokens: int | None = None
+    arc_paper_child_llm_output_reserve_tokens: int | None = None
     inherit_host_tools: bool = False
     skip_translation: bool = False
     context_paper_ids: tuple[str, ...] = ()
@@ -410,6 +414,30 @@ class BuildOptions:
             raise ValueError("arc_paper_access must be none or full")
         if self.arc_paper_direct_shell and self.arc_paper_access != "full":
             raise ValueError("arc_paper_direct_shell requires arc_paper_access=full")
+        child_budget = (
+            self.arc_paper_child_llm_max_calls,
+            self.arc_paper_child_llm_max_tokens,
+            self.arc_paper_child_llm_output_reserve_tokens,
+        )
+        if any(value is not None for value in child_budget):
+            if self.arc_paper_access != "full":
+                raise ValueError(
+                    "managed ARC-paper child LLM budget requires "
+                    "arc_paper_access=full"
+                )
+            if not all(type(value) is int and value > 0 for value in child_budget):
+                raise ValueError(
+                    "managed ARC-paper child LLM budget requires positive finite "
+                    "max calls, max tokens, and output reserve tokens"
+                )
+            if (
+                self.arc_paper_child_llm_output_reserve_tokens
+                > self.arc_paper_child_llm_max_tokens
+            ):
+                raise ValueError(
+                    "managed ARC-paper child LLM output reserve cannot exceed "
+                    "max tokens"
+                )
         if self.document_kind not in {"auto", "article", "book"}:
             raise ValueError("document_kind must be auto, article, or book")
         if self.idle_timeout_seconds is not None and self.idle_timeout_seconds <= 0:
@@ -584,12 +612,32 @@ def _build_companion_unlocked(
 
         llm = run_json
         chapter_result_llm = chapter_result_llm or run_json_result
-    llm = _limit_llm_concurrency(llm, options.workers, cancel_check=cancel_check)
+    submission_limiter = LLMSubmissionLimiter(options.workers)
+    llm = _limit_llm_concurrency(
+        llm,
+        options.workers,
+        cancel_check=cancel_check,
+        submission_limiter=submission_limiter,
+    )
     project_dir = options.project_dir.resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     state_path = project_dir / "state.json"
     notice = LANGUAGE_NOTICE if options.language_was_defaulted else None
     previous_state = _read_optional_json(state_path)
+    build_request_sha256 = _build_request_identity(options)
+    previous_build_instance_id = str(
+        previous_state.get("build_instance_id") or ""
+    ).strip()
+    reusable_build_instance_id = (
+        previous_build_instance_id
+        if (
+            not options.force
+            and previous_state.get("build_request_sha256")
+            == build_request_sha256
+            and re.fullmatch(r"[0-9a-f]{32}", previous_build_instance_id)
+        )
+        else None
+    )
     diagnostics: tuple[dict[str, str], ...] = ()
     fingerprint: str | None = None
     checkpoint_dir: Path | None = None
@@ -601,6 +649,7 @@ def _build_companion_unlocked(
         translation_mode="skipped" if options.skip_translation else "enabled",
         notice=notice,
         diagnostics=[],
+        pending_build_request_sha256=build_request_sha256,
     )
 
     try:
@@ -611,10 +660,44 @@ def _build_companion_unlocked(
             document_kind=options.document_kind,
         )
         generation_document = _generation_document(bundle.document)
+        bootstrap_fingerprint = _fingerprint(
+            bundle, options, evidence={}, domain_context=None,
+        )
+        # The UUID is assigned only after source acceptance. It identifies one
+        # exact request+source build, survives recovery of that snapshot, and
+        # rotates for force, request changes, or newly accepted source content.
+        build_instance_id = (
+            reusable_build_instance_id
+            if (
+                reusable_build_instance_id is not None
+                and previous_state.get("build_source_fingerprint")
+                == bootstrap_fingerprint
+            )
+            else uuid.uuid4().hex
+        )
+        _state(
+            state_path,
+            build_instance_id=build_instance_id,
+            build_request_sha256=build_request_sha256,
+            build_source_fingerprint=bootstrap_fingerprint,
+        )
         diagnostics = bundle.diagnostics
         def register_bootstrap_recovery_root(root: Path) -> None:
             nonlocal checkpoint_dir
             checkpoint_dir = root.resolve(strict=False)
+            write_json(checkpoint_dir / "source-snapshot-receipt.json", {
+                "schema_version": (
+                    "arc.companion.source-snapshot-receipt.v1"
+                ),
+                "paper_id": bundle.paper_id,
+                "fingerprint": bootstrap_fingerprint,
+                "build_instance_id": build_instance_id,
+                "build_request_sha256": build_request_sha256,
+                "build_source_fingerprint": bootstrap_fingerprint,
+                "document_payload_sha256": sha256_json(bundle.parsed),
+                "evidence_sha256": None,
+                "domain_context_sha256": None,
+            })
             _state(
                 state_path,
                 status="building_intent_guidance",
@@ -642,6 +725,7 @@ def _build_companion_unlocked(
                 call_label=call_label, model_tier=INTENT_GUIDANCE_TIER,
                 force_offline=True, disable_paper_cli=True,
                 recovery_descriptor=recovery_descriptor,
+                cancel_check=cancel_check,
             ),
             accept_recovery=_accept_registered_pipeline_control,
             register_recovery_root=register_bootstrap_recovery_root,
@@ -829,6 +913,9 @@ def _build_companion_unlocked(
             "schema_version": "arc.companion.source-snapshot-receipt.v1",
             "paper_id": bundle.paper_id,
             "fingerprint": fingerprint,
+            "build_instance_id": build_instance_id,
+            "build_request_sha256": build_request_sha256,
+            "build_source_fingerprint": bootstrap_fingerprint,
             "document_payload_sha256": sha256_json(bundle.parsed),
             "evidence_sha256": sha256_json(evidence),
             "domain_context_sha256": (
@@ -839,11 +926,13 @@ def _build_companion_unlocked(
             return _build_chaptered_companion(
                 options=options, bundle=bundle, evidence=evidence,
                 domain_context=domain_context, checkpoint_dir=checkpoint_dir,
-                fingerprint=fingerprint, notice=notice, diagnostics=diagnostics,
+                fingerprint=fingerprint, build_instance_id=build_instance_id,
+                notice=notice, diagnostics=diagnostics,
                 llm=llm, compiler=compiler, pdf_validator=pdf_validator,
                 result_llm=chapter_result_llm,
                 intent_guidance=intent_guidance,
                 cancel_check=cancel_check,
+                submission_limiter=submission_limiter,
                 require_first_chapter_freeze=(
                     previous_state.get("status") == "first_chapter_ready"
                     and previous_state.get("intent_guidance_identity")
@@ -872,6 +961,7 @@ def _build_companion_unlocked(
                     llm, prompt, schema, options=options, artifact_dir=artifact_dir,
                     call_label=call_label, model_tier=SEGMENTATION_TIER,
                     recovery_descriptor=recovery_descriptor,
+                    cancel_check=cancel_check,
                 ),
                 accept_recovery=_accept_registered_pipeline_control,
             )
@@ -901,6 +991,7 @@ def _build_companion_unlocked(
                     intent_guidance=intent_guidance,
                     intent_guidance_lane="glossary",
                     recovery_descriptor=recovery_descriptor,
+                    cancel_check=cancel_check,
                 ),
                 accept_recovery=_accept_registered_pipeline_control,
             )
@@ -940,6 +1031,7 @@ def _build_companion_unlocked(
                 intent_guidance=intent_guidance,
                 intent_guidance_lane="title_translation",
                 recovery_descriptor=recovery_descriptor,
+                cancel_check=cancel_check,
             ),
         )
 
@@ -1187,6 +1279,7 @@ def _build_companion_unlocked(
                 llm=llm,
                 checkpoint_dir=checkpoint_dir,
                 intent_guidance=intent_guidance,
+                cancel_check=cancel_check,
             )
             reviewed_payload = {
                 "schema_version": REVIEW_VERSION,
@@ -1344,13 +1437,15 @@ def _build_companion_unlocked(
 def _build_chaptered_companion(
     *, options: BuildOptions, bundle: SourceBundle, evidence: dict[str, Any],
     domain_context: dict[str, Any] | None, checkpoint_dir: Path,
-    fingerprint: str, notice: str | None, diagnostics: tuple[dict[str, str], ...],
+    fingerprint: str, build_instance_id: str, notice: str | None,
+    diagnostics: tuple[dict[str, str], ...],
     llm: Callable[..., dict[str, Any]], compiler: Callable[[Path, Path], None],
     pdf_validator: Callable[[Path], dict[str, object]],
     result_llm: Callable[..., Any] | None = None,
     intent_guidance: Mapping[str, Any] | None = None,
     require_first_chapter_freeze: bool = False,
     cancel_check: Callable[[], bool] | None = None,
+    submission_limiter: LLMSubmissionLimiter | None = None,
 ) -> dict[str, Any]:
     """Execute the chapter contract while retaining legacy runs for old caches."""
     regeneration = set(options.regenerate_lanes)
@@ -1571,7 +1666,14 @@ def _build_chaptered_companion(
         return bool(cancel_check is not None and cancel_check())
 
     session_manager = None
-    submission_limiter = LLMSubmissionLimiter(options.workers)
+    if submission_limiter is None:
+        submission_limiter = LLMSubmissionLimiter(options.workers)
+        llm = _limit_llm_concurrency(
+            llm,
+            options.workers,
+            cancel_check=cancel_check,
+            submission_limiter=submission_limiter,
+        )
     if result_llm is not None:
         from arc_llm.sessions import LLMSessionManager
         session_manager = LLMSessionManager(checkpoint_dir / "sessions")
@@ -1581,8 +1683,7 @@ def _build_chaptered_companion(
         prompt, schema, artifact_dir, call_label, tier, *, guided=False,
         prefix_guidance=True, guidance_lane=None, recovery_descriptor=None,
     ):
-        with submission_limiter.permit():
-            return _llm_call(llm, _guided_prompt(
+        return _llm_call(llm, _guided_prompt(
                                  prompt, intent_guidance, lane=guidance_lane,
                              )
                              if guided and prefix_guidance else prompt,
@@ -1596,7 +1697,8 @@ def _build_chaptered_companion(
                              ),
                              intent_guidance=intent_guidance if guided else None,
                              intent_guidance_lane=guidance_lane if guided else None,
-                             recovery_descriptor=recovery_descriptor)
+                             recovery_descriptor=recovery_descriptor,
+                             cancel_check=cancel_inflight_check)
 
     glossary_input_hash = ""
     glossary_recipe_hash = ""
@@ -2509,7 +2611,7 @@ def _build_chaptered_companion(
                     _companion_evidence_source_identity(
                         project_dir=options.project_dir,
                         checkpoint_dir=checkpoint_dir,
-                        run_id=fingerprint,
+                        checkpoint_fingerprint=fingerprint,
                         ledger_path=guide_ledger_path,
                         ledger=registered_guide,
                         session_key=session_key,
@@ -2520,7 +2622,7 @@ def _build_chaptered_companion(
                 )
                 guide_journal_context = _companion_evidence_journal_context(
                     checkpoint_dir=checkpoint_dir,
-                    run_id=fingerprint,
+                    run_id=build_instance_id,
                     lane="guide",
                     worker_id=call_label,
                     logical_task_id=evidence_source_logical_task,
@@ -2541,9 +2643,13 @@ def _build_chaptered_companion(
                     lane="guide",
                     policy=guide_broker_policy.get("policy"),
                     journal_context=guide_journal_context,
-                    checkpoint_root=checkpoint_dir,
-                    broker_run_id=fingerprint,
+                    checkpoint_root=_managed_build_broker_root(
+                        checkpoint_dir, build_instance_id,
+                    ),
+                    broker_run_id=build_instance_id,
                     generic_internet_allowed=options.allow_internet,
+                    managed_job_wait_context=lambda: nullcontext(),
+                    managed_job_cancel_check=cancel_inflight_check,
                 )
                 outcome, final_value = _complete_stateful_reference_evidence(
                     outcome, intent_guidance=intent_guidance, lane="guide",
@@ -3526,7 +3632,9 @@ def _build_chaptered_companion(
                             )
                         validate_lane_paper_runtime_profile(
                             runtime_profile,
-                            _paper_runtime_profile_from_policy(pinned_policy),
+                            _paper_runtime_profile_from_policy(
+                                pinned_policy, options=options,
+                            ),
                         )
                     stateful_prompt = stream.request(
                         (prompt if correction else (
@@ -3646,7 +3754,9 @@ def _build_chaptered_companion(
                         ):
                             validate_lane_paper_runtime_profile(
                                 runtime_profile,
-                                _paper_runtime_profile_from_policy(broker_policy),
+                                _paper_runtime_profile_from_policy(
+                                    broker_policy, options=options,
+                                ),
                             )
                         if broker_policy is not None and generation_bootstrap:
                             active_prompt = (
@@ -3773,7 +3883,7 @@ def _build_chaptered_companion(
                         _companion_evidence_source_identity(
                             project_dir=options.project_dir,
                             checkpoint_dir=checkpoint_dir,
-                            run_id=fingerprint,
+                            checkpoint_fingerprint=fingerprint,
                             ledger_path=path,
                             ledger=ledger,
                             session_key=session_key,
@@ -3784,7 +3894,7 @@ def _build_chaptered_companion(
                     )
                     lane_journal_context = _companion_evidence_journal_context(
                         checkpoint_dir=checkpoint_dir,
-                        run_id=fingerprint,
+                        run_id=build_instance_id,
                         lane=guidance_lane,
                         worker_id=call_label,
                         logical_task_id=evidence_source_logical_task,
@@ -3798,11 +3908,17 @@ def _build_chaptered_companion(
                         lane=guidance_lane,
                         policy=lane_broker_policy.get("policy"),
                         journal_context=lane_journal_context,
-                        checkpoint_root=checkpoint_dir,
-                        broker_run_id=fingerprint,
+                        checkpoint_root=_managed_build_broker_root(
+                            checkpoint_dir, build_instance_id,
+                        ),
+                        broker_run_id=build_instance_id,
                         generic_internet_allowed=bool(
                             runtime_profile["allow_internet"]
                         ),
+                        managed_job_wait_context=lambda: (
+                            _release_turn_lock_while_waiting(turn_lock)
+                        ),
+                        managed_job_cancel_check=cancel_inflight_check,
                     )
                     outcome, final_value = _complete_stateful_reference_evidence(
                         outcome, intent_guidance=intent_guidance,
@@ -3953,6 +4069,7 @@ def _build_chaptered_companion(
                     llm=reject_accepted_checkpoint_provider_call,
                     generation=block_generation, force_generation=False,
                     intent_guidance=intent_guidance,
+                    cancel_check=cancel_inflight_check,
                 )[segment_id]
                 if not _reusable_lane_output_valid(
                     object_lane, segment, value,
@@ -3990,6 +4107,7 @@ def _build_chaptered_companion(
                         or semantic_invalidated
                     ),
                     intent_guidance=intent_guidance,
+                    cancel_check=cancel_inflight_check,
                 )[segment_id]
             else:
                 value = _generate_annotations(
@@ -4007,6 +4125,7 @@ def _build_chaptered_companion(
                         or semantic_invalidated
                     ),
                     intent_guidance=intent_guidance,
+                    cancel_check=cancel_inflight_check,
                 )[segment_id]
         except BaseException as exc:
             _mark_translation_repair_supervision(
@@ -4236,6 +4355,7 @@ def _build_chaptered_companion(
             protected_names=protected_names, evidence=evidence, options=options,
             llm=llm, checkpoint_dir=checkpoint_dir,
             intent_guidance=intent_guidance,
+            cancel_check=cancel_inflight_check,
         )
         review_output = {
             "translations": translations,
@@ -8014,6 +8134,15 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "allow_internet": options.allow_internet,
         "arc_paper_access": options.arc_paper_access,
         "arc_paper_direct_shell": options.arc_paper_direct_shell,
+        "arc_paper_child_llm_max_calls": (
+            options.arc_paper_child_llm_max_calls
+        ),
+        "arc_paper_child_llm_max_tokens": (
+            options.arc_paper_child_llm_max_tokens
+        ),
+        "arc_paper_child_llm_output_reserve_tokens": (
+            options.arc_paper_child_llm_output_reserve_tokens
+        ),
         "inherit_host_tools": options.inherit_host_tools,
         "skip_translation": options.skip_translation,
         "context_paper_ids": list(options.context_paper_ids),
@@ -8031,6 +8160,15 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
             str(options.legacy_checkpoint) if options.legacy_checkpoint else None
         ),
     }
+
+
+def _build_request_identity(options: BuildOptions) -> str:
+    """Identify build intent/configuration without treating source as a run ID."""
+
+    return sha256_json({
+        "schema_version": "arc.companion.build-request.v1",
+        "options": _recovery_options(options),
+    })
 
 
 def _with_effective_source_language(options: BuildOptions) -> BuildOptions:
@@ -8094,6 +8232,15 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         allow_internet=bool(value.get("allow_internet", True)),
         arc_paper_access=access,
         arc_paper_direct_shell=bool(value.get("arc_paper_direct_shell", False)),
+        arc_paper_child_llm_max_calls=value.get(
+            "arc_paper_child_llm_max_calls"
+        ),
+        arc_paper_child_llm_max_tokens=value.get(
+            "arc_paper_child_llm_max_tokens"
+        ),
+        arc_paper_child_llm_output_reserve_tokens=value.get(
+            "arc_paper_child_llm_output_reserve_tokens"
+        ),
         inherit_host_tools=bool(value.get("inherit_host_tools", False)),
         skip_translation=bool(value.get("skip_translation", False)),
         context_paper_ids=tuple(value.get("context_paper_ids") or ()),
@@ -8686,6 +8833,7 @@ def _generate_annotations(
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     force_generation: bool = False,
     intent_guidance: Mapping[str, Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
     usage_state: dict[str, Any] = {"counts": {}, "topics": []}
@@ -8838,6 +8986,7 @@ def _generate_annotations(
             paper_access_policy=_guidance_policy(intent_guidance, lane="commentary"),
             intent_guidance=intent_guidance,
             intent_guidance_lane="commentary",
+            cancel_check=cancel_check,
             recovery_descriptor=submission_descriptor(
                 unit="annotation",
                 logical_unit=segment_id,
@@ -9826,6 +9975,7 @@ def _repair_translation_token_placement(
     input_sha256: str,
     llm: Callable[..., dict[str, Any]],
     generation: int = 1,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the single lifetime-bounded token-placement repair for a segment input."""
     segment_id = str(segment["segment_id"])
@@ -10088,6 +10238,7 @@ def _repair_translation_token_placement(
             call_label=f"companion-translation-{segment_id}-retry-offset-1",
             model_tier=TRANSLATION_RETRY_TIER,
             force_offline=True,
+            cancel_check=cancel_check,
             recovery_descriptor=submission_descriptor(
                 unit="translation-token-repair",
                 logical_unit=f"{segment_id}:token-repair",
@@ -10225,6 +10376,7 @@ def _generate_translations(
     accepted_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     force_generation: bool = False,
     intent_guidance: Mapping[str, Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     by_id = {block_id(block): block for block in bundle.document["blocks"]}
     output: dict[str, dict[str, Any]] = {}
@@ -10424,6 +10576,7 @@ def _generate_translations(
                     paper_access_policy=_guidance_policy(intent_guidance, lane="translation"),
                     intent_guidance=intent_guidance,
                     intent_guidance_lane="translation",
+                    cancel_check=cancel_check,
                     recovery_descriptor=submission_descriptor(
                         unit="translation",
                         logical_unit=segment_id,
@@ -10604,6 +10757,7 @@ def _generate_translations(
                             call_label=f"companion-translation-{segment_id}-coverage-repair-1",
                             model_tier=TRANSLATION_COVERAGE_REPAIR_TIER,
                             force_offline=True,
+                            cancel_check=cancel_check,
                             recovery_descriptor=submission_descriptor(
                                 unit="translation-coverage-repair",
                                 logical_unit=f"{segment_id}:coverage-repair",
@@ -10724,6 +10878,7 @@ def _generate_translations(
                         input_sha256=input_hashes[segment_id],
                         llm=llm,
                         generation=generation,
+                        cancel_check=cancel_check,
                     )
                     repair_provenance.append(provenance)
             if missing_blocks:
@@ -10761,6 +10916,7 @@ def _generate_translations(
                 input_sha256=input_hashes[segment_id],
                 llm=llm,
                 generation=generation,
+                cancel_check=cancel_check,
             )
             repair_provenance.append(provenance)
         try:
@@ -10889,6 +11045,7 @@ def _review(
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
     intent_guidance: Mapping[str, Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, dict[str, Any]], dict[str, Any]]:
     active_segments = [item for item in segments if not item.get("structural_only")]
     if len(active_segments) != len(segments):
@@ -10913,6 +11070,7 @@ def _review(
             llm=llm,
             checkpoint_dir=checkpoint_dir,
             intent_guidance=intent_guidance,
+            cancel_check=cancel_check,
         )
         merged_annotations = dict(annotations)
         merged_annotations.update(reviewed_annotations)
@@ -10951,6 +11109,7 @@ def _review(
             llm=llm,
             checkpoint_dir=checkpoint_dir,
             intent_guidance=intent_guidance,
+            cancel_check=cancel_check,
         )
         return None, reviewed, review
     translations = {
@@ -11137,6 +11296,7 @@ def _review(
                     paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
                     intent_guidance=intent_guidance,
                     intent_guidance_lane="review",
+                    cancel_check=cancel_check,
                     review_prompt_context=_review_prompt_context(
                         rendered,
                         stage="section",
@@ -11282,6 +11442,7 @@ def _review(
         paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
         intent_guidance=intent_guidance,
         intent_guidance_lane="review",
+        cancel_check=cancel_check,
         review_prompt_context=_review_prompt_context(
             final_rendered,
             stage="hierarchical-final" if hierarchical else "direct-final",
@@ -11402,6 +11563,7 @@ def _review_commentary_only(
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
     intent_guidance: Mapping[str, Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Review commentary without exposing a translation field to the model."""
     by_id = {block_id(block): block for block in document.get("blocks") or []}
@@ -11544,6 +11706,7 @@ def _review_commentary_only(
                 paper_access_policy=_guidance_policy(intent_guidance, lane="review"),
                 intent_guidance=intent_guidance,
                 intent_guidance_lane="review",
+                cancel_check=cancel_check,
                 review_prompt_context=_review_prompt_context(
                     rendered,
                     stage="commentary",
@@ -11989,7 +12152,101 @@ def _paper_broker_policy_for_call(
         paper_network_authorized=True,
         direct_shell_requested=effective_direct,
         nested_shell_capability=nested_shell_capability,
+        managed_job_route=(
+            options.arc_paper_child_llm_max_calls is not None
+        ),
     )
+
+
+def _stateless_managed_broker_scope(
+    options: BuildOptions,
+    *,
+    build_instance_id: str,
+) -> tuple[Path, str]:
+    """Return one durable parent child-budget identity for a build.
+
+    Call labels identify provider checkpoints, not budget ledgers.  Keeping
+    call labels and recovery generations out of this digest lets every
+    stateless attempt in the same accepted build share one finite parent
+    budget. Generation remains part of delivery/checkpoint identity.
+    """
+
+    digest = sha256_json({
+        "schema_version": "arc.companion.stateless-managed-broker-scope.v4",
+        "build_instance_id": build_instance_id,
+        "project_dir": str(options.project_dir.expanduser().resolve(strict=False)),
+        "paper_id": options.paper_id,
+        "provider": options.provider,
+        "model": options.model,
+        "budget": {
+            "max_calls": options.arc_paper_child_llm_max_calls,
+            "max_tokens": options.arc_paper_child_llm_max_tokens,
+            "output_reserve_tokens": (
+                options.arc_paper_child_llm_output_reserve_tokens
+            ),
+        },
+    })
+    return (
+        options.project_dir / ".arc-companion"
+        / "stateless-managed-broker" / digest[:24],
+        f"stateless-{digest}",
+    )
+
+
+def _stateless_managed_scope_identity(
+    *,
+    control: Mapping[str, Any] | None,
+    explicit_build_instance_id: str | None,
+    explicit_generation: int | None,
+) -> tuple[str, int]:
+    if explicit_build_instance_id is not None:
+        instance_id = str(explicit_build_instance_id).strip()
+        generation = explicit_generation
+    elif control is not None:
+        instance_id = _authoritative_build_instance_id(
+            Path(str(control["checkpoint_dir"])),
+        )
+        generation = int(control["generation"])
+    else:
+        raise RuntimeError(
+            "managed stateless ARC-paper calls require an authoritative "
+            "build instance and recovery-ledger generation"
+        )
+    if not re.fullmatch(r"[0-9a-f]{32}", instance_id):
+        raise RuntimeError(
+            "managed stateless ARC-paper build instance is invalid"
+        )
+    if type(generation) is not int or generation < 1:
+        raise RuntimeError(
+            "managed stateless ARC-paper generation is invalid"
+        )
+    return instance_id, generation
+
+
+def _managed_scope_instance_before_runtime(
+    *,
+    recovery_descriptor: Mapping[str, Any] | None,
+    explicit_build_instance_id: str | None,
+) -> str:
+    """Validate managed build ownership before any runtime staging can occur."""
+
+    if explicit_build_instance_id is not None:
+        instance_id = str(explicit_build_instance_id).strip()
+    elif recovery_descriptor is not None:
+        checkpoint_dir = Path(
+            str(recovery_descriptor.get("checkpoint_dir") or "")
+        ).resolve(strict=False)
+        instance_id = _authoritative_build_instance_id(checkpoint_dir)
+    else:
+        raise RuntimeError(
+            "managed stateless ARC-paper calls require an authoritative "
+            "build instance before runtime preparation"
+        )
+    if not re.fullmatch(r"[0-9a-f]{32}", instance_id):
+        raise RuntimeError(
+            "managed stateless ARC-paper build instance is invalid"
+        )
+    return instance_id
 
 
 def _paper_broker_for_call(
@@ -12002,6 +12259,8 @@ def _paper_broker_for_call(
     checkpoint_root: Path,
     broker_run_id: str,
     generic_internet_allowed: bool | None = None,
+    managed_job_wait_context: Callable[[], Any] | None = None,
+    managed_job_cancel_check: Callable[[], bool] | None = None,
 ) -> PaperBroker | None:
     """Create execution state from an explicit policy, root, and run identity."""
 
@@ -12020,7 +12279,26 @@ def _paper_broker_for_call(
             limit_bytes=arguments.get("limit_bytes"),
         )
 
+    from arc_llm.budget import SharedBudget
+    from arc_paper.broker_jobs import BrokerJobExecutionContext
     from arc_paper.cache import cache_root
+
+    managed_context = None
+    if options.arc_paper_child_llm_max_calls is not None:
+        assert options.arc_paper_child_llm_max_tokens is not None
+        assert options.arc_paper_child_llm_output_reserve_tokens is not None
+        budget = SharedBudget.create(
+            checkpoint_root / "paper-broker" / "child-llm-budget.sqlite3",
+            budget_id=f"companion-paper-child:{broker_run_id}",
+            max_calls=options.arc_paper_child_llm_max_calls,
+            max_tokens=options.arc_paper_child_llm_max_tokens,
+        )
+        managed_context = BrokerJobExecutionContext(
+            budget=budget.reference,
+            output_reserve_tokens=(
+                options.arc_paper_child_llm_output_reserve_tokens
+            ),
+        )
 
     return PaperBroker(
         checkpoint_root=checkpoint_root,
@@ -12034,7 +12312,39 @@ def _paper_broker_for_call(
         ),
         journal_context=journal_context,
         target_lister=target_lister,
+        managed_job_context=managed_context,
+        managed_job_wait_context=(
+            managed_job_wait_context if managed_context is not None else None
+        ),
+        managed_job_cancel_check=(
+            managed_job_cancel_check if managed_context is not None else None
+        ),
     )
+
+
+def _managed_build_broker_root(
+    checkpoint_dir: Path, build_instance_id: str,
+) -> Path:
+    """Keep one build's managed jobs and finite budget physically isolated."""
+
+    digest = sha256_json({
+        "schema_version": "arc.companion.managed-build-broker-root.v1",
+        "build_instance_id": str(build_instance_id),
+    })
+    return checkpoint_dir / "managed-paper-broker-builds" / digest[:24]
+
+
+@contextmanager
+def _release_turn_lock_while_waiting(
+    lock: threading.Lock,
+):
+    """Release a stateful lane turn while a Controller job is only polling."""
+
+    lock.release()
+    try:
+        yield
+    finally:
+        lock.acquire()
 
 
 def _paper_broker_bootstrap_prompt(
@@ -12058,7 +12368,7 @@ def _companion_evidence_source_identity(
     *,
     project_dir: Path,
     checkpoint_dir: Path,
-    run_id: str,
+    checkpoint_fingerprint: str,
     ledger_path: Path,
     ledger: Mapping[str, Any],
     session_key: str,
@@ -12114,7 +12424,9 @@ def _companion_evidence_source_identity(
     if transaction is None:
         raise RuntimeError("evidence generation rotation transaction is missing")
     checkpoint_path = str(transaction.get("checkpoint_path") or "")
-    checkpoint_fingerprint = str(transaction.get("checkpoint_fingerprint") or "")
+    transaction_fingerprint = str(
+        transaction.get("checkpoint_fingerprint") or ""
+    )
     replacement = transaction_signals[0]
     marker = ledger_signals[0]
     recovery = marker["recovery_context"]
@@ -12125,7 +12437,7 @@ def _companion_evidence_source_identity(
         checkpoint_path
         and Path(checkpoint_path).resolve(strict=False)
         == checkpoint_dir.resolve(strict=False)
-        and checkpoint_fingerprint == str(run_id)
+        and transaction_fingerprint == str(checkpoint_fingerprint)
         and str(replacement.get("authorization_source") or "")
         == "recovery_policy_auto"
         and str(replacement.get("status") or "") in {
@@ -12156,6 +12468,18 @@ def _authoritative_build_fingerprint(checkpoint_dir: Path) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
         raise RuntimeError("companion source snapshot has no authoritative build fingerprint")
     return fingerprint
+
+
+def _authoritative_build_instance_id(checkpoint_dir: Path) -> str:
+    """Read the independent build instance from its durable source receipt."""
+
+    receipt = read_json(checkpoint_dir / "source-snapshot-receipt.json")
+    instance_id = str(receipt.get("build_instance_id") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", instance_id):
+        raise RuntimeError(
+            "companion source snapshot has no authoritative build instance"
+        )
+    return instance_id
 
 
 def _complete_stateful_reference_evidence(
@@ -13053,7 +13377,24 @@ def _llm_call(
     recovery_descriptor: Mapping[str, Any] | None = None,
     evidence_journal_context: EvidenceJournalContext | None = None,
     evidence_target_generation: int | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    managed_broker_build_instance_id: str | None = None,
+    managed_broker_generation: int | None = None,
 ) -> dict[str, Any]:
+    early_managed_build_instance_id: str | None = None
+    if (
+        options.arc_paper_child_llm_max_calls is not None
+        and intent_guidance is not None
+        and evidence_journal_context is None
+    ):
+        early_managed_build_instance_id = (
+            _managed_scope_instance_before_runtime(
+                recovery_descriptor=recovery_descriptor,
+                explicit_build_instance_id=(
+                    managed_broker_build_instance_id
+                ),
+            )
+        )
     force_offline = force_offline or not allow_internet
     structured_policy = bool(
         paper_access_policy is not None
@@ -13103,7 +13444,10 @@ def _llm_call(
         )
     if intent_guidance is not None and evidence_journal_context is None and control is not None:
         checkpoint_root = Path(control["checkpoint_dir"])
-        build_fingerprint = _authoritative_build_fingerprint(checkpoint_root)
+        checkpoint_fingerprint = _authoritative_build_fingerprint(
+            checkpoint_root
+        )
+        build_instance_id = _authoritative_build_instance_id(checkpoint_root)
         control_ledger, _control_digest = read_registered_lane_ledger(
             checkpoint_root, Path(control["ledger_path"]),
         )
@@ -13111,7 +13455,7 @@ def _llm_call(
             _companion_evidence_source_identity(
                 project_dir=options.project_dir,
                 checkpoint_dir=checkpoint_root,
-                run_id=build_fingerprint,
+                checkpoint_fingerprint=checkpoint_fingerprint,
                 ledger_path=Path(control["ledger_path"]),
                 ledger=control_ledger,
                 session_key=str(control["session_key"]),
@@ -13122,7 +13466,7 @@ def _llm_call(
         )
         evidence_journal_context = _companion_evidence_journal_context(
             checkpoint_dir=checkpoint_root,
-            run_id=build_fingerprint,
+            run_id=build_instance_id,
             lane=str(intent_guidance_lane or "general"),
             worker_id=call_label,
             logical_task_id=evidence_source_logical_task,
@@ -13143,16 +13487,42 @@ def _llm_call(
         )
         if intent_guidance is not None else None
     )
-    broker_checkpoint_root = (
-        evidence_journal_context.journal_root.parent
-        if evidence_journal_context is not None
-        else options.project_dir / ".arc-companion"
-    )
-    broker_run_id = (
-        evidence_journal_context.run_id
-        if evidence_journal_context is not None
-        else f"stateless-{call_label}"
-    )
+    if evidence_journal_context is not None:
+        broker_checkpoint_root = evidence_journal_context.journal_root.parent
+        broker_run_id = evidence_journal_context.run_id
+        if options.arc_paper_child_llm_max_calls is not None:
+            broker_checkpoint_root = _managed_build_broker_root(
+                broker_checkpoint_root, broker_run_id,
+            )
+    elif options.arc_paper_child_llm_max_calls is not None:
+        build_instance_id, _broker_generation = (
+            _stateless_managed_scope_identity(
+                control=control,
+                explicit_build_instance_id=(
+                    early_managed_build_instance_id
+                ),
+                explicit_generation=managed_broker_generation,
+            )
+        )
+        broker_checkpoint_root, broker_run_id = (
+            _stateless_managed_broker_scope(
+                options,
+                build_instance_id=build_instance_id,
+            )
+        )
+    else:
+        inline_digest = sha256_json({
+            "schema_version": "arc.companion.stateless-inline-broker.v1",
+            "artifact_dir": str(artifact_dir.resolve(strict=False)),
+            "policy_sha256": (
+                broker_policy.policy_sha256
+                if broker_policy is not None else None
+            ),
+        })
+        broker_checkpoint_root = (
+            artifact_dir / "stateless-paper-broker" / inline_digest[:24]
+        )
+        broker_run_id = f"stateless-inline-{inline_digest}"
     paper_broker = _paper_broker_for_call(
         options=options,
         intent_guidance=intent_guidance,
@@ -13164,6 +13534,8 @@ def _llm_call(
         generic_internet_allowed=(
             not force_offline and allow_internet and options.allow_internet
         ),
+        managed_job_wait_context=lambda: nullcontext(),
+        managed_job_cancel_check=cancel_check,
     )
     active_prompt = (
         _paper_broker_bootstrap_prompt(broker_policy, _nested_shell)
@@ -13261,6 +13633,8 @@ def _llm_call(
                     "idempotency_key": idempotency_key,
                     "progress_callback": recovery_progress,
                 })
+            if cancel_check is not None:
+                recovery_call_kwargs["cancel_check"] = cancel_check
             value = llm(
                 active_prompt,
                 schema=active_schema,
@@ -13531,6 +13905,7 @@ def _limit_llm_concurrency(
     llm: Callable[..., dict[str, Any]], max_concurrent_calls: int,
     *,
     cancel_check: Callable[[], bool] | None = None,
+    submission_limiter: LLMSubmissionLimiter | None = None,
 ) -> Callable[..., dict[str, Any]]:
     """Share one call budget without cancelling unrelated submitted calls.
 
@@ -13539,7 +13914,7 @@ def _limit_llm_concurrency(
     caller's explicit cancellation signal, so already submitted calls drain.
     """
     external_cancel_check = cancel_check
-    permits = threading.BoundedSemaphore(max_concurrent_calls)
+    limiter = submission_limiter or LLMSubmissionLimiter(max_concurrent_calls)
     tripped = threading.Event()
     state_lock = threading.Lock()
     abort_reason: BaseException | None = None
@@ -13560,7 +13935,7 @@ def _limit_llm_concurrency(
     def limited(*args: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal abort_reason
         raise_if_tripped()
-        with permits:
+        with limiter.permit():
             raise_if_tripped()
             call_kwargs = kwargs
             if _accepts_explicit_keyword(llm, "cancel_check"):
@@ -13596,7 +13971,7 @@ def _accepts_explicit_keyword(call: Callable[..., Any], name: str) -> bool:
     }
 
 
-def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str, bool | str]:
+def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str, Any]:
     allow_internet = True if options is None else options.allow_internet
     return {
         "allow_mcp": False,
@@ -13606,6 +13981,22 @@ def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str,
             False if options is None else options.arc_paper_direct_shell
         ),
         "inherit_host_tools": False if options is None else options.inherit_host_tools,
+        "paper_managed_job_route": (
+            False
+            if options is None
+            else options.arc_paper_child_llm_max_calls is not None
+        ),
+        "paper_child_llm_max_calls": (
+            None if options is None else options.arc_paper_child_llm_max_calls
+        ),
+        "paper_child_llm_max_tokens": (
+            None if options is None else options.arc_paper_child_llm_max_tokens
+        ),
+        "paper_child_llm_output_reserve_tokens": (
+            None
+            if options is None
+            else options.arc_paper_child_llm_output_reserve_tokens
+        ),
     }
 
 
@@ -13633,6 +14024,7 @@ def _requested_paper_runtime_profile(options: BuildOptions) -> dict[str, Any]:
             if enabled else
             "none"
         ),
+        **_managed_child_budget_runtime_profile(options),
     }
 
 
@@ -13656,14 +14048,20 @@ def _resolved_paper_runtime_profile(
                     "arc_paper_direct_shell",
                     "paper_direct_decision",
                     "direct_shell_probe_id",
+                    "paper_managed_job_route",
+                    "paper_child_llm_max_calls",
+                    "paper_child_llm_max_tokens",
+                    "paper_child_llm_output_reserve_tokens",
                 )
             }
         return _requested_paper_runtime_profile(options)
-    return _paper_runtime_profile_from_policy(broker.policy)
+    return _paper_runtime_profile_from_policy(broker.policy, options=options)
 
 
 def _paper_runtime_profile_from_policy(
     policy: PaperBrokerPolicy,
+    *,
+    options: BuildOptions | None = None,
 ) -> dict[str, Any]:
     """Return the immutable lane recipe represented by a resolved policy."""
 
@@ -13677,6 +14075,25 @@ def _paper_runtime_profile_from_policy(
             "direct" if policy.direct_shell_requested else "controller"
         ),
         "direct_shell_probe_id": policy.direct_shell_probe_id,
+        **(
+            _managed_child_budget_runtime_profile(options)
+            if options is not None else {}
+        ),
+    }
+
+
+def _managed_child_budget_runtime_profile(
+    options: BuildOptions,
+) -> dict[str, int | bool | None]:
+    return {
+        "paper_managed_job_route": (
+            options.arc_paper_child_llm_max_calls is not None
+        ),
+        "paper_child_llm_max_calls": options.arc_paper_child_llm_max_calls,
+        "paper_child_llm_max_tokens": options.arc_paper_child_llm_max_tokens,
+        "paper_child_llm_output_reserve_tokens": (
+            options.arc_paper_child_llm_output_reserve_tokens
+        ),
     }
 
 
@@ -17424,6 +17841,8 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
         }
     if "notice" in values and values["notice"] is None:
         previous.pop("notice", None)
+    if values.get("build_instance_id") is not None:
+        previous.pop("pending_build_request_sha256", None)
     state = {
         **previous,
         **{key: value for key, value in values.items() if value is not None},

@@ -25,6 +25,7 @@ from .call_checkpoint import (
     LLMCallNeedsSupervision,
     LLMCallRetryExhausted,
     SupervisedNativeResumeAuthorization,
+    checkpoint_budget_state,
     checkpoint_path,
     normalize_supervised_native_resume_authorization,
     prepare_call,
@@ -32,6 +33,12 @@ from .call_checkpoint import (
     record_response,
     record_submitted,
     record_validated,
+)
+from .budget import (
+    BudgetError,
+    BudgetReservation,
+    BudgetRequired,
+    current_shared_budget_binding,
 )
 from .host import HostDetection, select_llm_provider
 from .json_schema import (
@@ -66,6 +73,8 @@ from .providers.base import (
     LLMWorkerCancelled,
     LLMWorkerError,
     LLMWorkerTimeout,
+    LLMSubmissionState,
+    failure_disposition,
 )
 from .progress_journal import ProgressJournal
 from .progress_prompt import apply_runtime_progress_contract
@@ -98,6 +107,145 @@ NATIVE_RESUME_RECONCILIATION_PROMPT = (
     "for that preceding request in the required format."
 )
 _PAPER_ACCESS_WARNINGS_ENV = "ARC_INTERNAL_PAPER_ACCESS_WARNINGS_JSON"
+
+
+def _reserve_descendant_provider_call(
+    prepared_checkpoint: Any,
+    *,
+    provider_prompt: str,
+) -> BudgetReservation | None:
+    binding = current_shared_budget_binding()
+    if binding is None:
+        return None
+    if prepared_checkpoint is None:
+        raise BudgetRequired(
+            "managed child LLM calls require a durable provider checkpoint"
+        )
+    return binding.reserve(
+        checkpoint_identity=prepared_checkpoint.identity,
+        provider_attempt=prepared_checkpoint.attempt,
+        prompt_bytes=len(provider_prompt.encode("utf-8")),
+        checkpoint_path=prepared_checkpoint.path,
+    )
+
+
+def _reconcile_descendant_replay(
+    prepared_checkpoint: Any,
+    response: LLMProviderResponse[Any],
+    *,
+    provider: str,
+) -> dict[str, Any] | None:
+    binding = current_shared_budget_binding()
+    if binding is None:
+        return None
+    usage = (
+        {
+            "input_tokens": response.usage.total_input_tokens or 0,
+            "output_tokens": response.usage.output_tokens or 0,
+        }
+        if provider != "kimi-code-cli" and response.usage.status == "known"
+        else None
+    )
+    settlement = binding.reconcile_replay(
+        checkpoint_identity=prepared_checkpoint.identity,
+        provider_attempt=prepared_checkpoint.attempt,
+        usage=usage,
+    )
+    if settlement is None:
+        return {
+            "schema_version": "arc.llm.budget-settlement.v1",
+            "budget_identity_sha256": binding.budget.reference.identity_sha256,
+            "reservation_id": None,
+            "disposition": "checkpoint_replay_no_reservation",
+            "charged_calls": 0,
+            "charged_tokens": 0,
+            "warning": None,
+        }
+    return {
+        "budget_identity_sha256": binding.budget.reference.identity_sha256,
+        **settlement.to_json(),
+    }
+
+
+def _reconcile_descendant_abandoned_checkpoint(
+    path: Path,
+    *,
+    checkpoint_identity: str,
+) -> None:
+    """Close a stale reservation before surfacing replay/supervision state."""
+
+    binding = current_shared_budget_binding()
+    if binding is None:
+        return
+    state = checkpoint_budget_state(
+        path, expected_identity=checkpoint_identity,
+    )
+    reservation = binding.budget.lookup(
+        checkpoint_identity=checkpoint_identity,
+        provider_attempt=int(state["attempt"]),
+    )
+    if reservation is None:
+        return
+    binding.budget.reconcile(
+        reservation.reservation_id,
+        checkpoint_submission_state=str(state["submission_state"]),
+        usage=(
+            state["usage"]
+            if state.get("provider") != "kimi-code-cli"
+            and isinstance(state.get("usage"), Mapping)
+            else None
+        ),
+    )
+
+
+def _settle_descendant_success(
+    reservation: BudgetReservation | None,
+    response: LLMProviderResponse[Any],
+    *,
+    provider: str,
+) -> dict[str, Any] | None:
+    if reservation is None:
+        return None
+    if provider == "kimi-code-cli" or response.usage.status != "known":
+        settlement = reservation.settle_unknown_usage()
+    else:
+        settlement = reservation.settle_known(
+            input_tokens=response.usage.total_input_tokens or 0,
+            output_tokens=response.usage.output_tokens or 0,
+        )
+    return {
+        "budget_identity_sha256": reservation.budget.reference.identity_sha256,
+        **settlement.to_json(),
+    }
+
+
+def _settle_descendant_failure(
+    reservation: BudgetReservation | None,
+    exc: BaseException,
+    *,
+    response: LLMProviderResponse[Any] | None = None,
+    provider: str | None = None,
+) -> None:
+    if reservation is None:
+        return
+    if (
+        response is not None
+        and provider != "kimi-code-cli"
+        and response.usage.status == "known"
+    ):
+        reservation.settle_known(
+            input_tokens=response.usage.total_input_tokens or 0,
+            output_tokens=response.usage.output_tokens or 0,
+        )
+        return
+    disposition = failure_disposition(exc)
+    if (
+        disposition is not None
+        and disposition.submission_state == LLMSubmissionState.NOT_SUBMITTED
+    ):
+        reservation.release_not_submitted()
+    else:
+        reservation.settle_conservative("failed_submission_unknown")
 
 
 def _runtime_capabilities(env: Mapping[str, str] | None) -> dict[str, Any]:
@@ -540,6 +688,7 @@ class LLMCallOutcome:
     generation: int | None = None
     prompt_bytes: int | None = None
     logical_receipt: dict[str, Any] | None = None
+    budget_receipt: dict[str, Any] | None = None
     call_record: dict[str, Any] | None = None
     structured_output: dict[str, Any] | None = None
     warnings: tuple[str, ...] = ()
@@ -1331,6 +1480,7 @@ def _run_with_retries(
                         LLMCallRetryExhausted,
                         LLMResponseCandidateConflict,
                         LLMResponseCandidateReceiptError,
+                        BudgetError,
                     ),
                 ):
                     raise
@@ -1487,6 +1637,7 @@ def _generate_json(
         transport_prompt, scope=progress_contract_scope, generation_bootstrap=True
     )
     generation: int | None = None
+    budget_receipt: dict[str, Any] | None = None
     progress = _progress_journal(
         artifact_dir=artifact_dir,
         call_label=call_label,
@@ -1504,7 +1655,7 @@ def _generate_json(
     def call_provider(
         session: LLMSessionRef | None, session_turn: int | None = None
     ) -> LLMProviderResponse[dict[str, Any]]:
-        nonlocal prepared_checkpoint
+        nonlocal prepared_checkpoint, budget_receipt
         progress.update_identity(
             session_key=session.key if session is not None else None,
             generation=session.generation if session is not None else None,
@@ -1526,15 +1677,25 @@ def _generate_json(
                 progress_contract_scope=progress_contract_scope,
                 initial_native_authorization=initial_native_authorization,
             )
-            prepared_checkpoint = prepare_call(
-                path,
-                identity=identity,
-                cancel_check=cancel_check,
-                supervised_native_resume=supervised_native_resume,
-                native_session_available=bool(session and session.native_session_id),
-                runtime_capabilities=_runtime_capabilities(env),
-                validated_legacy_logical_identity=validated_legacy_logical_identity,
-            )
+            try:
+                prepared_checkpoint = prepare_call(
+                    path,
+                    identity=identity,
+                    cancel_check=cancel_check,
+                    supervised_native_resume=supervised_native_resume,
+                    native_session_available=bool(
+                        session and session.native_session_id
+                    ),
+                    runtime_capabilities=_runtime_capabilities(env),
+                    validated_legacy_logical_identity=(
+                        validated_legacy_logical_identity
+                    ),
+                )
+            except (LLMCallNeedsSupervision, LLMCallRetryExhausted):
+                _reconcile_descendant_abandoned_checkpoint(
+                    path, checkpoint_identity=identity,
+                )
+                raise
             diagnostics = current_attempt_diagnostics()
             if diagnostics is not None:
                 diagnostics.bind_checkpoint(
@@ -1542,6 +1703,11 @@ def _generate_json(
                 )
             progress.update_identity(checkpoint_identity=prepared_checkpoint.identity)
             if prepared_checkpoint.replay_response is not None:
+                budget_receipt = _reconcile_descendant_replay(
+                    prepared_checkpoint,
+                    prepared_checkpoint.replay_response,
+                    provider=provider_used,
+                )
                 selection = select_response_candidate(
                     prepared_checkpoint.replay_response,
                     schema=schema,
@@ -1572,7 +1738,6 @@ def _generate_json(
                 if selection.conflict is not None:
                     raise selection.conflict
                 return replay_response
-            progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
             if supervised_native_resume is not None and (
                 session is None or not session.native_session_id
             ):
@@ -1587,6 +1752,19 @@ def _generate_json(
                 provider_prompt = with_canonical_json_schema_contract(
                     provider_prompt, schema_plan.checkpoint_schema
                 )
+        budget_reservation = _reserve_descendant_provider_call(
+            prepared_checkpoint,
+            provider_prompt=provider_prompt,
+        )
+
+        def record_provider_submitted() -> None:
+            if prepared_checkpoint is not None:
+                record_submitted(prepared_checkpoint)
+            if budget_reservation is not None:
+                budget_reservation.mark_submitted()
+
+        progress.bind_submission_callback(record_provider_submitted)
+
         def invoke() -> LLMProviderResponse[dict[str, Any]]:
             if hasattr(selected, "generate_json_result"):
                 kwargs = {
@@ -1637,13 +1815,15 @@ def _generate_json(
             return LLMProviderResponse(selected.generate_json(provider_prompt, schema=provider_schema, model=model))
 
         selection = None
+        response_for_failure = None
 
         def validate_provider_response(
             candidate_response: LLMProviderResponse[dict[str, Any]],
         ) -> LLMProviderResponse[dict[str, Any]]:
-            nonlocal selection
+            nonlocal selection, response_for_failure
+            response_for_failure = candidate_response
             if prepared_checkpoint is not None and prepared_checkpoint.owns_lock:
-                record_submitted(prepared_checkpoint)
+                progress.record_submission_barrier()
             if (
                 candidate_response.prompt_sent_bytes is None
                 or candidate_response.prompt_sent_sha256 is None
@@ -1723,6 +1903,12 @@ def _generate_json(
                 response_validator=validate_provider_response,
             )
         except BaseException as exc:
+            _settle_descendant_failure(
+                budget_reservation,
+                exc,
+                response=response_for_failure,
+                provider=provider_used,
+            )
             if prepared_checkpoint is not None and prepared_checkpoint.owns_lock:
                 record_failure(prepared_checkpoint, exc)
             raise
@@ -1748,12 +1934,22 @@ def _generate_json(
                     record_response(prepared_checkpoint, response)
                     publish_receipt()
         except BaseException as exc:
+            budget_receipt = _settle_descendant_success(
+                budget_reservation,
+                response,
+                provider=provider_used,
+            )
             if (
                 prepared_checkpoint is not None
                 and prepared_checkpoint.owns_lock
             ):
                 record_failure(prepared_checkpoint, exc)
             raise
+        budget_receipt = _settle_descendant_success(
+            budget_reservation,
+            response,
+            provider=provider_used,
+        )
         if selection.conflict is not None:
             raise selection.conflict
         progress({"event": "call_finished", "substantive": False, "resumable": False})
@@ -1908,6 +2104,7 @@ def _generate_json(
             prepared=prepared_checkpoint,
             response=response,
         ),
+        budget_receipt=budget_receipt,
         structured_output=structured_output,
         warnings=tuple(dict.fromkeys((
             *schema_plan.warnings,
@@ -1958,6 +2155,7 @@ def _generate_text(
         prompt, scope=progress_contract_scope, generation_bootstrap=True
     )
     generation: int | None = None
+    budget_receipt: dict[str, Any] | None = None
     progress = _progress_journal(
         artifact_dir=artifact_dir,
         call_label=call_label,
@@ -1975,7 +2173,7 @@ def _generate_text(
     def call_provider(
         session: LLMSessionRef | None, session_turn: int | None = None
     ) -> LLMProviderResponse[str]:
-        nonlocal prepared_checkpoint
+        nonlocal prepared_checkpoint, budget_receipt
         progress.update_identity(
             session_key=session.key if session is not None else None,
             generation=session.generation if session is not None else None,
@@ -1997,15 +2195,25 @@ def _generate_text(
                 progress_contract_scope=progress_contract_scope,
                 initial_native_authorization=initial_native_authorization,
             )
-            prepared_checkpoint = prepare_call(
-                path,
-                identity=identity,
-                cancel_check=cancel_check,
-                supervised_native_resume=supervised_native_resume,
-                native_session_available=bool(session and session.native_session_id),
-                runtime_capabilities=_runtime_capabilities(env),
-                validated_legacy_logical_identity=validated_legacy_logical_identity,
-            )
+            try:
+                prepared_checkpoint = prepare_call(
+                    path,
+                    identity=identity,
+                    cancel_check=cancel_check,
+                    supervised_native_resume=supervised_native_resume,
+                    native_session_available=bool(
+                        session and session.native_session_id
+                    ),
+                    runtime_capabilities=_runtime_capabilities(env),
+                    validated_legacy_logical_identity=(
+                        validated_legacy_logical_identity
+                    ),
+                )
+            except (LLMCallNeedsSupervision, LLMCallRetryExhausted):
+                _reconcile_descendant_abandoned_checkpoint(
+                    path, checkpoint_identity=identity,
+                )
+                raise
             diagnostics = current_attempt_diagnostics()
             if diagnostics is not None:
                 diagnostics.bind_checkpoint(
@@ -2013,8 +2221,12 @@ def _generate_text(
                 )
             progress.update_identity(checkpoint_identity=prepared_checkpoint.identity)
             if prepared_checkpoint.replay_response is not None:
+                budget_receipt = _reconcile_descendant_replay(
+                    prepared_checkpoint,
+                    prepared_checkpoint.replay_response,
+                    provider=provider_used,
+                )
                 return prepared_checkpoint.replay_response
-            progress.bind_submission_callback(lambda: record_submitted(prepared_checkpoint))
             if supervised_native_resume is not None and (
                 session is None or not session.native_session_id
             ):
@@ -2027,6 +2239,19 @@ def _generate_text(
             if supervised_native_resume is not None
             else effective_prompt
         )
+        budget_reservation = _reserve_descendant_provider_call(
+            prepared_checkpoint,
+            provider_prompt=provider_prompt,
+        )
+
+        def record_provider_submitted() -> None:
+            if prepared_checkpoint is not None:
+                record_submitted(prepared_checkpoint)
+            if budget_reservation is not None:
+                budget_reservation.mark_submitted()
+
+        progress.bind_submission_callback(record_provider_submitted)
+
         def invoke() -> LLMProviderResponse[str]:
             if hasattr(selected, "generate_text_result"):
                 kwargs = {
@@ -2069,17 +2294,43 @@ def _generate_text(
                 invoke=invoke,
             )
         except BaseException as exc:
+            _settle_descendant_failure(budget_reservation, exc)
             if prepared_checkpoint is not None:
                 record_failure(prepared_checkpoint, exc)
             raise
-        if response.prompt_sent_bytes is None or response.prompt_sent_sha256 is None:
-            response = replace(
+        progress.record_submission_barrier()
+        try:
+            if response.prompt_sent_bytes is None or response.prompt_sent_sha256 is None:
+                response = replace(
+                    response,
+                    prompt_sent_bytes=(
+                        response.prompt_sent_bytes
+                        or len(provider_prompt.encode("utf-8"))
+                    ),
+                    prompt_sent_sha256=(
+                        response.prompt_sent_sha256
+                        or sha256_text(provider_prompt)
+                    ),
+                )
+            if prepared_checkpoint is not None:
+                record_response(prepared_checkpoint, response)
+        except BaseException as exc:
+            budget_receipt = _settle_descendant_success(
+                budget_reservation,
                 response,
-                prompt_sent_bytes=response.prompt_sent_bytes or len(provider_prompt.encode("utf-8")),
-                prompt_sent_sha256=response.prompt_sent_sha256 or sha256_text(provider_prompt),
+                provider=provider_used,
             )
-        if prepared_checkpoint is not None:
-            record_response(prepared_checkpoint, response)
+            if (
+                prepared_checkpoint is not None
+                and prepared_checkpoint.owns_lock
+            ):
+                record_failure(prepared_checkpoint, exc)
+            raise
+        budget_receipt = _settle_descendant_success(
+            budget_reservation,
+            response,
+            provider=provider_used,
+        )
         progress({"event": "call_finished", "substantive": False, "resumable": False})
         return response
 
@@ -2176,6 +2427,7 @@ def _generate_text(
             prepared=prepared_checkpoint,
             response=response,
         ),
+        budget_receipt=budget_receipt,
         warnings=_nested_shell_warnings(env, raw_events=response.raw_events),
     )
 
@@ -2761,6 +3013,7 @@ def _call_record(
         "generation": outcome.generation if outcome else None,
         "prompt_bytes": outcome.prompt_bytes if outcome else None,
         "logical_receipt": outcome.logical_receipt if outcome else None,
+        "budget_receipt": outcome.budget_receipt if outcome else None,
         "usage": outcome.usage.to_json() if outcome else LLMUsage().to_json(),
         "structured_output": outcome.structured_output if outcome else None,
         "warnings": list(
