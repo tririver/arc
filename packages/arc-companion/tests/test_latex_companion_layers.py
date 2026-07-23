@@ -10,6 +10,7 @@ import unicodedata
 import pytest
 
 from arc_companion.latex import (
+    LatexError,
     _equation_environment,
     _begin_guarded_box,
     _layer_region,
@@ -20,10 +21,312 @@ from arc_companion.latex import (
     _render_glossary,
     _render_html_fragment,
     escape_tex,
-    render_companion_tex,
+    render_companion_tex as _render_companion_tex,
+    validate_pdf_source_credit_text,
     validate_tex_fidelity,
 )
 from arc_companion.reader_text import clean_reader_annotation, clean_reader_translation
+from arc_companion.source_credit import normalize_source_credit
+
+
+def render_companion_tex(document, *args, source_credit=None, metadata=None, **kwargs):
+    return _render_companion_tex(
+        document,
+        *args,
+        source_credit=(
+            source_credit
+            if source_credit is not None
+            else normalize_source_credit(document, metadata)
+        ),
+        metadata=metadata,
+        **kwargs,
+    )
+
+
+def test_pdf_renderer_rejects_missing_canonical_source_credit(tmp_path: Path) -> None:
+    with pytest.raises(LatexError, match="source credit is invalid"):
+        _render_companion_tex(
+            {"blocks": [], "integrity": {"status": "complete"}},
+            [],
+            {},
+            output_dir=tmp_path,
+            language="en",
+        )
+
+
+@pytest.mark.skipif(
+    shutil.which("xelatex") is None or shutil.which("pdftotext") is None,
+    reason="XeLaTeX and pdftotext are required",
+)
+def test_compiled_pdf_source_credit_observation_matches_canonical_projection(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "front_matter": {
+            "title": "CREDIT-VALIDATION-TITLE",
+            "author_records": [
+                {"source_id": "alice", "source_name": "Alice"},
+                {"source_id": "a", "source_name": "A"},
+                {"source_id": "duplicate-1", "source_name": "Duplicate"},
+                {"source_id": "duplicate-2", "source_name": "Duplicate"},
+            ],
+            "author_name_variants": [{
+                "author_id": "a",
+                "localized_name": "AUTHOR-LOCALIZED-UNIQUE",
+                "source_identity": "source:variant-a",
+            }],
+            "affiliation_records": [{
+                "source_id": "aff",
+                "text": "Institute A",
+            }],
+            "profiles": [
+                {
+                    "source_id": "profile",
+                    "author_id": "alice",
+                    "text": "Alice works on a profile.",
+                    "block_id": "profile-alice",
+                },
+                {
+                    "source_id": "profile-duplicate-1",
+                    "text": "IDENTICAL PROFILE TEXT",
+                    "block_id": "profile-duplicate-1",
+                },
+                {
+                    "source_id": "profile-duplicate-2",
+                    "text": "IDENTICAL PROFILE TEXT",
+                    "block_id": "profile-duplicate-2",
+                },
+            ],
+        },
+        "blocks": [
+            {
+                "block_id": "profile-alice",
+                "kind": "prose",
+                "text": "Alice works on a profile.",
+            },
+            {
+                "block_id": "profile-duplicate-1",
+                "kind": "prose",
+                "text": "IDENTICAL PROFILE TEXT",
+            },
+            {
+                "block_id": "profile-duplicate-2",
+                "kind": "prose",
+                "text": "IDENTICAL PROFILE TEXT",
+            },
+            {
+                "block_id": "body",
+                "kind": "prose",
+                "text": "BODY-UNIQUE later cites Alice and Institute A.",
+            },
+        ],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    credit = normalize_source_credit(document)
+    tex, manifest = _render_companion_tex(
+        document,
+        [{
+            "segment_id": "s",
+            "block_ids": [
+                "profile-alice", "profile-duplicate-1",
+                "profile-duplicate-2", "body",
+            ],
+        }],
+        {"s": {"explanation": "", "commentary": ""}},
+        output_dir=tmp_path,
+        language="en",
+        source_credit=credit,
+    )
+    tex_path = tmp_path / "source-credit-observation.tex"
+    tex_path.write_text(tex, encoding="utf-8")
+    result = subprocess.run(
+        [
+            shutil.which("xelatex") or "xelatex",
+            "-halt-on-error",
+            "-interaction=nonstopmode",
+            f"-output-directory={tmp_path}",
+            str(tex_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    observation = validate_pdf_source_credit_text(
+        tmp_path / "source-credit-observation.pdf", document, manifest,
+    )
+
+    assert observation["canonical_sha256"] == credit["canonical_sha256"]
+    assert observation["visible_counts"] == {
+        "authors": 4, "affiliations": 1, "profiles": 3,
+    }
+    assert len(observation["ordered_ids"]) == 8
+
+    tampered_tex = tex.replace(
+        "Alice works on a profile.",
+        "Alice works on a profile.\\par Alice works on a profile.",
+        1,
+    )
+    tampered_path = tmp_path / "source-credit-observation-tampered.tex"
+    tampered_path.write_text(tampered_tex, encoding="utf-8")
+    tampered_result = subprocess.run(
+        [
+            shutil.which("xelatex") or "xelatex",
+            "-halt-on-error",
+            "-interaction=nonstopmode",
+            f"-output-directory={tmp_path}",
+            str(tampered_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert tampered_result.returncode == 0, (
+        tampered_result.stdout + tampered_result.stderr
+    )
+    with pytest.raises(LatexError, match="occurrence count is invalid"):
+        validate_pdf_source_credit_text(
+            tmp_path / "source-credit-observation-tampered.pdf",
+            document,
+            manifest,
+        )
+
+
+def test_pdf_source_credit_uses_shared_hash_order_escaping_and_exactly_once(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "front_matter": {
+            "authors": [
+                {"source_id": "a", "name": "A_% Original"},
+                {"source_id": "b", "name": "اسم ب"},
+            ],
+            "affiliations": [{"source_id": "i", "text": "R&D_Institute"}],
+            "profiles": [{
+                "source_id": "p",
+                "text": "Long profile 第一行\nSecond line & more.",
+                "author_id": "a",
+            }],
+            "author_name_variants": [{
+                "author_id": "a",
+                "localized_name": "本地名",
+                "source_identity": "source:localized-a",
+            }],
+        },
+        "blocks": [{"block_id": "body", "kind": "prose", "text": "Source."}],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    credit = normalize_source_credit(document)
+    tex, manifest = render_companion_tex(
+        document,
+        [{"segment_id": "s", "block_ids": ["body"]}],
+        {"s": {"explanation": "Note.", "commentary": ""}},
+        output_dir=tmp_path,
+        language="zh-CN",
+        source_credit=credit,
+    )
+
+    assert manifest["source_credit"]["canonical_sha256"] == credit[
+        "canonical_sha256"
+    ]
+    assert tex.count("% ARC-SOURCE-CREDIT author ") == 2
+    assert tex.count("% ARC-SOURCE-CREDIT affiliation ") == 1
+    assert tex.count("% ARC-SOURCE-CREDIT profile ") == 1
+    assert r"A\_\% Original (\textit{本地名})" in tex
+    assert "اسم ب" in tex
+    assert r"R\&D\_Institute" in tex
+    assert "Long profile 第一行" in tex and r"Second line \& more." in tex
+    assert validate_tex_fidelity(tex, document, manifest) == []
+
+
+def test_pdf_source_credit_tamper_fails_fidelity(tmp_path: Path) -> None:
+    document = {
+        "front_matter": {"authors": ["Original"]},
+        "blocks": [{"block_id": "body", "kind": "prose", "text": "Source."}],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    credit = normalize_source_credit(document)
+    tex, manifest = render_companion_tex(
+        document,
+        [{"segment_id": "s", "block_ids": ["body"]}],
+        {"s": {"explanation": "Note.", "commentary": ""}},
+        output_dir=tmp_path,
+        language="en",
+        source_credit=credit,
+    )
+
+    errors = validate_tex_fidelity(
+        tex.replace("Original", "Changed", 1), document, manifest,
+    )
+
+    assert any("text is missing" in item for item in errors)
+
+
+def test_pdf_source_anchor_stays_at_block_while_fallback_follows_title(
+    tmp_path: Path,
+) -> None:
+    document = {
+        "front_matter": {
+            "authors": ["Fallback Author"],
+            "profiles": [{
+                "source_id": "profile-body",
+                "text": "Anchored profile.",
+                "block_id": "profile-block",
+            }],
+        },
+        "blocks": [
+            {"block_id": "opening", "kind": "prose", "text": "Opening."},
+            {
+                "block_id": "profile-block",
+                "kind": "prose",
+                "text": "Anchored profile.",
+            },
+            {"block_id": "closing", "kind": "prose", "text": "Closing."},
+        ],
+        "equations": [], "figures": [], "tables": [], "bibliography": [],
+        "assets": [], "links": [], "integrity": {"status": "complete"},
+    }
+    credit = normalize_source_credit(document)
+    tex, manifest = render_companion_tex(
+        document,
+        [{
+            "segment_id": "s",
+            "block_ids": ["opening", "profile-block", "closing"],
+        }],
+        {"s": {"explanation": "Note.", "commentary": ""}},
+        output_dir=tmp_path,
+        language="en",
+        source_credit=credit,
+    )
+    author_marker = "% ARC-SOURCE-CREDIT author "
+    profile_marker = "% ARC-SOURCE-CREDIT profile "
+    opening_marker = (
+        "% ARC-SOURCE-BLOCK "
+        + hashlib.sha256(b"opening").hexdigest()
+        + " "
+    )
+    profile_block_marker = (
+        "% ARC-SOURCE-BLOCK "
+        + hashlib.sha256(b"profile-block").hexdigest()
+        + " "
+    )
+
+    assert tex.index(author_marker) < tex.index(opening_marker)
+    assert tex.index(profile_block_marker) < tex.index(profile_marker)
+    assert manifest["source_credit"]["ordered_items"][0]["slot"] == "after_title"
+    assert manifest["source_credit"]["ordered_items"][1] == {
+        "kind": "profile",
+        "id": credit["profiles"][0]["id"],
+        "anchor_id": credit["profiles"][0]["anchor_id"],
+        "slot": "source_block",
+        "block_id": "profile-block",
+    }
+    assert tex.count("Anchored profile.") == 1
+    assert validate_tex_fidelity(tex, document, manifest) == []
 
 
 def test_empty_optional_annotation_has_no_visible_companion_panel() -> None:

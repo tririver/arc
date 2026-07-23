@@ -1,6 +1,17 @@
 from pathlib import Path
 
-from arc_companion.latex import render_companion_tex
+from arc_companion.latex import render_companion_tex as _render_companion_tex
+from arc_companion.source_credit import normalize_source_credit
+
+
+def render_companion_tex(document, *args, source_credit=None, metadata=None, **kwargs):
+    return _render_companion_tex(
+        document,
+        *args,
+        source_credit=source_credit or normalize_source_credit(document, metadata),
+        metadata=metadata,
+        **kwargs,
+    )
 
 
 def test_source_heading_keeps_original_number_without_latex_renumbering(tmp_path: Path) -> None:

@@ -24,6 +24,7 @@ from arc_companion.web import (
     WEB_MANIFEST_VERSION,
     WEB_RENDER_VERSION,
 )
+from arc_companion.source_credit import normalize_source_credit
 
 
 PDFINFO = """Title: fixture
@@ -484,12 +485,32 @@ def _add_web_reader(root: Path) -> dict[str, Path]:
     assets = asset_root / "katex" / "fonts"
     data.mkdir(parents=True)
     assets.mkdir(parents=True)
+    source_credit = normalize_source_credit(
+        {"front_matter": {}, "blocks": []}
+    )
+    source_credit_manifest = {
+        "schema_version": source_credit["schema_version"],
+        "canonical_sha256": source_credit["canonical_sha256"],
+        "front_matter_block_ids": [],
+        "replaced_block_ids": [],
+        "ordered_items": [],
+        "placements": [],
+        "visible_counts": {
+            "authors": 0, "affiliations": 0, "profiles": 0,
+        },
+    }
     snapshot = {
         "schema_version": READER_SNAPSHOT_VERSION,
         "translation_mode": "enabled",
         "glossary": [],
         "chapters": [],
         "appendices": [],
+        "authors": [],
+        "source_credit": source_credit,
+        "source_credit_sha256": source_credit["canonical_sha256"],
+        "source_credit_order": [],
+        "source_credit_front_matter_block_ids": [],
+        "source_credit_replaced_block_ids": [],
         "coverage": {
             "chapter_ids": [], "segment_ids": [],
             "translation_segment_ids": [], "annotation_segment_ids": [],
@@ -548,6 +569,7 @@ def _add_web_reader(root: Path) -> dict[str, Path]:
             "chapter_ids": [], "segment_ids": [],
             "translation_segment_ids": [], "annotation_segment_ids": [],
         },
+        "source_credit": source_credit_manifest,
     }
     manifest_path = _write_content_addressed_json(data, "manifest", manifest)
     paths["manifest"] = manifest_path

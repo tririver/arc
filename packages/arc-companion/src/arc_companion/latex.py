@@ -21,6 +21,13 @@ from .reader_text import (
 )
 from .source import asset_path, block_id
 from .substantive import non_substantive_block_ids
+from .source_credit import (
+    SourceCreditError,
+    ordered_source_credit_items,
+    source_credit_placement,
+    source_credit_visible_projection,
+    validate_source_credit,
+)
 
 
 class LatexError(RuntimeError):
@@ -392,6 +399,7 @@ def render_companion_tex(
     chapter_guides: dict[str, dict[str, Any]] | None = None,
     source_language: str | None = None,
     title_translations: dict[str, Any] | list[dict[str, Any]] | None = None,
+    source_credit: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     if augmentation_scope not in {"all", "substantive"}:
         raise ValueError(f"unsupported companion augmentation scope: {augmentation_scope}")
@@ -406,6 +414,13 @@ def render_companion_tex(
     source_language = _normalize_language_tag(source_language or "und")
     language = _normalize_language_tag(language or "und")
     title_translation_index = _title_translation_index(title_translations)
+    metadata = metadata or {}
+    try:
+        if source_credit is None:
+            raise SourceCreditError("canonical source credit is required")
+        canonical_source_credit = validate_source_credit(source_credit)
+    except (SourceCreditError, TypeError) as exc:
+        raise LatexError("source credit is invalid") from exc
 
     copied_assets: list[dict[str, Any]] = []
     rendered_links: list[dict[str, str]] = []
@@ -433,11 +448,75 @@ def render_companion_tex(
         )
     }
     front_roles = _front_matter_block_roles(blocks, document.get("front_matter") or {})
+    front_matter_block_ids = sorted({
+        str(value)
+        for key, values in (
+            (document.get("front_matter") or {}).get("block_ids") or {}
+        ).items()
+        if key in {"title", "authors", "affiliations"}
+        if isinstance(values, list)
+        for value in values
+        if str(value)
+    })
+    (
+        source_credit_header_tex,
+        source_credit_by_block,
+        source_credit_manifest,
+    ) = _render_source_credit(
+        canonical_source_credit,
+        front_matter_block_ids=front_matter_block_ids,
+    )
     renderable_ids = {
         block_id(block)
         for block in blocks
-        if block_id(block) not in bibliography_blocks and front_roles.get(block_id(block)) not in {"title", "author"}
+        if block_id(block) not in bibliography_blocks
+        and front_roles.get(block_id(block)) not in {
+            "title", "author", "affiliation", "profile",
+        }
     }
+    source_credit_records = {
+        str(item["id"]): item
+        for key in ("authors", "affiliations", "profiles")
+        for item in canonical_source_credit[key]
+    }
+    block_text_by_id = {
+        block_id(block): str(block.get("text") or "").strip()
+        for block in blocks
+    }
+    ambiguous_source_credit_blocks = [
+        str(item["block_id"])
+        for item in source_credit_manifest["ordered_items"]
+        if item["slot"] == "source_block"
+        and item["block_id"]
+        and block_text_by_id.get(str(item["block_id"])) != str(
+            source_credit_records[str(item["id"])].get("source_name")
+            or source_credit_records[str(item["id"])].get("text")
+            or ""
+        ).strip()
+    ]
+    if ambiguous_source_credit_blocks:
+        raise LatexError(
+            "source-credit block anchor does not identify an equivalent "
+            "standalone source block: "
+            + ", ".join(ambiguous_source_credit_blocks)
+        )
+    source_credit_only_block_ids = {
+        str(item["block_id"])
+        for item in source_credit_manifest["ordered_items"]
+        if item["slot"] == "source_block"
+        and item["block_id"]
+        and any(
+            block_id(block) == str(item["block_id"])
+            and str(block.get("text") or "").strip()
+            == str(
+                source_credit_records[str(item["id"])].get("source_name")
+                or source_credit_records[str(item["id"])].get("text")
+                or ""
+            ).strip()
+            for block in blocks
+        )
+    }
+    renderable_ids.difference_update(source_credit_only_block_ids)
     excluded_augmentation_ids = (
         non_substantive_block_ids(document)
         if augmentation_scope == "substantive"
@@ -494,6 +573,8 @@ def render_companion_tex(
         source_hash = sha256_json(block)
         block_records.append({"block_id": bid, "sha256": source_hash})
         body.append(_source_block_marker(bid, source_hash))
+        if bid in source_credit_by_block:
+            body.append(source_credit_by_block[bid])
         segment_id = segment_by_block.get(bid)
         chapter_id = chapter_after_block.get(bid)
         if chapter_id:
@@ -591,7 +672,6 @@ def render_companion_tex(
         )
 
     front = document.get("front_matter") or {}
-    metadata = metadata or {}
     title = front.get("title") or metadata.get("title") or "Paper Companion"
     translated_title = _translated_document_title(
         document, title_translation_index
@@ -610,12 +690,10 @@ def render_companion_tex(
         if translated_title and title_source_runs
         else escape_tex(translated_title)
     )
-    authors = front.get("authors") or metadata.get("authors") or []
-    if isinstance(authors, list):
-        author_text = ", ".join(_author_name(item) for item in authors)
-    else:
-        author_text = str(authors)
-    front_body = _render_front_matter(front, represented_roles=set(front_roles.values()))
+    front_body = _render_front_matter(
+        front,
+        represented_roles={*set(front_roles.values()), "affiliation"},
+    )
     guide = "" if chapters else _render_reading_guide(
         language=language, include_translation=bool(translations)
     )
@@ -637,11 +715,12 @@ def render_companion_tex(
             title=title,
             translated_title=translated_title,
             translated_title_tex=translated_title_tex,
-            authors=author_text,
+            authors="",
             language=language,
             source_language=source_language,
             include_translation=translation_mode,
         )
+        + source_credit_header_tex
         + front_body
         + guide
         + "\n".join(body)
@@ -663,6 +742,7 @@ def render_companion_tex(
         "source_language": source_language,
         "target_language": language,
         "render_warnings": _render_warnings(source_language, language),
+        "source_credit": source_credit_manifest,
         "companion_layers": {
             "augmentation_scope": augmentation_scope,
             "excluded_augmentation_block_ids": [
@@ -712,6 +792,7 @@ def validate_tex_fidelity(tex: str, document: dict[str, Any], manifest: dict[str
     )
     if str(manifest.get("document_hash") or "") != recorded_document_hash:
         errors.append("arc-paper document hash mismatch")
+    errors.extend(_validate_source_credit_tex(tex, manifest.get("source_credit")))
     for number in manifest.get("equation_numbers") or []:
         if f"\\tag{{{escape_tex(_clean_tag(number))}}}" not in tex:
             errors.append(f"missing equation number {number}")
@@ -824,6 +905,494 @@ def _render_front_matter(front: dict[str, Any], *, represented_roles: set[str]) 
             keywords = ", ".join(_front_value(value) for value in keywords)
         parts.append(f"\\noindent\\textbf{{Keywords:}} {escape_tex(keywords)}\\par\n")
     return "".join(parts)
+
+
+def _render_source_credit(
+    source_credit: Mapping[str, Any],
+    *,
+    front_matter_block_ids: Sequence[str] = (),
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    credit = validate_source_credit(source_credit)
+    ordered = ordered_source_credit_items(credit)
+    placement = source_credit_placement(
+        credit, front_matter_block_ids=front_matter_block_ids,
+    )
+    records = {
+        (kind, str(record["id"])): record
+        for kind, record, _anchor in ordered
+    }
+    header_items = [
+        item for item in placement
+        if item["slot"] in {"after_title", "front_matter"}
+    ]
+    block_items: dict[str, list[dict[str, Any]]] = {}
+    for item in placement:
+        if item["slot"] == "source_block" and item["block_id"]:
+            block_items.setdefault(str(item["block_id"]), []).append(item)
+    header_tex = _source_credit_rows(header_items, records=records)
+    by_block = {
+        block_id_value: _source_credit_rows(items, records=records)
+        for block_id_value, items in block_items.items()
+    }
+    anchors = {item["id"]: item for item in credit["anchors"]}
+    manifest_order: list[dict[str, Any]] = []
+    for item in placement:
+        anchor = anchors[str(item["anchor_id"])]
+        manifest_order.append(dict(item))
+    manifest = {
+        "canonical": credit,
+        "schema_version": credit["schema_version"],
+        "canonical_sha256": credit["canonical_sha256"],
+        "front_matter_block_ids": list(front_matter_block_ids),
+        "replaced_block_ids": [
+            str(item["block_id"])
+            for item in manifest_order
+            if item["slot"] == "source_block" and item["block_id"]
+        ],
+        "ordered_items": manifest_order,
+        "placements": [
+            {
+                "anchor_id": item["anchor_id"],
+                "placement": anchors[item["anchor_id"]]["placement"],
+                "block_id": anchors[item["anchor_id"]]["block_id"],
+                "render_slot": item["slot"],
+            }
+            for item in manifest_order
+        ],
+        "visible_counts": {
+            "authors": len(credit["authors"]),
+            "affiliations": len(credit["affiliations"]),
+            "profiles": len(credit["profiles"]),
+        },
+    }
+    return header_tex, by_block, manifest
+
+
+def _source_credit_rows(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    records: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> str:
+    if not items:
+        return ""
+    rows: list[str] = ["\\begin{center}\n"]
+    for item in items:
+        kind = str(item["kind"])
+        record = records[(kind, str(item["id"]))]
+        identifier = str(record["id"])
+        content_hash = str(record["content_sha256"])
+        rows.append(_source_credit_marker(kind, identifier, content_hash))
+        if kind == "author":
+            source_name = escape_tex(str(record["source_name"]))
+            localized = record.get("localized_name")
+            if localized:
+                rows.append(
+                    "{\\large "
+                    + source_name
+                    + " (\\textit{"
+                    + escape_tex(str(localized))
+                    + "})\\par}\n"
+                )
+            else:
+                rows.append("{\\large " + source_name + "\\par}\n")
+        elif kind == "affiliation":
+            rows.append("{\\small " + escape_tex(str(record["text"])) + "\\par}\n")
+        else:
+            rows.append(
+                "\\begin{minipage}{0.88\\textwidth}\\small "
+                + escape_tex(str(record["text"]))
+                + "\\end{minipage}\\par\n"
+            )
+    rows.append("\\end{center}\n")
+    return "".join(rows)
+
+
+def _validate_source_credit_tex(tex: str, raw_manifest: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(raw_manifest, Mapping):
+        return ["source-credit manifest is missing"]
+    try:
+        credit = validate_source_credit(raw_manifest.get("canonical"))
+    except (SourceCreditError, TypeError):
+        return ["source-credit manifest canonical object is invalid"]
+    ordered = ordered_source_credit_items(credit)
+    anchors = {item["id"]: item for item in credit["anchors"]}
+    front_ids = raw_manifest.get("front_matter_block_ids")
+    if not isinstance(front_ids, list) or not all(
+        isinstance(item, str) for item in front_ids
+    ):
+        return ["source-credit front-matter placement is invalid"]
+    expected_order = source_credit_placement(
+        credit, front_matter_block_ids=front_ids,
+    )
+    expected = {
+        "canonical": credit,
+        "schema_version": credit["schema_version"],
+        "canonical_sha256": credit["canonical_sha256"],
+        "front_matter_block_ids": front_ids,
+        "replaced_block_ids": [
+            str(item["block_id"])
+            for item in expected_order
+            if item["slot"] == "source_block" and item["block_id"]
+        ],
+        "ordered_items": expected_order,
+        "placements": [
+            {
+                "anchor_id": item["anchor_id"],
+                "placement": anchors[item["anchor_id"]]["placement"],
+                "block_id": anchors[item["anchor_id"]]["block_id"],
+                "render_slot": item["slot"],
+            }
+            for item in expected_order
+        ],
+        "visible_counts": {
+            "authors": len(credit["authors"]),
+            "affiliations": len(credit["affiliations"]),
+            "profiles": len(credit["profiles"]),
+        },
+    }
+    if dict(raw_manifest) != expected:
+        errors.append("source-credit manifest facts do not match the canonical object")
+    positions: list[int] = []
+    for kind, record, _anchor in ordered:
+        marker = _source_credit_marker(
+            kind, str(record["id"]), str(record["content_sha256"])
+        ).strip()
+        if tex.count(marker) != 1:
+            errors.append(
+                f"source-credit {kind} {record['id']} is not rendered exactly once"
+            )
+            continue
+        positions.append(tex.index(marker))
+        if kind == "author":
+            source_name = escape_tex(str(record["source_name"]))
+            localized = record.get("localized_name")
+            expected_text = (
+                source_name + " (\\textit{" + escape_tex(str(localized)) + "})"
+                if localized else source_name
+            )
+        else:
+            expected_text = escape_tex(str(record["text"]))
+        marker_position = tex.index(marker)
+        if tex.find(expected_text, marker_position) < marker_position:
+            errors.append(f"source-credit {kind} {record['id']} text is missing")
+    if positions != sorted(positions):
+        errors.append("source-credit TeX order differs from the canonical order")
+    return errors
+
+
+def validate_pdf_source_credit_text(
+    pdf_path: Path,
+    document: Mapping[str, Any],
+    source_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the compiled searchable text against the canonical credit."""
+
+    executable = shutil.which("pdftotext")
+    if executable is None:
+        raise LatexError("pdftotext is required for source-credit validation")
+    completed = subprocess.run(
+        [executable, str(pdf_path), "-"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        raise LatexError(
+            "compiled PDF source-credit text could not be extracted: "
+            + completed.stderr.strip()
+        )
+    searchable = _normalized_searchable_text(completed.stdout)
+    credit_manifest = source_manifest.get("source_credit")
+    credit_manifest = (
+        credit_manifest if isinstance(credit_manifest, Mapping)
+        else source_manifest
+    )
+    try:
+        credit = validate_source_credit(credit_manifest.get("canonical"))
+    except (SourceCreditError, TypeError) as exc:
+        raise LatexError("compiled PDF source-credit manifest is invalid") from exc
+    placements = credit_manifest.get("ordered_items")
+    expected = source_credit_placement(
+        credit,
+        front_matter_block_ids=credit_manifest.get("front_matter_block_ids") or [],
+    )
+    if placements != expected:
+        raise LatexError("compiled PDF source-credit placement is invalid")
+    records = {
+        (kind, str(item["id"])): item
+        for key, kind in (
+            ("authors", "author"),
+            ("affiliations", "affiliation"),
+            ("profiles", "profile"),
+        )
+        for item in credit[key]
+    }
+    sequence: list[dict[str, Any]] = []
+    for item in expected:
+        record = records[(str(item["kind"]), str(item["id"]))]
+        source_text = _normalized_searchable_text(
+            str(record.get("source_name") or record.get("text") or "")
+        )
+        if not source_text:
+            raise LatexError("compiled PDF source-credit text is empty")
+        sequence.append({
+            "kind": item["kind"],
+            "id": item["id"],
+            "source_text": source_text,
+            "localized_text": _normalized_searchable_text(
+                str(record.get("localized_name") or "")
+            ) or None,
+            "slot": item["slot"],
+            "block_id": item["block_id"],
+        })
+    observed_order: list[str] = []
+    groups: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
+    for item in sequence:
+        key = (
+            "header" if item["slot"] in {"after_title", "front_matter"}
+            else "source_block",
+            item["block_id"],
+        )
+        groups.setdefault(key, []).append(item)
+    replaced_ids = {
+        str(item.get("block_id"))
+        for item in sequence
+        if item["slot"] == "source_block" and item.get("block_id")
+    }
+    scoped_regions = _pdf_source_credit_scopes(
+        searchable,
+        document,
+        groups=list(groups.items()),
+        replaced_block_ids=replaced_ids,
+    )
+    for (region_kind, region_block_id), items in groups.items():
+        scoped = scoped_regions[(region_kind, region_block_id)]
+        cursor = 0
+        matched: list[dict[str, Any]] = []
+        for item in items:
+            source_span = _next_bounded_text_span(
+                scoped, item["source_text"], cursor,
+            )
+            if source_span is None:
+                raise LatexError("compiled PDF source-credit order is invalid")
+            position, source_end = source_span
+            localized = item["localized_text"]
+            if localized:
+                localized_span = _next_bounded_text_span(
+                    scoped, localized, source_end,
+                )
+                if (
+                    localized_span is None
+                    or localized_span[0] - source_end > 8
+                ):
+                    raise LatexError(
+                        "compiled PDF localized author is not adjacent to "
+                        "its source name"
+                    )
+                cursor = localized_span[1]
+            else:
+                cursor = source_end
+            matched.append({
+                "source_text": item["source_text"],
+                "source_span": source_span,
+                "entry_span": (position, cursor),
+            })
+            observed_order.append(str(item["id"]))
+        for text in {item["source_text"] for item in items}:
+            expected_source_spans = {
+                item["source_span"]
+                for item in matched
+                if item["source_text"] == text
+            }
+            visible_occurrences = []
+            for occurrence in _bounded_text_spans(scoped, text):
+                if occurrence in expected_source_spans:
+                    visible_occurrences.append(occurrence)
+                    continue
+                if any(
+                    entry["entry_span"][0] <= occurrence[0]
+                    and occurrence[1] <= entry["entry_span"][1]
+                    for entry in matched
+                ):
+                    continue
+                visible_occurrences.append(occurrence)
+            if len(visible_occurrences) != len(expected_source_spans):
+                raise LatexError(
+                    "compiled PDF source-credit occurrence count is invalid "
+                    f"in its credit region: {text}"
+                )
+    return {
+        "schema_version": "arc.companion.source-credit-pdf-observation.v1",
+        "canonical_sha256": credit["canonical_sha256"],
+        "searchable_text_sha256": hashlib.sha256(
+            searchable.encode("utf-8")
+        ).hexdigest(),
+        "ordered_ids": observed_order,
+        "visible_projection_sha256": sha256_json(
+            source_credit_visible_projection(
+                credit,
+                front_matter_block_ids=(
+                    credit_manifest.get("front_matter_block_ids") or []
+                ),
+            )
+        ),
+        "visible_counts": {
+            "authors": sum(item["kind"] == "author" for item in sequence),
+            "affiliations": sum(
+                item["kind"] == "affiliation" for item in sequence
+            ),
+            "profiles": sum(item["kind"] == "profile" for item in sequence),
+        },
+    }
+
+
+def _normalized_searchable_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _bounded_text_spans(value: str, text: str) -> list[tuple[int, int]]:
+    if not text:
+        return []
+    prefix = r"(?<!\w)" if text[0].isalnum() else ""
+    suffix = r"(?!\w)" if text[-1].isalnum() else ""
+    return [
+        match.span()
+        for match in re.finditer(prefix + re.escape(text) + suffix, value)
+    ]
+
+
+def _next_bounded_text_span(
+    value: str, text: str, cursor: int,
+) -> tuple[int, int] | None:
+    return next(
+        (span for span in _bounded_text_spans(value, text) if span[0] >= cursor),
+        None,
+    )
+
+
+def _pdf_source_credit_scopes(
+    searchable: str,
+    document: Mapping[str, Any],
+    *,
+    groups: Sequence[
+        tuple[tuple[str, str | None], Sequence[Mapping[str, Any]]]
+    ],
+    replaced_block_ids: set[str],
+) -> dict[tuple[str, str | None], str]:
+    """Partition searchable text into disjoint source-credit regions."""
+
+    blocks = [
+        item for item in document.get("blocks") or []
+        if isinstance(item, Mapping)
+    ]
+    front_group_ids = {
+        str(value)
+        for key, values in (
+            (document.get("front_matter") or {}).get("block_ids") or {}
+        ).items()
+        if key in {"title", "authors", "affiliations"}
+        for value in values
+    }
+    credit_block_ids = replaced_block_ids | front_group_ids
+    landmarks: list[tuple[int, int]] = []
+    cursor = 0
+    for _key, items in groups:
+        first_start: int | None = None
+        last_end: int | None = None
+        for item in items:
+            source_span = _next_bounded_text_span(
+                searchable, str(item["source_text"]), cursor,
+            )
+            if source_span is None:
+                raise LatexError("compiled PDF source-credit order is invalid")
+            if first_start is None:
+                first_start = source_span[0]
+            last_end = source_span[1]
+            cursor = source_span[1]
+            localized = str(item.get("localized_text") or "")
+            if localized:
+                localized_span = _next_bounded_text_span(
+                    searchable, localized, cursor,
+                )
+                if (
+                    localized_span is None
+                    or localized_span[0] - cursor > 8
+                ):
+                    raise LatexError(
+                        "compiled PDF localized author is not adjacent to "
+                        "its source name"
+                    )
+                last_end = localized_span[1]
+                cursor = localized_span[1]
+        if first_start is None or last_end is None:
+            raise LatexError("compiled PDF source-credit region is empty")
+        landmarks.append((first_start, last_end))
+
+    title = _normalized_searchable_text(
+        str((document.get("front_matter") or {}).get("title") or "")
+    )
+    title_position = searchable.find(title) if title else -1
+    block_indexes = {
+        str(block.get("block_id") or ""): index
+        for index, block in enumerate(blocks)
+        if str(block.get("block_id") or "")
+    }
+    output: dict[tuple[str, str | None], str] = {}
+    for index, ((key, _items), landmark) in enumerate(zip(groups, landmarks)):
+        region_kind, block_id = key
+        start = landmarks[index - 1][1] if index else 0
+        end = landmarks[index + 1][0] if index + 1 < len(landmarks) else len(
+            searchable
+        )
+        if region_kind == "header" and title_position >= 0:
+            start = max(start, title_position + len(title))
+        block_index = block_indexes.get(str(block_id or ""))
+        if region_kind == "header":
+            candidate_blocks = blocks
+        elif block_index is None:
+            raise LatexError("compiled PDF source-credit block scope is ambiguous")
+        else:
+            candidate_blocks = blocks[block_index + 1:]
+            for block in reversed(blocks[:block_index]):
+                candidate_id = str(block.get("block_id") or "")
+                if candidate_id in credit_block_ids:
+                    continue
+                text = _normalized_searchable_text(
+                    str(block.get("text") or "")
+                )
+                positions = _bounded_text_spans(searchable, text)
+                previous = [
+                    span for span in positions if span[1] <= landmark[0]
+                ]
+                if previous:
+                    start = max(start, previous[-1][1])
+                    break
+        for block in candidate_blocks:
+            candidate_id = str(block.get("block_id") or "")
+            if candidate_id in credit_block_ids:
+                continue
+            text = _normalized_searchable_text(str(block.get("text") or ""))
+            positions = _bounded_text_spans(searchable, text)
+            following = [
+                span for span in positions if span[0] >= landmark[1]
+            ]
+            if following:
+                end = min(end, following[0][0])
+                break
+        if not (start <= landmark[0] < landmark[1] <= end):
+            raise LatexError("compiled PDF source-credit region bounds are invalid")
+        output[key] = searchable[start:end]
+    return output
+
+
+def _source_credit_marker(kind: str, identifier: str, content_hash: str) -> str:
+    return (
+        f"% ARC-SOURCE-CREDIT {kind} "
+        f"{_safe_label(identifier)} {content_hash}\n"
+    )
 
 
 def _render_block(
@@ -2125,6 +2694,7 @@ def _front_matter_block_roles(
         "front_matter_title": "title",
         "front_matter_authors": "author",
         "front_matter_affiliations": "affiliation",
+        "front_matter_profiles": "profile",
         "front_matter_abstract": "abstract",
     }
     roles = {

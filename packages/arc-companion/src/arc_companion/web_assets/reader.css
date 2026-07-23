@@ -83,7 +83,12 @@ button { font: inherit; }
 .paper-header h1 { margin: 0; font-size: 1.35rem; line-height: 1.2; letter-spacing: -.015em; overflow-wrap: anywhere; }
 .title-source, .title-translation { display: block; }
 .title-translation { margin-top: .28em; color: #36586b; font-size: .9em; }
-.authors { margin: .75rem 0 0; color: #465464; }
+.source-credits { margin-top: .75rem; color: #465464; }
+.source-credit-entry { margin: .22rem 0 0; white-space: pre-wrap; }
+.source-credit-author { font-weight: 600; }
+.source-author-localized { color: #526474; font-weight: 500; }
+.source-credit-affiliation { font-size: .92rem; }
+.source-credit-profile { max-width: 62rem; margin-top: .55rem; font-size: .9rem; line-height: 1.55; }
 .build-status { display: flex; flex-wrap: wrap; gap: .55rem 1rem; margin-top: 1rem; color: var(--muted); font-size: .86rem; }
 .status-pill { padding: .1rem .55rem; border: 1px solid #ccd6df; border-radius: 999px; background: white; }
 

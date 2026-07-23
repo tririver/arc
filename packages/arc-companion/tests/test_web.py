@@ -5,20 +5,31 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+from copy import deepcopy
 
 import pytest
 
 from arc_companion.io import read_json, sha256_json, write_json
+from arc_companion.latex import (
+    render_companion_tex,
+    validate_pdf_source_credit_text,
+)
 from arc_companion.web import (
     READER_FINAL_VERSION,
     READER_SNAPSHOT_VERSION,
     WEB_MANIFEST_VERSION,
     WEB_RENDER_VERSION,
     WebReaderError,
+    _source_credit_visible_projection,
     build_reader_snapshot,
     publish_reader,
     validate_reader_project,
 )
+from arc_companion.source_credit import (
+    normalize_source_credit,
+    source_credit_placement,
+)
+from arc_paper.parse.source import parse_source_input
 
 
 def _segment_name(segment_id: str) -> str:
@@ -77,6 +88,13 @@ def _project(tmp_path: Path, *, translation_state: str = "accepted") -> tuple[Pa
                 "assets": [],
             },
         },
+    )
+    document_envelope = read_json(checkpoint / "document.json")
+    write_json(
+        checkpoint / "source-credit.json",
+        normalize_source_credit(
+            document_envelope["document"], document_envelope["metadata"],
+        ),
     )
     write_json(
         checkpoint / "chapters.json",
@@ -575,6 +593,55 @@ def test_publish_is_static_local_content_addressed_and_index_last(
     })["ok"] is True
 
 
+def test_web_snapshot_and_manifest_bind_shared_source_credit_and_reject_tamper(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    credit = normalize_source_credit({
+        "front_matter": {
+            "authors": [
+                {"source_id": "a", "name": "Original <A>"},
+                {"source_id": "b", "name": "اسم ب"},
+            ],
+            "affiliations": [{"source_id": "i", "text": "R&D Institute"}],
+            "profiles": [{
+                "source_id": "p",
+                "text": "Long profile 第一行\nSecond line.",
+                "author_id": "a",
+            }],
+            "author_name_variants": [{
+                "author_id": "a",
+                "localized_name": "本地名",
+                "source_identity": "source:localized-a",
+            }],
+        },
+        "blocks": [],
+    })
+    snapshot = build_reader_snapshot(
+        project, final_overrides={"source_credit": credit},
+    )
+
+    assert snapshot["source_credit"] == credit
+    assert snapshot["source_credit_sha256"] == credit["canonical_sha256"]
+    assert snapshot["authors"] == ["Original <A>", "اسم ب"]
+    assert [item["kind"] for item in snapshot["source_credit_order"]] == [
+        "author", "author", "affiliation", "profile",
+    ]
+    result = publish_reader(project, snapshot=snapshot)
+    manifest = read_json(Path(result["web_manifest_path"]))
+    assert manifest["source_credit"]["canonical_sha256"] == credit[
+        "canonical_sha256"
+    ]
+    assert manifest["source_credit"]["visible_counts"] == {
+        "authors": 2, "affiliations": 1, "profiles": 1,
+    }
+
+    tampered = deepcopy(snapshot)
+    tampered["source_credit"]["authors"][0]["source_name"] = "Changed"
+    with pytest.raises(WebReaderError, match="source credit"):
+        publish_reader(project, snapshot=tampered)
+
+
 def test_every_publish_fault_point_preserves_the_previous_valid_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -756,6 +823,172 @@ if (!app.classList.contains("sidebar-collapsed") || toggle.textContent !== "展�
         check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_source_credit_dom_uses_text_nodes_and_exactly_once_counts(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is unavailable")
+    javascript = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "arc_companion" / "web_assets" / "reader.js"
+    ).read_text(encoding="utf-8")
+    document = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">T</h1>
+          <div class="ltx_authors">
+            <p class="ltx_creator_author">
+              <span class="ltx_personname">Original &lt;A&gt;</span>
+            </p>
+            <p class="ltx_affiliation">R&amp;D Institute</p>
+            <p id="profile" class="ltx_role_profile">
+              Profile 第一行 Second line.
+            </p>
+          </div>
+          <p id="body">Body.</p>
+        </article>
+        """,
+        source_id="combined-source-credit",
+    )["document"]
+    author_id = document["front_matter"]["author_records"][0]["source_id"]
+    document["front_matter"]["author_name_variants"] = [{
+        "author_id": author_id,
+        "localized_name": "本地名",
+        "source_identity": "source:localized-a",
+    }]
+    assert document["front_matter"]["block_ids"]["profiles"] == ["profile"]
+    credit = normalize_source_credit(document)
+    front_ids = [
+        str(value)
+        for key, values in document["front_matter"]["block_ids"].items()
+        if key in {"title", "authors", "affiliations"}
+        for value in values
+    ]
+    order = source_credit_placement(
+        credit, front_matter_block_ids=front_ids,
+    )
+    snapshot = {
+        "language": "zh-CN",
+        "source_language": "en",
+        "direction": "ltr",
+        "source_direction": "ltr",
+        "title": "T",
+        "source_title": "T",
+        "paper_id": "p",
+        "status": "complete",
+        "chapters": [{
+            "chapter_id": "c1",
+            "title": "C",
+            "source_title": "C",
+            "structural_only": True,
+            "guide": [],
+            "segments": [{
+                "segment_id": "s1",
+                "structural_only": True,
+                "source": [{
+                    "block_id": "profile",
+                    "kind": "text",
+                    "runs": [{"type": "text", "text": "Profile 第一行\nSecond line."}],
+                    "language": "en",
+                    "direction": "ltr",
+                }],
+                "lane_status": {},
+            }],
+        }],
+        "appendices": [],
+        "glossary": [],
+        "coverage": {},
+        "source_credit": credit,
+        "source_credit_sha256": credit["canonical_sha256"],
+        "source_credit_order": order,
+        "source_credit_visible_projection": _source_credit_visible_projection(
+            credit, order,
+        ),
+        "source_credit_front_matter_block_ids": sorted(front_ids),
+        "source_credit_replaced_block_ids": ["profile"],
+    }
+    harness = r'''
+class Classes {
+  constructor(value = "") { this.values = new Set(String(value).split(/\s+/).filter(Boolean)); }
+  contains(value) { return this.values.has(value); }
+  add(value) { this.values.add(value); }
+  remove(value) { this.values.delete(value); }
+  toggle(value, force) { if (force === undefined) force = !this.values.has(value); if (force) this.values.add(value); else this.values.delete(value); }
+}
+class Node {
+  constructor(tag = "div", id = "") { this.tagName = tag.toUpperCase(); this.id = id; this.children = []; this.dataset = {}; this.attributes = {}; this.listeners = {}; this.classList = new Classes(); this.textContent = ""; }
+  set className(value) { this._className = value; this.classList = new Classes(value); }
+  get className() { return this._className || ""; }
+  get childNodes() { return this.children; }
+  append(...values) { this.children.push(...values); }
+  replaceChildren(...values) { this.children = values; }
+  setAttribute(key, value) { this.attributes[key] = String(value); }
+  addEventListener(kind, fn) { this.listeners[kind] = fn; }
+  querySelectorAll() { return []; }
+  scrollIntoView() {}
+}
+const nodes = Object.fromEntries(["reader-app", "reader-main", "chapter-sidebar", "sidebar-toggle"].map(id => [id, new Node("div", id)]));
+nodes["reader-app"].classList.add("reader-shell");
+global.localStorage = {getItem: () => null, setItem() {}};
+global.location = {hash: ""}; global.history = {state: null, replaceState() {}};
+global.requestAnimationFrame = fn => fn();
+global.document = {getElementById: id => nodes[id] || null, createElement: tag => new Node(tag), createTextNode: text => ({textContent: String(text)})};
+global.window = {__ARC_COMPANION_SNAPSHOT__: __PAYLOAD__, matchMedia: () => ({matches: false})};
+'''.replace("__PAYLOAD__", json.dumps(snapshot, ensure_ascii=False))
+    assertions = r'''
+const collect = (root, cls, out = []) => { for (const child of root.children || []) { if (child && child.classList && child.classList.contains(cls)) out.push(child); if (child && child.children) collect(child, cls, out); } return out; };
+const rows = collect(nodes["reader-main"], "source-credit-entry");
+if (rows.length !== 3) process.exit(21);
+const authors = collect(nodes["reader-main"], "source-credit-author");
+if (authors.length !== 1 || authors[0].children[0].textContent !== "Original <A>" || authors[0].children[2].textContent !== "本地名") process.exit(22);
+if (collect(nodes["reader-main"], "source-credit-affiliation").length !== 1 || collect(nodes["reader-main"], "source-credit-profile").length !== 1) process.exit(23);
+'''
+    result = subprocess.run(
+        [node, "-e", harness + "\n" + javascript + "\n" + assertions],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    if shutil.which("xelatex") and shutil.which("pdftotext"):
+        tex, manifest = render_companion_tex(
+            document,
+            [{
+                "segment_id": "s1",
+                "block_ids": [
+                    str(item["block_id"]) for item in document["blocks"]
+                ],
+            }],
+            {"s1": {"explanation": "", "commentary": ""}},
+            output_dir=tmp_path,
+            language="zh-CN",
+            source_credit=credit,
+        )
+        tex_path = tmp_path / "combined-source-credit.tex"
+        tex_path.write_text(tex, encoding="utf-8")
+        compiled = subprocess.run(
+            [
+                shutil.which("xelatex") or "xelatex",
+                "-halt-on-error",
+                "-interaction=nonstopmode",
+                f"-output-directory={tmp_path}",
+                str(tex_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+        pdf_observation = validate_pdf_source_credit_text(
+            tmp_path / "combined-source-credit.pdf", document, manifest,
+        )
+        assert pdf_observation["canonical_sha256"] == credit["canonical_sha256"]
+        assert pdf_observation["visible_projection_sha256"] == sha256_json(
+            snapshot["source_credit_visible_projection"]
+        )
 
 
 def test_snapshot_hides_formal_chapter_heading_but_keeps_lower_headings(tmp_path: Path) -> None:

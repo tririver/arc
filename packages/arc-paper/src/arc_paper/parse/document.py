@@ -11,10 +11,18 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 
 DOCUMENT_SCHEMA_VERSION = "arc.paper.document.v2"
-RICH_DOCUMENT_PARSER_VERSION = 5
+RICH_DOCUMENT_PARSER_VERSION = 7
 _HEADING_NAMES = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _ATOMIC_NAMES = _HEADING_NAMES | {"p", "ul", "ol", "pre", "blockquote"}
 _ASSET_ATTRIBUTES = (("img", "src"), ("source", "src"), ("object", "data"))
+_AUTHOR_CREDIT_SELECTOR = (
+    ".ltx_role_affiliation, .ltx_affiliation, [itemprop='affiliation'], "
+    ".ltx_role_profile, .ltx_profile, .ltx_role_biography, "
+    ".ltx_author_biography, [itemprop='description'], [role='doc-biography'], "
+    ".ltx_contact, [class*='ltx_role_contact'], .ltx_role_email, "
+    ".ltx_role_address, .ltx_role_url, .ltx_role_homepage, .ltx_role_orcid, "
+    "[itemprop='email'], [itemprop='telephone'], [itemprop='url'], a[href]"
+)
 
 
 def build_document(
@@ -145,16 +153,7 @@ def _front_matter(root: Tag | BeautifulSoup) -> tuple[dict[str, Any], dict[int, 
 
     title = root.select_one(".ltx_title_document, h1.ltx_title, h1")
     abstract = root.select_one(".ltx_abstract")
-    author_nodes = [
-        item
-        for item in root.select(".ltx_personname, .ltx_author_name")
-        if isinstance(item, Tag) and _text(item)
-    ]
-    if not author_nodes:
-        author_nodes = [
-            item for item in root.select(".ltx_creator_author")
-            if isinstance(item, Tag) and _text(item)
-        ]
+    author_nodes = _semantic_author_nodes(root)
     affiliation_nodes = [
         item
         for item in root.select(".ltx_role_affiliation, .ltx_affiliation")
@@ -169,7 +168,6 @@ def _front_matter(root: Tag | BeautifulSoup) -> tuple[dict[str, Any], dict[int, 
                 and not item.select_one(".ltx_role_affiliation, .ltx_affiliation")
             )
         ]
-
     roles: dict[int, str] = {}
     if isinstance(title, Tag):
         roles[id(title)] = "front_matter_title"
@@ -177,7 +175,6 @@ def _front_matter(root: Tag | BeautifulSoup) -> tuple[dict[str, Any], dict[int, 
         roles[id(item)] = "front_matter_authors"
     for item in affiliation_nodes:
         roles[id(item)] = "front_matter_affiliations"
-
     if not isinstance(title, Tag) or not author_nodes:
         legacy = _legacy_centered_front_matter(root)
         if not isinstance(title, Tag) and legacy.get("title"):
@@ -192,13 +189,251 @@ def _front_matter(root: Tag | BeautifulSoup) -> tuple[dict[str, Any], dict[int, 
             for item in affiliation_nodes:
                 roles[id(item)] = "front_matter_affiliations"
 
+    (
+        author_records,
+        affiliation_records,
+        profiles,
+        author_affiliations,
+        author_name_variants,
+        profile_nodes,
+    ) = _structured_source_credits(root, author_nodes, affiliation_nodes)
+    for item in profile_nodes:
+        roles[id(item)] = "front_matter_profiles"
+
     front = {
         "title": _text(title),
-        "authors": _dedupe([_text(item) for item in author_nodes]),
+        "authors": _dedupe([_author_text(item) for item in author_nodes]),
         "affiliations": _dedupe([_text(item) for item in affiliation_nodes]),
+        "author_records": author_records,
+        "affiliation_records": affiliation_records,
+        "profiles": profiles,
+        "author_affiliations": author_affiliations,
+        "author_name_variants": author_name_variants,
         "abstract": _text(abstract),
     }
     return front, roles
+
+
+def _semantic_author_nodes(root: Tag | BeautifulSoup) -> list[Tag]:
+    """Keep author order while selecting the narrowest reliable name node."""
+
+    output: list[Tag] = []
+    seen: set[int] = set()
+    for node in root.select(
+        ".ltx_creator_author, .ltx_personname, .ltx_author_name"
+    ):
+        if not isinstance(node, Tag):
+            continue
+        classes = set(node.get("class") or [])
+        if "ltx_creator_author" in classes:
+            candidates = [
+                item
+                for item in node.select(
+                    ".ltx_personname, .ltx_author_name, [itemprop='name']"
+                )
+                if isinstance(item, Tag)
+                and item.find_parent(class_="ltx_creator_author") is node
+                and _text(item)
+            ]
+            direct = [item for item in candidates if item.parent is node]
+            person_names = [
+                item
+                for item in candidates
+                if {"ltx_personname", "ltx_author_name"}.intersection(
+                    item.get("class") or []
+                )
+            ]
+            selected = direct or person_names or candidates
+            if not selected and _author_text(node):
+                selected = [node]
+        else:
+            if node.find_parent(class_="ltx_creator_author") is not None:
+                continue
+            selected = [node] if _text(node) else []
+        for item in selected:
+            if id(item) not in seen:
+                seen.add(id(item))
+                output.append(item)
+    return output
+
+
+def _structured_source_credits(
+    root: Tag | BeautifulSoup,
+    author_nodes: list[Tag],
+    affiliation_nodes: list[Tag],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[Tag],
+]:
+    """Preserve only explicit author-credit relationships carried by the DOM."""
+
+    author_records = [
+        {
+            "source_id": _front_identity("author", node, index),
+            "source_name": _author_text(node),
+            **_front_block_reference(node),
+        }
+        for index, node in enumerate(author_nodes)
+        if _author_text(node)
+    ]
+    affiliation_records = [
+        {
+            "source_id": _front_identity("affiliation", node, index),
+            "text": _text(node),
+            **_front_block_reference(node),
+        }
+        for index, node in enumerate(affiliation_nodes)
+        if _text(node)
+    ]
+    author_by_node = {
+        id(node): record for node, record in zip(author_nodes, author_records)
+    }
+    affiliation_by_node = {
+        id(node): record
+        for node, record in zip(affiliation_nodes, affiliation_records)
+    }
+
+    associations: list[dict[str, str]] = []
+    variants: list[dict[str, Any]] = []
+    profiles: list[dict[str, Any]] = []
+    profile_nodes: list[Tag] = []
+    containers = [
+        node
+        for node in root.select(
+            ".ltx_creator_author, .ltx_authors [itemprop='author'], "
+            ".ltx_authors [typeof~='schema:Person']"
+        )
+        if isinstance(node, Tag)
+    ]
+    for container_index, container in enumerate(containers):
+        contained_authors = [
+            node for node in author_nodes
+            if node is container or container in node.parents
+        ]
+        if len(contained_authors) != 1:
+            continue
+        author_record = author_by_node.get(id(contained_authors[0]))
+        if author_record is None:
+            continue
+        contained_affiliations = [
+            node for node in affiliation_nodes if container in node.parents
+        ]
+        for affiliation in contained_affiliations:
+            affiliation_record = affiliation_by_node.get(id(affiliation))
+            if affiliation_record is not None:
+                associations.append({
+                    "author_id": str(author_record["source_id"]),
+                    "affiliation_id": str(affiliation_record["source_id"]),
+                })
+
+        variant_nodes = [
+            node for node in container.select(
+                "[itemprop='alternateName'][lang], "
+                "[itemprop='alternateName'][xml\\:lang], "
+                "[data-localized-name][lang]"
+            )
+            if isinstance(node, Tag)
+        ]
+        for variant_index, variant in enumerate(variant_nodes):
+            localized_name = str(
+                variant.get("data-localized-name") or _text(variant)
+            ).strip()
+            language = str(
+                variant.get("lang") or variant.get("xml:lang") or ""
+            ).strip()
+            if localized_name and language:
+                variants.append({
+                    "author_id": str(author_record["source_id"]),
+                    "localized_name": localized_name,
+                    "language": language,
+                    "source_identity": _front_identity(
+                        f"author-variant-{container_index}", variant, variant_index
+                    ),
+                    **_front_block_reference(variant),
+                })
+
+        contained_profiles = [
+            node for node in container.select(
+                ".ltx_role_profile, .ltx_profile, .ltx_role_biography, "
+                ".ltx_author_biography, "
+                "[itemprop='description'], [role='doc-biography']"
+            )
+            if isinstance(node, Tag) and _text(node)
+        ]
+        for profile_index, profile in enumerate(contained_profiles):
+            profile_nodes.append(profile)
+            profiles.append({
+                "source_id": _front_identity(
+                    f"profile-{container_index}", profile, profile_index
+                ),
+                "text": _text(profile),
+                "author_id": str(author_record["source_id"]),
+                **_front_block_reference(profile),
+            })
+
+    # A biography role within the source's author front matter is reliable even
+    # when the source does not explicitly associate it with one author.
+    for profile_index, profile in enumerate(
+        node for node in root.select(
+            ".ltx_authors .ltx_role_profile, "
+            ".ltx_authors .ltx_profile, "
+            ".ltx_authors .ltx_role_biography, "
+            ".ltx_authors .ltx_author_biography, "
+            ".ltx_authors [role='doc-biography']"
+        )
+        if isinstance(node, Tag) and _text(node)
+    ):
+        if profile in profile_nodes:
+            continue
+        profile_nodes.append(profile)
+        profiles.append({
+            "source_id": _front_identity("profile-global", profile, profile_index),
+            "text": _text(profile),
+            **_front_block_reference(profile),
+        })
+
+    return (
+        author_records,
+        affiliation_records,
+        profiles,
+        _dedupe_records(associations),
+        _dedupe_records(variants),
+        profile_nodes,
+    )
+
+
+def _front_identity(kind: str, node: Tag, index: int) -> str:
+    explicit = str(node.get("id") or "").strip()
+    if explicit:
+        return f"{kind}:{explicit}"
+    block_id = _front_block_reference(node).get("block_id")
+    return f"{kind}:{block_id or 'front'}:{index}"
+
+
+def _front_block_reference(node: Tag) -> dict[str, str]:
+    for candidate in (node, *(item for item in node.parents if isinstance(item, Tag))):
+        if candidate.name in _ATOMIC_NAMES:
+            block_id = str(candidate.get("id") or "").strip()
+            if block_id:
+                return {"block_id": block_id}
+    return {}
+
+
+def _dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        identity = json.dumps(
+            record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if identity not in seen:
+            seen.add(identity)
+            output.append(record)
+    return output
 
 
 def _legacy_centered_front_matter(root: Tag | BeautifulSoup) -> dict[str, list[Tag]]:
@@ -244,6 +479,7 @@ def _front_matter_block_ids(blocks: list[dict[str, Any]]) -> dict[str, list[str]
         "title": "front_matter_title",
         "authors": "front_matter_authors",
         "affiliations": "front_matter_affiliations",
+        "profiles": "front_matter_profiles",
         "abstract": "front_matter_abstract",
     }
     return {
@@ -1162,6 +1398,28 @@ def _text(node: Tag | NavigableString | None) -> str:
     if isinstance(node, NavigableString):
         return " ".join(str(node).split())
     return " ".join(node.get_text(" ", strip=True).split())
+
+
+def _author_text(node: Tag) -> str:
+    if "ltx_creator_author" not in set(node.get("class") or []):
+        return _text(node)
+    excluded = {
+        id(item)
+        for item in node.select(_AUTHOR_CREDIT_SELECTOR)
+        if isinstance(item, Tag)
+    }
+    pieces: list[str] = []
+    for descendant in node.descendants:
+        if not isinstance(descendant, NavigableString):
+            continue
+        if any(
+            id(parent) in excluded
+            for parent in descendant.parents
+            if parent is not node
+        ):
+            continue
+        pieces.append(str(descendant))
+    return " ".join(" ".join(pieces).split())
 
 
 def _positive_int(value: Any) -> int:

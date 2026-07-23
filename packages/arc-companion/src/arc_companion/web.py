@@ -17,13 +17,19 @@ from urllib.parse import urlparse
 from .io import canonical_json, read_json, sha256_file, sha256_json, write_json, write_text
 from .reader_text import clean_reader_annotation, clean_reader_translation
 from .source import asset_path, block_id
+from .source_credit import (
+    SourceCreditError,
+    source_credit_placement,
+    source_credit_visible_projection,
+    validate_source_credit,
+)
 
 
-READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v3"
-READER_FINAL_VERSION = "arc.companion.reader-final.v3"
-WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v2"
-WEB_RENDER_VERSION = "arc.companion.web-render.v4"
-WEB_VALIDATION_VERSION = "arc.companion.web-validation.v2"
+READER_SNAPSHOT_VERSION = "arc.companion.reader-snapshot.v4"
+READER_FINAL_VERSION = "arc.companion.reader-final.v4"
+WEB_MANIFEST_VERSION = "arc.companion.web-manifest.v3"
+WEB_RENDER_VERSION = "arc.companion.web-render.v5"
+WEB_VALIDATION_VERSION = "arc.companion.web-validation.v3"
 
 _STATE_VERSIONS = {
     "arc.companion.state.v1",
@@ -135,6 +141,75 @@ def build_reader_snapshot(
     title_translations = _title_translation_index(
         overrides.get("title_translations") or content.get("title_translations")
     )
+    checkpoint_credit = (
+        _read_object(checkpoint / "source-credit.json", label="source credit")
+        if (
+            checkpoint is not None
+            and (checkpoint / "source-credit.json").is_file()
+        )
+        else None
+    )
+    try:
+        supplied_source_credit = (
+            overrides.get("source_credit")
+            or content.get("source_credit")
+            or checkpoint_credit
+        )
+        if supplied_source_credit is None:
+            raise SourceCreditError("canonical source credit is required")
+        source_credit = validate_source_credit(supplied_source_credit)
+    except (SourceCreditError, TypeError) as exc:
+        raise WebReaderError("reader source credit is invalid") from exc
+    source_credit_front_matter_block_ids = sorted({
+        str(value)
+        for key, values in (
+            ((document.get("front_matter") or {}).get("block_ids") or {})
+        ).items()
+        if key in {"title", "authors", "affiliations"}
+        if isinstance(values, list)
+        for value in values
+        if str(value)
+    })
+    source_credit_order = source_credit_placement(
+        source_credit,
+        front_matter_block_ids=source_credit_front_matter_block_ids,
+    )
+    source_credit_visible_projection = _source_credit_visible_projection(
+        source_credit, source_credit_order,
+    )
+    source_credit_records = {
+        str(item["id"]): item
+        for key in ("authors", "affiliations", "profiles")
+        for item in source_credit[key]
+    }
+    source_block_text = {
+        block_id(dict(item)): str(item.get("text") or "").strip()
+        for item in document.get("blocks") or []
+        if isinstance(item, Mapping) and block_id(dict(item))
+    }
+    source_credit_replaced_block_ids = [
+        str(item["block_id"])
+        for item in source_credit_order
+        if item["slot"] == "source_block"
+        and item["block_id"]
+        and source_block_text.get(str(item["block_id"])) == str(
+            source_credit_records[str(item["id"])].get("source_name")
+            or source_credit_records[str(item["id"])].get("text")
+            or ""
+        ).strip()
+    ]
+    ambiguous_source_credit_blocks = [
+        str(item["block_id"])
+        for item in source_credit_order
+        if item["slot"] == "source_block"
+        and str(item["block_id"]) not in source_credit_replaced_block_ids
+    ]
+    if ambiguous_source_credit_blocks:
+        raise WebReaderError(
+            "source-credit block anchor does not identify an equivalent "
+            "standalone source block: "
+            + ", ".join(ambiguous_source_credit_blocks)
+        )
 
     rendered_chapters: list[dict[str, Any]] = []
     ordered_segment_ids: list[str] = []
@@ -244,7 +319,16 @@ def build_reader_snapshot(
         "title": title,
         "source_title": source_title,
         "translated_title": translated_title,
-        "authors": _author_names(metadata.get("authors") or []),
+        # Compatibility only. The DOM renderer consumes source_credit_order.
+        "authors": [item["source_name"] for item in source_credit["authors"]],
+        "source_credit": source_credit,
+        "source_credit_sha256": source_credit["canonical_sha256"],
+        "source_credit_order": source_credit_order,
+        "source_credit_visible_projection": source_credit_visible_projection,
+        "source_credit_front_matter_block_ids": (
+            source_credit_front_matter_block_ids
+        ),
+        "source_credit_replaced_block_ids": source_credit_replaced_block_ids,
         "language": language,
         "source_language": source_language,
         "direction": _language_direction(language),
@@ -350,6 +434,7 @@ def publish_reader(
         },
         "assets": [*builtin_assets, *source_assets],
         "coverage": deepcopy(value.get("coverage") or {}),
+        "source_credit": _source_credit_manifest(value),
     }
     manifest_bytes = _json_file_bytes(manifest)
     manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
@@ -407,6 +492,10 @@ def publish_reader(
         "web_manifest_path": str(manifest_path),
         "web_manifest_sha256": manifest_hash,
         "web_render_version": WEB_RENDER_VERSION,
+        "source_credit_sha256": value["source_credit_sha256"],
+        "source_credit_observation_sha256": sha256_json(
+            value["source_credit_visible_projection"]
+        ),
         "web": report,
     }
 
@@ -464,6 +553,10 @@ def validate_reader_project(
         "snapshot_revision": snapshot["revision"],
         "chapter_count": len(snapshot.get("chapters") or []),
         "segment_count": len(segment_ids),
+        "source_credit_sha256": snapshot["source_credit_sha256"],
+        "source_credit_observation_sha256": sha256_json(
+            snapshot["source_credit_visible_projection"]
+        ),
     }
 
 
@@ -488,6 +581,41 @@ def _validate_reader_bundle(
     )
     if snapshot.get("revision") != expected_revision:
         raise WebReaderError("reader snapshot revision is invalid")
+    try:
+        source_credit = validate_source_credit(snapshot.get("source_credit"))
+    except (SourceCreditError, TypeError) as exc:
+        raise WebReaderError("reader source credit is invalid") from exc
+    if snapshot.get("source_credit_sha256") != source_credit["canonical_sha256"]:
+        raise WebReaderError("reader source-credit hash is invalid")
+    expected_credit_manifest = _source_credit_manifest(snapshot)
+    if manifest.get("source_credit") != expected_credit_manifest:
+        raise WebReaderError("web manifest source credit differs from the reader snapshot")
+    front_ids = snapshot.get("source_credit_front_matter_block_ids")
+    if not isinstance(front_ids, list) or not all(
+        isinstance(item, str) for item in front_ids
+    ):
+        raise WebReaderError("reader source-credit front-matter placement is invalid")
+    expected_order = source_credit_placement(
+        source_credit, front_matter_block_ids=front_ids,
+    )
+    if snapshot.get("source_credit_order") != expected_order:
+        raise WebReaderError("reader source-credit order is invalid")
+    expected_visible = _source_credit_visible_projection(
+        source_credit, expected_order,
+    )
+    if snapshot.get("source_credit_visible_projection") != expected_visible:
+        raise WebReaderError("reader source-credit visible projection is invalid")
+    expected_replaced = [
+        str(item["block_id"])
+        for item in expected_order
+        if item["slot"] == "source_block" and item["block_id"]
+    ]
+    if snapshot.get("source_credit_replaced_block_ids") != expected_replaced:
+        raise WebReaderError("reader source-credit replacement blocks are invalid")
+    if snapshot.get("authors") != [
+        item["source_name"] for item in source_credit["authors"]
+    ]:
+        raise WebReaderError("legacy reader authors differ from source credit")
 
     assets = manifest.get("assets")
     if not isinstance(assets, list):
@@ -542,6 +670,65 @@ def _validate_reader_bundle(
         raise WebReaderError("reader chapter content differs from declared segment coverage")
     _validate_snapshot_terms(snapshot)
     return snapshot, segment_ids
+
+
+def _source_credit_manifest(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        credit = validate_source_credit(snapshot.get("source_credit"))
+    except (SourceCreditError, TypeError) as exc:
+        raise WebReaderError("reader source credit is invalid") from exc
+    front_ids = snapshot.get("source_credit_front_matter_block_ids")
+    if not isinstance(front_ids, list) or not all(
+        isinstance(item, str) for item in front_ids
+    ):
+        raise WebReaderError("reader source-credit front-matter placement is invalid")
+    order = source_credit_placement(
+        credit, front_matter_block_ids=front_ids,
+    )
+    visible = snapshot.get("source_credit_visible_projection")
+    expected_visible = _source_credit_visible_projection(credit, order)
+    if visible != expected_visible:
+        raise WebReaderError("reader source-credit visible projection is invalid")
+    anchors = {item["id"]: item for item in credit["anchors"]}
+    return {
+        "schema_version": credit["schema_version"],
+        "canonical_sha256": credit["canonical_sha256"],
+        "front_matter_block_ids": front_ids,
+        "replaced_block_ids": list(
+            snapshot.get("source_credit_replaced_block_ids") or []
+        ),
+        "ordered_items": order,
+        "placements": [
+            {
+                "anchor_id": item["anchor_id"],
+                "placement": anchors[item["anchor_id"]]["placement"],
+                "block_id": anchors[item["anchor_id"]]["block_id"],
+                "render_slot": item["slot"],
+            }
+            for item in order
+        ],
+        "visible_counts": {
+            "authors": sum(item["kind"] == "author" for item in visible),
+            "affiliations": sum(
+                item["kind"] == "affiliation" for item in visible
+            ),
+            "profiles": sum(item["kind"] == "profile" for item in visible),
+        },
+    }
+
+
+def _source_credit_visible_projection(
+    credit: Mapping[str, Any], order: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the exact, text-bearing sequence consumed by the DOM renderer."""
+    front_ids = [
+        str(item["block_id"])
+        for item in order
+        if item["slot"] == "front_matter" and item.get("block_id")
+    ]
+    return source_credit_visible_projection(
+        credit, front_matter_block_ids=front_ids,
+    )
 
 
 def _validate_snapshot_terms(snapshot: Mapping[str, Any]) -> None:
@@ -1021,6 +1208,7 @@ def _source_block(
     value = dict(block)
     kind = str(value.get("type") or value.get("kind") or "text").casefold()
     output: dict[str, Any] = {
+        "block_id": block_id(dict(value)),
         "kind": kind,
         "title": str(value.get("title") or ""),
         "runs": _inline_runs(value),

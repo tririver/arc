@@ -112,7 +112,8 @@
       "h1", snapshot.source_title, snapshot.translated_title,
       snapshot.title || "Companion Reader"
     ));
-    if ((snapshot.authors || []).length) header.append(element("p", snapshot.authors.join(", "), "authors"));
+    const sourceCredits = renderSourceCredits();
+    if (sourceCredits) header.append(sourceCredits);
     const status = document.createElement("div");
     status.className = "build-status";
     status.append(element("span", `${labels.status}: ${snapshot.status || "preparing"}`, "status-pill"));
@@ -142,6 +143,53 @@
     (snapshot.appendices || []).forEach(appendix => main.append(renderAppendix(appendix)));
     prepareGlossary();
     lazyMountChapters();
+  }
+
+  function renderSourceCredits() {
+    const credit = snapshot.source_credit;
+    const order = snapshot.source_credit_visible_projection;
+    if (!credit || !Array.isArray(order)) return null;
+    return renderSourceCreditRows(
+      order.filter(item => item.slot === "after_title" || item.slot === "front_matter")
+    );
+  }
+
+  function renderSourceCreditRows(order) {
+    const credit = snapshot.source_credit;
+    if (!credit || !Array.isArray(order) || !order.length) return null;
+    const anchors = new Map((credit.anchors || []).map(item => [item.id, item]));
+    const section = document.createElement("section");
+    section.className = "source-credits";
+    section.dataset.sourceCreditSha256 = String(snapshot.source_credit_sha256 || "");
+    order.forEach(item => {
+      const anchor = anchors.get(item.anchor_id);
+      if (!anchor) return;
+      const row = document.createElement(item.kind === "author" ? "p" : "div");
+      row.className = `source-credit-entry source-credit-${safeClass(item.kind)}`;
+      row.dataset.sourceCreditId = String(item.id || "");
+      row.dataset.sourceCreditAnchor = String(item.anchor_id || "");
+      row.dataset.sourceCreditPlacement = String(anchor.placement || "");
+      if (anchor.block_id) row.dataset.sourceBlockId = String(anchor.block_id);
+      if (item.kind === "author") {
+        const original = element("span", item.source_text || "", "source-author-name");
+        setLanguage(original, sourceLanguage, sourceDirection);
+        row.append(original);
+        if (item.localized_text) {
+          row.append(document.createTextNode(" ("));
+          const localized = element("span", item.localized_text, "source-author-localized");
+          setLanguage(localized, targetLanguage, targetDirection);
+          row.append(localized, document.createTextNode(")"));
+        }
+      } else if (item.kind === "affiliation") {
+        row.textContent = String(item.source_text || "");
+        setLanguage(row, sourceLanguage, sourceDirection);
+      } else if (item.kind === "profile") {
+        row.textContent = String(item.source_text || "");
+        setLanguage(row, sourceLanguage, sourceDirection);
+      }
+      section.append(row);
+    });
+    return section.childNodes.length ? section : null;
   }
 
   function glossaryEnabled() {
@@ -284,6 +332,16 @@
       String(block.language || sourceLanguage),
       String(block.direction || sourceDirection)
     );
+    const anchoredCredits = (snapshot.source_credit_visible_projection || []).filter(
+      item => item.slot === "source_block" && item.block_id === block.block_id
+    );
+    if (anchoredCredits.length) {
+      const credits = renderSourceCreditRows(anchoredCredits);
+      if (credits) wrapper.append(credits);
+      if ((snapshot.source_credit_replaced_block_ids || []).includes(block.block_id)) {
+        return wrapper;
+      }
+    }
     if (block.kind === "equation" || block.kind === "math" || block.kind === "display_math") {
       if (block.number) wrapper.append(element("span", block.number, "equation-number"));
       appendRuns(wrapper, block.math || block.runs || []);

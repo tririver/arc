@@ -330,6 +330,20 @@ only the current segment, cursor, source hash, terms, and bounded sources. Stabl
 idempotency keys and accepted-block ledgers make routine resume automatic
 without repeating accepted provider calls.
 
+PDF and static-web output share one hashed source-credit model. Every original
+author, affiliation, and source profile remains visible exactly once; a
+reliably evidenced localized author name is adjacent and cannot replace the
+source name. When the programmatic
+`BuildOptions.source_credit_reference_id` input is set, cached-reference pairing
+is limited to one source author and one reference author. Multiple authors
+additionally require a complete `source_credit_author_mapping`, never positional
+or fuzzy inference; these inputs are not currently exposed by the CLI. Source
+anchors are authoritative:
+front matter stays with the title group and a distinct profile block stays in
+place. Unanchored metadata falls back after the title in author, affiliation,
+profile order. Reference evidence is strict cache-only and cannot fetch,
+upgrade caches, invoke an LLM, or alter an affiliation or profile.
+
 During generation, each accepted segment atomically refreshes the static reader
 snapshot and its hashed HTML/JavaScript asset bundle. The last complete bundle
 remains readable if a later refresh fails. `arc-companion render-web` rebuilds

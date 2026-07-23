@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import wraps
@@ -27,6 +28,8 @@ from bs4 import BeautifulSoup
 from .context_sources import load_context_evidence
 from .content import (
     checkpoint_receipts,
+    load_reader_content,
+    migrate_legacy_reader_content,
     reader_content_from_overrides,
     store_reader_content,
 )
@@ -66,6 +69,11 @@ from .ledger_registry import (
     registered_lane_ledger_paths,
 )
 from .progress import CompanionProgress
+from .source_credit import (
+    normalize_source_credit,
+    source_credit_visible_projection,
+    validate_source_credit,
+)
 from .recovery_units import (
     call_model_with_recovery_descriptor,
     recovery_unit_for_ledger,
@@ -122,7 +130,12 @@ from .paper_broker import (
     paper_broker_prompt_prefix,
 )
 from .language import base_language, contains_lexical_term, normalize_language_tag
-from .latex import LatexError, render_companion_tex, validate_tex_fidelity
+from .latex import (
+    LatexError,
+    render_companion_tex,
+    validate_pdf_source_credit_text,
+    validate_tex_fidelity,
+)
 from .pdf import (
     compile_latex,
     managed_run_root_pdf_path,
@@ -248,8 +261,8 @@ REVIEW_PROMPT_BUDGET_AUDIT_VERSION = "arc.companion.review-prompt-budget-audit.v
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v3"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
-FINAL_RENDER_VERSION = "arc.companion.final-render.v11"
-READER_FINAL_CHECKPOINT_VERSION = "arc.companion.reader-final.v3"
+FINAL_RENDER_VERSION = "arc.companion.final-render.v12"
+READER_FINAL_CHECKPOINT_VERSION = "arc.companion.reader-final.v4"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
 CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
 CONTEXT_SEGMENT_CHARS_TOTAL = 12_000
@@ -387,6 +400,8 @@ class BuildOptions:
     skip_translation: bool = False
     context_paper_ids: tuple[str, ...] = ()
     user_intent: str | None = None
+    source_credit_reference_id: str | None = None
+    source_credit_author_mapping: tuple[Mapping[str, str], ...] = ()
     stop_after_first_chapter: bool = False
     document_kind: str = "auto"
     idle_timeout_seconds: float | None = None
@@ -414,6 +429,15 @@ class BuildOptions:
             raise ValueError("arc_paper_access must be none or full")
         if self.arc_paper_direct_shell and self.arc_paper_access != "full":
             raise ValueError("arc_paper_direct_shell requires arc_paper_access=full")
+        if self.source_credit_author_mapping and not self.source_credit_reference_id:
+            raise ValueError(
+                "source_credit_author_mapping requires source_credit_reference_id"
+            )
+        if any(
+            not isinstance(item, Mapping)
+            for item in self.source_credit_author_mapping
+        ):
+            raise ValueError("source_credit_author_mapping entries must be mappings")
         child_budget = (
             self.arc_paper_child_llm_max_calls,
             self.arc_paper_child_llm_max_tokens,
@@ -625,6 +649,9 @@ def _build_companion_unlocked(
     notice = LANGUAGE_NOTICE if options.language_was_defaulted else None
     previous_state = _read_optional_json(state_path)
     build_request_sha256 = _build_request_identity(options)
+    credit_neutral_build_request_sha256 = (
+        _credit_neutral_build_request_identity(options)
+    )
     previous_build_instance_id = str(
         previous_state.get("build_instance_id") or ""
     ).strip()
@@ -659,6 +686,28 @@ def _build_companion_unlocked(
             recache=options.recache,
             document_kind=options.document_kind,
         )
+        source_credit_diagnostics: list[dict[str, str]] = []
+        source_credit = _source_credit_for_bundle(
+            options, bundle, diagnostics=source_credit_diagnostics,
+        )
+        diagnostics = (*bundle.diagnostics, *source_credit_diagnostics)
+        source_credit_refresh = _refresh_completed_source_credit_only(
+            options=options,
+            bundle=bundle,
+            source_credit=source_credit,
+            previous_state=previous_state,
+            state_path=state_path,
+            build_request_sha256=build_request_sha256,
+            credit_neutral_build_request_sha256=(
+                credit_neutral_build_request_sha256
+            ),
+            diagnostics=diagnostics,
+            compiler=compiler,
+            pdf_validator=pdf_validator,
+            notice=notice,
+        )
+        if source_credit_refresh is not None:
+            return source_credit_refresh
         generation_document = _generation_document(bundle.document)
         bootstrap_fingerprint = _fingerprint(
             bundle, options, evidence={}, domain_context=None,
@@ -679,9 +728,14 @@ def _build_companion_unlocked(
             state_path,
             build_instance_id=build_instance_id,
             build_request_sha256=build_request_sha256,
+            credit_neutral_build_request_sha256=(
+                credit_neutral_build_request_sha256
+            ),
             build_source_fingerprint=bootstrap_fingerprint,
+            source_credit_neutral_source_sha256=(
+                _source_credit_neutral_source_identity(bundle)
+            ),
         )
-        diagnostics = bundle.diagnostics
         def register_bootstrap_recovery_root(root: Path) -> None:
             nonlocal checkpoint_dir
             checkpoint_dir = root.resolve(strict=False)
@@ -754,6 +808,13 @@ def _build_companion_unlocked(
             previous_state=previous_state,
         )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        source_credit = _load_or_store_source_credit(
+            checkpoint_dir, source_credit,
+        )
+        _state(
+            state_path,
+            source_credit_sha256=source_credit["canonical_sha256"],
+        )
         previous_checkpoint = Path(str(previous_state.get("checkpoint_dir") or ""))
         if (
             not options.skip_translation
@@ -774,6 +835,8 @@ def _build_companion_unlocked(
             and not options.regenerate_lanes
             and not options.regenerate_segments
             and previous_state.get("status") == "complete"
+            and previous_state.get("build_request_sha256")
+            == build_request_sha256
             and previous_state.get("fingerprint") == fingerprint
             and previous_state.get("translation_mode") == (
                 "skipped" if options.skip_translation else "enabled"
@@ -925,6 +988,7 @@ def _build_companion_unlocked(
         if isinstance(bundle.parsed.get("structure"), dict):
             return _build_chaptered_companion(
                 options=options, bundle=bundle, evidence=evidence,
+                source_credit=source_credit,
                 domain_context=domain_context, checkpoint_dir=checkpoint_dir,
                 fingerprint=fingerprint, build_instance_id=build_instance_id,
                 notice=notice, diagnostics=diagnostics,
@@ -1050,6 +1114,7 @@ def _build_companion_unlocked(
                 target[str(segment_id)] = dict(value)
                 overrides = {
                     "document": bundle.document,
+                    "source_credit": source_credit,
                     "chapters": [],
                     "segments": expanded,
                     "chapter_guides": {},
@@ -1113,6 +1178,7 @@ def _build_companion_unlocked(
         stem = f"{safe_name(bundle.paper_id)}_companion_{safe_name(options.annotation_language)}"
         preview = _publish_pdf_artifact(
             document=_first_wave_preview_document(bundle.document, first_wave),
+            source_credit=source_credit,
             segments=first_wave,
             annotations=raw_annotations,
             translations=None if options.skip_translation else translations,
@@ -1294,6 +1360,7 @@ def _build_companion_unlocked(
         final_reader_overrides = {
             "status": "complete",
             "document": bundle.document,
+            "source_credit": source_credit,
             "chapters": [],
             "segments": expanded,
             "chapter_guides": {},
@@ -1321,6 +1388,7 @@ def _build_companion_unlocked(
                segment_count=len(expanded))
         final_artifact = _publish_pdf_artifact(
             document=bundle.document,
+            source_credit=source_credit,
             segments=expanded,
             annotations=reviewed,
             translations=reviewed_translations,
@@ -1436,6 +1504,7 @@ def _build_companion_unlocked(
 
 def _build_chaptered_companion(
     *, options: BuildOptions, bundle: SourceBundle, evidence: dict[str, Any],
+    source_credit: dict[str, Any],
     domain_context: dict[str, Any] | None, checkpoint_dir: Path,
     fingerprint: str, build_instance_id: str, notice: str | None,
     diagnostics: tuple[dict[str, str], ...],
@@ -1861,6 +1930,7 @@ def _build_chaptered_companion(
             )
             return {
                 "document": document,
+                "source_credit": source_credit,
                 "chapters": list(chapters_pack["chapters"]),
                 "segments": ordered_segments,
                 "chapter_guides": dict(reader_guides),
@@ -4393,6 +4463,7 @@ def _build_chaptered_companion(
             "first_chapter_ready" if options.stop_after_first_chapter else "complete"
         ),
         "document": render_document,
+        "source_credit": source_credit,
         "chapters": selected_chapters,
         "segments": segments,
         "chapter_guides": guides,
@@ -4417,7 +4488,8 @@ def _build_chaptered_companion(
     )
     stem = f"{safe_name(bundle.paper_id)}_companion_{safe_name(options.annotation_language)}"
     artifact = _publish_pdf_artifact(
-        document=render_document, segments=segments, annotations=annotations,
+        document=render_document, source_credit=source_credit,
+        segments=segments, annotations=annotations,
         translations=translations, evidence=evidence, glossary=glossary,
         metadata=bundle.metadata, language=options.annotation_language,
         source_language=options.source_language,
@@ -4461,11 +4533,24 @@ def _build_chaptered_companion(
         if freeze_path.is_file() and read_json(freeze_path) != freeze:
             raise RuntimeError("the confirmed first chapter freeze manifest changed")
         write_json(freeze_path, freeze)
-    _publish_reader_update(
+    final_web = _publish_reader_update(
         options.project_dir.resolve(), state_path, reader_publish_lock,
         final_overrides=final_reader_overrides,
         strict=True,
     )
+    if final_web is None or any(
+        artifact[pdf_key] != final_web.get(web_key)
+        for pdf_key, web_key in (
+            ("source_credit_sha256", "source_credit_sha256"),
+            (
+                "source_credit_observation_sha256",
+                "source_credit_observation_sha256",
+            ),
+        )
+    ):
+        raise RuntimeError(
+            "PDF and Web source-credit canonical/observation hashes differ"
+        )
     # Provider success is only response_received. Promote stateless controls
     # after the owning business pipeline completed normalization, invariants,
     # and durable application checkpoints.
@@ -8147,6 +8232,10 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "skip_translation": options.skip_translation,
         "context_paper_ids": list(options.context_paper_ids),
         "user_intent": options.user_intent,
+        "source_credit_reference_id": options.source_credit_reference_id,
+        "source_credit_author_mapping": [
+            dict(item) for item in options.source_credit_author_mapping
+        ],
         "stop_after_first_chapter": options.stop_after_first_chapter,
         "document_kind": options.document_kind,
         "idle_timeout_seconds": options.idle_timeout_seconds,
@@ -8168,6 +8257,18 @@ def _build_request_identity(options: BuildOptions) -> str:
     return sha256_json({
         "schema_version": "arc.companion.build-request.v1",
         "options": _recovery_options(options),
+    })
+
+
+def _credit_neutral_build_request_identity(options: BuildOptions) -> str:
+    """Identify every build input except the two source-credit selectors."""
+
+    recovery = _recovery_options(options)
+    recovery.pop("source_credit_reference_id", None)
+    recovery.pop("source_credit_author_mapping", None)
+    return sha256_json({
+        "schema_version": "arc.companion.credit-neutral-build-request.v1",
+        "options": recovery,
     })
 
 
@@ -8245,6 +8346,14 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         skip_translation=bool(value.get("skip_translation", False)),
         context_paper_ids=tuple(value.get("context_paper_ids") or ()),
         user_intent=(str(value.get("user_intent") or "").strip() or None),
+        source_credit_reference_id=(
+            str(value.get("source_credit_reference_id") or "").strip() or None
+        ),
+        source_credit_author_mapping=tuple(
+            dict(item)
+            for item in value.get("source_credit_author_mapping") or ()
+            if isinstance(item, Mapping)
+        ),
         stop_after_first_chapter=bool(value.get("stop_after_first_chapter")),
         document_kind=str(value.get("document_kind") or "auto"),
         idle_timeout_seconds=value.get("idle_timeout_seconds"),
@@ -8511,6 +8620,7 @@ def _first_wave_preview_document(
 def _publish_pdf_artifact(
     *,
     document: dict[str, Any],
+    source_credit: Mapping[str, Any],
     segments: list[dict[str, Any]],
     annotations: dict[str, dict[str, Any]],
     translations: dict[str, dict[str, Any]] | None,
@@ -8563,6 +8673,7 @@ def _publish_pdf_artifact(
         chapter_guides=chapter_guides,
         source_language=source_language,
         title_translations=title_translations,
+        source_credit=source_credit,
     )
     fidelity_errors = validate_tex_fidelity(tex, document, source_manifest)
     if fidelity_errors:
@@ -8582,12 +8693,44 @@ def _publish_pdf_artifact(
         write_text(building_tex, tex)
         compiler(building_tex, building_pdf)
         pdf_report = pdf_validator(building_pdf)
+        pdf_source_credit = (
+            validate_pdf_source_credit_text(
+                building_pdf, document, source_manifest,
+            )
+            if pdf_validator is validate_pdf
+            else {
+                "schema_version": (
+                    "arc.companion.source-credit-pdf-observation.v1"
+                ),
+                "canonical_sha256": validate_source_credit(source_credit)[
+                    "canonical_sha256"
+                ],
+                "visible_projection_sha256": sha256_json(
+                    source_credit_visible_projection(
+                        source_credit,
+                        front_matter_block_ids=[
+                            str(value)
+                            for key, values in (
+                                (document.get("front_matter") or {}).get(
+                                    "block_ids"
+                                )
+                                or {}
+                            ).items()
+                            if key in {"title", "authors", "affiliations"}
+                            for value in values
+                        ],
+                    )
+                ),
+                "validation": "delegated-test-validator",
+            }
+        )
         write_json(building_manifest, source_manifest)
         write_json(
             building_validation,
             {
                 "ok": True,
                 "pdf": pdf_report,
+                "source_credit_pdf": pdf_source_credit,
                 "fidelity_errors": [],
                 "warnings": list(source_manifest.get("render_warnings") or []),
             },
@@ -8611,6 +8754,12 @@ def _publish_pdf_artifact(
         "manifest_sha256": _sha256_existing_file(manifest_path),
         "validation_sha256": _sha256_existing_file(validation_path),
         "pdf": pdf_report,
+        "source_credit_sha256": validate_source_credit(source_credit)[
+            "canonical_sha256"
+        ],
+        "source_credit_observation_sha256": pdf_source_credit[
+            "visible_projection_sha256"
+        ],
     }
 
 
@@ -8652,7 +8801,14 @@ def _reader_evidence_by_segment(
     return result
 
 
-def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf) -> dict[str, Any]:
+def validate_project(
+    project_dir: Path,
+    *,
+    pdf_validator: Callable[[Path], dict[str, object]] = validate_pdf,
+    pdf_source_credit_validator: Callable[
+        [Path, Mapping[str, Any], Mapping[str, Any]], dict[str, Any]
+    ] = validate_pdf_source_credit_text,
+) -> dict[str, Any]:
     status = read_status(project_dir)
     if not status.get("ok"):
         return status
@@ -8676,6 +8832,13 @@ def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[
     if not tex.is_file() or not manifest_path.is_file():
         return err("companion_validation_failed", "TeX or source manifest is missing")
     try:
+        render_version = (
+            pdf_value.get("final_render_version")
+            or pdf_value.get("render_version")
+            or effective.get("final_render_version")
+        )
+        if render_version != FINAL_RENDER_VERSION:
+            raise RuntimeError("published PDF render version is stale")
         if not _published_pdf_outputs_match(effective):
             raise RuntimeError("completed companion outputs do not match their recorded hashes")
         if not _run_root_pdf_output_matches(effective, project_dir.resolve()):
@@ -8700,12 +8863,39 @@ def validate_project(project_dir: Path, *, pdf_validator: Callable[[Path], dict[
         fidelity_errors = validate_tex_fidelity(tex.read_text(encoding="utf-8"), document, manifest)
         if fidelity_errors:
             raise RuntimeError("source fidelity validation failed: " + "; ".join(fidelity_errors))
+        validation = read_json(Path(str(effective["validation_path"])))
+        stored_source_credit_pdf = validation.get("source_credit_pdf")
+        if not isinstance(stored_source_credit_pdf, Mapping):
+            raise RuntimeError(
+                "PDF validation receipt has no source_credit_pdf observation"
+            )
+        observed_source_credit_pdf = pdf_source_credit_validator(
+            pdf, document, manifest,
+        )
+        if (
+            not isinstance(observed_source_credit_pdf, Mapping)
+            or dict(observed_source_credit_pdf)
+            != dict(stored_source_credit_pdf)
+        ):
+            raise RuntimeError(
+                "searchable PDF source-credit observation differs from "
+                "the validation receipt"
+            )
         report = pdf_validator(pdf)
         from .web import validate_reader_project
         web_report = (
             validate_reader_project(project_dir.resolve(), state=effective)
             if effective.get("output_html") else None
         )
+        if web_report and (
+            web_report.get("source_credit_sha256")
+            != stored_source_credit_pdf.get("canonical_sha256")
+            or web_report.get("source_credit_observation_sha256")
+            != stored_source_credit_pdf.get("visible_projection_sha256")
+        ):
+            raise RuntimeError(
+                "validated PDF/Web source-credit observations differ"
+            )
     except (OSError, RuntimeError, ValueError) as exc:
         return err("companion_validation_failed", str(exc))
     return ok({
@@ -17712,6 +17902,335 @@ def _write_reader_final_checkpoint(
         "final_overrides": final_overrides,
     })
     return path
+
+
+def _load_or_store_source_credit(
+    checkpoint_dir: Path, candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover one checkpoint-bound canonical credit or persist the new one."""
+
+    path = checkpoint_dir / "source-credit.json"
+    credit = validate_source_credit(candidate)
+    if not path.is_file() or read_json(path) != credit:
+        write_json(path, credit)
+    return credit
+
+
+def _source_credit_for_bundle(
+    options: BuildOptions,
+    bundle: SourceBundle,
+    *,
+    diagnostics: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Resolve only explicitly requested, strict-cache localization evidence."""
+
+    cached_reference: dict[str, Any] | None = None
+    reference_id = str(options.source_credit_reference_id or "").strip()
+    if reference_id:
+        try:
+            from arc_paper.service import get_cached_source_author_evidence
+
+            result = get_cached_source_author_evidence(reference_id)
+        except (ImportError, OSError, ValueError):
+            result = None
+        if isinstance(result, Mapping) and result.get("ok") is True:
+            evidence = result.get("data")
+            if isinstance(evidence, Mapping):
+                records = []
+                for raw in evidence.get("authors") or []:
+                    if not isinstance(raw, Mapping):
+                        continue
+                    records.append({
+                        "source_id": raw.get("source_author_id"),
+                        "source_name": raw.get("source_name"),
+                        "field_sha256": raw.get("field_sha256"),
+                    })
+                cached_reference = {
+                    "identity": evidence.get("reference_identity"),
+                    "source_hash": evidence.get("source_hash"),
+                    "document_sha256": evidence.get("document_sha256"),
+                    "author_records": records,
+                    # Kept as the input spelling understood by the v1
+                    # normalizer; the records still carry stable identities.
+                    "authors": records,
+                }
+    return normalize_source_credit(
+        bundle.document,
+        bundle.metadata,
+        cached_reference=cached_reference,
+        explicit_author_mapping=options.source_credit_author_mapping,
+        diagnostics=diagnostics,
+    )
+
+
+def _refresh_completed_source_credit_only(
+    *,
+    options: BuildOptions,
+    bundle: SourceBundle,
+    source_credit: Mapping[str, Any],
+    previous_state: Mapping[str, Any],
+    state_path: Path,
+    build_request_sha256: str,
+    credit_neutral_build_request_sha256: str,
+    diagnostics: Sequence[Mapping[str, Any]],
+    compiler: Callable[[Path, Path], None],
+    pdf_validator: Callable[[Path], dict[str, object]],
+    notice: str | None,
+) -> dict[str, Any] | None:
+    """Re-render a completed build when only source-credit fidelity is stale."""
+
+    if (
+        options.force
+        or options.regenerate_lanes
+        or options.regenerate_segments
+        or previous_state.get("status") != "complete"
+        or previous_state.get("credit_neutral_build_request_sha256")
+        != credit_neutral_build_request_sha256
+        or previous_state.get("source_credit_neutral_source_sha256")
+        != _source_credit_neutral_source_identity(bundle)
+    ):
+        return None
+    canonical = validate_source_credit(source_credit)
+    published = previous_state.get("published")
+    published = published if isinstance(published, Mapping) else {}
+    old_digest = str(
+        published.get("content_sha256")
+        or previous_state.get("content_sha256")
+        or ""
+    )
+    if not old_digest:
+        return None
+    try:
+        envelope = load_reader_content(options.project_dir.resolve(), old_digest)
+    except Exception:
+        try:
+            envelope = migrate_legacy_reader_content(
+                options.project_dir.resolve(), old_digest,
+            )
+        except Exception:
+            return None
+    old_content = envelope.get("content")
+    if not isinstance(old_content, Mapping):
+        return None
+    old_credit_hash = str(
+        old_content.get("source_credit_sha256")
+        or previous_state.get("source_credit_sha256")
+        or ""
+    )
+    render_stale = (
+        previous_state.get("final_render_version") != FINAL_RENDER_VERSION
+        or not _web_outputs_match(dict(previous_state))
+    )
+    if old_credit_hash == canonical["canonical_sha256"] and not render_stale:
+        if previous_state.get("build_request_sha256") == build_request_sha256:
+            return None
+        current = _state(
+            state_path,
+            **{
+                **dict(previous_state),
+                "build_request_sha256": build_request_sha256,
+                "credit_neutral_build_request_sha256": (
+                    credit_neutral_build_request_sha256
+                ),
+                "recovery_options": _recovery_options(options),
+                "diagnostics": [dict(item) for item in diagnostics],
+            },
+        )
+        return ok(
+            current,
+            resumed=True,
+            source_credit_refresh=True,
+            provider_calls=0,
+            controller_calls=0,
+            notice=notice,
+            diagnostics=[dict(item) for item in diagnostics],
+        )
+    if (
+        _source_credit_neutral_document(old_content.get("document"))
+        != _source_credit_neutral_document(bundle.document)
+        or _source_credit_neutral_metadata(old_content.get("metadata"))
+        != _source_credit_neutral_metadata(bundle.metadata)
+    ):
+        return None
+    checkpoint = Path(str(previous_state.get("checkpoint_dir") or ""))
+    reader_final_path = checkpoint / "reader-final.json"
+    if not checkpoint.is_dir() or not reader_final_path.is_file():
+        return None
+    try:
+        reader_final = read_json(reader_final_path)
+        final_overrides = dict(reader_final.get("final_overrides") or {})
+        if not final_overrides:
+            return None
+    except (OSError, ValueError):
+        return None
+
+    old_reader_final_bytes = reader_final_path.read_bytes()
+    content = deepcopy(dict(old_content))
+    content["document"] = deepcopy(bundle.document)
+    content["metadata"] = deepcopy(bundle.metadata)
+    content["source_credit"] = canonical
+    content["source_credit_sha256"] = canonical["canonical_sha256"]
+    stored = store_reader_content(
+        options.project_dir.resolve(),
+        content=content,
+        checkpoint_dir=checkpoint,
+        review_receipts=envelope.get("review_receipts") or {},
+    )
+    final_overrides.update({
+        "document": deepcopy(bundle.document),
+        "metadata": deepcopy(bundle.metadata),
+        "source_credit": canonical,
+    })
+    _write_reader_final_checkpoint(checkpoint, final_overrides)
+    stem = (
+        f"{safe_name(bundle.paper_id)}_companion_"
+        f"{safe_name(str(content['language']))}"
+    )
+    try:
+        artifact = _publish_pdf_artifact(
+            document=dict(content["document"]),
+            source_credit=canonical,
+            segments=list(content["segments"]),
+            annotations=dict(content["annotations"]),
+            translations=(
+                dict(content["translations"])
+                if isinstance(content.get("translations"), Mapping) else None
+            ),
+            glossary=dict(content["glossary"]),
+            metadata=dict(content["metadata"]),
+            language=str(content["language"]),
+            source_language=str(content.get("source_language") or "und"),
+            title_translations=content.get("title_translations"),
+            output_dir=options.project_dir.resolve(),
+            stem=stem,
+            manifest_name="source-manifest.json",
+            validation_name="validation.json",
+            compiler=compiler,
+            pdf_validator=pdf_validator,
+            evidence={},
+            augmentation_scope="substantive",
+            chapters=list(content["chapters"]),
+            chapter_guides=dict(content["chapter_guides"]),
+        )
+        web_state = _publish_reader_update(
+            options.project_dir.resolve(),
+            state_path,
+            threading.RLock(),
+            final_overrides=final_overrides,
+            strict=True,
+        )
+        if web_state is None:
+            raise RuntimeError("source-credit Web refresh did not publish")
+        if any(
+            artifact[pdf_key] != web_state.get(web_key)
+            for pdf_key, web_key in (
+                ("source_credit_sha256", "source_credit_sha256"),
+                (
+                    "source_credit_observation_sha256",
+                    "source_credit_observation_sha256",
+                ),
+            )
+        ):
+            raise RuntimeError(
+                "source-credit refresh PDF/Web observations differ"
+            )
+    except Exception:
+        write_text(reader_final_path, old_reader_final_bytes.decode("utf-8"))
+        write_json(state_path, dict(previous_state))
+        raise
+
+    final_values = {
+        **dict(previous_state),
+        "status": "complete",
+        "paper_id": bundle.paper_id,
+        "content_sha256": stored["content_sha256"],
+        "content_object_path": str(stored["path"]),
+        "source_credit_sha256": canonical["canonical_sha256"],
+        "build_request_sha256": build_request_sha256,
+        "credit_neutral_build_request_sha256": (
+            credit_neutral_build_request_sha256
+        ),
+        "recovery_options": _recovery_options(options),
+        "diagnostics": [dict(item) for item in diagnostics],
+        "output_tex": artifact["tex_path"],
+        "output_pdf": artifact["pdf_path"],
+        "output_tex_sha256": artifact["tex_sha256"],
+        "output_pdf_sha256": artifact["pdf_sha256"],
+        "source_manifest_path": artifact["manifest_path"],
+        "source_manifest_sha256": artifact["manifest_sha256"],
+        "validation_path": artifact["validation_path"],
+        "validation_sha256": artifact["validation_sha256"],
+        "final_render_version": FINAL_RENDER_VERSION,
+        "reader_final_checkpoint_version": READER_FINAL_CHECKPOINT_VERSION,
+        "notice": notice,
+        **{
+            key: value
+            for key, value in dict(web_state).items()
+            if key in {
+                "output_html", "output_html_sha256", "reader_snapshot_path",
+                "reader_snapshot_sha256", "web_manifest_path",
+                "web_manifest_sha256", "web_render_version",
+            }
+        },
+    }
+    final = _state(state_path, **final_values)
+    run_pdf = publish_run_root_pdf(
+        Path(str(artifact["pdf_path"])),
+        options.project_dir.resolve(),
+        managed_path=managed_run_root_pdf_path(dict(previous_state)),
+    )
+    final = _state(state_path, **run_pdf)
+    return ok(
+        final,
+        resumed=True,
+        source_credit_refresh=True,
+        provider_calls=0,
+        controller_calls=0,
+        notice=notice,
+    )
+
+
+def _source_credit_neutral_document(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return None
+    document = deepcopy(dict(value))
+    document.pop("parser_version", None)
+    front = document.get("front_matter")
+    if isinstance(front, Mapping):
+        front = dict(front)
+        for key in (
+            "author_records", "affiliation_records", "profiles",
+            "author_profiles", "author_affiliations", "associations",
+            "author_name_variants",
+        ):
+            front.pop(key, None)
+        block_ids = front.get("block_ids")
+        if isinstance(block_ids, Mapping):
+            block_ids = dict(block_ids)
+            block_ids.pop("profiles", None)
+            front["block_ids"] = block_ids
+        document["front_matter"] = front
+    return document
+
+
+def _source_credit_neutral_source_identity(bundle: SourceBundle) -> str:
+    """Bind credit-only reuse to the same non-credit source snapshot."""
+
+    return sha256_json({
+        "schema_version": "arc.companion.source-credit-neutral-source.v1",
+        "paper_id": bundle.paper_id,
+        "document": _source_credit_neutral_document(bundle.document),
+        "metadata": _source_credit_neutral_metadata(bundle.metadata),
+    })
+
+
+def _source_credit_neutral_metadata(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return {}
+    metadata = dict(value)
+    for key in ("authors", "author", "affiliations", "profiles"):
+        metadata.pop(key, None)
+    return metadata
 
 
 def _write_legacy_reuse_plan(checkpoint_dir: Path, options: BuildOptions) -> Path:

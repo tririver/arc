@@ -13,9 +13,15 @@ from arc_companion.content import (
     READER_CONTENT_VERSION,
     ContentBundleError,
     load_reader_content,
+    migrate_legacy_reader_content,
+    reader_content_from_overrides,
     store_reader_content,
 )
-from arc_companion.io import read_json, sha256_file, write_json
+from arc_companion.source_credit import (
+    normalize_source_credit,
+    source_credit_visible_projection,
+)
+from arc_companion.io import read_json, sha256_file, sha256_json, write_json
 from arc_companion.pipeline import validate_project
 from arc_companion.render import render_content
 from arc_companion.run_lock import ProjectBuildLock
@@ -103,6 +109,124 @@ def test_reviewed_content_uses_current_schema_and_receipt_versions(tmp_path: Pat
     assert value["schema_version"] == READER_CONTENT_VERSION
     assert value["validation_receipt"]["schema_version"] == CONTENT_RECEIPT_VERSION
     assert value["validation_receipt"]["validator_version"] == CONTENT_RECEIPT_VERSION
+    assert value["content"]["source_credit"]["canonical_sha256"] == value["content"][
+        "source_credit_sha256"
+    ]
+
+
+def test_reader_content_persists_identical_validated_source_credit() -> None:
+    overrides = _content()
+    credit = normalize_source_credit(
+        {
+            **overrides["document"],
+            "front_matter": {
+                "authors": ["Original"],
+                "affiliations": ["Institute"],
+                "profiles": ["Profile"],
+            },
+        },
+        overrides["metadata"],
+    )
+    overrides["document"] = {
+        **overrides["document"],
+        "front_matter": {
+            "authors": ["Different fallback must not be used"],
+        },
+    }
+    overrides["source_credit"] = credit
+
+    content = reader_content_from_overrides(
+        overrides,
+        reader_evidence_by_segment=overrides["reader_evidence_by_segment"],
+    )
+
+    assert content["source_credit"] == credit
+    assert content["source_credit_sha256"] == credit["canonical_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("render_format", "expected"),
+    [
+        ("pdf", {"pdf": 1, "web": 0}),
+        ("web", {"pdf": 0, "web": 1}),
+        ("all", {"pdf": 1, "web": 1}),
+    ],
+)
+def test_credit_only_digest_rebuilds_only_requested_outputs_without_provider_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    render_format: str,
+    expected: dict[str, int],
+) -> None:
+    import arc_companion.render as render_module
+    import arc_companion.web as web_module
+
+    project, old_digest = _project(tmp_path)
+    changed = _content()
+    changed_credit = normalize_source_credit({
+        "front_matter": {
+            "authors": ["Original"],
+            "author_name_variants": [{
+                "source_name": "Original",
+                "localized_name": "本地名",
+                "source_identity": "source:localized",
+            }],
+        },
+        "blocks": [],
+    })
+    changed["source_credit"] = changed_credit
+    changed["source_credit_sha256"] = changed_credit["canonical_sha256"]
+    new_digest = store_reader_content(project, content=changed)["content_sha256"]
+    assert new_digest != old_digest
+    calls = {"pdf": 0, "web": 0}
+
+    def fake_pdf(*args, **kwargs):
+        calls["pdf"] += 1
+        return {
+            "content_sha256": new_digest,
+            "render_version": render_module.PDF_RENDER_VERSION,
+            "output_tex": str(project / "new.tex"),
+            "output_tex_sha256": "tex",
+            "output_pdf": str(project / "new.pdf"),
+            "output_pdf_sha256": "pdf",
+            "source_manifest_path": str(project / "manifest.json"),
+            "source_manifest_sha256": "manifest",
+            "validation_path": str(project / "validation.json"),
+            "validation_sha256": "validation",
+            "source_credit_sha256": changed_credit["canonical_sha256"],
+            "source_credit_observation_sha256": "shared-observation",
+        }
+
+    def fake_web(*args, **kwargs):
+        calls["web"] += 1
+        assert kwargs["final_overrides"]["source_credit_sha256"] == (
+            changed_credit["canonical_sha256"]
+        )
+        return {
+            "output_html": str(project / "reader" / "index.html"),
+            "output_html_sha256": "html",
+            "reader_snapshot_path": str(project / "reader" / "snapshot.json"),
+            "reader_snapshot_sha256": "snapshot",
+            "web_manifest_path": str(project / "reader" / "manifest.json"),
+            "web_manifest_sha256": "web-manifest",
+            "web_render_version": web_module.WEB_RENDER_VERSION,
+            "source_credit_sha256": changed_credit["canonical_sha256"],
+            "source_credit_observation_sha256": "shared-observation",
+        }
+
+    monkeypatch.setattr(render_module, "_render_pdf", fake_pdf)
+    monkeypatch.setattr(web_module, "publish_reader", fake_web)
+    monkeypatch.setattr(
+        render_module, "publish_run_root_pdf", lambda *args, **kwargs: {},
+    )
+
+    result = render_content(
+        project, format=render_format, content_sha256=new_digest,
+    )
+
+    assert result["ok"] is True, result
+    assert result["data"]["provider_calls"] == 0
+    assert calls == expected
 
 
 def test_store_refreshes_matching_legacy_content_envelope(tmp_path: Path) -> None:
@@ -122,6 +246,83 @@ def test_store_refreshes_matching_legacy_content_envelope(tmp_path: Path) -> Non
 
     assert stored["schema_version"] == READER_CONTENT_VERSION
     assert stored["validation_receipt"]["schema_version"] == CONTENT_RECEIPT_VERSION
+
+
+def test_valid_v2_object_migrates_to_new_digest_without_mutating_old_or_calling_llm(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    current = store_reader_content(project, content=_content())
+    current_path = current["path"]
+    envelope = read_json(current_path)
+    legacy_content = dict(envelope["content"])
+    legacy_content.pop("source_credit")
+    legacy_content.pop("source_credit_sha256")
+    legacy_digest = sha256_json(legacy_content)
+    legacy_receipt = {
+        **envelope["validation_receipt"],
+        "schema_version": "arc.companion.reader-content-validation.v2",
+        "validator_version": "arc.companion.reader-content-validation.v2",
+        "content_sha256": legacy_digest,
+        "checks": [
+            item for item in envelope["validation_receipt"]["checks"]
+            if item != "source_credit_contract_valid"
+        ],
+    }
+    legacy_receipt.pop("bundle_sha256")
+    legacy_bundle_sha = sha256_json({
+        "content_sha256": legacy_digest,
+        "content": legacy_content,
+        "review_receipts": envelope["review_receipts"],
+        "provenance": envelope["provenance"],
+        "validation_receipt": legacy_receipt,
+    })
+    legacy = {
+        **envelope,
+        "schema_version": "arc.companion.reader-content.v2",
+        "content_sha256": legacy_digest,
+        "bundle_sha256": legacy_bundle_sha,
+        "content": legacy_content,
+        "validation_receipt": {
+            **legacy_receipt,
+            "bundle_sha256": legacy_bundle_sha,
+        },
+    }
+    legacy_path = (
+        project / ".arc-companion" / "objects" / "reader-content"
+        / f"{legacy_digest}.json"
+    )
+    write_json(legacy_path, legacy)
+    old_bytes = legacy_path.read_bytes()
+
+    migrated = migrate_legacy_reader_content(project, legacy_digest)
+
+    assert migrated["content_sha256"] != legacy_digest
+    assert migrated["migrated_from_content_sha256"] == legacy_digest
+    assert migrated["content"]["source_credit_sha256"] == migrated["content"][
+        "source_credit"
+    ]["canonical_sha256"]
+    assert legacy_path.read_bytes() == old_bytes
+
+    write_json(project / "state.json", {
+        "schema_version": "arc.companion.state.v3",
+        "status": "complete",
+        "paper_id": "local:fixture",
+        "published": {"content_sha256": legacy_digest},
+    })
+    _render_fakes(monkeypatch)
+    result = render_content(
+        project,
+        format="pdf",
+        content_sha256=legacy_digest,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"migrated-pdf"),
+        pdf_validator=lambda _pdf: {"pages": 1},
+    )
+
+    assert result["ok"] is True, result
+    assert result["data"]["content_sha256"] == migrated["content_sha256"]
+    assert result["data"]["provider_calls"] == 0
+    assert legacy_path.read_bytes() == old_bytes
 
 
 def test_validation_receipt_checks_are_bound_to_bundle_identity(tmp_path: Path) -> None:
@@ -233,10 +434,17 @@ def test_only_all_render_can_complete_matching_render_failure(
         html = root / "reader" / "index.html"
         html.parent.mkdir(parents=True, exist_ok=True)
         html.write_text("reader", encoding="utf-8")
+        overrides = _kwargs["final_overrides"]
         return {
             "content_sha256": digest,
             "output_html": str(html),
             "output_html_sha256": sha256_file(html),
+            "source_credit_sha256": _kwargs["final_overrides"][
+                "source_credit_sha256"
+            ],
+            "source_credit_observation_sha256": sha256_json(
+                source_credit_visible_projection(overrides["source_credit"])
+            ),
         }
 
     monkeypatch.setattr(web_module, "publish_reader", publish_reader)
@@ -629,7 +837,20 @@ def test_validate_uses_published_last_good_while_active_run_failed(
     paths["output_tex"].write_text("fixture tex", encoding="utf-8")
     paths["output_pdf"].write_bytes(b"%PDF fixture")
     write_json(paths["source_manifest_path"], {"assets": []})
-    write_json(paths["validation_path"], {"ok": True})
+    source_credit_pdf = {
+        "schema_version": "arc.companion.source-credit-pdf-observation.v1",
+        "canonical_sha256": "c" * 64,
+        "searchable_text_sha256": "d" * 64,
+        "ordered_ids": [],
+        "visible_projection_sha256": "e" * 64,
+        "visible_counts": {
+            "authors": 0, "affiliations": 0, "profiles": 0,
+        },
+    }
+    write_json(paths["validation_path"], {
+        "ok": True,
+        "source_credit_pdf": source_credit_pdf,
+    })
     published_pdf = {
         key: str(path) for key, path in paths.items()
     }
@@ -637,6 +858,7 @@ def test_validate_uses_published_last_good_while_active_run_failed(
         key.replace("path", "sha256") if key.endswith("_path") else f"{key}_sha256": sha256_file(path)
         for key, path in paths.items()
     })
+    published_pdf["render_version"] = pipeline_module.FINAL_RENDER_VERSION
     # Correct the two output keys whose hash names append rather than replace.
     published_pdf["output_tex_sha256"] = sha256_file(paths["output_tex"])
     published_pdf["output_pdf_sha256"] = sha256_file(paths["output_pdf"])
@@ -660,15 +882,51 @@ def test_validate_uses_published_last_good_while_active_run_failed(
 
     def validate_web(_root: Path, *, state: dict) -> dict:
         observed.update(state)
-        return {"ok": True}
+        return {
+            "ok": True,
+            "source_credit_sha256": source_credit_pdf["canonical_sha256"],
+            "source_credit_observation_sha256": source_credit_pdf[
+                "visible_projection_sha256"
+            ],
+        }
 
     monkeypatch.setattr(web_module, "validate_reader_project", validate_web)
 
     result = validate_project(
-        project, pdf_validator=lambda path: {"bytes": path.stat().st_size},
+        project,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+        pdf_source_credit_validator=lambda *_args: source_credit_pdf,
     )
 
     assert result["ok"] is True
     assert result["data"]["output_pdf"] == str(paths["output_pdf"])
     assert observed["output_pdf"] == str(paths["output_pdf"])
     assert observed["output_html"].endswith("reader/index.html")
+
+    stale = read_json(project / "state.json")
+    stale["published"]["pdf"]["render_version"] = "stale"
+    write_json(project / "state.json", stale)
+    rejected = validate_project(
+        project,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+        pdf_source_credit_validator=lambda *_args: source_credit_pdf,
+    )
+    assert rejected["ok"] is False
+    assert "render version is stale" in rejected["error"]["message"]
+
+    missing_receipt = read_json(project / "state.json")
+    missing_receipt["published"]["pdf"]["render_version"] = (
+        pipeline_module.FINAL_RENDER_VERSION
+    )
+    write_json(paths["validation_path"], {"ok": True})
+    missing_receipt["published"]["pdf"]["validation_sha256"] = sha256_file(
+        paths["validation_path"]
+    )
+    write_json(project / "state.json", missing_receipt)
+    rejected = validate_project(
+        project,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+        pdf_source_credit_validator=lambda *_args: source_credit_pdf,
+    )
+    assert rejected["ok"] is False
+    assert "no source_credit_pdf observation" in rejected["error"]["message"]

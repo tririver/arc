@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -7,9 +8,25 @@ import time
 from typing import Any, Callable
 import uuid
 
-from .content import ContentBundleError, load_reader_content
-from .io import read_json, safe_name, sha256_file, write_json, write_text
-from .latex import LatexError, render_companion_tex, validate_tex_fidelity
+from .content import (
+    ContentBundleError,
+    load_reader_content,
+    migrate_legacy_reader_content,
+)
+from .io import (
+    read_json,
+    safe_name,
+    sha256_file,
+    sha256_json,
+    write_json,
+    write_text,
+)
+from .latex import (
+    LatexError,
+    render_companion_tex,
+    validate_pdf_source_credit_text,
+    validate_tex_fidelity,
+)
 from .pdf import (
     compile_latex,
     managed_run_root_pdf_path,
@@ -19,10 +36,11 @@ from .pdf import (
 )
 from .results import err, ok
 from .run_lock import BuildInProgressError, ProjectBuildLock
+from .source_credit import source_credit_visible_projection
 
 
 RENDER_MODE = "render_only"
-PDF_RENDER_VERSION = "arc.companion.final-render.v11"
+PDF_RENDER_VERSION = "arc.companion.final-render.v12"
 
 
 def render_content(
@@ -57,6 +75,7 @@ def render_content(
             (state.get("published") or {}).get("content_sha256") or ""
         )
         digest = content_sha256 or published_digest
+        requested_digest = digest
         if not digest:
             return err(
                 "content_bundle_not_found",
@@ -64,23 +83,41 @@ def render_content(
                 mode=RENDER_MODE,
                 provider_calls=0,
             )
-        if format != "all" and digest != published_digest:
-            return err(
-                "content_digest_requires_full_render",
-                "Rendering a different reviewed-content digest requires format=all",
-                mode=RENDER_MODE,
-                content_sha256=digest,
-                published_content_sha256=published_digest or None,
-                provider_calls=0,
-            )
         try:
             envelope = load_reader_content(root, digest)
         except ContentBundleError as exc:
-            return err(
-                "content_bundle_invalid", str(exc), mode=RENDER_MODE,
-                content_sha256=digest, provider_calls=0,
-            )
+            try:
+                envelope = migrate_legacy_reader_content(root, digest)
+            except ContentBundleError:
+                return err(
+                    "content_bundle_invalid", str(exc), mode=RENDER_MODE,
+                    content_sha256=digest, provider_calls=0,
+                )
+            digest = str(envelope["content_sha256"])
         content = envelope["content"]
+        if format != "all" and requested_digest != published_digest:
+            try:
+                published_content = load_reader_content(
+                    root, published_digest,
+                )["content"]
+            except ContentBundleError:
+                try:
+                    published_content = migrate_legacy_reader_content(
+                        root, published_digest,
+                    )["content"]
+                except ContentBundleError:
+                    published_content = None
+            if not _source_credit_only_content_change(
+                published_content, content,
+            ):
+                return err(
+                    "content_digest_requires_full_render",
+                    "Rendering a different reviewed-content digest requires format=all",
+                    mode=RENDER_MODE,
+                    content_sha256=digest,
+                    published_content_sha256=published_digest or None,
+                    provider_calls=0,
+                )
         phase_times: dict[str, float] = {"load_content": time.monotonic() - started}
         published: dict[str, Any] = {}
         if format in {"pdf", "all"}:
@@ -110,9 +147,20 @@ def render_content(
                 },
                 final_overrides=overrides,
             )
+            web["content_sha256"] = digest
             web_commit = (index_path, previous_index)
             published["web"] = web
             phase_times["web"] = time.monotonic() - phase
+        if format == "all":
+            for key in (
+                "source_credit_sha256",
+                "source_credit_observation_sha256",
+            ):
+                if published["pdf"].get(key) != published["web"].get(key):
+                    raise LatexError(
+                        "PDF and Web source-credit projections use different "
+                        f"{key}"
+                    )
         # Commit the immutable render before touching the mutable delivery copy.
         # A later copy/state failure therefore cannot invalidate the last-good
         # canonical revision recorded by state.json.
@@ -191,6 +239,7 @@ def _render_pdf(
         chapter_guides=content["chapter_guides"],
         source_language=content.get("source_language") or "und",
         title_translations=content.get("title_translations"),
+        source_credit=content["source_credit"],
     )
     fidelity_errors = validate_tex_fidelity(tex, content["document"], source_manifest)
     if fidelity_errors:
@@ -218,12 +267,42 @@ def _render_pdf(
         write_text(candidate_tex, tex)
         compiler(candidate_tex, candidate_pdf)
         report = pdf_validator(candidate_pdf)
+        source_credit_pdf = (
+            validate_pdf_source_credit_text(
+                candidate_pdf, content["document"], source_manifest,
+            )
+            if pdf_validator is validate_pdf
+            else {
+                "schema_version": (
+                    "arc.companion.source-credit-pdf-observation.v1"
+                ),
+                "canonical_sha256": content["source_credit_sha256"],
+                "visible_projection_sha256": sha256_json(
+                    source_credit_visible_projection(
+                        content["source_credit"],
+                        front_matter_block_ids=[
+                            str(value)
+                            for key, values in (
+                                (content["document"].get("front_matter") or {}).get(
+                                    "block_ids"
+                                )
+                                or {}
+                            ).items()
+                            if key in {"title", "authors", "affiliations"}
+                            for value in values
+                        ],
+                    )
+                ),
+                "validation": "delegated-test-validator",
+            }
+        )
         write_json(candidate_manifest, source_manifest)
         write_json(candidate_validation, {
             "ok": True,
             "content_sha256": content_sha256,
             "render_version": PDF_RENDER_VERSION,
             "pdf": report,
+            "source_credit_pdf": source_credit_pdf,
             "fidelity_errors": [],
             "warnings": list(source_manifest.get("render_warnings") or []),
         })
@@ -250,6 +329,10 @@ def _render_pdf(
         "source_manifest_sha256": sha256_file(manifest_path),
         "validation_path": str(validation_path),
         "validation_sha256": sha256_file(validation_path),
+        "source_credit_sha256": content["source_credit_sha256"],
+        "source_credit_observation_sha256": source_credit_pdf[
+            "visible_projection_sha256"
+        ],
     }
 
 
@@ -267,6 +350,50 @@ def _state(root: Path) -> dict[str, Any]:
 def _publish_replace(source: Path, target: Path) -> None:
     """Fault-injection seam for the immutable PDF publish sequence."""
     os.replace(source, target)
+
+
+def _source_credit_only_content_change(old: Any, new: Any) -> bool:
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return False
+    old_value = deepcopy(old)
+    new_value = deepcopy(new)
+    old_hash = str(old_value.pop("source_credit_sha256", "") or "")
+    new_hash = str(new_value.pop("source_credit_sha256", "") or "")
+    old_value.pop("source_credit", None)
+    new_value.pop("source_credit", None)
+    old_value["document"] = _neutral_credit_document(old_value.get("document"))
+    new_value["document"] = _neutral_credit_document(new_value.get("document"))
+    old_value["metadata"] = _neutral_credit_metadata(old_value.get("metadata"))
+    new_value["metadata"] = _neutral_credit_metadata(new_value.get("metadata"))
+    return bool(old_hash and new_hash and old_hash != new_hash and old_value == new_value)
+
+
+def _neutral_credit_document(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    document = deepcopy(value)
+    document.pop("parser_version", None)
+    front = document.get("front_matter")
+    if isinstance(front, dict):
+        for key in (
+            "author_records", "affiliation_records", "profiles",
+            "author_profiles", "author_affiliations", "associations",
+            "author_name_variants",
+        ):
+            front.pop(key, None)
+        block_ids = front.get("block_ids")
+        if isinstance(block_ids, dict):
+            block_ids.pop("profiles", None)
+    return document
+
+
+def _neutral_credit_metadata(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    metadata = deepcopy(value)
+    for key in ("authors", "author", "affiliations", "profiles"):
+        metadata.pop(key, None)
+    return metadata
 
 
 def _publish_state(

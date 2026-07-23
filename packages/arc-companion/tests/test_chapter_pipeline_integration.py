@@ -59,7 +59,7 @@ def test_reader_final_checkpoint_is_shared_by_both_pipeline_shapes(tmp_path: Pat
 
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved == {
-        "schema_version": "arc.companion.reader-final.v3",
+        "schema_version": "arc.companion.reader-final.v4",
         "final_overrides": overrides,
     }
 
@@ -799,11 +799,11 @@ def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> 
     assert "Energy, 1" not in tex
     assert (tmp_path / "run" / "state.json").is_file()
     assert Path(result["data"]["output_html"]).is_file()
-    assert result["data"]["web_render_version"] == "arc.companion.web-render.v4"
+    assert result["data"]["web_render_version"] == "arc.companion.web-render.v5"
     reader_final = json.loads(
         (Path(result["data"]["checkpoint_dir"]) / "reader-final.json").read_text()
     )
-    assert reader_final["schema_version"] == "arc.companion.reader-final.v3"
+    assert reader_final["schema_version"] == "arc.companion.reader-final.v4"
     assert reader_final["final_overrides"]["status"] == "first_chapter_ready"
     freeze = json.loads(
         (Path(result["data"]["checkpoint_dir"]) / "first-chapter-freeze.json").read_text()

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -481,17 +482,32 @@ def parse_source(
         return err("parse_source_failed", str(exc))
 
 
-def get_parsed_source(source_id: str, *, include_document: bool = False) -> dict[str, Any]:
+def get_parsed_source(
+    source_id: str,
+    *,
+    include_document: bool = False,
+    strict_cache_only: bool = False,
+) -> dict[str, Any]:
     lookup_id = _parsed_source_lookup_id(source_id)
     parsed = _read_parsed_source(source_id)
     if parsed is None:
         return err("parsed_source_not_found", f"No parsed source found for {source_id}")
     rich_path: Path | None = None
     if include_document:
-        document = _read_rich_document(parsed)
+        document = _read_rich_document(
+            parsed, migrate_legacy=not strict_cache_only,
+        )
         if document is not None:
             parsed = _parsed_source_with_document(parsed, document)
             rich_path = _rich_cache_path(parsed)
+        elif strict_cache_only:
+            return err(
+                "parsed_source_document_not_cached",
+                (
+                    f"No current complete parsed document is cached for {source_id}; "
+                    "strict cache-only reads never fetch, rebuild, or upgrade."
+                ),
+            )
         elif arxiv_path_id(lookup_id):
             try:
                 parsed = _parsed(lookup_id, refresh=False, require_document=True)
@@ -516,6 +532,105 @@ def get_parsed_source(source_id: str, *, include_document: bool = False) -> dict
         cache="hit",
         cache_path=str(parsed_source_cache_path(lookup_id)),
         rich_cache_path=str(rich_path) if rich_path is not None else None,
+    )
+
+
+def get_cached_source_author_evidence(source_id: str) -> dict[str, Any]:
+    """Return minimal stable author evidence from current local caches only.
+
+    This path never fetches, reparses, migrates, or writes cache data.  It is
+    intentionally narrower than ``get_parsed_source(..., include_document=True)``
+    so callers cannot accidentally treat unrelated document prose as identity
+    evidence.
+    """
+
+    lookup_id = _parsed_source_lookup_id(source_id)
+    parsed = _read_parsed_source(source_id)
+    if parsed is None:
+        return err(
+            "cached_source_author_evidence_not_found",
+            f"No parsed source cache found for {source_id}.",
+        )
+    structure = parsed.get("structure")
+    requested_kind = (
+        str(structure.get("requested_document_kind") or "auto")
+        if isinstance(structure, dict)
+        else "auto"
+    )
+    if not _is_current_light_cache(
+        parsed, lookup_id, document_kind=requested_kind,
+    ):
+        return err(
+            "cached_source_author_evidence_light_invalid",
+            f"The parsed source cache for {source_id} is stale or malformed.",
+        )
+    rich_path = _rich_cache_path(parsed)
+    rich_envelope = read_json(rich_path)
+    document = _read_rich_document(parsed, migrate_legacy=False)
+    if document is None or not isinstance(rich_envelope, dict):
+        return err(
+            "cached_source_author_evidence_rich_invalid",
+            (
+                f"No current complete rich document is cached for {source_id}; "
+                "strict cache-only reads never fetch, rebuild, upgrade, or write."
+            ),
+        )
+    front = document.get("front_matter")
+    front = front if isinstance(front, dict) else {}
+    raw_records = front.get("author_records")
+    if not isinstance(raw_records, list) or not raw_records:
+        return err(
+            "cached_source_author_evidence_identity_missing",
+            f"The cached source for {source_id} has no stable author records.",
+        )
+    authors: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for record in raw_records:
+        if not isinstance(record, dict):
+            return err(
+                "cached_source_author_evidence_identity_invalid",
+                f"The cached source for {source_id} has malformed author records.",
+            )
+        source_author_id = str(
+            record.get("source_id") or record.get("element_id") or record.get("id") or ""
+        ).strip()
+        source_name = unicodedata.normalize(
+            "NFC",
+            str(
+                record.get("source_name")
+                or record.get("name")
+                or record.get("text")
+                or ""
+            ).strip(),
+        )
+        if not source_author_id or not source_name or source_author_id in seen:
+            return err(
+                "cached_source_author_evidence_identity_invalid",
+                f"The cached source for {source_id} has ambiguous author identities.",
+            )
+        seen.add(source_author_id)
+        authors.append({
+            "source_author_id": source_author_id,
+            "source_name": source_name,
+            "field_sha256": hashlib.sha256(source_name.encode("utf-8")).hexdigest(),
+        })
+    document_sha256 = hashlib.sha256(
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return ok(
+        {
+            "schema_version": "arc.paper.cached-source-author-evidence.v1",
+            "reference_identity": lookup_id,
+            "source_hash": str(parsed["source_hash"]),
+            "document_sha256": document_sha256,
+            "authors": authors,
+        },
+        provider="local-cache",
+        cache="hit",
+        cache_path=str(parsed_source_cache_path(lookup_id)),
+        rich_cache_path=str(rich_path),
     )
 
 
@@ -1440,7 +1555,9 @@ def _rich_cache_path(parsed: dict[str, Any]) -> Path:
     )
 
 
-def _read_rich_document(parsed: dict[str, Any]) -> dict[str, Any] | None:
+def _read_rich_document(
+    parsed: dict[str, Any], *, migrate_legacy: bool = True,
+) -> dict[str, Any] | None:
     cached = read_json(_rich_cache_path(parsed))
     if isinstance(cached, dict):
         document = cached.get("document")
@@ -1455,6 +1572,8 @@ def _read_rich_document(parsed: dict[str, Any]) -> dict[str, Any] | None:
             return document
     legacy_document = parsed.get("document")
     if (
+        migrate_legacy
+        and
         isinstance(legacy_document, dict)
         and legacy_document.get("schema_version") == DOCUMENT_SCHEMA_VERSION
         and legacy_document.get("parser_version") == RICH_PARSER_VERSION

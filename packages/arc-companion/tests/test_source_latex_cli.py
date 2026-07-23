@@ -13,15 +13,26 @@ from arc_companion.latex import (
     LatexError,
     _render_html_fragment,
     _render_table,
-    render_companion_tex,
+    render_companion_tex as _render_companion_tex,
     validate_tex_fidelity,
 )
 from arc_companion.package import package_project
 from arc_companion.source import SourceError, load_source_bundle, validate_complete_document
+from arc_companion.source_credit import normalize_source_credit
 from arc_paper.parse.source import parse_source_input
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def render_companion_tex(document, *args, source_credit=None, metadata=None, **kwargs):
+    return _render_companion_tex(
+        document,
+        *args,
+        source_credit=source_credit or normalize_source_credit(document, metadata),
+        metadata=metadata,
+        **kwargs,
+    )
 
 
 def _current_parsed(source_id: str, *, document: dict | None = None, kind: str = "auto") -> dict:

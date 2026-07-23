@@ -8,12 +8,20 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .io import read_json, sha256_json, write_json
+from .source_credit import (
+    SourceCreditError,
+    normalize_source_credit,
+    validate_source_credit,
+)
 
 
-READER_CONTENT_VERSION = "arc.companion.reader-content.v2"
-CONTENT_RECEIPT_VERSION = "arc.companion.reader-content-validation.v2"
+READER_CONTENT_VERSION = "arc.companion.reader-content.v3"
+CONTENT_RECEIPT_VERSION = "arc.companion.reader-content-validation.v3"
 CONTENT_OBJECT_KIND = "reader-content"
-_LEGACY_READER_CONTENT_VERSIONS = {"arc.companion.reader-content.v1"}
+_LEGACY_READER_CONTENT_VERSIONS = {
+    "arc.companion.reader-content.v1",
+    "arc.companion.reader-content.v2",
+}
 
 
 class ContentBundleError(RuntimeError):
@@ -29,7 +37,7 @@ def store_reader_content(
 ) -> dict[str, Any]:
     """Validate and atomically store one immutable reviewed-content object."""
     root = project_dir.resolve()
-    value = deepcopy(dict(content))
+    value = _with_source_credit(deepcopy(dict(content)))
     checks = _validate_content(value)
     content_sha256 = sha256_json(value)
     receipts = deepcopy(dict(review_receipts or {}))
@@ -156,6 +164,95 @@ def load_reader_content(project_dir: Path, content_sha256: str) -> dict[str, Any
     return envelope
 
 
+def migrate_legacy_reader_content(
+    project_dir: Path, content_sha256: str,
+) -> dict[str, Any]:
+    """Validate a v1/v2 object, then store a separate current v3 object.
+
+    The old content-addressed object is never changed and its digest is never
+    presented as the identity of the derived payload.
+    """
+
+    root = project_dir.resolve()
+    path = content_object_path(root, content_sha256)
+    try:
+        envelope = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise ContentBundleError(
+            f"legacy reviewed-content object is unavailable: {path}"
+        ) from exc
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("schema_version") not in _LEGACY_READER_CONTENT_VERSIONS
+    ):
+        raise ContentBundleError("legacy reviewed-content object schema is invalid")
+    content = envelope.get("content")
+    if not isinstance(content, dict):
+        raise ContentBundleError("legacy reviewed-content payload is missing")
+    actual = sha256_json(content)
+    if actual != content_sha256 or envelope.get("content_sha256") != actual:
+        raise ContentBundleError("legacy reviewed-content hash does not match its identity")
+    review_receipts = envelope.get("review_receipts")
+    provenance = envelope.get("provenance")
+    receipt = envelope.get("validation_receipt")
+    if (
+        not isinstance(review_receipts, dict)
+        or not isinstance(provenance, dict)
+        or not isinstance(receipt, dict)
+    ):
+        raise ContentBundleError("legacy reviewed-content envelope is invalid")
+    for value in review_receipts.values():
+        if (
+            not isinstance(value, dict)
+            or not _sha(value.get("sha256"))
+            or not isinstance(value.get("bytes"), int)
+            or isinstance(value.get("bytes"), bool)
+            or value.get("bytes") < 1
+        ):
+            raise ContentBundleError("legacy reviewed-content review receipt is invalid")
+    version_suffix = str(envelope["schema_version"]).rsplit(".", 1)[-1]
+    receipt_version = f"arc.companion.reader-content-validation.{version_suffix}"
+    receipt_payload = {
+        key: value for key, value in receipt.items() if key != "bundle_sha256"
+    }
+    bundle_sha256 = sha256_json({
+        "content_sha256": actual,
+        "content": content,
+        "review_receipts": review_receipts,
+        "provenance": provenance,
+        "validation_receipt": receipt_payload,
+    })
+    derived = _with_source_credit(deepcopy(content))
+    legacy_checks = [
+        item for item in _validate_content(derived)
+        if item != "source_credit_contract_valid"
+    ]
+    if (
+        envelope.get("bundle_sha256") != bundle_sha256
+        or receipt.get("schema_version") != receipt_version
+        or receipt.get("validator_version") != receipt_version
+        or receipt.get("content_sha256") != actual
+        or receipt.get("bundle_sha256") != bundle_sha256
+        or receipt.get("checks") != legacy_checks
+        or not isinstance(receipt.get("validated_at"), str)
+        or not receipt.get("validated_at")
+    ):
+        raise ContentBundleError("legacy reviewed-content validation receipt is invalid")
+    checkpoint_value = provenance.get("checkpoint_dir")
+    checkpoint_dir = (
+        Path(str(checkpoint_value)) if isinstance(checkpoint_value, str)
+        and checkpoint_value else None
+    )
+    migrated = store_reader_content(
+        root,
+        content=derived,
+        checkpoint_dir=checkpoint_dir,
+        review_receipts=review_receipts,
+    )
+    migrated["migrated_from_content_sha256"] = actual
+    return migrated
+
+
 def reader_content_from_overrides(
     overrides: Mapping[str, Any],
     *,
@@ -180,6 +277,7 @@ def reader_content_from_overrides(
         "accepted_ledger_chains": deepcopy(dict(accepted_ledger_chains or {})),
         "review_overlay_hashes": deepcopy(dict(review_overlay_hashes or {})),
     }
+    content = _with_source_credit(content, supplied=overrides.get("source_credit"))
     # Title translation was added after the original immutable-content
     # contract.  Preserve read compatibility for callers that intentionally
     # construct a legacy payload while making every new pipeline payload
@@ -284,6 +382,12 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
         raise ContentBundleError("reviewed content glossary is invalid")
     if not isinstance(content.get("metadata"), Mapping):
         raise ContentBundleError("reviewed content metadata is invalid")
+    try:
+        source_credit = validate_source_credit(content.get("source_credit"))
+    except (SourceCreditError, TypeError) as exc:
+        raise ContentBundleError("reviewed content source credit is invalid") from exc
+    if content.get("source_credit_sha256") != source_credit["canonical_sha256"]:
+        raise ContentBundleError("reviewed content source-credit hash is invalid")
     if "title_translations" in content:
         title_translations = content.get("title_translations")
         if mode == "skipped":
@@ -318,12 +422,36 @@ def _validate_content(content: Mapping[str, Any]) -> list[str]:
         "reader_evidence_coverage_exact",
         "chapter_guide_shape_valid",
         "glossary_and_metadata_valid",
+        "source_credit_contract_valid",
         "accepted_chain_receipts_valid",
         "review_overlay_receipts_valid",
     ]
     if "title_translations" in content:
         checks.insert(-2, "title_translation_contract_valid")
     return checks
+
+
+def _with_source_credit(
+    content: dict[str, Any], *, supplied: Any = None,
+) -> dict[str, Any]:
+    candidate = supplied if supplied is not None else content.get("source_credit")
+    try:
+        if candidate is None:
+            document = content.get("document")
+            metadata = content.get("metadata")
+            if not isinstance(document, Mapping):
+                raise SourceCreditError("source document is missing")
+            credit = normalize_source_credit(
+                document,
+                metadata if isinstance(metadata, Mapping) else {},
+            )
+        else:
+            credit = validate_source_credit(candidate)
+    except (SourceCreditError, TypeError) as exc:
+        raise ContentBundleError("reviewed content source credit is invalid") from exc
+    content["source_credit"] = credit
+    content["source_credit_sha256"] = credit["canonical_sha256"]
+    return content
 
 
 def _validate_title_translation_content(

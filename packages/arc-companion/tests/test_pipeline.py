@@ -47,6 +47,410 @@ from arc_companion.pipeline import (
 from arc_companion.prompts import ANNOTATION_SCHEMA
 from arc_companion.source import SourceBundle
 from arc_companion.run_lock import ProjectBuildLock
+from arc_companion.content import store_reader_content
+from arc_companion.source_credit import normalize_source_credit
+
+
+def test_explicit_source_credit_reference_uses_strict_cached_singleton(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arc_paper.service
+
+    bundle = SourceBundle(
+        paper_id="local:source",
+        parsed={},
+        document={
+            "front_matter": {
+                "author_records": [{"source_id": "source-a", "source_name": "源名"}],
+            },
+            "blocks": [],
+        },
+        metadata={},
+        references=[],
+        citers=[],
+    )
+    seen: list[str] = []
+
+    def cached(reference_id: str) -> dict:
+        seen.append(reference_id)
+        return {
+            "ok": True,
+            "data": {
+                "reference_identity": reference_id,
+                "source_hash": "source-hash",
+                "document_sha256": "document-hash",
+                "authors": [{
+                    "source_author_id": "ref-a",
+                    "source_name": "Localized Name",
+                    "field_sha256": hashlib.sha256(
+                        b"Localized Name"
+                    ).hexdigest(),
+                }],
+            },
+        }
+
+    monkeypatch.setattr(
+        arc_paper.service, "get_cached_source_author_evidence", cached,
+    )
+    options = BuildOptions(
+        paper_id=bundle.paper_id,
+        project_dir=tmp_path,
+        source_credit_reference_id="ref:person",
+    )
+
+    credit = pipeline_module._source_credit_for_bundle(options, bundle)
+
+    assert seen == ["ref:person"]
+    assert credit["authors"][0]["localized_name"] == "Localized Name"
+    assert credit["authors"][0]["localized_evidence"]["reference_identity"] == (
+        "ref:person"
+    )
+    recovered = pipeline_module._options_from_recovery(
+        tmp_path, pipeline_module._recovery_options(options),
+    )
+    assert recovered.source_credit_reference_id == "ref:person"
+    assert recovered.source_credit_author_mapping == ()
+
+    def cached_multi(reference_id: str) -> dict:
+        return {
+            "ok": True,
+            "data": {
+                "reference_identity": reference_id,
+                "source_hash": "source-hash",
+                "document_sha256": "document-hash",
+                "authors": [
+                    {
+                        "source_author_id": "ref-a",
+                        "source_name": "Localized A",
+                        "field_sha256": hashlib.sha256(
+                            b"Localized A"
+                        ).hexdigest(),
+                    },
+                    {
+                        "source_author_id": "ref-b",
+                        "source_name": "Localized B",
+                        "field_sha256": hashlib.sha256(
+                            b"Localized B"
+                        ).hexdigest(),
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(
+        arc_paper.service, "get_cached_source_author_evidence", cached_multi,
+    )
+    diagnostics: list[dict[str, str]] = []
+    invalid = pipeline_module._source_credit_for_bundle(
+        BuildOptions(
+            paper_id="local:multi",
+            project_dir=tmp_path,
+            source_credit_reference_id="ref:multi",
+            source_credit_author_mapping=(
+                {
+                    "author_index": "0",
+                    "reference_name": "Localized A",
+                },
+            ),
+        ),
+        SourceBundle(
+            paper_id="local:multi",
+            parsed={},
+            document={
+                "front_matter": {
+                    "author_records": [
+                        {"source_id": "a", "source_name": "A"},
+                        {"source_id": "b", "source_name": "B"},
+                    ],
+                },
+                "blocks": [],
+            },
+            metadata={},
+            references=[],
+            citers=[],
+        ),
+        diagnostics=diagnostics,
+    )
+    assert all(item["localized_name"] is None for item in invalid["authors"])
+    assert diagnostics[0]["code"] == (
+        "source_credit_author_mapping_identity_keys_required"
+    )
+
+
+def test_completed_credit_only_refresh_reuses_reviewed_content_without_provider_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    checkpoint = project / "checkpoint"
+    checkpoint.mkdir(parents=True)
+
+    def document(localized: str) -> dict:
+        return {
+            "front_matter": {
+                "authors": [{"source_id": "a", "name": "Original"}],
+                "author_name_variants": [{
+                    "author_id": "a",
+                    "localized_name": localized,
+                    "source_identity": f"source:{localized}",
+                }],
+            },
+            "blocks": [{"block_id": "b1", "kind": "prose", "text": "Source."}],
+            "equations": [], "figures": [], "tables": [], "bibliography": [],
+            "assets": [], "links": [], "integrity": {"status": "complete"},
+        }
+
+    old_document = document("旧名")
+    old_credit = normalize_source_credit(old_document)
+    content = {
+        "document": old_document,
+        "chapters": [],
+        "segments": [{"segment_id": "s1", "block_ids": ["b1"]}],
+        "chapter_guides": {},
+        "translations": {"s1": {"blocks": [{"block_id": "b1", "text": "译文"}]}},
+        "annotations": {"s1": {"explanation": "Note.", "commentary": ""}},
+        "glossary": {},
+        "metadata": {"title": "Fixture"},
+        "reader_evidence_by_segment": {"s1": []},
+        "language": "zh-CN",
+        "source_language": "en",
+        "translation_mode": "enabled",
+        "accepted_ledger_chains": {},
+        "review_overlay_hashes": {},
+        "source_credit": old_credit,
+        "source_credit_sha256": old_credit["canonical_sha256"],
+    }
+    stored = store_reader_content(project, content=content, checkpoint_dir=checkpoint)
+    final_overrides = {
+        key: value for key, value in content.items()
+        if key not in {
+            "reader_evidence_by_segment", "accepted_ledger_chains",
+            "review_overlay_hashes", "source_credit_sha256",
+        }
+    }
+    pipeline_module._write_reader_final_checkpoint(checkpoint, final_overrides)
+    old_reader_final_bytes = (checkpoint / "reader-final.json").read_bytes()
+    previous_state = {
+        "schema_version": "arc.companion.state.v3",
+        "status": "complete",
+        "paper_id": "local:credit",
+        "checkpoint_dir": str(checkpoint),
+        "content_sha256": stored["content_sha256"],
+        "source_credit_sha256": old_credit["canonical_sha256"],
+        "final_render_version": pipeline_module.FINAL_RENDER_VERSION,
+        "reader_final_checkpoint_version": (
+            pipeline_module.READER_FINAL_CHECKPOINT_VERSION
+        ),
+        "output_pdf": str(project / "old.pdf"),
+        "output_pdf_sha256": "old-pdf",
+        "published": {"content_sha256": stored["content_sha256"]},
+    }
+    pipeline_module.write_json(project / "state.json", previous_state)
+    new_document = document("新名")
+    bundle = SourceBundle(
+        paper_id="local:credit",
+        parsed={"document": new_document},
+        document=new_document,
+        metadata={"title": "Fixture"},
+        references=[],
+        citers=[],
+    )
+    old_options = BuildOptions(paper_id=bundle.paper_id, project_dir=project)
+    options = BuildOptions(
+        paper_id=bundle.paper_id,
+        project_dir=project,
+        source_credit_reference_id="ref:localized-person",
+    )
+    previous_request_sha256 = pipeline_module._build_request_identity(old_options)
+    request_sha256 = pipeline_module._build_request_identity(options)
+    neutral_request_sha256 = (
+        pipeline_module._credit_neutral_build_request_identity(options)
+    )
+    previous_state["build_request_sha256"] = previous_request_sha256
+    previous_state["credit_neutral_build_request_sha256"] = (
+        neutral_request_sha256
+    )
+    previous_state["source_credit_neutral_source_sha256"] = (
+        pipeline_module._source_credit_neutral_source_identity(bundle)
+    )
+    calls = {"pdf": 0, "web": 0}
+
+    def fake_pdf(**kwargs):
+        calls["pdf"] += 1
+        assert kwargs["source_credit"]["authors"][0]["localized_name"] == "新名"
+        return {
+            "tex_path": str(project / "new.tex"),
+            "pdf_path": str(project / "new.pdf"),
+            "manifest_path": str(project / "new-manifest.json"),
+            "validation_path": str(project / "new-validation.json"),
+            "tex_sha256": "new-tex",
+            "pdf_sha256": "new-pdf",
+            "manifest_sha256": "new-manifest",
+            "validation_sha256": "new-validation",
+            "source_credit_sha256": kwargs["source_credit"][
+                "canonical_sha256"
+            ],
+            "source_credit_observation_sha256": "shared-observation",
+        }
+
+    def fake_web(*args, **kwargs):
+        calls["web"] += 1
+        assert kwargs["final_overrides"]["source_credit"]["authors"][0][
+            "localized_name"
+        ] == "新名"
+        return {
+            "output_html": str(project / "reader" / "index.html"),
+            "output_html_sha256": "new-web",
+            "reader_snapshot_path": str(project / "reader" / "snapshot.json"),
+            "reader_snapshot_sha256": "new-snapshot",
+            "web_manifest_path": str(project / "reader" / "manifest.json"),
+            "web_manifest_sha256": "new-web-manifest",
+            "web_render_version": "arc.companion.web-render.v5",
+            "source_credit_sha256": kwargs["final_overrides"][
+                "source_credit"
+            ]["canonical_sha256"],
+            "source_credit_observation_sha256": "shared-observation",
+        }
+
+    monkeypatch.setattr(pipeline_module, "_publish_pdf_artifact", fake_pdf)
+    monkeypatch.setattr(pipeline_module, "_publish_reader_update", fake_web)
+    monkeypatch.setattr(
+        pipeline_module,
+        "publish_run_root_pdf",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(pipeline_module, "_web_outputs_match", lambda _state: True)
+
+    refused = pipeline_module._refresh_completed_source_credit_only(
+        options=options,
+        bundle=bundle,
+        source_credit=normalize_source_credit(new_document),
+        previous_state=previous_state,
+        state_path=project / "state.json",
+        build_request_sha256="0" * 64,
+        credit_neutral_build_request_sha256="0" * 64,
+        diagnostics=(),
+        compiler=lambda *_args: None,
+        pdf_validator=lambda _path: {},
+        notice=None,
+    )
+    assert refused is None
+    assert calls == {"pdf": 0, "web": 0}
+    for changed_options in (
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=project,
+            annotation_language="fr",
+        ),
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=project,
+            user_intent="A different pedagogical intent.",
+        ),
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=project,
+            context_paper_ids=("context:changed",),
+        ),
+    ):
+        refused = pipeline_module._refresh_completed_source_credit_only(
+            options=changed_options,
+            bundle=bundle,
+            source_credit=normalize_source_credit(new_document),
+            previous_state=previous_state,
+            state_path=project / "state.json",
+            build_request_sha256=(
+                pipeline_module._build_request_identity(changed_options)
+            ),
+            credit_neutral_build_request_sha256=(
+                pipeline_module._credit_neutral_build_request_identity(
+                    changed_options
+                )
+            ),
+            diagnostics=(),
+            compiler=lambda *_args: None,
+            pdf_validator=lambda _path: {},
+            notice=None,
+        )
+        assert refused is None
+    assert calls == {"pdf": 0, "web": 0}
+
+    diagnostic = {
+        "severity": "warning",
+        "code": "source_credit_author_mapping_identity_keys_required",
+        "source": "source-credit",
+        "message": "invalid mapping",
+    }
+    diagnostic_only = pipeline_module._refresh_completed_source_credit_only(
+        options=options,
+        bundle=SourceBundle(
+            paper_id=bundle.paper_id,
+            parsed={"document": old_document},
+            document=old_document,
+            metadata={"title": "Fixture"},
+            references=[],
+            citers=[],
+        ),
+        source_credit=old_credit,
+        previous_state=previous_state,
+        state_path=project / "state.json",
+        build_request_sha256=request_sha256,
+        credit_neutral_build_request_sha256=neutral_request_sha256,
+        diagnostics=(diagnostic,),
+        compiler=lambda *_args: None,
+        pdf_validator=lambda _path: {},
+        notice=None,
+    )
+    assert diagnostic_only is not None and diagnostic_only["ok"] is True
+    assert diagnostic_only["data"]["diagnostics"] == [diagnostic]
+    assert calls == {"pdf": 0, "web": 0}
+    pipeline_module.write_json(project / "state.json", previous_state)
+
+    result = pipeline_module._refresh_completed_source_credit_only(
+        options=options,
+        bundle=bundle,
+        source_credit=normalize_source_credit(new_document),
+        previous_state=previous_state,
+        state_path=project / "state.json",
+        build_request_sha256=request_sha256,
+        credit_neutral_build_request_sha256=neutral_request_sha256,
+        diagnostics=(),
+        compiler=lambda *_args: None,
+        pdf_validator=lambda _path: {},
+        notice=None,
+    )
+
+    assert result is not None and result["ok"] is True
+    assert result["meta"]["provider_calls"] == 0
+    assert result["meta"]["controller_calls"] == 0
+    assert calls == {"pdf": 1, "web": 1}
+    assert result["data"]["source_credit_sha256"] != old_credit["canonical_sha256"]
+
+    pipeline_module.write_json(project / "state.json", previous_state)
+    (checkpoint / "reader-final.json").write_bytes(old_reader_final_bytes)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_publish_reader_update",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected web failure")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="injected web failure"):
+        pipeline_module._refresh_completed_source_credit_only(
+            options=options,
+            bundle=bundle,
+            source_credit=normalize_source_credit(new_document),
+            previous_state=previous_state,
+            state_path=project / "state.json",
+            build_request_sha256=request_sha256,
+            credit_neutral_build_request_sha256=neutral_request_sha256,
+            diagnostics=(),
+            compiler=lambda *_args: None,
+            pdf_validator=lambda _path: {},
+            notice=None,
+        )
+    restored = pipeline_module.read_json(project / "state.json")
+    assert restored["published"]["content_sha256"] == stored["content_sha256"]
+    assert (checkpoint / "reader-final.json").read_bytes() == old_reader_final_bytes
 
 
 def _record_guarded_test_response(
@@ -3978,14 +4382,18 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert run_pdf.read_bytes() == Path(data["output_pdf"]).read_bytes()
     assert data["output_run_pdf_sha256"] == data["output_pdf_sha256"]
     assert not ((tmp_path / "run").parent / run_pdf.name).exists()
-    assert data["web_render_version"] == "arc.companion.web-render.v4"
+    assert data["web_render_version"] == "arc.companion.web-render.v5"
     assert Path(data["output_html"]).is_file()
     assert Path(data["reader_snapshot_path"]).is_file()
     assert Path(data["web_manifest_path"]).is_file()
     reader_snapshot = json.loads(Path(data["reader_snapshot_path"]).read_text())
     assert reader_snapshot["language"] == "zh-CN"
     validation = validate_project(
-        tmp_path / "run", pdf_validator=lambda path: {"bytes": path.stat().st_size}
+        tmp_path / "run",
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+        pdf_source_credit_validator=lambda *_args: json.loads(
+            Path(data["validation_path"]).read_text(encoding="utf-8")
+        )["source_credit_pdf"],
     )
     assert validation["ok"]
     assert validation["data"]["web"]["ok"] is True
@@ -4010,7 +4418,8 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
         compiler=compiler,
         pdf_validator=lambda path: {},
     )
-    assert resumed["ok"] and resumed["meta"]["resumed"] is True
+    assert resumed["ok"], resumed
+    assert resumed["meta"]["resumed"] is True
     assert len(fake.calls) == call_count
     assert Path(resumed["data"]["output_html"]).is_file()
     assert Path(resumed["data"]["output_run_pdf"]).read_bytes() == Path(

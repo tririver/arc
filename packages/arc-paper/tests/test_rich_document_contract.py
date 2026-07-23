@@ -165,16 +165,34 @@ def test_legacy_centered_preamble_has_structural_front_matter_roles_and_ids() ->
     )
     document = parsed["document"]
 
-    assert document["parser_version"] == service.RICH_PARSER_VERSION == 5
+    assert document["parser_version"] == service.RICH_PARSER_VERSION == 7
     assert document["front_matter"] == {
         "title": "A Legacy Title",
         "authors": ["First Author 1 and Second Author 2"],
         "affiliations": ["1 First Institute 2 Second Institute"],
+        "author_records": [
+            {
+                "source_id": "author:front.authors",
+                "source_name": "First Author 1 and Second Author 2",
+                "block_id": "front.authors",
+            },
+        ],
+        "affiliation_records": [
+            {
+                "source_id": "affiliation:front.affiliations",
+                "text": "1 First Institute 2 Second Institute",
+                "block_id": "front.affiliations",
+            },
+        ],
+        "profiles": [],
+        "author_affiliations": [],
+        "author_name_variants": [],
         "abstract": "",
         "block_ids": {
             "title": ["front.title"],
             "authors": ["front.authors"],
             "affiliations": ["front.affiliations"],
+            "profiles": [],
             "abstract": [],
         },
     }
@@ -221,6 +239,156 @@ def test_semantic_front_matter_descendants_mark_combined_atomic_block() -> None:
     assert creator["front_matter_roles"] == ["front_matter_authors", "front_matter_affiliations"]
     assert document["front_matter"]["block_ids"]["authors"] == ["creator-line"]
     assert document["front_matter"]["block_ids"]["affiliations"] == ["creator-line"]
+
+
+def test_structured_source_credit_preserves_order_links_profiles_and_variants() -> None:
+    document = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">Structured credits</h1>
+          <div class="ltx_authors">
+            <p id="author-a" class="ltx_creator_author" itemprop="author">
+              <span id="name-a" class="ltx_personname" itemprop="name">Alice Original</span>
+              <span itemprop="alternateName" lang="zh">爱丽丝</span>
+              <span id="aff-a" class="ltx_role_affiliation">Institute A</span>
+              <span id="bio-a" class="ltx_role_biography">
+                Alice works on several lines of theory.
+                This is a deliberately multiline profile.
+              </span>
+            </p>
+            <p id="author-b" class="ltx_creator_author" itemprop="author">
+              <span id="name-b" class="ltx_personname" itemprop="name">Bob Original</span>
+              <span id="aff-b" class="ltx_role_affiliation">Institute B</span>
+            </p>
+            <p id="aff-global" class="ltx_affiliation">Global Institute</p>
+          </div>
+          <section><h2>Body</h2><p>Text.</p></section>
+        </article>
+        """,
+        source_id="structured-credits",
+    )["document"]
+    front = document["front_matter"]
+
+    assert [item["source_name"] for item in front["author_records"]] == [
+        "Alice Original", "Bob Original",
+    ]
+    assert [item["text"] for item in front["affiliation_records"]] == [
+        "Institute A", "Institute B", "Global Institute",
+    ]
+    assert front["author_name_variants"] == [{
+        "author_id": "author:name-a",
+        "localized_name": "爱丽丝",
+        "language": "zh",
+        "source_identity": "author-variant-0:author-a:0",
+        "block_id": "author-a",
+    }]
+    assert front["author_affiliations"] == [
+        {
+            "author_id": "author:name-a",
+            "affiliation_id": "affiliation:aff-a",
+        },
+        {
+            "author_id": "author:name-b",
+            "affiliation_id": "affiliation:aff-b",
+        },
+    ]
+    assert front["profiles"][0]["author_id"] == "author:name-a"
+    assert "deliberately multiline profile" in front["profiles"][0]["text"]
+    assert front["block_ids"]["profiles"] == ["author-a"]
+
+
+def test_unrelated_person_description_is_not_source_credit() -> None:
+    document = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">A paper</h1>
+          <p class="ltx_creator_author"><span class="ltx_personname">Author</span></p>
+          <section><h2>History</h2><p typeof="schema:Person">
+            <span itemprop="name">Unrelated Person</span>
+            <span itemprop="description">An unrelated biography.</span>
+          </p></section>
+        </article>
+        """,
+        source_id="unrelated-person",
+    )["document"]
+
+    assert document["front_matter"]["authors"] == ["Author"]
+    assert document["front_matter"]["profiles"] == []
+
+
+def test_creator_container_fallback_never_mixes_affiliation_or_profile_text() -> None:
+    document = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">A paper</h1>
+          <p id="mixed-author" class="ltx_creator_author">
+            Bare Author
+            <span id="mixed-aff" class="ltx_role_affiliation">Institute Text</span>
+            <span id="mixed-profile" class="ltx_role_profile">Profile Text</span>
+            <span class="ltx_contact">
+              <a itemprop="url" href="https://example.test/author">Contact URL</a>
+            </span>
+          </p>
+          <p class="ltx_creator_author">
+            <span id="structured-name" class="ltx_personname">
+              Structured Author
+            </span>
+          </p>
+          <section><h2>Body</h2><p>Text.</p></section>
+        </article>
+        """,
+        source_id="mixed-creator",
+    )["document"]
+
+    front = document["front_matter"]
+    assert front["authors"] == ["Bare Author", "Structured Author"]
+    assert front["author_records"] == [
+        {
+            "source_id": "author:mixed-author",
+            "source_name": "Bare Author",
+            "block_id": "mixed-author",
+        },
+        {
+            "source_id": "author:structured-name",
+            "source_name": "Structured Author",
+        },
+    ]
+    assert front["affiliations"] == ["Institute Text"]
+    assert front["profiles"] == [{
+        "source_id": "profile-0:mixed-profile",
+        "text": "Profile Text",
+        "author_id": "author:mixed-author",
+        "block_id": "mixed-author",
+    }]
+    assert front["author_affiliations"] == [{
+        "author_id": "author:mixed-author",
+        "affiliation_id": "affiliation:mixed-aff",
+    }]
+
+
+def test_creator_container_prefers_direct_name_over_mixed_credit_text() -> None:
+    document = parse_source_input(
+        html_text="""
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">A paper</h1>
+          <p id="named-author" class="ltx_creator_author">
+            Unstructured prefix
+            <span id="preferred-name" itemprop="name">Preferred Author</span>
+            <span class="ltx_role_affiliation">Named Institute</span>
+            <span class="ltx_role_profile">Named Profile</span>
+          </p>
+        </article>
+        """,
+        source_id="named-mixed-creator",
+    )["document"]
+
+    front = document["front_matter"]
+    assert front["authors"] == ["Preferred Author"]
+    assert [item["source_name"] for item in front["author_records"]] == [
+        "Preferred Author"
+    ]
+    assert front["affiliations"] == ["Named Institute"]
+    assert [item["text"] for item in front["profiles"]] == ["Named Profile"]
 
 
 def test_inline_runs_separate_text_math_citations_and_links_with_stable_tokens():

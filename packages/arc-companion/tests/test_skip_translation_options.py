@@ -17,8 +17,22 @@ from arc_companion.pipeline import (
     _verify_frozen_first_chapter_pre_review,
     build_companion,
 )
-from arc_companion.latex import render_companion_tex, validate_tex_fidelity
+from arc_companion.latex import (
+    render_companion_tex as _render_companion_tex,
+    validate_tex_fidelity,
+)
 from arc_companion.source import SourceBundle
+from arc_companion.source_credit import normalize_source_credit
+
+
+def render_companion_tex(document, *args, source_credit=None, metadata=None, **kwargs):
+    return _render_companion_tex(
+        document,
+        *args,
+        source_credit=source_credit or normalize_source_credit(document, metadata),
+        metadata=metadata,
+        **kwargs,
+    )
 
 
 def _bundle() -> SourceBundle:

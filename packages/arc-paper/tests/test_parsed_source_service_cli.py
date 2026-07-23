@@ -1,7 +1,14 @@
+import hashlib
 import json
 
 from arc_paper import cli, service
-from arc_paper.cache import parsed_source_annotations_cache_path, parsed_source_cache_path, read_json, write_json
+from arc_paper.cache import (
+    parsed_source_annotations_cache_path,
+    parsed_source_cache_path,
+    read_json,
+    rich_document_cache_path,
+    write_json,
+)
 
 
 def _write_tex(tmp_path):
@@ -91,6 +98,158 @@ def test_service_get_parsed_source_missing_returns_error(monkeypatch, tmp_path):
 
     assert result["ok"] is False
     assert result["error"]["code"] == "parsed_source_not_found"
+
+
+def test_strict_cached_document_read_never_fetches_rebuilds_or_upgrades(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    html_path = tmp_path / "paper.html"
+    html_path.write_text(
+        """
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">Cached</h1>
+          <p class="ltx_creator_author"><span class="ltx_personname">Author</span></p>
+          <p>Body.</p>
+        </article>
+        """,
+        encoding="utf-8",
+    )
+    parsed = service.parse_source(
+        html_path=html_path, source_id="cached-rich", include_document=True,
+    )
+    assert parsed["ok"] is True
+    light = read_json(parsed_source_cache_path("cached-rich"))
+    rich_path = rich_document_cache_path(
+        "cached-rich", light["source_hash"], service.RICH_PARSER_VERSION,
+    )
+
+    hit = service.get_parsed_source(
+        "cached-rich", include_document=True, strict_cache_only=True,
+    )
+    assert hit["ok"] is True
+    assert hit["data"]["document"]["front_matter"]["authors"] == ["Author"]
+
+    rich_path.unlink()
+    monkeypatch.setattr(
+        service, "_parsed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("network/upgrade path must not run")
+        ),
+    )
+    monkeypatch.setattr(
+        service, "_rebuild_local_rich_document_from_stale_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("local cache rebuild must not run")
+        ),
+    )
+
+    miss = service.get_parsed_source(
+        "cached-rich", include_document=True, strict_cache_only=True,
+    )
+
+    assert miss["ok"] is False
+    assert miss["error"]["code"] == "parsed_source_document_not_cached"
+    assert not rich_path.exists()
+
+
+def test_strict_cached_document_read_rejects_malformed_current_cache(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    html_path = tmp_path / "paper.html"
+    html_path.write_text("<article><h1>Cached</h1><p>Body.</p></article>", encoding="utf-8")
+    service.parse_source(
+        html_path=html_path, source_id="malformed-rich", include_document=True,
+    )
+    light = read_json(parsed_source_cache_path("malformed-rich"))
+    rich_path = rich_document_cache_path(
+        "malformed-rich", light["source_hash"], service.RICH_PARSER_VERSION,
+    )
+    write_json(rich_path, {"rich_parser_version": service.RICH_PARSER_VERSION})
+
+    result = service.get_parsed_source(
+        "malformed-rich", include_document=True, strict_cache_only=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "parsed_source_document_not_cached"
+
+
+def test_cached_source_author_evidence_is_minimal_strict_and_read_only(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    html_path = tmp_path / "person.html"
+    html_path.write_text(
+        """
+        <article class="ltx_document">
+          <h1 class="ltx_title_document">Profile</h1>
+          <p class="ltx_creator_author">
+            <span class="ltx_personname">Café Author</span>
+          </p>
+          <p>Private body must not leave the cache API.</p>
+        </article>
+        """,
+        encoding="utf-8",
+    )
+    parsed = service.parse_source(
+        html_path=html_path, source_id="cached-person", include_document=True,
+    )
+    assert parsed["ok"] is True
+    monkeypatch.setattr(
+        service, "_parsed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("network or rebuild path must not run")
+        ),
+    )
+
+    hit = service.get_cached_source_author_evidence("cached-person")
+
+    assert hit["ok"] is True
+    assert hit["meta"]["provider"] == "local-cache"
+    assert set(hit["data"]) == {
+        "schema_version", "reference_identity", "source_hash",
+        "document_sha256", "authors",
+    }
+    assert hit["data"]["authors"][0]["source_name"] == "Café Author"
+    assert hit["data"]["authors"][0]["field_sha256"] == (
+        hashlib.sha256("Café Author".encode("utf-8")).hexdigest()
+    )
+    assert "document" not in hit["data"]
+    assert "Private body" not in json.dumps(hit, ensure_ascii=False)
+
+    light = read_json(parsed_source_cache_path("cached-person"))
+    rich_path = rich_document_cache_path(
+        "cached-person", light["source_hash"], service.RICH_PARSER_VERSION,
+    )
+    before = parsed_source_cache_path("cached-person").read_bytes()
+    rich_path.unlink()
+    miss = service.get_cached_source_author_evidence("cached-person")
+    assert miss["ok"] is False
+    assert miss["error"]["code"] == "cached_source_author_evidence_rich_invalid"
+    assert parsed_source_cache_path("cached-person").read_bytes() == before
+    assert not rich_path.exists()
+
+
+def test_cached_source_author_evidence_rejects_malformed_light_cache(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "cache"))
+    write_json(parsed_source_cache_path("bad-person"), {
+        "paper_id": "bad-person",
+        "parser_version": -1,
+        "source_hash": "bad",
+        "structure": {"requested_document_kind": "auto"},
+        "index_entries": {},
+    })
+
+    result = service.get_cached_source_author_evidence("bad-person")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == (
+        "cached_source_author_evidence_light_invalid"
+    )
 
 
 def test_service_mark_parsed_equation_writes_sidecar_and_overlays_current_source_hash(monkeypatch, tmp_path):

@@ -409,6 +409,34 @@ CJK according to the source and target tags. Mathematics and formula
 RTL PDF layout remains best-effort and produces an explicit warning.
 Invisible manifest or TeX markers validate hierarchy.
 
+PDF and Web/HTML consume one canonical source-credit object and hash. Original
+source author names are permanent and visible exactly once; an explicit,
+reliable localized variant is only an adjacent secondary label and never
+replaces the original. ARC may pair an explicitly selected cached reference
+automatically only when both documents have exactly one author. Multiple
+authors require a complete explicit mapping; ARC never pairs by position,
+spelling, transliteration, affiliation, or model judgment. Affiliations and
+profiles always come from the original source and are never translated,
+completed, or rewritten from the reference.
+
+Reliable source block anchors control credit placement in both outputs.
+Front-matter anchors map to the title/front-matter group, while a distinct
+profile block remains at that source block. Only unanchored metadata uses the
+fallback immediately after the title, ordered as authors, affiliations, then
+profiles. Identity-and-content hashes suppress duplicate source/metadata
+projections without merging distinct equal strings. Cached localization
+evidence is read through the strict current-cache path: a miss, stale or
+malformed entry yields no localized label and performs no fetch, cache upgrade,
+or LLM call. Both output manifests bind the shared hash, ordered identities,
+placement facts, and exact visible counts.
+
+Reference localization is currently an explicit programmatic build input, not
+an inference from context papers: set `BuildOptions.source_credit_reference_id`.
+For multiple authors, also set
+`BuildOptions.source_credit_author_mapping` with complete
+`source_author_id`, `reference_author_id`, and `reference_identity` records.
+The command-line interface does not currently expose these fields.
+
 Direct citations render with the source title linked to its URL and the locator
 visible to the reader. The source manifest preserves each segment's citation
 objects unchanged, including claim association.
