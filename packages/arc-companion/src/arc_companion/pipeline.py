@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import threading
 import unicodedata
 import uuid
@@ -150,6 +151,7 @@ from .prompts import (
     TRANSLATION_SCHEMA,
     TRANSLATION_SLOT_REPAIR_SCHEMA,
     COMMENTARY_REVIEW_SCHEMA,
+    COMMENTARY_SEGMENT_REVIEW_SCHEMA,
     REVIEW_SCHEMA,
     SECTION_REVIEW_SCHEMA,
     COMMENTARY_PROMPT_VERSION,
@@ -184,6 +186,7 @@ from .review_arbitration import (
     ReviewPatchSource,
     apply_non_conflicting_atoms,
     arbitration_payload,
+    atomize_review_sources,
     canonical_sha256 as review_arbitration_sha256,
     json_pointer_unescape,
     materialize_review_patches,
@@ -191,6 +194,32 @@ from .review_arbitration import (
     trial_validate_candidates,
     validate_arbitration_output,
     validate_materialized_review,
+)
+from .review_reuse import (
+    REVIEW_LEGACY_IMPORT_VERSION,
+    REVIEW_REUSE_ACCEPTANCE_MAX_BYTES,
+    REVIEW_REUSE_MAX_ACCEPTANCES,
+    REVIEW_REUSE_MAX_TOTAL_BYTES,
+    REVIEW_REUSE_OBJECT_MAX_BYTES,
+    REVIEW_REUSE_PLAN_VERSION,
+    REVIEW_REUSE_RECEIPT_VERSION,
+    REVIEW_SEGMENT_RULE_VERSION,
+    REVIEW_SEGMENT_VALIDATION_VERSION,
+    AcceptedReviewSegment,
+    ReviewReuseError,
+    ReviewReusePlan,
+    ReviewSegmentIdentity,
+    ReviewSegmentSource,
+    bind_review_reuse_plan_chunks,
+    build_review_segment_acceptance,
+    load_review_segment_acceptances,
+    load_review_reuse_receipt,
+    plan_review_reuse,
+    publish_review_segment_acceptance,
+    publish_review_segment_object,
+    publish_reviewed_output,
+    split_review_segment_response,
+    validate_review_segment_source_set,
 )
 from .projection import (
     annotation_input_block as _project_annotation_input_block,
@@ -283,10 +312,10 @@ ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
 ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
 REVIEW_TIER = "medium"
 TITLE_TRANSLATION_TIER = "medium"
-REVIEW_VERSION = "arc.companion.review.v9"
+REVIEW_VERSION = "arc.companion.review.v10"
 ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v7"
-SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v4"
-COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v4"
+SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v5"
+COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v5"
 SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
@@ -1584,12 +1613,29 @@ def _build_companion_unlocked(
         )
         reviewed_path = checkpoint_dir / f"annotations.reviewed.v5{review_identity_suffix}.json"
         review_path = checkpoint_dir / f"review.v5{review_identity_suffix}.json"
-        if (
+        expected_review_identity_sha256s = [
+            identity.sha256
+            for identity in _prepare_review_segment_reuse_inputs(
+                expanded,
+                translations,
+                raw_annotations,
+                document=bundle.document,
+                glossary=glossary,
+                protected_names=protected_names,
+                evidence=evidence,
+                options=options,
+                intent_guidance=intent_guidance,
+                t14_reference_by_segment=None,
+            )["identities"]
+        ]
+        review_checkpoint_hit = (
             reviewed_path.is_file()
             and review_path.is_file()
             and not options.force
             and not options.regenerate_commentary
-        ):
+            and "review" not in options.regenerate_lanes
+        )
+        if review_checkpoint_hit:
             cached_reviewed = read_json(reviewed_path)
             review = read_json(review_path)
             if not isinstance(review, dict):
@@ -1611,26 +1657,21 @@ def _build_companion_unlocked(
                     annotations=cached_reviewed.get("annotations") or {},
                     options=options,
                 )
+                or not _review_reuse_reference_valid(
+                    review,
+                    checkpoint_dir=checkpoint_dir,
+                    project_dir=options.project_dir,
+                    translations=(
+                        None if options.skip_translation
+                        else cached_reviewed.get("translations")
+                    ),
+                    annotations=cached_reviewed.get("annotations") or {},
+                    expected_identity_sha256s=(
+                        expected_review_identity_sha256s
+                    ),
+                )
             ):
                 raise RuntimeError("invalid review checkpoint")
-            normalized_cached_segments: list[str] = []
-            if not options.skip_translation:
-                cached_reviewed, normalized_cached_segments = (
-                    _repair_reviewed_translation_checkpoint(
-                        reviewed_path,
-                        expanded,
-                        {block_id(block): block for block in bundle.document.get("blocks") or []},
-                        protected_names=protected_names,
-                    )
-                )
-            if normalized_cached_segments:
-                review = {
-                    **review,
-                    "citation_delimiter_normalized_cached_segment_ids": (
-                        normalized_cached_segments
-                    ),
-                }
-                write_json(review_path, review)
             reviewed = cached_reviewed.get("annotations")
             reviewed_translations = cached_reviewed.get("translations")
             if (
@@ -1700,6 +1741,12 @@ def _build_companion_unlocked(
             write_json(reviewed_path, reviewed_payload)
             write_json(review_path, review)
 
+        _merge_review_reuse_global_plan(
+            checkpoint_dir,
+            options.project_dir,
+            review,
+            whole_artifact_hit=review_checkpoint_hit,
+        )
         final_reader_overrides = {
             "status": "complete",
             "document": bundle.document,
@@ -2025,6 +2072,42 @@ def _build_chaptered_companion(
                 for item in plan.get("entries") or []
             )
             write_json(path, plan)
+
+    def mark_review_reuse_plan(
+        audit: Mapping[str, Any],
+        *,
+        whole_artifact_hit: bool,
+    ) -> None:
+        if not isinstance(audit.get("review_reuse"), Mapping):
+            with reuse_plan_header_lock:
+                path = checkpoint_dir / "reuse-plan.json"
+                plan = read_json(path)
+                for entry in plan.get("entries") or []:
+                    if (
+                        entry.get("lane") == "review"
+                        and entry.get("chapter_id") == "project"
+                    ):
+                        entry.update({
+                            "status": "skipped",
+                            "artifact_id": None,
+                            "reason": (
+                                "no substantive Review segments"
+                            ),
+                            "estimated_provider_calls": 0,
+                        })
+                plan["estimated_provider_calls"] = sum(
+                    int(item.get("estimated_provider_calls") or 0)
+                    for item in plan.get("entries") or []
+                )
+                write_json(path, plan)
+            return
+        with reuse_plan_header_lock:
+            _merge_review_reuse_global_plan(
+                checkpoint_dir,
+                options.project_dir,
+                audit,
+                whole_artifact_hit=whole_artifact_hit,
+            )
     cut_migration = {"reused": {}, "receipts": []}
     glossary_migration = {
         "accepted": False, "reason": "legacy_checkpoint_not_requested", "value": None,
@@ -4951,7 +5034,43 @@ def _build_chaptered_companion(
                 for value in first_segment_ids
             }),
         }
-    review_object = None if "review" in regeneration else artifact_store.find(
+    review_t14_reference_by_segment: dict[str, dict[str, Any]] = {}
+    if translation_reference_bundle is not None:
+        for segment in review_segments:
+            chapter_reference = translation_reference_bundle.chapter(
+                str(segment["chapter_id"])
+            )
+            reference_identity = chapter_reference.semantic_identity()
+            review_t14_reference_by_segment[str(segment["segment_id"])] = {
+                "identity": reference_identity,
+                "artifact_sha256": sha256_json({
+                    "content_artifact_id": (
+                        chapter_reference.content_artifact_id
+                    ),
+                    "reference_chapter_content_sha256": (
+                        chapter_reference.reference_chapter_content_sha256
+                    ),
+                }),
+            }
+    current_review_prepared = _prepare_review_segment_reuse_inputs(
+        review_segments,
+        translations,
+        annotations,
+        document=document,
+        glossary=glossary,
+        protected_names=protected_names,
+        evidence=evidence,
+        options=options,
+        intent_guidance=intent_guidance,
+        t14_reference_by_segment=review_t14_reference_by_segment,
+    )
+    expected_review_identity_sha256s = [
+        identity.sha256
+        for identity in current_review_prepared["identities"]
+    ]
+    review_object = None if (
+        options.force or "review" in regeneration
+    ) else artifact_store.find(
         kind="review", semantic_input_sha256=review_input_hash,
         recipe_sha256=review_recipe_hash, contract_version=REVIEW_VERSION,
         predecessor_accepted_chain_sha256=hashlib.sha256(b"").hexdigest(),
@@ -4968,6 +5087,16 @@ def _build_chaptered_companion(
                 expected_freeze_sha256=(
                     None if review_freeze_binding is None
                     else str(review_freeze_binding["freeze_sha256"])
+                ),
+            )
+            and _review_reuse_reference_valid(
+                value["review"],
+                checkpoint_dir=checkpoint_dir,
+                project_dir=options.project_dir,
+                translations=value.get("translations"),
+                annotations=value["annotations"],
+                expected_identity_sha256s=(
+                    expected_review_identity_sha256s
                 ),
             )
         ),
@@ -4990,6 +5119,7 @@ def _build_chaptered_companion(
             llm=llm, checkpoint_dir=checkpoint_dir,
             freeze_binding=review_freeze_binding,
             intent_guidance=intent_guidance,
+            t14_reference_by_segment=review_t14_reference_by_segment,
             cancel_check=cancel_inflight_check,
         )
         review_output = {
@@ -5005,6 +5135,10 @@ def _build_chaptered_companion(
             segment_id="project:review", checkpoint_dir=checkpoint_dir,
             provider=options.provider, model=options.model,
         )
+    mark_review_reuse_plan(
+        chapter_review,
+        whole_artifact_hit=review_object is not None,
+    )
     write_json(checkpoint_dir / "chapter-review.json", chapter_review)
     _write_review_overlays(
         checkpoint_dir, chapter_results, translations=translations, annotations=annotations,
@@ -12434,6 +12568,10 @@ def _coordinate_review_candidates(
     checkpoint_dir: Path,
     freeze_binding: Mapping[str, Any] | None,
     cancel_check: Callable[[], bool] | None,
+    controller_supersession_edges: Sequence[tuple[str, str]] = (),
+    trusted_frozen_reviewed_segments: (
+        Mapping[str, Mapping[str, Any]] | None
+    ) = None,
 ) -> tuple[
     dict[str, dict[str, Any]] | None,
     dict[str, dict[str, Any]],
@@ -12516,6 +12654,30 @@ def _coordinate_review_candidates(
     frozen_ids, freeze_sha256 = _review_arbitration_freeze_identity(
         freeze_binding, segments, translations, annotations,
     )
+    trusted_frozen = {
+        str(segment_id): deepcopy(value)
+        for segment_id, value in (
+            trusted_frozen_reviewed_segments or {}
+        ).items()
+        if str(segment_id) in frozen_ids
+    }
+    for segment_id, value in trusted_frozen.items():
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"translation", "annotation"}
+            or not isinstance(value.get("annotation"), Mapping)
+            or (
+                translations is None
+                and value.get("translation") is not None
+            )
+            or (
+                translations is not None
+                and not isinstance(value.get("translation"), Mapping)
+            )
+        ):
+            raise RuntimeError(
+                "trusted frozen Review proof is malformed"
+            )
     plan = plan_review_merge(
         sources,
         segment_order=segment_order,
@@ -12537,9 +12699,14 @@ def _coordinate_review_candidates(
         tool_policy=tool_policy,
         original_value_resolver=original_value,
         invariant_context_resolver=invariant_context,
+        controller_supersession_edges=controller_supersession_edges,
         semantic_context={
             "freeze_sha256": freeze_sha256,
             "frozen_segment_ids": sorted(frozen_ids),
+            "trusted_frozen_reviewed_segment_sha256s": {
+                segment_id: sha256_json(value)
+                for segment_id, value in sorted(trusted_frozen.items())
+            },
             "baseline_translation_sha256": (
                 None if translations is None else sha256_json(translations)
             ),
@@ -12565,7 +12732,10 @@ def _coordinate_review_candidates(
     invalid_paths = {item.path for item in invalid_candidates}
     frozen_paths = {
         item.path for item in plan.canonical_groups
-        if item.segment_id in frozen_ids
+        if (
+            item.segment_id in frozen_ids
+            and item.segment_id not in trusted_frozen
+        )
     }
     unresolved_paths = set(invalid_paths | frozen_paths)
     accepted_non_conflicting = [
@@ -13177,23 +13347,32 @@ def _coordinate_review_candidates(
         )
     if frozen_ids:
         after_translations = merged_state.get("translations")
-        if (
-            sha256_json({
-                value: merged_state["annotations"][value]
-                for value in frozen_ids
-            }) != sha256_json({
-                value: annotations[value] for value in frozen_ids
-            })
-            or (
-                translations is not None
-                and sha256_json({
-                    value: after_translations[value] for value in frozen_ids
-                }) != sha256_json({
-                    value: translations[value] for value in frozen_ids
-                })
+        for segment_id in frozen_ids:
+            trusted = trusted_frozen.get(segment_id)
+            expected_annotation = (
+                annotations[segment_id]
+                if trusted is None else trusted["annotation"]
             )
-        ):
-            raise RuntimeError("review arbitration changed the frozen first chapter")
+            expected_translation = (
+                None
+                if translations is None
+                else (
+                    translations[segment_id]
+                    if trusted is None else trusted["translation"]
+                )
+            )
+            if (
+                sha256_json(merged_state["annotations"][segment_id])
+                != sha256_json(expected_annotation)
+                or (
+                    translations is not None
+                    and sha256_json(after_translations[segment_id])
+                    != sha256_json(expected_translation)
+                )
+            ):
+                raise RuntimeError(
+                    "review arbitration changed the frozen first chapter"
+                )
     _clear_review_arbitration_supervision_ledger(checkpoint_dir)
     return (
         merged_state.get("translations"),
@@ -13201,6 +13380,1911 @@ def _coordinate_review_candidates(
         merged_review,
         receipt_reference,
     )
+
+
+def _review_reuse_cutpoint(
+    _stage: str,
+    _checkpoint_dir: Path,
+    _detail: str | None = None,
+) -> None:
+    """Fault-injection hook for segment Review reuse crash tests."""
+
+
+def _review_local_glossary(
+    glossary: Mapping[str, Any],
+    segment_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = _commentary_review_glossary_projection(
+        dict(glossary),
+        [dict(segment_payload)],
+        max_bytes=ANNOTATION_GLOSSARY_MAX_BYTES,
+    )
+    return {
+        "schema_version": (
+            glossary.get("schema_version")
+            if isinstance(glossary, Mapping) else None
+        ),
+        "entries": list(projected.get("entries") or []),
+    }
+
+
+def _review_reuse_evidence_projection(
+    records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project exact segment Review evidence without runtime/cache diagnostics."""
+
+    projected = []
+    for record in records:
+        descriptor = (
+            record.get("source_descriptor")
+            if isinstance(record.get("source_descriptor"), Mapping)
+            else {}
+        )
+        locator = (
+            descriptor.get("locator")
+            if isinstance(descriptor.get("locator"), Mapping)
+            else {}
+        )
+        content = {
+            "abstract": str(record.get("abstract") or ""),
+            "snippets": [
+                {
+                    "block_id": str(item.get("block_id") or ""),
+                    "section_title": str(
+                        item.get("section_title") or ""
+                    ),
+                    "text_sha256": sha256_json(
+                        str(item.get("text") or "")
+                    ),
+                }
+                for item in record.get("snippets") or []
+                if isinstance(item, Mapping)
+            ],
+        }
+        projected.append({
+            "evidence_id": str(record.get("evidence_id") or ""),
+            "relation": str(record.get("relation") or ""),
+            "paper_id": str(record.get("paper_id") or ""),
+            "title": str(record.get("title") or ""),
+            "year": record.get("year"),
+            "evidence_level": str(record.get("evidence_level") or ""),
+            "canonical_locator": str(
+                locator.get("canonical_locator")
+                or record.get("url")
+                or record.get("landing_url")
+                or ""
+            ),
+            "document_hash": str(locator.get("document_hash") or ""),
+            "content_sha256": sha256_json(content),
+        })
+    return projected
+
+
+def _review_reuse_t15_contracts() -> dict[str, str]:
+    return {
+        "review": REVIEW_VERSION,
+        "arbitration": REVIEW_ARBITRATION_VERSION,
+        "arbitration_output": REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+        "arbitration_receipt": REVIEW_ARBITRATION_RECEIPT_VERSION,
+        "section_checkpoint": SECTION_REVIEW_CHECKPOINT_VERSION,
+        "commentary_checkpoint": COMMENTARY_REVIEW_CHECKPOINT_VERSION,
+    }
+
+
+def _review_reuse_singleton_validation(
+    identity: ReviewSegmentIdentity,
+    singleton: Mapping[str, Any],
+    *,
+    payload_by_segment: Mapping[str, Mapping[str, Any]],
+    segments_by_id: Mapping[str, Mapping[str, Any]],
+    translations: Mapping[str, Mapping[str, Any]] | None,
+    annotations: Mapping[str, Mapping[str, Any]],
+    blocks_by_id: Mapping[str, Mapping[str, Any]],
+    protected_names_by_segment: Mapping[str, Sequence[str]],
+    reader_evidence: Mapping[str, list[dict[str, Any]]],
+    language: str,
+) -> Mapping[str, Any]:
+    segment_id = identity.segment_id
+    payload = dict(payload_by_segment[segment_id])
+    if identity.mode == "commentary_only":
+        if (
+            singleton.get("reviewed_segment_ids") != [segment_id]
+            or any(
+                item.get("segment_id") != segment_id
+                for item in singleton.get("findings") or []
+            )
+            or any(
+                item.get("segment_id") != segment_id
+                for item in singleton.get("patches") or []
+            )
+        ):
+            raise ReviewReuseError(
+                "commentary review singleton coverage changed"
+            )
+    else:
+        validation_error = _section_review_validation_error(
+            dict(singleton), [payload],
+        )
+        if validation_error is not None:
+            raise ReviewReuseError(
+                f"section review singleton {validation_error}"
+            )
+    raw_patches = list(singleton.get("patches") or [])
+    t15_patches = [
+        (
+            {"translation_blocks": None, **dict(patch)}
+            if identity.mode == "commentary_only"
+            and "translation_blocks" not in patch
+            else dict(patch)
+        )
+        for patch in raw_patches
+    ]
+    semantic_content_sha256 = review_arbitration_sha256({
+        "identity_sha256": identity.sha256,
+        "segment_id": segment_id,
+        "findings": list(singleton.get("findings") or []),
+        "patches": raw_patches,
+        "issues": [],
+        "supersession_edges": [],
+    })
+    source = ReviewPatchSource.from_review(
+        source_kind="segment_review",
+        stable_order=0,
+        review={
+            "reviewed_segment_ids": [segment_id],
+            "findings": list(singleton.get("findings") or []),
+            "patches": t15_patches,
+        },
+        segment_set=[segment_id],
+        source_semantic_identity={
+            "identity_sha256": identity.sha256,
+            "semantic_content_sha256": semantic_content_sha256,
+        },
+    )
+    block_order = {
+        segment_id: [
+            str(item.get("block_id") or "")
+            for item in (
+                [] if translations is None
+                else translations[segment_id].get("blocks") or []
+            )
+        ]
+    }
+    atoms = atomize_review_sources(
+        [source],
+        segment_order=[segment_id],
+        block_order_by_segment=block_order,
+        skip_translation=identity.mode == "commentary_only",
+    )
+    baseline = {
+        "translations": deepcopy(translations),
+        "annotations": deepcopy(annotations),
+    }
+    allowed_urls = {
+        segment_id: _annotation_source_urls(annotations[segment_id])
+    }
+    for atom in atoms:
+        trial = deepcopy(baseline)
+        try:
+            _review_candidate_apply(
+                trial,
+                atom,
+                segments_by_id=segments_by_id,
+                blocks_by_id=blocks_by_id,
+                protected_names=protected_names_by_segment[segment_id],
+                reader_evidence=reader_evidence,
+                language=language,
+                allowed_urls_by_segment=allowed_urls,
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ReviewReuseError(
+                f"review singleton domain validation failed: {exc}"
+            ) from exc
+    return {
+        "schema_version": REVIEW_SEGMENT_VALIDATION_VERSION,
+        "schema_valid": True,
+        "coverage_valid": True,
+        "target_valid": True,
+        "domain_valid": True,
+        "supersession_valid": True,
+        "candidate_count": len(atoms),
+        "owned_block_ids": list(block_order[segment_id]),
+    }
+
+
+def _review_reuse_reference_valid(
+    audit: Mapping[str, Any],
+    *,
+    checkpoint_dir: Path,
+    project_dir: Path,
+    translations: Mapping[str, Any] | None,
+    annotations: Mapping[str, Any],
+    expected_identity_sha256s: Sequence[str],
+) -> bool:
+    reference = audit.get("review_reuse_receipt")
+    if not isinstance(reference, Mapping):
+        return False
+    relative = Path(str(reference.get("path") or ""))
+    if relative.is_absolute() or ".." in relative.parts:
+        return False
+    path = checkpoint_dir / relative
+    if (
+        not path.is_file()
+        or reference.get("sha256") != sha256_file(path)
+    ):
+        return False
+    try:
+        receipt = load_review_reuse_receipt(
+            project_dir, path.relative_to(project_dir),
+        )
+        plan_document = read_bounded_json(
+            project_dir,
+            Path(str(receipt["plan_path"])),
+            max_bytes=REVIEW_REUSE_ACCEPTANCE_MAX_BYTES,
+        )
+        plan = ReviewReusePlan.from_document(
+            plan_document,
+            expected_sha256=str(receipt["plan_sha256"]),
+            require_sealed=True,
+        )
+    except (ReviewReuseError, SecureReadError, ValueError):
+        return False
+    expected_summary = {
+        "plan_sha256": plan.sha256,
+        "counts": dict(plan.document["counts"]),
+        "estimated_calls": plan.document["estimated_calls"],
+        "actual_review_calls": receipt["actual_review_calls"],
+        "ordered_missing_chunks": list(
+            plan.document["ordered_missing_chunks"]
+        ),
+    }
+    return (
+        receipt.get("identity_sha256s")
+        == list(expected_identity_sha256s)
+        and
+        receipt.get("plan_sha256") == reference.get("plan_sha256")
+        and receipt.get("merged_output_sha256")
+        == reference.get("merged_output_sha256")
+        and audit.get("review_reuse") == expected_summary
+        and receipt.get("merged_output_sha256")
+        == review_arbitration_sha256({
+            "translations": translations,
+            "annotations": annotations,
+        })
+    )
+
+
+def _legacy_commentary_review_segment_sources(
+    *,
+    identities: Sequence[ReviewSegmentIdentity],
+    payload_by_segment: Mapping[str, Mapping[str, Any]],
+    annotations: Mapping[str, Mapping[str, Any]],
+    glossary: Mapping[str, Any],
+    options: BuildOptions,
+    checkpoint_dir: Path,
+    intent_guidance: Mapping[str, Any] | None,
+    validate_singleton: Callable[
+        [ReviewSegmentIdentity, Mapping[str, Any]], Mapping[str, Any]
+    ],
+) -> tuple[
+    Mapping[str, tuple[AcceptedReviewSegment, ...]],
+    Mapping[str, tuple[ReviewSegmentSource, ...]],
+    Mapping[str, Any] | None,
+]:
+    """Translate exact legacy commentary v4 groups without unscoped issues."""
+
+    root = checkpoint_dir / "commentary-reviews"
+    project_dir = options.project_dir.resolve()
+    if not root.is_dir() or root.is_symlink():
+        return {}, {}, None
+
+    def safe_read(path: Path, max_bytes: int) -> bytes:
+        try:
+            return read_bounded_file(
+                project_dir,
+                path.relative_to(project_dir),
+                max_bytes=max_bytes,
+                suffixes=(".json",),
+            )
+        except (SecureReadError, ValueError) as exc:
+            raise ReviewReuseError(
+                "legacy commentary proof is unsafe"
+            ) from exc
+
+    try:
+        paths = sorted(root.glob("*.json"))
+        audit_paths = sorted(checkpoint_dir.glob("review.v5*.json"))
+        reviewed_paths = sorted(
+            checkpoint_dir.glob("annotations.reviewed.v5*.json")
+        )
+        invalid_files = (
+            not paths
+            or len(paths) > REVIEW_REUSE_MAX_ACCEPTANCES
+            or len(audit_paths) != 1
+            or len(reviewed_paths) != 1
+            or any(
+                path.is_symlink()
+                or not stat.S_ISREG(
+                    path.stat(follow_symlinks=False).st_mode
+                )
+                for path in [*paths, *audit_paths, *reviewed_paths]
+            )
+            or sum(
+                path.stat(follow_symlinks=False).st_size
+                for path in [*paths, *audit_paths, *reviewed_paths]
+            ) > REVIEW_REUSE_MAX_TOTAL_BYTES
+        )
+        if invalid_files:
+            return {}, {}, None
+        audit = json.loads(safe_read(
+            audit_paths[0], REVIEW_REUSE_ACCEPTANCE_MAX_BYTES,
+        ))
+        reviewed_checkpoint = json.loads(safe_read(
+            reviewed_paths[0], REVIEW_REUSE_OBJECT_MAX_BYTES,
+        ))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ReviewReuseError,
+    ):
+        return {}, {}, None
+    if (
+        not isinstance(audit, Mapping)
+        or not isinstance(reviewed_checkpoint, Mapping)
+        or reviewed_checkpoint.get("schema_version")
+        not in {"arc.companion.review.v9", REVIEW_VERSION}
+        or not isinstance(reviewed_checkpoint.get("annotations"), Mapping)
+        or not _review_arbitration_reference_valid(
+            audit,
+            checkpoint_dir,
+            translations=None,
+            annotations=reviewed_checkpoint["annotations"],
+            options=options,
+        )
+    ):
+        return {}, {}, None
+    prompt_audit = audit.get("prompt_budget_audit")
+    audit_calls = (
+        prompt_audit.get("calls")
+        if isinstance(prompt_audit, Mapping) else None
+    )
+    if not isinstance(audit_calls, list):
+        return {}, {}, None
+    identities_by_id = {
+        identity.segment_id: identity for identity in identities
+    }
+    expected_ids = [identity.segment_id for identity in identities]
+    covered: list[str] = []
+    valid_sources: list[ReviewSegmentSource] = []
+    invalid_by_segment: dict[str, AcceptedReviewSegment] = {}
+    checkpoint_hashes: list[str] = []
+    for index, path in enumerate(paths):
+        try:
+            raw = safe_read(path, REVIEW_REUSE_OBJECT_MAX_BYTES)
+            checkpoint = json.loads(raw)
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ReviewReuseError,
+        ):
+            return {}, {}, None
+        if (
+            not isinstance(checkpoint, Mapping)
+            or checkpoint.get("schema_version")
+            != "arc.companion.commentary-review-checkpoint.v4"
+            or checkpoint.get("group_index") != index
+            or not isinstance(
+                checkpoint.get("reviewed_segment_ids"), list
+            )
+            or not isinstance(checkpoint.get("review"), Mapping)
+        ):
+            return {}, {}, None
+        segment_ids = [
+            str(value)
+            for value in checkpoint["reviewed_segment_ids"]
+        ]
+        if (
+            not segment_ids
+            or len(segment_ids) != len(set(segment_ids))
+            or any(value not in identities_by_id for value in segment_ids)
+            or any(value in covered for value in segment_ids)
+        ):
+            return {}, {}, None
+        group = [
+            dict(payload_by_segment[value]) for value in segment_ids
+        ]
+        glossary_candidates = [
+            dict(glossary),
+            _commentary_review_glossary_projection(
+                dict(glossary),
+                group,
+                max_bytes=ANNOTATION_GLOSSARY_MAX_BYTES,
+            ),
+            _empty_commentary_review_glossary(dict(glossary)),
+        ]
+        prompt_candidates = [
+            _guided_prompt(
+                commentary_review_prompt(
+                    {"glossary": candidate, "segments": group},
+                    language=options.annotation_language,
+                ),
+                intent_guidance,
+                lane="review",
+            )
+            for candidate in glossary_candidates
+        ]
+        matches = [
+            prompt
+            for prompt in dict.fromkeys(prompt_candidates)
+            if checkpoint.get("input_sha256") == sha256_json({
+                "prompt": prompt,
+                "schema": COMMENTARY_REVIEW_SCHEMA,
+                "model_tier": REVIEW_TIER,
+            })
+            and any(
+                isinstance(item, Mapping)
+                and item.get("call_label")
+                == f"companion-commentary-review-{index}"
+                and item.get("segment_ids") == segment_ids
+                and item.get("prompt_sha256")
+                == hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest()
+                for item in audit_calls
+            )
+        ]
+        if (
+            len(matches) != 1
+            or _commentary_review_validation_error(
+                dict(checkpoint["review"]), group,
+            ) is not None
+        ):
+            return {}, {}, None
+        issues = list(checkpoint["review"].get("issues") or [])
+        if issues:
+            for segment_id in segment_ids:
+                identity = identities_by_id[segment_id]
+                invalid_by_segment[segment_id] = (
+                    AcceptedReviewSegment(
+                        identity=identity,
+                        source_sha256s=(),
+                        acceptance_sha256=review_arbitration_sha256({
+                            "legacy_checkpoint_sha256": (
+                                hashlib.sha256(raw).hexdigest()
+                            ),
+                            "segment_id": segment_id,
+                            "reason": "legacy_unscoped_issue",
+                        }),
+                        valid=False,
+                        invalidation_code="legacy_unscoped_issue",
+                    )
+                )
+        else:
+            complete = {
+                "reviewed_segment_ids": segment_ids,
+                "findings": [],
+                "patches": list(
+                    checkpoint["review"].get("patches") or []
+                ),
+            }
+            try:
+                valid_sources.extend(split_review_segment_response(
+                    complete,
+                    identities_by_segment={
+                        value: identities_by_id[value]
+                        for value in segment_ids
+                    },
+                    schema=COMMENTARY_SEGMENT_REVIEW_SCHEMA,
+                    validate_singleton=validate_singleton,
+                    audit={
+                        "legacy_import_version": (
+                            REVIEW_LEGACY_IMPORT_VERSION
+                        ),
+                        "legacy_checkpoint_sha256": (
+                            hashlib.sha256(raw).hexdigest()
+                        ),
+                    },
+                ))
+            except ReviewReuseError:
+                return {}, {}, None
+        covered.extend(segment_ids)
+        checkpoint_hashes.append(hashlib.sha256(raw).hexdigest())
+    if covered != expected_ids:
+        return {}, {}, None
+    proof = {
+        "schema_version": REVIEW_LEGACY_IMPORT_VERSION,
+        "mode": "commentary_only",
+        "commentary_checkpoint_sha256s": checkpoint_hashes,
+        "review_audit_sha256": hashlib.sha256(
+            safe_read(
+                audit_paths[0], REVIEW_REUSE_ACCEPTANCE_MAX_BYTES,
+            )
+        ).hexdigest(),
+        "expected_reviewed_translation_sha256": (
+            review_arbitration_sha256(None)
+        ),
+        "expected_reviewed_annotation_sha256": (
+            review_arbitration_sha256(
+                reviewed_checkpoint["annotations"]
+            )
+        ),
+        "enforce_output": not invalid_by_segment,
+    }
+    proof_sha256 = review_arbitration_sha256(proof)
+    source_map = {
+        identity.segment_id: tuple(
+            source for source in valid_sources
+            if source.identity.segment_id == identity.segment_id
+        )
+        for identity in identities
+    }
+    accepted = {
+        identity.segment_id: (
+            (invalid_by_segment[identity.segment_id],)
+            if identity.segment_id in invalid_by_segment
+            else (
+                AcceptedReviewSegment(
+                    identity=identity,
+                    source_sha256s=tuple(
+                        source.semantic_content_sha256
+                        for source in source_map[identity.segment_id]
+                    ),
+                    acceptance_sha256=proof_sha256,
+                ),
+            )
+        )
+        for identity in identities
+    }
+    return accepted, source_map, proof
+
+
+def _legacy_review_segment_sources(
+    *,
+    identities: Sequence[ReviewSegmentIdentity],
+    payload_by_segment: Mapping[str, Mapping[str, Any]],
+    segments: list[dict[str, Any]],
+    translations: Mapping[str, Mapping[str, Any]],
+    annotations: Mapping[str, Mapping[str, Any]],
+    document: Mapping[str, Any],
+    glossary: Mapping[str, Any],
+    protected_names: Sequence[str],
+    evidence: Mapping[str, Any],
+    options: BuildOptions,
+    checkpoint_dir: Path,
+    intent_guidance: Mapping[str, Any] | None,
+    validate_singleton: Callable[
+        [ReviewSegmentIdentity, Mapping[str, Any]], Mapping[str, Any]
+    ],
+) -> tuple[
+    Mapping[str, tuple[AcceptedReviewSegment, ...]],
+    Mapping[str, tuple[ReviewSegmentSource, ...]],
+    Mapping[str, Any] | None,
+]:
+    """Strictly import complete translated v3/v4 Review proof without mutation."""
+
+    project_dir = options.project_dir.resolve()
+
+    def legacy_read(path: Path, *, max_bytes: int) -> bytes:
+        try:
+            relative = path.relative_to(project_dir)
+            return read_bounded_file(
+                project_dir,
+                relative,
+                max_bytes=max_bytes,
+                suffixes=(".json",),
+            )
+        except (SecureReadError, ValueError) as exc:
+            raise ReviewReuseError(
+                "legacy Review proof file is unsafe"
+            ) from exc
+
+    if options.skip_translation:
+        return _legacy_commentary_review_segment_sources(
+            identities=identities,
+            payload_by_segment=payload_by_segment,
+            annotations=annotations,
+            glossary=glossary,
+            options=options,
+            checkpoint_dir=checkpoint_dir,
+            intent_guidance=intent_guidance,
+            validate_singleton=validate_singleton,
+        )
+
+    acceptance_path = checkpoint_dir / "final-review-accepted.json"
+    section_root = checkpoint_dir / "section-reviews"
+    if (
+        not acceptance_path.is_file()
+        or acceptance_path.is_symlink()
+        or not section_root.is_dir()
+        or section_root.is_symlink()
+    ):
+        return {}, {}, None
+    try:
+        acceptance_bytes = legacy_read(
+            acceptance_path,
+            max_bytes=REVIEW_REUSE_ACCEPTANCE_MAX_BYTES,
+        )
+        acceptance = json.loads(acceptance_bytes)
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ReviewReuseError,
+    ):
+        return {}, {}, None
+    if (
+        not isinstance(acceptance, Mapping)
+        or set(acceptance) != {
+            "schema_version",
+            "input_sha256",
+            "response",
+            "review_arbitration_receipt",
+            "reviewed_translation_sha256",
+            "reviewed_annotation_sha256",
+            "audit",
+        }
+        or acceptance.get("schema_version")
+        != "arc.companion.final-review-acceptance.v1"
+        or not isinstance(acceptance.get("response"), Mapping)
+        or not isinstance(acceptance.get("audit"), Mapping)
+        or not _is_sha256_value(acceptance.get("input_sha256"))
+        or not _is_sha256_value(
+            acceptance.get("reviewed_translation_sha256")
+        )
+        or not _is_sha256_value(
+            acceptance.get("reviewed_annotation_sha256")
+        )
+    ):
+        return {}, {}, None
+    arbitration_reference = acceptance.get(
+        "review_arbitration_receipt"
+    )
+    if not isinstance(arbitration_reference, Mapping):
+        return {}, {}, None
+    receipt_relative = Path(
+        str(arbitration_reference.get("path") or "")
+    )
+    if (
+        receipt_relative.is_absolute()
+        or ".." in receipt_relative.parts
+    ):
+        return {}, {}, None
+    receipt_path = checkpoint_dir / receipt_relative
+    try:
+        receipt_bytes = legacy_read(
+            receipt_path,
+            max_bytes=REVIEW_REUSE_ACCEPTANCE_MAX_BYTES,
+        )
+        receipt = json.loads(receipt_bytes)
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ReviewReuseError,
+    ):
+        return {}, {}, None
+    if (
+        not isinstance(receipt, Mapping)
+        or hashlib.sha256(receipt_bytes).hexdigest()
+        != arbitration_reference.get("sha256")
+        or receipt.get("schema_version")
+        != REVIEW_ARBITRATION_RECEIPT_VERSION
+        or receipt.get("status") not in {"no_conflicts", "resolved"}
+        or receipt.get("unresolved_paths")
+        or receipt.get("merged_sha256")
+        != review_arbitration_sha256(acceptance["response"])
+        or receipt.get("reviewed_translation_sha256")
+        != acceptance["reviewed_translation_sha256"]
+        or receipt.get("reviewed_annotation_sha256")
+        != acceptance["reviewed_annotation_sha256"]
+        or any(
+            arbitration_reference.get(key) != receipt.get(key)
+            for key in (
+                "status",
+                "semantic_input_sha256",
+                "merged_sha256",
+                "final_review_sha256",
+                "reviewed_translation_sha256",
+                "reviewed_annotation_sha256",
+            )
+            if key in arbitration_reference
+        )
+    ):
+        return {}, {}, None
+    prompt_audit = acceptance["audit"].get("prompt_budget_audit")
+    audit_calls = (
+        prompt_audit.get("calls")
+        if isinstance(prompt_audit, Mapping) else None
+    )
+    if not isinstance(audit_calls, list):
+        return {}, {}, None
+    identities_by_id = {item.segment_id: item for item in identities}
+    expected_ids = [item.segment_id for item in identities]
+    covered: list[str] = []
+    findings: list[dict[str, Any]] = []
+    section_summaries: list[dict[str, Any]] = []
+    section_hashes: list[str] = []
+    try:
+        section_paths = sorted(section_root.glob("*.json"))
+        invalid_section_set = (
+            not section_paths
+            or len(section_paths) > REVIEW_REUSE_MAX_ACCEPTANCES
+            or any(
+                path.is_symlink()
+                or path.suffix != ".json"
+                or not stat.S_ISREG(
+                    path.stat(follow_symlinks=False).st_mode
+                )
+                for path in section_paths
+            )
+            or sum(
+                path.stat(follow_symlinks=False).st_size
+                for path in section_paths
+            ) > REVIEW_REUSE_MAX_TOTAL_BYTES
+        )
+    except OSError:
+        return {}, {}, None
+    if invalid_section_set:
+        return {}, {}, None
+    for expected_index, path in enumerate(section_paths):
+        try:
+            raw = legacy_read(
+                path,
+                max_bytes=REVIEW_REUSE_OBJECT_MAX_BYTES,
+            )
+            checkpoint = json.loads(raw)
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ReviewReuseError,
+        ):
+            return {}, {}, None
+        if (
+            not isinstance(checkpoint, Mapping)
+            or checkpoint.get("schema_version") not in {
+                "arc.companion.section-review-checkpoint.v3",
+                "arc.companion.section-review-checkpoint.v4",
+            }
+            or checkpoint.get("section_index") != expected_index
+            or not isinstance(checkpoint.get("review"), Mapping)
+            or not isinstance(checkpoint.get("reviewed_segment_ids"), list)
+        ):
+            return {}, {}, None
+        segment_ids = [
+            str(value) for value in checkpoint["reviewed_segment_ids"]
+        ]
+        if (
+            not segment_ids
+            or len(segment_ids) != len(set(segment_ids))
+            or any(value not in identities_by_id for value in segment_ids)
+            or checkpoint["review"].get("reviewed_segment_ids")
+            != segment_ids
+            or any(value in covered for value in segment_ids)
+        ):
+            return {}, {}, None
+        group = [
+            dict(payload_by_segment[segment_id])
+            for segment_id in segment_ids
+        ]
+        chunk_text = json.dumps(
+            [item.get("source_blocks") or [] for item in group],
+            ensure_ascii=False,
+        )
+        prompt = _guided_prompt(
+            section_review_prompt(
+                {
+                    "segments": group,
+                    "glossary": (
+                        _commentary_review_glossary_projection(
+                            dict(glossary),
+                            group,
+                            max_bytes=ANNOTATION_GLOSSARY_MAX_BYTES,
+                        )
+                    ),
+                    "protected_names": [
+                        name for name in protected_names
+                        if name and name in chunk_text
+                    ],
+                },
+                language=options.annotation_language,
+            ),
+            intent_guidance,
+            lane="review",
+        )
+        prompt_sha256 = hashlib.sha256(
+            prompt.encode("utf-8")
+        ).hexdigest()
+        input_sha256 = sha256_json({
+            "prompt": prompt,
+            "schema": SECTION_REVIEW_SCHEMA,
+            "model_tier": REVIEW_TIER,
+        })
+        label = f"companion-section-review-{expected_index}"
+        checkpoint_audit = checkpoint.get("prompt_budget_audit")
+        matching_audits = [
+            item for item in audit_calls
+            if isinstance(item, Mapping)
+            and item.get("call_label") == label
+            and item.get("segment_ids") == segment_ids
+            and item.get("prompt_sha256") == prompt_sha256
+        ]
+        if isinstance(checkpoint_audit, Mapping):
+            matching_audits.append(checkpoint_audit)
+        if (
+            checkpoint.get("input_sha256") != input_sha256
+            or not any(
+                item.get("call_label") == label
+                and item.get("segment_ids") == segment_ids
+                and item.get("prompt_sha256") == prompt_sha256
+                for item in matching_audits
+            )
+            or _section_review_validation_error(
+                dict(checkpoint["review"]),
+                group,
+            ) is not None
+        ):
+            return {}, {}, None
+        covered.extend(segment_ids)
+        findings.extend(
+            dict(item)
+            for item in checkpoint["review"].get("findings") or []
+        )
+        section_summaries.append({
+            "section_index": expected_index,
+            "reviewed_segment_ids": segment_ids,
+            "findings": list(
+                checkpoint["review"].get("findings") or []
+            ),
+            "patch_proposals": _section_review_patch_proposals(
+                group,
+                list(checkpoint["review"].get("patches") or []),
+                list(checkpoint["review"].get("findings") or []),
+            ),
+        })
+        section_hashes.append(hashlib.sha256(raw).hexdigest())
+    if covered != expected_ids:
+        return {}, {}, None
+    blocks_by_id = {
+        block_id(block): block
+        for block in document.get("blocks") or []
+    }
+    final_payload, final_prompt = _bounded_hierarchical_review_prompt(
+        section_summaries,
+        segments,
+        blocks_by_id=blocks_by_id,
+        document=dict(document),
+        segment_payloads=[
+            dict(payload_by_segment[value]) for value in expected_ids
+        ],
+        glossary=dict(glossary),
+        protected_names=list(protected_names),
+        language=options.annotation_language,
+        max_prompt_bytes=_review_prompt_target_limit(options),
+        strict_prompt_bytes=_review_prompt_byte_limit(options),
+        intent_guidance=intent_guidance,
+    )
+    del final_payload
+    final_prompt_sha256 = hashlib.sha256(
+        final_prompt.encode("utf-8")
+    ).hexdigest()
+    final_audits = [
+        item for item in audit_calls
+        if isinstance(item, Mapping)
+        and item.get("call_label") == "companion-final-review"
+        and item.get("segment_ids") == expected_ids
+        and item.get("prompt_sha256") == final_prompt_sha256
+    ]
+    if (
+        len(final_audits) != 1
+        or acceptance["input_sha256"] != sha256_json({
+            "prompt": final_prompt,
+            "schema": REVIEW_SCHEMA,
+            "model_tier": REVIEW_TIER,
+        })
+        or acceptance["response"].get("issues")
+    ):
+        return {}, {}, None
+    try:
+        from jsonschema import (
+            ValidationError,
+            validate as validate_json_schema,
+        )
+
+        validate_json_schema(
+            instance=dict(acceptance["response"]),
+            schema=REVIEW_SCHEMA,
+        )
+    except ValidationError:
+        return {}, {}, None
+    final_patches = list(
+        acceptance["response"].get("patches") or []
+    )
+    complete = {
+        "reviewed_segment_ids": expected_ids,
+        "findings": findings,
+        "patches": final_patches,
+    }
+    try:
+        sources = split_review_segment_response(
+            complete,
+            identities_by_segment=identities_by_id,
+            schema=SECTION_REVIEW_SCHEMA,
+            validate_singleton=validate_singleton,
+            audit={
+                "legacy_import_version": REVIEW_LEGACY_IMPORT_VERSION,
+                "legacy_section_sha256s": section_hashes,
+                "legacy_final_acceptance_sha256": hashlib.sha256(
+                    acceptance_bytes
+                ).hexdigest(),
+            },
+        )
+    except ReviewReuseError:
+        return {}, {}, None
+    proof = {
+        "schema_version": REVIEW_LEGACY_IMPORT_VERSION,
+        "section_checkpoint_sha256s": section_hashes,
+        "final_acceptance_sha256": hashlib.sha256(
+            acceptance_bytes
+        ).hexdigest(),
+        "t15_receipt_sha256": hashlib.sha256(
+            receipt_bytes
+        ).hexdigest(),
+        "historical_base_identity_sha256": sha256_json({
+            "segment_ids": expected_ids,
+            "translations": translations,
+            "annotations": annotations,
+            "section_prompt_sha256s": [
+                item.get("prompt_sha256")
+                for item in audit_calls
+                if isinstance(item, Mapping)
+                and str(item.get("call_label") or "").startswith(
+                    "companion-section-review-"
+                )
+            ],
+            "final_prompt_sha256": final_prompt_sha256,
+        }),
+        "expected_reviewed_translation_sha256": acceptance[
+            "reviewed_translation_sha256"
+        ],
+        "expected_reviewed_annotation_sha256": acceptance[
+            "reviewed_annotation_sha256"
+        ],
+    }
+    proof_sha256 = review_arbitration_sha256(proof)
+    accepted = {
+        source.identity.segment_id: (
+            AcceptedReviewSegment(
+                identity=source.identity,
+                source_sha256s=(source.semantic_content_sha256,),
+                acceptance_sha256=proof_sha256,
+            ),
+        )
+        for source in sources
+    }
+    source_map = {
+        source.identity.segment_id: (source,)
+        for source in sources
+    }
+    return accepted, source_map, proof
+
+
+def _is_sha256_value(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+    )
+
+
+def _prepare_review_segment_reuse_inputs(
+    segments: Sequence[Mapping[str, Any]],
+    translations: Mapping[str, Mapping[str, Any]] | None,
+    annotations: Mapping[str, Mapping[str, Any]],
+    *,
+    document: Mapping[str, Any],
+    glossary: Mapping[str, Any],
+    protected_names: Sequence[str],
+    evidence: Mapping[str, Any],
+    options: BuildOptions,
+    intent_guidance: Mapping[str, Any] | None,
+    t14_reference_by_segment: (
+        Mapping[str, Mapping[str, Any]] | None
+    ),
+) -> dict[str, Any]:
+    """Build the one canonical input projection used by planning and fast paths."""
+
+    mode = (
+        "commentary_only"
+        if options.skip_translation else "translation_enabled"
+    )
+    by_id = {
+        block_id(block): block for block in document.get("blocks") or []
+    }
+    segments_by_id = {
+        str(item["segment_id"]): item for item in segments
+    }
+    cleaned_translations = (
+        None
+        if options.skip_translation or translations is None
+        else {
+            str(segment_id): clean_reader_translation(value)
+            for segment_id, value in translations.items()
+        }
+    )
+    reader_evidence = _reader_evidence_by_segment(
+        [dict(item) for item in segments],
+        document=dict(document),
+        evidence=dict(evidence),
+        annotations=dict(annotations),
+    )
+    cleaned_annotations = {
+        str(segment_id): clean_reader_annotation(
+            value,
+            evidence_records=reader_evidence.get(
+                str(segment_id), []
+            ),
+            language=options.annotation_language,
+        )
+        for segment_id, value in annotations.items()
+    }
+    protected_by_segment: dict[str, list[str]] = {}
+    payload_by_segment: dict[str, dict[str, Any]] = {}
+    local_glossary_by_segment: dict[str, dict[str, Any]] = {}
+    identities: list[ReviewSegmentIdentity] = []
+    schema = (
+        COMMENTARY_SEGMENT_REVIEW_SCHEMA
+        if options.skip_translation else SECTION_REVIEW_SCHEMA
+    )
+    schema_version = (
+        COMMENTARY_REVIEW_CHECKPOINT_VERSION
+        if options.skip_translation else SECTION_REVIEW_CHECKPOINT_VERSION
+    )
+    for segment_value in segments:
+        segment = dict(segment_value)
+        segment_id = str(segment["segment_id"])
+        semantic_segment = _semantic_segment_descriptor(segment)
+        semantic_segment["augmentation_block_ids"] = (
+            _augmentation_block_ids(segment, by_id)
+        )
+        source_blocks = [
+            _annotation_input_block(by_id[value], dict(document))
+            for value in _augmentation_block_ids(segment, by_id)
+        ]
+        protected_by_segment[segment_id] = _protected_names_for_blocks(
+            list(protected_names),
+            _augmentation_blocks(segment, by_id),
+        )
+        payload = {
+            "segment": semantic_segment,
+            "source_blocks": source_blocks,
+            **(
+                {}
+                if cleaned_translations is None
+                else {
+                    "translation": cleaned_translations[segment_id]
+                }
+            ),
+            "annotation": cleaned_annotations[segment_id],
+            "context_evidence": _review_context_evidence(
+                segment,
+                blocks_by_id=by_id,
+                evidence=dict(evidence),
+            ),
+        }
+        payload_by_segment[segment_id] = payload
+        local_glossary = _review_local_glossary(
+            dict(glossary), payload,
+        )
+        local_glossary_by_segment[segment_id] = local_glossary
+        reference = dict(
+            (t14_reference_by_segment or {}).get(segment_id) or {}
+        )
+        identities.append(ReviewSegmentIdentity.build(
+            segment_id=segment_id,
+            mode=mode,
+            semantic_segment=semantic_segment,
+            augmentation_blocks=source_blocks,
+            current_translation=(
+                None
+                if cleaned_translations is None
+                else cleaned_translations[segment_id]
+            ),
+            current_annotation=cleaned_annotations[segment_id],
+            local_glossary=local_glossary,
+            protected_names=protected_by_segment[segment_id],
+            segment_evidence=_review_reuse_evidence_projection(
+                payload["context_evidence"]
+            ),
+            t14_reference_identity=(
+                reference.get("identity")
+                if isinstance(reference.get("identity"), Mapping)
+                else None
+            ),
+            t14_reference_artifact_sha256=reference.get(
+                "artifact_sha256"
+            ),
+            intent_guidance=(
+                dict(intent_guidance)
+                if intent_guidance is not None else None
+            ),
+            annotation_language=options.annotation_language,
+            t15_contracts=_review_reuse_t15_contracts(),
+            provider_output_schema_version=schema_version,
+            provider_output_schema=schema,
+            segment_rule=REVIEW_SEGMENT_RULE_VERSION,
+        ))
+    return {
+        "translations": cleaned_translations,
+        "annotations": cleaned_annotations,
+        "by_id": by_id,
+        "segments_by_id": segments_by_id,
+        "reader_evidence": reader_evidence,
+        "protected_by_segment": protected_by_segment,
+        "payload_by_segment": payload_by_segment,
+        "local_glossary_by_segment": local_glossary_by_segment,
+        "identities": identities,
+        "schema": schema,
+        "schema_version": schema_version,
+    }
+
+
+def _review_with_segment_reuse(
+    segments: list[dict[str, Any]],
+    translations: dict[str, dict[str, Any]] | None,
+    annotations: dict[str, dict[str, Any]],
+    *,
+    document: dict[str, Any],
+    glossary: dict[str, Any],
+    protected_names: list[str],
+    evidence: dict[str, Any],
+    options: BuildOptions,
+    llm: Callable[..., dict[str, Any]],
+    checkpoint_dir: Path,
+    freeze_binding: Mapping[str, Any] | None,
+    intent_guidance: Mapping[str, Any] | None,
+    t14_reference_by_segment: Mapping[str, Mapping[str, Any]] | None,
+    cancel_check: Callable[[], bool] | None,
+) -> tuple[
+    dict[str, dict[str, Any]] | None,
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+]:
+    prepared = _prepare_review_segment_reuse_inputs(
+        segments,
+        document=document,
+        translations=translations,
+        annotations=annotations,
+        glossary=glossary,
+        protected_names=protected_names,
+        evidence=evidence,
+        options=options,
+        intent_guidance=intent_guidance,
+        t14_reference_by_segment=t14_reference_by_segment,
+    )
+    translations = prepared["translations"]
+    annotations = prepared["annotations"]
+    by_id = prepared["by_id"]
+    segments_by_id = prepared["segments_by_id"]
+    reader_evidence = prepared["reader_evidence"]
+    protected_by_segment = prepared["protected_by_segment"]
+    payload_by_segment = prepared["payload_by_segment"]
+    local_glossary_by_segment = prepared[
+        "local_glossary_by_segment"
+    ]
+    identities = prepared["identities"]
+    schema = prepared["schema"]
+    schema_version = prepared["schema_version"]
+    regenerate_review = (
+        options.force or "review" in options.regenerate_lanes
+    )
+    plan_path = checkpoint_dir / "review-reuse-plan.json"
+    receipt_path = checkpoint_dir / "review-reuse-receipt.json"
+    prior_receipt: Mapping[str, Any] | None = None
+    legacy_proof: Mapping[str, Any] | None = None
+    if regenerate_review:
+        accepted_by_segment: Mapping[
+            str, Sequence[AcceptedReviewSegment]
+        ] = {}
+        reused_sources: Mapping[
+            str, Sequence[ReviewSegmentSource]
+        ] = {}
+    else:
+        if receipt_path.is_file():
+            prior_receipt = load_review_reuse_receipt(
+                options.project_dir,
+                receipt_path.relative_to(options.project_dir),
+            )
+        accepted_by_segment, reused_sources = (
+            load_review_segment_acceptances(
+                options.project_dir,
+                identities,
+            )
+        )
+        if plan_path.is_file() and prior_receipt is None:
+            unfinished = ReviewReusePlan.from_document(
+                read_json(plan_path),
+                require_sealed=True,
+            )
+            planned_reused = {
+                entry.segment_id
+                for entry in unfinished.entries
+                if entry.disposition == "reused"
+            }
+            accepted_by_segment = {
+                key: value for key, value in accepted_by_segment.items()
+                if key in planned_reused
+            }
+            reused_sources = {
+                key: value for key, value in reused_sources.items()
+                if key in planned_reused
+            }
+    if (
+        not regenerate_review
+        and prior_receipt is None
+        and not plan_path.is_file()
+    ):
+        legacy_accepted, legacy_sources, legacy_proof = (
+            _legacy_review_segment_sources(
+                identities=identities,
+                payload_by_segment=payload_by_segment,
+                segments=segments,
+                translations=translations or {},
+                annotations=annotations,
+                document=document,
+                glossary=glossary,
+                protected_names=protected_names,
+                evidence=evidence,
+                options=options,
+                checkpoint_dir=checkpoint_dir,
+                intent_guidance=intent_guidance,
+                validate_singleton=lambda identity, singleton: (
+                    _review_reuse_singleton_validation(
+                        identity,
+                        singleton,
+                        payload_by_segment=payload_by_segment,
+                        segments_by_id=segments_by_id,
+                        translations=translations,
+                        annotations=annotations,
+                        blocks_by_id=by_id,
+                        protected_names_by_segment=protected_by_segment,
+                        reader_evidence=reader_evidence,
+                        language=options.annotation_language,
+                    )
+                ),
+            )
+        )
+        accepted_by_segment = {
+            segment_id: tuple(accepted_by_segment.get(segment_id, ()))
+            + tuple(legacy_accepted.get(segment_id, ()))
+            for segment_id in {
+                *accepted_by_segment,
+                *legacy_accepted,
+            }
+        }
+        reused_sources = {
+            segment_id: tuple(reused_sources.get(segment_id, ()))
+            + tuple(legacy_sources.get(segment_id, ()))
+            for segment_id in {
+                *reused_sources,
+                *legacy_sources,
+            }
+        }
+        if legacy_proof is not None:
+            write_json(
+                checkpoint_dir / "review-legacy-import.json",
+                legacy_proof,
+            )
+            for values in reused_sources.values():
+                for source in values:
+                    publish_review_segment_object(
+                        options.project_dir,
+                        source,
+                    )
+        elif (
+            (checkpoint_dir / "final-review-accepted.json").exists()
+            or (checkpoint_dir / "section-reviews").exists()
+        ):
+            accepted_by_segment = {
+                identity.segment_id: tuple(
+                    accepted_by_segment.get(identity.segment_id, ())
+                ) + (
+                    AcceptedReviewSegment(
+                        identity=identity,
+                        source_sha256s=(),
+                        acceptance_sha256=review_arbitration_sha256({
+                            "schema_version": REVIEW_LEGACY_IMPORT_VERSION,
+                            "segment_id": identity.segment_id,
+                            "status": "legacy_proof_unavailable",
+                        }),
+                        valid=False,
+                        invalidation_code="legacy_proof_unavailable",
+                    ),
+                )
+                for identity in identities
+            }
+    base_plan = plan_review_reuse(
+        identities,
+        accepted_by_segment,
+        regenerate_review,
+    )
+    miss_ids = [
+        item.segment_id
+        for item in base_plan.entries
+        if item.disposition != "reused"
+    ]
+    prompt_budget = _review_prompt_budget(options)
+    target = int(prompt_budget["target_limit_bytes"])
+    strict = int(prompt_budget["strict_limit_bytes"])
+
+    def render(group: list[dict[str, Any]]) -> str:
+        segment_ids = [
+            str(item["segment"]["segment_id"]) for item in group
+        ]
+        combined_glossary = {
+            "schema_version": "arc.companion.review-local-glossary.v1",
+            "entries": [
+                entry
+                for segment_id in segment_ids
+                for entry in local_glossary_by_segment[segment_id]["entries"]
+            ],
+        }
+        if options.skip_translation:
+            return _guided_prompt(
+                commentary_review_prompt(
+                    {"segments": group, "glossary": combined_glossary},
+                    language=options.annotation_language,
+                ),
+                intent_guidance,
+                lane="review",
+            )
+        names = [
+            name
+            for segment_id in segment_ids
+            for name in protected_by_segment[segment_id]
+        ]
+        return _guided_prompt(
+            section_review_prompt(
+                {
+                    "segments": group,
+                    "glossary": combined_glossary,
+                    "protected_names": list(dict.fromkeys(names)),
+                },
+                language=options.annotation_language,
+            ),
+            intent_guidance,
+            lane="review",
+        )
+
+    prior_plan = read_json(plan_path) if plan_path.is_file() else None
+    if (
+        plan_path.is_file()
+        and prior_receipt is None
+        and not regenerate_review
+    ):
+        if not isinstance(prior_plan, Mapping):
+            raise ReviewReuseError("unfinished review reuse plan is malformed")
+        sealed_plan = ReviewReusePlan.from_document(
+            prior_plan,
+            require_sealed=True,
+        )
+        current_keys = [
+            (
+                item.segment_id,
+                item.identity_sha256,
+                item.disposition,
+                item.reason,
+            )
+            for item in base_plan.entries
+        ]
+        prior_keys = [
+            (
+                item.segment_id,
+                item.identity_sha256,
+                item.disposition,
+                item.reason,
+            )
+            for item in sealed_plan.entries
+        ]
+        if prior_keys != current_keys:
+            raise ReviewReuseError(
+                "unfinished review reuse plan does not match current inputs"
+            )
+        segment_by_identity = {
+            item.sha256: item.segment_id for item in identities
+        }
+        chunk_ids = [
+            [
+                segment_by_identity[value]
+                for value in chunk.ordered_identity_sha256s
+            ]
+            for chunk in sealed_plan.chunks
+        ]
+        plan = bind_review_reuse_plan_chunks(base_plan, chunk_ids)
+        if plan != sealed_plan:
+            raise ReviewReuseError("review reuse plan tamper")
+    else:
+        calls = _pack_rendered_review_calls(
+            [payload_by_segment[value] for value in miss_ids],
+            render_prompt=render,
+            target_prompt_bytes=target,
+            strict_prompt_bytes=strict,
+            label="section review",
+        ) if miss_ids else []
+        chunk_ids = [
+            [str(value) for value in call["segment_ids"]]
+            for call in calls
+        ]
+        plan = bind_review_reuse_plan_chunks(base_plan, chunk_ids)
+        write_json(plan_path, plan.document)
+    _review_reuse_cutpoint("after_plan_before_submit", checkpoint_dir)
+
+    review_calls = [
+        _rendered_review_call(
+            [payload_by_segment[value] for value in segment_ids],
+            render([payload_by_segment[value] for value in segment_ids]),
+            target_prompt_bytes=target,
+            strict_prompt_bytes=strict,
+            headroom_class="segment_reuse_miss",
+        )
+        for segment_ids in chunk_ids
+    ]
+    new_sources: list[ReviewSegmentSource] = []
+    actual_review_calls = 0
+    call_audits: list[dict[str, Any]] = []
+    identity_by_id = {item.segment_id: item for item in identities}
+    for index, rendered in enumerate(review_calls):
+        segment_ids = [str(value) for value in rendered["segment_ids"]]
+        identity_hashes = [
+            identity_by_id[value].sha256 for value in segment_ids
+        ]
+        sealed_chunk = plan.chunks[index]
+        if list(sealed_chunk.ordered_identity_sha256s) != identity_hashes:
+            raise ReviewReuseError("review reuse chunk identity changed")
+        logical_unit = sealed_chunk.logical_unit
+        response_path = (
+            checkpoint_dir / "review-segment-responses"
+            / f"{sealed_chunk.chunk_sha256}.json"
+        )
+        input_sha256 = sha256_json({
+            "prompt": rendered["prompt"],
+            "schema": schema,
+            "identity_sha256s": identity_hashes,
+        })
+        response = None
+        disposition = "provider-call"
+        provider_called = False
+        if response_path.is_file() and not regenerate_review:
+            checkpoint = read_json(response_path)
+            if (
+                isinstance(checkpoint, Mapping)
+                and checkpoint.get("schema_version") == schema_version
+                and checkpoint.get("input_sha256") == input_sha256
+                and checkpoint.get("identity_sha256s") == identity_hashes
+                and checkpoint.get("logical_unit") == logical_unit
+                and checkpoint.get("reviewed_segment_ids") == segment_ids
+                and isinstance(checkpoint.get("response"), Mapping)
+                and checkpoint["response"].get("reviewed_segment_ids")
+                == segment_ids
+            ):
+                response = dict(checkpoint["response"])
+                disposition = "checkpoint-reuse"
+            else:
+                raise ReviewReuseError(
+                    "review segment response checkpoint tamper"
+                )
+        if response is None:
+            actual_review_calls += 1
+            provider_called = True
+            response = _llm_call(
+                llm,
+                str(rendered["prompt"]),
+                schema,
+                options=options,
+                artifact_dir=(
+                    checkpoint_dir / "llm" / "review-segment"
+                    / logical_unit
+                ),
+                call_label=f"companion-review-segment-{logical_unit}",
+                model_tier=REVIEW_TIER,
+                paper_access_policy=_guidance_policy(
+                    intent_guidance, lane="review",
+                ),
+                intent_guidance=intent_guidance,
+                intent_guidance_lane="review",
+                cancel_check=cancel_check,
+                review_prompt_context=_review_prompt_context(
+                    rendered,
+                    stage="segment-review",
+                    audit_sink=[],
+                ),
+                recovery_descriptor=submission_descriptor(
+                    unit="review-segment",
+                    logical_unit=logical_unit,
+                    checkpoint_dir=checkpoint_dir,
+                    artifact_root=(
+                        checkpoint_dir / "llm" / "review-segment"
+                        / logical_unit
+                    ),
+                    acceptance_checkpoint=response_path,
+                    input_sha256=input_sha256,
+                    group_sha256=sealed_chunk.chunk_sha256,
+                    ordered_siblings=[
+                        chunk.logical_unit for chunk in plan.chunks
+                    ],
+                    suffix=[
+                        chunk.logical_unit
+                        for chunk in plan.chunks[index:]
+                    ],
+                ),
+            )
+        chunk_sources = split_review_segment_response(
+            response,
+            identities_by_segment={
+                value: identity_by_id[value] for value in segment_ids
+            },
+            schema=schema,
+            validate_singleton=lambda identity, singleton: (
+                _review_reuse_singleton_validation(
+                    identity,
+                    singleton,
+                    payload_by_segment=payload_by_segment,
+                    segments_by_id=segments_by_id,
+                    translations=translations,
+                    annotations=annotations,
+                    blocks_by_id=by_id,
+                    protected_names_by_segment=protected_by_segment,
+                    reader_evidence=reader_evidence,
+                    language=options.annotation_language,
+                )
+            ),
+            audit={"logical_call_sha256": canonical_sha256(identity_hashes)},
+        )
+        if provider_called:
+            # The complete validated response is the sealed crash-recovery
+            # boundary; object publication can be repeated without another call.
+            write_json(response_path, {
+                "schema_version": schema_version,
+                "logical_unit": logical_unit,
+                "input_sha256": input_sha256,
+                "identity_sha256s": identity_hashes,
+                "reviewed_segment_ids": segment_ids,
+                "response": response,
+            })
+            _accept_registered_pipeline_control(
+                checkpoint_dir,
+                "review-segment",
+                logical_unit,
+            )
+            _review_reuse_cutpoint(
+                "after_response_before_objects",
+                checkpoint_dir,
+                logical_unit,
+            )
+        else:
+            _accept_completed_pipeline_controls(
+                checkpoint_dir,
+                caller_validated_units=frozenset({"review-segment"}),
+                only_logical_unit=logical_unit,
+                only_recovery_unit="review-segment",
+            )
+        for source in chunk_sources:
+            publish_review_segment_object(options.project_dir, source)
+            new_sources.append(source)
+            _review_reuse_cutpoint(
+                "after_subset_objects",
+                checkpoint_dir,
+                source.identity.segment_id,
+            )
+        call_audits.append(_review_prompt_call_audit(
+            rendered,
+            stage="segment-review",
+            call_label=f"companion-review-segment-{logical_unit}",
+            disposition=disposition,
+        ))
+    reused_segment_ids = {
+        item.segment_id
+        for item in plan.entries
+        if item.disposition == "reused"
+    }
+    all_sources: list[ReviewSegmentSource] = [
+        item
+        for identity in identities
+        if identity.segment_id in reused_segment_ids
+        for item in reused_sources.get(identity.segment_id, ())
+    ]
+    all_sources.extend(new_sources)
+    by_semantic = {
+        (
+            source.identity.segment_id,
+            source.semantic_content_sha256,
+        ): source
+        for source in all_sources
+    }
+    document_rank = {
+        identity.segment_id: index
+        for index, identity in enumerate(identities)
+    }
+    ordered_sources = sorted(
+        by_semantic.values(),
+        key=lambda source: (
+            document_rank[source.identity.segment_id],
+            source.semantic_content_sha256,
+        ),
+    )
+    t15_sources = [
+        source.as_t15_source(stable_order=index)
+        for index, source in enumerate(ordered_sources)
+    ]
+    trusted_frozen_reviewed_segments = {
+        segment_id: dict(candidate.reviewed_segment)
+        for segment_id in reused_segment_ids
+        for candidate in accepted_by_segment.get(segment_id, ())
+        if candidate.reviewed_segment is not None
+    }
+    supersession_edges = tuple(sorted({
+        edge
+        for identity in identities
+        for edge in validate_review_segment_source_set([
+            source for source in ordered_sources
+            if source.identity.segment_id == identity.segment_id
+        ])
+    }))
+    _review_reuse_cutpoint(
+        "after_all_sources_before_t15", checkpoint_dir,
+    )
+    reviewed_translations, reviewed_annotations, merged_review, t15_receipt = (
+        _coordinate_review_candidates(
+            t15_sources,
+            segments=segments,
+            translations=translations,
+            annotations=annotations,
+            blocks_by_id=by_id,
+            protected_names=protected_names,
+            reader_evidence=reader_evidence,
+            options=options,
+            llm=llm,
+            checkpoint_dir=checkpoint_dir,
+            freeze_binding=freeze_binding,
+            cancel_check=cancel_check,
+            controller_supersession_edges=supersession_edges,
+            trusted_frozen_reviewed_segments=(
+                trusted_frozen_reviewed_segments
+            ),
+        )
+    )
+    _review_reuse_cutpoint(
+        "after_t15_before_acceptances", checkpoint_dir,
+    )
+    if (
+        legacy_proof is not None
+        and legacy_proof.get("enforce_output", True)
+        and (
+        review_arbitration_sha256(reviewed_translations)
+        != legacy_proof["expected_reviewed_translation_sha256"]
+        or review_arbitration_sha256(reviewed_annotations)
+        != legacy_proof["expected_reviewed_annotation_sha256"]
+        )
+    ):
+        raise ReviewReuseError(
+            "legacy accepted Review output does not match current validation"
+        )
+    t15_path = checkpoint_dir / str(t15_receipt["path"])
+    project_relative_t15 = t15_path.relative_to(options.project_dir)
+    actual_t15 = read_json(t15_path)
+    safe_t15 = {
+        "path": str(project_relative_t15),
+        "sha256": str(t15_receipt["sha256"]),
+        "status": str(t15_receipt["status"]),
+        **{
+            key: actual_t15[key]
+            for key in (
+                "schema_version",
+                "semantic_input_sha256",
+                "source_hashes",
+                "merged_sha256",
+                "final_review_sha256",
+                "reviewed_translation_sha256",
+                "reviewed_annotation_sha256",
+                "supersession_edges",
+            )
+        },
+    }
+    reviewed_segment_bodies = {
+        identity.segment_id: {
+            "translation": (
+                None
+                if reviewed_translations is None
+                else reviewed_translations[identity.segment_id]
+            ),
+            "annotation": reviewed_annotations[identity.segment_id],
+        }
+        for identity in identities
+    }
+    merged_segment_sha256s = {
+        segment_id: review_arbitration_sha256(body)
+        for segment_id, body in reviewed_segment_bodies.items()
+    }
+    reviewed_output_sha256 = review_arbitration_sha256({
+        "translations": reviewed_translations,
+        "annotations": reviewed_annotations,
+    })
+    reviewed_output_path, reviewed_output_object_sha256 = (
+        publish_reviewed_output(
+            options.project_dir,
+            segments=reviewed_segment_bodies,
+            merged_output_sha256=reviewed_output_sha256,
+            reviewed_translation_sha256=actual_t15[
+                "reviewed_translation_sha256"
+            ],
+            reviewed_annotation_sha256=actual_t15[
+                "reviewed_annotation_sha256"
+            ],
+        )
+    )
+    reviewed_output_link = {
+        "path": str(reviewed_output_path.relative_to(options.project_dir)),
+        "sha256": reviewed_output_object_sha256,
+    }
+    acceptance_hashes: list[str] = []
+    source_hashes: list[str] = []
+    for identity in identities:
+        segment_sources = [
+            source for source in ordered_sources
+            if source.identity.segment_id == identity.segment_id
+        ]
+        object_links = []
+        for source in segment_sources:
+            object_path, object_sha = publish_review_segment_object(
+                options.project_dir, source,
+            )
+            object_links.append({
+                "path": str(object_path.relative_to(options.project_dir)),
+                "object_sha256": object_sha,
+                "semantic_content_sha256": source.semantic_content_sha256,
+            })
+            source_hashes.append(source.semantic_content_sha256)
+        segment_supersession_edges = validate_review_segment_source_set(
+            segment_sources
+        )
+        acceptance, acceptance_sha = build_review_segment_acceptance(
+            identity=identity,
+            object_links=object_links,
+            validation={
+                "schema_version": REVIEW_SEGMENT_VALIDATION_VERSION,
+                "schema_valid": True,
+                "domain_valid": True,
+            },
+            t15_receipt=safe_t15,
+            accepted_merged_segment_sha256=(
+                merged_segment_sha256s[identity.segment_id]
+            ),
+            reviewed_output=reviewed_output_link,
+            supersession_edges=segment_supersession_edges,
+        )
+        publish_review_segment_acceptance(
+            options.project_dir,
+            identity=identity,
+            document=acceptance,
+            acceptance_sha256=acceptance_sha,
+        )
+        acceptance_hashes.append(acceptance_sha)
+        _review_reuse_cutpoint(
+            "after_subset_acceptances",
+            checkpoint_dir,
+            identity.segment_id,
+        )
+    receipt = {
+        "schema_version": REVIEW_REUSE_RECEIPT_VERSION,
+        "plan_path": str(plan_path.relative_to(options.project_dir)),
+        "plan_sha256": plan.sha256,
+        "identity_sha256s": [item.sha256 for item in identities],
+        "source_sha256s": source_hashes,
+        "acceptance_sha256s": acceptance_hashes,
+        "new_segment_count": sum(
+            item.disposition != "reused" for item in plan.entries
+        ),
+        "reused_segment_count": sum(
+            item.disposition == "reused" for item in plan.entries
+        ),
+        "actual_review_calls": actual_review_calls,
+        "t15_receipt": safe_t15,
+        "merged_output_sha256": reviewed_output_sha256,
+        "merged_segment_sha256s": merged_segment_sha256s,
+        "schema_valid": True,
+        "domain_valid": True,
+    }
+    _review_reuse_cutpoint(
+        "after_acceptances_before_receipt", checkpoint_dir,
+    )
+    if receipt_path.is_file():
+        existing = read_json(receipt_path)
+        replay = dict(receipt)
+        replay["actual_review_calls"] = int(
+            existing.get("actual_review_calls") or 0
+        )
+        if existing != replay:
+            if (
+                regenerate_review
+                or (
+                    isinstance(prior_receipt, Mapping)
+                    and prior_receipt.get("plan_sha256") != plan.sha256
+                )
+            ):
+                write_json(receipt_path, receipt)
+            else:
+                raise ReviewReuseError("review reuse receipt tamper")
+        else:
+            receipt = dict(existing)
+    else:
+        write_json(receipt_path, receipt)
+    receipt_reference = {
+        "path": str(receipt_path.relative_to(checkpoint_dir)),
+        "sha256": sha256_file(receipt_path),
+        "plan_sha256": plan.sha256,
+        "merged_output_sha256": receipt["merged_output_sha256"],
+    }
+    patched = {
+        str(item.get("segment_id") or "")
+        for item in merged_review.get("patches") or []
+    }
+    citation_normalized: set[str] = set()
+    for patch in merged_review.get("patches") or []:
+        if patch.get("translation_blocks") is None:
+            continue
+        _normalized, changed_ids = (
+            _normalize_translation_citation_delimiters_for_segment(
+                clean_reader_translation({
+                    "blocks": list(patch["translation_blocks"])
+                }),
+                by_id,
+            )
+        )
+        if changed_ids:
+            citation_normalized.add(str(patch["segment_id"]))
+    audit = {
+        "translation_mode": (
+            "skipped" if options.skip_translation else "enabled"
+        ),
+        "hierarchical": len(review_calls) > 1,
+        "review_group_count": len(review_calls),
+        "section_findings": [
+            dict(item)
+            for source in ordered_sources for item in source.findings
+        ],
+        "reviewed_segment_ids": [
+            str(item["segment_id"]) for item in segments
+        ],
+        "issues": list(merged_review.get("issues") or []),
+        "patched_segment_ids": sorted(patched),
+        "citation_delimiter_normalized_segment_ids": sorted(
+            citation_normalized
+        ),
+        "review_arbitration_receipt": t15_receipt,
+        "review_reuse_receipt": receipt_reference,
+        "review_reuse": {
+            "plan_sha256": plan.sha256,
+            "counts": dict(plan.document["counts"]),
+            "estimated_calls": plan.document["estimated_calls"],
+            "actual_review_calls": int(receipt["actual_review_calls"]),
+            "ordered_missing_chunks": list(
+                plan.document["ordered_missing_chunks"]
+            ),
+        },
+        "prompt_budget_audit": {
+            "schema_version": REVIEW_PROMPT_BUDGET_AUDIT_VERSION,
+            "budget": prompt_budget,
+            "routing": {
+                "mode": "segment-reuse",
+                "direct_prompt_bytes": 0,
+                "hierarchy_threshold_bytes": 0,
+            },
+            "calls": call_audits,
+            "historical_measurements_available": True,
+        },
+    }
+    return reviewed_translations, reviewed_annotations, audit
 
 
 def _review(
@@ -13217,6 +15301,9 @@ def _review(
     checkpoint_dir: Path,
     freeze_binding: Mapping[str, Any] | None = None,
     intent_guidance: Mapping[str, Any] | None = None,
+    t14_reference_by_segment: (
+        Mapping[str, Mapping[str, Any]] | None
+    ) = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, dict[str, Any]], dict[str, Any]]:
     active_segments = [item for item in segments if not item.get("structural_only")]
@@ -13243,6 +15330,7 @@ def _review(
             checkpoint_dir=checkpoint_dir,
             freeze_binding=freeze_binding,
             intent_guidance=intent_guidance,
+            t14_reference_by_segment=t14_reference_by_segment,
             cancel_check=cancel_check,
         )
         merged_annotations = dict(annotations)
@@ -13269,6 +15357,22 @@ def _review(
                 "provider_calls": 0,
             },
         }
+    return _review_with_segment_reuse(
+        segments,
+        translations,
+        annotations,
+        document=document,
+        glossary=glossary,
+        protected_names=protected_names,
+        evidence=evidence,
+        options=options,
+        llm=llm,
+        checkpoint_dir=checkpoint_dir,
+        freeze_binding=freeze_binding,
+        intent_guidance=intent_guidance,
+        t14_reference_by_segment=t14_reference_by_segment,
+        cancel_check=cancel_check,
+    )
     if options.skip_translation:
         if translations not in (None, {}):
             raise RuntimeError("skip-translation review received translation content")
@@ -14884,7 +16988,7 @@ def _guarded_mark_transport_state(
 
 _CALLER_VALIDATED_RECOVERY_UNITS = frozenset({
     "intent-guidance", "guide", "section-review", "final-review",
-    "commentary-review",
+    "commentary-review", "review-segment",
 })
 
 
@@ -15323,6 +17427,36 @@ def _pipeline_acceptance_checkpoint_valid(
             and isinstance(value["review"].get("findings"), list)
             and isinstance(value["review"].get("patches"), list)
             and _recovery_candidate_matches_schema(value["review"], receipt)
+        )
+    if unit == "review-segment":
+        response = value.get("response")
+        reviewed_segment_ids = value.get("reviewed_segment_ids")
+        return (
+            value.get("schema_version") in {
+                SECTION_REVIEW_CHECKPOINT_VERSION,
+                COMMENTARY_REVIEW_CHECKPOINT_VERSION,
+            }
+            and value.get("input_sha256") == input_sha
+            and value.get("logical_unit") == receipt.get("logical_unit")
+            and isinstance(value.get("identity_sha256s"), list)
+            and bool(value["identity_sha256s"])
+            and all(
+                isinstance(item, str)
+                and re.fullmatch(r"[0-9a-f]{64}", item)
+                for item in value["identity_sha256s"]
+            )
+            and canonical_sha256({
+                "ordered_identity_sha256s": value["identity_sha256s"],
+            }) == receipt.get("group_sha256")
+            and isinstance(reviewed_segment_ids, list)
+            and bool(reviewed_segment_ids)
+            and len(reviewed_segment_ids) == len(set(reviewed_segment_ids))
+            and isinstance(response, Mapping)
+            and response.get("reviewed_segment_ids")
+            == reviewed_segment_ids
+            and isinstance(response.get("findings"), list)
+            and isinstance(response.get("patches"), list)
+            and _recovery_candidate_matches_schema(response, receipt)
         )
     if unit == "commentary-review":
         return (
@@ -20372,6 +22506,94 @@ def _write_legacy_reuse_plan(checkpoint_dir: Path, options: BuildOptions) -> Pat
         "estimated_provider_calls": sum(item["estimated_provider_calls"] for item in entries),
     })
     return path
+
+
+def _merge_review_reuse_global_plan(
+    checkpoint_dir: Path,
+    project_dir: Path,
+    audit: Mapping[str, Any],
+    *,
+    whole_artifact_hit: bool,
+) -> None:
+    """Project the sealed T16 plan summary into the global body-free plan."""
+
+    reference = audit.get("review_reuse_receipt")
+    if not isinstance(reference, Mapping):
+        raise RuntimeError("review reuse receipt reference is missing")
+    relative = Path(str(reference.get("path") or ""))
+    receipt_path = checkpoint_dir / relative
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or not receipt_path.is_file()
+        or sha256_file(receipt_path) != reference.get("sha256")
+    ):
+        raise RuntimeError("review reuse receipt reference is unsafe")
+    receipt = load_review_reuse_receipt(
+        project_dir,
+        receipt_path.relative_to(project_dir),
+    )
+    plan_document = read_bounded_json(
+        project_dir,
+        Path(str(receipt["plan_path"])),
+        max_bytes=REVIEW_REUSE_ACCEPTANCE_MAX_BYTES,
+    )
+    sealed_plan = ReviewReusePlan.from_document(
+        plan_document,
+        expected_sha256=str(receipt["plan_sha256"]),
+        require_sealed=True,
+    )
+    expected_audit = {
+        "plan_sha256": sealed_plan.sha256,
+        "counts": dict(sealed_plan.document["counts"]),
+        "estimated_calls": sealed_plan.document["estimated_calls"],
+        "actual_review_calls": receipt["actual_review_calls"],
+        "ordered_missing_chunks": list(
+            sealed_plan.document["ordered_missing_chunks"]
+        ),
+    }
+    if audit.get("review_reuse") != expected_audit:
+        raise RuntimeError("review reuse audit/plan binding changed")
+    summary = {
+        "plan_sha256": sealed_plan.sha256,
+        "counts": dict(sealed_plan.document["counts"]),
+        "estimated_calls": sealed_plan.document["estimated_calls"],
+        "ordered_missing_chunks": list(
+            sealed_plan.document["ordered_missing_chunks"]
+        ),
+    }
+    path = checkpoint_dir / "reuse-plan.json"
+    plan = read_json(path)
+    entries = list(plan.get("entries") or [])
+    review_entries = [
+        item for item in entries
+        if item.get("lane") == "review"
+        and item.get("chapter_id") == "project"
+    ]
+    if len(review_entries) != 1:
+        raise RuntimeError("global reuse plan review entry is not unique")
+    entry = review_entries[0]
+    entry["review_segment_plan"] = summary
+    if not whole_artifact_hit:
+        entry.update({
+            "status": (
+                "composed_hit"
+                if summary["estimated_calls"] == 0
+                else "miss"
+            ),
+            "artifact_id": None,
+            "reason": (
+                "all Review segments reused after local validation"
+                if summary["estimated_calls"] == 0
+                else "only planned Review segment misses require provider calls"
+            ),
+            "estimated_provider_calls": summary["estimated_calls"],
+        })
+    plan["estimated_provider_calls"] = sum(
+        int(item.get("estimated_provider_calls") or 0)
+        for item in entries
+    )
+    write_json(path, plan)
 
 
 def _store_reviewed_content(

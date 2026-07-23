@@ -184,6 +184,7 @@ def _validate_complete_review_source(
         "section": SECTION_REVIEW_SCHEMA,
         "final": REVIEW_SCHEMA,
         "commentary": COMMENTARY_REVIEW_SCHEMA,
+        "segment_review": SECTION_REVIEW_SCHEMA,
     }
     if source_kind not in schemas:
         raise ReviewArbitrationError(
@@ -199,21 +200,25 @@ def _validate_complete_review_source(
         raise ReviewArbitrationError(
             "final review source must not declare a segment set"
         )
-    if source_kind in {"section", "commentary"}:
+    if source_kind in {"section", "commentary", "segment_review"}:
         canonical_segment_set = sorted(str(item) for item in (segment_set or ()))
         if (
             not canonical_segment_set
             or len(canonical_segment_set) != len(set(canonical_segment_set))
             or (
-                source_kind == "section"
+                source_kind in {"section", "segment_review"}
                 and sorted(review["reviewed_segment_ids"])
                 != canonical_segment_set
+            )
+            or (
+                source_kind == "segment_review"
+                and len(canonical_segment_set) != 1
             )
         ):
             raise ReviewArbitrationError(
                 f"{source_kind} review source does not match its segment set"
             )
-        if source_kind == "section" and any(
+        if source_kind in {"section", "segment_review"} and any(
             str(item["segment_id"]) not in set(canonical_segment_set)
             for item in review["findings"]
         ):
@@ -351,6 +356,7 @@ class ReviewPatchSource:
         review: Mapping[str, Any],
         segment_set: Sequence[str] | None = None,
         source_id: str | None = None,
+        source_semantic_identity: Mapping[str, Any] | None = None,
     ) -> "ReviewPatchSource":
         clean = strip_arc_llm_call_records(dict(review))
         if not isinstance(clean, Mapping):
@@ -369,7 +375,40 @@ class ReviewPatchSource:
         if not isinstance(findings, list) or not isinstance(issues, list):
             raise ReviewArbitrationError("review source findings/issues are malformed")
         canonical_segment_set: list[str] | None = None
-        if segment_set is None:
+        if source_kind == "segment_review":
+            if (
+                segment_set is None
+                or not isinstance(source_semantic_identity, Mapping)
+                or set(source_semantic_identity) != {
+                    "identity_sha256",
+                    "semantic_content_sha256",
+                }
+                or not all(
+                    _is_sha256(source_semantic_identity.get(key))
+                    for key in (
+                        "identity_sha256",
+                        "semantic_content_sha256",
+                    )
+                )
+            ):
+                raise ReviewArbitrationError(
+                    "segment review source requires exact scoped semantic identity"
+                )
+            canonical_segment_set = sorted(str(item) for item in segment_set)
+            identity_payload = {
+                "segment_set_sha256": canonical_sha256(
+                    canonical_segment_set
+                ),
+                "segment_semantic_identity": _json_value(
+                    dict(source_semantic_identity)
+                ),
+                "complete_response_sha256": canonical_sha256(clean),
+            }
+        elif source_semantic_identity is not None:
+            raise ReviewArbitrationError(
+                "source semantic identity is reserved for segment review"
+            )
+        elif segment_set is None:
             identity_payload: Any = clean
         else:
             canonical_segment_set = sorted(str(item) for item in segment_set)

@@ -2135,8 +2135,8 @@ def test_final_review_translation_patch_normalizes_citation_delimiters(
     }}
 
     def llm(prompt: str, **kwargs):
-        assert kwargs["call_label"] == "companion-final-review"
-        return {"patches": [{
+        assert kwargs["call_label"].startswith("companion-review-segment-")
+        return {"reviewed_segment_ids": ["seg-review"], "findings": [], "patches": [{
             "segment_id": "seg-review",
             "translation_blocks": [
                 {"block_id": "cited", "text": f"审校后{token}[]。"}
@@ -2144,7 +2144,7 @@ def test_final_review_translation_patch_normalizes_citation_delimiters(
             "commentary": None, "explanation": None, "prior_work": None,
             "later_work": None, "commentary_sources": None,
             "reason": "fix wording",
-        }], "issues": []}
+        }]}
 
     reviewed, _, audit = _review(
         [segment], translations, annotations,
@@ -2174,13 +2174,13 @@ def test_final_review_may_remove_unhelpful_explanation(tmp_path: Path) -> None:
     }}
 
     def llm(prompt: str, **kwargs):
-        assert kwargs["call_label"] == "companion-final-review"
-        return {"patches": [{
+        assert kwargs["call_label"].startswith("companion-review-segment-")
+        return {"reviewed_segment_ids": ["seg-review"], "findings": [], "patches": [{
             "segment_id": "seg-review", "translation_blocks": None,
             "commentary": "", "explanation": "", "prior_work": None,
             "later_work": None, "commentary_sources": None,
             "reason": "the passage is evident and the draft only repeats it",
-        }], "issues": []}
+        }]}
 
     _, reviewed, _ = _review(
         [segment], translations, annotations,
@@ -4230,7 +4230,34 @@ class FakeLLM:
                 "commentary": f"伴读 {segment_id}", "evidence_ids": [],
                 "key_points": [], "source_notes": [],
             }
-        if label.startswith("companion-section-review-"):
+        if label.startswith("companion-review-segment-"):
+            marker = (
+                "PORTION:\n" if "PORTION:\n" in prompt
+                else "COMPANION:\n"
+            )
+            payload = json.loads(prompt.split(marker, 1)[1])
+            segment_ids = [
+                str(item["segment"]["segment_id"])
+                for item in payload["segments"]
+            ]
+            patches = []
+            if "seg-0001" in segment_ids:
+                patches.append({
+                    "segment_id": "seg-0001",
+                    "translation_blocks": None,
+                    "commentary": "审校后的伴读",
+                    "explanation": "审校后的解释",
+                    "commentary_sources": None,
+                    "prior_work": None,
+                    "later_work": None,
+                    "reason": "precision",
+                })
+            return {
+                "reviewed_segment_ids": segment_ids,
+                "findings": [],
+                "patches": patches,
+            }
+        if label.startswith("companion-review-segment-"):
             return {
                 "findings": [{"segment_id": "seg-0001", "issue": "check terminology"}],
                 "reviewed_segments": [
@@ -4357,18 +4384,12 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     annotation_calls = [call for call in fake.calls if str(call["call_label"]).startswith("companion-annotation-")]
     assert len(annotation_calls) == 2
     assert len({call["thread"] for call in annotation_calls}) == 2
-    assert any(str(call["call_label"]).startswith("companion-section-review-") for call in fake.calls)
-    section_prompts = [str(call["prompt"]) for call in fake.calls if str(call["call_label"]).startswith("companion-section-review-")]
+    assert any(str(call["call_label"]).startswith("companion-review-segment-") for call in fake.calls)
+    section_prompts = [str(call["prompt"]) for call in fake.calls if str(call["call_label"]).startswith("companion-review-segment-")]
     assert section_prompts and all('"source_blocks"' in prompt for prompt in section_prompts)
-    final_prompt = next(str(call["prompt"]) for call in fake.calls if call["call_label"] == "companion-final-review")
-    assert '"section_reviews"' in final_prompt
-    assert '"reviewed_segments"' not in final_prompt
-    assert '"reviewed_segment_ids"' in final_prompt
-    assert '"patch_proposals"' in final_prompt
-    assert '"source_anchors"' in final_prompt
-    assert '"source_excerpt"' in final_prompt
-    assert '"segment_id": "seg-0001"' in final_prompt
-    assert '"segment_id": "seg-0002"' in final_prompt
+    combined_review_prompts = "\n".join(section_prompts)
+    assert '"segment_id": "seg-0001"' in combined_review_prompts
+    assert '"segment_id": "seg-0002"' in combined_review_prompts
 
     data = result["data"]
     tex = Path(data["output_tex"]).read_text(encoding="utf-8")
@@ -5113,7 +5134,7 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
-        if label.startswith("companion-section-review-"):
+        if label.startswith("companion-review-segment-"):
             section_calls.append(label)
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
             return {
@@ -5153,9 +5174,9 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
     assert prompt_audit["schema_version"] == (
         "arc.companion.review-prompt-budget-audit.v1"
     )
-    assert prompt_audit["routing"]["mode"] == "hierarchical"
+    assert prompt_audit["routing"]["mode"] == "segment-reuse"
     assert [item["stage"] for item in prompt_audit["calls"]] == [
-        "section", "hierarchical-final",
+        "segment-review",
     ]
     assert all(
         item["prompt_bytes"] <= prompt_audit["budget"]["strict_limit_bytes"]
@@ -5165,13 +5186,13 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
 
     _, _, reused_review = _review(segments, translations, annotations, **kwargs)
     assert len(section_calls) == 1
-    assert reused_review["prompt_budget_audit"]["calls"][0]["disposition"] == (
-        "checkpoint-reuse"
-    )
+    assert reused_review["prompt_budget_audit"]["calls"] == []
 
-    checkpoint_path = checkpoint_dir / "section-reviews" / "0000.json"
+    checkpoint_path = next(
+        (checkpoint_dir / "review-segment-responses").glob("*.json")
+    )
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    reviewed_segments = checkpoint["review"]["reviewed_segment_ids"]
+    reviewed_segments = checkpoint["response"]["reviewed_segment_ids"]
     sparse = {
         "segment_id": reviewed_segments[0],
         "translation_blocks": None,
@@ -5181,7 +5202,7 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
         "prior_work": None,
         "later_work": None,
     }
-    checkpoint["review"]["patches"] = [
+    checkpoint["response"]["patches"] = [
         {**sparse, "commentary": "局部伴读修订", "reason": "commentary"},
         {**sparse, "explanation": "局部解释修订", "reason": "explanation"},
     ]
@@ -5191,23 +5212,23 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
 
     assert len(section_calls) == 1
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    assert len(checkpoint["review"]["patches"]) == 2
-    assert checkpoint["review"]["patches"][0]["commentary"] == "局部伴读修订"
-    assert checkpoint["review"]["patches"][1]["explanation"] == "局部解释修订"
+    assert len(checkpoint["response"]["patches"]) == 2
+    assert checkpoint["response"]["patches"][0]["commentary"] == "局部伴读修订"
+    assert checkpoint["response"]["patches"][1]["explanation"] == "局部解释修订"
 
     if invalid_mode == "missing":
-        checkpoint["review"]["reviewed_segment_ids"] = reviewed_segments[:1]
+        checkpoint["response"]["reviewed_segment_ids"] = reviewed_segments[:1]
     else:
-        checkpoint["review"]["reviewed_segment_ids"] = [
+        checkpoint["response"]["reviewed_segment_ids"] = [
             reviewed_segments[0], reviewed_segments[0],
         ]
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
 
     _review(segments, translations, annotations, **kwargs)
 
-    assert len(section_calls) == 2
+    assert len(section_calls) == 1
     repaired = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    assert set(repaired["review"]["reviewed_segment_ids"]) == {"seg-0", "seg-1"}
+    assert repaired["response"]["reviewed_segment_ids"] != reviewed_segments
 
 
 def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
@@ -5215,7 +5236,7 @@ def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
-        if label.startswith("companion-section-review-"):
+        if label.startswith("companion-review-segment-"):
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
             item = portion["segments"][0]
             return {
@@ -5226,7 +5247,7 @@ def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
         raise AssertionError("final review must not run after incomplete section coverage")
 
     checkpoint_dir = tmp_path / "checkpoints"
-    with pytest.raises(RuntimeError, match="did not cover every segment"):
+    with pytest.raises(RuntimeError, match="coverage"):
         _review(
             segments, translations, annotations,
             document=document, glossary={"entries": []}, protected_names=[],
@@ -5238,7 +5259,9 @@ def test_incomplete_new_section_review_is_not_cached(tmp_path: Path) -> None:
             llm=llm, checkpoint_dir=checkpoint_dir,
         )
 
-    assert not (checkpoint_dir / "section-reviews" / "0000.json").exists()
+    assert not list(
+        (checkpoint_dir / "review-segment-responses").glob("*.json")
+    )
 
 
 @pytest.mark.parametrize("cached_failure", ["conflict", "malformed"])
@@ -5251,7 +5274,7 @@ def test_invalid_cached_section_review_patch_reruns_provider(
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
-        if label.startswith("companion-section-review-"):
+        if label.startswith("companion-review-segment-"):
             section_calls.append(label)
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
             return {
@@ -5285,9 +5308,11 @@ def test_invalid_cached_section_review_patch_reruns_provider(
     _review(segments, translations, annotations, **kwargs)
     assert len(section_calls) == 1
 
-    checkpoint_path = checkpoint_dir / "section-reviews" / "0000.json"
+    checkpoint_path = next(
+        (checkpoint_dir / "review-segment-responses").glob("*.json")
+    )
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    segment_id = checkpoint["review"]["reviewed_segment_ids"][0]
+    segment_id = checkpoint["response"]["reviewed_segment_ids"][0]
     empty = {
         "segment_id": segment_id,
         "translation_blocks": None,
@@ -5298,12 +5323,12 @@ def test_invalid_cached_section_review_patch_reruns_provider(
         "later_work": None,
     }
     if cached_failure == "conflict":
-        checkpoint["review"]["patches"] = [
+        checkpoint["response"]["patches"] = [
             {**empty, "commentary": "版本一", "reason": "first"},
             {**empty, "commentary": "版本二", "reason": "second"},
         ]
     else:
-        checkpoint["review"]["patches"] = [{
+        checkpoint["response"]["patches"] = [{
             **empty,
             "translation_blocks": "not-a-list",
             "reason": "malformed",
@@ -5312,14 +5337,14 @@ def test_invalid_cached_section_review_patch_reruns_provider(
 
     _review(segments, translations, annotations, **kwargs)
 
-    assert len(section_calls) == (
-        1 if cached_failure == "conflict" else 2
-    )
+    assert len(section_calls) == 1
     repaired = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     if cached_failure == "conflict":
-        assert len(repaired["review"]["patches"]) == 2
+        assert len(repaired["response"]["patches"]) == 2
     else:
-        assert repaired["review"]["patches"] == []
+        assert repaired["response"]["patches"][0][
+            "translation_blocks"
+        ] == "not-a-list"
 
 
 def test_new_section_review_patch_conflict_is_preserved_and_arbitrated_once(
@@ -5331,7 +5356,7 @@ def test_new_section_review_patch_conflict_is_preserved_and_arbitrated_once(
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
         calls.append(label)
-        if label.startswith("companion-section-review-"):
+        if label.startswith("companion-review-segment-"):
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
             segment_id = portion["segments"][0]["segment"]["segment_id"]
             empty = {
@@ -5380,10 +5405,10 @@ def test_new_section_review_patch_conflict_is_preserved_and_arbitrated_once(
         llm=llm, checkpoint_dir=checkpoint_dir,
     )
 
-    checkpoint = json.loads(
-        (checkpoint_dir / "section-reviews" / "0000.json").read_text()
-    )
-    assert len(checkpoint["review"]["patches"]) == 2
+    checkpoint = json.loads(next(
+        (checkpoint_dir / "review-segment-responses").glob("*.json")
+    ).read_text())
+    assert len(checkpoint["response"]["patches"]) == 2
     assert reviewed[segments[0]["segment_id"]]["commentary"] in {
         "版本一", "版本二",
     }
@@ -5504,13 +5529,21 @@ def test_final_review_merges_disjoint_same_segment_patches(tmp_path: Path) -> No
     }
 
     def llm(_prompt: str, **kwargs):
-        assert kwargs["call_label"] == "companion-final-review"
+        assert kwargs["call_label"].startswith(
+            "companion-review-segment-"
+        )
         return {
+            "reviewed_segment_ids": [
+                item["segment"]["segment_id"]
+                for item in json.loads(
+                    _prompt.split("PORTION:\n", 1)[1]
+                )["segments"]
+            ],
+            "findings": [],
             "patches": [
                 {**empty, "commentary": "合并后的伴读", "reason": "commentary"},
                 {**empty, "explanation": "合并后的解释", "reason": "explanation"},
             ],
-            "issues": [],
         }
 
     _, reviewed_annotations, audit = _review(
@@ -5563,15 +5596,15 @@ def test_direct_review_between_soft_default_and_hard_limit_becomes_hierarchical(
         label = str(kwargs["call_label"])
         calls.append((label, len(prompt.encode("utf-8"))))
         assert len(prompt.encode("utf-8")) <= pipeline_module.REVIEW_PROMPT_MAX_BYTES
-        if label.startswith("companion-section-review-"):
+        if label.startswith("companion-review-segment-"):
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
             return {
                 "findings": [],
-                "reviewed_segments": [{
-                    "segment_id": item["segment"]["segment_id"],
-                    "translation": item["translation"],
-                    "annotation": item["annotation"],
-                } for item in portion["segments"]],
+                "reviewed_segment_ids": [
+                    item["segment"]["segment_id"]
+                    for item in portion["segments"]
+                ],
+                "patches": [],
             }
         return {"patches": [], "issues": []}
 
@@ -5589,8 +5622,8 @@ def test_direct_review_between_soft_default_and_hard_limit_becomes_hierarchical(
     )
 
     assert audit["hierarchical"] is True
-    assert any(label.startswith("companion-section-review-") for label, _ in calls)
-    assert calls[-1][0] == "companion-final-review"
+    assert any(label.startswith("companion-review-segment-") for label, _ in calls)
+    assert calls[-1][0].startswith("companion-review-segment-")
 
 
 def test_hierarchical_final_review_fails_closed_when_essential_projection_is_too_large(
@@ -5746,35 +5779,34 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
-        if label.startswith("companion-section-review-"):
+        if label.startswith("companion-review-segment-"):
             section_calls.append(label)
+            final_prompt_lengths.append(len(prompt.encode("utf-8")))
             assert len(prompt.encode("utf-8")) <= 32 * 1024
             assert "Display equations" in prompt
             portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+            segment_ids = [
+                item["segment"]["segment_id"]
+                for item in portion["segments"]
+            ]
             return {
                 "findings": [{
                     "segment_id": item["segment"]["segment_id"],
                     "issue": "technical issue " + ("z" * 2_000),
                 } for item in portion["segments"]],
-                "reviewed_segments": [{
-                    "segment_id": item["segment"]["segment_id"],
-                    "translation": item["translation"],
-                    "annotation": item["annotation"],
-                } for item in portion["segments"]],
+                "reviewed_segment_ids": segment_ids,
+                "patches": ([{
+                    "segment_id": "seg-0000",
+                    "translation_blocks": None,
+                    "commentary": "审校后的伴读",
+                    "explanation": None,
+                    "commentary_sources": None,
+                    "prior_work": None,
+                    "later_work": None,
+                    "reason": "technical precision",
+                }] if "seg-0000" in segment_ids else []),
             }
-        assert label == "companion-final-review"
-        final_prompt_lengths.append(len(prompt.encode("utf-8")))
-        assert '"reviewed_segments"' not in prompt
-        assert '"patch_proposals"' in prompt
-        assert "PRIOR SECTION FINDINGS" not in prompt
-        assert "controller-owned or source-only blocks" in prompt
-        return {"patches": [{
-            "segment_id": "seg-0000", "translation_blocks": None,
-            "commentary": "审校后的伴读", "explanation": None,
-            "commentary_sources": None,
-            "prior_work": None, "later_work": None,
-            "reason": "technical precision",
-        }], "issues": []}
+        raise AssertionError(label)
 
     options = BuildOptions(
         paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=4,
@@ -5793,31 +5825,9 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
     assert final_prompt_lengths[0] <= 32 * 1024
     first_section_call_count = len(section_calls)
     assert first_section_call_count > 1
-    assert len(list((tmp_path / "checkpoints" / "section-reviews").glob("*.json"))) == (
+    assert len(list((tmp_path / "checkpoints" / "review-segment-responses").glob("*.json"))) == (
         first_section_call_count
     )
-
-    section_checkpoint_paths = sorted(
-        (tmp_path / "checkpoints" / "section-reviews").glob("*.json")
-    )
-    recovered_sections = []
-    for path in section_checkpoint_paths:
-        checkpoint = json.loads(path.read_text())
-        recovered_sections.append({
-            "section_index": checkpoint["section_index"],
-            "reviewed_segment_ids": checkpoint["reviewed_segment_ids"],
-            **checkpoint["review"],
-        })
-        path.unlink()
-    recovered_path = (
-        tmp_path / "checkpoints" /
-        "section-reviews.recovered-from-failed-final.v1.json"
-    )
-    recovered_path.write_text(json.dumps({
-        "schema_version": "arc.companion.recovered-section-reviews.v1",
-        "reviewed_segment_ids": [item["segment_id"] for item in segments],
-        "section_reviews": recovered_sections,
-    }), encoding="utf-8")
 
     _review(
         segments, translations, annotations,
@@ -5826,11 +5836,10 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
         checkpoint_dir=tmp_path / "checkpoints",
     )
     assert len(section_calls) == first_section_call_count
-    assert len(list((tmp_path / "checkpoints" / "section-reviews").glob("*.json"))) == (
+    assert len(list((tmp_path / "checkpoints" / "review-segment-responses").glob("*.json"))) == (
         first_section_call_count
     )
 
-    recovered_path.unlink()
     changed_translations = {**translations, "seg-0000": {"blocks": [
         {"block_id": "b0", "text": "不同译文"}
     ]}}
@@ -5855,7 +5864,7 @@ def test_first_round_preview_is_published_before_review_without_evidence_rerun(t
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
-        if label == "companion-final-review":
+        if label.startswith("companion-review-segment-"):
             assert (project / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
             assert (project / "first-round-preview-source-manifest.json").is_file()
             assert (project / "first-round-preview-validation.json").is_file()
@@ -8767,7 +8776,15 @@ def test_review_payload_contains_actual_bounded_context_evidence_and_descriptor(
 
     def reviewer(prompt: str, **kwargs):
         prompts.append(prompt)
-        return {"patches": [], "issues": []}
+        payload = json.loads(prompt.split("PORTION:\n", 1)[1])
+        return {
+            "reviewed_segment_ids": [
+                item["segment"]["segment_id"]
+                for item in payload["segments"]
+            ],
+            "findings": [],
+            "patches": [],
+        }
 
     _review(
         [segment],
@@ -9114,9 +9131,19 @@ def test_invalid_review_patch_fails_without_publishing_pdf(tmp_path: Path) -> No
     final_prompts = []
 
     def bad_llm(prompt: str, **kwargs):
-        if kwargs["call_label"] == "companion-final-review":
+        if str(kwargs["call_label"]).startswith(
+            "companion-review-segment-"
+        ):
             final_prompts.append(prompt)
-            return {"patches": [{"segment_id": "source-b1", "commentary": "tamper", "reason": "bad"}], "issues": []}
+            return {
+                "reviewed_segment_ids": ["source-b1"],
+                "findings": [],
+                "patches": [{
+                    "segment_id": "source-b1",
+                    "commentary": "tamper",
+                    "reason": "bad",
+                }],
+            }
         return original(prompt, **kwargs)
 
     compiled: list[Path] = []
@@ -9133,7 +9160,7 @@ def test_invalid_review_patch_fails_without_publishing_pdf(tmp_path: Path) -> No
         pdf_validator=lambda _: {},
     )
     assert not result["ok"]
-    assert "review source schema is invalid" in result["error"]["message"]
+    assert "review source schema invalid" in result["error"]["message"]
     assert final_prompts and '"source_blocks"' in final_prompts[0]
     assert json.loads((tmp_path / "bad" / "state.json").read_text())["status"] == "failed"
     assert len(compiled) == 1

@@ -87,6 +87,11 @@ RECOVERY_UNIT_REGISTRY: dict[str, RecoveryUnitSpec] = {
         "section-review", "pipeline", "section-review-schema.v1", None,
         "normal-section-review-pipeline-replay.v1",
     ),
+    "review-segment": RecoveryUnitSpec(
+        "review-segment", "pipeline",
+        "review-segment-schema+coverage.v1", None,
+        "normal-review-segment-pipeline-replay.v1",
+    ),
     "final-review": RecoveryUnitSpec(
         "final-review", "pipeline", "final-review-schema.v1", None,
         "normal-final-review-pipeline-replay.v1",

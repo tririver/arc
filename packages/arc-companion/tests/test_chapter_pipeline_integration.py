@@ -47,6 +47,19 @@ def _title_response(prompt: str) -> dict[str, object]:
     ]}
 
 
+def _segment_review_response(prompt: str) -> dict[str, object]:
+    marker = "PORTION:\n" if "PORTION:\n" in prompt else "COMPANION:\n"
+    payload = json.loads(prompt.split(marker, 1)[1])
+    return {
+        "reviewed_segment_ids": [
+            item["segment"]["segment_id"]
+            for item in payload["segments"]
+        ],
+        "findings": [],
+        "patches": [],
+    }
+
+
 def test_reader_final_checkpoint_is_shared_by_both_pipeline_shapes(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint"
     overrides = {
@@ -277,8 +290,8 @@ def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(
                 "evidence_ids": [], "key_points": [], "source_notes": [],
                 "evidence_requests": [],
             }
-        if label.startswith("companion-commentary-review-"):
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(prompt)
         raise AssertionError(label)
 
     result = build_companion(
@@ -501,8 +514,8 @@ def test_targeted_commentary_regeneration_rebinds_deferred_suffix(
                 "context_claims": [], "evidence_ids": [], "key_points": [],
                 "source_notes": [], "evidence_requests": [],
             }
-        if label.startswith("companion-commentary-review-"):
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(_prompt)
         raise AssertionError(label)
 
     def result_llm(prompt: str, **kwargs):
@@ -623,8 +636,8 @@ def test_stateless_targeted_deferred_commentary_resumes_from_current_checkpoint(
                 "context_claims": [], "evidence_ids": [], "key_points": [],
                 "source_notes": [], "evidence_requests": [],
             }
-        if label.startswith("companion-commentary-review-"):
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(_prompt)
         raise AssertionError(label)
 
     project = tmp_path / "run"
@@ -749,8 +762,8 @@ def test_chaptered_interactive_build_runs_only_first_chapter(tmp_path: Path) -> 
             return {"explanation": "解释守恒的意义。", "commentary": "", "prior_work": [],
                     "later_work": [], "context_claims": [], "evidence_ids": [], "key_points": [],
                     "source_notes": [], "evidence_requests": []}
-        if label == "companion-final-review":
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(prompt)
         raise AssertionError(label)
 
     def result_llm(prompt: str, **kwargs):
@@ -942,8 +955,8 @@ def test_chaptered_build_applies_read_only_legacy_migration_before_lanes(
         if label.startswith("companion-translation-"):
             assert "Chapter One" not in prompt
             return {"blocks": [{"block_id": "p1", "text": "能量守恒。"}]}
-        if label == "companion-final-review":
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(prompt)
         raise AssertionError(f"migration should have avoided call: {label}")
 
     def result_llm(prompt: str, **kwargs):
@@ -1085,8 +1098,8 @@ def test_chaptered_build_projects_accepted_store_translation_without_legacy_opti
                 "later_work": [], "context_claims": [], "evidence_ids": [],
                 "key_points": [], "source_notes": [], "evidence_requests": [],
             }
-        if label == "companion-final-review":
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(_prompt)
         raise AssertionError(label)
 
     def result_llm(prompt: str, **kwargs):
@@ -2178,8 +2191,8 @@ def test_production_callback_loss_reconstructs_then_runs_one_fresh_task(
             return {"entries": []}
         if label.startswith("companion-segmentation"):
             return {"cut_after_ordinals": []}
-        if label == "companion-final-review":
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(_prompt)
         raise AssertionError(label)
 
     def result_llm(_prompt: str, **kwargs):

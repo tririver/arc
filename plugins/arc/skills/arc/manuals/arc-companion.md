@@ -74,7 +74,12 @@ Useful flags:
 - `--recache`: rebuild parsing and PDF reconciliation from cached inputs.
 - `--refresh`: refresh remote inputs; mutually exclusive with `--recache`.
 - `--idle-timeout-seconds <seconds>`: override provider inactivity timeout.
-- `--regenerate-commentary`: keep reusable translations and rebuild commentary.
+- `--regenerate LANE`: repeat to rebuild selected lanes. `--regenerate review`
+  marks every current Review segment for explicit regeneration and bypasses the
+  whole-Review fast path, response checkpoints, legacy imports, and segment
+  acceptances.
+- `--regenerate-commentary`: deprecated alias for `--regenerate commentary`;
+  reusable translations remain eligible.
 - `--no-internet`: disable host search; commentary may cite only prompt-supplied
   sources or local ARC cache records that have usable URLs.
 - `--arc-paper-access full|none`: enable the default Controller Broker or remove
@@ -103,7 +108,7 @@ Useful flags:
   beginning/middle/end source sampling. The CLI does not detect it.
 - `--user-intent <text>`: freeze the exact managed-run intent and generate one
   cached global guidance artifact shared by glossary, title, guide,
-  translation, commentary, and final-review workers. With authorized
+  translation, commentary, and segment-review workers. With authorized
   `--context-paper-id` values, only compact cached TOCs are supplied initially;
   workers later read exact selected chapters through a restricted read-only
   ARC paper policy.
@@ -342,13 +347,27 @@ bundle or the new complete bundle, never a partially written update. A failed
 web refresh does not discard the last valid bundle; run `render-web` to refresh
 it manually after the underlying issue is fixed.
 
-### Step 3: Arbitrate exact Review conflicts
+### Step 3: Reuse Review segments and arbitrate exact conflicts
 
-ARC retains every complete, schema-valid Review source. In hierarchical review,
-all section responses and the final response remain candidate sources; the
-final reviewer does not replace or erase section proposals. Commentary-only
-review likewise retains every group response. Candidate identity excludes
-provider call records and operational session metadata.
+Translated and commentary-only builds use one segment-addressed Review planner.
+Each complete response must declare the exact `reviewed_segment_ids`; ARC
+splits it only after current schema, exact coverage, singleton scope, block
+ownership, patch-domain, trial-application, and translation or commentary
+invariants pass. Empty findings and patches are valid negative coverage.
+Commentary-only Review cannot propose translation. Provider call records,
+provider/model/tier, workers, prompt budget, chunk topology, session, path,
+time, and unrelated segments are not semantic identity.
+
+Validated bodies are immutable project-local objects under
+`.arc-companion/review-segments/objects/`; flat acceptances bind them to exact
+segment identities without copying bodies. ARC prompts only uncovered,
+changed, corrupt, invalid, or explicitly regenerated segments. It sends every
+valid reused and new source to T15 exactly once in document and semantic-hash
+order, and never follows that with a whole-document model Review.
+Canonically equivalent sources collapse; non-equivalent sources remain
+candidates. Supersession is accepted only when explicit, acyclic, and within
+the same segment and exact T15 target. It is never inferred from age, order,
+provider, or whether a source was reused.
 
 Each non-null annotation field and each translation block is an independent
 target. Canonically identical proposals merge their origins, proposals for
@@ -379,6 +398,25 @@ With `--skip-translation`, Review uses the commentary-only schema and rejects
 every translation target before arbitration. Review arbitration also respects
 the accepted first-chapter freeze; neither a local merge nor an arbitration
 decision may rewrite the frozen chapter.
+
+Before any segment submission ARC atomically seals the body-free
+`review-reuse-plan.json`. The global reuse plan records its hash, counts,
+estimated calls, and ordered missing chunks. After terminal T15 arbitration and
+acceptance publication, `review-reuse-receipt.json` records actual calls,
+identity/source/acceptance and merged-output hashes, and a safe T15 receipt
+link. Cross-run acceptance requires terminal `no_conflicts` or `resolved`;
+`needs_supervision` remains recoverable only in the current run. The
+whole-Review fast path additionally requires matching semantic output and valid
+T15 and T16 receipts. Resume revalidates response, object, T15, acceptance, and
+receipt checkpoints locally; tampering, corruption, unsafe paths, or hash
+mismatches fail closed.
+
+Legacy Review v3/v4 files are read-only and remain byte-identical. ARC imports
+them only with exact unique coverage, recomputed historical input/prompt/schema
+hashes, a matching prompt audit, a valid accepted global Review, and matching
+terminal T15 proof. Otherwise it records `legacy_proof_unavailable` and
+regenerates the affected current segments. After v1 acceptances exist,
+invalidation is segment-local.
 
 An internet-enabled commentary agent searches, reads, writes, and cites sources
 within one generation turn. It should prefer papers, publishers, and official

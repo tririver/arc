@@ -297,6 +297,31 @@ COMMENTARY_REVIEW_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+COMMENTARY_SEGMENT_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["reviewed_segment_ids", "findings", "patches"],
+    "properties": {
+        "reviewed_segment_ids": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["segment_id", "issue"],
+                "properties": {
+                    "segment_id": {"type": "string", "minLength": 1},
+                    "issue": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "patches": COMMENTARY_REVIEW_SCHEMA["properties"]["patches"],
+    },
+    "additionalProperties": False,
+}
+
 SECTION_REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["reviewed_segment_ids", "findings", "patches"],
@@ -704,7 +729,10 @@ def commentary_review_prompt(payload: dict[str, Any], *, language: str) -> str:
         "or patch any translation. Source blocks and the frozen glossary are immutable. Return one "
         "patch only for a segment needing a commentary correction. Every patch field is required: "
         "use null for unchanged fields, an empty string to clear commentary/explanation, and an empty "
-        "array only to clear commentary_sources, prior_work, or later_work. Remove paraphrase and generic teaching "
+        "array only to clear commentary_sources, prior_work, or later_work. Return "
+        "reviewed_segment_ids containing exactly every input segment_id and scope every "
+        "structured finding and patch to one of those segment IDs. Empty findings and "
+        "patches are valid exact negative coverage. Remove paraphrase and generic teaching "
         "filler. Prefer positive, direct statements. Rewrite a corrective contrast such as 'not X but Y' unless the "
         "source explicitly raises that confusion or an attached, inspected reliable source establishes a common "
         "misunderstanding whose correction helps the reader; never invent a reader's mistaken belief. Treat landmark, "

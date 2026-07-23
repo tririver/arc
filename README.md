@@ -298,10 +298,14 @@ bound to the immutable reference manifest and chapter objects.
 
 Use `--document-kind auto|article|book` to select the structure policy,
 `--idle-timeout-seconds` to override provider inactivity timeout, and
-`--regenerate-commentary` to rebuild commentary while retaining reusable
-translations. `--stop-after-first-chapter` provides the first-chapter
-validation checkpoint for `interactive` runs or a one-time review gate; it
-does not permanently change the managed run's automation level.
+`--regenerate LANE` to rebuild one content lane. In particular,
+`--regenerate review` explicitly regenerates every current Review segment and
+bypasses the whole-Review fast path, response checkpoints, legacy imports, and
+segment acceptances. `--regenerate-commentary` remains a deprecated alias for
+`--regenerate commentary`. `--stop-after-first-chapter` provides the
+first-chapter validation checkpoint for `interactive` runs or a one-time
+review gate; it does not permanently change the managed run's automation
+level.
 
 Companion workers use the structured ARC-paper Controller Broker by default.
 `--arc-paper-access none` removes its schema, catalog, controls, and paper
@@ -339,14 +343,24 @@ only the current segment, cursor, source hash, terms, and bounded sources. Stabl
 idempotency keys and accepted-block ledgers make routine resume automatic
 without repeating accepted provider calls.
 
-Review retains every schema-valid proposal from section, final, or
-commentary-only reviewers. Proposals on different annotation fields or
-translation blocks are applied independently; only different replacements for
-the same exact field or block require arbitration. ARC first preserves all
-valid non-conflicting work, then sends every remaining conflict in one
-low-tier, stateless, offline arbitration call. A review with no conflicts makes
-no arbitration call. The final reviewer contributes another candidate source
-and does not implicitly discard section proposals.
+Review is segment-addressed in both translated and commentary-only builds.
+ARC reuses locally validated segment sources and puts only uncovered, changed,
+corrupt, invalid, or explicitly regenerated segments into paid prompts; reused
+source or companion bodies are never resent. A segment identity contains only
+its semantic inputs: source projection, current translation or commentary,
+local glossary and names, local evidence, T14 reference, intent, language,
+rules, contracts, and output schema. Provider, model, tier, workers, prompt
+budget, session, path, time, chunk topology, and an unrelated later suffix do
+not invalidate it.
+
+Every valid reused and new source reaches the conflict coordinator once in
+stable document order. Review retains every schema-valid proposal: proposals
+on different annotation fields or translation blocks are applied
+independently, while different replacements for the same exact field or block
+require arbitration. ARC preserves valid non-conflicting work, then sends all
+remaining conflicts in one low-tier, stateless, offline arbitration call. A
+review with no conflicts makes no arbitration call, and ARC does not run a
+second whole-document model review.
 
 The arbitration call disables ARC internet, paper Broker/CLI, MCP exposure, and
 inherited host-tool routes. This policy is not a sandbox and makes no claim
@@ -357,6 +371,16 @@ the exact affected paths while retaining non-conflicting work. Durable receipt
 and observability records contain hashes, decisions, reasons, and safe relative
 links rather than candidate bodies. Commentary-only review cannot introduce a
 translation, and arbitration cannot rewrite an approved frozen first chapter.
+
+Before the first segment Review submission, ARC seals a body-free
+`review-reuse-plan.json`. Immutable source objects and body-light acceptances
+remain project-local. After terminal arbitration it writes
+`review-reuse-receipt.json`, recording plan and output hashes, segment and call
+counts, and a safe T15 receipt link; Review v10 and chapter audit reference that
+receipt. Resume locally revalidates completed responses, objects, arbitration,
+acceptances, and receipts without repeating accepted calls. The whole-Review
+fast path requires matching semantic output plus valid T15 and T16 receipts.
+Tampered or corrupt links fail closed.
 
 PDF and static-web output share one hashed source-credit model. Every original
 author, affiliation, and source profile remains visible exactly once; a

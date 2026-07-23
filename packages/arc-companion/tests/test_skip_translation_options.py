@@ -51,6 +51,19 @@ def _bundle() -> SourceBundle:
     )
 
 
+def _segment_review_response(prompt: str) -> dict[str, object]:
+    marker = "PORTION:\n" if "PORTION:\n" in prompt else "COMPANION:\n"
+    payload = json.loads(prompt.split(marker, 1)[1])
+    return {
+        "reviewed_segment_ids": [
+            item["segment"]["segment_id"]
+            for item in payload["segments"]
+        ],
+        "findings": [],
+        "patches": [],
+    }
+
+
 def test_skip_translation_defaults_off_without_changing_source_fingerprint(tmp_path: Path) -> None:
     bundle = _bundle()
     evidence = {"records": []}
@@ -372,8 +385,8 @@ def test_legacy_pipeline_skip_translation_keeps_commentary_and_pdf(tmp_path: Pat
                 "source_notes": [],
                 "evidence_requests": [],
             }
-        if label.startswith("companion-commentary-review-"):
-            return {"issues": [], "patches": []}
+        if label.startswith("companion-review-segment-"):
+            return _segment_review_response(prompt)
         raise AssertionError(label)
 
     options = BuildOptions(
@@ -398,16 +411,35 @@ def test_legacy_pipeline_skip_translation_keeps_commentary_and_pdf(tmp_path: Pat
     assert not any("glossary" in label for label in labels)
     assert all("GLOSSARY:\n" not in prompt for prompt in prompts)
     assert any(label.startswith("companion-annotation-") for label in labels)
-    assert any(label.startswith("companion-commentary-review-") for label in labels)
+    assert any(label.startswith("companion-review-segment-") for label in labels)
     assert not list(checkpoint.rglob("translations*"))
     assert not (checkpoint / "llm" / "translation").exists()
     reuse_plan = json.loads((checkpoint / "reuse-plan.json").read_text())
     glossary_entry = next(item for item in reuse_plan["entries"] if item["lane"] == "glossary")
     translation_entry = next(item for item in reuse_plan["entries"] if item["lane"] == "translation")
+    review_entry = next(
+        item for item in reuse_plan["entries"]
+        if item["lane"] == "review"
+    )
     assert glossary_entry["status"] == "skipped"
     assert glossary_entry["reason"] == "glossary_disabled_for_same_language_source"
     assert glossary_entry["estimated_provider_calls"] == 0
     assert translation_entry["status"] == "skipped"
+    assert review_entry["review_segment_plan"] == {
+        "plan_sha256": json.loads(
+            (checkpoint / "review-reuse-receipt.json").read_text()
+        )["plan_sha256"],
+        "counts": {
+            "reused": 0,
+            "uncovered": 1,
+            "invalidated": 0,
+            "explicit_regeneration": 0,
+        },
+        "estimated_calls": 1,
+        "ordered_missing_chunks": json.loads(
+            (checkpoint / "review-reuse-plan.json").read_text()
+        )["ordered_missing_chunks"],
+    }
     reader_final = json.loads((checkpoint / "reader-final.json").read_text())
     assert reader_final["final_overrides"]["glossary"] == {}
     assert Path(result["data"]["output_pdf"]).is_file()
@@ -448,23 +480,24 @@ def test_commentary_only_review_rejects_translation_patch(tmp_path: Path) -> Non
         "evidence_requests": [],
     }
 
-    def invalid_review(_prompt: str, **_kwargs):
+    def invalid_review(prompt: str, **_kwargs):
+        response = _segment_review_response(prompt)
+        response["patches"] = [{
+            "segment_id": "seg-0001",
+            "commentary": None,
+            "explanation": "Revised commentary.",
+            "prior_work": None,
+            "later_work": None,
+            "commentary_sources": None,
+            "reason": "attempted mixed-layer patch",
+            "translation_blocks": [{"block_id": "body", "text": "Forbidden"}],
+        }]
         return {
-            "issues": [],
-            "patches": [{
-                "segment_id": "seg-0001",
-                "commentary": None,
-                "explanation": "Revised commentary.",
-                "prior_work": None,
-                "later_work": None,
-                "evidence_ids": None,
-                "reason": "attempted mixed-layer patch",
-                "translation_blocks": [{"block_id": "body", "text": "Forbidden"}],
-            }],
+            **response,
         }
 
     with pytest.raises(
-        RuntimeError, match="commentary-only review attempted a translation patch"
+        RuntimeError, match="schema|translation"
     ):
         _review(
             [segment],
@@ -510,7 +543,7 @@ def test_large_commentary_only_review_chunks_without_translation_fields(
     def review(prompt: str, **kwargs):
         prompts.append(prompt)
         labels.append(str(kwargs["call_label"]))
-        return {"issues": [], "patches": []}
+        return _segment_review_response(prompt)
 
     translations, reviewed, result = _review(
         segments,
@@ -533,11 +566,12 @@ def test_large_commentary_only_review_chunks_without_translation_fields(
 
     assert translations is None
     assert set(reviewed) == {"s1", "s2"}
-    assert result["hierarchical"] is True
-    assert labels == ["companion-commentary-review-0"]
+    assert result["hierarchical"] is False
+    assert len(labels) == 1
+    assert all(label.startswith("companion-review-segment-") for label in labels)
     assert all('"translation"' not in prompt for prompt in prompts)
     prompt_audit = result["prompt_budget_audit"]
-    assert prompt_audit["routing"]["mode"] == "commentary-hierarchical"
+    assert prompt_audit["routing"]["mode"] == "segment-reuse"
     assert len(prompt_audit["calls"]) == 1
     assert all(
         call["prompt_bytes"] <= prompt_audit["budget"]["strict_limit_bytes"]
@@ -578,7 +612,7 @@ def test_hierarchical_commentary_review_uses_relevant_glossary_and_checkpoints(
 
     def review(prompt: str, **_kwargs):
         prompts.append(prompt)
-        return {"issues": [], "patches": []}
+        return _segment_review_response(prompt)
 
     kwargs = dict(
         segments=segments,
@@ -598,9 +632,11 @@ def test_hierarchical_commentary_review_uses_relevant_glossary_and_checkpoints(
 
     assert len(prompts) == 1
     assert all("GLOSSARY" not in prompt for prompt in prompts)
-    assert all("RELEVANT" not in prompt for prompt in prompts)
+    assert all("RELEVANT" in prompt for prompt in prompts)
     assert all("UNRELATED-" not in prompt for prompt in prompts)
-    checkpoints = sorted((tmp_path / "checkpoint" / "commentary-reviews").glob("*.json"))
+    checkpoints = sorted(
+        (tmp_path / "checkpoint" / "review-segment-responses").glob("*.json")
+    )
     assert len(checkpoints) == 1
     assert all(json.loads(path.read_text())["input_sha256"] for path in checkpoints)
 
@@ -627,16 +663,21 @@ def test_hierarchical_commentary_review_rejects_patch_from_another_group(
         "key_points": [], "source_notes": [], "evidence_requests": [],
     }
 
-    def review(_prompt: str, **kwargs):
-        if str(kwargs["call_label"]).endswith("-0"):
-            return {"issues": [], "patches": [{
-                "segment_id": "s2", "commentary": "wrong group", "explanation": None,
-                "prior_work": None, "later_work": None, "evidence_ids": None,
+    def review(prompt: str, **_kwargs):
+        response = _segment_review_response(prompt)
+        if response["reviewed_segment_ids"] == ["s1"]:
+            response["patches"] = [{
+                "segment_id": "s2",
+                "commentary": "wrong group",
+                "explanation": None,
+                "prior_work": None,
+                "later_work": None,
+                "commentary_sources": None,
                 "reason": "invalid cross-group patch",
-            }]}
-        return {"issues": [], "patches": []}
+            }]
+        return response
 
-    with pytest.raises(RuntimeError, match="outside its review group"):
+    with pytest.raises(RuntimeError, match="scope|coverage|unknown segment id"):
         _review(
             segments, None, {"s1": dict(annotation), "s2": dict(annotation)},
             document=document, glossary={"entries": []}, protected_names=[],

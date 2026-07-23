@@ -1,0 +1,129 @@
+{
+  "schema_version": "arc.companion.sanitized-review-segment-reuse-fixture.v1",
+  "legacy_call_count": 37,
+  "legacy_calls": [
+    {"call_id":"call-01","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 01 for segment-01","prompt_sha256":"329f0da4099a25f3bdb7f2b2d35173b04bb090b74ee6a4b3b4dd2ad31627f28b","input_sha256":"1d493f92a82818aeb0d1f38ed2b2e785bfc5c6d0bebe3e5b212b73d8dd8d1935"},
+    {"call_id":"call-02","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 02 for segment-02","prompt_sha256":"131cb915efb4a6cc8b4e1f5681f48617ee385b43d8e6409e2cc68344010e4c31","input_sha256":"1156344d98dd06b3f2e3412ac2e64dec373ebeeb3b0abfd5c38e31b6cdf5b4de"},
+    {"call_id":"call-03","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-03"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-03"],"findings":[],"patches":[]},"prompt":"sanitized review 03 for segment-03","prompt_sha256":"a321ad4d0ce3a7aaf44bcee4060c76d2f778f9f9ad6e452ffa027f5633fd3f03","input_sha256":"7325e02b4d810a6d2b31db82e08b46a8d789aa564832caee91f9af659fee872c"},
+    {"call_id":"call-04","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-04"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-04"],"findings":[],"patches":[]},"prompt":"sanitized review 04 for segment-04","prompt_sha256":"b18349b02364f82cf206ff3e08b7bc0ac5225f159b53e689bbad2f157c851c1e","input_sha256":"7015d3857ee300e8212b2f0d007bde60f3177144da7c70223de8b1d43ecd5376"},
+    {"call_id":"call-05","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-05"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-05"],"findings":[],"patches":[]},"prompt":"sanitized review 05 for segment-05","prompt_sha256":"a2abd7f3f4f4db57cfeefe8c31ab0d1e32d27b30b8330fffdb649fd031714eb6","input_sha256":"08fccf8dd0cf8db649619d61631bdc8d7507ac9d2095f8da3f439b1b879a7cd3"},
+    {"call_id":"call-06","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 06 for segment-01","prompt_sha256":"07d58aa7ce204b3dcdb55ddb72a1857be747e0da1cf50958edf2ca3d6e0ea42f","input_sha256":"30ec14017f0fe7bd558a6c72d361f7afdf614a2a1dc95ff02e3b0b48f4cdf2a6"},
+    {"call_id":"call-07","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 07 for segment-02","prompt_sha256":"ce263f45237a2792bc75fe052b58008c792737ad8b84d01204e6b493cc28d1a5","input_sha256":"f709da3a2b42638da89354b65ccee1caf07ae5c795044ac5ab73e2443a7c1c84"},
+    {"call_id":"call-08","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-03"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-03"],"findings":[],"patches":[]},"prompt":"sanitized review 08 for segment-03","prompt_sha256":"1df0c1f9d5a47eac8f757e312d2c2017398992a0801f65b4bcf3e7be576dff14","input_sha256":"f2074d73f624f6006bf55452a8962e2e511de86f4754c1b521d6826f77edcc15"},
+    {"call_id":"call-09","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-04"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-04"],"findings":[],"patches":[]},"prompt":"sanitized review 09 for segment-04","prompt_sha256":"acc159b2f9ea5d2cbeb9d82a19218b06d94f40931099604740b57c998e419cab","input_sha256":"d0a164804500044b1d3f933b2c083cc11425f9145cb9a277243f3324a2d53adb"},
+    {"call_id":"call-10","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-05"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-05"],"findings":[],"patches":[]},"prompt":"sanitized review 10 for segment-05","prompt_sha256":"0a6f397f8a8b8da25d2290222a8c1c5fe1053866c56e1a49fbd67e0bf05c20f8","input_sha256":"ed87086ca6f41d6b49ea0ca3ebf96c6b4c3e0444a622f78d279bfcb6cb565a02"},
+    {"call_id":"call-11","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 11 for segment-01","prompt_sha256":"a452481fa258cf035d59fe2eabd5a2032a3ec0f59ef47b3cc8f1ec82620d1289","input_sha256":"1107488e1f9470e46d2da0362b557b7b462158b1f2d25eb3cc844f16c526734c"},
+    {"call_id":"call-12","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 12 for segment-02","prompt_sha256":"52f7068da8fe0435ef1b6ac04b1930499797d5565ae530402a6f015867812f2f","input_sha256":"02b7e866fa0b3a18ddd7b5d92418bb44206c45169c66dc78c5007ceb31452567"},
+    {"call_id":"call-13","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-03"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-03"],"findings":[],"patches":[]},"prompt":"sanitized review 13 for segment-03","prompt_sha256":"394e965f11e66b1c420e8123f127a470bc3a8748ae60d3623087f9fc20fb5fca","input_sha256":"56d4f21135327043afc73ff066896299f673b89d32bdf340a2708a77ccb23e37"},
+    {"call_id":"call-14","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-04"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-04"],"findings":[],"patches":[]},"prompt":"sanitized review 14 for segment-04","prompt_sha256":"77b4ff770059c42db791daa5c5ebe3163ea78e3d7c14a1095088143a5ab55562","input_sha256":"f52e4c5ee8c4c8a0d825eef20da738e40d5ee06dda38b0ed8ad5d9778ea58c90"},
+    {"call_id":"call-15","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-05"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-05"],"findings":[],"patches":[]},"prompt":"sanitized review 15 for segment-05","prompt_sha256":"e805e1fed6dd240b47483181ec4eba7c3a010a14e9e3a04d4a385b12ce1d82d1","input_sha256":"ba3f6f270bc4beea62591668ea6ab1747c863c77f1f31c1e7e3da3f4340c81e9"},
+    {"call_id":"call-16","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 16 for segment-01","prompt_sha256":"26ada2529a34821fc2a65fc987ce9a0c0d2f2c8a55e9c170c86a8ca507df507e","input_sha256":"0a6fa409613302e48fa871af1f0b11e11b7fb5ae614e22a484a882a2e51022ff"},
+    {"call_id":"call-17","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 17 for segment-02","prompt_sha256":"7c7d415bcb51347e5221f06b7225715468d5eda5cfe1e355f9cba9bc5de0d8f5","input_sha256":"73523e0b82cbda853cb65b8b3e12cb047f7915245a15c1ad2e133dbdb2847362"},
+    {"call_id":"call-18","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-03"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-03"],"findings":[],"patches":[]},"prompt":"sanitized review 18 for segment-03","prompt_sha256":"cffef2988f057c3be1c92db0867c375b854c18db8e2e3d60c245bc3946bf9c43","input_sha256":"e722f95bf17a519d3b9e18a9c5985c34988630200c0ab504d07fc7e92724f985"},
+    {"call_id":"call-19","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-04"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-04"],"findings":[],"patches":[]},"prompt":"sanitized review 19 for segment-04","prompt_sha256":"a17cb280f040bfd5a22cd4685937c0947e2528b05098adb179cec332675d533f","input_sha256":"a21ba92e1c3087010fb86be03b4f32f0399e7e56be661e0689d54c00bf8f4211"},
+    {"call_id":"call-20","checkpoint_version":"arc.companion.section-review-checkpoint.v3","reviewed_segment_ids":["segment-05"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-05"],"findings":[],"patches":[]},"prompt":"sanitized review 20 for segment-05","prompt_sha256":"c1b5f4ab9d9cd154551b29cc02b48a995474c662aaacb5a39bf04cd731afeb88","input_sha256":"c5f05d6ff4c304a29f62eee0f7deeafd125bf258986f68c4db493d00dcdf0286"},
+    {"call_id":"call-21","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 21 for segment-01","prompt_sha256":"099bc44eb01250475a39451516f40479c69843148d19f380b82a4c043a907e76","input_sha256":"60a7b88594d3d60768467881484447e5ce6943ba73a4874906eb40f8e572ee5c"},
+    {"call_id":"call-22","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 22 for segment-02","prompt_sha256":"194bcf57b6a3216abc02fcb62787ed680d4affda30fe42cde755ae057ad9fa89","input_sha256":"44b066d2359d77f3b36ba5cfdaa64220a83861d39530acaeddc996399301d83f"},
+    {"call_id":"call-23","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-03"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-03"],"findings":[],"patches":[]},"prompt":"sanitized review 23 for segment-03","prompt_sha256":"f813c76c54969b72647c362b406718c1acd1dfd1f9812f2bf812200b7cd48f3e","input_sha256":"562ca7a6a318f6340f6e17e35f6a0987dcd9d813252627b8d9e575817d573efb"},
+    {"call_id":"call-24","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-04"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-04"],"findings":[],"patches":[]},"prompt":"sanitized review 24 for segment-04","prompt_sha256":"ad2ec6a8b8a38e718964505a27b0e4048d79f922a2b173548186f43dc7777a1e","input_sha256":"b99a38890a22b1726cc72face2934054e614c952fb28b18e4e6662fc6f825184"},
+    {"call_id":"call-25","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-05"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-05"],"findings":[],"patches":[]},"prompt":"sanitized review 25 for segment-05","prompt_sha256":"5b081bbcc0b1bc54b52d398461f858881cd1948f349c2ad650d56f1b2b60ce95","input_sha256":"a4fc40aca335cba3f84b0c27d4e1d64563d80f89148ef45360c425fc48e977c6"},
+    {"call_id":"call-26","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 26 for segment-01","prompt_sha256":"2f7a68b173c0f16b08b1966c99f56a8ccbdde5388542652ec9d853a9307a8b91","input_sha256":"52430e24825c4b0b5ff80c9f4b1a263e16425e7582880920d92125a4a01135ca"},
+    {"call_id":"call-27","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 27 for segment-02","prompt_sha256":"a7f042dc654abf9d33ea211d7ab18ce4229e6ecc78eb365cb7767142c7232b9d","input_sha256":"9b92367612a8fd56a6b828aa7b11f1df93385c075a5ed892ef4ed21f1ef88e3e"},
+    {"call_id":"call-28","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-03"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-03"],"findings":[],"patches":[]},"prompt":"sanitized review 28 for segment-03","prompt_sha256":"3f3452c17a35114c8b23e4bcec2be2f7c5bcfd95e038a08def056336270f86c9","input_sha256":"d9ca89784a7de1de883de2499c0844d335aa6867a85ee8b6d313742c31c8a8a4"},
+    {"call_id":"call-29","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-04"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-04"],"findings":[],"patches":[]},"prompt":"sanitized review 29 for segment-04","prompt_sha256":"35083c52b296098ff52876571cb38889e0e177960d7b21e47d90a251a92dbaeb","input_sha256":"a8bbb201065a9407fc969d88ceca4665e8767e0663a83b7eea23416c02d1a317"},
+    {"call_id":"call-30","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-05"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-05"],"findings":[],"patches":[]},"prompt":"sanitized review 30 for segment-05","prompt_sha256":"e5e855d826ea091fedccce0de159012c57c4140ca1f531c57263ec733122d752","input_sha256":"d3fce3525955e9a2d08475de969d841648f92dd7bfe24501276dc2897a884a2f"},
+    {"call_id":"call-31","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 31 for segment-01","prompt_sha256":"cf7baa014521e443a28ef6f2ac1ae2e29dcad62eb301f893819402a82ade7e0a","input_sha256":"8d0b12ebadf31803f2a32b9b228663bb516200514e48a7726cf62e167a8d4f47"},
+    {"call_id":"call-32","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 32 for segment-02","prompt_sha256":"b80442673c2c64c60028e9681d64c9c77e8dc40082a76fa098655af144cde36c","input_sha256":"af0cc8c60af18eaf90d03a852768258adb6c6c2acf3dc66b3787d384e99f9667"},
+    {"call_id":"call-33","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-03"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-03"],"findings":[],"patches":[]},"prompt":"sanitized review 33 for segment-03","prompt_sha256":"4e98d9e2d5bb711e4647e21707484a8fb93d68adf045eed35b967cf4ee5c0cf6","input_sha256":"5b3b25d1ba72cb9b872698c77a26511d4ca735d577c8cd89b7ddbece12fa2db1"},
+    {"call_id":"call-34","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-04"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-04"],"findings":[],"patches":[]},"prompt":"sanitized review 34 for segment-04","prompt_sha256":"5a7cd6c60991428ae3af6787bea0a18bae644fd7364022178e55e7be66012a6f","input_sha256":"5afffe31c5f065f4e773a8ba0a4cdb269e3312f85f4996bda4050c634e3f6017"},
+    {"call_id":"call-35","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-05"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-05"],"findings":[],"patches":[]},"prompt":"sanitized review 35 for segment-05","prompt_sha256":"6f0d3562adbc3e4550463e9259cd5fbb6a50f50ec14f68087f8e155ee485da7f","input_sha256":"8f0fc889d430427ae269929f36c7c5cd9eb97fcf39f41ab99b0de5966af14328"},
+    {"call_id":"call-36","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-01"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-01"],"findings":[],"patches":[]},"prompt":"sanitized review 36 for segment-01","prompt_sha256":"c41c2bda5b629a5e0edba33370cc4b63656cbe16fd7d3e9b355941182c38b2be","input_sha256":"b20f9001a763bdd1618aa04bdf96b189ae0f9985029e8c6c4b4353720a08dfc5"},
+    {"call_id":"call-37","checkpoint_version":"arc.companion.section-review-checkpoint.v4","reviewed_segment_ids":["segment-02"],"findings":[],"patches":[],"response":{"reviewed_segment_ids":["segment-02"],"findings":[],"patches":[]},"prompt":"sanitized review 37 for segment-02","prompt_sha256":"5b79329e292e62a505588b5bf1b966570c666cad1c5acdbf1ce313c6a405673d","input_sha256":"3dfda991f15de59fe25a0871753a3af605e2ccf7f16e2bbaa55a34510d0fb71d"}
+  ],
+  "legacy_topologies": [
+    {
+      "checkpoint_version": "arc.companion.section-review-checkpoint.v3",
+      "group_id": "legacy-group-a",
+      "reviewed_segment_ids": ["segment-01", "segment-02", "segment-03"],
+      "finding_segment_ids": ["segment-02"],
+      "patch_segment_ids": ["segment-02"],
+      "prompt_sha256": "30ed35a0d0c5e863ec5b05e3ae0765a67396e13df32790efd7a3cd4ca0a4c6ad",
+      "input_sha256": "c4f9c66f48787954a036368ee7c1531058f419aadc1a1b1b1ca88a005766393e",
+      "schema_sha256": "c3b9d05f19a1d3a9657577aacc98338d9d3bbf2ae93e1dc7112a92410e72b0c5",
+      "call_count": 20
+    },
+    {
+      "checkpoint_version": "arc.companion.section-review-checkpoint.v4",
+      "group_id": "legacy-group-b",
+      "reviewed_segment_ids": ["segment-04", "segment-05"],
+      "finding_segment_ids": [],
+      "patch_segment_ids": [],
+      "prompt_sha256": "51f5e467b4b7eb520958e536837ebbdc624a785d2ff7f26f2af1ee45875b1c57",
+      "input_sha256": "ccdab74aebf7c38c72e54c378046b939f3971616c89ef983403a8754093e0d5e",
+      "schema_sha256": "61aa0baad1ee8fee876148b911502c096920e410ccf6d138de5578c54a9bd7cf",
+      "call_count": 17
+    }
+  ],
+  "legacy_global_acceptance": {
+    "schema_version": "arc.companion.final-review-acceptance.v1",
+    "historical_base_identity_sha256": "8c32654876e83ab971909bd60017f7494f04424a29d7486ec39418a75391428e",
+    "prompt_audit_sha256": "2479c0c56eff4ea8d13e4bf766515d5da8718087f06d539f44d70e281567c1cb",
+    "accepted_review_sha256": "bf617a100ff338c199dcf6a4039539a144d18ede11adc618b899b8fe1a649c4c",
+    "review": {"patches": [], "issues": []},
+    "t15_receipt": {
+      "schema_version": "arc.companion.review-arbitration-receipt.v1",
+      "status": "resolved",
+      "sha256": "aa3d639d6e84337a762a17baf8f7bed99f8c912a3c6e6574bdcc732cad6bb95e"
+    }
+  },
+  "expected_decisions": {
+    "unchanged_topology": {
+      "review_calls": 0,
+      "reused_segment_ids": [
+        "segment-01", "segment-02", "segment-03", "segment-04", "segment-05"
+      ]
+    },
+    "changed_middle_segment": {
+      "review_calls": 1,
+      "missing_segment_ids": ["segment-03"]
+    },
+    "changed_later_suffix": {
+      "preserved_segment_ids": [
+        "segment-01", "segment-02", "segment-03", "segment-04"
+      ],
+      "missing_segment_ids": ["segment-05"]
+    }
+  },
+  "segments": [
+    {
+      "segment_id": "segment-01",
+      "source": "Local source A.",
+      "translation": "Local translation A.",
+      "commentary": "Local note A."
+    },
+    {
+      "segment_id": "segment-02",
+      "source": "Local source B.",
+      "translation": "Local translation B.",
+      "commentary": "Local note B."
+    },
+    {
+      "segment_id": "segment-03",
+      "source": "Local source C.",
+      "translation": "Local translation C.",
+      "commentary": "Local note C."
+    },
+    {
+      "segment_id": "segment-04",
+      "source": "Local source D.",
+      "translation": "Local translation D.",
+      "commentary": "Local note D."
+    },
+    {
+      "segment_id": "segment-05",
+      "source": "Local source E.",
+      "translation": "Local translation E.",
+      "commentary": "Local note E."
+    }
+  ]
+}
