@@ -10,6 +10,11 @@ from arc_companion.recovery_units import (
     RECOVERY_UNIT_REGISTRY,
     call_model_with_recovery_descriptor,
     recovery_unit_for_ledger,
+    validate_review_arbitration_acceptance_checkpoint,
+)
+from arc_companion.review_arbitration import (
+    REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+    canonical_sha256,
 )
 from arc_companion.callsite_inventory import (
     EXPLICIT_NONRECOVERABLE_EXEMPTIONS,
@@ -39,6 +44,79 @@ def test_descriptor_wrapper_fails_closed_for_runtime_callback_without_keyword(
             "paid-call",
             {"unit": "segmentation"},
         )
+
+
+def test_review_arbitration_recovery_unit_and_acceptance_binding() -> None:
+    spec = RECOVERY_UNIT_REGISTRY["review-arbitration"]
+    assert spec.owner == "pipeline"
+    assert spec.ledger_lane is None
+    assert spec.validator == "review-arbitration-decision+semantics.v1"
+    assert spec.application == "normal-review-arbitration-pipeline-replay.v1"
+
+    semantic_input_sha256 = "a" * 64
+    value = {
+        "schema_version": REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+        "semantic_input_sha256": semantic_input_sha256,
+        "output_sha256": "b" * 64,
+        "decision_summaries": [],
+        "validated_output_path": (
+            "llm/review-arbitration/aaaaaaaaaaaaaaaa/"
+            "validated-output.json"
+        ),
+        "validated_output_sha256": "c" * 64,
+    }
+    receipt = {"input_sha256": semantic_input_sha256}
+    assert validate_review_arbitration_acceptance_checkpoint(value, receipt)
+
+    with_call_record = {**value, "replacement_body": "must not appear"}
+    assert not validate_review_arbitration_acceptance_checkpoint(
+        with_call_record, receipt,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"schema_version": "wrong"},
+        {"semantic_input_sha256": "b" * 64},
+        {"output_sha256": "not-a-hash"},
+        {"decision_summaries": {}},
+        {"validated_output_path": "../escaped.json"},
+        {"validated_output_sha256": "not-a-hash"},
+        {"extra": True},
+    ],
+)
+def test_review_arbitration_acceptance_rejects_unbound_or_open_values(
+    mutation,
+) -> None:
+    semantic_input_sha256 = "a" * 64
+    value = {
+        "schema_version": REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+        "semantic_input_sha256": semantic_input_sha256,
+        "output_sha256": "b" * 64,
+        "decision_summaries": [],
+        "validated_output_path": (
+            "llm/review-arbitration/aaaaaaaaaaaaaaaa/"
+            "validated-output.json"
+        ),
+        "validated_output_sha256": "c" * 64,
+    }
+    value.update(mutation)
+    assert not validate_review_arbitration_acceptance_checkpoint(
+        value,
+        {"input_sha256": semantic_input_sha256},
+    )
+    assert not validate_review_arbitration_acceptance_checkpoint(
+        {
+            "schema_version": REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+            "semantic_input_sha256": None,
+            "output_sha256": "b" * 64,
+            "decision_summaries": [],
+            "validated_output_path": "llm/review/validated-output.json",
+            "validated_output_sha256": "c" * 64,
+        },
+        {},
+    )
 
 
 def test_segmentation_acceptance_replays_full_window_invariants(tmp_path: Path) -> None:

@@ -1,0 +1,140 @@
+{
+  "segment_order": [
+    "segment-a",
+    "segment-b"
+  ],
+  "block_order_by_segment": {
+    "segment-a": [
+      "block-a"
+    ],
+    "segment-b": [
+      "block-b"
+    ]
+  },
+  "originals": {
+    "segment-a": {
+      "translation_blocks": [
+        {
+          "block_id": "block-a",
+          "text": "The first phrase and the second phrase are imprecise."
+        }
+      ],
+      "annotation": {
+        "commentary": "",
+        "explanation": "Original explanation.",
+        "commentary_sources": [],
+        "prior_work": [],
+        "later_work": []
+      }
+    },
+    "segment-b": {
+      "translation_blocks": [
+        {
+          "block_id": "block-b",
+          "text": "Stable translation."
+        }
+      ],
+      "annotation": {
+        "commentary": "",
+        "explanation": "Original explanation.",
+        "commentary_sources": [],
+        "prior_work": [],
+        "later_work": []
+      }
+    }
+  },
+  "sources": [
+    {
+      "source_id": "section-a",
+      "source_kind": "section",
+      "stable_order": 0,
+      "review": {
+        "reviewed_segment_ids": [
+          "segment-a",
+          "segment-b"
+        ],
+        "findings": [
+          {
+            "segment_id": "segment-a",
+            "issue": "The first phrase needs a local correction."
+          }
+        ],
+        "patches": [
+          {
+            "segment_id": "segment-a",
+            "translation_blocks": [
+              {
+                "block_id": "block-a",
+                "text": "The corrected first phrase and the second phrase are imprecise."
+              }
+            ],
+            "commentary": null,
+            "explanation": null,
+            "commentary_sources": null,
+            "prior_work": null,
+            "later_work": null,
+            "reason": "repair first phrase"
+          },
+          {
+            "segment_id": "segment-b",
+            "translation_blocks": null,
+            "commentary": null,
+            "explanation": "Explanation candidate one.",
+            "commentary_sources": null,
+            "prior_work": null,
+            "later_work": null,
+            "reason": "first explanation"
+          }
+        ]
+      }
+    },
+    {
+      "source_id": "section-b",
+      "source_kind": "section",
+      "stable_order": 1,
+      "review": {
+        "reviewed_segment_ids": [
+          "segment-a",
+          "segment-b"
+        ],
+        "findings": [
+          {
+            "segment_id": "segment-a",
+            "issue": "The second phrase needs a separate local correction."
+          }
+        ],
+        "patches": [
+          {
+            "segment_id": "segment-a",
+            "translation_blocks": [
+              {
+                "block_id": "block-a",
+                "text": "The first phrase and the corrected second phrase are precise."
+              }
+            ],
+            "commentary": null,
+            "explanation": null,
+            "commentary_sources": null,
+            "prior_work": null,
+            "later_work": null,
+            "reason": "repair second phrase"
+          },
+          {
+            "segment_id": "segment-b",
+            "translation_blocks": null,
+            "commentary": null,
+            "explanation": "Explanation candidate two.",
+            "commentary_sources": null,
+            "prior_work": null,
+            "later_work": null,
+            "reason": "second explanation"
+          }
+        ]
+      }
+    }
+  ],
+  "expected_synthesized_block": {
+    "block_id": "block-a",
+    "text": "The corrected first phrase and the corrected second phrase are precise."
+  }
+}

@@ -339,6 +339,25 @@ only the current segment, cursor, source hash, terms, and bounded sources. Stabl
 idempotency keys and accepted-block ledgers make routine resume automatic
 without repeating accepted provider calls.
 
+Review retains every schema-valid proposal from section, final, or
+commentary-only reviewers. Proposals on different annotation fields or
+translation blocks are applied independently; only different replacements for
+the same exact field or block require arbitration. ARC first preserves all
+valid non-conflicting work, then sends every remaining conflict in one
+low-tier, stateless, offline arbitration call. A review with no conflicts makes
+no arbitration call. The final reviewer contributes another candidate source
+and does not implicitly discard section proposals.
+
+The arbitration call disables ARC internet, paper Broker/CLI, MCP exposure, and
+inherited host-tool routes. This policy is not a sandbox and makes no claim
+about capabilities intrinsic to the selected provider. Terminal
+no-conflict, resolved, and supervised receipts replay locally without another
+arbitration call. An invalid or unresolved decision stops for supervision at
+the exact affected paths while retaining non-conflicting work. Durable receipt
+and observability records contain hashes, decisions, reasons, and safe relative
+links rather than candidate bodies. Commentary-only review cannot introduce a
+translation, and arbitration cannot rewrite an approved frozen first chapter.
+
 PDF and static-web output share one hashed source-credit model. Every original
 author, affiliation, and source profile remains visible exactly once; a
 reliably evidenced localized author name is adjacent and cannot replace the

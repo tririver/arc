@@ -15,6 +15,7 @@ dependencies = [
   "arc-llm>=1.0,<1.1",
   "arc-paper>=1.0,<1.1",
   "beautifulsoup4>=4.12",
+  "jsonschema>=4.0",
 ]
 classifiers = [
   "Programming Language :: Python :: 3",

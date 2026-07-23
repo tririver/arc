@@ -2142,7 +2142,8 @@ def test_final_review_translation_patch_normalizes_citation_delimiters(
                 {"block_id": "cited", "text": f"审校后{token}[]。"}
             ],
             "commentary": None, "explanation": None, "prior_work": None,
-            "later_work": None, "evidence_ids": None, "reason": "fix wording",
+            "later_work": None, "commentary_sources": None,
+            "reason": "fix wording",
         }], "issues": []}
 
     reviewed, _, audit = _review(
@@ -2177,7 +2178,7 @@ def test_final_review_may_remove_unhelpful_explanation(tmp_path: Path) -> None:
         return {"patches": [{
             "segment_id": "seg-review", "translation_blocks": None,
             "commentary": "", "explanation": "", "prior_work": None,
-            "later_work": None, "evidence_ids": None,
+            "later_work": None, "commentary_sources": None,
             "reason": "the passage is evident and the draft only repeats it",
         }], "issues": []}
 
@@ -4261,9 +4262,9 @@ class FakeLLM:
                 "translation_blocks": None,
                 "commentary": "审校后的伴读",
                 "explanation": "审校后的解释",
+                "commentary_sources": None,
                 "prior_work": None,
                 "later_work": None,
-                "evidence_ids": None,
                 "reason": "precision",
             }], "issues": []}
         raise AssertionError(label)
@@ -5122,6 +5123,18 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
                 ],
                 "patches": [],
             }
+        if label.startswith("companion-review-arbitration-"):
+            payload = json.loads(prompt.split("REVIEW CONFLICTS:\n", 1)[1])
+            return {"decisions": [
+                {
+                    "path": conflict["path"],
+                    "action": "keep_original",
+                    "selected_candidate_hashes": [],
+                    "replacement_patch": None,
+                    "reason": "retain original",
+                }
+                for conflict in payload["conflicts"]
+            ]}
         return {"patches": [], "issues": []}
 
     checkpoint_dir = tmp_path / "checkpoints"
@@ -5178,9 +5191,9 @@ def test_section_review_checkpoint_requires_exact_coverage_before_reuse(
 
     assert len(section_calls) == 1
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    assert len(checkpoint["review"]["patches"]) == 1
+    assert len(checkpoint["review"]["patches"]) == 2
     assert checkpoint["review"]["patches"][0]["commentary"] == "局部伴读修订"
-    assert checkpoint["review"]["patches"][0]["explanation"] == "局部解释修订"
+    assert checkpoint["review"]["patches"][1]["explanation"] == "局部解释修订"
 
     if invalid_mode == "missing":
         checkpoint["review"]["reviewed_segment_ids"] = reviewed_segments[:1]
@@ -5248,6 +5261,15 @@ def test_invalid_cached_section_review_patch_reruns_provider(
                 ],
                 "patches": [],
             }
+        if label.startswith("companion-review-arbitration-"):
+            payload = json.loads(prompt.split("REVIEW CONFLICTS:\n", 1)[1])
+            return {"decisions": [{
+                "path": conflict["path"],
+                "action": "keep_original",
+                "selected_candidate_hashes": [],
+                "replacement_patch": None,
+                "reason": "retain original",
+            } for conflict in payload["conflicts"]]}
         return {"patches": [], "issues": []}
 
     checkpoint_dir = tmp_path / "checkpoints"
@@ -5290,57 +5312,86 @@ def test_invalid_cached_section_review_patch_reruns_provider(
 
     _review(segments, translations, annotations, **kwargs)
 
-    assert len(section_calls) == 2
+    assert len(section_calls) == (
+        1 if cached_failure == "conflict" else 2
+    )
     repaired = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    assert repaired["review"]["patches"] == []
+    if cached_failure == "conflict":
+        assert len(repaired["review"]["patches"]) == 2
+    else:
+        assert repaired["review"]["patches"] == []
 
 
-def test_new_section_review_patch_conflict_fails_closed(tmp_path: Path) -> None:
+def test_new_section_review_patch_conflict_is_preserved_and_arbitrated_once(
+    tmp_path: Path,
+) -> None:
     segments, translations, annotations, document = _minimal_section_review_inputs()
+    calls: list[str] = []
 
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
-        if not label.startswith("companion-section-review-"):
-            raise AssertionError("final review must not run after a section conflict")
-        portion = json.loads(prompt.split("PORTION:\n", 1)[1])
-        segment_id = portion["segments"][0]["segment"]["segment_id"]
-        empty = {
-            "segment_id": segment_id,
-            "translation_blocks": None,
-            "commentary": None,
-            "explanation": None,
-            "commentary_sources": None,
-            "prior_work": None,
-            "later_work": None,
-        }
-        return {
-            "findings": [],
-            "reviewed_segment_ids": [
-                item["segment"]["segment_id"] for item in portion["segments"]
-            ],
-            "patches": [
-                {**empty, "commentary": "版本一", "reason": "first"},
-                {**empty, "commentary": "版本二", "reason": "second"},
-            ],
-        }
+        calls.append(label)
+        if label.startswith("companion-section-review-"):
+            portion = json.loads(prompt.split("PORTION:\n", 1)[1])
+            segment_id = portion["segments"][0]["segment"]["segment_id"]
+            empty = {
+                "segment_id": segment_id,
+                "translation_blocks": None,
+                "commentary": None,
+                "explanation": None,
+                "commentary_sources": None,
+                "prior_work": None,
+                "later_work": None,
+            }
+            return {
+                "findings": [],
+                "reviewed_segment_ids": [
+                    item["segment"]["segment_id"] for item in portion["segments"]
+                ],
+                "patches": [
+                    {**empty, "commentary": "版本一", "reason": "first"},
+                    {**empty, "commentary": "版本二", "reason": "second"},
+                ],
+            }
+        if label == "companion-final-review":
+            return {"patches": [], "issues": []}
+        if label.startswith("companion-review-arbitration-"):
+            payload = json.loads(prompt.split("REVIEW CONFLICTS:\n", 1)[1])
+            conflict = payload["conflicts"][0]
+            candidate = conflict["candidates"][0]
+            return {"decisions": [{
+                "path": conflict["path"],
+                "action": "select_candidate",
+                "selected_candidate_hashes": [candidate["candidate_sha256"]],
+                "replacement_patch": candidate["replacement_patch"],
+                "reason": "select supplied candidate",
+            }]}
+        raise AssertionError(label)
 
     checkpoint_dir = tmp_path / "checkpoints"
-    with pytest.raises(
-        RuntimeError,
-        match="section review returned conflicting patches.*field commentary",
-    ):
-        _review(
-            segments, translations, annotations,
-            document=document, glossary={"entries": []}, protected_names=[],
-            evidence={"related_papers": []},
-            options=BuildOptions(
-                paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
-                review_context_chars=1,
-            ),
-            llm=llm, checkpoint_dir=checkpoint_dir,
-        )
+    _translations, reviewed, audit = _review(
+        segments, translations, annotations,
+        document=document, glossary={"entries": []}, protected_names=[],
+        evidence={"related_papers": []},
+        options=BuildOptions(
+            paper_id="arXiv:1234.5678", project_dir=tmp_path, workers=1,
+            review_context_chars=1,
+        ),
+        llm=llm, checkpoint_dir=checkpoint_dir,
+    )
 
-    assert not (checkpoint_dir / "section-reviews" / "0000.json").exists()
+    checkpoint = json.loads(
+        (checkpoint_dir / "section-reviews" / "0000.json").read_text()
+    )
+    assert len(checkpoint["review"]["patches"]) == 2
+    assert reviewed[segments[0]["segment_id"]]["commentary"] in {
+        "版本一", "版本二",
+    }
+    assert sum(
+        label.startswith("companion-review-arbitration-")
+        for label in calls
+    ) == 1
+    assert audit["review_arbitration_receipt"]["status"] == "resolved"
 
 
 def test_section_review_merges_compatible_sparse_patches_before_validation() -> None:
@@ -5720,7 +5771,8 @@ def test_hierarchical_review_bounds_final_prompt_and_reuses_section_checkpoints(
         return {"patches": [{
             "segment_id": "seg-0000", "translation_blocks": None,
             "commentary": "审校后的伴读", "explanation": None,
-            "prior_work": None, "later_work": None, "evidence_ids": None,
+            "commentary_sources": None,
+            "prior_work": None, "later_work": None,
             "reason": "technical precision",
         }], "issues": []}
 
@@ -9081,7 +9133,7 @@ def test_invalid_review_patch_fails_without_publishing_pdf(tmp_path: Path) -> No
         pdf_validator=lambda _: {},
     )
     assert not result["ok"]
-    assert "invalid or duplicate annotation patch" in result["error"]["message"]
+    assert "review source schema is invalid" in result["error"]["message"]
     assert final_prompts and '"source_blocks"' in final_prompts[0]
     assert json.loads((tmp_path / "bad" / "state.json").read_text())["status"] == "failed"
     assert len(compiled) == 1

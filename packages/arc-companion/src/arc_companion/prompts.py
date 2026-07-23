@@ -658,6 +658,8 @@ def review_prompt(payload: dict[str, Any], *, language: str, findings: list[Any]
     return (
         "Review this complete source/translation/companion paper for technical accuracy, exact translation "
         "coverage, terminology consistency, protected-name preservation, and unsupported literature claims. "
+        "When prior section proposals are supplied, this final review is one additional global candidate source; "
+        "it does not authorize discarding or silently consolidating those proposals. "
         "Source blocks and the frozen glossary are immutable. Return one patch only for a segment needing correction. "
         "Do not fill an intentionally empty explanation merely to achieve commentary coverage. Remove any commentary "
         "that merely rewrites the source's meaning, repeats its reasoning, or gives generic teaching prose. Preserve "
@@ -712,6 +714,22 @@ def commentary_review_prompt(payload: dict[str, Any], *, language: str) -> str:
         "search and inspect during generation; review performs no new source research. An empty patches list is valid. "
         f"All replacements must be in {language}.\n\nCOMPANION:\n"
         f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def review_arbitration_prompt(payload: dict[str, Any]) -> str:
+    """Render the bounded, conflict-only Review arbitration request."""
+    return (
+        "Resolve only the supplied Review conflicts. Preserve every finding and all "
+        "non-conflicting work; do not research, use tools, add facts, or add sources. "
+        "Return exactly one decision for every supplied path and copy paths and candidate "
+        "hashes exactly. Prefer merge_candidates when compatible same-block candidates "
+        "repair independent defects, synthesizing only that exact target. Select a candidate "
+        "only when its complete replacement is preferable. Use keep_original when the "
+        "pre-review value is best. If the supplied evidence is insufficient for a safe exact "
+        "decision, use unresolved. A replacement patch may change only its conflict target "
+        "and must keep every other Review field null.\n\n"
+        f"REVIEW CONFLICTS:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
 

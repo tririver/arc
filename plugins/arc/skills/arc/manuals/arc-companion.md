@@ -342,6 +342,44 @@ bundle or the new complete bundle, never a partially written update. A failed
 web refresh does not discard the last valid bundle; run `render-web` to refresh
 it manually after the underlying issue is fixed.
 
+### Step 3: Arbitrate exact Review conflicts
+
+ARC retains every complete, schema-valid Review source. In hierarchical review,
+all section responses and the final response remain candidate sources; the
+final reviewer does not replace or erase section proposals. Commentary-only
+review likewise retains every group response. Candidate identity excludes
+provider call records and operational session metadata.
+
+Each non-null annotation field and each translation block is an independent
+target. Canonically identical proposals merge their origins, proposals for
+different targets coexist, and only different replacements for the same exact
+target conflict. ARC validates candidates locally and applies valid
+non-conflicting targets first. It materializes any changed translation as the
+complete ordered block list, never as an incomplete replacement.
+
+When conflicts remain, ARC sends all of them in exactly one low-tier, stateless,
+offline arbitration call. ARC disables its internet, paper Broker/CLI, MCP
+exposure, and inherited host-tool routes for this call. This is an ARC call
+policy, not a sandbox or a claim that provider-intrinsic configuration or
+capabilities are isolated. With no conflicts, ARC makes no arbitration call.
+
+Before submission ARC writes a private partial recovery checkpoint containing
+the validated non-conflicting merge. Terminal `no_conflicts`, `resolved`, and
+`needs_supervision` receipts replay locally after exact identity and hash
+validation, without another arbitration call. A recovered submitted response
+returns through the same schema and semantic validation path. Missing,
+malformed, foreign, invalid, or explicitly unresolved decisions preserve the
+partial work and stop only the exact affected paths for operator supervision;
+ARC does not silently choose a candidate or automatically research a
+replacement. Decision receipts, supervision records, and status references are
+body-light and expose safe relative paths and hashes rather than candidate
+text.
+
+With `--skip-translation`, Review uses the commentary-only schema and rejects
+every translation target before arbitration. Review arbitration also respects
+the accepted first-chapter freeze; neither a local merge nor an arbitration
+decision may rewrite the frozen chapter.
+
 An internet-enabled commentary agent searches, reads, writes, and cites sources
 within one generation turn. It should prefer papers, publishers, and official
 primary pages, and must not use search-results pages or snippet-only aggregators
@@ -358,7 +396,7 @@ Delta turns do not resend old commentary. ARC does not create or persist
 commentary summaries, covered points, or similarity checks. A rollover or
 restart carries only hash-based continuity, so modest repetition is acceptable.
 
-### Step 3: Roll over safely
+### Step 4: Roll over safely
 
 At an accepted boundary, start a new generation when a session reaches 70% of
 its known context window; use a conservative 128k-token estimate if unknown.

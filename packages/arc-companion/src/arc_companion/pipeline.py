@@ -79,6 +79,7 @@ from .recovery_units import (
     recovery_unit_for_ledger,
     submission_descriptor,
     pipeline_lane_binding,
+    validate_review_arbitration_acceptance_checkpoint,
 )
 from .recovery_responses import (
     RecoveryResponseError,
@@ -161,12 +162,35 @@ from .prompts import (
     TRANSLATION_SLOT_REPAIR_SCHEMA_VERSION,
     annotation_prompt,
     commentary_review_prompt,
+    review_arbitration_prompt,
     review_prompt,
     section_review_prompt,
     translation_coverage_repair_prompt,
     translation_prompt,
     translation_reference_prompt,
     translation_retry_prompt,
+)
+from .review_arbitration import (
+    REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+    REVIEW_ARBITRATION_PARTIAL_VERSION,
+    REVIEW_ARBITRATION_RECEIPT_VERSION,
+    REVIEW_ARBITRATION_SCHEMA,
+    REVIEW_ARBITRATION_TIER,
+    REVIEW_ARBITRATION_VERSION,
+    CanonicalCandidate,
+    ReviewArbitrationError,
+    ReviewArbitrationNeedsSupervision,
+    ReviewConflictComponent,
+    ReviewPatchSource,
+    apply_non_conflicting_atoms,
+    arbitration_payload,
+    canonical_sha256 as review_arbitration_sha256,
+    json_pointer_unescape,
+    materialize_review_patches,
+    plan_review_merge,
+    trial_validate_candidates,
+    validate_arbitration_output,
+    validate_materialized_review,
 )
 from .projection import (
     annotation_input_block as _project_annotation_input_block,
@@ -259,10 +283,10 @@ ANNOTATION_GLOSSARY_MAX_BYTES = 8 * 1024
 ANNOTATION_GLOSSARY_PROJECTION_VERSION = "arc.companion.annotation-glossary-projection.v1"
 REVIEW_TIER = "medium"
 TITLE_TRANSLATION_TIER = "medium"
-REVIEW_VERSION = "arc.companion.review.v8"
+REVIEW_VERSION = "arc.companion.review.v9"
 ANNOTATION_CHECKPOINT_VERSION = "arc.companion.annotation-checkpoint.v7"
-SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v3"
-COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v3"
+SECTION_REVIEW_CHECKPOINT_VERSION = "arc.companion.section-review-checkpoint.v4"
+COMMENTARY_REVIEW_CHECKPOINT_VERSION = "arc.companion.commentary-review-checkpoint.v4"
 SECTION_REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MAX_BYTES = 60 * 1024
 REVIEW_PROMPT_MIN_SOFT_BYTES = 32 * 1024
@@ -272,6 +296,34 @@ REVIEW_PROMPT_BUDGET_AUDIT_VERSION = "arc.companion.review-prompt-budget-audit.v
 FULL_PAPER_CONTEXT_VERSION = "arc.companion.full-paper-context.v3"
 FULL_PAPER_CONTEXT_CHARS = 24_000
 FIRST_WAVE_PREVIEW_VERSION = "arc.companion.first-wave-preview.v2"
+
+
+def _review_recipe_access(options: "BuildOptions") -> dict[str, Any]:
+    return {
+        "provider": options.provider,
+        "model": options.model,
+        "allow_internet": False,
+        "review_version": REVIEW_VERSION,
+        "section_checkpoint_version": SECTION_REVIEW_CHECKPOINT_VERSION,
+        "commentary_checkpoint_version": COMMENTARY_REVIEW_CHECKPOINT_VERSION,
+        "primary_tier": REVIEW_TIER,
+        "arbitration_version": REVIEW_ARBITRATION_VERSION,
+        "arbitration_output_schema_version": (
+            REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION
+        ),
+        "arbitration_partial_version": REVIEW_ARBITRATION_PARTIAL_VERSION,
+        "arbitration_receipt_version": REVIEW_ARBITRATION_RECEIPT_VERSION,
+        "arbitration_tier": REVIEW_ARBITRATION_TIER,
+        "arbitration_policy": {
+            "force_offline": True,
+            "allow_internet": False,
+            "paper_access": "none",
+            "disable_paper_cli": True,
+            "inherit_host_tools": False,
+            "provider_tools": [],
+            "session_policy": "stateless",
+        },
+    }
 FINAL_RENDER_VERSION = "arc.companion.final-render.v12"
 READER_FINAL_CHECKPOINT_VERSION = "arc.companion.reader-final.v4"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
@@ -1142,6 +1194,8 @@ def _build_companion_unlocked(
                                 ),
                             }
                             if lane == "guide"
+                            else _review_recipe_access(options)
+                            if lane == "review"
                             else {"provider": options.provider, "allow_internet": False}
                         ),
                     )
@@ -1547,6 +1601,16 @@ def _build_companion_unlocked(
             if (
                 not isinstance(cached_reviewed, dict)
                 or cached_reviewed.get("schema_version") != REVIEW_VERSION
+                or not _review_arbitration_reference_valid(
+                    review,
+                    checkpoint_dir,
+                    translations=(
+                        None if options.skip_translation
+                        else cached_reviewed.get("translations")
+                    ),
+                    annotations=cached_reviewed.get("annotations") or {},
+                    options=options,
+                )
             ):
                 raise RuntimeError("invalid review checkpoint")
             normalized_cached_segments: list[str] = []
@@ -4859,8 +4923,34 @@ def _build_chaptered_companion(
     })
     review_recipe_hash = lane_recipe_sha256(
         "review", prompt=REVIEW_VERSION, model=options.model, tier=REVIEW_TIER,
-        access_recipe={"provider": options.provider, "allow_internet": False},
+        access_recipe=_review_recipe_access(options),
     )
+    review_freeze_binding = None
+    if existing_freeze is not None:
+        first_chapter_id = str(chapters_pack["chapters"][0]["chapter_id"])
+        first_segment_ids = [
+            str(item["segment_id"])
+            for item in chapter_results[first_chapter_id]["segments"]
+            if not item.get("structural_only")
+        ]
+        review_freeze_binding = {
+            "schema_version": "arc.companion.review-freeze-binding.v1",
+            "freeze_sha256": sha256_file(freeze_path),
+            "segment_ids": first_segment_ids,
+            "translation_mode": existing_freeze["translation_mode"],
+            "pre_review_translation_sha256": (
+                None if options.skip_translation else sha256_json({
+                    value: chapter_results[first_chapter_id][
+                        "translation"
+                    ][value]
+                    for value in first_segment_ids
+                })
+            ),
+            "pre_review_annotation_sha256": sha256_json({
+                value: chapter_results[first_chapter_id]["companion"][value]
+                for value in first_segment_ids
+            }),
+        }
     review_object = None if "review" in regeneration else artifact_store.find(
         kind="review", semantic_input_sha256=review_input_hash,
         recipe_sha256=review_recipe_hash, contract_version=REVIEW_VERSION,
@@ -4869,6 +4959,17 @@ def _build_chaptered_companion(
             isinstance(value, dict)
             and isinstance(value.get("annotations"), dict)
             and isinstance(value.get("review"), dict)
+            and _review_arbitration_reference_valid(
+                value["review"],
+                checkpoint_dir,
+                translations=value.get("translations"),
+                annotations=value["annotations"],
+                options=options,
+                expected_freeze_sha256=(
+                    None if review_freeze_binding is None
+                    else str(review_freeze_binding["freeze_sha256"])
+                ),
+            )
         ),
     )
     if review_object is not None:
@@ -4887,6 +4988,7 @@ def _build_chaptered_companion(
             review_segments, translations, annotations, document=document, glossary=glossary,
             protected_names=protected_names, evidence=evidence, options=options,
             llm=llm, checkpoint_dir=checkpoint_dir,
+            freeze_binding=review_freeze_binding,
             intent_guidance=intent_guidance,
             cancel_check=cancel_inflight_check,
         )
@@ -5133,7 +5235,10 @@ def _all_lane_ledger_paths(
 
 
 def _chapter_failure_requires_supervision(exc: BaseException) -> bool:
-    if isinstance(exc, TranslationRepairNeedsSupervision):
+    if isinstance(
+        exc,
+        (TranslationRepairNeedsSupervision, ReviewArbitrationNeedsSupervision),
+    ):
         return True
     if isinstance(exc, TimeoutError):
         return True
@@ -12040,6 +12145,1064 @@ def _generate_translations(
     return {segment["segment_id"]: output[segment["segment_id"]] for segment in segments}
 
 
+def _review_arbitration_freeze_identity(
+    freeze_binding: Mapping[str, Any] | None,
+    segments: Sequence[Mapping[str, Any]],
+    translations: Mapping[str, Mapping[str, Any]] | None,
+    annotations: Mapping[str, Mapping[str, Any]],
+) -> tuple[set[str], str | None]:
+    """Validate the caller-selected first-chapter freeze binding."""
+
+    if freeze_binding is None:
+        return set(), None
+    if (
+        not isinstance(freeze_binding, Mapping)
+        or freeze_binding.get("schema_version")
+        != "arc.companion.review-freeze-binding.v1"
+        or not isinstance(freeze_binding.get("freeze_sha256"), str)
+        or not isinstance(freeze_binding.get("segment_ids"), list)
+    ):
+        raise RuntimeError("review arbitration received an invalid freeze binding")
+    ordered_ids = [str(item["segment_id"]) for item in segments]
+    frozen_ids = [str(item) for item in freeze_binding["segment_ids"]]
+    if (
+        not frozen_ids
+        or len(frozen_ids) != len(set(frozen_ids))
+        or ordered_ids[:len(frozen_ids)] != frozen_ids
+        or any(value not in annotations for value in frozen_ids)
+    ):
+        raise RuntimeError("review arbitration freeze segments do not match review input")
+    annotation_matches = sha256_json({
+        value: annotations[value] for value in frozen_ids
+    }) == freeze_binding.get("pre_review_annotation_sha256")
+    translation_matches = (
+        freeze_binding.get("translation_mode") == "skipped"
+        or (
+            translations is not None
+            and sha256_json({
+                value: translations[value] for value in frozen_ids
+            }) == freeze_binding.get("pre_review_translation_sha256")
+        )
+    )
+    if not annotation_matches or not translation_matches:
+        raise RuntimeError(
+            "review arbitration freeze baseline does not match review input"
+        )
+    return set(frozen_ids), str(freeze_binding["freeze_sha256"])
+
+
+def _review_arbitration_reference_valid(
+    review_audit: Mapping[str, Any],
+    checkpoint_dir: Path,
+    *,
+    translations: Mapping[str, Any] | None,
+    annotations: Mapping[str, Any],
+    options: BuildOptions,
+    expected_freeze_sha256: str | None = None,
+) -> bool:
+    reference = review_audit.get("review_arbitration_receipt")
+    if not isinstance(reference, Mapping):
+        return False
+    relative = reference.get("path")
+    if (
+        not isinstance(relative, str)
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+    ):
+        return False
+    path = checkpoint_dir / relative
+    if not path.is_file() or reference.get("sha256") != sha256_file(path):
+        return False
+    receipt = read_json(path)
+    return (
+        isinstance(receipt, Mapping)
+        and receipt.get("schema_version") == REVIEW_ARBITRATION_RECEIPT_VERSION
+        and receipt.get("status") in {"resolved", "no_conflicts"}
+        and not receipt.get("unresolved_paths")
+        and reference.get("semantic_input_sha256")
+        == receipt.get("semantic_input_sha256")
+        and reference.get("merged_sha256") == receipt.get("merged_sha256")
+        and reference.get("final_review_sha256")
+        == receipt.get("final_review_sha256")
+        and reference.get("reviewed_translation_sha256")
+        == receipt.get("reviewed_translation_sha256")
+        == sha256_json(translations)
+        and reference.get("reviewed_annotation_sha256")
+        == receipt.get("reviewed_annotation_sha256")
+        == sha256_json(annotations)
+        and reference.get("recipe_sha256")
+        == receipt.get("recipe_sha256")
+        == sha256_json(_review_recipe_access(options))
+        and reference.get("freeze_sha256") == receipt.get("freeze_sha256")
+        and reference.get("freeze_sha256") == expected_freeze_sha256
+    )
+
+
+def _review_arbitration_cutpoint(
+    _stage: str,
+    _arbitration_dir: Path,
+) -> None:
+    """Fault-injection hook for arbitration crash/replay tests."""
+
+
+def _review_arbitration_submitted_prompt_bytes(
+    prompt: str,
+    *,
+    options: BuildOptions,
+    artifact_dir: Path,
+    llm: Callable[..., dict[str, Any]],
+) -> int:
+    """Measure the exact prompt after portable runtime/schema preparation."""
+
+    runtime_env = _llm_runtime_env(
+        allow_internet=False,
+        force_disable_internet=True,
+        inherit_host_tools=False,
+        paper_access_policy=None,
+        disable_paper_cli=True,
+        arc_paper_access=options.arc_paper_access,
+        arc_paper_direct_shell=options.arc_paper_direct_shell,
+    )
+    from arc_llm.runner import prepare_runtime_prompt
+
+    prepared, _prefix, _nested_shell = prepare_runtime_prompt(
+        prompt,
+        provider=options.provider,
+        model=options.model,
+        model_tier=None if options.model else REVIEW_ARBITRATION_TIER,
+        env=runtime_env,
+        artifact_dir=artifact_dir,
+        schema=REVIEW_ARBITRATION_SCHEMA,
+        stage_paper_worker=(
+            getattr(llm, "__module__", "") == "arc_llm.runner"
+        ),
+    )
+    return _utf8_size(prepared)
+
+
+def _write_review_arbitration_supervision_ledger(
+    checkpoint_dir: Path,
+    *,
+    segment_universe: Sequence[str],
+    paths: Sequence[str],
+    partial_path: Path,
+    receipt_path: Path,
+    submission_state: str,
+    reason: str,
+) -> Path:
+    paths_by_segment: dict[str, list[str]] = {}
+    for path in paths:
+        parts = str(path).split("/")
+        segment_id = json_pointer_unescape(parts[2]) if len(parts) > 2 else ""
+        if not segment_id:
+            raise ReviewArbitrationError(
+                f"cannot ledger an invalid arbitration path: {path}"
+            )
+        paths_by_segment.setdefault(segment_id, []).append(str(path))
+    ledger_path = (
+        checkpoint_dir / "recovery-controls"
+        / "review-arbitration" / "review-arbitration-ledger.json"
+    )
+    initialize_control_ledger(
+        ledger_path,
+        chapter_id="project:review",
+        lane="review-arbitration",
+        segment_ids=[str(item) for item in segment_universe],
+        checkpoint_dir=checkpoint_dir,
+    )
+    ledger, digest = read_registered_lane_ledger(
+        checkpoint_dir, ledger_path,
+    )
+    for segment_id in sorted(paths_by_segment):
+        mark_needs_supervision(
+            ledger_path,
+            segment_id=segment_id,
+            reason=reason,
+            recovery_context={
+                "submission_state": submission_state,
+                "resumable": False,
+                "recovery_action": "operator-supervision",
+                "review_arbitration_paths": paths_by_segment[segment_id],
+                "partial_path": str(partial_path.relative_to(checkpoint_dir)),
+                "partial_sha256": sha256_file(partial_path),
+                "receipt_path": str(receipt_path.relative_to(checkpoint_dir)),
+                "receipt_sha256": sha256_file(receipt_path),
+            },
+            expected_ledger_sha256=digest,
+            checkpoint_dir=checkpoint_dir,
+        )
+        _ledger, digest = read_registered_lane_ledger(
+            checkpoint_dir, ledger_path,
+        )
+    return ledger_path
+
+
+def _clear_review_arbitration_supervision_ledger(
+    checkpoint_dir: Path,
+) -> None:
+    ledger_path = (
+        checkpoint_dir / "recovery-controls"
+        / "review-arbitration" / "review-arbitration-ledger.json"
+    )
+    if not ledger_path.is_file():
+        return
+    while True:
+        ledger, digest = read_registered_lane_ledger(
+            checkpoint_dir, ledger_path,
+        )
+        if not ledger.get("needs_supervision"):
+            return
+        clear_needs_supervision(
+            ledger_path,
+            expected_ledger_sha256=digest,
+            checkpoint_dir=checkpoint_dir,
+        )
+
+
+def _review_candidate_apply(
+    state: dict[str, Any],
+    candidate: CanonicalCandidate,
+    *,
+    segments_by_id: Mapping[str, Mapping[str, Any]],
+    blocks_by_id: Mapping[str, Mapping[str, Any]],
+    protected_names: Sequence[str],
+    reader_evidence: Mapping[str, list[dict[str, Any]]],
+    language: str,
+    allowed_urls_by_segment: Mapping[str, set[str]],
+) -> None:
+    segment_id = candidate.segment_id
+    if candidate.target_kind == "translation_block":
+        translations = state.get("translations")
+        if not isinstance(translations, dict) or segment_id not in translations:
+            raise RuntimeError(f"missing translation baseline for {candidate.path}")
+        blocks = [
+            dict(item)
+            for item in translations[segment_id].get("blocks") or []
+        ]
+        replaced = False
+        for index, block in enumerate(blocks):
+            if str(block.get("block_id") or "") == candidate.target_id:
+                blocks[index] = dict(candidate.replacement)
+                replaced = True
+                break
+        if not replaced:
+            raise RuntimeError(f"missing translation target for {candidate.path}")
+        replacement = clean_reader_translation({"blocks": blocks})
+        replacement, _changed = _normalize_translation_citation_delimiters_for_segment(
+            replacement, dict(blocks_by_id),
+        )
+        _validate_translation(
+            dict(segments_by_id[segment_id]),
+            replacement,
+            dict(blocks_by_id),
+            list(protected_names),
+        )
+        translations[segment_id] = replacement
+        return
+    if (
+        candidate.target_kind != "annotation"
+        or candidate.target_id not in _SPARSE_REVIEW_PATCH_FIELDS
+    ):
+        raise RuntimeError(f"invalid annotation target for {candidate.path}")
+    annotations = state["annotations"]
+    before = dict(annotations[segment_id])
+    annotations[segment_id][candidate.target_id] = deepcopy(candidate.replacement)
+    validated = _validate_direct_annotation_sources(
+        annotations[segment_id],
+        allowed_urls=allowed_urls_by_segment[segment_id],
+    )
+    cleaned = clean_reader_annotation(
+        validated,
+        evidence_records=reader_evidence.get(segment_id, []),
+        language=language,
+    )
+    _assert_review_did_not_add_related_work(before, cleaned)
+    annotations[segment_id] = cleaned
+
+
+def _coordinate_review_candidates(
+    sources: Sequence[ReviewPatchSource],
+    *,
+    segments: list[dict[str, Any]],
+    translations: dict[str, dict[str, Any]] | None,
+    annotations: dict[str, dict[str, Any]],
+    blocks_by_id: Mapping[str, Mapping[str, Any]],
+    protected_names: Sequence[str],
+    reader_evidence: Mapping[str, list[dict[str, Any]]],
+    options: BuildOptions,
+    llm: Callable[..., dict[str, Any]],
+    checkpoint_dir: Path,
+    freeze_binding: Mapping[str, Any] | None,
+    cancel_check: Callable[[], bool] | None,
+) -> tuple[
+    dict[str, dict[str, Any]] | None,
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    """Merge complete Review sources and arbitrate only exact conflicts."""
+
+    segment_order = [str(item["segment_id"]) for item in segments]
+    segments_by_id = {str(item["segment_id"]): item for item in segments}
+    block_order = {
+        segment_id: [
+            str(item.get("block_id") or "")
+            for item in (
+                [] if translations is None
+                else translations[segment_id].get("blocks") or []
+            )
+        ]
+        for segment_id in segment_order
+    }
+    baseline = {
+        "translations": deepcopy(translations),
+        "annotations": deepcopy(annotations),
+    }
+    allowed_urls = {
+        segment_id: _annotation_source_urls(annotations[segment_id])
+        for segment_id in segment_order
+    }
+
+    def original_value(path: str) -> Any:
+        parts = [json_pointer_unescape(item) for item in path.split("/")[1:]]
+        if len(parts) != 4 or parts[0] != "segments":
+            raise ReviewArbitrationError(f"invalid review target path {path}")
+        segment_id, kind, target_id = parts[1], parts[2], parts[3]
+        if kind == "translation_blocks":
+            return next(
+                dict(item)
+                for item in (translations or {})[segment_id].get("blocks") or []
+                if str(item.get("block_id") or "") == target_id
+            )
+        if kind == "annotation":
+            return deepcopy(annotations[segment_id].get(target_id))
+        raise ReviewArbitrationError(f"invalid review target path {path}")
+
+    def invariant_context(
+        component: ReviewConflictComponent,
+    ) -> Mapping[str, Any]:
+        candidate = component.candidates[0]
+        if candidate.target_kind == "translation_block":
+            source_block = dict(blocks_by_id[candidate.target_id])
+            current = original_value(component.path)
+            source_text = json.dumps(source_block, ensure_ascii=False)
+            current_text = json.dumps(current, ensure_ascii=False)
+            return {
+                "source_block": source_block,
+                "current_block": current,
+                "expected_opaque_tokens": list(
+                    _project_opaque_inline_tokens(source_block)
+                ),
+                "relevant_protected_names": [
+                    value for value in protected_names
+                    if value and (value in source_text or value in current_text)
+                ],
+                "block_order": block_order[candidate.segment_id],
+            }
+        return {
+            "allowed_source_hashes": sorted(
+                sha256_json(value)
+                for value in allowed_urls[candidate.segment_id]
+            ),
+        }
+
+    tool_policy = {
+        "allow_internet": False,
+        "paper_access": "none",
+        "inherit_host_tools": False,
+        "provider_tools": [],
+        "session_policy": "stateless",
+    }
+    frozen_ids, freeze_sha256 = _review_arbitration_freeze_identity(
+        freeze_binding, segments, translations, annotations,
+    )
+    plan = plan_review_merge(
+        sources,
+        segment_order=segment_order,
+        block_order_by_segment=block_order,
+        skip_translation=options.skip_translation,
+        contract_versions={
+            "review": REVIEW_VERSION,
+            "arbitration": REVIEW_ARBITRATION_VERSION,
+            "output_schema": REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+            "partial": REVIEW_ARBITRATION_PARTIAL_VERSION,
+            "receipt": REVIEW_ARBITRATION_RECEIPT_VERSION,
+            "section_checkpoint": SECTION_REVIEW_CHECKPOINT_VERSION,
+            "commentary_checkpoint": COMMENTARY_REVIEW_CHECKPOINT_VERSION,
+        },
+        provider=options.provider,
+        model=options.model,
+        primary_tier=REVIEW_TIER,
+        arbitration_tier=REVIEW_ARBITRATION_TIER,
+        tool_policy=tool_policy,
+        original_value_resolver=original_value,
+        invariant_context_resolver=invariant_context,
+        semantic_context={
+            "freeze_sha256": freeze_sha256,
+            "frozen_segment_ids": sorted(frozen_ids),
+            "baseline_translation_sha256": (
+                None if translations is None else sha256_json(translations)
+            ),
+            "baseline_annotation_sha256": sha256_json(annotations),
+        },
+    )
+
+    def apply_atom(state: Any, candidate: CanonicalCandidate) -> None:
+        _review_candidate_apply(
+            state,
+            candidate,
+            segments_by_id=segments_by_id,
+            blocks_by_id=blocks_by_id,
+            protected_names=protected_names,
+            reader_evidence=reader_evidence,
+            language=options.annotation_language,
+            allowed_urls_by_segment=allowed_urls,
+        )
+
+    invalid_candidates = list(trial_validate_candidates(
+        plan, baseline, apply_atom=apply_atom,
+    ))
+    invalid_paths = {item.path for item in invalid_candidates}
+    frozen_paths = {
+        item.path for item in plan.canonical_groups
+        if item.segment_id in frozen_ids
+    }
+    unresolved_paths = set(invalid_paths | frozen_paths)
+    accepted_non_conflicting = [
+        item for item in plan.non_conflicting_atoms
+        if item.path not in unresolved_paths
+    ]
+    partial_state = deepcopy(baseline)
+    for candidate in accepted_non_conflicting:
+        apply_atom(partial_state, candidate)
+    partial_patches = materialize_review_patches(
+        accepted_non_conflicting,
+        segment_order=segment_order,
+        original_translation_blocks=lambda segment_id: (
+            [] if translations is None
+            else translations[segment_id].get("blocks") or []
+        ),
+    )
+    partial_review = {
+        "patches": partial_patches,
+        "issues": list(plan.issues),
+    }
+    prefix = plan.semantic_input_sha256[:16]
+    arbitration_dir = checkpoint_dir / "review-arbitration" / prefix
+    partial_path = arbitration_dir / "partial-review.json"
+    decision_path = arbitration_dir / "decision.json"
+    receipt_path = arbitration_dir / "receipt.json"
+    llm_arbitration_dir = (
+        checkpoint_dir / "llm" / "review-arbitration" / prefix
+    )
+    validated_output_path = llm_arbitration_dir / "validated-output.json"
+    partial_artifact = {
+        "schema_version": REVIEW_ARBITRATION_PARTIAL_VERSION,
+        "semantic_input_sha256": plan.semantic_input_sha256,
+        "review": partial_review,
+        "review_sha256": sha256_json(partial_review),
+        "finding_hashes": list(plan.finding_hashes),
+        "issue_hashes": list(plan.issue_hashes),
+        "unresolved_paths": sorted(unresolved_paths | set(plan.conflict_paths)),
+    }
+    _review_arbitration_cutpoint("before_partial", arbitration_dir)
+    if partial_path.is_file():
+        if read_json(partial_path) != partial_artifact:
+            raise ReviewArbitrationError(
+                "review arbitration short-directory collision or partial tamper"
+            )
+    else:
+        write_json(partial_path, partial_artifact)
+    _review_arbitration_cutpoint(
+        "after_partial_before_submit", arbitration_dir,
+    )
+
+    active_components = tuple(
+        item for item in plan.components if item.path not in unresolved_paths
+    )
+    active_plan = replace(plan, components=active_components)
+
+    def validate_synthesis(
+        component: ReviewConflictComponent,
+        value: Any,
+    ) -> None:
+        apply_atom(
+            deepcopy(baseline),
+            replace(
+                component.candidates[0],
+                replacement=value,
+                candidate_sha256=review_arbitration_sha256({
+                    "path": component.path, "replacement": value,
+                }),
+            ),
+        )
+
+    def decision_summaries(
+        value: Any,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "path": item.path,
+                "action": item.action,
+                "selected_candidate_hashes": list(
+                    item.selected_candidate_hashes
+                ),
+                "replacement_sha256": (
+                    review_arbitration_sha256(item.replacement_patch)
+                    if item.replacement_patch is not None else None
+                ),
+                "origin_hashes": sorted({
+                    origin.origin_sha256
+                    for candidate_hash in item.selected_candidate_hashes
+                    for component in active_plan.components
+                    if component.path == item.path
+                    for candidate in component.candidates
+                    if candidate.candidate_sha256 == candidate_hash
+                    for origin in candidate.origins
+                }),
+                "reason": item.reason,
+            }
+            for item in value.decisions
+        ]
+
+    def load_body_light_decision() -> tuple[dict[str, Any], Any]:
+        decision_artifact = read_json(decision_path)
+        if (
+            not isinstance(decision_artifact, Mapping)
+            or set(decision_artifact) != {
+                "schema_version",
+                "semantic_input_sha256",
+                "output_sha256",
+                "decision_summaries",
+                "validated_output_path",
+                "validated_output_sha256",
+            }
+            or decision_artifact.get("schema_version")
+            != REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION
+            or decision_artifact.get("semantic_input_sha256")
+            != plan.semantic_input_sha256
+        ):
+            raise ReviewArbitrationError(
+                "review arbitration body-light decision mismatch"
+            )
+        relative_output = decision_artifact.get("validated_output_path")
+        if (
+            not isinstance(relative_output, str)
+            or Path(relative_output).is_absolute()
+            or ".." in Path(relative_output).parts
+        ):
+            raise ReviewArbitrationError(
+                "review arbitration validated output path is invalid"
+            )
+        owned_output_path = checkpoint_dir / relative_output
+        if (
+            owned_output_path != validated_output_path
+            or not owned_output_path.is_file()
+            or decision_artifact.get("validated_output_sha256")
+            != sha256_file(owned_output_path)
+        ):
+            raise ReviewArbitrationError(
+                "review arbitration validated output binding mismatch"
+            )
+        validated_artifact = read_json(owned_output_path)
+        if (
+            not isinstance(validated_artifact, Mapping)
+            or set(validated_artifact) != {
+                "schema_version",
+                "semantic_input_sha256",
+                "output",
+                "output_sha256",
+            }
+            or validated_artifact.get("schema_version")
+            != "arc.companion.review-arbitration-validated-output.v1"
+            or validated_artifact.get("semantic_input_sha256")
+            != plan.semantic_input_sha256
+        ):
+            raise ReviewArbitrationError(
+                "review arbitration validated output artifact is invalid"
+            )
+        output = validated_artifact.get("output")
+        replay_resolution = validate_arbitration_output(
+            output,
+            active_plan,
+            synthesized_candidate_validator=validate_synthesis,
+        )
+        if (
+            validated_artifact.get("output_sha256")
+            != replay_resolution.output_sha256
+            or decision_artifact.get("output_sha256")
+            != replay_resolution.output_sha256
+            or decision_artifact.get("decision_summaries")
+            != decision_summaries(replay_resolution)
+        ):
+            raise ReviewArbitrationError(
+                "review arbitration body-light decision semantics changed"
+            )
+        return dict(output), replay_resolution
+
+    provider_calls = 0
+    submission_state = "not_submitted"
+    supervision_reason = (
+        "invalid_review_candidate"
+        if invalid_paths else
+        "frozen_first_chapter_target"
+        if frozen_paths else ""
+    )
+    resolution = None
+    decision_output: dict[str, Any] | None = None
+    status = "no_conflicts"
+    if receipt_path.is_file():
+        receipt = read_json(receipt_path)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema_version") != REVIEW_ARBITRATION_RECEIPT_VERSION
+            or receipt.get("semantic_input_sha256") != plan.semantic_input_sha256
+            or receipt.get("partial_sha256") != sha256_file(partial_path)
+            or receipt.get("paths") != list(plan.conflict_paths)
+        ):
+            raise ReviewArbitrationError("review arbitration receipt replay mismatch")
+        status = str(receipt.get("status") or "")
+        supervision_reason = str(
+            receipt.get("supervision_reason") or supervision_reason
+        )
+        submission_state = str(
+            receipt.get("submission_state") or submission_state
+        )
+        unresolved_paths.update(str(item) for item in receipt.get("unresolved_paths") or [])
+        if decision_path.is_file():
+            if (
+                receipt.get("decision_sha256") != sha256_file(decision_path)
+            ):
+                raise ReviewArbitrationError("review arbitration decision replay mismatch")
+            decision_output, resolution = load_body_light_decision()
+    elif active_components and decision_path.is_file():
+        decision_output, resolution = load_body_light_decision()
+        unresolved_paths.update(resolution.unresolved_paths)
+        status = "needs_supervision" if unresolved_paths else "resolved"
+    elif active_components:
+        payload = arbitration_payload(active_plan)
+        prompt = review_arbitration_prompt(payload)
+        if _review_arbitration_submitted_prompt_bytes(
+            prompt,
+            options=options,
+            artifact_dir=llm_arbitration_dir,
+            llm=llm,
+        ) > _review_prompt_byte_limit(options):
+            unresolved_paths.update(item.path for item in active_components)
+            status = "needs_supervision"
+            supervision_reason = "arbitration_input_too_large"
+        else:
+            provider_calls = 1
+            try:
+                decision_output = _llm_call(
+                    llm,
+                    prompt,
+                    REVIEW_ARBITRATION_SCHEMA,
+                    options=options,
+                    artifact_dir=llm_arbitration_dir,
+                    call_label=f"companion-review-arbitration-{prefix}",
+                    model_tier=REVIEW_ARBITRATION_TIER,
+                    allow_internet=False,
+                    force_offline=True,
+                    paper_access_policy=None,
+                    disable_paper_cli=True,
+                    intent_guidance=None,
+                    cancel_check=cancel_check,
+                    recovery_descriptor=submission_descriptor(
+                        unit="review-arbitration",
+                        logical_unit=prefix,
+                        checkpoint_dir=checkpoint_dir,
+                        artifact_root=llm_arbitration_dir,
+                        acceptance_checkpoint=decision_path,
+                        input_sha256=plan.semantic_input_sha256,
+                        ordered_siblings=[prefix],
+                        suffix=[prefix],
+                    ),
+                )
+            except BaseException as exc:
+                from arc_llm import LLMWorkerError
+                from arc_llm.providers.base import (
+                    LLMSubmissionState,
+                    failure_disposition,
+                )
+
+                disposition = (
+                    failure_disposition(exc)
+                    if isinstance(exc, LLMWorkerError) else None
+                )
+                if (
+                    disposition is None
+                    or disposition.submission_state
+                    == LLMSubmissionState.NOT_SUBMITTED
+                ):
+                    raise
+                submission_state = disposition.submission_state.value
+                unresolved_paths.update(
+                    item.path for item in active_components
+                )
+                status = "needs_supervision"
+                supervision_reason = (
+                    f"provider_{submission_state}_failure"
+                )
+                decision_output = None
+            if decision_output is None:
+                pass
+            else:
+                submission_state = "submitted"
+                _review_arbitration_cutpoint(
+                    "after_submit_before_decision", arbitration_dir,
+                )
+                from arc_llm import strip_arc_llm_call_records
+
+                decision_output = strip_arc_llm_call_records(decision_output)
+                if not isinstance(decision_output, dict):
+                    unresolved_paths.update(
+                        item.path for item in active_components
+                    )
+                    status = "needs_supervision"
+                    supervision_reason = "malformed_arbitration_output"
+                    decision_output = None
+            try:
+                if decision_output is None:
+                    raise ReviewArbitrationError(
+                        supervision_reason or "arbitration output unavailable"
+                    )
+                resolution = validate_arbitration_output(
+                    decision_output, active_plan,
+                    synthesized_candidate_validator=validate_synthesis,
+                )
+            except ReviewArbitrationError:
+                unresolved_paths.update(
+                    item.path for item in active_components
+                )
+                status = "needs_supervision"
+                if not supervision_reason:
+                    supervision_reason = "invalid_arbitration_output"
+            else:
+                validated_artifact = {
+                    "schema_version": (
+                        "arc.companion.review-arbitration-validated-output.v1"
+                    ),
+                    "semantic_input_sha256": plan.semantic_input_sha256,
+                    "output": decision_output,
+                    "output_sha256": resolution.output_sha256,
+                }
+                write_json(validated_output_path, validated_artifact)
+                decision_artifact = {
+                    "schema_version": REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+                    "semantic_input_sha256": plan.semantic_input_sha256,
+                    "output_sha256": resolution.output_sha256,
+                    "decision_summaries": decision_summaries(resolution),
+                    "validated_output_path": str(
+                        validated_output_path.relative_to(checkpoint_dir)
+                    ),
+                    "validated_output_sha256": sha256_file(
+                        validated_output_path
+                    ),
+                }
+                write_json(decision_path, decision_artifact)
+                _accept_registered_pipeline_control(
+                    checkpoint_dir, "review-arbitration", prefix,
+                )
+                _review_arbitration_cutpoint(
+                    "after_decision_before_receipt", arbitration_dir,
+                )
+                unresolved_paths.update(resolution.unresolved_paths)
+                if resolution.unresolved_paths and not supervision_reason:
+                    supervision_reason = "explicit_unresolved_decision"
+                status = (
+                    "needs_supervision" if unresolved_paths else "resolved"
+                )
+    elif unresolved_paths:
+        status = "needs_supervision"
+
+    resolved_candidates = (
+        [] if resolution is None else list(resolution.resolved_candidates)
+    )
+    merged_candidates = [*accepted_non_conflicting, *resolved_candidates]
+    merged_review = {
+        "patches": materialize_review_patches(
+            merged_candidates,
+            segment_order=segment_order,
+            original_translation_blocks=lambda segment_id: (
+                [] if translations is None
+                else translations[segment_id].get("blocks") or []
+            ),
+        ),
+        "issues": list(plan.issues),
+    }
+    candidates_by_path = {item.path: item for item in merged_candidates}
+
+    def project_merged_review(
+        _review: Mapping[str, Any],
+        paths: Sequence[str],
+    ) -> Mapping[str, Any]:
+        selected = [
+            candidates_by_path[path]
+            for path in paths if path in candidates_by_path
+        ]
+        return {
+            "patches": materialize_review_patches(
+                selected,
+                segment_order=segment_order,
+                original_translation_blocks=lambda segment_id: (
+                    [] if translations is None
+                    else translations[segment_id].get("blocks") or []
+                ),
+            ),
+            "issues": list(plan.issues),
+        }
+
+    def apply_complete_review(
+        state: Any,
+        value: Mapping[str, Any],
+    ) -> None:
+        patched_segments: set[str] = set()
+        for patch in value.get("patches") or []:
+            segment_id = str(patch.get("segment_id") or "")
+            if (
+                segment_id not in segments_by_id
+                or segment_id in patched_segments
+            ):
+                raise RuntimeError(
+                    f"merged Review has invalid segment patch {segment_id}"
+                )
+            original_annotation = dict(state["annotations"][segment_id])
+            if patch.get("translation_blocks") is not None:
+                if options.skip_translation:
+                    raise RuntimeError(
+                        "merged commentary Review attempted translation"
+                    )
+                replacement = clean_reader_translation({
+                    "blocks": list(patch["translation_blocks"])
+                })
+                replacement, _changed = (
+                    _normalize_translation_citation_delimiters_for_segment(
+                        replacement, dict(blocks_by_id),
+                    )
+                )
+                _validate_translation(
+                    dict(segments_by_id[segment_id]),
+                    replacement,
+                    dict(blocks_by_id),
+                    list(protected_names),
+                )
+                state["translations"][segment_id] = replacement
+            changed_fields = [
+                field for field in _SPARSE_REVIEW_PATCH_FIELDS
+                if patch.get(field) is not None
+            ]
+            for field in changed_fields:
+                state["annotations"][segment_id][field] = deepcopy(patch[field])
+            validated = _validate_direct_annotation_sources(
+                state["annotations"][segment_id],
+                allowed_urls=allowed_urls[segment_id],
+            )
+            cleaned = clean_reader_annotation(
+                validated,
+                evidence_records=reader_evidence.get(segment_id, []),
+                language=options.annotation_language,
+            )
+            _assert_review_did_not_add_related_work(
+                original_annotation, cleaned,
+            )
+            state["annotations"][segment_id] = cleaned
+            patched_segments.add(segment_id)
+
+    try:
+        merged_state = validate_materialized_review(
+            merged_review,
+            full_schema=REVIEW_SCHEMA,
+            baseline=baseline,
+            changed_paths=[item.path for item in merged_candidates],
+            apply_review=apply_complete_review,
+            project_review=project_merged_review,
+        )
+    except ReviewArbitrationNeedsSupervision as exc:
+        unresolved_paths.update(exc.paths)
+        status = "needs_supervision"
+        supervision_reason = "merged_review_domain_validation_failed"
+        merged_state = partial_state
+
+    merged_sha256 = sha256_json(merged_review)
+    reviewed_translation_sha256 = sha256_json(
+        merged_state.get("translations")
+    )
+    reviewed_annotation_sha256 = sha256_json(
+        merged_state["annotations"]
+    )
+    review_recipe_sha256 = sha256_json(_review_recipe_access(options))
+    receipt = {
+        "schema_version": REVIEW_ARBITRATION_RECEIPT_VERSION,
+        "versions": {
+            "review": REVIEW_VERSION,
+            "arbitration": REVIEW_ARBITRATION_VERSION,
+            "output_schema": REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+            "partial": REVIEW_ARBITRATION_PARTIAL_VERSION,
+            "receipt": REVIEW_ARBITRATION_RECEIPT_VERSION,
+            "section_checkpoint": SECTION_REVIEW_CHECKPOINT_VERSION,
+            "commentary_checkpoint": COMMENTARY_REVIEW_CHECKPOINT_VERSION,
+        },
+        "status": status,
+        "supervision_reason": supervision_reason or None,
+        "submission_state": submission_state,
+        "semantic_input_sha256": plan.semantic_input_sha256,
+        "policy_sha256": sha256_json(tool_policy),
+        "recipe_sha256": review_recipe_sha256,
+        "provider": options.provider,
+        "model": options.model,
+        "primary_tier": REVIEW_TIER,
+        "arbitration_tier": REVIEW_ARBITRATION_TIER,
+        "source_hashes": list(plan.source_hashes),
+        "finding_hashes": list(plan.finding_hashes),
+        "issue_hashes": list(plan.issue_hashes),
+        "candidate_hashes": [
+            item.candidate_sha256 for item in plan.canonical_groups
+        ],
+        "origin_hashes": [
+            origin.origin_sha256
+            for item in plan.canonical_groups for origin in item.origins
+        ],
+        "patch_hashes": [
+            origin.patch_sha256
+            for item in plan.canonical_groups for origin in item.origins
+        ],
+        "paths": list(plan.conflict_paths),
+        "graph": [
+            {
+                "path": component.path,
+                "candidate_hashes": [
+                    item.candidate_sha256 for item in component.candidates
+                ],
+            }
+            for component in plan.components
+        ],
+        "supersession_edges": [list(item) for item in plan.supersession_edges],
+        "pruned_candidate_hashes": list(plan.pruned_candidate_hashes),
+        "invalid_candidate_hashes": [
+            item.candidate_sha256 for item in invalid_candidates
+        ],
+        "non_conflicting_candidate_hashes": [
+            item.candidate_sha256 for item in accepted_non_conflicting
+        ],
+        "partial_path": str(partial_path.relative_to(checkpoint_dir)),
+        "partial_sha256": sha256_file(partial_path),
+        "decision_path": (
+            str(decision_path.relative_to(checkpoint_dir))
+            if decision_path.is_file() else None
+        ),
+        "decision_sha256": (
+            sha256_file(decision_path) if decision_path.is_file() else None
+        ),
+        "raw_output_sha256": (
+            resolution.output_sha256 if resolution is not None else None
+        ),
+        "merged_sha256": merged_sha256,
+        "final_review_sha256": merged_sha256,
+        "reviewed_translation_sha256": reviewed_translation_sha256,
+        "reviewed_annotation_sha256": reviewed_annotation_sha256,
+        "schema_valid": not unresolved_paths,
+        "domain_valid": not unresolved_paths,
+        "decisions": (
+            [] if resolution is None else [
+                {
+                    "path": item.path,
+                    "action": item.action,
+                    "selected_candidate_hashes": list(
+                        item.selected_candidate_hashes
+                    ),
+                    "reason": item.reason,
+                }
+                for item in resolution.decisions
+            ]
+        ),
+        "unresolved_paths": sorted(unresolved_paths),
+        "provider_call_count": provider_calls,
+        "freeze_sha256": freeze_sha256,
+    }
+    if receipt_path.is_file():
+        existing_receipt = read_json(receipt_path)
+        replay_receipt = dict(receipt)
+        replay_receipt["provider_call_count"] = int(
+            existing_receipt.get("provider_call_count") or 0
+        )
+        if existing_receipt != replay_receipt:
+            differing_keys = sorted(
+                key for key in set(existing_receipt).union(replay_receipt)
+                if existing_receipt.get(key) != replay_receipt.get(key)
+            )
+            raise ReviewArbitrationError(
+                "review arbitration receipt tamper; differing fields: "
+                + ", ".join(differing_keys)
+            )
+        receipt = existing_receipt
+    else:
+        write_json(receipt_path, receipt)
+    _review_arbitration_cutpoint(
+        "after_receipt_before_reviewed_artifact", arbitration_dir,
+    )
+    receipt_reference = {
+        "path": str(receipt_path.relative_to(checkpoint_dir)),
+        "sha256": sha256_file(receipt_path),
+        "status": status,
+        "provider_call_count": int(receipt.get("provider_call_count") or 0),
+        "semantic_input_sha256": plan.semantic_input_sha256,
+        "merged_sha256": merged_sha256,
+        "final_review_sha256": merged_sha256,
+        "reviewed_translation_sha256": reviewed_translation_sha256,
+        "reviewed_annotation_sha256": reviewed_annotation_sha256,
+        "recipe_sha256": review_recipe_sha256,
+        "freeze_sha256": freeze_sha256,
+    }
+    if unresolved_paths:
+        _write_review_arbitration_supervision_ledger(
+            checkpoint_dir,
+            segment_universe=segment_order,
+            paths=sorted(unresolved_paths),
+            partial_path=partial_path,
+            receipt_path=receipt_path,
+            submission_state=str(receipt["submission_state"]),
+            reason=supervision_reason or (
+                "review arbitration retained unresolved exact targets"
+            ),
+        )
+        raise ReviewArbitrationNeedsSupervision(
+            paths=sorted(unresolved_paths),
+            reason=supervision_reason or (
+                "review arbitration retained unresolved exact targets"
+            ),
+            partial_path=str(partial_path.relative_to(checkpoint_dir)),
+            receipt_path=str(receipt_path.relative_to(checkpoint_dir)),
+            submission_state=str(receipt["submission_state"]),
+        )
+    if frozen_ids:
+        after_translations = merged_state.get("translations")
+        if (
+            sha256_json({
+                value: merged_state["annotations"][value]
+                for value in frozen_ids
+            }) != sha256_json({
+                value: annotations[value] for value in frozen_ids
+            })
+            or (
+                translations is not None
+                and sha256_json({
+                    value: after_translations[value] for value in frozen_ids
+                }) != sha256_json({
+                    value: translations[value] for value in frozen_ids
+                })
+            )
+        ):
+            raise RuntimeError("review arbitration changed the frozen first chapter")
+    _clear_review_arbitration_supervision_ledger(checkpoint_dir)
+    return (
+        merged_state.get("translations"),
+        merged_state["annotations"],
+        merged_review,
+        receipt_reference,
+    )
+
+
 def _review(
     segments: list[dict[str, Any]],
     translations: dict[str, dict[str, Any]] | None,
@@ -12052,6 +13215,7 @@ def _review(
     options: BuildOptions,
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
+    freeze_binding: Mapping[str, Any] | None = None,
     intent_guidance: Mapping[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, dict[str, Any]], dict[str, Any]]:
@@ -12077,6 +13241,7 @@ def _review(
             options=options,
             llm=llm,
             checkpoint_dir=checkpoint_dir,
+            freeze_binding=freeze_binding,
             intent_guidance=intent_guidance,
             cancel_check=cancel_check,
         )
@@ -12116,6 +13281,7 @@ def _review(
             options=options,
             llm=llm,
             checkpoint_dir=checkpoint_dir,
+            freeze_binding=freeze_binding,
             intent_guidance=intent_guidance,
             cancel_check=cancel_check,
         )
@@ -12172,6 +13338,7 @@ def _review(
     )
     hierarchical = _utf8_size(direct_prompt) > hierarchy_threshold
     review_call_audits: list[dict[str, Any]] = []
+    review_sources: list[ReviewPatchSource] = []
     if hierarchical:
         def render_section_prompt(chunk: list[dict[str, Any]]) -> str:
             chunk_text = json.dumps(
@@ -12256,17 +13423,10 @@ def _review(
             invalid_matching_checkpoint = False
             if path.is_file() and not force_review:
                 checkpoint = read_json(path)
-                try:
-                    checkpoint_review = _normalize_sparse_review_patches(
-                        checkpoint.get("review")
-                        if isinstance(checkpoint, dict) else None,
-                        block_order_by_segment=_review_patch_block_order(chunk),
-                        scope="section review checkpoint",
-                    )
-                except RuntimeError:
-                    # A conflicting or malformed cached patch is not trusted,
-                    # but it also must not prevent a fresh provider review.
-                    checkpoint_review = None
+                checkpoint_review = (
+                    checkpoint.get("review")
+                    if isinstance(checkpoint, dict) else None
+                )
                 checkpoint_matches = (
                     isinstance(checkpoint, dict)
                     and checkpoint.get("schema_version") == SECTION_REVIEW_CHECKPOINT_VERSION
@@ -12276,9 +13436,6 @@ def _review(
                     checkpoint_review, chunk
                 )
                 if checkpoint_matches and checkpoint_validation_error is None:
-                    if checkpoint_review != checkpoint.get("review"):
-                        checkpoint = {**checkpoint, "review": checkpoint_review}
-                        write_json(path, checkpoint)
                     _accept_completed_pipeline_controls(
                         checkpoint_dir,
                         caller_validated_units=frozenset({"section-review"}),
@@ -12335,11 +13492,6 @@ def _review(
                         "findings": list(value.get("findings") or []),
                         "patches": [],
                     }
-            value = _normalize_sparse_review_patches(
-                value,
-                block_order_by_segment=_review_patch_block_order(chunk),
-                scope="section review",
-            )
             validation_error = _section_review_validation_error(value, chunk)
             if validation_error is not None:
                 raise RuntimeError(f"section review {index} {validation_error}")
@@ -12399,6 +13551,12 @@ def _review(
                     chunks[index], list(value["patches"]), chunk_findings
                 ),
             })
+            review_sources.append(ReviewPatchSource.from_review(
+                source_kind="section",
+                stable_order=index,
+                review=value,
+                segment_set=sorted(chunk_ids),
+            ))
         all_segment_ids = {str(item["segment_id"]) for item in segments}
         if review_coverage != all_segment_ids:
             missing = sorted(all_segment_ids - review_coverage)
@@ -12467,14 +13625,11 @@ def _review(
             suffix=["final-review"],
         ),
     )
-    review = _normalize_sparse_review_patches(
-        review,
-        block_order_by_segment={
-            str(segment["segment_id"]): _augmentation_block_ids(segment, by_id)
-            for segment in segments
-        },
-        scope="final review",
-    )
+    review_sources.append(ReviewPatchSource.from_review(
+        source_kind="final",
+        stable_order=len(review_sources),
+        review=review,
+    ))
     review_call_audits.append(_review_prompt_call_audit(
         final_rendered,
         stage="hierarchical-final" if hierarchical else "direct-final",
@@ -12482,51 +13637,40 @@ def _review(
         disposition="provider-call",
     ))
     review_call_audits.extend(final_evidence_round_audits)
-    reviewed_translations = {key: {"blocks": [dict(item) for item in value.get("blocks") or []]} for key, value in translations.items()}
-    reviewed = {key: dict(value) for key, value in annotations.items()}
-    valid_ids = set(reviewed)
-    patched: set[str] = set()
+    reviewed_translations, reviewed, review, arbitration_receipt = (
+        _coordinate_review_candidates(
+            review_sources,
+            segments=segments,
+            translations=translations,
+            annotations=annotations,
+            blocks_by_id=by_id,
+            protected_names=protected_names,
+            reader_evidence=reader_evidence,
+            options=options,
+            llm=llm,
+            checkpoint_dir=checkpoint_dir,
+            freeze_binding=freeze_binding,
+            cancel_check=cancel_check,
+        )
+    )
+    patched = {
+        str(item.get("segment_id") or "")
+        for item in review.get("patches") or []
+    }
     citation_normalized: set[str] = set()
     for patch in review.get("patches") or []:
-        segment_id = str(patch.get("segment_id") or "")
-        if segment_id not in valid_ids or segment_id in patched:
-            raise RuntimeError(f"review returned invalid or duplicate annotation patch: {segment_id}")
-        original_annotation = dict(reviewed[segment_id])
-        translation_changed = patch.get("translation_blocks") is not None
-        if translation_changed:
-            replacement = clean_reader_translation(
-                {"blocks": list(patch.get("translation_blocks") or [])}
+        if patch.get("translation_blocks") is None:
+            continue
+        _normalized, changed_ids = (
+            _normalize_translation_citation_delimiters_for_segment(
+                clean_reader_translation({
+                    "blocks": list(patch["translation_blocks"])
+                }),
+                by_id,
             )
-            segment = next(item for item in segments if item["segment_id"] == segment_id)
-            replacement, changed_ids = _normalize_translation_citation_delimiters_for_segment(
-                replacement, by_id
-            )
-            if changed_ids:
-                citation_normalized.add(segment_id)
-            _validate_translation(segment, replacement, by_id, protected_names)
-            reviewed_translations[segment_id] = replacement
-        annotation_fields = (
-            "commentary", "explanation", "commentary_sources", "prior_work", "later_work",
         )
-        changed_annotation_fields = [field for field in annotation_fields if patch.get(field) is not None]
-        if not changed_annotation_fields and not translation_changed:
-            raise RuntimeError(f"review returned an empty patch: {segment_id}")
-        for field in changed_annotation_fields:
-            if field in {"commentary", "explanation"}:
-                text = str(patch[field])
-                reviewed[segment_id][field] = text
-            else:
-                reviewed[segment_id][field] = patch[field]
-        reviewed[segment_id] = _validate_direct_annotation_sources(
-            reviewed[segment_id],
-            allowed_urls=_annotation_source_urls(original_annotation),
-        )
-        reviewed[segment_id] = clean_reader_annotation(
-            reviewed[segment_id],
-            evidence_records=reader_evidence.get(segment_id, []),
-            language=options.annotation_language,
-        )
-        patched.add(segment_id)
+        if changed_ids:
+            citation_normalized.add(str(patch["segment_id"]))
     final_review_audit = {
         "hierarchical": hierarchical,
         "section_findings": findings,
@@ -12545,11 +13689,13 @@ def _review(
             "calls": review_call_audits,
             "historical_measurements_available": True,
         },
+        "review_arbitration_receipt": arbitration_receipt,
     }
     write_json(final_review_acceptance_path, {
         "schema_version": "arc.companion.final-review-acceptance.v1",
         "input_sha256": final_review_input_sha256,
         "response": review,
+        "review_arbitration_receipt": arbitration_receipt,
         "reviewed_translation_sha256": sha256_json(reviewed_translations),
         "reviewed_annotation_sha256": sha256_json(reviewed),
         "audit": final_review_audit,
@@ -12570,6 +13716,7 @@ def _review_commentary_only(
     options: BuildOptions,
     llm: Callable[..., dict[str, Any]],
     checkpoint_dir: Path,
+    freeze_binding: Mapping[str, Any] | None = None,
     intent_guidance: Mapping[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
@@ -12771,43 +13918,40 @@ def _review_commentary_only(
         responses = [value for value, _, _ in completed]
         dispositions = [disposition for _, disposition, _ in completed]
 
-    valid_ids = set(reviewed)
-    patched: set[str] = set()
-    issues: list[str] = []
-    for (group, _), response in zip(payload_groups, responses):
-        group_ids = {
-            str(item["segment"]["segment_id"]) for item in group
-        }
-        issues.extend(str(item) for item in response.get("issues") or [])
-        for patch in response.get("patches") or []:
-            if "translation" in patch or "translation_blocks" in patch:
-                raise RuntimeError("commentary-only review attempted a translation patch")
-            segment_id = str(patch.get("segment_id") or "")
-            if segment_id not in group_ids or segment_id not in valid_ids or segment_id in patched:
-                raise RuntimeError(
-                    f"review returned out-of-group, invalid, or duplicate annotation patch: {segment_id}"
-                )
-            original = dict(reviewed[segment_id])
-            fields = (
-                "commentary", "explanation", "commentary_sources", "prior_work", "later_work",
-            )
-            changed = [field for field in fields if patch.get(field) is not None]
-            if not changed:
-                raise RuntimeError(f"review returned an empty patch: {segment_id}")
-            for field in changed:
-                if field in {"commentary", "explanation"}:
-                    reviewed[segment_id][field] = str(patch[field])
-                else:
-                    reviewed[segment_id][field] = patch[field]
-            reviewed[segment_id] = _validate_direct_annotation_sources(
-                reviewed[segment_id], allowed_urls=_annotation_source_urls(original),
-            )
-            reviewed[segment_id] = clean_reader_annotation(
-                reviewed[segment_id],
-                evidence_records=reader_evidence.get(segment_id, []),
-                language=options.annotation_language,
-            )
-            patched.add(segment_id)
+    commentary_sources = [
+        ReviewPatchSource.from_review(
+            source_kind="commentary",
+            stable_order=index,
+            review=response,
+            segment_set=[
+                str(item["segment"]["segment_id"]) for item in group
+            ],
+        )
+        for index, ((group, _), response) in enumerate(
+            zip(payload_groups, responses)
+        )
+    ]
+    _unused_translations, reviewed, merged_review, arbitration_receipt = (
+        _coordinate_review_candidates(
+            commentary_sources,
+            segments=segments,
+            translations=None,
+            annotations=annotations,
+            blocks_by_id=by_id,
+            protected_names=[],
+            reader_evidence=reader_evidence,
+            options=options,
+            llm=llm,
+            checkpoint_dir=checkpoint_dir,
+            freeze_binding=freeze_binding,
+            cancel_check=cancel_check,
+        )
+    )
+    patched = {
+        str(item.get("segment_id") or "")
+        for item in merged_review.get("patches") or []
+    }
+    issues = list(merged_review.get("issues") or [])
     return reviewed, {
         "translation_mode": "skipped",
         "hierarchical": hierarchical,
@@ -12815,6 +13959,7 @@ def _review_commentary_only(
         "reviewed_segment_ids": [str(item["segment_id"]) for item in segments],
         "issues": issues,
         "patched_segment_ids": sorted(patched),
+        "review_arbitration_receipt": arbitration_receipt,
         "prompt_budget_audit": {
             "schema_version": REVIEW_PROMPT_BUDGET_AUDIT_VERSION,
             "budget": prompt_budget,
@@ -12941,8 +14086,12 @@ def _commentary_review_validation_error(
         if segment_id not in expected_ids:
             return "returned a patch outside its review group"
         patch_ids.append(segment_id)
-    if len(patch_ids) != len(set(patch_ids)):
-        return "returned duplicate patches"
+    try:
+        from jsonschema import validate as validate_json_schema
+
+        validate_json_schema(instance=review, schema=COMMENTARY_REVIEW_SCHEMA)
+    except Exception as exc:
+        return f"contains invalid patch shape: {exc}"
     return None
 
 
@@ -14185,6 +15334,71 @@ def _pipeline_acceptance_checkpoint_valid(
             and isinstance(value["review"].get("patches"), list)
             and _recovery_candidate_matches_schema(value["review"], receipt)
         )
+    if unit == "review-arbitration":
+        if (
+            checkpoint_dir is None
+            or not validate_review_arbitration_acceptance_checkpoint(
+                value, receipt,
+            )
+        ):
+            return False
+        relative = Path(str(value["validated_output_path"]))
+        try:
+            decision_relative = path.relative_to(checkpoint_dir)
+        except ValueError:
+            return False
+        if (
+            len(decision_relative.parts) != 3
+            or decision_relative.parts[0] != "review-arbitration"
+            or decision_relative.parts[2] != "decision.json"
+            or relative != Path(
+                "llm",
+                "review-arbitration",
+                decision_relative.parts[1],
+                "validated-output.json",
+            )
+        ):
+            return False
+        owned_path = checkpoint_dir / relative
+        from jsonschema import (
+            ValidationError,
+            validate as validate_json_schema,
+        )
+        try:
+            if (
+                not owned_path.is_file()
+                or value.get("validated_output_sha256")
+                != sha256_file(owned_path)
+            ):
+                return False
+            validated_output = read_json(owned_path)
+            if (
+                not isinstance(validated_output, Mapping)
+                or set(validated_output) != {
+                    "schema_version",
+                    "semantic_input_sha256",
+                    "output",
+                    "output_sha256",
+                }
+                or validated_output.get("schema_version")
+                != "arc.companion.review-arbitration-validated-output.v1"
+            ):
+                return False
+            output = validated_output.get("output")
+            from arc_llm import strip_arc_llm_call_records
+            clean_output = strip_arc_llm_call_records(output)
+            validate_json_schema(
+                instance=clean_output,
+                schema=REVIEW_ARBITRATION_SCHEMA,
+            )
+            return (
+                validated_output.get("semantic_input_sha256") == input_sha
+                and validated_output.get("output_sha256")
+                == value.get("output_sha256")
+                == review_arbitration_sha256(clean_output)
+            )
+        except (OSError, TypeError, ValueError, ValidationError):
+            return False
     if unit == "final-review":
         return (
             isinstance(value.get("section_findings"), list)
@@ -18050,8 +19264,27 @@ def _section_review_validation_error(
     ]
     if len(patch_ids) != len(patches) or any(value not in expected_ids for value in patch_ids):
         return "returned a malformed or out-of-chunk patch"
-    if len(patch_ids) != len(set(patch_ids)):
-        return "returned duplicate patches"
+    try:
+        from jsonschema import validate as validate_json_schema
+
+        validate_json_schema(instance=review, schema=SECTION_REVIEW_SCHEMA)
+        source = ReviewPatchSource.from_review(
+            source_kind="section",
+            stable_order=0,
+            review=review,
+            segment_set=expected_ids,
+        )
+        plan_review_merge(
+            [source],
+            segment_order=expected_ids,
+            block_order_by_segment=_review_patch_block_order(chunk),
+            original_value_resolver=lambda path: {"validation_path": path},
+            invariant_context_resolver=lambda component: {
+                "validation_path": component.path
+            },
+        )
+    except Exception as exc:
+        return f"contains invalid patch shape or ownership: {exc}"
     return None
 
 
@@ -18092,9 +19325,6 @@ def _load_recovered_section_reviews(
             "findings": item.get("findings"),
             "patches": item.get("patches") or item.get("patch_proposals") or [],
         }
-        review = _normalize_sparse_review_patches(
-            review, scope="recovered section review",
-        )
         validation_error = _section_review_validation_error(
             review,
             [

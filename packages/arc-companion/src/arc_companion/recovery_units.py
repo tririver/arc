@@ -6,6 +6,10 @@ import inspect
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .review_arbitration import (
+    REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION,
+)
+
 
 @dataclass(frozen=True)
 class RecoveryUnitSpec:
@@ -90,6 +94,11 @@ RECOVERY_UNIT_REGISTRY: dict[str, RecoveryUnitSpec] = {
     "commentary-review": RecoveryUnitSpec(
         "commentary-review", "pipeline", "commentary-review-schema.v1", None,
         "normal-commentary-review-pipeline-replay.v1",
+    ),
+    "review-arbitration": RecoveryUnitSpec(
+        "review-arbitration", "pipeline",
+        "review-arbitration-decision+semantics.v1", None,
+        "normal-review-arbitration-pipeline-replay.v1",
     ),
 }
 
@@ -224,6 +233,99 @@ def require_control_acceptance(
         raise RuntimeError(
             f"{unit}:{logical_unit} did not reach one exact control acceptance"
         )
+
+
+def validate_review_arbitration_acceptance_checkpoint(
+    value: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> bool:
+    """Validate one arbitration decision against its recovery receipt.
+
+    The pipeline remains responsible for applying the decision.  This validator
+    owns only the body-light acceptance binding needed for deterministic replay.
+    """
+
+    if not isinstance(value, Mapping) or not isinstance(receipt, Mapping):
+        return False
+    if set(value) != {
+        "schema_version",
+        "semantic_input_sha256",
+        "output_sha256",
+        "decision_summaries",
+        "validated_output_path",
+        "validated_output_sha256",
+    }:
+        return False
+    semantic_input_sha256 = value.get("semantic_input_sha256")
+    receipt_input_sha256 = receipt.get("input_sha256")
+    if (
+        not isinstance(semantic_input_sha256, str)
+        or len(semantic_input_sha256) != 64
+        or any(character not in "0123456789abcdef"
+               for character in semantic_input_sha256)
+        or semantic_input_sha256 != receipt_input_sha256
+    ):
+        return False
+    output_sha256 = value.get("output_sha256")
+    validated_output_sha256 = value.get("validated_output_sha256")
+    validated_output_path = value.get("validated_output_path")
+    summaries = value.get("decision_summaries")
+    if not (
+        _is_sha256(output_sha256)
+        and _is_sha256(validated_output_sha256)
+        and isinstance(validated_output_path, str)
+        and validated_output_path
+        and not Path(validated_output_path).is_absolute()
+        and ".." not in Path(validated_output_path).parts
+        and isinstance(summaries, list)
+    ):
+        return False
+    for item in summaries:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {
+                "path",
+                "action",
+                "selected_candidate_hashes",
+                "replacement_sha256",
+                "origin_hashes",
+                "reason",
+            }
+            or not isinstance(item.get("path"), str)
+            or item.get("action") not in {
+                "select_candidate",
+                "merge_candidates",
+                "keep_original",
+                "unresolved",
+            }
+            or not isinstance(item.get("reason"), str)
+            or not isinstance(item.get("selected_candidate_hashes"), list)
+            or not all(
+                _is_sha256(candidate_hash)
+                for candidate_hash in item["selected_candidate_hashes"]
+            )
+            or len(item["selected_candidate_hashes"])
+            != len(set(item["selected_candidate_hashes"]))
+            or not isinstance(item.get("origin_hashes"), list)
+            or not all(_is_sha256(value) for value in item["origin_hashes"])
+            or (
+                item.get("replacement_sha256") is not None
+                and not _is_sha256(item.get("replacement_sha256"))
+            )
+        ):
+            return False
+    return (
+        value.get("schema_version")
+        == REVIEW_ARBITRATION_OUTPUT_SCHEMA_VERSION
+    )
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def recovery_unit_for_ledger(lane: str) -> RecoveryUnitSpec | None:

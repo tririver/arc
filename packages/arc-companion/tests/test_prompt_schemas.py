@@ -25,11 +25,13 @@ from arc_companion.prompts import (
     glossary_consolidation_prompt,
     glossary_prompt,
     review_prompt,
+    review_arbitration_prompt,
     section_review_prompt,
     translation_coverage_repair_prompt,
     translation_prompt,
     translation_reference_prompt,
 )
+from arc_companion.review_arbitration import REVIEW_ARBITRATION_SCHEMA
 
 
 def _assert_codex_strict_objects(node: Any) -> None:
@@ -59,6 +61,7 @@ def test_all_companion_schemas_satisfy_codex_strict_object_contract() -> None:
         REVIEW_SCHEMA,
         COMMENTARY_REVIEW_SCHEMA,
         SECTION_REVIEW_SCHEMA,
+        REVIEW_ARBITRATION_SCHEMA,
         CHAPTER_GUIDE_SCHEMA,
     )
 
@@ -66,6 +69,18 @@ def test_all_companion_schemas_satisfy_codex_strict_object_contract() -> None:
         provider_schema = to_provider_json_schema(schema)
         assert provider_schema is not None
         _assert_codex_strict_objects(provider_schema)
+
+
+def test_review_arbitration_prompt_is_conflict_only_and_tool_forbidden() -> None:
+    prompt = review_arbitration_prompt({
+        "conflicts": [{"path": "/segments/s/annotation/commentary"}],
+    })
+    assert "only the supplied Review conflicts" in prompt
+    assert "do not research, use tools, add facts, or add sources" in prompt
+    assert "Prefer merge_candidates" in prompt
+    assert "same-block candidates" in prompt
+    assert "use unresolved" in prompt
+    assert "/segments/s/annotation/commentary" in prompt
 
 
 def test_reference_translation_prompt_keeps_source_authoritative() -> None:
