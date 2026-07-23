@@ -6,12 +6,25 @@ from pathlib import Path
 import zipfile
 
 from .io import read_json, sha256_file, write_json
+from .pdf import (
+    PDF_RENDER_VERSION,
+    PDF_VALIDATOR_VERSION,
+    PDF_VALIDATION_RECEIPT_VERSION,
+    current_pdf_validation_receipt_matches,
+    match_validated_pdf_revision,
+    pdf_render_recipe_sha256,
+)
 from .results import err, ok
 from .web import (
     WEB_MANIFEST_VERSION,
     WEB_RENDER_VERSION,
     validate_reader_project,
 )
+
+_LEGACY_PDF_RENDER_VERSIONS = {
+    f"arc.companion.final-render.v{version}"
+    for version in range(1, 13)
+}
 
 
 def package_project(project_dir: Path) -> dict[str, object]:
@@ -73,7 +86,81 @@ def package_project(project_dir: Path) -> dict[str, object]:
         if not source_manifest_path.is_file() or not validation_path.is_file():
             raise ValueError("Source manifest or validation report is missing")
         validation = read_json(validation_path)
-        if not isinstance(validation, dict) or validation.get("ok") is not True:
+        legacy_validation = (
+            isinstance(validation, dict)
+            and validation.get("schema_version")
+            != PDF_VALIDATION_RECEIPT_VERSION
+            and validation.get("ok") is True
+            and (
+                not str(
+                    published_pdf.get("render_version")
+                    or effective.get("render_version")
+                    or effective.get("final_render_version")
+                    or ""
+                )
+                or str(
+                    published_pdf.get("render_version")
+                    or effective.get("render_version")
+                    or effective.get("final_render_version")
+                    or ""
+                )
+                in _LEGACY_PDF_RENDER_VERSIONS
+            )
+        )
+        current_identity = (
+            str(
+                published_pdf.get("render_version")
+                or effective.get("render_version")
+                or ""
+            )
+            == PDF_RENDER_VERSION
+            and str(
+                published_pdf.get("render_recipe_sha256")
+                or effective.get("render_recipe_sha256")
+                or ""
+            )
+            == pdf_render_recipe_sha256()
+            and str(
+                published_pdf.get("validator_version")
+                or effective.get("validator_version")
+                or ""
+            )
+            == PDF_VALIDATOR_VERSION
+        )
+        current_validation = (
+            isinstance(validation, dict)
+            and current_identity
+            and validation.get("schema_version")
+            == PDF_VALIDATION_RECEIPT_VERSION
+            and current_pdf_validation_receipt_matches(
+                validation,
+                content_sha256=str(
+                    published.get("content_sha256")
+                    or effective.get("content_sha256")
+                    or ""
+                ),
+                render_recipe_sha256=pdf_render_recipe_sha256(),
+                validator_version=PDF_VALIDATOR_VERSION,
+                pdf_sha256=str(effective.get("output_pdf_sha256") or ""),
+                tex_sha256=str(effective.get("output_tex_sha256") or ""),
+                source_manifest_sha256=str(
+                    effective.get("source_manifest_sha256") or ""
+                ),
+                pdf_bytes=pdf_path.stat().st_size,
+            )
+        )
+        if current_validation:
+            current_validation = match_validated_pdf_revision(
+                root,
+                state,
+                content_sha256=str(
+                    published.get("content_sha256")
+                    or effective.get("content_sha256")
+                    or ""
+                ),
+            ).reusable
+        validation_success = legacy_validation or current_validation
+        if not validation_success:
             raise ValueError("Companion validation report is not successful")
         source_manifest = read_json(source_manifest_path)
         files = [pdf_path, tex_path, source_manifest_path, validation_path, state_path]

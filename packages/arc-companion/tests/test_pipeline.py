@@ -16,6 +16,7 @@ import pytest
 from arc_companion import pipeline as pipeline_module
 from arc_companion.cli import _emit
 from arc_companion.evidence import arc_cache_descriptor, text_sha256, validate_evidence_record
+from arc_companion.io import read_json, sha256_file, write_json
 from arc_companion.pipeline import (
     BuildOptions,
     CompanionLLMCircuitOpen,
@@ -48,6 +49,12 @@ from arc_companion.prompts import ANNOTATION_SCHEMA
 from arc_companion.source import SourceBundle
 from arc_companion.run_lock import ProjectBuildLock
 from arc_companion.content import store_reader_content
+from arc_companion.pdf import (
+    PDF_RENDER_VERSION,
+    PDF_VALIDATOR_VERSION,
+    build_pdf_validation_receipt,
+    pdf_render_recipe_sha256,
+)
 from arc_companion.source_credit import normalize_source_credit
 
 
@@ -188,6 +195,8 @@ def test_explicit_source_credit_reference_uses_strict_cached_singleton(
 def test_completed_credit_only_refresh_reuses_reviewed_content_without_provider_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import arc_companion.render as render_module
+
     project = tmp_path / "project"
     checkpoint = project / "checkpoint"
     checkpoint.mkdir(parents=True)
@@ -319,7 +328,34 @@ def test_completed_credit_only_refresh_reuses_reviewed_content_without_provider_
             "source_credit_observation_sha256": "shared-observation",
         }
 
-    monkeypatch.setattr(pipeline_module, "_publish_pdf_artifact", fake_pdf)
+    def fake_render(*_args, **kwargs):
+        content_value = kwargs["content"]
+        legacy = fake_pdf(source_credit=content_value["source_credit"])
+        return {
+            "output_tex": legacy["tex_path"],
+            "output_pdf": legacy["pdf_path"],
+            "source_manifest_path": legacy["manifest_path"],
+            "validation_path": legacy["validation_path"],
+            "output_tex_sha256": legacy["tex_sha256"],
+            "output_pdf_sha256": legacy["pdf_sha256"],
+            "source_manifest_sha256": legacy["manifest_sha256"],
+            "validation_sha256": legacy["validation_sha256"],
+            "render_version": pipeline_module.FINAL_RENDER_VERSION,
+            "render_recipe_sha256": (
+                pipeline_module.pdf_render_recipe_sha256()
+            ),
+            "validator_version": "custom-validator",
+            "source_credit_sha256": legacy[
+                "source_credit_sha256"
+            ],
+            "source_credit_observation_sha256": legacy[
+                "source_credit_observation_sha256"
+            ],
+        }
+
+    monkeypatch.setattr(
+        render_module, "render_pdf_content_unlocked", fake_render,
+    )
     monkeypatch.setattr(pipeline_module, "_publish_reader_update", fake_web)
     monkeypatch.setattr(
         pipeline_module,
@@ -4425,8 +4461,8 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
             Path(data["validation_path"]).read_text(encoding="utf-8")
         )["source_credit_pdf"],
     )
-    assert validation["ok"]
-    assert validation["data"]["web"]["ok"] is True
+    assert validation["ok"] is False
+    assert "receipt_invalid" in validation["error"]["message"]
     saved_evidence = list((Path(data["checkpoint_dir"]) / "segment-evidence").glob("*.json"))
     assert len(saved_evidence) == 2
     assert all("evidence" in json.loads(path.read_text(encoding="utf-8")) for path in saved_evidence)
@@ -5865,16 +5901,21 @@ def test_first_round_preview_is_published_before_review_without_evidence_rerun(t
     def llm(prompt: str, **kwargs):
         label = str(kwargs["call_label"])
         if label.startswith("companion-review-segment-"):
-            assert (project / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
-            assert (project / "first-round-preview-source-manifest.json").is_file()
-            assert (project / "first-round-preview-validation.json").is_file()
+            preview_state = read_json(project / "state.json")
+            assert Path(preview_state["preview_pdf"]).is_file()
+            assert Path(
+                preview_state["preview_source_manifest_path"]
+            ).is_file()
+            assert Path(
+                preview_state["preview_validation_path"]
+            ).is_file()
         return fake(prompt, **kwargs)
 
     def compiler(tex_path: Path, pdf_path: Path) -> None:
-        if "first_round_preview" in tex_path.name:
-            assert tex_path.parent == project
-        else:
-            assert tex_path.parent.parent.parent == project / ".arc-companion" / "renders"
+        assert (
+            tex_path.parent.parent.parent
+            == project / ".arc-companion" / "renders"
+        )
         assert pdf_path.parent == tex_path.parent
         assert not tex_path.name.startswith(".")
         assert not pdf_path.name.startswith(".")
@@ -6685,7 +6726,9 @@ def test_run_root_pdf_state_event_failure_keeps_already_committed_delivery(
         output_pdf=str(canonical),
         output_pdf_sha256=digest,
     )
-    publication = pipeline_module.publish_run_root_pdf(canonical, project)
+    publication = pipeline_module.publish_run_root_pdf(
+        canonical, project, expected_sha256=digest,
+    )
     monkeypatch.setattr(
         observability,
         "append_state_event",
@@ -6715,7 +6758,10 @@ def test_run_root_pdf_precommit_failure_leaves_adoptable_delivery(
     canonical.write_bytes(b"%PDF canonical")
     state_path = project / "state.json"
     state_path.write_text('{"status":"complete"}', encoding="utf-8")
-    publication = pipeline_module.publish_run_root_pdf(canonical, project)
+    digest = hashlib.sha256(canonical.read_bytes()).hexdigest()
+    publication = pipeline_module.publish_run_root_pdf(
+        canonical, project, expected_sha256=digest,
+    )
     real_state = pipeline_module._state
     monkeypatch.setattr(
         pipeline_module,
@@ -6730,7 +6776,9 @@ def test_run_root_pdf_precommit_failure_leaves_adoptable_delivery(
 
     assert Path(publication["output_run_pdf"]).is_file()
     monkeypatch.setattr(pipeline_module, "_state", real_state)
-    adopted = pipeline_module.publish_run_root_pdf(canonical, project)
+    adopted = pipeline_module.publish_run_root_pdf(
+        canonical, project, expected_sha256=digest,
+    )
     persisted = pipeline_module._state(state_path, **adopted)
     assert persisted["output_run_pdf"] == publication["output_run_pdf"]
 
@@ -6744,7 +6792,9 @@ def test_fingerprint_change_preserves_delivery_ownership_until_replacement(
     old_pdf.write_bytes(b"%PDF old")
     state_path = project / "state.json"
     old_hash = hashlib.sha256(old_pdf.read_bytes()).hexdigest()
-    old_publication = pipeline_module.publish_run_root_pdf(old_pdf, project)
+    old_publication = pipeline_module.publish_run_root_pdf(
+        old_pdf, project, expected_sha256=old_hash,
+    )
     _state(
         state_path,
         status="complete",
@@ -6776,6 +6826,7 @@ def test_fingerprint_change_preserves_delivery_ownership_until_replacement(
     managed = pipeline_module.managed_run_root_pdf_path(interrupted)
     new_publication = pipeline_module.publish_run_root_pdf(
         new_pdf, project, managed_path=managed,
+        expected_sha256=new_hash,
     )
     recovered = _state(state_path, **new_publication)
     assert Path(recovered["output_run_pdf"]).read_bytes() == b"%PDF new"
@@ -9164,7 +9215,8 @@ def test_invalid_review_patch_fails_without_publishing_pdf(tmp_path: Path) -> No
     assert final_prompts and '"source_blocks"' in final_prompts[0]
     assert json.loads((tmp_path / "bad" / "state.json").read_text())["status"] == "failed"
     assert len(compiled) == 1
-    assert (tmp_path / "bad" / "arXiv-1234.5678_companion_zh-CN_first_round_preview.pdf").is_file()
+    failed_state = read_json(tmp_path / "bad" / "state.json")
+    assert Path(failed_state["preview_pdf"]).is_file()
     assert not (tmp_path / "bad" / "arXiv-1234.5678_companion_zh-CN.pdf").exists()
 
 
@@ -9325,6 +9377,209 @@ def test_json_emit_warns_about_segmentation_failure_on_stderr(capsys) -> None:
     assert captured.err == "WARNING: window w-0002 failed after 3 attempts\n"
 
 
+def test_exact_pdf_resume_is_a_state_file_noop(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    project = tmp_path / "exact-pdf-resume"
+    compile_count = 0
+
+    def compiler(_tex: Path, pdf: Path) -> None:
+        nonlocal compile_count
+        compile_count += 1
+        pdf.write_bytes(b"%PDF-1.7 fixture")
+
+    first = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=FakeLLM(),
+        compiler=compiler,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+    assert first["ok"], first
+    state_path = project / "state.json"
+    state = read_json(state_path)
+    pdf_state = state["published"]["pdf"]
+    pdf = Path(pdf_state["output_pdf"])
+    tex = Path(pdf_state["output_tex"])
+    manifest = Path(pdf_state["source_manifest_path"])
+    receipt_path = Path(pdf_state["validation_path"])
+    write_json(
+        receipt_path,
+        build_pdf_validation_receipt(
+            content_sha256=state["published"]["content_sha256"],
+            pdf_sha256=sha256_file(pdf),
+            tex_sha256=sha256_file(tex),
+            source_manifest_sha256=sha256_file(manifest),
+            pdf_report={
+                "validator": PDF_VALIDATOR_VERSION,
+                "result": "success",
+                "pages": 1,
+                "pages_checked": 1,
+                "dpi": 144,
+                "pdf_bytes": pdf.stat().st_size,
+                "text_bytes": 1,
+                "raster_bytes": 1,
+                "encrypted": False,
+                "embedded_font_count": 2,
+                "font_roles": {
+                    "sans": ["Noto Sans"],
+                    "serif": ["Latin Modern"],
+                },
+            },
+            source_credit_pdf={
+                "schema_version": (
+                    "arc.companion.source-credit-pdf-observation.v1"
+                ),
+                "canonical_sha256": pdf_state[
+                    "source_credit_sha256"
+                ],
+                "searchable_text_sha256": "2" * 64,
+                "ordered_ids": [],
+                "visible_projection_sha256": pdf_state[
+                    "source_credit_observation_sha256"
+                ],
+                "visible_counts": {
+                    "authors": 0,
+                    "affiliations": 0,
+                    "profiles": 0,
+                },
+            },
+        ),
+    )
+    current_fields = {
+        "render_version": PDF_RENDER_VERSION,
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": PDF_VALIDATOR_VERSION,
+        "validation_sha256": sha256_file(receipt_path),
+    }
+    pdf_state.update(current_fields)
+    state.update(current_fields)
+    write_json(state_path, state)
+    before_bytes = state_path.read_bytes()
+    before_stat = state_path.stat()
+    initial_compile_count = compile_count
+
+    resumed = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=lambda *_args, **_kwargs: pytest.fail("model called"),
+        compiler=lambda *_args: pytest.fail("compiler called"),
+        pdf_validator=lambda _path: pytest.fail("validator called"),
+    )
+
+    assert resumed["ok"], resumed
+    assert resumed["meta"]["resumed"] is True
+    assert compile_count == initial_compile_count
+    assert state_path.read_bytes() == before_bytes
+    after_stat = state_path.stat()
+    assert after_stat.st_ino == before_stat.st_ino
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+
+
+@pytest.mark.parametrize("interrupted_status", ["typesetting", "failed"])
+def test_interrupted_final_state_adopts_published_revision_without_recompile(
+    tmp_path: Path,
+    interrupted_status: str,
+) -> None:
+    bundle = _bundle(tmp_path)
+    project = tmp_path / interrupted_status
+
+    def compiler(_tex: Path, pdf: Path) -> None:
+        pdf.write_bytes(b"%PDF-1.7 fixture")
+
+    first = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=FakeLLM(),
+        compiler=compiler,
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+    assert first["ok"], first
+    state_path = project / "state.json"
+    state = read_json(state_path)
+    pdf_state = state["published"]["pdf"]
+    pdf = Path(pdf_state["output_pdf"])
+    tex = Path(pdf_state["output_tex"])
+    manifest = Path(pdf_state["source_manifest_path"])
+    receipt_path = Path(pdf_state["validation_path"])
+    write_json(
+        receipt_path,
+        build_pdf_validation_receipt(
+            content_sha256=state["published"]["content_sha256"],
+            pdf_sha256=sha256_file(pdf),
+            tex_sha256=sha256_file(tex),
+            source_manifest_sha256=sha256_file(manifest),
+            pdf_report={
+                "validator": PDF_VALIDATOR_VERSION,
+                "result": "success",
+                "pages": 1,
+                "pages_checked": 1,
+                "dpi": 144,
+                "pdf_bytes": pdf.stat().st_size,
+                "text_bytes": 1,
+                "raster_bytes": 1,
+                "encrypted": False,
+                "embedded_font_count": 2,
+                "font_roles": {
+                    "sans": ["Noto Sans"],
+                    "serif": ["Latin Modern"],
+                },
+            },
+            source_credit_pdf={
+                "schema_version": (
+                    "arc.companion.source-credit-pdf-observation.v1"
+                ),
+                "canonical_sha256": pdf_state[
+                    "source_credit_sha256"
+                ],
+                "searchable_text_sha256": "4" * 64,
+                "ordered_ids": [],
+                "visible_projection_sha256": pdf_state[
+                    "source_credit_observation_sha256"
+                ],
+                "visible_counts": {
+                    "authors": 0,
+                    "affiliations": 0,
+                    "profiles": 0,
+                },
+            },
+        ),
+    )
+    state["status"] = interrupted_status
+    state["published"].pop("pdf")
+    for key in (
+        "output_tex",
+        "output_tex_sha256",
+        "output_pdf",
+        "output_pdf_sha256",
+        "source_manifest_path",
+        "source_manifest_sha256",
+        "validation_path",
+        "validation_sha256",
+        "render_version",
+        "render_recipe_sha256",
+        "validator_version",
+    ):
+        state.pop(key, None)
+    if interrupted_status == "failed":
+        state["error"] = {
+            "code": "companion_pdf_failed",
+            "message": "state commit interrupted",
+        }
+    write_json(state_path, state)
+
+    resumed = build_companion(
+        BuildOptions(paper_id=bundle.paper_id, project_dir=project),
+        source_loader=lambda *args, **kwargs: bundle,
+        llm=lambda *_args, **_kwargs: pytest.fail("model called"),
+        compiler=lambda *_args: pytest.fail("compiler called"),
+        pdf_validator=lambda _path: pytest.fail("validator called"),
+    )
+
+    assert resumed["ok"], resumed
+    assert resumed["meta"]["resumed"] is True
+    assert resumed["data"]["output_pdf_sha256"] == sha256_file(pdf)
+
+
 def test_complete_resume_requires_matching_output_hashes(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     fake = FakeLLM()
@@ -9355,9 +9610,9 @@ def test_complete_resume_requires_matching_output_hashes(tmp_path: Path) -> None
         compiler=compiler,
         pdf_validator=lambda path: {"bytes": path.stat().st_size},
     )
-    assert second["ok"]
-    assert second["meta"]["resumed"] is False
-    assert compile_count == 4
+    assert second["ok"], second
+    assert second["meta"]["resumed"] is True
+    assert compile_count == 3
 
 
 def test_pdf_failure_preserves_reviewed_content_before_typesetting(
@@ -9403,6 +9658,8 @@ def test_pdf_failure_preserves_reviewed_content_before_typesetting(
 def test_final_pdf_partial_replace_failure_preserves_published_revision(
     tmp_path: Path, monkeypatch,
 ) -> None:
+    import arc_companion.render as render_module
+
     bundle = _bundle(tmp_path)
     project = tmp_path / "immutable-final-pdf"
     options = BuildOptions(paper_id=bundle.paper_id, project_dir=project)
@@ -9417,7 +9674,7 @@ def test_final_pdf_partial_replace_failure_preserves_published_revision(
     old_pdf = Path(old_state["published"]["pdf"]["output_pdf"])
     old_bytes = old_pdf.read_bytes()
 
-    real_replace = pipeline_module._publish_artifact_replace
+    real_replace = render_module._publish_replace
     final_replacements = 0
 
     def fail_second_final_replace(source: Path, target: Path) -> None:
@@ -9429,7 +9686,7 @@ def test_final_pdf_partial_replace_failure_preserves_published_revision(
         real_replace(source, target)
 
     monkeypatch.setattr(
-        pipeline_module, "_publish_artifact_replace", fail_second_final_replace,
+        render_module, "_publish_replace", fail_second_final_replace,
     )
     rerender_state = dict(old_state)
     rerender_state["final_render_version"] = "stale-render-recipe"

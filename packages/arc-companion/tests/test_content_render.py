@@ -23,6 +23,12 @@ from arc_companion.source_credit import (
 )
 from arc_companion.io import read_json, sha256_file, sha256_json, write_json
 from arc_companion.pipeline import validate_project
+from arc_companion.pdf import (
+    PDF_RENDER_VERSION,
+    PDF_VALIDATOR_VERSION,
+    build_pdf_validation_receipt,
+    pdf_render_recipe_sha256,
+)
 from arc_companion.render import render_content
 from arc_companion.run_lock import ProjectBuildLock
 
@@ -847,10 +853,34 @@ def test_validate_uses_published_last_good_while_active_run_failed(
             "authors": 0, "affiliations": 0, "profiles": 0,
         },
     }
-    write_json(paths["validation_path"], {
-        "ok": True,
-        "source_credit_pdf": source_credit_pdf,
-    })
+    write_json(
+        paths["validation_path"],
+        build_pdf_validation_receipt(
+                content_sha256=digest,
+                pdf_sha256=sha256_file(paths["output_pdf"]),
+                tex_sha256=sha256_file(paths["output_tex"]),
+                source_manifest_sha256=sha256_file(
+                    paths["source_manifest_path"]
+                ),
+                pdf_report={
+                    "validator": PDF_VALIDATOR_VERSION,
+                    "result": "success",
+                    "pages": 1,
+                    "pages_checked": 1,
+                    "dpi": 144,
+                    "pdf_bytes": paths["output_pdf"].stat().st_size,
+                    "text_bytes": 1,
+                    "raster_bytes": 1,
+                    "encrypted": False,
+                    "embedded_font_count": 2,
+                    "font_roles": {
+                        "sans": ["Noto Sans"],
+                        "serif": ["Latin Modern"],
+                    },
+                },
+                source_credit_pdf=source_credit_pdf,
+        ),
+    )
     published_pdf = {
         key: str(path) for key, path in paths.items()
     }
@@ -858,7 +888,18 @@ def test_validate_uses_published_last_good_while_active_run_failed(
         key.replace("path", "sha256") if key.endswith("_path") else f"{key}_sha256": sha256_file(path)
         for key, path in paths.items()
     })
-    published_pdf["render_version"] = pipeline_module.FINAL_RENDER_VERSION
+    published_pdf.update({
+        "content_sha256": digest,
+        "render_version": PDF_RENDER_VERSION,
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": PDF_VALIDATOR_VERSION,
+        "source_credit_sha256": source_credit_pdf[
+            "canonical_sha256"
+        ],
+        "source_credit_observation_sha256": source_credit_pdf[
+            "visible_projection_sha256"
+        ],
+    })
     # Correct the two output keys whose hash names append rather than replace.
     published_pdf["output_tex_sha256"] = sha256_file(paths["output_tex"])
     published_pdf["output_pdf_sha256"] = sha256_file(paths["output_pdf"])
@@ -912,7 +953,7 @@ def test_validate_uses_published_last_good_while_active_run_failed(
         pdf_source_credit_validator=lambda *_args: source_credit_pdf,
     )
     assert rejected["ok"] is False
-    assert "render version is stale" in rejected["error"]["message"]
+    assert "render_version_mismatch" in rejected["error"]["message"]
 
     missing_receipt = read_json(project / "state.json")
     missing_receipt["published"]["pdf"]["render_version"] = (
@@ -929,4 +970,4 @@ def test_validate_uses_published_last_good_while_active_run_failed(
         pdf_source_credit_validator=lambda *_args: source_credit_pdf,
     )
     assert rejected["ok"] is False
-    assert "no source_credit_pdf observation" in rejected["error"]["message"]
+    assert "legacy_receipt" in rejected["error"]["message"]

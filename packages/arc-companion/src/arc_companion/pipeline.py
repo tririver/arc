@@ -139,9 +139,17 @@ from .latex import (
     validate_tex_fidelity,
 )
 from .pdf import (
+    PDF_RENDER_VERSION as _PDF_RENDER_VERSION,
+    PDF_VALIDATOR_VERSION,
+    allowlisted_source_credit_pdf,
+    build_pdf_rejected_attempt,
+    build_pdf_validation_receipt,
     compile_latex,
+    find_adoptable_pdf_revision,
     managed_run_root_pdf_path,
+    match_validated_pdf_revision,
     normalize_run_root_pdf_state,
+    pdf_render_recipe_sha256,
     publish_run_root_pdf,
     validate_pdf,
 )
@@ -353,7 +361,7 @@ def _review_recipe_access(options: "BuildOptions") -> dict[str, Any]:
             "session_policy": "stateless",
         },
     }
-FINAL_RENDER_VERSION = "arc.companion.final-render.v12"
+FINAL_RENDER_VERSION = _PDF_RENDER_VERSION
 READER_FINAL_CHECKPOINT_VERSION = "arc.companion.reader-final.v4"
 CONTEXT_SELECTION_VERSION = "arc.companion.context-selection.v2"
 CONTEXT_SEGMENT_CHARS_PER_SOURCE = 3_000
@@ -782,6 +790,30 @@ def _build_companion_unlocked(
     previous_build_instance_id = str(
         previous_state.get("build_instance_id") or ""
     ).strip()
+    completion_probe = (
+        not options.force
+        and not options.regenerate_lanes
+        and not options.regenerate_segments
+        and previous_state.get("status")
+        in {"complete", "typesetting", "failed"}
+        and (
+            previous_state.get("status") == "complete"
+            or bool(
+                (
+                    (previous_state.get("published") or {}).get(
+                        "content_sha256"
+                    )
+                    if isinstance(
+                        previous_state.get("published"), Mapping
+                    )
+                    else None
+                )
+                or previous_state.get("content_sha256")
+            )
+        )
+        and previous_state.get("build_request_sha256")
+        == build_request_sha256
+    )
     reusable_build_instance_id = (
         previous_build_instance_id
         if (
@@ -795,20 +827,23 @@ def _build_companion_unlocked(
     diagnostics: tuple[dict[str, str], ...] = ()
     fingerprint: str | None = None
     checkpoint_dir: Path | None = None
-    _state(
-        state_path,
-        status="loading_source",
-        paper_id=options.paper_id,
-        source_language=options.source_language,
-        translation_mode="skipped" if options.skip_translation else "enabled",
-        notice=notice,
-        diagnostics=[],
-        pending_build_request_sha256=build_request_sha256,
-        translation_reference_manifest_path=None,
-        translation_reference_manifest_sha256=None,
-        translation_reference_source_id=None,
-        translation_reference_source_hash=None,
-    )
+    if not completion_probe:
+        _state(
+            state_path,
+            status="loading_source",
+            paper_id=options.paper_id,
+            source_language=options.source_language,
+            translation_mode=(
+                "skipped" if options.skip_translation else "enabled"
+            ),
+            notice=notice,
+            diagnostics=[],
+            pending_build_request_sha256=build_request_sha256,
+            translation_reference_manifest_path=None,
+            translation_reference_manifest_sha256=None,
+            translation_reference_source_id=None,
+            translation_reference_source_hash=None,
+        )
 
     try:
         bundle = source_loader(
@@ -895,45 +930,46 @@ def _build_companion_unlocked(
             )
             else uuid.uuid4().hex
         )
-        _state(
-            state_path,
-            build_instance_id=build_instance_id,
-            build_request_sha256=build_request_sha256,
-            credit_neutral_build_request_sha256=(
-                credit_neutral_build_request_sha256
-            ),
-            build_source_fingerprint=bootstrap_fingerprint,
-            source_credit_neutral_source_sha256=(
-                _source_credit_neutral_source_identity(bundle)
-            ),
-            translation_reference_manifest_path=(
-                str(
-                    translation_reference_bundle.manifest_path.relative_to(
-                        project_dir
+        if not completion_probe:
+            _state(
+                state_path,
+                build_instance_id=build_instance_id,
+                build_request_sha256=build_request_sha256,
+                credit_neutral_build_request_sha256=(
+                    credit_neutral_build_request_sha256
+                ),
+                build_source_fingerprint=bootstrap_fingerprint,
+                source_credit_neutral_source_sha256=(
+                    _source_credit_neutral_source_identity(bundle)
+                ),
+                translation_reference_manifest_path=(
+                    str(
+                        translation_reference_bundle.manifest_path.relative_to(
+                            project_dir
+                        )
                     )
-                )
-                if translation_reference_bundle is not None else None
-            ),
-            translation_reference_manifest_sha256=(
-                translation_reference_manifest_sha256
-            ),
-            translation_reference_source_id=(
-                str(
-                    translation_reference_bundle.manifest["reference"][
-                        "canonical_id"
-                    ]
-                )
-                if translation_reference_bundle is not None else None
-            ),
-            translation_reference_source_hash=(
-                str(
-                    translation_reference_bundle.manifest["reference"][
-                        "source_hash"
-                    ]
-                )
-                if translation_reference_bundle is not None else None
-            ),
-        )
+                    if translation_reference_bundle is not None else None
+                ),
+                translation_reference_manifest_sha256=(
+                    translation_reference_manifest_sha256
+                ),
+                translation_reference_source_id=(
+                    str(
+                        translation_reference_bundle.manifest["reference"][
+                            "canonical_id"
+                        ]
+                    )
+                    if translation_reference_bundle is not None else None
+                ),
+                translation_reference_source_hash=(
+                    str(
+                        translation_reference_bundle.manifest["reference"][
+                            "source_hash"
+                        ]
+                    )
+                    if translation_reference_bundle is not None else None
+                ),
+            )
         fingerprint = bootstrap_fingerprint
         checkpoint_dir = (
             project_dir / ".arc-companion" / "checkpoints" / fingerprint
@@ -1081,37 +1117,56 @@ def _build_companion_unlocked(
                 recovery_options=_recovery_options(options),
             )
 
-        intent_guidance = build_intent_guidance(
-            options.user_intent,
-            source_language=str(options.source_language or "und"),
-            target_language=options.annotation_language,
-            document_type=(
-                options.document_kind
-                if options.document_kind != "auto"
-                else str(
-                    (bundle.parsed.get("structure") or {}).get("document_kind")
-                    or "article"
-                )
-            ),
-            context_paper_ids=options.context_paper_ids,
-            project_dir=project_dir,
-            call_model=lambda prompt, schema, artifact_dir, call_label, recovery_descriptor=None: _llm_call(
-                llm, prompt, schema, options=options, artifact_dir=artifact_dir,
-                call_label=call_label, model_tier=INTENT_GUIDANCE_TIER,
-                force_offline=True, disable_paper_cli=True,
-                recovery_descriptor=recovery_descriptor,
-                cancel_check=cancel_check,
-            ),
-            accept_recovery=_accept_registered_pipeline_control,
-            register_recovery_root=register_bootstrap_recovery_root,
-        )
-        intent_guidance_identity = _intent_guidance_identity(intent_guidance)
+        def load_current_intent_guidance() -> dict[str, Any] | None:
+            return build_intent_guidance(
+                options.user_intent,
+                source_language=str(options.source_language or "und"),
+                target_language=options.annotation_language,
+                document_type=(
+                    options.document_kind
+                    if options.document_kind != "auto"
+                    else str(
+                        (bundle.parsed.get("structure") or {}).get(
+                            "document_kind"
+                        )
+                        or "article"
+                    )
+                ),
+                context_paper_ids=options.context_paper_ids,
+                project_dir=project_dir,
+                call_model=lambda prompt, schema, artifact_dir, call_label, recovery_descriptor=None: _llm_call(
+                    llm, prompt, schema, options=options,
+                    artifact_dir=artifact_dir,
+                    call_label=call_label,
+                    model_tier=INTENT_GUIDANCE_TIER,
+                    force_offline=True, disable_paper_cli=True,
+                    recovery_descriptor=recovery_descriptor,
+                    cancel_check=cancel_check,
+                ),
+                accept_recovery=_accept_registered_pipeline_control,
+                register_recovery_root=register_bootstrap_recovery_root,
+            )
+
+        if completion_probe:
+            intent_guidance = None
+            intent_guidance_identity = previous_state.get(
+                "intent_guidance_identity"
+            )
+        else:
+            intent_guidance = load_current_intent_guidance()
+            intent_guidance_identity = _intent_guidance_identity(
+                intent_guidance
+            )
         # Legacy context papers retain their prior bounded-body behavior only
         # when no user intent was supplied. Intent-guided runs expose metadata
         # and compact TOCs to the guidance call, then read exact sections on demand.
         context_evidence = (
             load_context_evidence(options.context_paper_ids)
-            if options.context_paper_ids and intent_guidance is None else []
+            if (
+                options.context_paper_ids
+                and intent_guidance_identity is None
+            )
+            else []
         )
         evidence = _evidence(bundle, context_evidence=context_evidence)
         domain_context = load_domain_context(
@@ -1137,10 +1192,11 @@ def _build_companion_unlocked(
         source_credit = _load_or_store_source_credit(
             checkpoint_dir, source_credit,
         )
-        _state(
-            state_path,
-            source_credit_sha256=source_credit["canonical_sha256"],
-        )
+        if not completion_probe:
+            _state(
+                state_path,
+                source_credit_sha256=source_credit["canonical_sha256"],
+            )
         previous_checkpoint = Path(str(previous_state.get("checkpoint_dir") or ""))
         if (
             not options.skip_translation
@@ -1156,6 +1212,42 @@ def _build_companion_unlocked(
                     # reuse, so carrying the file across generation fingerprints
                     # cannot make a stale glossary authoritative.
                     shutil.copy2(source, target)
+        if (
+            completion_probe
+            and previous_state.get("status") != "complete"
+            and previous_state.get("fingerprint") == fingerprint
+        ):
+            prior_published = previous_state.get("published")
+            prior_published = (
+                prior_published
+                if isinstance(prior_published, Mapping) else {}
+            )
+            prior_content_sha256 = str(
+                prior_published.get("content_sha256")
+                or previous_state.get("content_sha256")
+                or ""
+            )
+            adopted = find_adoptable_pdf_revision(
+                project_dir,
+                content_sha256=prior_content_sha256,
+            )
+            if adopted.reusable:
+                previous_state = _state(
+                    state_path,
+                    status="complete",
+                    **dict(adopted.revision or {}),
+                    final_render_version=FINAL_RENDER_VERSION,
+                    chapter_projection_version=(
+                        CHAPTER_PROJECTION_VERSION
+                    ),
+                    augmentation_projection_version=(
+                        AUGMENTATION_PROJECTION_VERSION
+                    ),
+                    chapter_guide_version=CHAPTER_GUIDE_VERSION,
+                    reader_final_checkpoint_version=(
+                        READER_FINAL_CHECKPOINT_VERSION
+                    ),
+                )
         if (
             not options.force
             and not options.regenerate_lanes
@@ -1176,6 +1268,95 @@ def _build_companion_unlocked(
                 or _first_wave_preview_outputs_match(previous_state)
             )
         ):
+            published_state = previous_state.get("published")
+            published_state = (
+                published_state
+                if isinstance(published_state, Mapping) else {}
+            )
+            content_digest = str(
+                published_state.get("content_sha256")
+                or previous_state.get("content_sha256")
+                or ""
+            )
+            pdf_match = match_validated_pdf_revision(
+                project_dir,
+                previous_state,
+                content_sha256=content_digest,
+            )
+            if not pdf_match.reusable:
+                adopted_pdf = find_adoptable_pdf_revision(
+                    project_dir,
+                    content_sha256=content_digest,
+                )
+                if adopted_pdf.reusable:
+                    pdf_match = adopted_pdf
+                    adopted_revision = dict(
+                        adopted_pdf.revision or {}
+                    )
+                    previous_state = _state(
+                        state_path,
+                        **adopted_revision,
+                        final_render_version=FINAL_RENDER_VERSION,
+                    )
+            content_for_repair: dict[str, Any] | None = None
+            if not pdf_match.reusable:
+                try:
+                    content_envelope = load_reader_content(
+                        project_dir, content_digest,
+                    )
+                except Exception as exc:
+                    return err(
+                        "content_bundle_invalid",
+                        str(exc),
+                        provider_calls=0,
+                        controller_calls=0,
+                    )
+                from .render import render_pdf_content_unlocked
+
+                content_for_repair = dict(content_envelope["content"])
+                repaired_pdf = render_pdf_content_unlocked(
+                    project_dir,
+                    state=dict(previous_state),
+                    content=content_for_repair,
+                    content_sha256=content_digest,
+                    compiler=compiler,
+                    pdf_validator=pdf_validator,
+                )
+                previous_state = _state(
+                    state_path,
+                    output_tex=repaired_pdf["output_tex"],
+                    output_tex_sha256=repaired_pdf[
+                        "output_tex_sha256"
+                    ],
+                    output_pdf=repaired_pdf["output_pdf"],
+                    output_pdf_sha256=repaired_pdf[
+                        "output_pdf_sha256"
+                    ],
+                    source_manifest_path=repaired_pdf[
+                        "source_manifest_path"
+                    ],
+                    source_manifest_sha256=repaired_pdf[
+                        "source_manifest_sha256"
+                    ],
+                    validation_path=repaired_pdf["validation_path"],
+                    validation_sha256=repaired_pdf[
+                        "validation_sha256"
+                    ],
+                    final_render_version=FINAL_RENDER_VERSION,
+                    render_version=repaired_pdf["render_version"],
+                    render_recipe_sha256=repaired_pdf[
+                        "render_recipe_sha256"
+                    ],
+                    validator_version=repaired_pdf[
+                        "validator_version"
+                    ],
+                    source_credit_sha256=repaired_pdf[
+                        "source_credit_sha256"
+                    ],
+                    source_credit_observation_sha256=repaired_pdf[
+                        "source_credit_observation_sha256"
+                    ],
+                )
             plan_path = checkpoint_dir / "reuse-plan.json"
             if plan_path.is_file():
                 plan = read_json(plan_path)
@@ -1260,19 +1441,77 @@ def _build_companion_unlocked(
                 plan["estimated_provider_calls"] = 0
                 write_json(plan_path, plan)
             resumed_state = {**previous_state, "diagnostics": list(diagnostics)}
+            before_delivery = normalize_run_root_pdf_state(previous_state)
+            before_published = before_delivery.get("published")
+            before_pdf = (
+                before_published.get("pdf")
+                if isinstance(before_published, Mapping) else None
+            )
+            before_pdf = (
+                before_pdf if isinstance(before_pdf, Mapping)
+                else before_delivery
+            )
+            delivery_was_valid = _run_root_pdf_output_matches(
+                previous_state, project_dir,
+            )
             run_pdf = publish_run_root_pdf(
                 Path(str(previous_state["output_pdf"])), project_dir,
                 managed_path=managed_run_root_pdf_path(previous_state),
+                expected_sha256=str(
+                    previous_state["output_pdf_sha256"]
+                ),
             )
             resumed_state.update(run_pdf)
+            delivery_unchanged = all(
+                before_pdf.get(key) == value
+                for key, value in run_pdf.items()
+            ) and delivery_was_valid
+            web_repaired = False
             if not _web_outputs_match(resumed_state):
                 # The reviewed reader checkpoint is authoritative.  Rebuilding a
                 # missing web bundle must never cause completed model work to run.
+                if content_for_repair is None:
+                    try:
+                        content_for_repair = dict(
+                            load_reader_content(
+                                project_dir, content_digest,
+                            )["content"]
+                        )
+                    except Exception as exc:
+                        return err(
+                            "content_bundle_invalid",
+                            str(exc),
+                            provider_calls=0,
+                            controller_calls=0,
+                        )
                 published = _publish_reader_update(
-                    project_dir, state_path, threading.RLock(), strict=True,
+                    project_dir,
+                    state_path,
+                    threading.RLock(),
+                    final_overrides={
+                        "status": "complete",
+                        **content_for_repair,
+                    },
+                    strict=True,
                 )
                 if published is not None:
                     resumed_state = {**resumed_state, **published}
+                    web_repaired = True
+            if (
+                pdf_match.reusable
+                and delivery_unchanged
+                and not web_repaired
+                and previous_state.get("diagnostics")
+                == list(diagnostics)
+                and previous_state.get("source_credit_sha256")
+                == source_credit["canonical_sha256"]
+            ):
+                return ok(
+                    previous_state,
+                    resumed=True,
+                    notice=notice,
+                    diagnostics=list(diagnostics),
+                )
             resumed_state = _state(state_path, **resumed_state)
             return ok(
                 resumed_state,
@@ -1281,6 +1520,26 @@ def _build_companion_unlocked(
                 diagnostics=list(diagnostics),
             )
 
+        if completion_probe:
+            intent_guidance = load_current_intent_guidance()
+            intent_guidance_identity = _intent_guidance_identity(
+                intent_guidance
+            )
+            _state(
+                state_path,
+                build_instance_id=build_instance_id,
+                build_request_sha256=build_request_sha256,
+                credit_neutral_build_request_sha256=(
+                    credit_neutral_build_request_sha256
+                ),
+                build_source_fingerprint=bootstrap_fingerprint,
+                source_credit_neutral_source_sha256=(
+                    _source_credit_neutral_source_identity(bundle)
+                ),
+                source_credit_sha256=source_credit[
+                    "canonical_sha256"
+                ],
+            )
         write_json(checkpoint_dir / "document.json", bundle.parsed)
         _state(
             state_path,
@@ -1557,6 +1816,26 @@ def _build_companion_unlocked(
             compiler=compiler,
             pdf_validator=pdf_validator,
             augmentation_scope="substantive",
+            content_sha256=sha256_json({
+                "scope": "first-round-preview",
+                "document": _first_wave_preview_document(
+                    bundle.document, first_wave,
+                ),
+                "segments": first_wave,
+                "annotations": raw_annotations,
+                "translations": (
+                    None if options.skip_translation else translations
+                ),
+                "language": options.annotation_language,
+                "source_language": options.source_language,
+                "source_credit": source_credit,
+                "evidence": evidence,
+                "glossary": glossary,
+                "metadata": bundle.metadata,
+                "title_translations": title_translations,
+                "augmentation_scope": "substantive",
+            }),
+            preview=True,
         )
         preview_state = _state(
             state_path,
@@ -1795,6 +2074,7 @@ def _build_companion_unlocked(
             compiler=compiler,
             pdf_validator=pdf_validator,
             augmentation_scope="substantive",
+            content_sha256=content_object["content_sha256"],
         )
         tex_path = Path(final_artifact["tex_path"])
         pdf_path = Path(final_artifact["pdf_path"])
@@ -1827,6 +2107,17 @@ def _build_companion_unlocked(
             source_manifest_path=str(manifest_path),
             validation_path=str(validation_path),
             final_render_version=FINAL_RENDER_VERSION,
+            render_version=final_artifact["render_version"],
+            render_recipe_sha256=final_artifact[
+                "render_recipe_sha256"
+            ],
+            validator_version=final_artifact["validator_version"],
+            source_credit_sha256=final_artifact[
+                "source_credit_sha256"
+            ],
+            source_credit_observation_sha256=final_artifact[
+                "source_credit_observation_sha256"
+            ],
             chapter_projection_version=CHAPTER_PROJECTION_VERSION,
             augmentation_projection_version=AUGMENTATION_PROJECTION_VERSION,
             chapter_guide_version=CHAPTER_GUIDE_VERSION,
@@ -1838,6 +2129,7 @@ def _build_companion_unlocked(
         run_pdf = publish_run_root_pdf(
             Path(final_artifact["pdf_path"]), project_dir,
             managed_path=managed_run_pdf,
+            expected_sha256=str(final_artifact["pdf_sha256"]),
         )
         final_state = _state(state_path, **run_pdf)
         return ok(
@@ -5209,6 +5501,8 @@ def _build_chaptered_companion(
             dict(translation_reference_bundle.compact_provenance)
             if translation_reference_bundle is not None else None
         ),
+        content_sha256=content_object["content_sha256"],
+        preview=options.stop_after_first_chapter,
     )
     if existing_freeze is not None:
         _verify_frozen_first_chapter_final(
@@ -5290,6 +5584,15 @@ def _build_chaptered_companion(
                    validation_path=artifact["validation_path"],
                    validation_sha256=artifact["validation_sha256"],
                    final_render_version=FINAL_RENDER_VERSION,
+                   render_version=artifact["render_version"],
+                   render_recipe_sha256=artifact["render_recipe_sha256"],
+                   validator_version=artifact["validator_version"],
+                   source_credit_sha256=artifact[
+                       "source_credit_sha256"
+                   ],
+                   source_credit_observation_sha256=artifact[
+                       "source_credit_observation_sha256"
+                   ],
                    chapter_projection_version=CHAPTER_PROJECTION_VERSION,
                    augmentation_projection_version=AUGMENTATION_PROJECTION_VERSION,
                    chapter_guide_version=CHAPTER_GUIDE_VERSION,
@@ -5301,6 +5604,7 @@ def _build_chaptered_companion(
         run_pdf = publish_run_root_pdf(
             Path(artifact["pdf_path"]), options.project_dir.resolve(),
             managed_path=managed_run_pdf,
+            expected_sha256=str(artifact["pdf_sha256"]),
         )
         final = _state(state_path, **run_pdf)
     progress.safe_boundary(
@@ -9640,47 +9944,55 @@ def _publish_pdf_artifact(
     source_language: str | None = None,
     title_translations: dict[str, Any] | list[dict[str, Any]] | None = None,
     translation_reference: Mapping[str, Any] | None = None,
+    content_sha256: str,
+    preview: bool = False,
 ) -> dict[str, Any]:
     """Render, validate, and atomically publish one preview or final PDF artifact."""
-    # Final builds never overwrite a path referenced by the published state.
-    # A new revision directory makes every target immutable; the later state
-    # write is the sole publication commit. Preview paths remain stable because
-    # they are not last-good deliverables and existing CLI/tests expose them.
-    artifact_dir = output_dir
-    if manifest_name == "source-manifest.json":
-        artifact_dir = (
-            output_dir / ".arc-companion" / "renders" / "pdf"
-            / f"{safe_name(stem)}-{uuid.uuid4().hex[:12]}"
+    # Every final or preview render gets an immutable revision directory.
+    # A failed later preview therefore cannot delete or partially overwrite
+    # the last successful preview referenced by state.
+    artifact_dir = (
+        output_dir / ".arc-companion" / "renders" / "pdf"
+        / f"{safe_name(stem)}-{uuid.uuid4().hex[:12]}"
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        evidence_by_segment = _reader_evidence_by_segment(
+            segments,
+            document=document,
+            evidence=evidence or {},
+            annotations=annotations,
         )
-        artifact_dir.mkdir(parents=True, exist_ok=False)
-    evidence_by_segment = _reader_evidence_by_segment(
-        segments,
-        document=document,
-        evidence=evidence or {},
-        annotations=annotations,
-    )
-    tex, source_manifest = render_companion_tex(
-        document,
-        segments,
-        annotations,
-        output_dir=artifact_dir,
-        language=language,
-        metadata=metadata,
-        translations=translations,
-        glossary=glossary,
-        evidence_by_segment=evidence_by_segment,
-        augmentation_scope=augmentation_scope,
-        chapters=chapters,
-        chapter_guides=chapter_guides,
-        source_language=source_language,
-        title_translations=title_translations,
-        source_credit=source_credit,
-        translation_reference=translation_reference,
-        project_root=output_dir,
-    )
-    fidelity_errors = validate_tex_fidelity(tex, document, source_manifest)
-    if fidelity_errors:
-        raise LatexError("source fidelity validation failed: " + "; ".join(fidelity_errors))
+        tex, source_manifest = render_companion_tex(
+            document,
+            segments,
+            annotations,
+            output_dir=artifact_dir,
+            language=language,
+            metadata=metadata,
+            translations=translations,
+            glossary=glossary,
+            evidence_by_segment=evidence_by_segment,
+            augmentation_scope=augmentation_scope,
+            chapters=chapters,
+            chapter_guides=chapter_guides,
+            source_language=source_language,
+            title_translations=title_translations,
+            source_credit=source_credit,
+            translation_reference=translation_reference,
+            project_root=output_dir,
+        )
+        fidelity_errors = validate_tex_fidelity(
+            tex, document, source_manifest,
+        )
+        if fidelity_errors:
+            raise LatexError(
+                "source fidelity validation failed: "
+                + "; ".join(fidelity_errors)
+            )
+    except BaseException:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+        raise
 
     tex_path = artifact_dir / f"{stem}.tex"
     pdf_path = artifact_dir / f"{stem}.pdf"
@@ -9695,6 +10007,7 @@ def _publish_pdf_artifact(
     try:
         write_text(building_tex, tex)
         compiler(building_tex, building_pdf)
+        write_json(building_manifest, source_manifest)
         pdf_report = pdf_validator(building_pdf)
         pdf_source_credit = (
             validate_pdf_source_credit_text(
@@ -9727,27 +10040,90 @@ def _publish_pdf_artifact(
                 "validation": "delegated-test-validator",
             }
         )
-        write_json(building_manifest, source_manifest)
-        write_json(
-            building_validation,
-            {
-                "ok": True,
-                "pdf": pdf_report,
-                "source_credit_pdf": pdf_source_credit,
-                "fidelity_errors": [],
-                "warnings": list(source_manifest.get("render_warnings") or []),
-            },
+        expected_hashes = {
+            "tex_sha256": sha256_file(building_tex),
+            "pdf_sha256": sha256_file(building_pdf),
+            "manifest_sha256": sha256_file(building_manifest),
+        }
+        receipt = build_pdf_validation_receipt(
+            content_sha256=content_sha256,
+            pdf_sha256=expected_hashes["pdf_sha256"],
+            tex_sha256=expected_hashes["tex_sha256"],
+            source_manifest_sha256=expected_hashes[
+                "manifest_sha256"
+            ],
+            pdf_report=pdf_report,
+            source_credit_pdf=pdf_source_credit,
+            warnings=list(source_manifest.get("render_warnings") or []),
+            preview=preview,
+            validator_version=(
+                PDF_VALIDATOR_VERSION
+                if pdf_validator is validate_pdf
+                else "custom-validator"
+            ),
+            reusable=(not preview and pdf_validator is validate_pdf),
+        )
+        write_json(building_validation, receipt)
+        expected_hashes["validation_sha256"] = sha256_file(
+            building_validation
         )
         _publish_artifact_replace(building_tex, tex_path)
         _publish_artifact_replace(building_pdf, pdf_path)
         _publish_artifact_replace(building_manifest, manifest_path)
         _publish_artifact_replace(building_validation, validation_path)
-    except BaseException:
-        for path in staging_paths:
-            path.unlink(missing_ok=True)
+        if {
+            "tex_sha256": sha256_file(tex_path),
+            "pdf_sha256": sha256_file(pdf_path),
+            "manifest_sha256": sha256_file(manifest_path),
+            "validation_sha256": sha256_file(validation_path),
+        } != expected_hashes:
+            raise LatexError(
+                "immutable PDF revision changed during publication"
+            )
+    except BaseException as exc:
+        try:
+            attempt = build_pdf_rejected_attempt(
+                exc,
+                content_sha256=content_sha256,
+                pdf_sha256=(
+                    sha256_file(building_pdf)
+                    if building_pdf.is_file() else None
+                ),
+                tex_sha256=(
+                    sha256_file(building_tex)
+                    if building_tex.is_file() else None
+                ),
+                source_manifest_sha256=(
+                    sha256_file(building_manifest)
+                    if building_manifest.is_file() else None
+                ),
+                preview=preview,
+            )
+            try:
+                _write_pdf_attempt_diagnostic(output_dir, attempt)
+            except OSError:
+                pass
+        finally:
+            for path in (
+                *staging_paths,
+                tex_path,
+                pdf_path,
+                manifest_path,
+                validation_path,
+            ):
+                path.unlink(missing_ok=True)
+            shutil.rmtree(artifact_dir, ignore_errors=True)
         raise
 
     return {
+        "content_sha256": content_sha256,
+        "render_version": FINAL_RENDER_VERSION,
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": (
+            PDF_VALIDATOR_VERSION
+            if pdf_validator is validate_pdf
+            else "custom-validator"
+        ),
         "tex_path": str(tex_path),
         "pdf_path": str(pdf_path),
         "manifest_path": str(manifest_path),
@@ -9764,6 +10140,18 @@ def _publish_pdf_artifact(
             "visible_projection_sha256"
         ],
     }
+
+
+def _write_pdf_attempt_diagnostic(
+    project_dir: Path,
+    attempt: Mapping[str, object],
+) -> Path:
+    directory = project_dir / ".arc-companion" / "pdf-validation-attempts"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{sha256_json(dict(attempt))}.json"
+    if not path.exists():
+        write_json(path, dict(attempt))
+    return path
 
 
 def _publish_artifact_replace(source: Path, target: Path) -> None:
@@ -9835,21 +10223,21 @@ def validate_project(
     if not tex.is_file() or not manifest_path.is_file():
         return err("companion_validation_failed", "TeX or source manifest is missing")
     try:
-        render_version = (
-            pdf_value.get("final_render_version")
-            or pdf_value.get("render_version")
-            or effective.get("final_render_version")
+        content_sha256 = str(published.get("content_sha256") or "")
+        reuse = match_validated_pdf_revision(
+            project_dir.resolve(),
+            state,
+            content_sha256=content_sha256,
         )
-        if render_version != FINAL_RENDER_VERSION:
-            raise RuntimeError("published PDF render version is stale")
-        if not _published_pdf_outputs_match(effective):
-            raise RuntimeError("completed companion outputs do not match their recorded hashes")
+        if not reuse.reusable:
+            raise RuntimeError(
+                f"published PDF revision is not reusable: {reuse.reason}"
+            )
         if not _run_root_pdf_output_matches(effective, project_dir.resolve()):
             raise RuntimeError(
                 "run-root delivery PDF is missing, outside the resolved "
                 "--project-dir, or has a hash mismatch"
             )
-        content_sha256 = str(published.get("content_sha256") or "")
         if content_sha256:
             from .content import load_reader_content
 
@@ -9877,8 +10265,10 @@ def validate_project(
         )
         if (
             not isinstance(observed_source_credit_pdf, Mapping)
-            or dict(observed_source_credit_pdf)
-            != dict(stored_source_credit_pdf)
+            or allowlisted_source_credit_pdf(
+                observed_source_credit_pdf
+            )
+            != allowlisted_source_credit_pdf(stored_source_credit_pdf)
         ):
             raise RuntimeError(
                 "searchable PDF source-credit observation differs from "
@@ -19162,8 +19552,7 @@ def _sha256_existing_file(path: Path) -> str:
 
 
 def _completion_outputs_match(state: dict[str, Any]) -> bool:
-    if state.get("final_render_version") != FINAL_RENDER_VERSION:
-        return False
+    """Match completed semantic outputs independently of the PDF revision."""
     if state.get("chapter_projection_version") != CHAPTER_PROJECTION_VERSION:
         return False
     if state.get("augmentation_projection_version") != AUGMENTATION_PROJECTION_VERSION:
@@ -19172,37 +19561,35 @@ def _completion_outputs_match(state: dict[str, Any]) -> bool:
         return False
     if state.get("reader_final_checkpoint_version") != READER_FINAL_CHECKPOINT_VERSION:
         return False
-    checks = (
-        ("output_tex", "output_tex_sha256"),
-        ("output_pdf", "output_pdf_sha256"),
-        ("source_manifest_path", "source_manifest_sha256"),
-        ("validation_path", "validation_sha256"),
-    )
-    for path_key, hash_key in checks:
-        value = state.get(path_key)
-        expected = str(state.get(hash_key) or "")
-        if not value or not expected:
-            return False
-        path = Path(str(value))
-        if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
-            return False
     return True
 
 
 def _web_outputs_match(state: dict[str, Any]) -> bool:
+    published = state.get("published")
+    published_web = (
+        published.get("web")
+        if isinstance(published, Mapping) else None
+    )
+    effective = {
+        **state,
+        **(
+            dict(published_web)
+            if isinstance(published_web, Mapping) else {}
+        ),
+    }
     try:
         from .web import WEB_RENDER_VERSION
     except ImportError:
         return False
-    if state.get("web_render_version") != WEB_RENDER_VERSION:
+    if effective.get("web_render_version") != WEB_RENDER_VERSION:
         return False
     for path_key, hash_key in (
         ("output_html", "output_html_sha256"),
         ("reader_snapshot_path", "reader_snapshot_sha256"),
         ("web_manifest_path", "web_manifest_sha256"),
     ):
-        path_value = state.get(path_key)
-        expected = str(state.get(hash_key) or "")
+        path_value = effective.get(path_key)
+        expected = str(effective.get(hash_key) or "")
         if not path_value or not expected:
             return False
         path = Path(str(path_value))
@@ -22249,10 +22636,21 @@ def _refresh_completed_source_credit_only(
         or previous_state.get("source_credit_sha256")
         or ""
     )
-    render_stale = (
-        previous_state.get("final_render_version") != FINAL_RENDER_VERSION
-        or not _web_outputs_match(dict(previous_state))
+    current_pdf = match_validated_pdf_revision(
+        options.project_dir.resolve(),
+        previous_state,
+        content_sha256=old_digest,
     )
+    if (
+        old_credit_hash == canonical["canonical_sha256"]
+        and not current_pdf.reusable
+        and previous_state.get("build_request_sha256")
+        == build_request_sha256
+    ):
+        # A generic legacy/tampered PDF upgrade belongs to the central
+        # render-only completion path, not this source-credit special case.
+        return None
+    render_stale = not _web_outputs_match(dict(previous_state))
     if old_credit_hash == canonical["canonical_sha256"] and not render_stale:
         if previous_state.get("build_request_sha256") == build_request_sha256:
             return None
@@ -22322,37 +22720,39 @@ def _refresh_completed_source_credit_only(
     else:
         final_overrides.pop("translation_reference", None)
     _write_reader_final_checkpoint(checkpoint, final_overrides)
-    stem = (
-        f"{safe_name(bundle.paper_id)}_companion_"
-        f"{safe_name(str(content['language']))}"
-    )
     try:
-        artifact = _publish_pdf_artifact(
-            document=dict(content["document"]),
-            source_credit=canonical,
-            segments=list(content["segments"]),
-            annotations=dict(content["annotations"]),
-            translations=(
-                dict(content["translations"])
-                if isinstance(content.get("translations"), Mapping) else None
-            ),
-            glossary=dict(content["glossary"]),
-            metadata=dict(content["metadata"]),
-            language=str(content["language"]),
-            source_language=str(content.get("source_language") or "und"),
-            title_translations=content.get("title_translations"),
-            output_dir=options.project_dir.resolve(),
-            stem=stem,
-            manifest_name="source-manifest.json",
-            validation_name="validation.json",
+        from .render import render_pdf_content_unlocked
+
+        rendered = render_pdf_content_unlocked(
+            options.project_dir.resolve(),
+            state=dict(previous_state),
+            content=content,
+            content_sha256=stored["content_sha256"],
             compiler=compiler,
             pdf_validator=pdf_validator,
-            evidence={},
-            augmentation_scope="substantive",
-            chapters=list(content["chapters"]),
-            chapter_guides=dict(content["chapter_guides"]),
-            translation_reference=current_reference,
         )
+        artifact = {
+            "tex_path": rendered["output_tex"],
+            "pdf_path": rendered["output_pdf"],
+            "manifest_path": rendered["source_manifest_path"],
+            "validation_path": rendered["validation_path"],
+            "tex_sha256": rendered["output_tex_sha256"],
+            "pdf_sha256": rendered["output_pdf_sha256"],
+            "manifest_sha256": rendered[
+                "source_manifest_sha256"
+            ],
+            "validation_sha256": rendered["validation_sha256"],
+            **{
+                key: rendered[key]
+                for key in (
+                    "render_version",
+                    "render_recipe_sha256",
+                    "validator_version",
+                    "source_credit_sha256",
+                    "source_credit_observation_sha256",
+                )
+            },
+        }
         web_state = _publish_reader_update(
             options.project_dir.resolve(),
             state_path,
@@ -22402,6 +22802,18 @@ def _refresh_completed_source_credit_only(
         "validation_path": artifact["validation_path"],
         "validation_sha256": artifact["validation_sha256"],
         "final_render_version": FINAL_RENDER_VERSION,
+        "render_version": artifact.get(
+            "render_version", FINAL_RENDER_VERSION,
+        ),
+        "render_recipe_sha256": artifact.get(
+            "render_recipe_sha256", pdf_render_recipe_sha256(),
+        ),
+        "validator_version": artifact.get(
+            "validator_version", "custom-validator",
+        ),
+        "source_credit_observation_sha256": artifact[
+            "source_credit_observation_sha256"
+        ],
         "reader_final_checkpoint_version": READER_FINAL_CHECKPOINT_VERSION,
         "notice": notice,
         **{
@@ -22419,6 +22831,7 @@ def _refresh_completed_source_credit_only(
         Path(str(artifact["pdf_path"])),
         options.project_dir.resolve(),
         managed_path=managed_run_root_pdf_path(dict(previous_state)),
+        expected_sha256=str(artifact["pdf_sha256"]),
     )
     final = _state(state_path, **run_pdf)
     return ok(
@@ -22723,6 +23136,9 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
                 "output_run_pdf", "output_run_pdf_sha256",
                 "source_manifest_path", "source_manifest_sha256", "validation_path",
                 "validation_sha256", "final_render_version",
+                "render_version", "render_recipe_sha256",
+                "validator_version", "source_credit_sha256",
+                "source_credit_observation_sha256",
             )
             if state.get(key) is not None
         }

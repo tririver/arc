@@ -28,9 +28,16 @@ from .latex import (
     validate_tex_fidelity,
 )
 from .pdf import (
+    PDF_RENDER_VERSION as _PDF_RENDER_VERSION,
+    PDF_VALIDATOR_VERSION,
+    build_pdf_rejected_attempt,
+    build_pdf_validation_receipt,
     compile_latex,
+    find_adoptable_pdf_revision,
     managed_run_root_pdf_path,
+    match_validated_pdf_revision,
     normalize_run_root_pdf_state,
+    pdf_render_recipe_sha256,
     publish_run_root_pdf,
     validate_pdf,
 )
@@ -40,7 +47,7 @@ from .source_credit import source_credit_visible_projection
 
 
 RENDER_MODE = "render_only"
-PDF_RENDER_VERSION = "arc.companion.final-render.v12"
+PDF_RENDER_VERSION = _PDF_RENDER_VERSION
 
 
 def render_content(
@@ -120,13 +127,97 @@ def render_content(
                 )
         phase_times: dict[str, float] = {"load_content": time.monotonic() - started}
         published: dict[str, Any] = {}
+        pdf_reused = False
         if format in {"pdf", "all"}:
             phase = time.monotonic()
-            published["pdf"] = _render_pdf(
-                root, state=state, content=content, content_sha256=digest,
-                compiler=compiler, pdf_validator=pdf_validator,
+            pdf_match = match_validated_pdf_revision(
+                root,
+                state,
+                content_sha256=digest,
             )
+            if not pdf_match.reusable:
+                adopted = find_adoptable_pdf_revision(
+                    root, content_sha256=digest,
+                )
+                if adopted.reusable:
+                    pdf_match = adopted
+            if pdf_match.reusable:
+                pdf_reused = True
+                prior_pdf = (
+                    dict((state.get("published") or {}).get("pdf") or {})
+                    if isinstance(state.get("published"), dict) else {}
+                )
+                published["pdf"] = {
+                    **prior_pdf,
+                    **dict(pdf_match.revision or {}),
+                }
+            else:
+                published["pdf"] = _render_pdf(
+                    root, state=state, content=content,
+                    content_sha256=digest,
+                    compiler=compiler, pdf_validator=pdf_validator,
+                )
             phase_times["pdf"] = time.monotonic() - phase
+            if format == "pdf" and pdf_reused:
+                delivery_was_valid = _run_root_delivery_valid(
+                    root, state,
+                )
+                delivery = publish_run_root_pdf(
+                    Path(str(published["pdf"]["output_pdf"])),
+                    root,
+                    managed_path=managed_run_root_pdf_path(state),
+                    expected_sha256=str(
+                        published["pdf"]["output_pdf_sha256"]
+                    ),
+                )
+                published["pdf"].update(delivery)
+                current_pdf = (
+                    dict((state.get("published") or {}).get("pdf") or {})
+                    if isinstance(state.get("published"), dict) else {}
+                )
+                if all(
+                    current_pdf.get(key) == value
+                    and state.get(key) == value
+                    for key, value in delivery.items()
+                ) and delivery_was_valid:
+                    phase_times["total"] = time.monotonic() - started
+                    return ok({
+                        "mode": RENDER_MODE,
+                        "format": format,
+                        "content_sha256": digest,
+                        "provider_calls": 0,
+                        "phase_times_seconds": phase_times,
+                        "published": state.get("published"),
+                        "output_pdf": published["pdf"]["output_pdf"],
+                        "output_pdf_sha256": published["pdf"][
+                            "output_pdf_sha256"
+                        ],
+                        **delivery,
+                        "pdf_reuse_status": "hit",
+                        "pdf_reuse_reason": pdf_match.reason,
+                    })
+                final_state = _publish_state(
+                    root,
+                    content_sha256=digest,
+                    outputs={"pdf": published["pdf"]},
+                    render_format=format,
+                )
+                phase_times["total"] = time.monotonic() - started
+                return ok({
+                    "mode": RENDER_MODE,
+                    "format": format,
+                    "content_sha256": digest,
+                    "provider_calls": 0,
+                    "phase_times_seconds": phase_times,
+                    "published": final_state["published"],
+                    "output_pdf": published["pdf"]["output_pdf"],
+                    "output_pdf_sha256": published["pdf"][
+                        "output_pdf_sha256"
+                    ],
+                    **delivery,
+                    "pdf_reuse_status": "hit",
+                    "pdf_reuse_reason": pdf_match.reason,
+                })
         if format in {"web", "all"}:
             phase = time.monotonic()
             from .web import publish_reader
@@ -175,6 +266,9 @@ def render_content(
                     Path(str(published["pdf"]["output_pdf"])),
                     root,
                     managed_path=managed_run_root_pdf_path(state),
+                    expected_sha256=str(
+                        published["pdf"]["output_pdf_sha256"]
+                    ),
                 )
             )
             final_state = _publish_state(
@@ -192,6 +286,9 @@ def render_content(
             "phase_times_seconds": phase_times,
             "published": final_state["published"],
         }
+        if "pdf" in published:
+            data["pdf_reuse_status"] = "hit" if pdf_reused else "miss"
+            data["pdf_reuse_reason"] = pdf_match.reason
         pdf = published.get("pdf") or {}
         web = published.get("web") or {}
         data.update({key: value for key, value in pdf.items() if key.startswith("output_")})
@@ -221,7 +318,7 @@ def render_content(
         lock.release()
 
 
-def _render_pdf(
+def render_pdf_content_unlocked(
     root: Path,
     *,
     state: dict[str, Any],
@@ -230,6 +327,7 @@ def _render_pdf(
     compiler: Callable[[Path, Path], None],
     pdf_validator: Callable[[Path], dict[str, object]],
 ) -> dict[str, Any]:
+    """Render one verified content object without acquiring project locks."""
     tex, source_manifest = render_companion_tex(
         content["document"], content["segments"], content["annotations"],
         output_dir=root, language=content["language"], metadata=content["metadata"],
@@ -268,6 +366,7 @@ def _render_pdf(
     try:
         write_text(candidate_tex, tex)
         compiler(candidate_tex, candidate_pdf)
+        write_json(candidate_manifest, source_manifest)
         report = pdf_validator(candidate_pdf)
         source_credit_pdf = (
             validate_pdf_source_credit_text(
@@ -298,44 +397,140 @@ def _render_pdf(
                 "validation": "delegated-test-validator",
             }
         )
-        write_json(candidate_manifest, source_manifest)
-        write_json(candidate_validation, {
-            "ok": True,
-            "content_sha256": content_sha256,
-            "render_version": PDF_RENDER_VERSION,
-            "pdf": report,
-            "source_credit_pdf": source_credit_pdf,
-            "fidelity_errors": [],
-            "warnings": list(source_manifest.get("render_warnings") or []),
-        })
+        expected_hashes = {
+            "output_tex_sha256": sha256_file(candidate_tex),
+            "output_pdf_sha256": sha256_file(candidate_pdf),
+            "source_manifest_sha256": sha256_file(candidate_manifest),
+        }
+        receipt = build_pdf_validation_receipt(
+            content_sha256=content_sha256,
+            pdf_sha256=expected_hashes["output_pdf_sha256"],
+            tex_sha256=expected_hashes["output_tex_sha256"],
+            source_manifest_sha256=expected_hashes[
+                "source_manifest_sha256"
+            ],
+            pdf_report=report,
+            source_credit_pdf=source_credit_pdf,
+            warnings=list(
+                source_manifest.get("render_warnings") or []
+            ),
+            validator_version=(
+                PDF_VALIDATOR_VERSION
+                if pdf_validator is validate_pdf
+                else "custom-validator"
+            ),
+            reusable=pdf_validator is validate_pdf,
+        )
+        write_json(candidate_validation, receipt)
+        expected_hashes["validation_sha256"] = sha256_file(
+            candidate_validation
+        )
         _publish_replace(candidate_tex, tex_path)
         _publish_replace(candidate_pdf, pdf_path)
         _publish_replace(candidate_manifest, manifest_path)
         _publish_replace(candidate_validation, validation_path)
-    except BaseException:
-        for path in (*candidates, tex_path, pdf_path, manifest_path, validation_path):
-            path.unlink(missing_ok=True)
+        published_hashes = {
+            "output_tex_sha256": sha256_file(tex_path),
+            "output_pdf_sha256": sha256_file(pdf_path),
+            "source_manifest_sha256": sha256_file(manifest_path),
+            "validation_sha256": sha256_file(validation_path),
+        }
+        if published_hashes != expected_hashes:
+            raise LatexError(
+                "immutable PDF revision changed during publication"
+            )
+    except BaseException as exc:
         try:
-            render_dir.rmdir()
-        except OSError:
-            pass
+            attempt = build_pdf_rejected_attempt(
+                exc,
+                content_sha256=content_sha256,
+                pdf_sha256=(
+                    sha256_file(candidate_pdf)
+                    if candidate_pdf.is_file() else None
+                ),
+                tex_sha256=(
+                    sha256_file(candidate_tex)
+                    if candidate_tex.is_file() else None
+                ),
+                source_manifest_sha256=(
+                    sha256_file(candidate_manifest)
+                    if candidate_manifest.is_file() else None
+                ),
+            )
+            try:
+                _write_pdf_attempt(root, attempt)
+            except OSError:
+                pass
+        finally:
+            for path in (
+                *candidates,
+                tex_path,
+                pdf_path,
+                manifest_path,
+                validation_path,
+            ):
+                path.unlink(missing_ok=True)
+            try:
+                render_dir.rmdir()
+            except OSError:
+                pass
         raise
     return {
         "content_sha256": content_sha256,
         "render_version": PDF_RENDER_VERSION,
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": (
+            PDF_VALIDATOR_VERSION
+            if pdf_validator is validate_pdf
+            else "custom-validator"
+        ),
         "output_tex": str(tex_path),
-        "output_tex_sha256": sha256_file(tex_path),
+        "output_tex_sha256": expected_hashes["output_tex_sha256"],
         "output_pdf": str(pdf_path),
-        "output_pdf_sha256": sha256_file(pdf_path),
+        "output_pdf_sha256": expected_hashes["output_pdf_sha256"],
         "source_manifest_path": str(manifest_path),
-        "source_manifest_sha256": sha256_file(manifest_path),
+        "source_manifest_sha256": expected_hashes[
+            "source_manifest_sha256"
+        ],
         "validation_path": str(validation_path),
-        "validation_sha256": sha256_file(validation_path),
+        "validation_sha256": expected_hashes["validation_sha256"],
         "source_credit_sha256": content["source_credit_sha256"],
         "source_credit_observation_sha256": source_credit_pdf[
             "visible_projection_sha256"
         ],
     }
+
+
+_render_pdf = render_pdf_content_unlocked
+
+
+def _run_root_delivery_valid(
+    root: Path,
+    state: dict[str, Any],
+) -> bool:
+    normalized = normalize_run_root_pdf_state(state)
+    published = normalized.get("published")
+    pdf = (
+        published.get("pdf")
+        if isinstance(published, dict) else None
+    )
+    effective = {
+        **normalized,
+        **(dict(pdf) if isinstance(pdf, dict) else {}),
+    }
+    path_value = effective.get("output_run_pdf")
+    expected = str(effective.get("output_run_pdf_sha256") or "")
+    canonical = str(effective.get("output_pdf_sha256") or "")
+    if not path_value or not expected or expected != canonical:
+        return False
+    path = Path(str(path_value))
+    return (
+        path.parent == root
+        and not path.is_symlink()
+        and path.is_file()
+        and path.stat().st_size > 0
+        and sha256_file(path) == expected
+    )
 
 
 def _state(root: Path) -> dict[str, Any]:
@@ -352,6 +547,35 @@ def _state(root: Path) -> dict[str, Any]:
 def _publish_replace(source: Path, target: Path) -> None:
     """Fault-injection seam for the immutable PDF publish sequence."""
     os.replace(source, target)
+
+
+def _allowlisted_source_credit_pdf(
+    value: Any,
+) -> dict[str, object]:
+    source = dict(value) if isinstance(value, dict) else {}
+    return {
+        key: source.get(key)
+        for key in (
+            "schema_version",
+            "canonical_sha256",
+            "visible_projection_sha256",
+            "validation",
+        )
+    }
+
+
+def _write_pdf_attempt(
+    root: Path,
+    attempt: dict[str, object],
+) -> Path:
+    directory = (
+        root / ".arc-companion" / "pdf-validation-attempts"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{sha256_json(attempt)}.json"
+    if not path.exists():
+        write_json(path, attempt)
+    return path
 
 
 def _source_credit_only_content_change(old: Any, new: Any) -> bool:

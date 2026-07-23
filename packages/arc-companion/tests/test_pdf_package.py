@@ -9,14 +9,23 @@ import zipfile
 import pytest
 
 from arc_companion import pdf as pdf_module
-from arc_companion.io import canonical_json, sha256_file, sha256_json
+from arc_companion.io import (
+    canonical_json,
+    read_json,
+    sha256_file,
+    sha256_json,
+    write_json,
+)
 from arc_companion.package import _WEB_STATE_KEYS, package_project
 from arc_companion.pdf import (
     PDFError,
+    PDF_VALIDATOR_VERSION,
+    build_pdf_validation_receipt,
     compile_latex,
     managed_run_root_pdf_path,
     normalize_run_root_pdf_state,
     publish_run_root_pdf,
+    pdf_render_recipe_sha256,
     validate_pdf,
 )
 from arc_companion.web import (
@@ -47,7 +56,9 @@ def test_publish_run_root_pdf_creates_stable_byte_identical_copy(
     source.parent.mkdir(parents=True)
     source.write_bytes(b"%PDF stable")
 
-    published = publish_run_root_pdf(source, project)
+    published = publish_run_root_pdf(
+        source, project, expected_sha256=sha256_file(source),
+    )
 
     target = project / "paper.pdf"
     assert published == {
@@ -71,7 +82,9 @@ def test_publish_run_root_pdf_resolves_exact_root_and_never_writes_parent(
     linked_root = tmp_path / "companion-link"
     linked_root.symlink_to(resolved_root, target_is_directory=True)
 
-    published = publish_run_root_pdf(source, linked_root)
+    published = publish_run_root_pdf(
+        source, linked_root, expected_sha256=sha256_file(source),
+    )
 
     target = resolved_root.resolve() / "paper.pdf"
     assert published["output_run_pdf"] == str(target)
@@ -91,10 +104,15 @@ def test_publish_run_root_pdf_refuses_unmanaged_conflict_and_repairs_managed_cop
     target.write_bytes(b"user file")
 
     with pytest.raises(PDFError, match="unmanaged run-root delivery PDF"):
-        publish_run_root_pdf(source, project)
+        publish_run_root_pdf(
+            source, project, expected_sha256=sha256_file(source),
+        )
     assert target.read_bytes() == b"user file"
 
-    published = publish_run_root_pdf(source, project, managed_path=target)
+    published = publish_run_root_pdf(
+        source, project, managed_path=target,
+        expected_sha256=sha256_file(source),
+    )
 
     assert target.read_bytes() == source.read_bytes()
     assert published["output_run_pdf_sha256"] == sha256_file(source)
@@ -110,7 +128,9 @@ def test_publish_run_root_pdf_adopts_byte_identical_unmanaged_file(
     target = project / "paper.pdf"
     target.write_bytes(source.read_bytes())
 
-    published = publish_run_root_pdf(source, project)
+    published = publish_run_root_pdf(
+        source, project, expected_sha256=sha256_file(source),
+    )
 
     assert target.read_bytes() == b"%PDF same"
     assert published["output_run_pdf"] == str(target)
@@ -130,7 +150,9 @@ def test_publish_run_root_pdf_does_not_adopt_unmanaged_symlink(
     target.symlink_to(external)
 
     with pytest.raises(PDFError, match="unmanaged run-root delivery PDF"):
-        publish_run_root_pdf(source, project)
+        publish_run_root_pdf(
+            source, project, expected_sha256=sha256_file(source),
+        )
 
     assert target.is_symlink()
     assert external.read_bytes() == b"%PDF stable"
@@ -152,7 +174,10 @@ def test_publish_run_root_pdf_replace_failure_preserves_managed_copy(
     )
 
     with pytest.raises(OSError, match="replace failed"):
-        publish_run_root_pdf(source, project, managed_path=target)
+        publish_run_root_pdf(
+            source, project, managed_path=target,
+            expected_sha256=sha256_file(source),
+        )
 
     assert target.read_bytes() == b"%PDF old"
     assert not list(project.glob("*.arc-companion-delivery-*.tmp"))
@@ -173,7 +198,9 @@ def test_publish_run_root_pdf_does_not_overwrite_racing_unmanaged_file(
 
     monkeypatch.setattr(pdf_module, "_publish_run_root_pdf_create", race_create)
     with pytest.raises(PDFError, match="unmanaged run-root delivery PDF"):
-        publish_run_root_pdf(source, project)
+        publish_run_root_pdf(
+            source, project, expected_sha256=sha256_file(source),
+        )
 
     assert target.read_bytes() == b"user race"
     assert not list(project.glob("*.arc-companion-delivery-*.tmp"))
@@ -242,11 +269,18 @@ def test_validate_pdf_checks_fonts_and_renders_every_page(tmp_path: Path, monkey
     assert report["encrypted"] is False
     assert report["embedded_font_count"] == 3
     assert report["font_roles"]["sans"] == ["NotoSansCJKSC"]
-    assert len(report["render_paths"]) == 3
+    assert report["pages_checked"] == 3
+    assert report["dpi"] == 144
+    assert report["raster_bytes"] == 9
+    assert set(report) == {
+        "validator", "result", "pages", "pages_checked", "dpi",
+        "pdf_bytes", "text_bytes", "raster_bytes", "encrypted",
+        "embedded_font_count", "font_roles",
+    }
     render_calls = [call for call in calls if Path(call[0]).name == "pdftoppm"]
     assert [call[call.index("-f") + 1] for call in render_calls] == ["1", "2", "3"]
-    assert all(Path(path).is_file() for path in report["render_paths"])
     assert all(call[call.index("-r") + 1] == "144" for call in render_calls)
+    assert not list(tmp_path.glob("*.validation*"))
 
 
 def test_validate_pdf_rejects_removed_visible_labels(tmp_path: Path, monkeypatch) -> None:
@@ -737,6 +771,102 @@ def test_package_keeps_pdf_only_compatibility_for_legacy_state(tmp_path: Path) -
     result = package_project(tmp_path)
 
     assert result["ok"] is True
+
+
+def test_package_accepts_current_v2_success_receipt(tmp_path: Path) -> None:
+    _complete_project(tmp_path)
+    state_path = tmp_path / "state.json"
+    state = read_json(state_path)
+    pdf = Path(state["output_pdf"])
+    tex = tmp_path / "deliverables" / "paper.tex"
+    manifest = tmp_path / "source-manifest.json"
+    content_sha256 = "1" * 64
+    write_json(
+        tmp_path / "validation.json",
+        build_pdf_validation_receipt(
+            content_sha256=content_sha256,
+            pdf_sha256=sha256_file(pdf),
+            tex_sha256=sha256_file(tex),
+            source_manifest_sha256=sha256_file(manifest),
+            pdf_report={
+                "validator": PDF_VALIDATOR_VERSION,
+                "result": "success",
+                "pages": 1,
+                "pages_checked": 1,
+                "dpi": 144,
+                "pdf_bytes": pdf.stat().st_size,
+                "text_bytes": 1,
+                "raster_bytes": 1,
+                "encrypted": False,
+                "embedded_font_count": 2,
+                "font_roles": {
+                    "sans": ["Noto Sans"],
+                    "serif": ["Latin Modern"],
+                },
+            },
+            source_credit_pdf={
+                "schema_version": (
+                    "arc.companion.source-credit-pdf-observation.v1"
+                ),
+                "canonical_sha256": "2" * 64,
+                "searchable_text_sha256": "3" * 64,
+                "ordered_ids": ["author:1"],
+                "visible_projection_sha256": "4" * 64,
+                "visible_counts": {
+                    "authors": 1,
+                    "affiliations": 0,
+                    "profiles": 0,
+                },
+            },
+        ),
+    )
+    state.update({
+        "schema_version": "arc.companion.state.v1",
+        "content_sha256": content_sha256,
+        "output_pdf_sha256": sha256_file(pdf),
+        "output_tex_sha256": sha256_file(tex),
+        "source_manifest_path": str(manifest),
+        "source_manifest_sha256": sha256_file(manifest),
+        "validation_path": str(tmp_path / "validation.json"),
+        "validation_sha256": sha256_file(tmp_path / "validation.json"),
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": PDF_VALIDATOR_VERSION,
+        "render_version": "arc.companion.final-render.v13",
+        "source_credit_sha256": "2" * 64,
+        "source_credit_observation_sha256": "4" * 64,
+    })
+    write_json(state_path, state)
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is True
+
+
+def test_package_rejects_legacy_receipt_for_current_render(
+    tmp_path: Path,
+) -> None:
+    _complete_project(tmp_path)
+    state = read_json(tmp_path / "state.json")
+    state["render_version"] = "arc.companion.final-render.v13"
+    write_json(tmp_path / "state.json", state)
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is False
+    assert "not successful" in result["error"]["message"]
+
+
+def test_package_rejects_legacy_receipt_for_future_render(
+    tmp_path: Path,
+) -> None:
+    _complete_project(tmp_path)
+    state = read_json(tmp_path / "state.json")
+    state["render_version"] = "arc.companion.final-render.v999"
+    write_json(tmp_path / "state.json", state)
+
+    result = package_project(tmp_path)
+
+    assert result["ok"] is False
 
 
 def test_package_uses_published_last_good_while_active_run_failed(tmp_path: Path) -> None:
