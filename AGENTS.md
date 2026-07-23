@@ -59,6 +59,12 @@ tools it names.
 - ARC is local research software, not an internet-facing service. Design for
   robustness against crashes, interrupted writes, accidental corruption,
   malformed model/provider output, and ordinary cooperating-process races.
+- Treat ARC agents and LLMs as trusted collaborators, not adversaries. Use only
+  simple, maintainable guardrails against accidental misunderstanding, faulty
+  instructions or deletion, crashes, malformed output, and ordinary I/O or
+  concurrency failures; do not build complex defenses against deliberate agent
+  bypass, forgery, or attack unless the user explicitly requests that threat
+  model.
 - Do not over-engineer for a malicious local user or hostile filesystem. Avoid
   adversarial symlink/inode-swap defenses, cryptographic tamper resistance,
   attacker-oriented TOCTOU machinery, or comparable complexity unless the user
