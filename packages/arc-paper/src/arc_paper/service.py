@@ -487,7 +487,18 @@ def get_parsed_source(
     *,
     include_document: bool = False,
     strict_cache_only: bool = False,
+    author_evidence_only: bool = False,
 ) -> dict[str, Any]:
+    if author_evidence_only:
+        if not strict_cache_only or include_document:
+            return err(
+                "parsed_source_author_evidence_flags_invalid",
+                (
+                    "author_evidence_only requires strict_cache_only=True "
+                    "and include_document=False."
+                ),
+            )
+        return _cached_source_author_evidence(source_id)
     lookup_id = _parsed_source_lookup_id(source_id)
     parsed = _read_parsed_source(source_id)
     if parsed is None:
@@ -535,13 +546,12 @@ def get_parsed_source(
     )
 
 
-def get_cached_source_author_evidence(source_id: str) -> dict[str, Any]:
+def _cached_source_author_evidence(source_id: str) -> dict[str, Any]:
     """Return minimal stable author evidence from current local caches only.
 
     This path never fetches, reparses, migrates, or writes cache data.  It is
-    intentionally narrower than ``get_parsed_source(..., include_document=True)``
-    so callers cannot accidentally treat unrelated document prose as identity
-    evidence.
+    exposed only through strict author-evidence mode on ``get_parsed_source``
+    so unrelated document prose cannot be treated as identity evidence.
     """
 
     lookup_id = _parsed_source_lookup_id(source_id)

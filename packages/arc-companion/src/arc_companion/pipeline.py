@@ -17928,9 +17928,13 @@ def _source_credit_for_bundle(
     reference_id = str(options.source_credit_reference_id or "").strip()
     if reference_id:
         try:
-            from arc_paper.service import get_cached_source_author_evidence
+            from arc_paper.service import get_parsed_source
 
-            result = get_cached_source_author_evidence(reference_id)
+            result = get_parsed_source(
+                reference_id,
+                strict_cache_only=True,
+                author_evidence_only=True,
+            )
         except (ImportError, OSError, ValueError):
             result = None
         if isinstance(result, Mapping) and result.get("ok") is True:

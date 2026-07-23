@@ -204,7 +204,11 @@ def test_cached_source_author_evidence_is_minimal_strict_and_read_only(
         ),
     )
 
-    hit = service.get_cached_source_author_evidence("cached-person")
+    hit = service.get_parsed_source(
+        "cached-person",
+        strict_cache_only=True,
+        author_evidence_only=True,
+    )
 
     assert hit["ok"] is True
     assert hit["meta"]["provider"] == "local-cache"
@@ -225,7 +229,11 @@ def test_cached_source_author_evidence_is_minimal_strict_and_read_only(
     )
     before = parsed_source_cache_path("cached-person").read_bytes()
     rich_path.unlink()
-    miss = service.get_cached_source_author_evidence("cached-person")
+    miss = service.get_parsed_source(
+        "cached-person",
+        strict_cache_only=True,
+        author_evidence_only=True,
+    )
     assert miss["ok"] is False
     assert miss["error"]["code"] == "cached_source_author_evidence_rich_invalid"
     assert parsed_source_cache_path("cached-person").read_bytes() == before
@@ -244,11 +252,45 @@ def test_cached_source_author_evidence_rejects_malformed_light_cache(
         "index_entries": {},
     })
 
-    result = service.get_cached_source_author_evidence("bad-person")
+    result = service.get_parsed_source(
+        "bad-person",
+        strict_cache_only=True,
+        author_evidence_only=True,
+    )
 
     assert result["ok"] is False
     assert result["error"]["code"] == (
         "cached_source_author_evidence_light_invalid"
+    )
+
+
+def test_cached_source_author_evidence_rejects_non_strict_or_document_flags(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        service,
+        "_read_parsed_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid evidence flags must fail before cache access")
+        ),
+    )
+
+    non_strict = service.get_parsed_source(
+        "unused",
+        author_evidence_only=True,
+    )
+    with_document = service.get_parsed_source(
+        "unused",
+        include_document=True,
+        strict_cache_only=True,
+        author_evidence_only=True,
+    )
+
+    assert non_strict["error"]["code"] == (
+        "parsed_source_author_evidence_flags_invalid"
+    )
+    assert with_document["error"]["code"] == (
+        "parsed_source_author_evidence_flags_invalid"
     )
 
 

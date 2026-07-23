@@ -71,7 +71,11 @@ def test_explicit_source_credit_reference_uses_strict_cached_singleton(
     )
     seen: list[str] = []
 
-    def cached(reference_id: str) -> dict:
+    def cached(reference_id: str, **kwargs) -> dict:
+        assert kwargs == {
+            "strict_cache_only": True,
+            "author_evidence_only": True,
+        }
         seen.append(reference_id)
         return {
             "ok": True,
@@ -90,7 +94,7 @@ def test_explicit_source_credit_reference_uses_strict_cached_singleton(
         }
 
     monkeypatch.setattr(
-        arc_paper.service, "get_cached_source_author_evidence", cached,
+        arc_paper.service, "get_parsed_source", cached,
     )
     options = BuildOptions(
         paper_id=bundle.paper_id,
@@ -111,7 +115,11 @@ def test_explicit_source_credit_reference_uses_strict_cached_singleton(
     assert recovered.source_credit_reference_id == "ref:person"
     assert recovered.source_credit_author_mapping == ()
 
-    def cached_multi(reference_id: str) -> dict:
+    def cached_multi(reference_id: str, **kwargs) -> dict:
+        assert kwargs == {
+            "strict_cache_only": True,
+            "author_evidence_only": True,
+        }
         return {
             "ok": True,
             "data": {
@@ -138,7 +146,7 @@ def test_explicit_source_credit_reference_uses_strict_cached_singleton(
         }
 
     monkeypatch.setattr(
-        arc_paper.service, "get_cached_source_author_evidence", cached_multi,
+        arc_paper.service, "get_parsed_source", cached_multi,
     )
     diagnostics: list[dict[str, str]] = []
     invalid = pipeline_module._source_credit_for_bundle(
