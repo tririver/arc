@@ -7,6 +7,8 @@ from typing import Any
 
 from arc_llm.evidence import EVIDENCE_REQUESTS_FIELD, EvidenceResponse
 from arc_llm.proposers_reviewer.runner import run_proposers_reviewer_batch
+from arc_llm.proposers_reviewer.dialogue import _evidence_responses
+from arc_llm.proposers_reviewer import runner as runner_module
 
 
 def _config(tmp_path: Path, *, max_rounds: int) -> dict[str, Any]:
@@ -118,6 +120,12 @@ def test_runner_resolves_requests_and_injects_provenance_next_round(tmp_path: Pa
         if json.loads(line).get("type") == "evidence_responses"
     ]
     assert evidence_events[0]["exchanges"][0]["response"]["provenance"]["source"] == "arc-paper"
+    receipts = list((Path(result["run_root"]) / "evidence-journal" / "receipts").glob("*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["deliveries"][0]["followup_id"] == (
+        "loop/loop_001/round_002/proposer_001"
+    )
 
 
 def test_empty_request_list_is_a_no_op(tmp_path: Path) -> None:
@@ -351,3 +359,129 @@ def test_controller_is_never_called_after_three_evidence_rounds(tmp_path: Path) 
         if event.get("type") == "evidence_responses"
     ]
     assert statuses == ["resolved", "resolved", "resolved", "round_limit_reached", "no_followup_round"]
+
+
+def test_same_request_id_is_scoped_to_worker_and_resolved_in_separate_groups(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, max_rounds=2)
+    config["loops"][0]["proposers"].append({
+        "id": "proposer_002",
+        "prompt": {"system": "proposer-two", "template": "Propose in round {round_number}."},
+        "output_schema": {"type": "object", "additionalProperties": False, "properties": {}},
+        "runtime": {"allow_mcp": False},
+    })
+    controller_workers: list[str] = []
+
+    def json_runner(prompt: str, **_kwargs: Any) -> dict[str, Any]:
+        round_number = int(re.findall(r'"round_number":\s*(\d+)', prompt)[-1])
+        if "### System\nreviewer" in prompt:
+            return {
+                "schema_version": "arc.llm.review_envelope.v1",
+                "controller": {"message": "continue", "stop_requested": False},
+                "proposer_messages": {
+                    "proposer_001": {"message": "revise"},
+                    "proposer_002": {"message": "revise"},
+                },
+                "review_payload": {"round": round_number},
+            }
+        output = {"proposal": f"round {round_number}"}
+        if round_number == 1:
+            output[EVIDENCE_REQUESTS_FIELD] = [{
+                "request_id": "r1",
+                "operation": "paper.metadata",
+                "arguments": {"paper_id": "1234.5678"},
+                "reason": "verify metadata",
+            }]
+        return output
+
+    def controller(requests, *, round_number):
+        assert len(requests) == 1
+        controller_workers.append(requests[0].worker_id)
+        return (EvidenceResponse(
+            "r1", True, {"worker": requests[0].worker_id, "round": round_number},
+        ),)
+
+    result = run_proposers_reviewer_batch(
+        config, json_runner=json_runner, evidence_controller=controller, base_env={},
+    )
+
+    assert result["status"] == "completed"
+    assert controller_workers == ["proposer_001", "proposer_002"]
+    journal_root = Path(result["run_root"]) / "evidence-journal" / "receipts"
+    receipts = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in journal_root.glob("*.json")
+    ]
+    assert len(receipts) == 2
+    assert {
+        receipt["deliveries"][0]["followup_id"] for receipt in receipts
+    } == {
+        "loop/loop_001/round_002/proposer_001",
+        "loop/loop_001/round_002/proposer_002",
+    }
+
+
+def test_dialogue_searches_back_to_latest_event_for_addressed_worker() -> None:
+    correspondence = [
+        {
+            "type": "evidence_responses",
+            "exchanges": [{
+                "request": {"worker_id": "worker-a", "request_id": "a1"},
+                "response": {"request_id": "a1", "ok": True},
+            }],
+        },
+        {
+            "type": "evidence_responses",
+            "exchanges": [{
+                "request": {"worker_id": "worker-b", "request_id": "b1"},
+                "response": {"request_id": "b1", "ok": True},
+            }],
+        },
+    ]
+
+    responses = _evidence_responses(correspondence, worker_id="worker-a")
+
+    assert responses[0]["request"]["request_id"] == "a1"
+    assert all(item["request"]["worker_id"] == "worker-a" for item in responses)
+
+
+def test_transcript_append_crash_leaves_persisted_undelivered_response(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    runner = EvidenceRunner(
+        lambda round_number: [{
+            "request_id": "r1",
+            "operation": "paper.metadata",
+            "arguments": {"paper_id": "1234.5678"},
+            "reason": "verify metadata",
+        }] if round_number == 1 else []
+    )
+    controller_calls = 0
+    original_append = runner_module.append_jsonl
+
+    def append_then_crash(path, item):
+        if item.get("type") == "evidence_responses":
+            raise RuntimeError("simulated transcript append crash")
+        original_append(path, item)
+
+    def controller(requests, *, round_number):
+        nonlocal controller_calls
+        controller_calls += 1
+        return (EvidenceResponse("r1", True, {"round": round_number}),)
+
+    monkeypatch.setattr(runner_module, "append_jsonl", append_then_crash)
+    result = run_proposers_reviewer_batch(
+        _config(tmp_path, max_rounds=2),
+        json_runner=runner,
+        evidence_controller=controller,
+        base_env={},
+    )
+
+    assert result["status"] == "failed"
+    assert controller_calls == 1
+    receipts = list((Path(result["run_root"]) / "evidence-journal" / "receipts").glob("*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["state"] == "response_persisted"
+    assert receipt["deliveries"] == []

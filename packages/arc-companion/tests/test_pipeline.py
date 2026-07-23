@@ -6429,7 +6429,7 @@ def test_guided_reference_policy_exposes_only_command_scoped_claude_bash() -> No
 def test_guided_stateless_call_uses_controller_evidence_fallback(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    from arc_llm import EvidenceResponse
+    from arc_llm import EvidenceJournal, EvidenceJournalContext, EvidenceResponse
     from arc_companion.intent_guidance import (
         INTENT_GUIDANCE_VERSION,
         _target_catalog_metadata,
@@ -6471,9 +6471,10 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
             }
         return {"answer": "done", "arc_evidence_requests": []}
 
-    monkeypatch.setattr(
-        pipeline_module, "resolve_worker_evidence_requests",
-        lambda _artifact, requests, *, round_number, lane=None: tuple(
+    resolver_calls = []
+    def resolve_evidence(_artifact, requests, *, round_number, lane=None):
+        resolver_calls.append(tuple(requests))
+        return tuple(
             EvidenceResponse(
                 request.request_id, True, {
                     "content": "cached chapter "
@@ -6482,9 +6483,22 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
                 provenance={"provider": "local-cache", "round": round_number},
             )
             for request in requests
-        ),
+        )
+    monkeypatch.setattr(
+        pipeline_module, "resolve_worker_evidence_requests",
+        resolve_evidence,
     )
     round_audits = []
+    journal_context = EvidenceJournalContext(
+        journal_root=tmp_path / "checkpoint" / "evidence-journal",
+        run_id="f" * 64,
+        lane_id="translation",
+        worker_id="guided",
+        logical_task_id="translation:segment-1:generation-1",
+        source_generation=1,
+        policy_hash="policy-hash",
+        runtime_hash="runtime-hash",
+    )
     result = _llm_call(
         fake_llm, "p" * 54_000, {
             "type": "object", "additionalProperties": False,
@@ -6502,6 +6516,7 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
             "strict_limit_bytes": 61_440,
             "audit_sink": round_audits,
         },
+        evidence_journal_context=journal_context,
     )
     assert result == {"answer": "done"}
     assert len(calls) == 2
@@ -6510,12 +6525,21 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
     assert "arc_evidence_requests" in calls[0][1]["schema"]["properties"]
     assert round_audits[0]["budget_class"] == "evidence_headroom"
     assert round_audits[0]["strict_headroom_bytes"] >= 0
+    assert len(resolver_calls) == 1
+    bounded_request = resolver_calls[0][0]
+    receipt = EvidenceJournal(journal_context.journal_root).read_receipt(
+        journal_context.address(bounded_request.request_id, evidence_round=1)
+    )
+    assert receipt["state"] == "delivered"
+    assert receipt["deliveries"][0]["followup_id"] == (
+        "translation:segment-1:generation-1:evidence-01"
+    )
 
 
 def test_guided_stateful_call_uses_controller_evidence_delta(
-    monkeypatch,
+    tmp_path: Path, monkeypatch,
 ) -> None:
-    from arc_llm import EvidenceResponse
+    from arc_llm import EvidenceJournal, EvidenceJournalContext, EvidenceResponse
 
     class Outcome:
         def __init__(self, value):
@@ -6558,15 +6582,29 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
         calls.append((prompt, schema, round_number))
         return Outcome({"answer": "done", "arc_evidence_requests": []})
 
-    monkeypatch.setattr(
-        pipeline_module, "resolve_worker_evidence_requests",
-        lambda _artifact, requests, *, round_number, lane=None: tuple(
+    resolver_calls = []
+    def resolve_stateful(_artifact, requests, *, round_number, lane=None):
+        resolver_calls.append(tuple(requests))
+        return tuple(
             EvidenceResponse(
                 request.request_id, True, {"content": "cached chapter"},
                 provenance={"provider": "local-cache", "lane": lane},
             )
             for request in requests
-        ),
+        )
+    monkeypatch.setattr(
+        pipeline_module, "resolve_worker_evidence_requests",
+        resolve_stateful,
+    )
+    journal_context = EvidenceJournalContext(
+        journal_root=tmp_path / "checkpoint" / "evidence-journal",
+        run_id="f" * 64,
+        lane_id="translation",
+        worker_id="translation-1",
+        logical_task_id="translation:segment-1:generation-1",
+        source_generation=1,
+        policy_hash="policy-hash",
+        runtime_hash="runtime-hash",
     )
     final_outcome, value = pipeline_module._complete_stateful_reference_evidence(
         initial, intent_guidance=artifact, lane="translation",
@@ -6576,6 +6614,9 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
             "required": ["answer"], "properties": {"answer": {"type": "string"}},
         },
         call_round=call_round,
+        journal_context=journal_context,
+        target_session="translation-session",
+        followup_id="translation:segment-1:generation-1",
     )
 
     assert final_outcome.value["answer"] == "done"
@@ -6583,6 +6624,389 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
     assert calls[0][2] == 1
     assert "CONTROLLER REFERENCE EVIDENCE ROUND" in calls[0][0]
     assert "arc_evidence_requests" in calls[0][1]["properties"]
+    receipt = EvidenceJournal(journal_context.journal_root).read_receipt(
+        journal_context.address("r1", evidence_round=1)
+    )
+    assert receipt["state"] == "delivered"
+    assert receipt["deliveries"][0]["target_session"] == "translation-session"
+
+    fresh_calls = []
+    replay_outcome, replay_value = pipeline_module._complete_stateful_reference_evidence(
+        initial, intent_guidance=artifact, lane="translation",
+        worker_id="translation-1",
+        schema={
+            "type": "object", "additionalProperties": False,
+            "required": ["answer"], "properties": {"answer": {"type": "string"}},
+        },
+        call_round=lambda prompt, schema, round_number: (
+            fresh_calls.append((prompt, schema, round_number))
+            or Outcome({"answer": "done", "arc_evidence_requests": []})
+        ),
+        journal_context=journal_context,
+        target_session="translation-session-fresh",
+        target_generation=2,
+        followup_id="translation:segment-1:generation-2",
+    )
+    assert replay_outcome.value["answer"] == "done"
+    assert replay_value == {"answer": "done"}
+    assert len(resolver_calls) == 1
+    assert len(fresh_calls) == 1
+    redelivered = EvidenceJournal(journal_context.journal_root).read_receipt(
+        journal_context.address("r1", evidence_round=1)
+    )
+    assert [item["target_generation"] for item in redelivered["deliveries"]] == [1, 2]
+    assert [item["followup_id"] for item in redelivered["deliveries"]] == [
+        "translation:segment-1:generation-1:evidence-01",
+        "translation:segment-1:generation-2:evidence-01",
+    ]
+
+
+def test_typed_idle_generation_replays_source_evidence_receipt_in_production_path(
+    tmp_path: Path,
+) -> None:
+    from arc_companion.intent_guidance import _build_artifact
+    from arc_companion.io import read_json
+    from arc_companion.ledger import (
+        initialize_lane_ledger,
+        invalidate_suffix,
+        mark_needs_supervision,
+    )
+    from arc_companion.ledger_registry import read_registered_lane_ledger
+    from arc_companion.resume_transaction import (
+        begin_transaction,
+        claim_automatic_restart,
+        mark_replacement,
+    )
+    from arc_llm import EvidenceJournal
+
+    class Outcome:
+        def __init__(self, value):
+            self.value = value
+
+    class CountingArtifact(dict):
+        target_reads = 0
+
+        def get(self, key, default=None):
+            if key == "reference_targets":
+                self.target_reads += 1
+            return super().get(key, default)
+
+    project_dir = tmp_path / "project"
+    checkpoint_dir = project_dir / ".arc-companion" / "checkpoints" / "opaque-name"
+    ledger_path = (
+        checkpoint_dir / "chapters" / "chapter-1" / "translation-ledger.json"
+    )
+    fingerprint = "a" * 64
+    session_key = "chapter-1:translation"
+    segment_id = "seg-1"
+    source_base = f"{session_key}:{segment_id}:generation-1"
+    target_base = f"{session_key}:{segment_id}:generation-2"
+    abandoned_key = f"{source_base}:evidence-01"
+    initialize_lane_ledger(
+        ledger_path,
+        chapter_id="chapter-1",
+        lane="translation",
+        segment_ids=[segment_id],
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    references = [{
+        "source_id": "book",
+        "source_hash": "v1",
+        "document_hash": "v1",
+        "metadata": {},
+        "toc": [{"locator": "ch-2", "title": "Two"}],
+    }]
+    normalized = {
+        "guidance": "Use the selected terminology.",
+        "resolution_status": "resolved",
+        "reference_targets": [{
+            "source_id": "book",
+            "locator": "ch-2",
+            "purpose": "terms",
+            "lanes": ["translation"],
+        }],
+    }
+    artifact = CountingArtifact(_build_artifact(
+        normalized,
+        semantic_sha256="s" * 64,
+        user_intent_sha256="u" * 64,
+        references=references,
+        artifact_dir=tmp_path / "intent-guidance",
+    ))
+    initial = Outcome({
+        "answer": "pending",
+        "arc_evidence_requests": [{
+            "request_id": "r1",
+            "operation": "list-reference-targets",
+            "arguments": {"source_id": "book"},
+            "reason": "terminology",
+        }],
+    })
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}},
+    }
+    source_context = pipeline_module._companion_evidence_journal_context(
+        checkpoint_dir=checkpoint_dir,
+        run_id=fingerprint,
+        lane="translation",
+        worker_id="translation-1",
+        logical_task_id=source_base,
+        source_generation=1,
+        policy={"access": "local"},
+        runtime={"provider": "fake"},
+    )
+    first_outcome, first_value = pipeline_module._complete_stateful_reference_evidence(
+        initial,
+        intent_guidance=artifact,
+        lane="translation",
+        worker_id="translation-1",
+        schema=schema,
+        call_round=lambda _prompt, _schema, _round: Outcome({
+            "answer": "done", "arc_evidence_requests": [],
+        }),
+        journal_context=source_context,
+        target_session=session_key,
+        target_generation=1,
+        followup_id=source_base,
+    )
+    assert first_outcome.value["answer"] == first_value["answer"] == "done"
+    assert artifact.target_reads > 0
+
+    mark_needs_supervision(
+        ledger_path,
+        segment_id=segment_id,
+        reason="idle timeout after submission",
+        recovery_context={
+            "session_key": session_key,
+            "generation": 1,
+            "idempotency_key": abandoned_key,
+            "submission_state": "unknown",
+        },
+        checkpoint_dir=checkpoint_dir,
+    )
+    begin_transaction(
+        project_dir,
+        action="auto",
+        policy="auto",
+        recovery_options={"max_auto_replacements": 1},
+        entries=[{
+            "ledger_path": ledger_path,
+            "session_key": session_key,
+            "segment_id": segment_id,
+            "generation": 1,
+            "idempotency_key": abandoned_key,
+        }],
+        checkpoint_path=checkpoint_dir,
+        checkpoint_fingerprint=fingerprint,
+    )
+    replacement = claim_automatic_restart(
+        project_dir,
+        session_key=session_key,
+        segment_id=segment_id,
+        ledger_path=ledger_path,
+        source_generation=1,
+        target_generation=2,
+        suffix_segment_ids=[segment_id],
+        trigger_code="idle_timeout",
+        trigger_reason="typed idle recovery",
+        abandoned_logical_key=abandoned_key,
+    )
+    mark_replacement(
+        project_dir, replacement["replacement_id"], status="rotated",
+    )
+    invalidate_suffix(
+        ledger_path,
+        from_segment_id=segment_id,
+        generation=2,
+        checkpoint_dir=checkpoint_dir,
+    )
+    mark_replacement(
+        project_dir, replacement["replacement_id"], status="suffix_invalidated",
+    )
+    validated_ledger, _ledger_digest = read_registered_lane_ledger(
+        checkpoint_dir, ledger_path,
+    )
+    assert read_json(ledger_path)["supervision_history"]
+
+    source_generation, source_logical_task = (
+        pipeline_module._companion_evidence_source_identity(
+            project_dir=project_dir,
+            checkpoint_dir=checkpoint_dir,
+            run_id=fingerprint,
+            ledger_path=ledger_path,
+            ledger=validated_ledger,
+            session_key=session_key,
+            logical_unit=segment_id,
+            target_generation=2,
+            target_idempotency_key=target_base,
+        )
+    )
+    assert (source_generation, source_logical_task) == (1, source_base)
+    replay_context = pipeline_module._companion_evidence_journal_context(
+        checkpoint_dir=checkpoint_dir,
+        run_id=fingerprint,
+        lane="translation",
+        worker_id="translation-1",
+        logical_task_id=source_logical_task,
+        source_generation=source_generation,
+        policy={"access": "local"},
+        runtime={"provider": "fake"},
+    )
+    artifact.target_reads = 0
+    replay_outcome, replay_value = pipeline_module._complete_stateful_reference_evidence(
+        initial,
+        intent_guidance=artifact,
+        lane="translation",
+        worker_id="translation-1",
+        schema=schema,
+        call_round=lambda _prompt, _schema, _round: Outcome({
+            "answer": "done", "arc_evidence_requests": [],
+        }),
+        journal_context=replay_context,
+        target_session=session_key,
+        target_generation=2,
+        followup_id=target_base,
+    )
+    assert replay_outcome.value["answer"] == replay_value["answer"] == "done"
+    assert artifact.target_reads == 0
+    receipt = EvidenceJournal(source_context.journal_root).read_receipt(
+        source_context.address("r1", evidence_round=1)
+    )
+    assert [item["target_generation"] for item in receipt["deliveries"]] == [1, 2]
+    assert [item["followup_id"] for item in receipt["deliveries"]] == [
+        f"{source_base}:evidence-01",
+        f"{target_base}:evidence-01",
+    ]
+
+
+def test_evidence_source_identity_rejects_one_sided_rotation_authority(
+    tmp_path: Path,
+) -> None:
+    from arc_companion.resume_transaction import (
+        begin_transaction,
+        claim_automatic_restart,
+    )
+
+    project_dir = tmp_path / "project"
+    checkpoint_dir = project_dir / "checkpoint"
+    ledger_path = checkpoint_dir / "chapters" / "ch" / "translation-ledger.json"
+    ledger_path.parent.mkdir(parents=True)
+    ledger_path.write_text("{}", encoding="utf-8")
+    fingerprint = "b" * 64
+    session_key = "ch:translation"
+    logical_unit = "seg"
+    abandoned_key = "ch:translation:seg:generation-1:evidence-01"
+    ledger_signal = {
+        "supervision_history": [{
+            "segment_id": logical_unit,
+            "source_generation": 1,
+            "target_generation": 2,
+            "archive_reason": "generation_suffix_invalidated",
+            "recovery_context": {
+                "session_key": session_key,
+                "generation": 1,
+                "idempotency_key": abandoned_key,
+            },
+        }],
+    }
+
+    with pytest.raises(RuntimeError, match="one-sided"):
+        pipeline_module._companion_evidence_source_identity(
+            project_dir=project_dir,
+            checkpoint_dir=checkpoint_dir,
+            run_id=fingerprint,
+            ledger_path=ledger_path,
+            ledger=ledger_signal,
+            session_key=session_key,
+            logical_unit=logical_unit,
+            target_generation=2,
+            target_idempotency_key="ch:translation:seg:generation-2",
+        )
+
+    begin_transaction(
+        project_dir,
+        action="auto",
+        policy="auto",
+        recovery_options={},
+        entries=[],
+        checkpoint_path=checkpoint_dir,
+        checkpoint_fingerprint=fingerprint,
+    )
+    claim_automatic_restart(
+        project_dir,
+        session_key=session_key,
+        segment_id=logical_unit,
+        ledger_path=ledger_path,
+        source_generation=1,
+        target_generation=2,
+        suffix_segment_ids=[logical_unit],
+        trigger_code="idle_timeout",
+        trigger_reason="typed idle recovery",
+        abandoned_logical_key=abandoned_key,
+    )
+    with pytest.raises(RuntimeError, match="one-sided"):
+        pipeline_module._companion_evidence_source_identity(
+            project_dir=project_dir,
+            checkpoint_dir=checkpoint_dir,
+            run_id=fingerprint,
+            ledger_path=ledger_path,
+            ledger={"supervision_history": []},
+            session_key=session_key,
+            logical_unit=logical_unit,
+            target_generation=2,
+            target_idempotency_key="ch:translation:seg:generation-2",
+        )
+
+
+def test_non_evidence_idle_rotation_uses_current_evidence_identity(tmp_path: Path) -> None:
+    from arc_companion.resume_transaction import (
+        begin_transaction,
+        claim_automatic_restart,
+    )
+
+    project_dir = tmp_path / "project"
+    checkpoint_dir = project_dir / "checkpoint"
+    ledger_path = checkpoint_dir / "chapters" / "ch" / "translation-ledger.json"
+    ledger_path.parent.mkdir(parents=True)
+    ledger_path.write_text("{}", encoding="utf-8")
+    fingerprint = "c" * 64
+    begin_transaction(
+        project_dir,
+        action="auto",
+        policy="auto",
+        recovery_options={},
+        entries=[],
+        checkpoint_path=checkpoint_dir,
+        checkpoint_fingerprint=fingerprint,
+    )
+    claim_automatic_restart(
+        project_dir,
+        session_key="ch:translation",
+        segment_id="seg",
+        ledger_path=ledger_path,
+        source_generation=1,
+        target_generation=2,
+        suffix_segment_ids=["seg"],
+        trigger_code="idle_timeout",
+        trigger_reason="initial call idle",
+        abandoned_logical_key="ch:translation:seg:generation-1",
+    )
+
+    assert pipeline_module._companion_evidence_source_identity(
+        project_dir=project_dir,
+        checkpoint_dir=checkpoint_dir,
+        run_id=fingerprint,
+        ledger_path=ledger_path,
+        ledger={"supervision_history": []},
+        session_key="ch:translation",
+        logical_unit="seg",
+        target_generation=2,
+        target_idempotency_key="ch:translation:seg:generation-2",
+    ) == (2, "ch:translation:seg:generation-2")
 
 
 def test_source_fingerprint_excludes_runtime_access_options(tmp_path: Path) -> None:

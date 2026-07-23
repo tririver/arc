@@ -39,6 +39,43 @@ def test_controller_round_requires_exactly_one_response_per_request() -> None:
         resolve_evidence_round((request,), lambda *_args, **_kwargs: (), round_number=1)
 
 
+def test_controller_round_rejects_duplicate_request_ids() -> None:
+    requests = (
+        EvidenceRequest("request", "paper.search"),
+        EvidenceRequest("request", "paper.metadata"),
+    )
+
+    with pytest.raises(ValueError, match="request IDs must be unique"):
+        resolve_evidence_round(requests, lambda *_args, **_kwargs: (), round_number=1)
+
+
+def test_controller_round_rejects_duplicate_response_ids() -> None:
+    requests = (
+        EvidenceRequest("first", "paper.search"),
+        EvidenceRequest("second", "paper.metadata"),
+    )
+
+    with pytest.raises(ValueError, match="response IDs must be unique"):
+        resolve_evidence_round(
+            requests,
+            lambda *_args, **_kwargs: (
+                EvidenceResponse("first", True, {}),
+                EvidenceResponse("first", True, {}),
+            ),
+            round_number=1,
+        )
+
+
+def test_controller_round_rejects_malformed_response_envelope() -> None:
+    request = EvidenceRequest("request", "paper.search")
+
+    with pytest.raises(ValueError, match="EvidenceResponse envelopes"):
+        resolve_evidence_round(
+            (request,), lambda *_args, **_kwargs: ({"request_id": "request"},),
+            round_number=1,
+        )
+
+
 def test_failed_response_requires_error() -> None:
     with pytest.raises(ValueError, match="requires an error"):
         EvidenceResponse("request", False)

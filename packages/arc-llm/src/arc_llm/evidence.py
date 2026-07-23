@@ -100,6 +100,10 @@ def resolve_evidence_round(
         return ()
 
     responses = tuple(controller(material, round_number=round_number))
+    if not all(isinstance(item, EvidenceResponse) for item in responses):
+        raise EvidenceProtocolError(
+            "evidence controller responses must be EvidenceResponse envelopes"
+        )
     response_ids = [item.request_id for item in responses]
     if len(response_ids) != len(set(response_ids)):
         raise ValueError("evidence response IDs must be unique within a round")

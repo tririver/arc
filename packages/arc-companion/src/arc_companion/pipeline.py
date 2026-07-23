@@ -17,7 +17,10 @@ import threading
 import unicodedata
 import uuid
 from urllib.parse import urlparse
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+
+if TYPE_CHECKING:
+    from arc_llm import EvidenceJournalContext
 
 from bs4 import BeautifulSoup
 from .context_sources import load_context_evidence
@@ -2445,9 +2448,42 @@ def _build_chaptered_companion(
                 outcome = invoke(
                     prompt, _intent_guidance_schema(schema, intent_guidance), 0,
                 )
+                evidence_source_generation, evidence_source_logical_task = (
+                    _companion_evidence_source_identity(
+                        project_dir=options.project_dir,
+                        checkpoint_dir=checkpoint_dir,
+                        run_id=fingerprint,
+                        ledger_path=guide_ledger_path,
+                        ledger=registered_guide,
+                        session_key=session_key,
+                        logical_unit=guide_segment_id,
+                        target_generation=generation,
+                        target_idempotency_key=idempotency_key,
+                    )
+                )
                 outcome, final_value = _complete_stateful_reference_evidence(
                     outcome, intent_guidance=intent_guidance, lane="guide",
                     worker_id=call_label, schema=schema, call_round=invoke,
+                    journal_context=_companion_evidence_journal_context(
+                        checkpoint_dir=checkpoint_dir,
+                        run_id=fingerprint,
+                        lane="guide",
+                        worker_id=call_label,
+                        logical_task_id=evidence_source_logical_task,
+                        source_generation=evidence_source_generation,
+                        policy=guide_policy,
+                        runtime={
+                            "runtime_fingerprint": str(
+                                getattr(outcome, "runtime_fingerprint", "")
+                            ),
+                            "provider": options.provider,
+                            "model": options.model,
+                            "model_tier": ANNOTATION_TIER,
+                        },
+                    ),
+                    target_session=session_key,
+                    target_generation=generation,
+                    followup_id=idempotency_key,
                 )
             except BaseException as exc:
                 if _chapter_failure_requires_supervision(exc):
@@ -3538,10 +3574,36 @@ def _build_chaptered_companion(
                         _intent_guidance_schema(base_schema, intent_guidance),
                         0,
                     )
+                    evidence_source_generation, evidence_source_logical_task = (
+                        _companion_evidence_source_identity(
+                            project_dir=options.project_dir,
+                            checkpoint_dir=checkpoint_dir,
+                            run_id=fingerprint,
+                            ledger_path=path,
+                            ledger=ledger,
+                            session_key=session_key,
+                            logical_unit=segment_id,
+                            target_generation=block_generation,
+                            target_idempotency_key=idempotency_key,
+                        )
+                    )
                     outcome, final_value = _complete_stateful_reference_evidence(
                         outcome, intent_guidance=intent_guidance,
                         lane=guidance_lane, worker_id=call_label,
                         schema=base_schema, call_round=invoke,
+                        journal_context=_companion_evidence_journal_context(
+                            checkpoint_dir=checkpoint_dir,
+                            run_id=fingerprint,
+                            lane=guidance_lane,
+                            worker_id=call_label,
+                            logical_task_id=evidence_source_logical_task,
+                            source_generation=evidence_source_generation,
+                            policy=lane_policy,
+                            runtime=runtime_profile,
+                        ),
+                        target_session=session_key,
+                        target_generation=block_generation,
+                        followup_id=idempotency_key,
                     )
                 except BaseException as exc:
                     if _chapter_failure_requires_supervision(exc):
@@ -11600,6 +11662,141 @@ def _controller_evidence_prompt(responses: Sequence[Any]) -> str:
     )
 
 
+def _companion_evidence_journal_context(
+    *,
+    checkpoint_dir: Path,
+    run_id: str,
+    lane: str,
+    worker_id: str,
+    logical_task_id: str,
+    source_generation: int,
+    policy: Any,
+    runtime: Any,
+) -> EvidenceJournalContext:
+    """Build the explicit, provider-neutral address used by companion loops."""
+
+    from arc_llm import EvidenceJournalContext, evidence_identity_hash
+
+    return EvidenceJournalContext(
+        journal_root=checkpoint_dir / "evidence-journal",
+        run_id=str(run_id),
+        lane_id=str(lane),
+        worker_id=str(worker_id),
+        logical_task_id=str(logical_task_id).split(":evidence-", 1)[0],
+        source_generation=int(source_generation),
+        policy_hash=evidence_identity_hash({
+            "protocol": "arc.companion.controller-evidence.v1",
+            "lane": str(lane),
+            "policy": policy,
+        }),
+        runtime_hash=evidence_identity_hash({"lane": str(lane), "runtime": runtime}),
+    )
+
+
+def _companion_evidence_source_identity(
+    *,
+    project_dir: Path,
+    checkpoint_dir: Path,
+    run_id: str,
+    ledger_path: Path,
+    ledger: Mapping[str, Any],
+    session_key: str,
+    logical_unit: str,
+    target_generation: int,
+    target_idempotency_key: str,
+) -> tuple[int, str]:
+    """Recover a typed-idle source address from two durable authorities.
+
+    The archived ledger marker proves which submitted source generation was
+    abandoned.  The replacement transaction independently proves that the
+    current generation was authorized as its replacement.  Any partial or
+    conflicting evidence fails closed instead of silently spending a second
+    resolver call under a fresh journal address.
+    """
+
+    current = (int(target_generation), _base_evidence_id(target_idempotency_key))
+    if target_generation <= 1:
+        return current
+    from .resume_transaction import load_transaction
+
+    transaction = load_transaction(project_dir)
+    ledger_signals = [
+        dict(item) for item in ledger.get("supervision_history") or []
+        if isinstance(item, Mapping)
+        and str(item.get("segment_id") or "") == logical_unit
+        and int(item.get("target_generation") or 0) == target_generation
+        and str(item.get("archive_reason") or "")
+        == "generation_suffix_invalidated"
+        and isinstance(item.get("recovery_context"), Mapping)
+        and str(item["recovery_context"].get("session_key") or "") == session_key
+        and ":evidence-" in str(
+            item["recovery_context"].get("idempotency_key") or ""
+        )
+    ]
+    transaction_signals = [
+        dict(item) for item in (transaction or {}).get("replacements") or []
+        if isinstance(item, Mapping)
+        and str(item.get("session_key") or "") == session_key
+        and int(item.get("target_generation") or 0) == target_generation
+        and logical_unit in {
+            str(value) for value in item.get("suffix_segment_ids") or []
+        }
+        and str(item.get("trigger_code") or "") == "idle_timeout"
+        and ":evidence-" in str(item.get("abandoned_logical_key") or "")
+    ]
+    if not ledger_signals and not transaction_signals:
+        return current
+    if len(ledger_signals) != 1 or len(transaction_signals) != 1:
+        raise RuntimeError(
+            "evidence generation rotation has one-sided or ambiguous durable authority"
+        )
+    if transaction is None:
+        raise RuntimeError("evidence generation rotation transaction is missing")
+    checkpoint_path = str(transaction.get("checkpoint_path") or "")
+    checkpoint_fingerprint = str(transaction.get("checkpoint_fingerprint") or "")
+    replacement = transaction_signals[0]
+    marker = ledger_signals[0]
+    recovery = marker["recovery_context"]
+    source_generation = int(replacement.get("source_generation") or 0)
+    abandoned_key = str(replacement.get("abandoned_logical_key") or "")
+    canonical_ledger = ledger_path.resolve(strict=False)
+    exact = bool(
+        checkpoint_path
+        and Path(checkpoint_path).resolve(strict=False)
+        == checkpoint_dir.resolve(strict=False)
+        and checkpoint_fingerprint == str(run_id)
+        and str(replacement.get("authorization_source") or "")
+        == "recovery_policy_auto"
+        and str(replacement.get("status") or "") in {
+            "suffix_invalidated", "response_persisted", "accepted",
+        }
+        and Path(str(replacement.get("ledger_path") or "")).resolve(strict=False)
+        == canonical_ledger
+        and 0 < source_generation < target_generation
+        and int(marker.get("source_generation") or 0) == source_generation
+        and int(recovery.get("generation") or 0) == source_generation
+        and str(recovery.get("idempotency_key") or "") == abandoned_key
+        and bool(abandoned_key)
+    )
+    if not exact:
+        raise RuntimeError("evidence generation rotation durable authorities conflict")
+    return source_generation, _base_evidence_id(abandoned_key)
+
+
+def _base_evidence_id(value: str) -> str:
+    return str(value).split(":evidence-", 1)[0]
+
+
+def _authoritative_build_fingerprint(checkpoint_dir: Path) -> str:
+    """Read the build identity from its receipt, never from directory names."""
+
+    receipt = read_json(checkpoint_dir / "source-snapshot-receipt.json")
+    fingerprint = str(receipt.get("fingerprint") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise RuntimeError("companion source snapshot has no authoritative build fingerprint")
+    return fingerprint
+
+
 def _complete_stateful_reference_evidence(
     initial_outcome: Any,
     *,
@@ -11608,6 +11805,10 @@ def _complete_stateful_reference_evidence(
     worker_id: str,
     schema: dict[str, Any],
     call_round: Callable[[str, dict[str, Any], int], Any],
+    journal_context: EvidenceJournalContext | None = None,
+    target_session: str | None = None,
+    target_generation: int | None = None,
+    followup_id: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve controller reads as native-session delta turns for shell-less hosts."""
     outcome = initial_outcome
@@ -11616,7 +11817,12 @@ def _complete_stateful_reference_evidence(
         value = dict(outcome.value)
         if intent_guidance is None:
             return outcome, value
-        from arc_llm import evidence_requests_from_output, resolve_evidence_round
+        from arc_llm import (
+            EvidenceJournal,
+            EvidenceOperationPolicy,
+            evidence_requests_from_output,
+            resolve_evidence_round,
+        )
 
         requests = evidence_requests_from_output(
             value, worker_id=worker_id, role="companion-content-worker",
@@ -11628,13 +11834,38 @@ def _complete_stateful_reference_evidence(
             raise RuntimeError(
                 "companion reference evidence exceeded three controller rounds"
             )
-        responses = resolve_evidence_round(
-            requests,
-            lambda material, *, round_number: resolve_worker_evidence_requests(
-                intent_guidance, material, round_number=round_number, lane=lane,
-            ),
-            round_number=round_number + 1,
+        resolver = lambda material, *, round_number: resolve_worker_evidence_requests(
+            intent_guidance, material, round_number=round_number, lane=lane,
         )
+        if journal_context is None:
+            responses = resolve_evidence_round(
+                requests, resolver, round_number=round_number + 1,
+            )
+        else:
+            journal = EvidenceJournal(journal_context.journal_root)
+            responses = journal.resolve_round(
+                journal_context,
+                requests,
+                resolver,
+                round_number=round_number + 1,
+                operation_policies={
+                    request.operation: EvidenceOperationPolicy(idempotent=True)
+                    for request in requests
+                },
+            )
+            journal.mark_delivered(
+                journal_context,
+                requests,
+                round_number=round_number + 1,
+                target_generation=(
+                    target_generation or journal_context.source_generation
+                ),
+                target_session=target_session or journal_context.worker_id,
+                followup_id=(
+                    f"{followup_id or journal_context.logical_task_id}:"
+                    f"evidence-{round_number + 1:02d}"
+                ),
+            )
         outcome = call_round(
             _controller_evidence_prompt(responses), active_schema, round_number + 1,
         )
@@ -12467,6 +12698,8 @@ def _llm_call(
     intent_guidance_lane: str | None = None,
     review_prompt_context: Mapping[str, Any] | None = None,
     recovery_descriptor: Mapping[str, Any] | None = None,
+    evidence_journal_context: EvidenceJournalContext | None = None,
+    evidence_target_generation: int | None = None,
 ) -> dict[str, Any]:
     force_offline = force_offline or not allow_internet
     structured_policy = bool(
@@ -12493,6 +12726,40 @@ def _llm_call(
         control = _prepare_pipeline_recovery_control(
             recovery_descriptor,
             artifact_dir=artifact_dir,
+        )
+    if intent_guidance is not None and evidence_journal_context is None and control is not None:
+        checkpoint_root = Path(control["checkpoint_dir"])
+        build_fingerprint = _authoritative_build_fingerprint(checkpoint_root)
+        control_ledger, _control_digest = read_registered_lane_ledger(
+            checkpoint_root, Path(control["ledger_path"]),
+        )
+        evidence_source_generation, evidence_source_logical_task = (
+            _companion_evidence_source_identity(
+                project_dir=options.project_dir,
+                checkpoint_dir=checkpoint_root,
+                run_id=build_fingerprint,
+                ledger_path=Path(control["ledger_path"]),
+                ledger=control_ledger,
+                session_key=str(control["session_key"]),
+                logical_unit=str(control["logical_unit"]),
+                target_generation=int(control["generation"]),
+                target_idempotency_key=str(control["idempotency_key"]),
+            )
+        )
+        evidence_journal_context = _companion_evidence_journal_context(
+            checkpoint_dir=checkpoint_root,
+            run_id=build_fingerprint,
+            lane=str(intent_guidance_lane or "general"),
+            worker_id=call_label,
+            logical_task_id=evidence_source_logical_task,
+            source_generation=evidence_source_generation,
+            policy=paper_access_policy,
+            runtime={
+                "provider": options.provider,
+                "model": options.model,
+                "model_tier": model_tier,
+                "environment_hash": sha256_json(runtime_env),
+            },
         )
     for round_number in range(0, 4):
         active_label = (
@@ -12679,6 +12946,8 @@ def _llm_call(
                 if ARC_LLM_CALL_RECORD_FIELD in value else value
             )
         from arc_llm import (
+            EvidenceJournal,
+            EvidenceOperationPolicy,
             evidence_requests_from_output,
             resolve_evidence_round,
         )
@@ -12709,20 +12978,77 @@ def _llm_call(
                 intent_guidance, material, round_number=round_number,
                 lane=intent_guidance_lane,
             )
+        journal = (
+            EvidenceJournal(evidence_journal_context.journal_root)
+            if evidence_journal_context is not None else None
+        )
+        def journaled_resolver(material, *, round_number):
+            if journal is None:
+                return resolver(material, round_number=round_number)
+            return journal.resolve_round(
+                evidence_journal_context,
+                material,
+                resolver,
+                round_number=round_number,
+                operation_policies={
+                    request.operation: EvidenceOperationPolicy(idempotent=True)
+                    for request in material
+                },
+            )
         if review_prompt_context is None:
             responses = resolve_evidence_round(
-                requests, resolver, round_number=round_number + 1,
+                requests, journaled_resolver, round_number=round_number + 1,
             )
-            followup = _controller_evidence_prompt(responses)
+            delivered_requests = requests
         else:
-            responses, followup = _bounded_review_evidence_followup(
+            delivered_requests = _bounded_review_evidence_requests(
                 requests,
-                resolver=resolver,
-                round_number=round_number + 1,
                 active_prompt=active_prompt,
                 strict_prompt_bytes=int(
                     review_prompt_context["strict_limit_bytes"]
                 ),
+            )
+            responses = resolve_evidence_round(
+                delivered_requests,
+                journaled_resolver,
+                round_number=round_number + 1,
+            )
+        followup = _controller_evidence_prompt(responses)
+        if (
+            review_prompt_context is not None
+            and _utf8_size(active_prompt + "\n\n" + followup)
+            > int(review_prompt_context["strict_limit_bytes"])
+        ):
+            raise RuntimeError(
+                "review evidence response cannot fit under the strict prompt limit"
+            )
+        if journal is not None:
+            target_followup_base = (
+                str(control["idempotency_key"])
+                if control is not None
+                else evidence_journal_context.logical_task_id
+            )
+            journal.mark_delivered(
+                evidence_journal_context,
+                delivered_requests,
+                round_number=round_number + 1,
+                target_generation=(
+                    int(control["generation"])
+                    if control is not None
+                    else evidence_target_generation
+                    or evidence_journal_context.source_generation
+                ),
+                target_session=(
+                    str(control["session_key"])
+                    if control is not None else evidence_journal_context.worker_id
+                ),
+                followup_id=(
+                    f"{target_followup_base}:evidence-{round_number + 1:02d}"
+                ),
+                operation_policies={
+                    request.operation: EvidenceOperationPolicy(idempotent=True)
+                    for request in delivered_requests
+                },
             )
         active_prompt = active_prompt + "\n\n" + followup
     raise AssertionError("unreachable evidence loop")
@@ -12739,6 +13065,30 @@ def _bounded_review_evidence_followup(
     """Fit controller evidence into the remaining strict review prompt budget."""
     from arc_llm import resolve_evidence_round
 
+    bounded_requests = _bounded_review_evidence_requests(
+        requests,
+        active_prompt=active_prompt,
+        strict_prompt_bytes=strict_prompt_bytes,
+    )
+    responses = resolve_evidence_round(
+        bounded_requests, resolver, round_number=round_number,
+    )
+    followup = _controller_evidence_prompt(responses)
+    if _utf8_size(active_prompt + "\n\n" + followup) > strict_prompt_bytes:
+        raise RuntimeError(
+            "review evidence response cannot fit under the strict prompt limit"
+        )
+    return responses, followup
+
+
+def _bounded_review_evidence_requests(
+    requests: Sequence[Any],
+    *,
+    active_prompt: str,
+    strict_prompt_bytes: int,
+) -> tuple[Any, ...]:
+    """Choose one conservative page limit before the addressed request executes."""
+
     empty_followup = _controller_evidence_prompt(())
     remaining = strict_prompt_bytes - _utf8_size(active_prompt + "\n\n" + empty_followup)
     if remaining < 1:
@@ -12746,33 +13096,21 @@ def _bounded_review_evidence_followup(
             "review evidence response has no remaining space under the strict prompt limit"
         )
     page_limit = max(1, remaining // max(1, len(requests)) - 512)
-    for _ in range(16):
-        bounded_requests = []
-        for request in requests:
-            arguments = dict(getattr(request, "arguments", {}) or {})
-            key = (
-                "limit_bytes"
-                if str(getattr(request, "operation", "")) == "list-reference-targets"
-                else "limit"
-            )
-            try:
-                requested = int(arguments.get(key, page_limit))
-            except (TypeError, ValueError):
-                requested = page_limit
-            arguments[key] = max(1, min(requested, page_limit))
-            bounded_requests.append(replace(request, arguments=arguments))
-        responses = resolve_evidence_round(
-            tuple(bounded_requests), resolver, round_number=round_number,
+    bounded_requests = []
+    for request in requests:
+        arguments = dict(getattr(request, "arguments", {}) or {})
+        key = (
+            "limit_bytes"
+            if str(getattr(request, "operation", "")) == "list-reference-targets"
+            else "limit"
         )
-        followup = _controller_evidence_prompt(responses)
-        if _utf8_size(active_prompt + "\n\n" + followup) <= strict_prompt_bytes:
-            return responses, followup
-        if page_limit == 1:
-            break
-        page_limit = max(1, page_limit // 2)
-    raise RuntimeError(
-        "review evidence response cannot fit under the strict prompt limit"
-    )
+        try:
+            requested = int(arguments.get(key, page_limit))
+        except (TypeError, ValueError):
+            requested = page_limit
+        arguments[key] = max(1, min(requested, page_limit))
+        bounded_requests.append(replace(request, arguments=arguments))
+    return tuple(bounded_requests)
 
 
 def _review_evidence_round_audit(

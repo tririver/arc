@@ -20,8 +20,13 @@ from arc_llm.evidence import (
     EvidenceRequest,
     EvidenceResponse,
     evidence_requests_from_output,
-    resolve_evidence_round,
     EVIDENCE_REQUESTS_FIELD,
+)
+from arc_llm.evidence_journal import (
+    SCHEMA_VERSION as EVIDENCE_JOURNAL_SCHEMA_VERSION,
+    EvidenceJournal,
+    EvidenceJournalContext,
+    canonical_hash,
 )
 from arc_llm.runner import LLMNeedsLLM, resolve_llm_config, run_json
 from arc_llm.providers.base import (
@@ -156,6 +161,7 @@ def run_proposers_reviewer_batch(
                     _run_loop,
                     copy.deepcopy(loop),
                     paths.loop(loop.loop_id),
+                    paths.evidence_journal_root,
                     batch.run_id,
                     batch.artifact_options,
                     batch,
@@ -260,6 +266,7 @@ def _count_jsonl(path: Path) -> int:
 def _run_loop(
     loop: LoopConfig,
     paths,
+    evidence_journal_root: Path,
     run_id: str,
     artifact_options: ArtifactOptions,
     batch: BatchConfig,
@@ -290,6 +297,7 @@ def _run_loop(
             result = _run_loop_rounds(
                 loop,
                 paths,
+                evidence_journal_root,
                 artifact_options,
                 batch,
                 session_manager,
@@ -318,6 +326,7 @@ def _run_loop(
 def _run_loop_rounds(
     loop: LoopConfig,
     paths,
+    evidence_journal_root: Path,
     artifact_options: ArtifactOptions,
     batch: BatchConfig,
     session_manager: LLMSessionManager,
@@ -484,11 +493,19 @@ def _run_loop_rounds(
                 and round_number < loop.max_rounds
             ):
                 evidence_rounds_completed += 1
-                evidence_responses = resolve_evidence_round(
-                    evidence_requests,
-                    evidence_controller,
+                evidence_responses, journal_deliveries = _resolve_journaled_evidence(
+                    requests=evidence_requests,
+                    controller=evidence_controller,
                     round_number=evidence_rounds_completed,
+                    source_round_number=round_number,
                     max_rounds=batch.evidence.max_rounds,
+                    loop=loop,
+                    batch=batch,
+                    paths=paths,
+                    evidence_journal_root=evidence_journal_root,
+                    session_manager=session_manager,
+                    base_env=base_env,
+                    process_chain=process_chain,
                 )
                 resolution_status = "resolved"
                 evidence_round_number: int | None = evidence_rounds_completed
@@ -502,6 +519,7 @@ def _run_loop_rounds(
                     followup_available=round_number < loop.max_rounds,
                 )
                 evidence_round_number = None
+                journal_deliveries = ()
             evidence_event = _evidence_event(
                 round_number=round_number,
                 evidence_round_number=evidence_round_number,
@@ -511,6 +529,17 @@ def _run_loop_rounds(
             )
             correspondence.append(evidence_event)
             append_jsonl(paths.transcript, evidence_event)
+            for journal, context, worker_requests, target_session, target_generation in journal_deliveries:
+                journal.mark_delivered(
+                    context,
+                    worker_requests,
+                    round_number=evidence_round_number or 1,
+                    target_generation=target_generation,
+                    target_session=target_session,
+                    followup_id=_worker_call_identity(
+                        loop.loop_id, round_number + 1, context.worker_id,
+                    ),
+                )
             _emit_progress(
                 paths,
                 progress_callback,
@@ -604,7 +633,9 @@ def _run_proposers(
                 process_chain=process_chain,
                 session_manager=session_manager,
                 session_key=session_keys[proposer.id],
-                call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{proposer.id}",
+                call_label=_worker_call_identity(
+                    loop.loop_id, round_number, proposer.id,
+                ),
                 artifact_dir=round_paths.round_root / "llm_calls" / proposer.id,
                 prefix_limiter=prefix_limiter,
                 cache_guard=loop.session.cache_guard,
@@ -623,7 +654,9 @@ def _run_proposers(
         }
         for future in as_completed(future_by_proposer):
             proposer = future_by_proposer[future]
-            call_label = f"loop/{loop.loop_id}/round_{round_number:03d}/{proposer.id}"
+            call_label = _worker_call_identity(
+                loop.loop_id, round_number, proposer.id,
+            )
             try:
                 output = future.result().output
                 output = _prepare_peer_visible_proposer_output(
@@ -720,7 +753,7 @@ def _call_reviewer(
         process_chain=process_chain,
         session_manager=session_manager,
         session_key=session_key,
-        call_label=f"loop/{loop.loop_id}/round_{round_number:03d}/{worker.id}",
+        call_label=_worker_call_identity(loop.loop_id, round_number, worker.id),
         artifact_dir=artifact_dir,
         prefix_limiter=prefix_limiter,
         cache_guard=cache_guard,
@@ -1232,6 +1265,12 @@ def _worker_session_key(batch_run_id: str, loop: LoopConfig, worker: WorkerConfi
     else:
         scope = f"{loop.session.scope_id or batch_run_id}/{loop.loop_id}"
     return f"{scope}/{role}/{worker.id}"
+
+
+def _worker_call_identity(loop_id: str, round_number: int, worker_id: str) -> str:
+    """Return the exact call label/idempotency identity shared by calls and delivery."""
+
+    return f"loop/{loop_id}/round_{round_number:03d}/{worker_id}"
 
 
 def _turn_kind(
@@ -1848,10 +1887,91 @@ def _collect_evidence_requests(
                 role="reviewer",
             )
         )
-    request_ids = [request.request_id for request in requests]
-    if len(request_ids) != len(set(request_ids)):
-        raise EvidenceProtocolError("evidence request IDs must be unique across all workers in a loop round")
+    addresses = [(request.worker_id, request.request_id) for request in requests]
+    if len(addresses) != len(set(addresses)):
+        raise EvidenceProtocolError(
+            "evidence request IDs must be unique per addressed worker in a loop round"
+        )
     return tuple(requests)
+
+
+def _resolve_journaled_evidence(
+    *,
+    requests: tuple[EvidenceRequest, ...],
+    controller: EvidenceControllerCallback,
+    round_number: int,
+    source_round_number: int,
+    max_rounds: int,
+    loop: LoopConfig,
+    batch: BatchConfig,
+    paths,
+    evidence_journal_root: Path,
+    session_manager: LLMSessionManager,
+    base_env: Mapping[str, str] | None,
+    process_chain: list[str] | None,
+) -> tuple[
+    tuple[EvidenceResponse, ...],
+    tuple[tuple[EvidenceJournal, EvidenceJournalContext, tuple[EvidenceRequest, ...], str, int], ...],
+]:
+    """Resolve per-worker groups and merge responses into request order."""
+
+    worker_configs = {
+        worker.id: (worker, role)
+        for role, workers in (("proposer", loop.proposers), ("reviewer", loop.reviewers))
+        for worker in workers
+    }
+    groups: dict[str, list[EvidenceRequest]] = {}
+    for request in requests:
+        groups.setdefault(request.worker_id, []).append(request)
+    journal = EvidenceJournal(evidence_journal_root)
+    by_address: dict[tuple[str, str], EvidenceResponse] = {}
+    deliveries = []
+    for worker_id, worker_requests_list in groups.items():
+        worker_requests = tuple(worker_requests_list)
+        worker, role = worker_configs[worker_id]
+        session_key = _worker_session_key(batch.run_id, loop, worker, role)
+        session = session_manager.get_existing(session_key)
+        generation = session.generation if session is not None else 1
+        env = worker_env(worker, base_env=base_env)
+        context = EvidenceJournalContext(
+            journal_root=journal.root,
+            run_id=batch.run_id,
+            lane_id=loop.loop_id,
+            worker_id=worker_id,
+            logical_task_id=f"loop-round-{source_round_number:03d}",
+            source_generation=generation,
+            policy_hash=canonical_hash({
+                "protocol": EVIDENCE_JOURNAL_SCHEMA_VERSION,
+                "controller_evidence_operations": loop.caller_context.get(
+                    "controller_evidence_operations"
+                ),
+                "controller_evidence_policy": loop.caller_context.get(
+                    "controller_evidence_policy"
+                ),
+            }),
+            runtime_hash=runtime_fingerprint(
+                provider=worker.provider,
+                model=worker.model,
+                model_tier=worker.model_tier,
+                env=env,
+                process_chain=process_chain,
+            ),
+        )
+        worker_responses = journal.resolve_round(
+            context,
+            worker_requests,
+            controller,
+            round_number=round_number,
+            max_rounds=max_rounds,
+        )
+        by_address.update({
+            (worker_id, response.request_id): response for response in worker_responses
+        })
+        deliveries.append((journal, context, worker_requests, session_key, generation))
+    return (
+        tuple(by_address[(request.worker_id, request.request_id)] for request in requests),
+        tuple(deliveries),
+    )
 
 
 def _unresolved_evidence_responses(

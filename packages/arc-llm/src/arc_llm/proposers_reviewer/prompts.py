@@ -67,7 +67,7 @@ def render_prompt(worker: WorkerConfig, context: dict[str, Any]) -> str:
         sections.extend(
             [
                 "## Controller Evidence Protocol",
-                "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a worker-prefixed request_id unique in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. "
+                "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a request_id unique for this worker in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. "
                 + (
                     "Except for arc-paper-worker, do not invoke shell commands, ARC CLIs, or MCP tools yourself."
                     if paper_cli_access == "full"

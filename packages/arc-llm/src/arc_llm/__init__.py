@@ -16,6 +16,21 @@ from .evidence import (
     evidence_requests_from_output,
     resolve_evidence_round,
 )
+from .evidence_journal import (
+    SCHEMA_VERSION as EVIDENCE_JOURNAL_SCHEMA_VERSION,
+    STATES as EVIDENCE_JOURNAL_STATES,
+    EvidenceExecution,
+    EvidenceJournal,
+    EvidenceJournalAction,
+    EvidenceJournalAddress,
+    EvidenceJournalContext,
+    EvidenceJournalCorruptError,
+    EvidenceJournalError,
+    EvidenceJournalRecoveryError,
+    EvidenceJournalStaleError,
+    EvidenceOperationPolicy,
+    canonical_hash as evidence_identity_hash,
+)
 from .failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from .host import HostDetection, ProviderSelection, detect_host, select_llm_provider
 from .model import ModelTierError, resolve_model
@@ -60,6 +75,18 @@ __all__ = [
     "HostDetection",
     "EVIDENCE_REQUESTS_FIELD",
     "EvidenceControllerCallback",
+    "EvidenceExecution",
+    "EVIDENCE_JOURNAL_SCHEMA_VERSION",
+    "EVIDENCE_JOURNAL_STATES",
+    "EvidenceJournal",
+    "EvidenceJournalAction",
+    "EvidenceJournalAddress",
+    "EvidenceJournalContext",
+    "EvidenceJournalCorruptError",
+    "EvidenceJournalError",
+    "EvidenceJournalRecoveryError",
+    "EvidenceJournalStaleError",
+    "EvidenceOperationPolicy",
     "EvidenceProtocolError",
     "EvidenceRequest",
     "EvidenceResponse",
@@ -84,6 +111,7 @@ __all__ = [
     "disposition_error_kwargs",
     "allow_evidence_requests",
     "evidence_requests_from_output",
+    "evidence_identity_hash",
     "failure_disposition",
     "install_signal_cancel_chain",
     "resolve_llm_config",

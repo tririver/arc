@@ -64,7 +64,7 @@ def render_initial_worker_prompt(
     ]
     if worker.evidence_enabled:
         static_parts.append(
-            "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a worker-prefixed request_id unique in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. Do not invoke shell commands, ARC CLIs, or MCP tools yourself."
+            "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a request_id unique for this worker in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. Do not invoke shell commands, ARC CLIs, or MCP tools yourself."
         )
     static_prefix = "\n".join(static_parts).rstrip() + "\n\n"
     variable_suffix = "\n".join(
@@ -235,14 +235,16 @@ def _evidence_responses(correspondence: list[dict[str, Any]], *, worker_id: str)
             continue
         exchanges = event.get("exchanges", [])
         if not isinstance(exchanges, list):
-            return []
-        return [
+            continue
+        addressed = [
             strip_arc_llm_call_records(exchange)
             for exchange in exchanges
             if isinstance(exchange, dict)
             and isinstance(exchange.get("request"), dict)
             and exchange["request"].get("worker_id") == worker_id
         ]
+        if addressed:
+            return addressed
     return []
 
 

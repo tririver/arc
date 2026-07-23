@@ -49,6 +49,10 @@ class RunPaths:
     def call_records(self) -> Path:
         return self.run_root / "call_records.jsonl"
 
+    @property
+    def evidence_journal_root(self) -> Path:
+        return self.run_root / "evidence-journal"
+
     def loop(self, loop_id: str) -> "LoopPaths":
         return LoopPaths(run_root=self.run_root, loop_id=loop_id)
 
