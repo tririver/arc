@@ -79,25 +79,36 @@ def test_kimi_cli_text_json_stateful_resume_and_auto_detection():
     )
     assert explicit_text.stdout.strip()
 
-    stateful_base = [
-        "run-json",
-        "--provider",
-        "kimi-code-cli",
-        "--schema",
-        str(schema_path),
-        "--session-policy",
-        "stateful",
-        "--session-root",
-        str(session_root),
-        "--session-key",
-        "smoke/kimi-code-cli",
-        "--json",
-    ]
-    first = _json_stdout(
-        _run_cli([*stateful_base, "--prompt", str(first_prompt)], env=env, cwd=work_dir)
+    from arc_llm.runner import run_json
+    from arc_llm.sessions import LLMSessionManager
+
+    session_manager = LLMSessionManager(session_root)
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    first = run_json(
+        first_prompt.read_text(encoding="utf-8"),
+        schema=schema,
+        provider="kimi-code-cli",
+        env=env,
+        session_policy="stateful",
+        session_manager=session_manager,
+        session_key="smoke/kimi-code-cli",
+        artifact_dir=run_root / "json-first-call",
+        idempotency_key="kimi-cli-smoke-first",
+        idle_timeout_seconds=300,
+        progress_contract_scope="session",
     )
-    second = _json_stdout(
-        _run_cli([*stateful_base, "--prompt", str(second_prompt)], env=env, cwd=work_dir)
+    second = run_json(
+        second_prompt.read_text(encoding="utf-8"),
+        schema=schema,
+        provider="kimi-code-cli",
+        env=env,
+        session_policy="stateful",
+        session_manager=session_manager,
+        session_key="smoke/kimi-code-cli",
+        artifact_dir=run_root / "json-resume-call",
+        idempotency_key="kimi-cli-smoke-resume",
+        idle_timeout_seconds=300,
+        progress_contract_scope="session",
     )
 
     assert first["ok"] is True
