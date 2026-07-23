@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -55,6 +56,33 @@ def main(argv: list[str] | None = None) -> int:
         "--no-internet",
         action="store_true",
         help="disable internet access independently of MCP access",
+    )
+    build.add_argument(
+        "--arc-paper-access",
+        choices=("none", "full"),
+        default=None,
+        help="ARC-paper access; full uses the Controller broker by default.",
+    )
+    legacy_paper = build.add_mutually_exclusive_group()
+    legacy_paper.add_argument(
+        "--arc-paper-cli",
+        dest="arc_paper_cli_access",
+        action="store_const",
+        const="full",
+        default=None,
+        help="Deprecated alias for --arc-paper-access full.",
+    )
+    legacy_paper.add_argument(
+        "--no-arc-paper-cli",
+        dest="arc_paper_cli_access",
+        action="store_const",
+        const="none",
+        help="Deprecated alias for --arc-paper-access none.",
+    )
+    build.add_argument(
+        "--arc-paper-direct-shell",
+        action="store_true",
+        help="Explicitly request trusted nested-shell ARC-paper access.",
     )
     build.add_argument(
         "--inherit-host-tools",
@@ -194,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
 def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "build":
         from .pipeline import BuildOptions, build_companion as pipeline_build_companion
+        from arc_llm.paper_access_policy import resolve_arc_paper_access
 
         defaulted = args.annotation_language is None
         language = args.annotation_language or DEFAULT_LANGUAGE
@@ -215,6 +244,19 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(
                     "--force no longer regenerates companion content; use --regenerate LANE"
                 )
+            paper_access = resolve_arc_paper_access(
+                {
+                    "arc_paper_access": args.arc_paper_access,
+                    "arc_paper_cli_access": args.arc_paper_cli_access,
+                },
+                os.environ,
+            )
+            for warning in paper_access.warnings:
+                print(
+                    f"WARNING: {warning}: use --arc-paper-access instead of the "
+                    "deprecated ARC-paper CLI access alias.",
+                    file=sys.stderr,
+                )
             options = BuildOptions(
                 paper_id=args.paper_id,
                 project_dir=project_dir,
@@ -230,6 +272,8 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 domain_id=args.domain_id,
                 domain_manifest=Path(args.domain_manifest) if args.domain_manifest else None,
                 allow_internet=not args.no_internet,
+                arc_paper_access=paper_access.access,
+                arc_paper_direct_shell=args.arc_paper_direct_shell,
                 inherit_host_tools=args.inherit_host_tools,
                 skip_translation=args.skip_translation,
                 context_paper_ids=tuple(args.context_paper_id),

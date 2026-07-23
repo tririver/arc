@@ -12,7 +12,7 @@ from arc_paper import capabilities, cli, service
 def test_catalog_publishes_strict_valid_schemas_and_effect_classification():
     document = capabilities.catalog_document()
 
-    assert document["schema_version"] == "arc.paper.capability-catalog.v1"
+    assert document["schema_version"] == "arc.paper.capability-catalog.v2"
     assert len(document["operations"]) == len(capabilities.OPERATION_CATALOG) == 42
     assert [item["name"] for item in document["operations"]] == sorted(
         capabilities.OPERATION_CATALOG
@@ -22,7 +22,11 @@ def test_catalog_publishes_strict_valid_schemas_and_effect_classification():
         Draft202012Validator.check_schema(operation["result"]["schema"])
         assert operation["parameters"]["additionalProperties"] is False
         assert set(operation["classification"]) == {
-            "execution", "network", "cache", "llm", "job", "destructive", "admin"
+            "execution", "network", "cache", "llm", "job", "destructive", "admin",
+            "recovery",
+        }
+        assert operation["classification"]["recovery"] in {
+            "idempotent", "transactional", "managed_job",
         }
         assert operation["id"] == f"arc-paper.{operation['name']}.v1"
         assert operation["version"] == 1
@@ -47,6 +51,7 @@ def test_catalog_publishes_strict_valid_schemas_and_effect_classification():
     assert batch.cache_access == "read-write"
     assert batch.uses_llm is True
     assert batch.is_job is True
+    assert batch.recovery_class == "managed_job"
 
     removal = capabilities.get_operation_spec("cache.remove")
     assert removal is not None
@@ -58,6 +63,11 @@ def test_catalog_publishes_strict_valid_schemas_and_effect_classification():
     assert batch_create is not None
     assert batch_create.destructive is True
     assert batch_create.as_dict()["authorization"]["supervision_required"] is True
+    assert batch_create.recovery_class == "managed_job"
+
+    mark = capabilities.get_operation_spec("mark-parsed-equation")
+    assert mark is not None
+    assert mark.recovery_class == "transactional"
 
 
 def _subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:

@@ -82,10 +82,11 @@ support, and detected risk categories and paths without printing configuration
 values or credentials.
 
 Codex and Claude internal workers disable inherited MCP, skills, plugins,
-rules, and other host configuration by default. An ordinary worker receives
-direct `arc-paper-worker` instructions only when the runtime reports
-`nested_sandboxed_shell=true`; otherwise deterministic reads go through the
-Controller evidence protocol. Claude and Kimi are not treated as proven
+rules, and other host configuration by default. ARC-paper access is canonical
+`none|full`; `full` uses the Controller evidence protocol by default and does
+not stage a direct worker. Direct `arc-paper-worker` instructions require an
+explicit direct-shell request and `nested_sandboxed_shell=true`. Claude and
+Kimi are not treated as proven
 sandboxed shells. Generic `arc-llm` callers may opt in
 to all host tools with `--inherit-host-tools`; this is a high-risk per-run
 choice, is fingerprinted for audit/resume checks, and is not an ARC workflow
@@ -103,17 +104,21 @@ Text output:
 arc-llm run-text --prompt-text "Say hello" --provider auto
 ```
 
-New ordinary calls enable paper CLI access by default. Use
-`--no-arc-paper-cli` for an isolated call, or `--arc-paper-cli` to state the
-default explicitly. Schema formatting, output recovery, provider preflight,
+New ordinary calls default to `--arc-paper-access full`, meaning Controller
+paper access where the embedding workflow supplies a Broker. Use
+`--arc-paper-access none` for an isolated call. The deprecated
+`--arc-paper-cli`/`--no-arc-paper-cli` flags remain equal-value aliases during
+migration; conflicting canonical and legacy settings fail before a provider or
+session starts. Direct shell is a separate explicit trusted opt-in. Schema formatting, output recovery, provider preflight,
 and blind-reference workers always disable it regardless of ordinary runtime
 configuration. Checkpoints created before the access field existed resume as
 `none` instead of silently gaining access.
 
-For Codex `read-only` and `workspace-write`, ARC caches a short, harmless
-`codex sandbox` probe with network disabled. A namespace denial disables only
-the inner worker shell: it does not fail the model/provider call, switch
-providers, enable `danger-full-access`, or affect the outer ARC CLI. Doctor
+For an explicit direct request on Codex `read-only` or `workspace-write`, ARC
+caches a short, harmless `codex sandbox` probe with network disabled. Without
+that request no shell probe runs. A namespace denial blocks the explicit direct
+request before the paid call; it does not switch providers, enable
+`danger-full-access`, or affect the outer ARC CLI. Doctor
 output reports only the stable capability classification and bounded receipt
 metadata, never the probe command, environment, or raw output.
 
@@ -269,8 +274,9 @@ and injects only the addressed worker's exchanges into its next turn. Empty
 arrays are no-ops, malformed requests fail the loop, and resolver calls stop
 after three evidence rounds. A request in the final configured worker round is
 recorded with `no_followup_round` instead of being resolved, because no later
-turn could consume it. Workers with a proven nested shell may call only the
-bounded paper worker; other workers never call ARC CLI, shell, or MCP tools.
+turn could consume it. Controller evidence is the default. Only an explicit
+direct request with a proven nested shell may call the bounded cache-only paper
+worker; other workers never call ARC CLI, shell, or MCP tools.
 
 The ideas workflow installs an `arc-paper` service resolver by default. Its
 portable operations are `paper.metadata`, `paper.section`,

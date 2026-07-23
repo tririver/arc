@@ -17,6 +17,7 @@ from urllib.parse import quote
 import fcntl
 
 from .ids import normalize_paper_id, paper_ids_safe_dir_name
+from .runtime_context import current_worker_call_id, current_worker_session
 from .worker_guard import in_worker_context, wrapper_call_authorized
 
 
@@ -83,6 +84,8 @@ def cache_root() -> Path:
         raise PermissionError(
             "paper_worker_wrapper_required: model workers must access the paper cache through arc-paper-worker"
         )
+    if session := current_worker_session():
+        return Path(session.overlay_root)
     if value := os.environ.get("ARC_PAPER_CACHE"):
         return Path(value).expanduser()
     if value := os.environ.get("ARC_HOME"):
@@ -103,19 +106,32 @@ def resolve_cache_read_path(path: Path) -> Path | None:
 
     if path.exists():
         return path
-    base_value = os.environ.get("ARC_PAPER_WORKER_BASE_CACHE")
-    if not base_value:
+    session = current_worker_session()
+    base_root = (
+        Path(session.base_root)
+        if session is not None else
+        Path(value).expanduser()
+        if (value := os.environ.get("ARC_PAPER_WORKER_BASE_CACHE")) else
+        None
+    )
+    if base_root is None:
         return None
     try:
         relative = path.resolve(strict=False).relative_to(cache_root().resolve(strict=False))
     except ValueError:
         return None
-    tombstone_root = os.environ.get("ARC_PAPER_WORKER_TOMBSTONE_DIR")
+    tombstone_root = (
+        Path(session.tombstone_root)
+        if session is not None else
+        Path(value).expanduser()
+        if (value := os.environ.get("ARC_PAPER_WORKER_TOMBSTONE_DIR")) else
+        None
+    )
     if tombstone_root:
         digest = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()
-        if (Path(tombstone_root) / f"{digest}.json").exists():
+        if (tombstone_root / f"{digest}.json").exists():
             return None
-    candidate = Path(base_value).expanduser() / relative
+    candidate = base_root / relative
     return candidate if candidate.exists() else None
 
 
@@ -134,9 +150,16 @@ def iter_cache_paths(relative_dir: str | Path, pattern: str = "*") -> list[Path]
     if overlay_dir.is_dir():
         for path in overlay_dir.glob(pattern):
             visible[path.relative_to(overlay_dir).as_posix()] = path
-    base_value = os.environ.get("ARC_PAPER_WORKER_BASE_CACHE")
-    if base_value:
-        base_dir = Path(base_value).expanduser() / directory
+    session = current_worker_session()
+    base_root = (
+        Path(session.base_root)
+        if session is not None else
+        Path(value).expanduser()
+        if (value := os.environ.get("ARC_PAPER_WORKER_BASE_CACHE")) else
+        None
+    )
+    if base_root is not None:
+        base_dir = base_root / directory
         if base_dir.is_dir():
             for path in base_dir.glob(pattern):
                 key = path.relative_to(base_dir).as_posix()
@@ -313,9 +336,22 @@ def write_bytes(path: Path, data: bytes) -> None:
 def _worker_cache_write_guard(path: Path):
     """Lock and attribute one worker cache write to its active CLI call."""
 
-    call_id = os.environ.get("ARC_PAPER_WORKER_CALL_ID", "").strip()
-    session_dir = os.environ.get("ARC_PAPER_WORKER_SESSION_DIR", "").strip()
-    if not call_id or not session_dir or not os.environ.get("ARC_PAPER_WORKER_BASE_CACHE"):
+    session = current_worker_session()
+    call_id = (
+        current_worker_call_id()
+        or os.environ.get("ARC_PAPER_WORKER_CALL_ID", "")
+    ).strip()
+    session_dir = (
+        str(session.run_root)
+        if session is not None else
+        os.environ.get("ARC_PAPER_WORKER_SESSION_DIR", "").strip()
+    )
+    base_root = (
+        str(session.base_root)
+        if session is not None else
+        os.environ.get("ARC_PAPER_WORKER_BASE_CACHE", "")
+    )
+    if not call_id or not session_dir or not base_root:
         yield
         return
     overlay = cache_root().resolve(strict=False)
@@ -336,7 +372,11 @@ def _worker_cache_write_guard(path: Path):
                 content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
                 record = {
                     "schema_version": "arc.paper.worker-session.v1",
-                    "session_id": os.environ.get("ARC_PAPER_WORKER_SESSION_ID", ""),
+                    "session_id": (
+                        str(session.session_id)
+                        if session is not None else
+                        os.environ.get("ARC_PAPER_WORKER_SESSION_ID", "")
+                    ),
                     "writer_call_id": call_id,
                     "writer": "arc_paper.cache.v1",
                     "relative_path": relative.as_posix(),

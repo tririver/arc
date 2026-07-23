@@ -80,6 +80,86 @@ def test_invalid_or_tampered_artifact_is_quarantined(tmp_path):
     assert json.loads(record.read_text(encoding="utf-8"))["reason"] == "content_hash_mismatch"
 
 
+def test_call_scoped_promotion_is_all_or_none_and_keeps_other_calls(tmp_path):
+    session = make_session(tmp_path)
+    with session.call_scope("call-a"):
+        valid_a = session.stage_bytes(
+            "sources/a.json",
+            b'{"paper_id":"a","source_hash":"a","parser_version":1}',
+            source={"provider": "fake"},
+        )
+        invalid_a = session.stage_bytes(
+            "sources/a-bad.json",
+            b'{"paper_id":"a","source_hash":"a","parser_version":1}',
+            source={"provider": "fake"},
+        )
+    invalid_a.write_bytes(b"tampered")
+    with session.call_scope("call-b"):
+        session.stage_bytes(
+            "sources/b.json",
+            b'{"paper_id":"b","source_hash":"b","parser_version":1}',
+            source={"provider": "fake"},
+        )
+
+    failed = session.promote_call("call-a")
+    assert failed.quarantined == ("sources/a-bad.json",)
+    assert valid_a.exists()
+    assert not (session.base_root / "sources/a.json").exists()
+    assert not (session.base_root / "sources/b.json").exists()
+
+    other = session.promote_call("call-b")
+    assert other.promoted == ("sources/b.json",)
+    assert (session.base_root / "sources/b.json").exists()
+
+
+def test_malformed_owned_tombstone_blocks_call_promotion(tmp_path):
+    session = make_session(tmp_path)
+    target = session.base_root / "sources/old.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("old", encoding="utf-8")
+    with session.call_scope("call-a"):
+        staged = session.stage_bytes(
+            "sources/new.json",
+            b'{"paper_id":"new","source_hash":"new","parser_version":1}',
+            source={"provider": "fake"},
+        )
+        session.tombstone(
+            "sources/old.json", source={"operation": "cache remove"},
+        )
+    marker = next(session.tombstone_root.glob("*.json"))
+    value = json.loads(marker.read_text(encoding="utf-8"))
+    value["operation"] = ""
+    marker.write_text(json.dumps(value), encoding="utf-8")
+
+    result = session.promote_call("call-a")
+
+    assert result.promoted == ()
+    assert result.deleted == ()
+    assert result.quarantined
+    assert staged.exists()
+    assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_source_identity_namespace_promotes_under_call_scope(tmp_path):
+    session = make_session(tmp_path)
+    with session.call_scope("call-source"):
+        session.stage_bytes(
+            "source-identities/0911.3380.json",
+            json.dumps({
+                "schema_version": "arc.parsed-source.identity.v1",
+                "paper_id": "arXiv:0911.3380",
+                "source_hash": "a" * 64,
+                "parser_version": 1,
+            }).encode("utf-8"),
+            source={"provider": "fake"},
+        )
+
+    result = session.promote_call("call-source")
+
+    assert result.promoted == ("source-identities/0911.3380.json",)
+    assert (session.base_root / result.promoted[0]).is_file()
+
+
 def test_finish_call_promotes_after_failure_and_audit_redacts_secrets(tmp_path):
     session = make_session(tmp_path)
     with session.activated(), session.call_scope("call-3"):

@@ -127,6 +127,56 @@ def test_old_recovery_options_keep_translation_enabled(tmp_path: Path) -> None:
     assert recovered.recovery_policy == "auto"
 
 
+def test_arc_paper_access_round_trips_and_old_recovery_defaults_full(
+    tmp_path: Path,
+) -> None:
+    original = BuildOptions(
+        paper_id="local:skip-translation",
+        project_dir=tmp_path,
+        arc_paper_access="none",
+    )
+
+    serialized = _recovery_options(original)
+    recovered = _options_from_recovery(tmp_path, serialized)
+    old = _options_from_recovery(
+        tmp_path, {"paper_id": "local:skip-translation", "workers": 1},
+    )
+    legacy = _options_from_recovery(
+        tmp_path,
+        {
+            "paper_id": "local:skip-translation",
+            "arc_paper_cli_access": "none",
+        },
+    )
+
+    assert serialized["arc_paper_access"] == "none"
+    assert "arc_paper_cli_access" not in serialized
+    assert recovered.arc_paper_access == "none"
+    assert old.arc_paper_access == "full"
+    assert legacy.arc_paper_access == "none"
+
+
+def test_arc_paper_recovery_rejects_alias_conflict_and_direct_none(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="conflicts"):
+        _options_from_recovery(
+            tmp_path,
+            {
+                "paper_id": "local:skip-translation",
+                "arc_paper_access": "full",
+                "arc_paper_cli_access": "none",
+            },
+        )
+    with pytest.raises(ValueError, match="requires arc_paper_access=full"):
+        _options_from_recovery(
+            tmp_path,
+            {
+                "paper_id": "local:skip-translation",
+                "arc_paper_access": "none",
+                "arc_paper_direct_shell": True,
+            },
+        )
+
+
 def test_recovery_policy_round_trips_and_validates(tmp_path: Path) -> None:
     original = BuildOptions(
         paper_id="local:skip-translation",

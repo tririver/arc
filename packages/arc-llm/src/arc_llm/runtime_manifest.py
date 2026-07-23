@@ -8,12 +8,14 @@ from typing import Any, Mapping
 
 from .schema_cache import canonical_json, sha256_text
 from .nested_shell_capability import capability_runtime_identity
+from .paper_access_policy import resolve_arc_paper_access
 
 
 RUNTIME_MANIFEST_VERSION = "arc.llm.runtime_manifest.v2"
 
 _SHARED_RECIPE_KEYS = {
-    "ARC_PAPER_CLI_ACCESS",
+    "ARC_PAPER_ACCESS",
+    "ARC_PAPER_DIRECT_SHELL",
     "ARC_LLM_INHERIT_HOST_TOOLS",
     "ARC_LLM_HOST_TOOLS_RISK",
     "ARC_LLM_WORKER_CONTEXT",
@@ -59,6 +61,7 @@ _BOOLEAN_KEYS = {
     "ARC_CLAUDE_ALLOW_MCP", "ARC_CLAUDE_STRICT_MCP_CONFIG", "ARC_CLAUDE_BARE",
     "ARC_CLAUDE_EXCLUDE_DYNAMIC_SYSTEM_PROMPT_SECTIONS", "ARC_CLAUDE_ALLOW_INTERNET",
     "ARC_LLM_INHERIT_HOST_TOOLS", "ARC_LLM_WORKER_CONTEXT",
+    "ARC_PAPER_DIRECT_SHELL",
 }
 
 
@@ -77,13 +80,15 @@ def runtime_manifest(
     """
 
     source = os.environ if env is None and provider == "kimi-code-cli" else (env or {})
+    access = resolve_arc_paper_access(env=source)
     keys = _PROVIDER_RECIPE_KEYS.get(provider, set()) | _SHARED_RECIPE_KEYS
     recipe_env = {
         key: normalized
         for key in sorted(keys)
         if (normalized := _normalize_env_value(key, source.get(key))) is not None
     }
-    if recipe_env.get("ARC_PAPER_CLI_ACCESS") in {None, "none"}:
+    recipe_env["ARC_PAPER_ACCESS"] = access.access
+    if access.access == "none":
         for key in (
             "ARC_LLM_WORKER_CONTEXT", "ARC_PAPER_CACHE", "ARC_PAPER_WORKER_BASE_CACHE",
             "ARC_PAPER_WORKER_SESSION_DIR", "ARC_PAPER_WORKER_TOMBSTONE_DIR",
@@ -122,8 +127,6 @@ def _normalize_env_value(key: str, value: str | None) -> Any:
             return True
         return normalized
     if value is None or not str(value).strip():
-        return None
-    if key == "ARC_PAPER_CLI_ACCESS" and str(value).strip().lower() == "none":
         return None
     if key == "ARC_LLM_HOST_TOOLS_RISK" and str(value).strip().lower() == "none":
         return None

@@ -61,7 +61,12 @@ def render_initial_worker_prompt(
         "## ARC Paper Access",
         (
             NESTED_SHELL_PROMPT_MARKER
-            if str(worker.runtime.get("arc_paper_cli_access", "full")) == "full"
+            if (
+                str(worker.runtime.get("arc_paper_access", "full")) == "full"
+                and bool(worker.runtime.get("arc_paper_direct_shell", False))
+            )
+            else "Use structured Controller evidence requests for ARC-paper access."
+            if str(worker.runtime.get("arc_paper_access", "full")) == "full"
             else "Direct paper CLI access is disabled for this worker."
         ),
         "",

@@ -30,7 +30,12 @@ from arc_llm.providers.base import (
     LLMWorkerError,
 )
 from arc_llm.progress_prompt import ensure_runtime_progress_contract
-from arc_llm.sessions import LLMSessionManager, runtime_fingerprint
+from arc_llm.paper_access_policy import PAPER_ACCESS_LEGACY_WARNING
+from arc_llm.sessions import (
+    LLMSessionManager,
+    legacy_runtime_fingerprint,
+    runtime_fingerprint,
+)
 from arc_llm.schema_cache import sha256_text
 from arc_llm.structured_recovery import structured_metadata
 from arc_llm import runner
@@ -1207,7 +1212,7 @@ def test_call_record_v5_requires_warnings_and_existing_provider_emits_empty_list
 
     assert ARC_LLM_CALL_RECORD_SCHEMA_VERSION == "arc.llm.call_record.v5"
     assert "warnings" in ARC_LLM_CALL_RECORD_SCHEMA["required"]
-    assert record["warnings"] == ["nested_shell.helper_missing"]
+    assert record["warnings"] == []
 
 
 def test_kimi_config_warnings_propagate_to_call_record(monkeypatch):
@@ -1739,7 +1744,7 @@ def test_run_json_explicit_provider_does_not_replay_without_proof(tmp_path, monk
 def test_legacy_session_without_capability_metadata_resumes_with_paper_cli_disabled(tmp_path):
     manager = LLMSessionManager(tmp_path / "sessions")
     legacy_env = {"ARC_AGENT_HOST": "codex"}
-    legacy_fp = runtime_fingerprint(
+    legacy_fp = legacy_runtime_fingerprint(
         provider="codex-cli",
         model="m",
         model_tier=None,
@@ -1762,8 +1767,9 @@ def test_legacy_session_without_capability_metadata_resumes_with_paper_cli_disab
         idempotency_key=None,
     )
     assert env["ARC_PAPER_CLI_ACCESS"] == "none"
-    assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "none"
-    assert runtime_fingerprint(
+    assert env["ARC_PAPER_ACCESS"] == "none"
+    assert metadata["arc_runtime_capabilities"]["arc_paper_access"] == "none"
+    assert legacy_runtime_fingerprint(
         provider="codex-cli", model="m", model_tier=None, env=env
     ) == legacy_fp
 
@@ -1799,6 +1805,7 @@ def test_new_call_constructs_shared_paper_overlay_before_submission(tmp_path):
     env, metadata = runner._runtime_compatibility_policy(
         {
             "ARC_PAPER_CLI_ACCESS": "full",
+            "ARC_PAPER_DIRECT_SHELL": "true",
             "ARC_PAPER_CACHE": str(base_cache),
             "ARC_CODEX_ADD_DIRS": '["/unrelated"]',
         },
@@ -1826,12 +1833,33 @@ def test_new_call_constructs_shared_paper_overlay_before_submission(tmp_path):
     assert env["ARC_CODEX_SANDBOX"] == "workspace-write"
     assert env["ARC_CODEX_WORK_DIR"] == str(run_root)
     assert "ARC_CODEX_ADD_DIRS" not in env
-    assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "full"
+    assert metadata["arc_runtime_capabilities"]["arc_paper_access"] == "full"
+    assert metadata["arc_runtime_capabilities"]["arc_paper_access_warnings"] == [
+        PAPER_ACCESS_LEGACY_WARNING
+    ]
+
+
+def test_default_full_controller_route_does_not_stage_direct_worker(tmp_path):
+    env = {
+        "ARC_PAPER_ACCESS": "full",
+        "ARC_PAPER_CACHE": str(tmp_path / "global-paper-cache"),
+    }
+
+    runner._configure_paper_worker_session(
+        env, artifact_dir=tmp_path / "run", session_manager=None,
+    )
+
+    assert env["ARC_PAPER_ACCESS"] == "full"
+    assert "ARC_PAPER_CACHE" not in env
+    assert "ARC_LLM_WORKER_CONTEXT" not in env
+    assert not any(key.startswith("ARC_PAPER_WORKER_") for key in env)
+    assert not (tmp_path / "run" / "paper-cache-overlay").exists()
 
 
 def test_paper_access_policy_is_staged_by_content_hash(tmp_path):
     env = {
         "ARC_PAPER_CLI_ACCESS": "full",
+        "ARC_PAPER_DIRECT_SHELL": "true",
         "ARC_PAPER_CACHE": str(tmp_path / "base"),
         "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON": '["legacy"]',
         "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON": '{"legacy":{}}',
@@ -1872,11 +1900,27 @@ def test_run_text_result_accepts_structured_paper_access_policy(tmp_path, monkey
         return FakeTextResultProvider()
 
     monkeypatch.setattr(runner, "select_provider", select_provider)
+    monkeypatch.setattr(
+        runner,
+        "_resolve_request_nested_shell",
+        lambda _configs, _env: runner.NestedShellCapability(
+            schema_version=runner.NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
+            provider="codex-cli",
+            nested_sandboxed_shell=True,
+            status="available",
+            probe_kind="test",
+            probe_identity="test-probe",
+            warning=None,
+        ),
+    )
     outcome = run_text_result(
         "prompt",
         provider="codex-cli",
         model="fast",
-        env={"ARC_PAPER_CLI_ACCESS": "full"},
+        env={
+            "ARC_PAPER_CLI_ACCESS": "full",
+            "ARC_PAPER_DIRECT_SHELL": "true",
+        },
         process_chain=[],
         artifact_dir=tmp_path / "artifacts",
         paper_access_policy={
@@ -1892,9 +1936,23 @@ def test_run_text_result_accepts_structured_paper_access_policy(tmp_path, monkey
 
 def test_stateful_calls_share_paper_overlay_across_artifact_directories(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "select_provider", lambda provider, **kwargs: FakeResultProvider())
+    monkeypatch.setattr(
+        runner,
+        "_resolve_request_nested_shell",
+        lambda _configs, _env: runner.NestedShellCapability(
+            schema_version=runner.NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
+            provider="codex-cli",
+            nested_sandboxed_shell=True,
+            status="available",
+            probe_kind="test",
+            probe_identity="test-probe",
+            warning=None,
+        ),
+    )
     manager = LLMSessionManager(tmp_path / "sessions")
     env = {
         "ARC_PAPER_CLI_ACCESS": "full",
+        "ARC_PAPER_DIRECT_SHELL": "true",
         "ARC_PAPER_CACHE": str(tmp_path / "global-paper-cache"),
     }
 
@@ -1937,7 +1995,7 @@ def test_stateful_rotated_unused_generation_rebinds_runtime_before_provider(tmp_
         runtime_fingerprint="pre-fix-runtime",
         metadata={
             "arc_runtime_capabilities": {
-                "arc_paper_cli_access": "full",
+                "arc_paper_access": "full",
                 "inherit_host_tools": False,
             }
         },
@@ -1951,6 +2009,7 @@ def test_stateful_rotated_unused_generation_rebinds_runtime_before_provider(tmp_
         provider="codex-cli",
         env={
             "ARC_PAPER_CLI_ACCESS": "full",
+            "ARC_PAPER_DIRECT_SHELL": "false",
             "ARC_PAPER_CACHE": str(tmp_path / "global-paper-cache"),
         },
         process_chain=[],
@@ -1973,7 +2032,11 @@ def test_stateful_rotated_unused_generation_rebinds_runtime_before_provider(tmp_
 def test_new_call_without_artifact_or_session_root_uses_managed_tmp_overlay(tmp_path, monkeypatch):
     monkeypatch.setenv("ARC_LLM_TMP_DIR", str(tmp_path / "llm-tmp"))
     env, metadata = runner._runtime_compatibility_policy(
-        {"ARC_PAPER_CLI_ACCESS": "full", "ARC_LLM_TMP_DIR": str(tmp_path / "llm-tmp")},
+        {
+            "ARC_PAPER_CLI_ACCESS": "full",
+            "ARC_PAPER_DIRECT_SHELL": "true",
+            "ARC_LLM_TMP_DIR": str(tmp_path / "llm-tmp"),
+        },
         session_policy="stateless",
         session_manager=None,
         session_key=None,
@@ -1985,8 +2048,9 @@ def test_new_call_without_artifact_or_session_root_uses_managed_tmp_overlay(tmp_
     metadata["arc_runtime_capabilities"] = runner._runtime_capabilities(env)
 
     assert env["ARC_PAPER_CLI_ACCESS"] == "full"
+    assert env["ARC_PAPER_ACCESS"] == "full"
     assert "paper-worker-isolation/paper-cache-overlay" in env["ARC_PAPER_CACHE"]
-    assert metadata["arc_runtime_capabilities"]["arc_paper_cli_access"] == "full"
+    assert metadata["arc_runtime_capabilities"]["arc_paper_access"] == "full"
 
 
 def test_disabled_paper_cli_hides_inherited_global_cache(tmp_path):
@@ -2002,8 +2066,8 @@ def test_disabled_paper_cli_hides_inherited_global_cache(tmp_path):
         env, artifact_dir=artifact_dir, session_manager=None
     )
 
-    assert env["ARC_PAPER_CACHE"] == str(artifact_dir / "paper-cache-disabled")
-    assert env["ARC_LLM_WORKER_CONTEXT"] == "true"
+    assert "ARC_PAPER_CACHE" not in env
+    assert "ARC_LLM_WORKER_CONTEXT" not in env
     assert "ARC_PAPER_WORKER_BASE_CACHE" not in env
     assert "ARC_PAPER_WORKER_SESSION_DIR" not in env
 
@@ -2012,6 +2076,7 @@ def test_controller_finalizer_uses_session_paths_without_local_auth_tokens(tmp_p
     run_root = tmp_path / "run"
     env = {
         "ARC_PAPER_CLI_ACCESS": "full",
+        "ARC_PAPER_DIRECT_SHELL": "true",
         "ARC_PAPER_CACHE": str(tmp_path / "base"),
         "ARC_LLM_CACHE": str(tmp_path / "llm-cache"),
     }

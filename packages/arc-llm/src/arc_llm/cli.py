@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from .cache_audit import audit_run
 from .host import detect_host, select_llm_provider
 from .paths import llm_cache_root
+from .paper_access_policy import apply_arc_paper_access, resolve_arc_paper_access
 from .proposers_reviewer.template_materializer import materialize_batch
 from .proposers_reviewer.runner import run_proposers_reviewer_batch
 from .proposers_reviewer_bench.runner import run_proposers_reviewer_bench
@@ -407,7 +408,15 @@ def _apply_loop_session_overrides(config: dict[str, Any], args: argparse.Namespa
 
 
 def _apply_loop_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
-    access = getattr(args, "arc_paper_cli_access", None)
+    canonical = getattr(args, "arc_paper_access", None)
+    legacy = getattr(args, "arc_paper_cli_access", None)
+    access = (
+        resolve_arc_paper_access({
+            "arc_paper_access": canonical,
+            "arc_paper_cli_access": legacy,
+        }).access
+        if canonical is not None or legacy is not None else None
+    )
     inherit = bool(getattr(args, "inherit_host_tools", False))
     if access is None and not inherit:
         return
@@ -420,7 +429,8 @@ def _apply_loop_runtime_overrides(config: dict[str, Any], args: argparse.Namespa
                     continue
                 runtime = dict(worker.get("runtime") or {})
                 if access is not None:
-                    runtime["arc_paper_cli_access"] = access
+                    runtime["arc_paper_access"] = access
+                    runtime.pop("arc_paper_cli_access", None)
                 if inherit:
                     runtime["inherit_host_tools"] = True
                 worker["runtime"] = runtime
@@ -459,6 +469,12 @@ def _llm_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _worker_capability_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--arc-paper-access",
+        choices=("none", "full"),
+        default=None,
+        help="Canonical ARC-paper access; full uses the Controller route by default.",
+    )
     paper_cli = parser.add_mutually_exclusive_group()
     paper_cli.add_argument(
         "--arc-paper-cli",
@@ -466,14 +482,14 @@ def _worker_capability_args(parser: argparse.ArgumentParser) -> None:
         action="store_const",
         const="full",
         default=None,
-        help="Allow the non-LLM arc-paper-worker CLI (the default for new ordinary calls).",
+        help="Deprecated alias for --arc-paper-access full.",
     )
     paper_cli.add_argument(
         "--no-arc-paper-cli",
         dest="arc_paper_cli_access",
         action="store_const",
         const="none",
-        help="Disable arc-paper-worker for this call.",
+        help="Deprecated alias for --arc-paper-access none.",
     )
     parser.add_argument(
         "--inherit-host-tools",
@@ -503,11 +519,18 @@ def _remaining_llm_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 def _runtime_env(args: argparse.Namespace) -> dict[str, str] | None:
     overrides: dict[str, str] = {}
-    # Ordinary newly submitted workers receive the paper-only CLI. Isolated
-    # internal stages override this below or at their call site.
-    overrides["ARC_PAPER_CLI_ACCESS"] = (
-        "none" if args.command == "schema-format" else (args.arc_paper_cli_access or "full")
+    # Canonical access is available to caller-owned Controller integrations;
+    # direct worker-shell staging remains a separate explicit opt-in.
+    configured_access = resolve_arc_paper_access(
+        {
+            "arc_paper_access": (
+                "none" if args.command == "schema-format" else args.arc_paper_access
+            ),
+            "arc_paper_cli_access": args.arc_paper_cli_access,
+        },
+        os.environ,
     )
+    apply_arc_paper_access(overrides, configured_access)
     overrides["ARC_LLM_INHERIT_HOST_TOOLS"] = "true" if args.inherit_host_tools else "false"
     if args.allow_internet:
         overrides["ARC_CODEX_ALLOW_INTERNET"] = "true"

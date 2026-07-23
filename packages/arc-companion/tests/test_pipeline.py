@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import jsonschema
 import pytest
@@ -6404,18 +6405,23 @@ def test_guided_reference_policy_does_not_assume_claude_bash_sandbox() -> None:
     )
     assert env["ARC_CLAUDE_TOOLS"] == ""
     assert env["ARC_CLAUDE_ALLOWED_TOOLS"] == ""
-    assert json.loads(env["ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON"]) == [
-        "artifact-read", "get-parsed-toc", "get-parsed-section",
-    ]
-    assert json.loads(env["ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON"]) == {
-        "book": {"sections": ["ch-2"]},
-    }
+    assert env["ARC_PAPER_DIRECT_SHELL"] == "false"
+    assert "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON" not in env
+    assert "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON" not in env
     assert env["ARC_CLAUDE_ALLOW_MCP"] == "false"
     assert env["ARC_LLM_INHERIT_HOST_TOOLS"] == "false"
 
 
+@pytest.mark.parametrize(
+    ("provider", "denied_status"),
+    [
+        pytest.param("codex-cli", "namespace_denied", id="codex-namespace-denied"),
+        pytest.param("claude-cli", "provider_unsupported", id="claude-without-bash"),
+        pytest.param("kimi-code-cli", "provider_unsupported", id="kimi-reverse-denied"),
+    ],
+)
 def test_guided_stateless_call_uses_controller_evidence_fallback(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, provider: str, denied_status: str,
 ) -> None:
     from arc_llm import EvidenceJournal, EvidenceJournalContext, EvidenceResponse
     from arc_companion.intent_guidance import (
@@ -6460,22 +6466,38 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
         return {"answer": "done", "arc_evidence_requests": []}
 
     resolver_calls = []
-    def resolve_evidence(_artifact, requests, *, round_number, lane=None):
-        resolver_calls.append(tuple(requests))
-        return tuple(
-            EvidenceResponse(
-                request.request_id, True, {
-                    "content": "cached chapter "
-                    + "x" * int(request.arguments.get("limit", 46 * 1024)),
-                },
-                provenance={"provider": "local-cache", "round": round_number},
-            )
-            for request in requests
-        )
+
+    def resolve_evidence(operation, arguments, **_kwargs):
+        resolver_calls.append((operation, dict(arguments)))
+        return {
+            "ok": True,
+            "data": {
+                "content": "cached chapter "
+                + "x" * int(arguments.get("limit", 46 * 1024)),
+            },
+            "errors": [],
+            "meta": {},
+        }
+
     monkeypatch.setattr(
-        pipeline_module, "resolve_worker_evidence_requests",
-        resolve_evidence,
+        "arc_companion.paper_broker.dispatch_operation", resolve_evidence,
     )
+    from arc_llm import runner as runner_module
+
+    real_prepare_runtime_prompt = runner_module.prepare_runtime_prompt
+
+    def prepare_with_denied_shell(*args, **kwargs):
+        prepared, prefix, _capability = real_prepare_runtime_prompt(*args, **kwargs)
+        return prepared, prefix, {
+            "nested_sandboxed_shell": False,
+            "nested_shell_status": denied_status,
+            "nested_shell_probe_id": f"fake-{provider}-{denied_status}",
+        }
+
+    monkeypatch.setattr(
+        runner_module, "prepare_runtime_prompt", prepare_with_denied_shell,
+    )
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "paper-cache"))
     round_audits = []
     journal_context = EvidenceJournalContext(
         journal_root=tmp_path / "checkpoint" / "evidence-journal",
@@ -6492,7 +6514,9 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
             "type": "object", "additionalProperties": False,
             "required": ["answer"], "properties": {"answer": {"type": "string"}},
         },
-        options=BuildOptions(paper_id="local:x", project_dir=tmp_path),
+        options=BuildOptions(
+            paper_id="local:x", project_dir=tmp_path, provider=provider,
+        ),
         artifact_dir=tmp_path / "llm", call_label="guided", model_tier="medium",
         paper_access_policy=pipeline_module.worker_policy_descriptor(artifact),
         intent_guidance=artifact,
@@ -6509,14 +6533,15 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
     assert result == {"answer": "done"}
     assert len(calls) == 2
     assert "CONTROLLER REFERENCE EVIDENCE ROUND" in calls[1][0]
+    assert all("arc-paper-worker" not in prompt for prompt, _kwargs in calls)
     assert len(calls[1][0].encode("utf-8")) <= 61_440
     assert "arc_evidence_requests" in calls[0][1]["schema"]["properties"]
     assert round_audits[0]["budget_class"] == "evidence_headroom"
     assert round_audits[0]["strict_headroom_bytes"] >= 0
     assert len(resolver_calls) == 1
-    bounded_request = resolver_calls[0][0]
+    assert resolver_calls[0][0] == "get-parsed-section"
     receipt = EvidenceJournal(journal_context.journal_root).read_receipt(
-        journal_context.address(bounded_request.request_id, evidence_round=1)
+        journal_context.address("r1", evidence_round=1)
     )
     assert receipt["state"] == "delivered"
     assert receipt["deliveries"][0]["followup_id"] == (
@@ -6524,17 +6549,30 @@ def test_guided_stateless_call_uses_controller_evidence_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    ("provider", "denied_status"),
+    [
+        pytest.param("codex-cli", "namespace_denied", id="codex-namespace-denied"),
+        pytest.param("claude-cli", "provider_unsupported", id="claude-without-bash"),
+        pytest.param("kimi-code-cli", "provider_unsupported", id="kimi-reverse-denied"),
+    ],
+)
 def test_guided_stateful_call_uses_controller_evidence_delta(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, provider: str, denied_status: str,
 ) -> None:
     from arc_llm import EvidenceJournal, EvidenceJournalContext, EvidenceResponse
+    from arc_companion.intent_guidance import (
+        INTENT_GUIDANCE_VERSION,
+        _target_catalog_metadata,
+        _worker_payload_unvalidated,
+    )
 
     class Outcome:
         def __init__(self, value):
             self.value = value
 
     artifact = {
-        "schema_version": "arc.companion.intent-guidance.v1",
+        "schema_version": INTENT_GUIDANCE_VERSION,
         "semantic_input_sha256": "s" * 64,
         "user_intent_sha256": "u" * 64,
         "output_sha256": "o" * 64,
@@ -6548,14 +6586,13 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
             "source_id": "book", "source_hash": "v1", "document_hash": "v1",
             "metadata": {}, "toc": [{"locator": "ch-2", "title": "Two"}],
         }],
-        "worker_payload": {
-            "guidance": "Use the selected terminology.",
-            "reference_targets": [{
-                "source_id": "book", "locator": "ch-2", "purpose": "terms",
-                "lanes": ["translation"],
-            }],
-        },
     }
+    artifact["target_catalog"] = _target_catalog_metadata(
+        artifact["reference_targets"]
+    )
+    artifact["worker_payload"] = _worker_payload_unvalidated(
+        artifact, lane=None
+    )
     initial = Outcome({
         "answer": "pending",
         "arc_evidence_requests": [{
@@ -6571,28 +6608,50 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
         return Outcome({"answer": "done", "arc_evidence_requests": []})
 
     resolver_calls = []
-    def resolve_stateful(_artifact, requests, *, round_number, lane=None):
-        resolver_calls.append(tuple(requests))
-        return tuple(
-            EvidenceResponse(
-                request.request_id, True, {"content": "cached chapter"},
-                provenance={"provider": "local-cache", "lane": lane},
-            )
-            for request in requests
-        )
+
+    def resolve_stateful(operation, arguments, **_kwargs):
+        resolver_calls.append((operation, dict(arguments)))
+        return {
+            "ok": True,
+            "data": {"content": "cached chapter"},
+            "errors": [],
+            "meta": {},
+        }
+
     monkeypatch.setattr(
-        pipeline_module, "resolve_worker_evidence_requests",
-        resolve_stateful,
+        "arc_companion.paper_broker.dispatch_operation", resolve_stateful,
     )
+    monkeypatch.setenv("ARC_PAPER_CACHE", str(tmp_path / "paper-cache"))
     journal_context = EvidenceJournalContext(
         journal_root=tmp_path / "checkpoint" / "evidence-journal",
         run_id="f" * 64,
         lane_id="translation",
         worker_id="translation-1",
-        logical_task_id="translation:segment-1:generation-1",
+        logical_task_id=f"translation:{provider}:segment-1:generation-1",
         source_generation=1,
         policy_hash="policy-hash",
         runtime_hash="runtime-hash",
+    )
+    broker_options = BuildOptions(paper_id="local:x", project_dir=tmp_path)
+    broker_policy = pipeline_module._paper_broker_policy_for_call(
+        options=broker_options,
+        paper_access_policy=pipeline_module.worker_policy_descriptor(
+            artifact, lane="translation",
+        ),
+        nested_shell_capability={
+            "nested_sandboxed_shell": False,
+            "nested_shell_status": denied_status,
+            "nested_shell_probe_id": f"fake-{provider}-{denied_status}",
+        },
+    )
+    paper_broker = pipeline_module._paper_broker_for_call(
+        options=broker_options,
+        intent_guidance=artifact,
+        lane="translation",
+        policy=broker_policy,
+        journal_context=journal_context,
+        checkpoint_root=tmp_path / "checkpoint",
+        broker_run_id="f" * 64,
     )
     final_outcome, value = pipeline_module._complete_stateful_reference_evidence(
         initial, intent_guidance=artifact, lane="translation",
@@ -6602,6 +6661,7 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
             "required": ["answer"], "properties": {"answer": {"type": "string"}},
         },
         call_round=call_round,
+        paper_broker=paper_broker,
         journal_context=journal_context,
         target_session="translation-session",
         followup_id="translation:segment-1:generation-1",
@@ -6611,6 +6671,7 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
     assert value == {"answer": "done"}
     assert calls[0][2] == 1
     assert "CONTROLLER REFERENCE EVIDENCE ROUND" in calls[0][0]
+    assert "arc-paper-worker" not in calls[0][0]
     assert "arc_evidence_requests" in calls[0][1]["properties"]
     receipt = EvidenceJournal(journal_context.journal_root).read_receipt(
         journal_context.address("r1", evidence_round=1)
@@ -6630,6 +6691,7 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
             fresh_calls.append((prompt, schema, round_number))
             or Outcome({"answer": "done", "arc_evidence_requests": []})
         ),
+        paper_broker=paper_broker,
         journal_context=journal_context,
         target_session="translation-session-fresh",
         target_generation=2,
@@ -6646,6 +6708,190 @@ def test_guided_stateful_call_uses_controller_evidence_delta(
     assert [item["followup_id"] for item in redelivered["deliveries"]] == [
         "translation:segment-1:generation-1:evidence-01",
         "translation:segment-1:generation-2:evidence-01",
+    ]
+
+
+def test_stateful_lane_serializes_segment_evidence_before_next_primary(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from arc_companion.intent_guidance import (
+        INTENT_GUIDANCE_VERSION,
+        _target_catalog_metadata,
+        _worker_payload_unvalidated,
+    )
+
+    bundle = _bundle(tmp_path)
+    bundle.parsed["structure"] = {"document_kind": "book"}
+    artifact = {
+        "schema_version": INTENT_GUIDANCE_VERSION,
+        "semantic_input_sha256": "s" * 64,
+        "user_intent_sha256": "u" * 64,
+        "output_sha256": "o" * 64,
+        "resolution_status": "resolved",
+        "guidance": "Use the selected source.",
+        "reference_targets": [{
+            "source_id": "arXiv:0911.3380",
+            "locator": "Abstract",
+            "purpose": "terminology",
+            "lanes": ["commentary"],
+        }],
+        "reference_sources": [{
+            "source_id": "arXiv:0911.3380",
+            "source_hash": "v1",
+            "document_hash": "v1",
+            "metadata": {},
+            "toc": [{"locator": "Abstract", "title": "Abstract"}],
+        }],
+    }
+    artifact["target_catalog"] = _target_catalog_metadata(
+        artifact["reference_targets"]
+    )
+    artifact["worker_payload"] = _worker_payload_unvalidated(
+        artifact, lane=None,
+    )
+    monkeypatch.setattr(
+        pipeline_module, "build_intent_guidance",
+        lambda *_args, **_kwargs: artifact,
+    )
+    monkeypatch.setattr(
+        "arc_companion.paper_broker.dispatch_operation",
+        lambda *_args, **_kwargs: {
+            "ok": True, "data": {"title": "Reference"},
+            "errors": [], "meta": {},
+        },
+    )
+
+    ordinary = FakeLLM()
+    ordinary.annotation_barrier = threading.Barrier(1)
+    def ordinary_call(prompt: str, **kwargs):
+        if str(kwargs["call_label"]).startswith("companion-commentary-review-"):
+            return {"patches": [], "issues": []}
+        return ordinary(prompt, **kwargs)
+    submissions: list[tuple[str, bool]] = []
+    submission_lock = threading.Lock()
+    first_annotation_label: list[str] = []
+
+    def stateful_result(prompt: str, **kwargs):
+        label = str(kwargs["call_label"])
+        session_manager = kwargs["session_manager"]
+        session_key = str(kwargs["session_key"])
+        idempotency_key = str(kwargs["idempotency_key"])
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback is not None:
+            progress_callback({"event": "submitted"})
+        ref = session_manager.get_existing(session_key)
+        if ref is None:
+            ref = session_manager.get_or_create(
+                key=session_key,
+                provider=str(kwargs["provider"]),
+                model=kwargs.get("model"),
+                runtime_fingerprint="fake-runtime",
+            )
+        session_manager.update_native_session_id(
+            session_key, f"native-{session_key.replace(':', '-')}",
+        )
+        session_manager.record_turn(
+            session_key,
+            call_label=label,
+            prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+            static_prefix_sha256=None,
+            schema_sha256="schema",
+            usage={},
+            provider_used=ref.provider,
+            model_used=ref.model,
+            native_session_id=f"native-{session_key.replace(':', '-')}",
+            idempotency_key=idempotency_key,
+            generation=ref.generation,
+        )
+
+        if label.startswith("companion-guide-"):
+            value = {
+                "motivation": None,
+                "main_content": "Guide",
+                "section_logic": None,
+                "prerequisites": None,
+                "pedagogical_comparison": None,
+                "historical_context": [],
+                "supplementary_reading": [],
+                "arc_evidence_requests": [],
+            }
+        elif label.startswith("companion-annotation-"):
+            assert ref is not None
+            is_evidence = "-evidence-" in label
+            primary_label = label.split("-evidence-", 1)[0]
+            with submission_lock:
+                if not first_annotation_label:
+                    first_annotation_label.append(primary_label)
+                owner = (
+                    "A" if primary_label == first_annotation_label[0] else "B"
+                )
+                submissions.append(
+                    (
+                        f"{'evidence' if is_evidence else 'primary'}-{owner}",
+                        "ARC PAPER BROKER (bootstrap only)" in prompt,
+                    )
+                )
+            value = {
+                "explanation": f"Explanation {owner}",
+                "prior_work": [],
+                "later_work": [],
+                "commentary": f"Commentary {owner}",
+                "evidence_ids": [],
+                "key_points": [],
+                "source_notes": [],
+                "arc_evidence_requests": (
+                    []
+                    if is_evidence or owner == "B"
+                    else [{
+                        "request_id": "evidence-a",
+                        "operation": "get-title",
+                        "arguments": {"paper_ids": ["arXiv:0911.3380"]},
+                        "reason": "terminology",
+                    }]
+                ),
+            }
+        else:
+            raise AssertionError(label)
+        return SimpleNamespace(
+            value=value,
+            usage={},
+            native_session_id=f"native-{session_key.replace(':', '-')}",
+            runtime_fingerprint=(
+                ref.runtime_fingerprint if ref is not None else "guide-runtime"
+            ),
+            logical_receipt={
+                "idempotency_key": idempotency_key,
+                "call_id": label,
+            },
+            provider=ref.provider if ref is not None else kwargs["provider"],
+            model=ref.model if ref is not None else kwargs.get("model"),
+            prompt_bytes=len(prompt.encode()),
+        )
+
+    result = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "stateful-order",
+            workers=8,
+            skip_translation=True,
+            user_intent="Use the reference terminology.",
+            review_context_chars=1,
+            document_kind="book",
+            provider="codex-cli",
+            model="fake-model",
+        ),
+        source_loader=lambda *_args, **_kwargs: bundle,
+        llm=ordinary_call,
+        result_llm=stateful_result,
+        compiler=lambda _tex, pdf: pdf.write_bytes(b"%PDF-1.7 fixture"),
+        pdf_validator=lambda path: {"bytes": path.stat().st_size},
+    )
+
+    assert result["ok"], result
+    assert submissions == [
+        ("primary-A", True),
+        ("evidence-A", False),
+        ("primary-B", False),
     ]
 
 
@@ -6747,6 +6993,33 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         policy={"access": "local"},
         runtime={"provider": "fake"},
     )
+    from arc_companion.paper_broker import PaperBroker, build_paper_broker_policy
+
+    broker_policy = build_paper_broker_policy(
+        allowed_operations=["get-parsed-section"],
+        authorized_source_ids=["book"],
+        authorized_sections=[{"source_id": "book", "section": "ch-2"}],
+    )
+
+    def target_lister(**arguments):
+        return pipeline_module.list_reference_targets(
+            artifact,
+            lane="translation",
+            cursor=arguments.get("cursor"),
+            source_id=arguments.get("source_id"),
+            query=arguments.get("query"),
+            limit_bytes=arguments.get("limit_bytes"),
+        )
+
+    source_broker = PaperBroker(
+        checkpoint_root=checkpoint_dir,
+        base_cache_root=tmp_path / "paper-cache",
+        policy=broker_policy,
+        run_id=fingerprint,
+        generic_internet_allowed=False,
+        journal_context=source_context,
+        target_lister=target_lister,
+    )
     first_outcome, first_value = pipeline_module._complete_stateful_reference_evidence(
         initial,
         intent_guidance=artifact,
@@ -6756,6 +7029,7 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         call_round=lambda _prompt, _schema, _round: Outcome({
             "answer": "done", "arc_evidence_requests": [],
         }),
+        paper_broker=source_broker,
         journal_context=source_context,
         target_session=session_key,
         target_generation=1,
@@ -6844,6 +7118,15 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         policy={"access": "local"},
         runtime={"provider": "fake"},
     )
+    replay_broker = PaperBroker(
+        checkpoint_root=checkpoint_dir,
+        base_cache_root=tmp_path / "paper-cache",
+        policy=broker_policy,
+        run_id=fingerprint,
+        generic_internet_allowed=False,
+        journal_context=replay_context,
+        target_lister=target_lister,
+    )
     artifact.target_reads = 0
     replay_outcome, replay_value = pipeline_module._complete_stateful_reference_evidence(
         initial,
@@ -6854,6 +7137,7 @@ def test_typed_idle_generation_replays_source_evidence_receipt_in_production_pat
         call_round=lambda _prompt, _schema, _round: Outcome({
             "answer": "done", "arc_evidence_requests": [],
         }),
+        paper_broker=replay_broker,
         journal_context=replay_context,
         target_session=session_key,
         target_generation=2,

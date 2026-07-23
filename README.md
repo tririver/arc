@@ -294,6 +294,14 @@ translations. `--stop-after-first-chapter` provides the first-chapter
 validation checkpoint for `interactive` runs or a one-time review gate; it
 does not permanently change the managed run's automation level.
 
+Companion workers use the structured ARC-paper Controller Broker by default.
+`--arc-paper-access none` removes its schema, catalog, controls, and paper
+network route. Generic `--no-internet` does not disable Broker-only paper
+fetches. `--arc-paper-direct-shell` is a separate trusted opt-in that fails
+preflight unless a nested sandboxed shell is proven and exposes only
+policy-authorized `network=none` operations. Large Broker results use verified
+content-addressed handles and pages across at most three evidence rounds.
+
 For a managed companion workflow, the executing agent inspects substantive
 source body text near the beginning, middle, and end before building. It
 compares normalized base languages (`EN_US`, `EN_UK`, and `en-GB` are `en`;

@@ -376,19 +376,15 @@ def render_nested_shell_prompt(
         available = capability.get("nested_sandboxed_shell") is True
     if available:
         replacement = (
-            "A verified sandboxed shell is available for this turn. Direct access is "
-            "limited to these fixed deterministic reads: arc-paper-worker policy-targets "
-            "with cursor-based, byte-bounded catalog pagination, "
-            "arc-paper-worker get-parsed-toc, arc-paper-worker get-parsed-section, and "
-            "arc-paper-worker artifact-read with offset-based, byte-bounded artifact "
-            "pagination. Do not invoke "
-            "other shell commands, raw arc-paper, Python arc_paper modules, arc-llm, "
-            "arc-jobs, arc-domain, or nested model commands."
+            "A verified sandboxed shell is available for this turn. When direct ARC-paper "
+            "access was explicitly requested, use only the catalog-authorized network=none "
+            "operations listed in the Broker bootstrap. Use Controller requests for every "
+            "possibly-networked operation. Do not invoke unrelated CLI or nested model "
+            "commands."
         )
     elif controller_evidence_exposed:
         replacement = (
-            "No verified nested shell is available for this turn. Do not invoke shell "
-            "commands or attempt a bypass. Request deterministic paper reads only through "
+            "No verified nested shell is available for this turn. Request paper reads through "
             "the addressed arc_evidence_requests Controller schema."
         )
     else:

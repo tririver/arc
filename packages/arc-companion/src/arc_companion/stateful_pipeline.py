@@ -12,7 +12,8 @@ import uuid
 
 STATEFUL_TURN_VERSION = "arc.companion.stateful-turn.v2"
 STATEFUL_STREAM_STATE_VERSION = "arc.companion.stateful-stream-state.v1"
-LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v1"
+LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v2"
+LEGACY_LANE_RUNTIME_PROFILE_VERSION = "arc.companion.lane-runtime-profile.v1"
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 ROLLOVER_FRACTION = 0.70
 
@@ -272,6 +273,7 @@ def resolve_lane_runtime_profile(
     existing_generation: bool, recorded_runtime_fingerprint: str | None,
     provider: str = "auto", model: str | None = None,
     model_tier: str | None = None,
+    paper_runtime_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pin one access recipe for every primary/repair call in a generation."""
     try:
@@ -284,10 +286,30 @@ def resolve_lane_runtime_profile(
         "chapter_id": chapter_id, "lane": lane, "generation": generation,
     }
     if isinstance(existing, Mapping):
-        if existing.get("schema_version") != LANE_RUNTIME_PROFILE_VERSION or any(
+        if existing.get("schema_version") not in {
+            LANE_RUNTIME_PROFILE_VERSION, LEGACY_LANE_RUNTIME_PROFILE_VERSION,
+        } or any(
             existing.get(key) != value for key, value in identity.items()
         ):
             raise ValueError(f"lane runtime profile identity changed: {path}")
+        if existing.get("schema_version") == LEGACY_LANE_RUNTIME_PROFILE_VERSION:
+            migrated = {
+                **dict(existing),
+                "schema_version": LANE_RUNTIME_PROFILE_VERSION,
+                "arc_paper_access": "none",
+                "paper_policy_sha256": None,
+                "paper_catalog_sha256": None,
+                "paper_network_authorized": False,
+                "arc_paper_direct_shell": False,
+                "paper_direct_decision": "disabled",
+                "direct_shell_probe_id": "none",
+                "migrated_from_schema_version": LEGACY_LANE_RUNTIME_PROFILE_VERSION,
+            }
+            _atomic_write_json(path, migrated)
+            return migrated
+        _validate_paper_runtime_recipe(
+            existing, paper_runtime_profile or {}, allow_provisional=True,
+        )
         return dict(existing)
     # A pre-profile generation may already own a paid native session. Preserve
     # the user's access choice for that generation; only newly created
@@ -306,15 +328,67 @@ def resolve_lane_runtime_profile(
         "model": model,
         "model_tier": model_tier,
         "recorded_runtime_fingerprint": recorded_runtime_fingerprint,
+        **dict(paper_runtime_profile or {}),
     }
     _atomic_write_json(path, profile)
     return profile
+
+
+def _validate_paper_runtime_recipe(
+    pinned: Mapping[str, Any],
+    requested: Mapping[str, Any],
+    *,
+    allow_provisional: bool,
+) -> None:
+    """Reject capability widening or recipe drift before a paid lane call."""
+
+    labels = {
+        "arc_paper_access": "access",
+        "arc_paper_direct_shell": "direct decision",
+        "paper_policy_sha256": "policy",
+        "paper_catalog_sha256": "catalog",
+        "paper_network_authorized": "paper network decision",
+        "paper_direct_decision": "direct route",
+        "direct_shell_probe_id": "direct-shell probe",
+    }
+    provisional = {
+        "paper_policy_sha256": {None},
+        "paper_catalog_sha256": {None},
+        "paper_direct_decision": {"preflight_required"},
+        "direct_shell_probe_id": {"pending"},
+    }
+    for key, label in labels.items():
+        if key not in requested:
+            continue
+        value = requested.get(key)
+        if allow_provisional and (
+            value in provisional.get(key, set())
+            or pinned.get(key) in provisional.get(key, set())
+            or (
+                key == "direct_shell_probe_id"
+                and pinned.get("paper_policy_sha256") is None
+            )
+        ):
+            continue
+        if pinned.get(key) != value:
+            raise ValueError(f"lane ARC-paper {label} changed after generation start")
+
+
+def validate_lane_paper_runtime_profile(
+    profile: Mapping[str, Any], resolved_recipe: Mapping[str, Any],
+) -> None:
+    """Validate a completed local preflight against the generation pin."""
+
+    _validate_paper_runtime_recipe(
+        profile, resolved_recipe, allow_provisional=False,
+    )
 
 
 def pin_lane_runtime_profile(
     path: Path, profile: Mapping[str, Any], *, provider: str,
     model: str | None, runtime_fingerprint: str,
     migrated_from_fingerprint: str | None = None,
+    paper_runtime_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist the provider-resolved identity after a generation's first call."""
     pinned = dict(profile)
@@ -342,6 +416,14 @@ def pin_lane_runtime_profile(
         "model": model,
         "recorded_runtime_fingerprint": runtime_fingerprint,
     })
+    if (
+        paper_runtime_profile is not None
+        and pinned.get("schema_version") == LANE_RUNTIME_PROFILE_VERSION
+    ):
+        _validate_paper_runtime_recipe(
+            pinned, paper_runtime_profile, allow_provisional=True,
+        )
+        pinned.update(dict(paper_runtime_profile))
     _atomic_write_json(path, pinned)
     return pinned
 

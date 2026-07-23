@@ -988,11 +988,9 @@ def remove_cached_papers(
     removed_paths: list[str] = []
     skipped_paths: list[dict[str, str]] = []
     if not dry_run:
-        worker_session = None
-        if os.environ.get("ARC_PAPER_WORKER_BASE_CACHE"):
-            from .worker_session import WorkerCacheSession
+        from .worker_session import WorkerCacheSession
 
-            worker_session = WorkerCacheSession.from_environment()
+        worker_session = WorkerCacheSession.from_environment()
         for path in _unique_selected_paths(items):
             if worker_session is not None:
                 raw_path = Path(path).resolve(strict=False)

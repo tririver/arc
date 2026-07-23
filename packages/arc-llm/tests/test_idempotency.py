@@ -36,7 +36,7 @@ def _kwargs(tmp_path, manager, key="logical-1"):
         "schema": {"type": "object", "required": ["ok"]},
         "provider": "codex-cli",
         "model": "m",
-        "env": {},
+        "env": {"ARC_PAPER_ACCESS": "none"},
         "process_chain": [],
         "session_policy": "stateful",
         "session_manager": manager,
@@ -259,8 +259,14 @@ def test_submitted_timeout_only_explicitly_resumes_native_session(tmp_path, monk
         model="m",
         runtime_fingerprint=runner._runtime_fp(
             provider_used="codex-cli", model="m", model_tier=None,
-            env={}, process_chain=[],
+                env={"ARC_PAPER_ACCESS": "none"}, process_chain=[],
         ),
+        metadata={
+            "arc_runtime_capabilities": runner._runtime_capabilities(
+                {"ARC_PAPER_ACCESS": "none"}
+            ),
+            "arc_runtime_manifest_version": runner.RUNTIME_MANIFEST_VERSION,
+        },
     )
     manager.update_native_session_id("chapter/translation", "native-existing")
     monkeypatch.setattr(runner, "select_provider", lambda *_args, **_kwargs: provider)
@@ -410,7 +416,7 @@ def test_stateful_runner_fails_closed_on_authorized_generation_mismatch(
     manager = LLMSessionManager(tmp_path / "sessions")
     runtime_fp = runner._runtime_fp(
         provider_used="codex-cli", model="m", model_tier=None,
-        env={}, process_chain=[],
+        env={"ARC_PAPER_ACCESS": "none"}, process_chain=[],
     )
     manager.get_or_create(
         key="chapter/translation", provider="codex-cli", model="m",

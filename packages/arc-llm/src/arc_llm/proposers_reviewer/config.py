@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from arc_llm.call_record import allow_arc_llm_call_record
 from arc_llm.evidence import MAX_EVIDENCE_ROUNDS, allow_evidence_requests
 from arc_llm.model import VALID_MODEL_TIERS, reasoning_effort_for_model_tier
+from arc_llm.paper_access_policy import apply_arc_paper_access, resolve_arc_paper_access
 
 
 BATCH_CONFIG_SCHEMA = "arc.llm.proposers_reviewer_batch.config.v1"
@@ -21,7 +22,6 @@ DEFAULT_OUTPUT_RECOVERY_MODE = "warn"
 DEFAULT_ALLOW_NATURAL_LANGUAGE = True
 DEFAULT_SCHEMA_VIOLATION_POLICY = "peer_visible"
 DEFAULT_SCHEMA_FORMATTER_ENABLED = True
-ARC_PAPER_CLI_ACCESS_VALUES = {"full", "none"}
 
 
 class ConfigError(ValueError):
@@ -192,15 +192,17 @@ def load_batch_config(payload: Mapping[str, Any]) -> BatchConfig:
 def worker_env(worker: WorkerConfig, *, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     runtime = worker.runtime
-    arc_paper_cli_access = _arc_paper_cli_access(
-        runtime.get("arc_paper_cli_access", "full"),
-        "runtime.arc_paper_cli_access",
-    )
+    try:
+        arc_paper_access = resolve_arc_paper_access(runtime, env).access
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     inherit_host_tools = _bool(
         runtime.get("inherit_host_tools", False),
         "runtime.inherit_host_tools",
     )
-    env["ARC_PAPER_CLI_ACCESS"] = arc_paper_cli_access
+    apply_arc_paper_access(
+        env, resolve_arc_paper_access({"arc_paper_access": arc_paper_access})
+    )
     env["ARC_LLM_INHERIT_HOST_TOOLS"] = "true" if inherit_host_tools else "false"
     allow_internet = _bool(runtime.get("allow_internet", False), "runtime.allow_internet")
     allow_mcp = _bool(runtime.get("allow_mcp", False), "runtime.allow_mcp")
@@ -286,6 +288,7 @@ def isolated_worker_env(env: Mapping[str, str] | None) -> dict[str, str]:
     isolated = dict(os.environ if env is None else env)
     isolated.update(
         {
+            "ARC_PAPER_ACCESS": "none",
             "ARC_PAPER_CLI_ACCESS": "none",
             "ARC_LLM_WORKER_CONTEXT": "true",
             "ARC_LLM_INHERIT_HOST_TOOLS": "false",
@@ -427,10 +430,12 @@ def _parse_worker(
 
     runtime = dict(default_runtime)
     runtime.update(_dict(worker_data.get("runtime", {}), f"{field_name}.{worker_id}.runtime"))
-    runtime["arc_paper_cli_access"] = _arc_paper_cli_access(
-        runtime.get("arc_paper_cli_access", "full"),
-        f"{field_name}.{worker_id}.runtime.arc_paper_cli_access",
-    )
+    try:
+        access = resolve_arc_paper_access(runtime).access
+    except ValueError as exc:
+        raise ConfigError(f"{field_name}.{worker_id}.runtime: {exc}") from exc
+    runtime["arc_paper_access"] = access
+    runtime.pop("arc_paper_cli_access", None)
     runtime["inherit_host_tools"] = _bool(
         runtime.get("inherit_host_tools", False),
         f"{field_name}.{worker_id}.runtime.inherit_host_tools",
@@ -464,14 +469,6 @@ def _parse_worker(
             else None
         ),
     )
-
-
-def _arc_paper_cli_access(value: Any, field_name: str) -> str:
-    access = str(value or "").strip().lower()
-    if access not in ARC_PAPER_CLI_ACCESS_VALUES:
-        allowed = ", ".join(sorted(ARC_PAPER_CLI_ACCESS_VALUES))
-        raise ConfigError(f"{field_name} must be one of: {allowed}")
-    return access
 
 
 def _parse_artifact_options(raw_options: Any) -> ArtifactOptions:

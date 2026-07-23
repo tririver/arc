@@ -1141,8 +1141,8 @@ def test_no_info_variant_disables_controller_evidence_in_materialized_loop(tmp_p
 
     assert loop["evidence"] == {"enabled": False}
     assert "controller_evidence_operations" not in loop["caller_context"]
-    assert loop["proposers"][0]["runtime"]["arc_paper_cli_access"] == "none"
-    assert loop["reviewers"][0]["runtime"]["arc_paper_cli_access"] == "none"
+    assert loop["proposers"][0]["runtime"]["arc_paper_access"] == "none"
+    assert loop["reviewers"][0]["runtime"]["arc_paper_access"] == "none"
     assert loop["proposers"][0]["runtime"]["inherit_host_tools"] is False
     assert loop["reviewers"][0]["runtime"]["inherit_host_tools"] is False
 
@@ -1169,8 +1169,8 @@ def test_domain_variant_keeps_controller_evidence_enabled(tmp_path: Path) -> Non
     batch = runner._loop_batch_config(parsed, ideas, run_root=project_dir / "ideas")  # noqa: SLF001
     loop = batch["loops"][0]
 
-    assert loop["proposers"][0]["runtime"].get("arc_paper_cli_access", "full") == "full"
-    assert loop["reviewers"][0]["runtime"].get("arc_paper_cli_access", "full") == "full"
+    assert loop["proposers"][0]["runtime"].get("arc_paper_access", "full") == "full"
+    assert loop["reviewers"][0]["runtime"].get("arc_paper_access", "full") == "full"
     loop = batch["loops"][0]
 
     assert loop["evidence"] == {"enabled": True}

@@ -86,7 +86,8 @@ def test_valid_config_parses_and_merges_defaults():
     assert proposer.model_tier == "high"
     assert proposer.runtime["allow_internet"] is True
     assert proposer.runtime["allow_mcp"] is False
-    assert proposer.runtime["arc_paper_cli_access"] == "full"
+    assert proposer.runtime["arc_paper_access"] == "full"
+    assert "arc_paper_cli_access" not in proposer.runtime
     assert proposer.runtime["inherit_host_tools"] is False
     assert proposer.evidence_enabled is True
     assert EVIDENCE_REQUESTS_FIELD in proposer.output_schema.get("properties", {})
@@ -534,7 +535,7 @@ def test_worker_prompt_context_strips_arc_llm_call_records():
     assert "keep" in json.dumps(proposer, ensure_ascii=False)
 
 
-def test_worker_prompt_advertises_only_the_paper_cli_and_nested_llm_guard():
+def test_worker_prompt_advertises_controller_without_direct_shell_marker():
     config = load_batch_config(minimal_config())
     loop = config.loops[0]
     context = proposer_context(
@@ -546,11 +547,11 @@ def test_worker_prompt_advertises_only_the_paper_cli_and_nested_llm_guard():
 
     rendered = render_prompt(loop.proposers[0], context)
 
-    assert "{{ARC_NESTED_SHELL_CAPABILITY}}" in rendered
+    assert "{{ARC_NESTED_SHELL_CAPABILITY}}" not in rendered
     assert "arc-paper-worker" not in rendered
     assert "worker guard" not in rendered
     assert "trusted controller" not in rendered
-    assert "Follow the resolved ARC Paper Access capability" in rendered
+    assert "structured Controller evidence protocol" in rendered
 
 
 def test_worker_prompt_with_paper_cli_disabled_retains_blanket_tool_guard():

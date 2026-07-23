@@ -55,7 +55,9 @@ from .nested_shell_capability import (
 )
 from .paper_access_policy import (
     PAPER_ACCESS_POLICY_VERSION,
+    apply_arc_paper_access,
     canonical_paper_access_policy,
+    resolve_arc_paper_access,
 )
 from .providers.activity import resolve_idle_timeout_seconds
 from .providers.base import (
@@ -95,11 +97,26 @@ NATIVE_RESUME_RECONCILIATION_PROMPT = (
     "Do not repeat its work. Reconcile the native session and return the final answer "
     "for that preceding request in the required format."
 )
+_PAPER_ACCESS_WARNINGS_ENV = "ARC_INTERNAL_PAPER_ACCESS_WARNINGS_JSON"
+
+
 def _runtime_capabilities(env: Mapping[str, str] | None) -> dict[str, Any]:
     values = env or {}
+    access = resolve_arc_paper_access(env=values)
+    warnings = list(access.warnings)
+    raw_warnings = values.get(_PAPER_ACCESS_WARNINGS_ENV)
+    if raw_warnings:
+        try:
+            preserved = json.loads(raw_warnings)
+        except json.JSONDecodeError:
+            preserved = []
+        if isinstance(preserved, list) and all(
+            isinstance(item, str) for item in preserved
+        ):
+            warnings = list(dict.fromkeys((*preserved, *warnings)))
     return {
-        "arc_paper_cli_access": values.get("ARC_PAPER_CLI_ACCESS", "full"),
-        "arc_paper_access": "full",
+        "arc_paper_access": access.access,
+        "arc_paper_access_warnings": warnings,
         "inherit_host_tools": values.get("ARC_LLM_INHERIT_HOST_TOOLS", "false").strip().lower()
         == "true",
         **capability_runtime_identity(values),
@@ -119,7 +136,11 @@ def _runtime_compatibility_policy(
     """Default new calls to paper access while keeping legacy resumptions closed."""
     effective_env = dict(os.environ if env is None else env)
     clear_runtime_capability_values(effective_env)
-    effective_env.setdefault("ARC_PAPER_CLI_ACCESS", "full")
+    access = resolve_arc_paper_access(env=effective_env)
+    apply_arc_paper_access(effective_env, access)
+    effective_env[_PAPER_ACCESS_WARNINGS_ENV] = json.dumps(
+        list(access.warnings), separators=(",", ":"),
+    )
     effective_env.setdefault("ARC_LLM_INHERIT_HOST_TOOLS", "false")
     legacy_resume = False
 
@@ -142,8 +163,20 @@ def _runtime_compatibility_policy(
         # Before this capability was serialized, ARC workers had no direct
         # paper CLI. Never enlarge such a run merely because it was resumed by
         # a newer package version.
-        effective_env["ARC_PAPER_CLI_ACCESS"] = "none"
+        apply_arc_paper_access(
+            effective_env, resolve_arc_paper_access({"arc_paper_access": "none"})
+        )
+        effective_env["ARC_PAPER_DIRECT_SHELL"] = "false"
         effective_env["ARC_LLM_INHERIT_HOST_TOOLS"] = "false"
+
+    if (
+        resolve_arc_paper_access(env=effective_env).access == "none"
+        and effective_env.get("ARC_PAPER_DIRECT_SHELL", "false").strip().lower()
+        == "true"
+    ):
+        raise ValueError(
+            "ARC_PAPER_DIRECT_SHELL requires ARC_PAPER_ACCESS=full"
+        )
 
     effective_metadata = dict(session_metadata or {})
     effective_metadata["arc_runtime_capabilities"] = _runtime_capabilities(effective_env)
@@ -155,7 +188,8 @@ def _resolve_request_nested_shell(
     configs: Sequence["LLMConfig"], env: dict[str, str]
 ) -> NestedShellCapability:
     provider = configs[0].provider
-    if env.get("ARC_PAPER_CLI_ACCESS", "full") != "full":
+    direct_requested = env.get("ARC_PAPER_DIRECT_SHELL", "false").strip().lower() == "true"
+    if resolve_arc_paper_access(env=env).access != "full" or not direct_requested:
         capability = NestedShellCapability(
             schema_version=NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
             provider=provider,
@@ -171,6 +205,11 @@ def _resolve_request_nested_shell(
             env=env,
             cwd=env.get("ARC_CODEX_WORK_DIR"),
         )
+        if not capability.nested_sandboxed_shell:
+            raise LLMConfigurationError(
+                "Explicit ARC-paper direct shell was requested, but the trusted nested "
+                f"shell preflight failed: {capability.status}"
+            )
     apply_runtime_capability(env, capability)
     return capability
 
@@ -233,7 +272,8 @@ def _nested_shell_warnings(
     identity = capability_runtime_identity(env)
     warnings: list[str] = []
     if (
-        (env or {}).get("ARC_PAPER_CLI_ACCESS", "full") == "full"
+        resolve_arc_paper_access(env=env or {}).access == "full"
+        and (env or {}).get("ARC_PAPER_DIRECT_SHELL", "false").strip().lower() == "true"
         and identity["nested_shell_status"] != "available"
     ):
         warnings.append(f"nested_shell.{identity['nested_shell_status']}")
@@ -250,8 +290,19 @@ def _configure_paper_worker_session(
     session_manager: LLMSessionManager | None,
 ) -> None:
     """Create the arc-paper overlay contract without importing arc-paper."""
-    access = env.get("ARC_PAPER_CLI_ACCESS", "none")
-    if access == "full" and env.get("ARC_PAPER_WORKER_SESSION_DIR"):
+    access = resolve_arc_paper_access(env=env, default="none").access
+    direct_requested = (
+        env.get("ARC_PAPER_DIRECT_SHELL", "false").strip().lower() == "true"
+    )
+    if access == "full" and direct_requested and env.get("ARC_PAPER_WORKER_SESSION_DIR"):
+        return
+    if access != "full" or not direct_requested:
+        for key in tuple(env):
+            if key.startswith("ARC_PAPER_WORKER_") or key in {
+                "ARC_PAPER_CACHE",
+                "ARC_LLM_WORKER_CONTEXT",
+            }:
+                env.pop(key, None)
         return
     # A stateful session can span calls whose artifact directories differ (for
     # example, one directory per segment or round).  Keep its paper-worker
@@ -264,20 +315,6 @@ def _configure_paper_worker_session(
         location = llm_tmp_root(env) / "paper-worker-isolation"
 
     run_root = _paper_worker_run_root(location)
-    if access != "full":
-        disabled_cache = run_root / "paper-cache-disabled"
-        disabled_cache.mkdir(parents=True, exist_ok=True)
-        env["ARC_PAPER_CACHE"] = str(disabled_cache)
-        env["ARC_LLM_WORKER_CONTEXT"] = "true"
-        for key in (
-            "ARC_PAPER_WORKER_BASE_CACHE",
-            "ARC_PAPER_WORKER_SESSION_DIR",
-            "ARC_PAPER_WORKER_TOMBSTONE_DIR",
-            "ARC_PAPER_WORKER_SESSION_ID",
-        ):
-            env.pop(key, None)
-        return
-
     base_cache = _paper_base_cache(env)
     overlay = run_root / "paper-cache-overlay"
     state = overlay / ".arc-paper-worker"
@@ -308,8 +345,10 @@ def _stage_paper_access_policy(
     """Stage a content-addressed read policy inside the authorized run root."""
     if policy is None:
         return
-    if env.get("ARC_PAPER_CLI_ACCESS") != "full":
+    if resolve_arc_paper_access(env=env, default="none").access != "full":
         raise ValueError("paper_access_policy requires ARC paper CLI access")
+    if env.get("ARC_PAPER_DIRECT_SHELL", "false").strip().lower() != "true":
+        raise ValueError("paper_access_policy requires explicit direct shell access")
     raw_root = env.get("ARC_PAPER_WORKER_SESSION_DIR")
     if not raw_root:
         raise ValueError("paper_access_policy requires a paper worker session directory")
@@ -363,7 +402,7 @@ def _finalize_paper_worker_call(
     call_id: str | None,
 ) -> None:
     values = env or {}
-    if values.get("ARC_PAPER_CLI_ACCESS") != "full":
+    if resolve_arc_paper_access(env=values, default="none").access != "full":
         return
     session_id = values.get("ARC_PAPER_WORKER_SESSION_ID")
     run_root = values.get("ARC_PAPER_WORKER_SESSION_DIR")
@@ -394,6 +433,7 @@ def _finalize_paper_worker_call(
     for key in tuple(controller_env):
         if key.startswith("ARC_PAPER_WORKER_") or key in {
             "ARC_PAPER_CLI_ACCESS",
+            "ARC_PAPER_ACCESS",
             "ARC_PAPER_CACHE",
             "ARC_LLM_WORKER_CONTEXT",
         }:

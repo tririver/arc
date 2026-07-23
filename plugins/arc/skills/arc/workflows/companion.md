@@ -193,11 +193,16 @@ first segment. When `user_intent` is nonempty, ARC first generates one shared
 global intent-guidance artifact from the intent plus authorized cached
 reference metadata and compact TOCs. Every content worker receives that same
 guidance in its bootstrap; segmentation, repairs, rendering, and validation do
-not. Workers with `nested_sandboxed_shell=true` may read only
-guidance-selected exact chapter locators through `arc-paper-worker
-get-parsed-toc`, `get-parsed-section`, and read-only artifact pagination. Other
-runtimes use the Controller evidence-request fallback without changing
-provider or sandbox mode. Reference text may guide terminology, idiom, and style, but the
+not. Workers read guidance-selected exact chapter locators through the
+Controller Broker by default. Its bootstrap supplies the frozen compact
+operation catalog; large results use verified read-only handles and pages, and
+the worker may use at most three addressed evidence rounds. `--no-internet`
+does not disable this paper-only Controller route. `--arc-paper-access none`
+removes it completely. Direct `arc-paper-worker` access requires the separate
+explicit `--arc-paper-direct-shell` opt-in plus a trusted nested-shell
+preflight, and is limited to policy-authorized `network=none` operations; a
+failed preflight blocks before the provider call. Reference text may guide
+terminology, idiom, and style, but the
 original source remains authoritative for facts, coverage, and structure.
 
 Later turns contain only the current segment, its glossary

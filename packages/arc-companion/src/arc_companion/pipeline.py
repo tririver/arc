@@ -109,10 +109,16 @@ from .evidence import (
 from .io import read_json, safe_name, sha256_file, sha256_json, write_json, write_text
 from .intent_guidance import (
     build_intent_guidance,
+    list_reference_targets,
     worker_guidance_payload,
     worker_guidance_prompt_prefix,
     worker_policy_descriptor,
-    resolve_worker_evidence_requests,
+)
+from .paper_broker import (
+    PaperBroker,
+    PaperBrokerPolicy,
+    build_paper_broker_policy,
+    paper_broker_prompt_prefix,
 )
 from .language import base_language, contains_lexical_term, normalize_language_tag
 from .latex import LatexError, render_companion_tex, validate_tex_fidelity
@@ -197,6 +203,7 @@ from .stateful_pipeline import (
     read_stream_state,
     pin_lane_runtime_profile,
     resolve_lane_runtime_profile,
+    validate_lane_paper_runtime_profile,
     write_stream_state,
 )
 
@@ -370,6 +377,8 @@ class BuildOptions:
     domain_id: str | None = None
     domain_manifest: Path | None = None
     allow_internet: bool = True
+    arc_paper_access: str = "full"
+    arc_paper_direct_shell: bool = False
     inherit_host_tools: bool = False
     skip_translation: bool = False
     context_paper_ids: tuple[str, ...] = ()
@@ -397,6 +406,10 @@ class BuildOptions:
             raise ValueError("refresh and recache are mutually exclusive")
         if self.domain_id and self.domain_manifest is not None:
             raise ValueError("domain_id and domain_manifest are mutually exclusive")
+        if self.arc_paper_access not in {"none", "full"}:
+            raise ValueError("arc_paper_access must be none or full")
+        if self.arc_paper_direct_shell and self.arc_paper_access != "full":
+            raise ValueError("arc_paper_direct_shell requires arc_paper_access=full")
         if self.document_kind not in {"auto", "article", "book"}:
             raise ValueError("document_kind must be auto, article, or book")
         if self.idle_timeout_seconds is not None and self.idle_timeout_seconds <= 0:
@@ -2278,6 +2291,7 @@ def _build_chaptered_companion(
         guide_policy = _guidance_policy(intent_guidance, lane="guide")
         guide_structured_policy = bool(
             guide_policy is not None
+            and options.arc_paper_direct_shell
             and result_llm is not None
             and _accepts_explicit_keyword(result_llm, "paper_access_policy")
         )
@@ -2328,6 +2342,8 @@ def _build_chaptered_companion(
                 "idempotency_key": idempotency_key, "artifact_dir": str(artifact_dir),
                 "generation": str(generation),
             })
+            guide_nested_shell: dict[str, Any] = {}
+            guide_broker_policy: dict[str, PaperBrokerPolicy | None] = {}
             def invoke(
                 active_prompt: str, active_schema: dict[str, Any], evidence_round: int,
             ) -> Any:
@@ -2356,6 +2372,8 @@ def _build_chaptered_companion(
                     ),
                     paper_access_policy=guide_policy,
                     serialize_paper_access_policy=not guide_structured_policy,
+                    arc_paper_access=options.arc_paper_access,
+                    arc_paper_direct_shell=options.arc_paper_direct_shell,
                 )
                 from arc_llm.runner import prepare_runtime_prompt
 
@@ -2371,6 +2389,20 @@ def _build_chaptered_companion(
                         schema=active_schema,
                     )
                 )
+                guide_nested_shell["capability"] = _guide_nested_shell
+                if evidence_round == 0:
+                    broker_policy = _paper_broker_policy_for_call(
+                        options=options,
+                        paper_access_policy=guide_policy,
+                        nested_shell_capability=_guide_nested_shell,
+                    )
+                    guide_broker_policy["policy"] = broker_policy
+                    active_prompt = (
+                        _paper_broker_bootstrap_prompt(
+                            broker_policy, _guide_nested_shell,
+                        )
+                        + active_prompt
+                    )
                 last_guide_submission_receipt = write_ledger_submission_receipt(
                     checkpoint_dir=checkpoint_dir,
                     artifact_dir=active_artifact_dir,
@@ -2455,13 +2487,23 @@ def _build_chaptered_companion(
                             progress.provider_event(event),
                         )[-1],
                         **(
-                            {"paper_access_policy": guide_policy}
+                            {
+                                "paper_access_policy": (
+                                    _direct_shell_policy_descriptor(guide_policy)
+                                )
+                            }
                             if guide_structured_policy else {}
                         ),
                     )
             try:
                 outcome = invoke(
-                    prompt, _intent_guidance_schema(schema, intent_guidance), 0,
+                    prompt,
+                    _intent_guidance_schema(
+                        schema,
+                        intent_guidance,
+                        arc_paper_access=options.arc_paper_access,
+                    ),
+                    0,
                 )
                 evidence_source_generation, evidence_source_logical_task = (
                     _companion_evidence_source_identity(
@@ -2476,26 +2518,38 @@ def _build_chaptered_companion(
                         target_idempotency_key=idempotency_key,
                     )
                 )
+                guide_journal_context = _companion_evidence_journal_context(
+                    checkpoint_dir=checkpoint_dir,
+                    run_id=fingerprint,
+                    lane="guide",
+                    worker_id=call_label,
+                    logical_task_id=evidence_source_logical_task,
+                    source_generation=evidence_source_generation,
+                    policy=guide_policy,
+                    runtime={
+                        "runtime_fingerprint": str(
+                            getattr(outcome, "runtime_fingerprint", "")
+                        ),
+                        "provider": options.provider,
+                        "model": options.model,
+                        "model_tier": ANNOTATION_TIER,
+                    },
+                )
+                guide_broker = _paper_broker_for_call(
+                    options=options,
+                    intent_guidance=intent_guidance,
+                    lane="guide",
+                    policy=guide_broker_policy.get("policy"),
+                    journal_context=guide_journal_context,
+                    checkpoint_root=checkpoint_dir,
+                    broker_run_id=fingerprint,
+                    generic_internet_allowed=options.allow_internet,
+                )
                 outcome, final_value = _complete_stateful_reference_evidence(
                     outcome, intent_guidance=intent_guidance, lane="guide",
                     worker_id=call_label, schema=schema, call_round=invoke,
-                    journal_context=_companion_evidence_journal_context(
-                        checkpoint_dir=checkpoint_dir,
-                        run_id=fingerprint,
-                        lane="guide",
-                        worker_id=call_label,
-                        logical_task_id=evidence_source_logical_task,
-                        source_generation=evidence_source_generation,
-                        policy=guide_policy,
-                        runtime={
-                            "runtime_fingerprint": str(
-                                getattr(outcome, "runtime_fingerprint", "")
-                            ),
-                            "provider": options.provider,
-                            "model": options.model,
-                            "model_tier": ANNOTATION_TIER,
-                        },
-                    ),
+                    journal_context=guide_journal_context,
+                    paper_broker=guide_broker,
                     target_session=session_key,
                     target_generation=generation,
                     followup_id=idempotency_key,
@@ -2631,6 +2685,7 @@ def _build_chaptered_companion(
     prepared_report_lock = threading.Lock()
     stream_lock = threading.Lock()
     prompt_streams: dict[tuple[str, str, int], StatefulPromptStream] = {}
+    stateful_turn_locks: dict[tuple[str, str, int], threading.Lock] = {}
     rollover_budgets: dict[tuple[str, str, int], ContextRolloverBudget] = {}
     lane_runtime_profiles: dict[tuple[str, str, int], dict[str, Any]] = {}
     correction_budget = CorrectionBudget()
@@ -2688,6 +2743,7 @@ def _build_chaptered_companion(
                 ),
                 provider=options.provider, model=options.model,
                 model_tier=(TRANSLATION_TIER if lane == "translation" else ANNOTATION_TIER),
+                paper_runtime_profile=_requested_paper_runtime_profile(options),
             )
             stream = prompt_streams.get(key)
             if stream is None:
@@ -3363,7 +3419,7 @@ def _build_chaptered_companion(
             stream = lane_stream(prepared, lane, block_generation)
             guidance_lane = "translation" if lane == "translation" else "commentary"
             lane_policy = _guidance_policy(intent_guidance, lane=guidance_lane)
-            lane_structured_policy = bool(
+            lane_structured_policy_supported = bool(
                 lane_policy is not None
                 and _accepts_explicit_keyword(result_llm, "paper_access_policy")
             )
@@ -3425,21 +3481,80 @@ def _build_chaptered_companion(
                     ),
                 }
                 current_payload["segment_glossary"] = segment_glossary
-                runtime_profile = lane_runtime_profiles[
-                    (chapter_id, lane, block_generation)
-                ]
-                stateful_prompt = stream.request(
-                    (prompt if correction else (
-                        "Translate the current segment payload under the generation rules."
-                        if lane == "translation" else
-                        "Research when useful and write the current segment annotation under the generation rules."
-                    )), cursor=segment_id,
-                    source_sha256=_segment_input_hash(
-                        segment, blocks_by_id, glossary=segment_glossary
-                    ),
-                    current_payload=current_payload,
+                generation_key = (chapter_id, lane, block_generation)
+                with stream_lock:
+                    turn_lock = stateful_turn_locks.setdefault(
+                        generation_key, threading.Lock(),
+                    )
+                turn_lock.acquire()
+                turn_lock_held = True
+                stream.reconcile_turn_count(
+                    session_manager.turn_count(
+                        session_key, generation=block_generation,
+                    )
                 )
+                try:
+                    runtime_profile = lane_runtime_profiles[generation_key]
+                    effective_lane_structured_policy = bool(
+                        lane_structured_policy_supported
+                        and runtime_profile["arc_paper_access"] == "full"
+                        and runtime_profile["arc_paper_direct_shell"]
+                    )
+                    if runtime_profile.get("paper_policy_sha256") is not None:
+                        pinned_policy = _paper_broker_policy_for_call(
+                            options=options,
+                            paper_access_policy=lane_policy,
+                            nested_shell_capability={
+                                "nested_sandboxed_shell": (
+                                    runtime_profile.get("paper_direct_decision")
+                                    == "direct"
+                                ),
+                                "nested_shell_probe_id": runtime_profile.get(
+                                    "direct_shell_probe_id"
+                                ),
+                            },
+                            arc_paper_access=str(
+                                runtime_profile["arc_paper_access"]
+                            ),
+                            arc_paper_direct_shell=bool(
+                                runtime_profile["arc_paper_direct_shell"]
+                            ),
+                        )
+                        if pinned_policy is None:
+                            raise ValueError(
+                                "pinned ARC-paper policy unexpectedly became disabled"
+                            )
+                        validate_lane_paper_runtime_profile(
+                            runtime_profile,
+                            _paper_runtime_profile_from_policy(pinned_policy),
+                        )
+                    stateful_prompt = stream.request(
+                        (prompt if correction else (
+                            "Translate the current segment payload under the generation rules."
+                            if lane == "translation" else
+                            "Research when useful and write the current segment annotation under the generation rules."
+                        )), cursor=segment_id,
+                        source_sha256=_segment_input_hash(
+                            segment, blocks_by_id, glossary=segment_glossary
+                        ),
+                        current_payload=current_payload,
+                    )
+                    generation_bootstrap = (
+                        json.loads(stateful_prompt).get("turn_kind")
+                        == "generation_bootstrap"
+                    )
+                except BaseException:
+                    stream.reconcile_turn_count(
+                        session_manager.turn_count(
+                            session_key, generation=block_generation,
+                        )
+                    )
+                    turn_lock.release()
+                    turn_lock_held = False
+                    raise
                 base_schema = kwargs.get("schema") or {}
+                lane_nested_shell: dict[str, Any] = {}
+                lane_broker_policy: dict[str, PaperBrokerPolicy | None] = {}
                 current_idempotency_key = idempotency_key
                 current_artifact_dir = artifact_dir
                 current_submission_receipt: Path | None = None
@@ -3481,8 +3596,18 @@ def _build_chaptered_companion(
                             bool(runtime_profile["inherit_host_tools"])
                             if lane_policy is None else False
                         ),
-                        paper_access_policy=lane_policy,
-                        serialize_paper_access_policy=not lane_structured_policy,
+                        paper_access_policy=(
+                            lane_policy
+                            if runtime_profile["arc_paper_access"] == "full"
+                            else None
+                        ),
+                        serialize_paper_access_policy=(
+                            not effective_lane_structured_policy
+                        ),
+                        arc_paper_access=str(runtime_profile["arc_paper_access"]),
+                        arc_paper_direct_shell=bool(
+                            runtime_profile["arc_paper_direct_shell"]
+                        ),
                     )
                     from arc_llm.runner import prepare_runtime_prompt
 
@@ -3501,6 +3626,35 @@ def _build_chaptered_companion(
                             schema=active_schema,
                         )
                     )
+                    lane_nested_shell["capability"] = _lane_nested_shell
+                    if evidence_round == 0:
+                        broker_policy = _paper_broker_policy_for_call(
+                            options=options,
+                            paper_access_policy=lane_policy,
+                            nested_shell_capability=_lane_nested_shell,
+                            arc_paper_access=str(
+                                runtime_profile["arc_paper_access"]
+                            ),
+                            arc_paper_direct_shell=bool(
+                                runtime_profile["arc_paper_direct_shell"]
+                            ),
+                        )
+                        lane_broker_policy["policy"] = broker_policy
+                        if (
+                            broker_policy is not None
+                            and runtime_profile.get("paper_policy_sha256") is not None
+                        ):
+                            validate_lane_paper_runtime_profile(
+                                runtime_profile,
+                                _paper_runtime_profile_from_policy(broker_policy),
+                            )
+                        if broker_policy is not None and generation_bootstrap:
+                            active_prompt = (
+                                _paper_broker_bootstrap_prompt(
+                                    broker_policy, _lane_nested_shell,
+                                )
+                                + active_prompt
+                            )
                     current_submission_receipt = write_ledger_submission_receipt(
                         checkpoint_dir=checkpoint_dir,
                         artifact_dir=active_artifact_dir,
@@ -3595,14 +3749,24 @@ def _build_chaptered_companion(
                                 progress.provider_event(event),
                             )[-1],
                             **(
-                                {"paper_access_policy": lane_policy}
-                                if lane_structured_policy else {}
+                                {
+                                    "paper_access_policy": (
+                                        _direct_shell_policy_descriptor(lane_policy)
+                                    )
+                                }
+                                if effective_lane_structured_policy else {}
                             ),
                         )
                 try:
                     outcome = invoke(
                         stateful_prompt,
-                        _intent_guidance_schema(base_schema, intent_guidance),
+                        _intent_guidance_schema(
+                            base_schema,
+                            intent_guidance,
+                            arc_paper_access=str(
+                                runtime_profile["arc_paper_access"]
+                            ),
+                        ),
                         0,
                     )
                     evidence_source_generation, evidence_source_logical_task = (
@@ -3618,25 +3782,80 @@ def _build_chaptered_companion(
                             target_idempotency_key=idempotency_key,
                         )
                     )
+                    lane_journal_context = _companion_evidence_journal_context(
+                        checkpoint_dir=checkpoint_dir,
+                        run_id=fingerprint,
+                        lane=guidance_lane,
+                        worker_id=call_label,
+                        logical_task_id=evidence_source_logical_task,
+                        source_generation=evidence_source_generation,
+                        policy=lane_policy,
+                        runtime=runtime_profile,
+                    )
+                    lane_broker = _paper_broker_for_call(
+                        options=options,
+                        intent_guidance=intent_guidance,
+                        lane=guidance_lane,
+                        policy=lane_broker_policy.get("policy"),
+                        journal_context=lane_journal_context,
+                        checkpoint_root=checkpoint_dir,
+                        broker_run_id=fingerprint,
+                        generic_internet_allowed=bool(
+                            runtime_profile["allow_internet"]
+                        ),
+                    )
                     outcome, final_value = _complete_stateful_reference_evidence(
                         outcome, intent_guidance=intent_guidance,
                         lane=guidance_lane, worker_id=call_label,
                         schema=base_schema, call_round=invoke,
-                        journal_context=_companion_evidence_journal_context(
-                            checkpoint_dir=checkpoint_dir,
-                            run_id=fingerprint,
-                            lane=guidance_lane,
-                            worker_id=call_label,
-                            logical_task_id=evidence_source_logical_task,
-                            source_generation=evidence_source_generation,
-                            policy=lane_policy,
-                            runtime=runtime_profile,
-                        ),
+                        journal_context=lane_journal_context,
+                        paper_broker=lane_broker,
                         target_session=session_key,
                         target_generation=block_generation,
                         followup_id=idempotency_key,
                     )
+                    profile_path = (
+                        checkpoint_dir / "chapters" / chapter_id
+                        / f"{lane}-runtime-generation-{block_generation}.json"
+                    )
+                    refreshed_session = session_manager.get_existing(session_key)
+                    lane_runtime_profiles[generation_key] = pin_lane_runtime_profile(
+                        profile_path, runtime_profile,
+                        provider=(
+                            refreshed_session.provider
+                            if refreshed_session else options.provider
+                        ),
+                        model=(
+                            refreshed_session.model
+                            if refreshed_session else options.model
+                        ),
+                        runtime_fingerprint=str(
+                            getattr(outcome, "runtime_fingerprint", "")
+                        ),
+                        migrated_from_fingerprint=(
+                            str(refreshed_session.metadata.get(
+                                "arc_runtime_fingerprint_migrated_from"
+                            ))
+                            if refreshed_session is not None
+                            and refreshed_session.metadata.get(
+                                "arc_runtime_fingerprint_migrated_from"
+                            ) else None
+                        ),
+                        paper_runtime_profile=_resolved_paper_runtime_profile(
+                            options, lane_broker, pinned_profile=runtime_profile,
+                        ),
+                    )
+                    turn_lock.release()
+                    turn_lock_held = False
                 except BaseException as exc:
+                    if turn_lock_held:
+                        stream.reconcile_turn_count(
+                            session_manager.turn_count(
+                                session_key, generation=block_generation,
+                            )
+                        )
+                        turn_lock.release()
+                        turn_lock_held = False
                     if _chapter_failure_requires_supervision(exc):
                         from arc_llm import read_recovery_context
                         recovery = read_recovery_context(
@@ -3694,27 +3913,6 @@ def _build_chaptered_companion(
                     "call_id": str(logical.get("idempotency_key") or logical.get("call_id") or call_label),
                     "usage": dict(usage_json) if isinstance(usage_json, dict) else {},
                 }
-                generation_key = (chapter_id, lane, block_generation)
-                profile_path = (
-                    checkpoint_dir / "chapters" / chapter_id
-                    / f"{lane}-runtime-generation-{block_generation}.json"
-                )
-                refreshed_session = session_manager.get_existing(session_key)
-                lane_runtime_profiles[generation_key] = pin_lane_runtime_profile(
-                    profile_path, runtime_profile,
-                    provider=(refreshed_session.provider if refreshed_session else options.provider),
-                    model=(refreshed_session.model if refreshed_session else options.model),
-                    runtime_fingerprint=str(getattr(outcome, "runtime_fingerprint", "")),
-                    migrated_from_fingerprint=(
-                        str(refreshed_session.metadata.get(
-                            "arc_runtime_fingerprint_migrated_from"
-                        ))
-                        if refreshed_session is not None
-                        and refreshed_session.metadata.get(
-                            "arc_runtime_fingerprint_migrated_from"
-                        ) else None
-                    ),
-                )
                 rollover_budgets[generation_key].record(
                     getattr(outcome, "usage", {}),
                     prompt_bytes=getattr(outcome, "prompt_bytes", None),
@@ -7814,6 +8012,8 @@ def _recovery_options(options: BuildOptions) -> dict[str, Any]:
         "domain_id": options.domain_id,
         "domain_manifest": str(options.domain_manifest) if options.domain_manifest else None,
         "allow_internet": options.allow_internet,
+        "arc_paper_access": options.arc_paper_access,
+        "arc_paper_direct_shell": options.arc_paper_direct_shell,
         "inherit_host_tools": options.inherit_host_tools,
         "skip_translation": options.skip_translation,
         "context_paper_ids": list(options.context_paper_ids),
@@ -7876,6 +8076,9 @@ def _multilingual_prompt_source(options: BuildOptions) -> str | None:
 
 
 def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOptions:
+    from arc_llm.paper_access_policy import resolve_arc_paper_access
+
+    access = resolve_arc_paper_access(value).access
     return BuildOptions(
         paper_id=str(value["paper_id"]), project_dir=project_dir,
         annotation_language=str(value.get("annotation_language") or DEFAULT_LANGUAGE),
@@ -7889,6 +8092,8 @@ def _options_from_recovery(project_dir: Path, value: dict[str, Any]) -> BuildOpt
         domain_id=value.get("domain_id"),
         domain_manifest=Path(value["domain_manifest"]) if value.get("domain_manifest") else None,
         allow_internet=bool(value.get("allow_internet", True)),
+        arc_paper_access=access,
+        arc_paper_direct_shell=bool(value.get("arc_paper_direct_shell", False)),
         inherit_host_tools=bool(value.get("inherit_host_tools", False)),
         skip_translation=bool(value.get("skip_translation", False)),
         context_paper_ids=tuple(value.get("context_paper_ids") or ()),
@@ -11663,13 +11868,15 @@ def _related_work_claim_key(claim: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _intent_guidance_schema(
-    schema: dict[str, Any], intent_guidance: Mapping[str, Any] | None,
+    schema: dict[str, Any],
+    intent_guidance: Mapping[str, Any] | None,
+    *,
+    arc_paper_access: str = "full",
 ) -> dict[str, Any]:
-    if intent_guidance is None:
-        return schema
-    from arc_llm import allow_evidence_requests
+    from .paper_broker import paper_broker_schema
 
-    return allow_evidence_requests(schema) or schema
+    access = "full" if intent_guidance is not None and arc_paper_access == "full" else "none"
+    return paper_broker_schema(schema, access=access) or schema
 
 
 def _controller_evidence_prompt(responses: Sequence[Any]) -> str:
@@ -11721,6 +11928,129 @@ def _companion_evidence_journal_context(
             "policy": policy,
         }),
         runtime_hash=evidence_identity_hash({"lane": str(lane), "runtime": runtime}),
+    )
+
+
+def _paper_broker_policy_for_call(
+    *,
+    options: BuildOptions,
+    paper_access_policy: Mapping[str, Any] | None,
+    nested_shell_capability: Any,
+    arc_paper_access: str | None = None,
+    arc_paper_direct_shell: bool | None = None,
+) -> PaperBrokerPolicy | None:
+    """Resolve the immutable Broker recipe without creating execution state."""
+
+    effective_access = (
+        options.arc_paper_access if arc_paper_access is None else arc_paper_access
+    )
+    effective_direct = (
+        options.arc_paper_direct_shell
+        if arc_paper_direct_shell is None else arc_paper_direct_shell
+    )
+    if effective_access != "full":
+        return None
+    descriptor = dict(paper_access_policy or {})
+    frozen_operations = (
+        descriptor.get("operations")
+        if "operations" in descriptor
+        else descriptor.get("allowed_operations")
+        if "allowed_operations" in descriptor
+        else None
+    )
+    operations = (
+        None
+        if frozen_operations is None
+        else [
+            str(value) for value in frozen_operations
+            if str(value) not in {
+                "artifact-read", "policy-targets", "list-reference-targets",
+            }
+        ]
+    )
+    source_ids = [
+        str(value) for value in descriptor.get("authorized_source_ids") or []
+    ]
+    section_targets = list(descriptor.get("authorized_section_targets") or [])
+    if not section_targets:
+        section_targets = [
+            {
+                "source_id": str(item.get("source_id") or ""),
+                "section": str(item.get("locator") or ""),
+            }
+            for item in descriptor.get("targets") or []
+            if isinstance(item, Mapping)
+        ]
+    return build_paper_broker_policy(
+        access=effective_access,
+        allowed_operations=operations,
+        authorized_source_ids=source_ids,
+        authorized_sections=section_targets,
+        paper_network_authorized=True,
+        direct_shell_requested=effective_direct,
+        nested_shell_capability=nested_shell_capability,
+    )
+
+
+def _paper_broker_for_call(
+    *,
+    options: BuildOptions,
+    intent_guidance: Mapping[str, Any] | None,
+    lane: str | None,
+    policy: PaperBrokerPolicy | None,
+    journal_context: EvidenceJournalContext | None,
+    checkpoint_root: Path,
+    broker_run_id: str,
+    generic_internet_allowed: bool | None = None,
+) -> PaperBroker | None:
+    """Create execution state from an explicit policy, root, and run identity."""
+
+    if intent_guidance is None or policy is None:
+        return None
+
+    def target_lister(**arguments: Any) -> Mapping[str, Any]:
+        if lane is None:
+            raise ValueError("reference target listing requires a worker lane")
+        return list_reference_targets(
+            intent_guidance,
+            lane=lane,
+            cursor=arguments.get("cursor"),
+            source_id=arguments.get("source_id"),
+            query=arguments.get("query"),
+            limit_bytes=arguments.get("limit_bytes"),
+        )
+
+    from arc_paper.cache import cache_root
+
+    return PaperBroker(
+        checkpoint_root=checkpoint_root,
+        base_cache_root=cache_root(),
+        policy=policy,
+        run_id=broker_run_id,
+        generic_internet_allowed=(
+            options.allow_internet
+            if generic_internet_allowed is None
+            else generic_internet_allowed
+        ),
+        journal_context=journal_context,
+        target_lister=target_lister,
+    )
+
+
+def _paper_broker_bootstrap_prompt(
+    policy: PaperBrokerPolicy | None,
+    nested_shell_capability: Any,
+) -> str:
+    """Render the one bootstrap catalog after trusted-shell preflight."""
+
+    if policy is None:
+        return ""
+    from arc_llm import render_nested_shell_prompt
+
+    return render_nested_shell_prompt(
+        paper_broker_prompt_prefix(policy),
+        nested_shell_capability,
+        controller_evidence_exposed=True,
     )
 
 
@@ -11836,6 +12166,7 @@ def _complete_stateful_reference_evidence(
     worker_id: str,
     schema: dict[str, Any],
     call_round: Callable[[str, dict[str, Any], int], Any],
+    paper_broker: PaperBroker | None = None,
     journal_context: EvidenceJournalContext | None = None,
     target_session: str | None = None,
     target_generation: int | None = None,
@@ -11843,17 +12174,18 @@ def _complete_stateful_reference_evidence(
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve controller reads as native-session delta turns for shell-less hosts."""
     outcome = initial_outcome
-    active_schema = _intent_guidance_schema(schema, intent_guidance)
+    active_schema = _intent_guidance_schema(
+        schema,
+        intent_guidance,
+        arc_paper_access=(
+            paper_broker.policy.access if paper_broker is not None else "none"
+        ),
+    )
     for round_number in range(0, 4):
         value = dict(outcome.value)
         if intent_guidance is None:
             return outcome, value
-        from arc_llm import (
-            EvidenceJournal,
-            EvidenceOperationPolicy,
-            evidence_requests_from_output,
-            resolve_evidence_round,
-        )
+        from arc_llm import evidence_requests_from_output, resolve_evidence_round
 
         requests = evidence_requests_from_output(
             value, worker_id=worker_id, role="companion-content-worker",
@@ -11865,27 +12197,17 @@ def _complete_stateful_reference_evidence(
             raise RuntimeError(
                 "companion reference evidence exceeded three controller rounds"
             )
-        resolver = lambda material, *, round_number: resolve_worker_evidence_requests(
-            intent_guidance, material, round_number=round_number, lane=lane,
+        if paper_broker is None:
+            raise RuntimeError(
+                "ARC-paper evidence request was emitted while access is disabled"
+            )
+        responses = resolve_evidence_round(
+            requests,
+            paper_broker.resolve_round,
+            round_number=round_number + 1,
         )
-        if journal_context is None:
-            responses = resolve_evidence_round(
-                requests, resolver, round_number=round_number + 1,
-            )
-        else:
-            journal = EvidenceJournal(journal_context.journal_root)
-            responses = journal.resolve_round(
-                journal_context,
-                requests,
-                resolver,
-                round_number=round_number + 1,
-                operation_policies={
-                    request.operation: EvidenceOperationPolicy(idempotent=True)
-                    for request in requests
-                },
-            )
-            journal.mark_delivered(
-                journal_context,
+        if journal_context is not None:
+            paper_broker.mark_delivered(
                 requests,
                 round_number=round_number + 1,
                 target_generation=(
@@ -12735,6 +13057,7 @@ def _llm_call(
     force_offline = force_offline or not allow_internet
     structured_policy = bool(
         paper_access_policy is not None
+        and options.arc_paper_direct_shell
         and _accepts_explicit_keyword(llm, "paper_access_policy")
     )
     runtime_env = _llm_runtime_env(
@@ -12747,9 +13070,17 @@ def _llm_call(
         paper_access_policy=paper_access_policy,
         serialize_paper_access_policy=not structured_policy,
         disable_paper_cli=disable_paper_cli,
+        arc_paper_access=options.arc_paper_access,
+        arc_paper_direct_shell=options.arc_paper_direct_shell,
     )
     active_prompt = prompt
-    active_schema = _intent_guidance_schema(schema, intent_guidance)
+    active_schema = _intent_guidance_schema(
+        schema,
+        intent_guidance,
+        arc_paper_access=(
+            "none" if disable_paper_cli else options.arc_paper_access
+        ),
+    )
     from arc_llm.runner import prepare_runtime_prompt
 
     active_prompt, _unused_prefix, _nested_shell = prepare_runtime_prompt(
@@ -12804,6 +13135,40 @@ def _llm_call(
                 "environment_hash": sha256_json(runtime_env),
             },
         )
+    broker_policy = (
+        _paper_broker_policy_for_call(
+            options=options,
+            paper_access_policy=paper_access_policy,
+            nested_shell_capability=_nested_shell,
+        )
+        if intent_guidance is not None else None
+    )
+    broker_checkpoint_root = (
+        evidence_journal_context.journal_root.parent
+        if evidence_journal_context is not None
+        else options.project_dir / ".arc-companion"
+    )
+    broker_run_id = (
+        evidence_journal_context.run_id
+        if evidence_journal_context is not None
+        else f"stateless-{call_label}"
+    )
+    paper_broker = _paper_broker_for_call(
+        options=options,
+        intent_guidance=intent_guidance,
+        lane=intent_guidance_lane,
+        policy=broker_policy,
+        journal_context=evidence_journal_context,
+        checkpoint_root=broker_checkpoint_root,
+        broker_run_id=broker_run_id,
+        generic_internet_allowed=(
+            not force_offline and allow_internet and options.allow_internet
+        ),
+    )
+    active_prompt = (
+        _paper_broker_bootstrap_prompt(broker_policy, _nested_shell)
+        + active_prompt
+    )
     for round_number in range(0, 4):
         active_label = (
             call_label if round_number == 0
@@ -12826,7 +13191,9 @@ def _llm_call(
                     ))
         call_kwargs: dict[str, Any] = {}
         if structured_policy:
-            call_kwargs["paper_access_policy"] = paper_access_policy
+            call_kwargs["paper_access_policy"] = _direct_shell_policy_descriptor(
+                paper_access_policy
+            )
         base_artifact_dir = (
             artifact_dir if round_number == 0
             else artifact_dir / f"evidence-round-{round_number:02d}"
@@ -12989,8 +13356,6 @@ def _llm_call(
                 if ARC_LLM_CALL_RECORD_FIELD in value else value
             )
         from arc_llm import (
-            EvidenceJournal,
-            EvidenceOperationPolicy,
             evidence_requests_from_output,
             resolve_evidence_round,
         )
@@ -13017,30 +13382,12 @@ def _llm_call(
             })
         if round_number >= 3:
             raise RuntimeError("companion reference evidence exceeded three controller rounds")
-        resolver = lambda material, *, round_number: resolve_worker_evidence_requests(
-                intent_guidance, material, round_number=round_number,
-                lane=intent_guidance_lane,
-            )
-        journal = (
-            EvidenceJournal(evidence_journal_context.journal_root)
-            if evidence_journal_context is not None else None
-        )
-        def journaled_resolver(material, *, round_number):
-            if journal is None:
-                return resolver(material, round_number=round_number)
-            return journal.resolve_round(
-                evidence_journal_context,
-                material,
-                resolver,
-                round_number=round_number,
-                operation_policies={
-                    request.operation: EvidenceOperationPolicy(idempotent=True)
-                    for request in material
-                },
-            )
+        if paper_broker is None:
+            raise RuntimeError("ARC-paper evidence request was emitted while access is disabled")
+        broker_resolver = paper_broker.resolve_round
         if review_prompt_context is None:
             responses = resolve_evidence_round(
-                requests, journaled_resolver, round_number=round_number + 1,
+                requests, broker_resolver, round_number=round_number + 1,
             )
             delivered_requests = requests
         else:
@@ -13053,7 +13400,7 @@ def _llm_call(
             )
             responses = resolve_evidence_round(
                 delivered_requests,
-                journaled_resolver,
+                broker_resolver,
                 round_number=round_number + 1,
             )
         followup = _controller_evidence_prompt(responses)
@@ -13065,14 +13412,13 @@ def _llm_call(
             raise RuntimeError(
                 "review evidence response cannot fit under the strict prompt limit"
             )
-        if journal is not None:
+        if evidence_journal_context is not None:
             target_followup_base = (
                 str(control["idempotency_key"])
                 if control is not None
                 else evidence_journal_context.logical_task_id
             )
-            journal.mark_delivered(
-                evidence_journal_context,
+            paper_broker.mark_delivered(
                 delivered_requests,
                 round_number=round_number + 1,
                 target_generation=(
@@ -13088,10 +13434,6 @@ def _llm_call(
                 followup_id=(
                     f"{target_followup_base}:evidence-{round_number + 1:02d}"
                 ),
-                operation_policies={
-                    request.operation: EvidenceOperationPolicy(idempotent=True)
-                    for request in delivered_requests
-                },
             )
         active_prompt = active_prompt + "\n\n" + followup
     raise AssertionError("unreachable evidence loop")
@@ -13138,7 +13480,11 @@ def _bounded_review_evidence_requests(
         raise RuntimeError(
             "review evidence response has no remaining space under the strict prompt limit"
         )
-    page_limit = max(1, remaining // max(1, len(requests)) - 512)
+    # Reserve space for the Broker envelope, provenance, and the follow-up
+    # instruction.  The old 512-byte allowance only covered the pre-Broker
+    # response shape and could overflow a strict review prompt even when the
+    # operation honored its requested content limit.
+    page_limit = max(1, remaining // max(1, len(requests)) - 4_096)
     bounded_requests = []
     for request in requests:
         arguments = dict(getattr(request, "arguments", {}) or {})
@@ -13255,8 +13601,82 @@ def _generation_runtime_policy(options: BuildOptions | None = None) -> dict[str,
     return {
         "allow_mcp": False,
         "allow_internet": allow_internet,
-        "arc_paper_cli_access": "full",
+        "arc_paper_access": "full" if options is None else options.arc_paper_access,
+        "arc_paper_direct_shell": (
+            False if options is None else options.arc_paper_direct_shell
+        ),
         "inherit_host_tools": False if options is None else options.inherit_host_tools,
+    }
+
+
+def _requested_paper_runtime_profile(options: BuildOptions) -> dict[str, Any]:
+    """Record the immutable request before trusted-shell/Broker preflight."""
+
+    enabled = options.arc_paper_access == "full"
+    return {
+        "arc_paper_access": options.arc_paper_access,
+        "paper_policy_sha256": None,
+        "paper_catalog_sha256": None,
+        "paper_network_authorized": enabled,
+        "arc_paper_direct_shell": options.arc_paper_direct_shell,
+        "paper_direct_decision": (
+            "disabled"
+            if not enabled else
+            "preflight_required"
+            if options.arc_paper_direct_shell else
+            "controller"
+        ),
+        "direct_shell_probe_id": (
+            "pending"
+            if enabled and options.arc_paper_direct_shell else
+            "probe-not-requested"
+            if enabled else
+            "none"
+        ),
+    }
+
+
+def _resolved_paper_runtime_profile(
+    options: BuildOptions,
+    broker: PaperBroker | None,
+    *,
+    pinned_profile: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pin the actual Controller/direct decision after local preflight."""
+
+    if broker is None:
+        if pinned_profile is not None:
+            return {
+                key: pinned_profile.get(key)
+                for key in (
+                    "arc_paper_access",
+                    "paper_policy_sha256",
+                    "paper_catalog_sha256",
+                    "paper_network_authorized",
+                    "arc_paper_direct_shell",
+                    "paper_direct_decision",
+                    "direct_shell_probe_id",
+                )
+            }
+        return _requested_paper_runtime_profile(options)
+    return _paper_runtime_profile_from_policy(broker.policy)
+
+
+def _paper_runtime_profile_from_policy(
+    policy: PaperBrokerPolicy,
+) -> dict[str, Any]:
+    """Return the immutable lane recipe represented by a resolved policy."""
+
+    return {
+        "arc_paper_access": policy.access,
+        "paper_policy_sha256": policy.policy_sha256,
+        "paper_catalog_sha256": policy.catalog_sha256,
+        "paper_network_authorized": policy.paper_network_authorized,
+        "arc_paper_direct_shell": policy.direct_shell_requested,
+        "paper_direct_decision": (
+            "direct" if policy.direct_shell_requested else "controller"
+        ),
+        "direct_shell_probe_id": policy.direct_shell_probe_id,
     }
 
 
@@ -13299,16 +13719,9 @@ def _guided_prompt(
 ) -> str:
     if intent_guidance is None:
         return prompt
-    from arc_llm.nested_shell_capability import NESTED_SHELL_PROMPT_MARKER
-
     return (
         worker_guidance_prompt_prefix(intent_guidance, lane=lane)
-        + "\n"
-        + NESTED_SHELL_PROMPT_MARKER
-        + " Use list-reference-targets through the available access channel to inspect a "
-        "non-inline target catalog, then get-parsed-toc or get-parsed-section with "
-        "source_id, locator, and optional byte offset/limit; return [] when no Controller "
-        "read is needed.\n"
+        + "\nThe Controller supplies the ARC-paper Broker contract separately.\n"
         + prompt
     )
 
@@ -13324,6 +13737,35 @@ def _guidance_policy(
     )
 
 
+def _direct_shell_policy_descriptor(
+    policy: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project a Controller policy onto trusted, cache-only direct operations."""
+
+    if policy is None:
+        return None
+    from arc_paper.capabilities import get_operation_spec
+
+    value = dict(policy)
+    raw_operations = value.get("operations", value.get("allowed_operations", ()))
+    operations: list[str] = []
+    for operation in raw_operations or ():
+        spec = get_operation_spec(str(operation))
+        if (
+            spec is not None
+            and spec.network_access == "none"
+            and not spec.admin
+            and not spec.destructive
+            and not spec.uses_llm
+            and not spec.is_job
+            and spec.name not in operations
+        ):
+            operations.append(spec.name)
+    value["operations"] = operations
+    value.pop("allowed_operations", None)
+    return value
+
+
 def _llm_runtime_env(
     *,
     allow_internet: bool,
@@ -13332,16 +13774,34 @@ def _llm_runtime_env(
     paper_access_policy: Mapping[str, Any] | None = None,
     serialize_paper_access_policy: bool = True,
     disable_paper_cli: bool = False,
+    arc_paper_access: str = "full",
+    arc_paper_direct_shell: bool = False,
 ) -> dict[str, str] | None:
     """Map portable access intent onto both supported host runtimes."""
     if disable_paper_cli:
         inherit_host_tools = False
     env = dict(os.environ)
+    from arc_llm.paper_access_policy import (
+        apply_arc_paper_access,
+        resolve_arc_paper_access,
+    )
+
+    resolved_access = resolve_arc_paper_access(
+        {
+            "arc_paper_access": (
+                "none" if disable_paper_cli else arc_paper_access
+            ),
+        },
+        os.environ,
+    )
+    apply_arc_paper_access(env, resolved_access)
+    env["ARC_PAPER_DIRECT_SHELL"] = (
+        "true" if arc_paper_direct_shell and resolved_access.access == "full" else "false"
+    )
     if allow_internet or force_disable_internet:
         value = "true" if allow_internet else "false"
         env["ARC_CODEX_ALLOW_INTERNET"] = value
         env["ARC_CLAUDE_ALLOW_INTERNET"] = value
-    env["ARC_PAPER_CLI_ACCESS"] = "none" if disable_paper_cli else "full"
     for key in (
         "ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON",
         "ARC_PAPER_WORKER_ALLOWED_TARGETS_JSON",
@@ -13352,9 +13812,12 @@ def _llm_runtime_env(
         env.pop(key, None)
     if (
         paper_access_policy is not None
-        and not disable_paper_cli
+        and resolved_access.access == "full"
+        and arc_paper_direct_shell
         and serialize_paper_access_policy
     ):
+        paper_access_policy = _direct_shell_policy_descriptor(paper_access_policy)
+        assert paper_access_policy is not None
         operations = list(
             paper_access_policy.get("operations")
             or paper_access_policy.get("allowed_operations")

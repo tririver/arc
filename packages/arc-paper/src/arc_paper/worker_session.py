@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -15,6 +15,12 @@ import fcntl
 
 from .cache import now_iso
 from .ids import normalize_paper_id
+from .runtime_context import (
+    current_worker_call_id,
+    current_worker_session,
+    worker_call_context,
+    worker_session_context,
+)
 
 
 SCHEMA_VERSION = "arc.paper.worker-session.v1"
@@ -23,7 +29,8 @@ _SECRET_KEYS = ("authorization", "credential", "password", "secret", "token", "a
 _TERMINAL_FETCH_STATUS = {401, 403, 429}
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ALLOWED_CACHE_NAMESPACES = {
-    "papers", "sources", "rich-sources", "source-annotations", "paper-aliases", "queries"
+    "papers", "sources", "source-identities", "rich-sources", "source-annotations",
+    "paper-aliases", "queries",
 }
 
 
@@ -96,9 +103,16 @@ class WorkerCacheSession:
         self._write_session_manifest()
 
     @classmethod
+    def current(cls) -> "WorkerCacheSession | None":
+        session = current_worker_session()
+        return session if isinstance(session, cls) else None
+
+    @classmethod
     def from_environment(cls) -> "WorkerCacheSession | None":
         """Reopen the controller-created session described by worker env vars."""
 
+        if session := cls.current():
+            return session
         overlay_value = os.environ.get("ARC_PAPER_CACHE")
         if not overlay_value:
             return None
@@ -180,14 +194,23 @@ class WorkerCacheSession:
         values = self.environment()
         previous = {key: os.environ.get(key) for key in values}
         os.environ.update(values)
-        try:
+        with worker_session_context(self):
+            try:
+                yield
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    @contextmanager
+    def in_process(self, call_id: str) -> Iterator[None]:
+        """Activate session and call identity without changing process env."""
+
+        self._validate_call_id(call_id)
+        with worker_session_context(self), worker_call_context(call_id):
             yield
-        finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
 
     @contextmanager
     def call_scope(self, call_id: str) -> Iterator[None]:
@@ -196,13 +219,14 @@ class WorkerCacheSession:
         key = "ARC_PAPER_WORKER_CALL_ID"
         previous = os.environ.get(key)
         os.environ[key] = call_id
-        try:
-            yield
-        finally:
-            if previous is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = previous
+        with worker_call_context(call_id):
+            try:
+                yield
+            finally:
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
 
     def overlay_path(self, relative: str | Path) -> Path:
         return self.overlay_root / self._safe_relative(relative)
@@ -235,7 +259,11 @@ class WorkerCacheSession:
                 relative_path,
                 source=source or {"operation": "stage_bytes"},
                 parser_version=parser_version,
-                writer_call_id=os.environ.get("ARC_PAPER_WORKER_CALL_ID", "session-direct"),
+                writer_call_id=(
+                    current_worker_call_id()
+                    or os.environ.get("ARC_PAPER_WORKER_CALL_ID")
+                    or "session-direct"
+                ),
                 operation="stage_bytes",
             )
         return target
@@ -254,7 +282,11 @@ class WorkerCacheSession:
                 "relative_path": relative_path.as_posix(),
                 "created_at": now_iso(),
                 "source": _redact(dict(source or {})),
-                "writer_call_id": os.environ.get("ARC_PAPER_WORKER_CALL_ID", "session-direct"),
+                "writer_call_id": (
+                    current_worker_call_id()
+                    or os.environ.get("ARC_PAPER_WORKER_CALL_ID")
+                    or "session-direct"
+                ),
                 "operation": str((source or {}).get("operation") or "cache remove"),
             }
             self._atomic_json(self._tombstone_path(relative_path), data)
@@ -341,26 +373,12 @@ class WorkerCacheSession:
                         self._quarantine(relative, path, error)
                         quarantined.append(relative.as_posix())
                         continue
-                    payload = self._promotion_bytes(path)
-                    digest = hashlib.sha256(payload).hexdigest()
-                    target = self.base_root / relative
-                    if target.exists():
-                        if target.is_file() and _sha256_file(target) == digest:
-                            deduplicated.append(relative.as_posix())
-                            path.unlink()
-                        else:
-                            conflict = self.base_root / ".arc-paper-worker-conflicts" / self.session_id / relative
-                            conflict = conflict.with_name(f"{conflict.name}.{digest}")
-                            conflict.parent.mkdir(parents=True, exist_ok=True)
-                            self._write_atomic_bytes(conflict, payload)
-                            self._write_conflict_record(relative, digest, target, conflict)
-                            conflicted.append(relative.as_posix())
-                            path.unlink()
-                        continue
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    self._write_atomic_bytes(target, payload)
-                    promoted.append(relative.as_posix())
-                    path.unlink()
+                    self._apply_validated_artifacts(
+                        ((relative, path),),
+                        promoted=promoted,
+                        deduplicated=deduplicated,
+                        conflicted=conflicted,
+                    )
 
             for marker in sorted(self.tombstone_root.glob("*.json")):
                 data = _read_json(marker)
@@ -380,18 +398,156 @@ class WorkerCacheSession:
                 ):
                     continue
                 with self._artifact_lock(relative):
-                    target = self.base_root / relative
-                    if target.exists():
-                        trash = self.base_root / ".arc-paper-worker-trash" / self.session_id / relative
-                        trash.parent.mkdir(parents=True, exist_ok=True)
-                        if trash.exists():
-                            trash = trash.with_name(f"{trash.name}.{time.time_ns()}")
-                        os.replace(target, trash)
-                    deleted.append(relative.as_posix())
-                    marker.unlink()
+                    self._apply_validated_tombstones(
+                        ((relative, marker),), deleted=deleted,
+                    )
         return PromotionResult(
             tuple(promoted), tuple(deduplicated), tuple(conflicted), tuple(quarantined), tuple(deleted)
         )
+
+    def promote_call(self, call_id: str) -> PromotionResult:
+        """Validate and promote only artifacts and tombstones owned by one call.
+
+        Validation is all-or-none for base-cache changes: if any owned artifact
+        is invalid, invalid files are quarantined and no valid file or tombstone
+        from the call is applied. Other concurrent calls remain untouched.
+        """
+
+        self._validate_call_id(call_id)
+        promoted: list[str] = []
+        deduplicated: list[str] = []
+        conflicted: list[str] = []
+        quarantined: list[str] = []
+        deleted: list[str] = []
+        with self._locked(self.base_root / ".arc-paper-worker-locks" / "promotion.lock"):
+            candidates: list[tuple[Path, Path]] = []
+            for path in sorted(self._artifact_files()):
+                relative = path.relative_to(self.overlay_root)
+                record = _read_json(self._record_path(relative))
+                if not isinstance(record, dict) or record.get("writer_call_id") != call_id:
+                    continue
+                candidates.append((relative, path))
+            tombstones: list[tuple[Path, Path]] = []
+            invalid_markers: list[tuple[Path, str]] = []
+            for marker in sorted(self.tombstone_root.glob("*.json")):
+                data = _read_json(marker)
+                if not isinstance(data, dict) or data.get("writer_call_id") != call_id:
+                    continue
+                try:
+                    relative = self._safe_relative(str(data["relative_path"]))
+                except (KeyError, TypeError, ValueError):
+                    invalid_markers.append((marker, "tombstone_path_invalid"))
+                    continue
+                if (
+                    marker == self._tombstone_path(relative)
+                    and data.get("schema_version") == SCHEMA_VERSION
+                    and data.get("session_id") == self.session_id
+                    and data.get("operation")
+                    and isinstance(data.get("source"), dict)
+                    and data["source"]
+                ):
+                    tombstones.append((relative, marker))
+                else:
+                    invalid_markers.append((marker, "tombstone_contract_invalid"))
+            locked_relatives = sorted({relative for relative, _path in candidates} | {
+                relative for relative, _marker in tombstones
+            })
+            with ExitStack() as locks:
+                for relative in locked_relatives:
+                    locks.enter_context(self._artifact_lock(relative))
+                owned: list[tuple[Path, Path]] = []
+                invalid: list[tuple[Path, Path, str]] = []
+                for relative, path in candidates:
+                    record = _read_json(self._record_path(relative))
+                    if (
+                        not path.exists()
+                        or not isinstance(record, dict)
+                        or record.get("writer_call_id") != call_id
+                    ):
+                        continue
+                    error = self._validation_error(relative, path)
+                    if error:
+                        invalid.append((relative, path, error))
+                    else:
+                        owned.append((relative, path))
+                if invalid or invalid_markers:
+                    for relative, path, error in invalid:
+                        if path.exists():
+                            self._quarantine(relative, path, error)
+                            quarantined.append(relative.as_posix())
+                    for marker, error in invalid_markers:
+                        if marker.exists():
+                            quarantined.append(self._quarantine_marker(marker, error))
+                    return PromotionResult(quarantined=tuple(quarantined))
+
+                self._apply_validated_artifacts(
+                    owned,
+                    promoted=promoted,
+                    deduplicated=deduplicated,
+                    conflicted=conflicted,
+                )
+                self._apply_validated_tombstones(tombstones, deleted=deleted)
+        return PromotionResult(
+            tuple(promoted), tuple(deduplicated), tuple(conflicted),
+            tuple(quarantined), tuple(deleted),
+        )
+
+    def _apply_validated_artifacts(
+        self,
+        artifacts: list[tuple[Path, Path]] | tuple[tuple[Path, Path], ...],
+        *,
+        promoted: list[str],
+        deduplicated: list[str],
+        conflicted: list[str],
+    ) -> None:
+        """Apply artifacts whose ownership and contents were already validated."""
+
+        for relative, path in artifacts:
+            if not path.exists():
+                continue
+            payload = self._promotion_bytes(path)
+            digest = hashlib.sha256(payload).hexdigest()
+            target = self.base_root / relative
+            if target.exists():
+                if target.is_file() and _sha256_file(target) == digest:
+                    deduplicated.append(relative.as_posix())
+                else:
+                    conflict = (
+                        self.base_root / ".arc-paper-worker-conflicts"
+                        / self.session_id / relative
+                    ).with_name(f"{relative.name}.{digest}")
+                    conflict.parent.mkdir(parents=True, exist_ok=True)
+                    self._write_atomic_bytes(conflict, payload)
+                    self._write_conflict_record(relative, digest, target, conflict)
+                    conflicted.append(relative.as_posix())
+                path.unlink()
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._write_atomic_bytes(target, payload)
+            promoted.append(relative.as_posix())
+            path.unlink()
+
+    def _apply_validated_tombstones(
+        self,
+        tombstones: list[tuple[Path, Path]] | tuple[tuple[Path, Path], ...],
+        *,
+        deleted: list[str],
+    ) -> None:
+        """Apply tombstones whose ownership and contracts were already validated."""
+
+        for relative, marker in tombstones:
+            target = self.base_root / relative
+            if target.exists():
+                trash = (
+                    self.base_root / ".arc-paper-worker-trash"
+                    / self.session_id / relative
+                )
+                trash.parent.mkdir(parents=True, exist_ok=True)
+                if trash.exists():
+                    trash = trash.with_name(f"{trash.name}.{time.time_ns()}")
+                os.replace(target, trash)
+            deleted.append(relative.as_posix())
+            marker.unlink(missing_ok=True)
 
     def audit(
         self,
@@ -591,6 +747,15 @@ class WorkerCacheSession:
                 return "parsed_source_contract_invalid"
             if not isinstance(data.get("parser_version"), int) or data["parser_version"] < 1:
                 return "parser_version_invalid"
+        elif namespace == "source-identities":
+            if (
+                not isinstance(data, dict)
+                or data.get("schema_version") != "arc.parsed-source.identity.v1"
+                or not data.get("paper_id")
+                or not data.get("source_hash")
+                or not isinstance(data.get("parser_version"), int)
+            ):
+                return "parsed_source_identity_contract_invalid"
         elif namespace == "rich-sources":
             if not isinstance(data, dict) or not isinstance(data.get("rich_parser_version"), int):
                 return "rich_parser_version_invalid"
@@ -624,6 +789,22 @@ class WorkerCacheSession:
                 "quarantined_at": now_iso(),
             },
         )
+
+    def _quarantine_marker(self, marker: Path, reason: str) -> str:
+        target = self.quarantine_root / "tombstones" / marker.name
+        target = target.with_name(f"{target.name}.{time.time_ns()}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(marker, target)
+        self._atomic_json(
+            target.with_name(f"{target.name}.record.json"),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "relative_path": f"{_STATE_DIR}/tombstones/{marker.name}",
+                "reason": reason,
+                "quarantined_at": now_iso(),
+            },
+        )
+        return f"{_STATE_DIR}/tombstones/{marker.name}"
 
     def _write_conflict_record(self, relative: Path, digest: str, target: Path, conflict: Path) -> None:
         self._atomic_json(

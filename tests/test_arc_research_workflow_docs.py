@@ -641,9 +641,9 @@ def test_calculate_uses_phase_specific_source_defaults() -> None:
     assert '"allow_mcp": false' in text
     assert '"allow_internet": true' in text
     assert '"allow_mcp": true' not in text
-    assert "arc-paper-worker" in text
-    assert '"arc_paper_cli_access": "none"' in text
-    assert '"arc_paper_cli_access": "full"' in text
+    assert "controller arc-paper access" in text
+    assert '"arc_paper_access": "none"' in text
+    assert '"arc_paper_access": "full"' in text
     assert "reference_disagrees" in text
     assert "post-check new calculation" in text
 

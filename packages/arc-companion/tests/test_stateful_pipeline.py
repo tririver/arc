@@ -16,6 +16,7 @@ from arc_companion.stateful_pipeline import (
     read_stream_state,
     pin_lane_runtime_profile,
     resolve_lane_runtime_profile,
+    validate_lane_paper_runtime_profile,
     write_stream_state,
 )
 
@@ -183,6 +184,146 @@ def test_auto_profile_pins_actual_provider_and_model_across_restart(tmp_path) ->
     assert restarted == pinned
     assert restarted["provider"] == "codex-cli"
     assert restarted["model"] == "actual-model"
+
+
+def test_lane_runtime_profile_pins_broker_policy_and_direct_decision(tmp_path) -> None:
+    path = tmp_path / "profile.json"
+    requested = {
+        "arc_paper_access": "full",
+        "paper_policy_sha256": None,
+        "paper_catalog_sha256": None,
+        "paper_network_authorized": True,
+        "arc_paper_direct_shell": False,
+        "paper_direct_decision": "controller",
+        "direct_shell_probe_id": "probe-not-requested",
+    }
+    selected = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=1,
+        requested_allow_internet=False, inherit_host_tools=False,
+        existing_generation=False, recorded_runtime_fingerprint=None,
+        provider="codex-cli", model="fixed-model", model_tier="medium",
+        paper_runtime_profile=requested,
+    )
+    resolved = {
+        **requested,
+        "paper_policy_sha256": "policy-hash",
+        "paper_catalog_sha256": "catalog-hash",
+        "direct_shell_probe_id": "probe-not-requested",
+    }
+    pinned = pin_lane_runtime_profile(
+        path, selected, provider="codex-cli", model="fixed-model",
+        runtime_fingerprint="runtime-hash", paper_runtime_profile=resolved,
+    )
+
+    assert pinned["arc_paper_access"] == "full"
+    assert pinned["paper_policy_sha256"] == "policy-hash"
+    assert pinned["paper_catalog_sha256"] == "catalog-hash"
+    assert pinned["paper_network_authorized"] is True
+    assert pinned["paper_direct_decision"] == "controller"
+    assert pinned["direct_shell_probe_id"] == "probe-not-requested"
+
+
+def test_legacy_started_lane_profile_does_not_gain_new_paper_capabilities(
+    tmp_path,
+) -> None:
+    path = tmp_path / "profile.json"
+    path.write_text(
+        json.dumps({
+            "schema_version": "arc.companion.lane-runtime-profile.v1",
+            "chapter_id": "ch-1", "lane": "translation", "generation": 1,
+            "allow_internet": False, "inherit_host_tools": False,
+            "provider": "codex-cli", "model": "fixed-model",
+            "model_tier": "medium", "recorded_runtime_fingerprint": "old-runtime",
+        }),
+        encoding="utf-8",
+    )
+    existing = resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=1,
+        requested_allow_internet=True, inherit_host_tools=True,
+        existing_generation=True, recorded_runtime_fingerprint="old-runtime",
+        paper_runtime_profile={"arc_paper_access": "full"},
+    )
+
+    assert existing["schema_version"] == "arc.companion.lane-runtime-profile.v2"
+    assert existing["migrated_from_schema_version"].endswith(".v1")
+    assert existing["arc_paper_access"] == "none"
+    assert existing["arc_paper_direct_shell"] is False
+    assert existing["paper_direct_decision"] == "disabled"
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"arc_paper_access": "none", "arc_paper_direct_shell": False},
+        {"arc_paper_access": "full", "arc_paper_direct_shell": True},
+    ],
+)
+def test_started_v2_lane_rejects_access_or_direct_recipe_drift(
+    tmp_path, changed,
+) -> None:
+    path = tmp_path / "profile.json"
+    requested = {
+        "arc_paper_access": "full",
+        "paper_policy_sha256": None,
+        "paper_catalog_sha256": None,
+        "paper_network_authorized": True,
+        "arc_paper_direct_shell": False,
+        "paper_direct_decision": "controller",
+        "direct_shell_probe_id": "probe-not-requested",
+    }
+    resolve_lane_runtime_profile(
+        path, chapter_id="ch-1", lane="translation", generation=1,
+        requested_allow_internet=False, inherit_host_tools=False,
+        existing_generation=False, recorded_runtime_fingerprint=None,
+        paper_runtime_profile=requested,
+    )
+
+    with pytest.raises(ValueError, match="lane ARC-paper"):
+        resolve_lane_runtime_profile(
+            path, chapter_id="ch-1", lane="translation", generation=1,
+            requested_allow_internet=False, inherit_host_tools=False,
+            existing_generation=True, recorded_runtime_fingerprint=None,
+            paper_runtime_profile={**requested, **changed},
+        )
+
+
+def test_started_v2_lane_rejects_resolved_policy_catalog_and_probe_drift() -> None:
+    pinned = {
+        "arc_paper_access": "full",
+        "paper_policy_sha256": "policy-a",
+        "paper_catalog_sha256": "catalog-a",
+        "paper_network_authorized": True,
+        "arc_paper_direct_shell": True,
+        "paper_direct_decision": "direct",
+        "direct_shell_probe_id": "probe-a",
+    }
+    for key, value in (
+        ("paper_policy_sha256", "policy-b"),
+        ("paper_catalog_sha256", "catalog-b"),
+        ("direct_shell_probe_id", "probe-b"),
+    ):
+        with pytest.raises(ValueError, match="lane ARC-paper"):
+            validate_lane_paper_runtime_profile(
+                pinned, {**pinned, key: value},
+            )
+
+
+def test_generation_bootstrap_retries_until_a_native_turn_is_accepted() -> None:
+    stream = _stream()
+    first = json.loads(stream.request(
+        "first", cursor="s1", source_sha256="one", current_payload={},
+    ))
+    stream.reconcile_turn_count(0)
+    retry = json.loads(stream.request(
+        "retry", cursor="s1", source_sha256="one", current_payload={},
+    ))
+    stream.reconcile_turn_count(1)
+    next_segment = json.loads(stream.request(
+        "next", cursor="s2", source_sha256="two", current_payload={},
+    ))
+
+    assert first["turn_kind"] == retry["turn_kind"] == "generation_bootstrap"
+    assert next_segment["turn_kind"] == "delta"
 
 
 def test_provisional_rollover_profile_migrates_preceding_generation_fingerprint(

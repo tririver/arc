@@ -19,13 +19,14 @@ from jsonschema import Draft202012Validator
 from .results import err, ok
 
 
-CATALOG_SCHEMA_VERSION = "arc.paper.capability-catalog.v1"
+CATALOG_SCHEMA_VERSION = "arc.paper.capability-catalog.v2"
 RECURSIVE_LLM_CAPABILITY = "recursive_llm"
 
 NetworkAccess = Literal["none", "may"]
 CacheAccess = Literal["none", "read", "write", "read-write"]
 ExecutionClass = Literal["inline", "job"]
 ArtifactAccess = Literal["read", "write"]
+RecoveryClass = Literal["idempotent", "transactional", "managed_job"]
 ArtifactResolver = Callable[..., str | Path]
 
 
@@ -74,6 +75,7 @@ class OperationSpec:
     destructive: bool = False
     admin: bool = False
     artifact_parameters: tuple[tuple[str, ArtifactAccess], ...] = ()
+    recovery_class: RecoveryClass = "idempotent"
 
     @property
     def operation_id(self) -> str:
@@ -110,6 +112,7 @@ class OperationSpec:
                 "job": self.is_job,
                 "destructive": self.destructive,
                 "admin": self.admin,
+                "recovery": self.recovery_class,
             },
             "authorization": {
                 "supervision_required": self.destructive or self.admin,
@@ -192,6 +195,7 @@ def _spec(
     destructive: bool = False,
     admin: bool = False,
     artifacts: tuple[tuple[str, ArtifactAccess], ...] = (),
+    recovery: RecoveryClass | None = None,
 ) -> OperationSpec:
     return OperationSpec(
         name=name,
@@ -207,6 +211,14 @@ def _spec(
         destructive=destructive,
         admin=admin,
         artifact_parameters=artifacts,
+        recovery_class=(
+            recovery
+            or (
+                "managed_job"
+                if llm or job
+                else "transactional" if destructive else "idempotent"
+            )
+        ),
     )
 
 
@@ -388,7 +400,8 @@ _OPERATIONS = (
             },
             required=("source_id", "equation_id", "reason"),
         ),
-        "service.mark_parsed_equation", positional=("source_id", "equation_id"), cache="read-write",
+        "service.mark_parsed_equation", positional=("source_id", "equation_id"),
+        cache="read-write", recovery="transactional",
     ),
     _spec(
         "search-parsed", "Search one cached parsed source.",
@@ -420,7 +433,8 @@ _OPERATIONS = (
     _spec(
         "store-llm-summary", "Validate and store a paper summary.",
         _object({"paper_id": NONEMPTY, "summary": {"type": "object"}}, required=("paper_id", "summary")),
-        "service.store_llm_summary", positional=("paper_id", "summary"), cache="write",
+        "service.store_llm_summary", positional=("paper_id", "summary"),
+        cache="write", recovery="transactional",
     ),
     _spec(
         "cache.list", "List cached paper artifacts.",

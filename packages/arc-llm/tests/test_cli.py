@@ -293,7 +293,8 @@ def test_loop_worker_capability_flags_override_all_workers():
 
     for collection in ("proposers", "reviewers"):
         runtime = config["loops"][0][collection][0]["runtime"]
-        assert runtime["arc_paper_cli_access"] == "none"
+        assert runtime["arc_paper_access"] == "none"
+        assert "arc_paper_cli_access" not in runtime
         assert runtime["inherit_host_tools"] is True
 
 

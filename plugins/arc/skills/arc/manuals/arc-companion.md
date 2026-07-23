@@ -6,10 +6,18 @@ note, or book. It consumes a rich source plus its paired PDF through
 renders and validates both a PDF and a static-web reader deterministically. The
 core workflow is CLI-only and portable across supported agent hosts.
 
-Chapter workers use `arc-paper-worker` directly only when the resolved runtime
-capability proves a nested sandboxed shell. Otherwise the same deterministic
-reads use addressed Controller evidence requests; this does not switch the
-provider, enable unsafe sandbox access, or affect the outer companion CLI.
+Chapter workers use addressed Controller Broker requests for ARC-paper reads by
+default. This route is independent of nested-shell support and generic web
+access: `--no-internet` disables WebSearch/WebFetch and provider internet, but
+`--arc-paper-access full` may still let the Controller fetch missing paper data
+through ARC-paper's declared providers. `--arc-paper-access none` removes the
+request schema, catalog, controls, direct wrapper, and paper-network route.
+
+Trusted direct access is a separate explicit opt-in with
+`--arc-paper-direct-shell`. It fails before a provider call unless the runtime
+proves a nested sandboxed shell, and exposes only policy-authorized catalog
+operations declared as `network=none`; possibly networked reads remain on the
+Controller route. It never switches provider or enables unsafe sandbox access.
 They do not inherit the user's MCP,
 skills, plugins, rules, or extra CLIs unless the run explicitly enables the
 high-risk `inherit_host_tools` option. When internet access is enabled, the
@@ -69,6 +77,10 @@ Useful flags:
 - `--regenerate-commentary`: keep reusable translations and rebuild commentary.
 - `--no-internet`: disable host search; commentary may cite only prompt-supplied
   sources or local ARC cache records that have usable URLs.
+- `--arc-paper-access full|none`: enable the default Controller Broker or remove
+  ARC-paper access completely. The default is `full`.
+- `--arc-paper-direct-shell`: opt in to the trusted cache-only direct subset;
+  unavailable capability is a preflight error, not a Controller fallback.
 - `--skip-translation`: omit translation only after the workflow agent has
   confirmed from beginning, middle, and end body samples that the source and
   target have the same base language. This also disables bilingual glossary
@@ -276,6 +288,15 @@ Every turn has a stable idempotency key. A repeated accepted turn replays its
 recorded response without another provider call. The lane ledger records logical
 call ID, input/output hashes, accepted-chain predecessor, session, generation,
 native ID, usage, and validation receipt.
+
+The bootstrap includes the compact, policy-filtered ARC-paper catalog once.
+Workers request at most three Controller evidence rounds. Every complete
+dispatch envelope is stored as a content-addressed object; responses at or
+below 64 KiB may be inline, while larger results and authorized result files
+use read-only handles. `artifact-read` returns verified base64 pages of at most
+46 KiB and requires a new request ID for every new offset. Normal companion
+policies exclude admin, destructive, LLM, and job operations; managed long jobs
+remain outside this workflow until the dedicated managed-job layer.
 
 ### Step 2: Validate before advancement
 

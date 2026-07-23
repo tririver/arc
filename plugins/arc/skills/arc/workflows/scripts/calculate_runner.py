@@ -12,6 +12,7 @@ from _arc_script_bootstrap import bootstrap_arc_pythonpath
 
 bootstrap_arc_pythonpath()
 
+from arc_llm.paper_access_policy import resolve_arc_paper_access
 from arc_llm.proposers_reviewer.artifacts import RunPaths, atomic_write_json
 from arc_llm.proposers_reviewer.config import ConfigError, SAFE_ID_RE
 from arc_llm.proposers_reviewer.runner import JsonRunner, run_proposers_reviewer_batch
@@ -580,8 +581,11 @@ def _reviewer_config(
         selectable_proposer_ids,
         allow_reference_disagrees=bool(reviewer_reference_claim),
     )
-    runtime = _dict(payload.get("runtime", {}), "calculate-reviewer.template.runtime")
-    runtime["arc_paper_cli_access"] = "none" if reviewer_reference_claim else "full"
+    runtime = _canonical_paper_access_runtime(
+        _dict(payload.get("runtime", {}), "calculate-reviewer.template.runtime"),
+        "calculate-reviewer.template.runtime",
+    )
+    runtime["arc_paper_access"] = "none" if reviewer_reference_claim else "full"
     runtime["inherit_host_tools"] = False
     payload["runtime"] = runtime
     return payload
@@ -593,7 +597,7 @@ def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str,
             "allow_internet": False,
             "allow_mcp": False,
             "codex_sandbox": "read-only",
-            "arc_paper_cli_access": "none",
+            "arc_paper_access": "none",
             "inherit_host_tools": False,
         }
     elif step.kind == "new_calculation":
@@ -601,7 +605,7 @@ def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str,
             "allow_internet": True,
             "allow_mcp": False,
             "codex_sandbox": "read-only",
-            "arc_paper_cli_access": "full",
+            "arc_paper_access": "full",
             "inherit_host_tools": False,
         }
     else:
@@ -609,23 +613,25 @@ def _proposer_runtime(config: CalculateConfig, step: CalculateStep) -> dict[str,
             "allow_internet": False,
             "allow_mcp": False,
             "codex_sandbox": "read-only",
-            "arc_paper_cli_access": "full",
+            "arc_paper_access": "full",
             "inherit_host_tools": False,
         }
     runtime.update(_dict(config.defaults.get("proposer_runtime", {}), "defaults.proposer_runtime"))
     runtime.update(step.proposer_runtime)
+    runtime = _canonical_paper_access_runtime(runtime, f"{step.step_id}.proposer_runtime")
     if step.reviewer_reference_claim:
         # Blind validation is a hard isolation boundary; ordinary runtime
         # overrides cannot expose paper or inherited host tools here.
-        runtime["arc_paper_cli_access"] = "none"
+        runtime["arc_paper_access"] = "none"
         runtime["inherit_host_tools"] = False
     return runtime
 
 
 def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
+    runtime = _canonical_paper_access_runtime(dict(runtime), "proposer_runtime")
     allow_mcp = _bool_default(runtime.get("allow_mcp", False), False)
     allow_internet = _bool_default(runtime.get("allow_internet", False), False)
-    paper_access = str(runtime.get("arc_paper_cli_access", "full"))
+    paper_access = str(runtime.get("arc_paper_access", "full"))
     if paper_access == "none" and not allow_mcp and not allow_internet:
         return (
             "Do not use internet search. Do not use ARC paper MCP tools. "
@@ -637,7 +643,7 @@ def _proposer_source_policy(runtime: Mapping[str, Any]) -> str:
     parts = []
     if paper_access == "full":
         parts.append(
-            "Use arc-paper-worker for deterministic cached or missing-paper evidence; "
+            "Use structured Controller requests for deterministic cached or missing-paper evidence; "
             "do not invoke any other ARC CLI or nested LLM command."
         )
     elif allow_mcp:
@@ -1480,6 +1486,18 @@ def _dict(value: Any, field_name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{field_name} must be an object")
     return copy.deepcopy(value)
+
+
+def _canonical_paper_access_runtime(
+    runtime: dict[str, Any], field_name: str,
+) -> dict[str, Any]:
+    try:
+        access = resolve_arc_paper_access(runtime).access
+    except ValueError as exc:
+        raise ConfigError(f"{field_name}: {exc}") from exc
+    runtime["arc_paper_access"] = access
+    runtime.pop("arc_paper_cli_access", None)
+    return runtime
 
 
 def _bool(value: Any, field_name: str) -> bool:

@@ -666,7 +666,8 @@ def test_new_calculation_worker_defaults_to_no_mcp(tmp_path: Path) -> None:
 
     assert runtime["allow_internet"] is True
     assert runtime["allow_mcp"] is False
-    assert runtime["arc_paper_cli_access"] == "full"
+    assert runtime["arc_paper_access"] == "full"
+    assert "arc_paper_cli_access" not in runtime
     assert runtime["inherit_host_tools"] is False
     assert "mcp_mode" not in runtime
 
@@ -675,12 +676,12 @@ def test_blind_reference_runtime_cannot_override_paper_isolation(tmp_path: Path)
     runner = load_calculate_runner()
     payload = minimal_config(tmp_path)
     payload["defaults"] = {"proposer_runtime": {
-        "arc_paper_cli_access": "full",
+        "arc_paper_access": "full",
         "inherit_host_tools": True,
     }}
     payload["steps"][0]["reviewer_reference_claim"] = {"id": "target", "latex": "x"}
     payload["steps"][0]["proposer_runtime"] = {
-        "arc_paper_cli_access": "full",
+        "arc_paper_access": "full",
         "inherit_host_tools": True,
     }
     config = runner.load_calculation_config(payload)
@@ -694,9 +695,11 @@ def test_blind_reference_runtime_cannot_override_paper_isolation(tmp_path: Path)
         human_gate=config.human_gate,
     )
 
-    assert runtime["arc_paper_cli_access"] == "none"
+    assert runtime["arc_paper_access"] == "none"
+    assert "arc_paper_cli_access" not in runtime
     assert runtime["inherit_host_tools"] is False
-    assert reviewer["runtime"]["arc_paper_cli_access"] == "none"
+    assert reviewer["runtime"]["arc_paper_access"] == "none"
+    assert "arc_paper_cli_access" not in reviewer["runtime"]
     assert reviewer["runtime"]["inherit_host_tools"] is False
 
 

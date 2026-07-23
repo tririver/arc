@@ -1,11 +1,100 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 
 PAPER_ACCESS_POLICY_VERSION = "arc.paper.worker-read-policy.v2"
 POLICY_TARGETS_OPERATION = "policy-targets"
+PAPER_ACCESS_VALUES = frozenset({"none", "full"})
+PAPER_ACCESS_LEGACY_WARNING = "arc_paper_access.legacy_alias"
+PAPER_ACCESS_INTERNAL_MIRROR = "ARC_INTERNAL_PAPER_ACCESS_LEGACY_MIRROR"
+
+
+@dataclass(frozen=True)
+class PaperAccessResolution:
+    """Canonical ARC-paper access plus non-semantic migration diagnostics."""
+
+    access: str
+    warnings: tuple[str, ...] = ()
+
+
+def resolve_arc_paper_access(
+    config: Mapping[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    default: str = "full",
+) -> PaperAccessResolution:
+    """Resolve canonical and legacy ARC-paper access without silent conflicts.
+
+    ``arc_paper_access``/``ARC_PAPER_ACCESS`` are authoritative spellings.
+    The old ``*_cli_access`` names remain accepted only as equal-value aliases.
+    """
+
+    canonical = _access_candidates(
+        ((config or {}).get("arc_paper_access"), (env or {}).get("ARC_PAPER_ACCESS")),
+        label="arc_paper_access",
+    )
+    internal_mirror = (
+        (env or {}).get(PAPER_ACCESS_INTERNAL_MIRROR) == "true"
+        and (env or {}).get("ARC_PAPER_ACCESS")
+        == (env or {}).get("ARC_PAPER_CLI_ACCESS")
+    )
+    legacy = _access_candidates(
+        (
+            (config or {}).get("arc_paper_cli_access"),
+            None if internal_mirror else (env or {}).get("ARC_PAPER_CLI_ACCESS"),
+        ),
+        label="arc_paper_cli_access",
+    )
+    fallback = _validate_access(default, "default arc_paper_access")
+    canonical_value = canonical[0] if canonical else None
+    legacy_value = legacy[0] if legacy else None
+    if canonical_value is not None and legacy_value is not None:
+        if canonical_value != legacy_value:
+            raise ValueError(
+                "arc_paper_access conflicts with deprecated arc_paper_cli_access"
+            )
+        return PaperAccessResolution(
+            canonical_value, (PAPER_ACCESS_LEGACY_WARNING,)
+        )
+    if canonical_value is not None:
+        return PaperAccessResolution(canonical_value)
+    if legacy_value is not None:
+        return PaperAccessResolution(legacy_value, (PAPER_ACCESS_LEGACY_WARNING,))
+    return PaperAccessResolution(fallback)
+
+
+def apply_arc_paper_access(
+    env: dict[str, str], resolution: PaperAccessResolution, *, mirror_legacy: bool = True
+) -> None:
+    """Write canonical access and an optional equal compatibility mirror."""
+
+    env["ARC_PAPER_ACCESS"] = resolution.access
+    if mirror_legacy:
+        env["ARC_PAPER_CLI_ACCESS"] = resolution.access
+        env[PAPER_ACCESS_INTERNAL_MIRROR] = "true"
+    else:
+        env.pop("ARC_PAPER_CLI_ACCESS", None)
+        env.pop(PAPER_ACCESS_INTERNAL_MIRROR, None)
+
+
+def _access_candidates(values: Sequence[Any], *, label: str) -> tuple[str, ...]:
+    normalized = tuple(
+        _validate_access(value, label) for value in values if value is not None
+    )
+    if len(set(normalized)) > 1:
+        raise ValueError(f"conflicting {label} values")
+    return normalized
+
+
+def _validate_access(value: Any, label: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in PAPER_ACCESS_VALUES:
+        allowed = ", ".join(sorted(PAPER_ACCESS_VALUES))
+        raise ValueError(f"{label} must be one of: {allowed}")
+    return normalized
 
 
 def canonical_paper_access_policy(policy: Mapping[str, Any]) -> dict[str, Any]:

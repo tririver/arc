@@ -555,7 +555,7 @@ def test_prompt_renderer_removes_marker_and_direct_commands_when_false(tmp_path:
     assert "arc_evidence_requests" in rendered
 
 
-def test_prompt_renderer_true_exposes_only_bounded_paper_worker_operations() -> None:
+def test_prompt_renderer_true_defers_direct_allowlist_to_broker_catalog() -> None:
     capability = NestedShellCapability(
         schema_version=NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
         provider="codex-cli",
@@ -571,17 +571,10 @@ def test_prompt_renderer_true_exposes_only_bounded_paper_worker_operations() -> 
         controller_evidence_exposed=True,
     )
     assert NESTED_SHELL_PROMPT_MARKER not in rendered
-    for operation in (
-        "policy-targets",
-        "get-parsed-toc",
-        "get-parsed-section",
-        "artifact-read",
-    ):
-        assert f"arc-paper-worker {operation}" in rendered
-    assert "policy-targets with cursor-based, byte-bounded catalog pagination" in rendered
-    assert "artifact-read with offset-based, byte-bounded artifact pagination" in rendered
-    assert "other shell commands" in rendered
-    assert "arc_evidence_requests" not in rendered
+    assert "catalog-authorized network=none operations" in rendered
+    assert "Broker bootstrap" in rendered
+    assert "Controller requests" in rendered
+    assert "arc-paper-worker" not in rendered
 
 
 def test_raw_event_warning_only_scans_typed_command_execution() -> None:
@@ -665,7 +658,7 @@ def test_user_env_cannot_assert_true_and_marker_never_reaches_provider(monkeypat
     assert "arc_evidence_requests" in captured[0]
 
 
-def test_capability_failure_preserves_provider_network_and_controller(monkeypatch) -> None:
+def test_controller_route_does_not_probe_or_warn_for_nested_shell(monkeypatch) -> None:
     calls = 0
     selected_env: dict[str, str] = {}
     capability = NestedShellCapability(
@@ -689,11 +682,14 @@ def test_capability_failure_preserves_provider_network_and_controller(monkeypatc
         return Provider()
 
     monkeypatch.setattr(runner_module, "select_provider", select_provider)
-    monkeypatch.setattr(
-        runner_module,
-        "resolve_nested_shell_capability",
-        lambda **_kwargs: capability,
-    )
+    probes = 0
+
+    def unexpected_probe(**_kwargs):
+        nonlocal probes
+        probes += 1
+        return capability
+
+    monkeypatch.setattr(runner_module, "resolve_nested_shell_capability", unexpected_probe)
     result = run_json(
         NESTED_SHELL_PROMPT_MARKER,
         schema={
@@ -708,10 +704,53 @@ def test_capability_failure_preserves_provider_network_and_controller(monkeypatc
         },
     )
     assert calls == 1
+    assert probes == 0
     assert selected_env["ARC_CODEX_ALLOW_INTERNET"] == "true"
     capabilities = runner_module._runtime_capabilities(selected_env)  # noqa: SLF001
     assert capabilities["arc_paper_access"] == "full"
     assert capabilities["nested_sandboxed_shell"] is False
     record = result[ARC_LLM_CALL_RECORD_FIELD]
     assert record["call_status"] == "valid"
-    assert "nested_shell.probe_failed" in record["warnings"]
+    assert "nested_shell.probe_failed" not in record["warnings"]
+
+
+def test_explicit_direct_shell_failure_blocks_before_provider(monkeypatch) -> None:
+    calls = 0
+    capability = NestedShellCapability(
+        schema_version=NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
+        provider="codex-cli",
+        nested_sandboxed_shell=False,
+        status="probe_failed",
+        probe_kind="codex_sandbox",
+        probe_identity=NESTED_SHELL_PROBE_ID,
+        warning="nested_shell.probe_failed",
+    )
+
+    class Provider:
+        def generate_json_result(self, prompt, **kwargs):
+            nonlocal calls
+            calls += 1
+            return LLMProviderResponse({"arc_evidence_requests": []})
+
+    monkeypatch.setattr(runner_module, "select_provider", lambda *_a, **_k: Provider())
+    monkeypatch.setattr(
+        runner_module,
+        "resolve_nested_shell_capability",
+        lambda **_kwargs: capability,
+    )
+
+    with pytest.raises(runner_module.LLMConfigurationError):
+        run_json(
+            NESTED_SHELL_PROMPT_MARKER,
+            schema={
+                "type": "object",
+                "properties": {"arc_evidence_requests": {"type": "array"}},
+            },
+            validate_schema=False,
+            provider="codex-cli",
+            env={
+                "ARC_PAPER_ACCESS": "full",
+                "ARC_PAPER_DIRECT_SHELL": "true",
+            },
+        )
+    assert calls == 0

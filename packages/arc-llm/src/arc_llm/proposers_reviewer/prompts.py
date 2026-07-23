@@ -56,12 +56,17 @@ def render_prompt(worker: WorkerConfig, context: dict[str, Any]) -> str:
     if worker.prompt.system:
         sections.extend(["### System", worker.prompt.system])
     sections.extend(["### Task", rendered_template])
-    paper_cli_access = str(worker.runtime.get("arc_paper_cli_access", "full"))
-    if paper_cli_access == "full":
+    paper_access = str(worker.runtime.get("arc_paper_access", "full"))
+    direct_shell = bool(worker.runtime.get("arc_paper_direct_shell", False))
+    if paper_access == "full":
         sections.extend(
             [
                 "## ARC Paper Access",
-                NESTED_SHELL_PROMPT_MARKER,
+                (
+                    NESTED_SHELL_PROMPT_MARKER
+                    if direct_shell
+                    else "Use the structured Controller evidence protocol; direct ARC-paper commands are not exposed."
+                ),
             ]
         )
     if worker.evidence_enabled:
@@ -71,7 +76,7 @@ def render_prompt(worker: WorkerConfig, context: dict[str, Any]) -> str:
                 "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a request_id unique for this worker in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. "
                 + (
                     "Follow the resolved ARC Paper Access capability above; do not invoke other shell commands, ARC CLIs, or MCP tools yourself."
-                    if paper_cli_access == "full"
+                    if paper_access == "full"
                     else "Do not invoke shell commands, ARC CLIs, or MCP tools yourself."
                 ),
             ]
@@ -79,7 +84,7 @@ def render_prompt(worker: WorkerConfig, context: dict[str, Any]) -> str:
     if worker.runtime.get("append_context", True):
         sections.extend(["## ARC Worker Context", json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)])
     prompt = "\n".join(sections).rstrip() + "\n"
-    if paper_cli_access == "full":
+    if paper_access == "full":
         prompt = _remove_legacy_paper_cli_blankets(prompt)
     return ensure_runtime_progress_contract(prompt)
 
