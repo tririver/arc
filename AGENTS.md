@@ -54,6 +54,19 @@ tools it names.
 - Treat example papers as regression cases only. They should validate general
   behavior, not define special-case behavior.
 
+## Local Research Threat Model
+
+- ARC is local research software, not an internet-facing service. Design for
+  robustness against crashes, interrupted writes, accidental corruption,
+  malformed model/provider output, and ordinary cooperating-process races.
+- Do not over-engineer for a malicious local user or hostile filesystem. Avoid
+  adversarial symlink/inode-swap defenses, cryptographic tamper resistance,
+  attacker-oriented TOCTOU machinery, or comparable complexity unless the user
+  explicitly places a hostile boundary in scope.
+- Security measures that prevent accidental credential disclosure or unsafe
+  provider invocation are still appropriate, but keep them proportional to
+  realistic local research use.
+
 ## Workflow Design Principles
 
 - Design ARC workflows to support agent reasoning, not to replace it with
