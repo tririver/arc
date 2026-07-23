@@ -400,6 +400,49 @@ def test_concurrent_completion_is_not_overwritten_by_cancel(
 
 
 @pytest.mark.parametrize(
+    ("terminal_status", "terminal_event"),
+    [
+        ("done", "job_done"),
+        ("failed", "job_failed"),
+        ("cancelled", "job_cancelled"),
+    ],
+)
+def test_terminal_event_is_durable_before_terminal_status(
+    tmp_path, monkeypatch, terminal_status, terminal_event,
+) -> None:
+    monkeypatch.setenv("ARC_JOBS_CACHE", str(tmp_path / "cache"))
+    _install_fake_cli(tmp_path, monkeypatch, body="printf '{\"ok\":true}'")
+    manager = JobManager(worker_mode="process")
+    monkeypatch.setattr(manager, "_launch_worker", lambda job_id: None)
+    job_id = manager.submit(["arc-paper", "--json"])
+    paths = JobPaths.for_job(job_id)
+    observed_events: list[str] = []
+    real_update_status = jobs_module.update_status
+
+    def observe_terminal_update(job_id, *, paths=None, **fields):
+        if fields.get("status") == terminal_status:
+            observed_events.extend(
+                event["event"]
+                for event in tail_events(paths.events, limit=10)
+            )
+        return real_update_status(job_id, paths=paths, **fields)
+
+    monkeypatch.setattr(jobs_module, "update_status", observe_terminal_update)
+    if terminal_status == "done":
+        jobs_module.finish_job(job_id, {"ok": True}, terminal_status)
+    else:
+        jobs_module.set_error(
+            job_id,
+            "job_cancelled" if terminal_status == "cancelled" else "job_failed",
+            "terminal test",
+            cancelled=terminal_status == "cancelled",
+        )
+
+    assert observed_events[-1] == terminal_event
+    assert manager.status(job_id)["status"] == terminal_status
+
+
+@pytest.mark.parametrize(
     ("reported", "expected_status", "expected_code"),
     [
         ("cancelled", "cancelled", "job_cancelled"),

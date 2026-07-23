@@ -1250,16 +1250,17 @@ def finish_job(job_id: str, result: Any, status: str) -> None:
         ):
             return
         persist_result(job_id, result, paths=paths)
-        finished_at = now_iso()
+        terminal_event = append_event(
+            job_id, {"event": f"job_{status}"}, paths=paths,
+        )
         update_status(
             job_id,
             paths=paths,
             status=status,
             phase=status,
-            finished_at=finished_at,
+            finished_at=terminal_event["at"],
             result_path=str(paths.result),
         )
-        append_event(job_id, {"event": f"job_{status}"}, paths=paths)
         record_history(job_id, status=status, paths=paths)
 
 
@@ -1288,19 +1289,19 @@ def set_error(
         }
         write_json(paths.error, error)
         status = "cancelled" if cancelled else "failed"
+        terminal_event = append_event(
+            job_id,
+            {"event": f"job_{status}", "error_code": code},
+            paths=paths,
+        )
         update_status(
             job_id,
             paths=paths,
             status=status,
             phase=status,
-            finished_at=now_iso(),
+            finished_at=terminal_event["at"],
             error=error,
             error_path=str(paths.error),
-        )
-        append_event(
-            job_id,
-            {"event": f"job_{status}", "error_code": code},
-            paths=paths,
         )
         record_history(job_id, status=status, paths=paths)
 
